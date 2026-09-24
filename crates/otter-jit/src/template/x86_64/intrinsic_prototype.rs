@@ -27,7 +27,7 @@ pub(crate) fn emit(
     receiver: u8,
     miss: DynamicLabel,
 ) {
-    if !target.is_property_receiver() {
+    if !target.is_generated_receiver() {
         dynasm!(ops ; .arch x64 ; jmp =>miss);
         return;
     }

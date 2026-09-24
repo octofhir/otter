@@ -1247,7 +1247,11 @@ impl Interpreter {
                     receiver: jit::JitGuardedReceiver::Shape {
                         shape: recv_shape_offset,
                     },
-                    holder_shape: holder_shape_offset,
+                    holder: if holder_shape_offset == 0 {
+                        jit::JitMethodHolder::Receiver
+                    } else {
+                        jit::JitMethodHolder::Shape(holder_shape_offset)
+                    },
                     method_value_byte,
                     builtin_native_ref,
                     entry_stub_id: stub_id,

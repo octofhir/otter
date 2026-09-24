@@ -273,6 +273,10 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             stub: *stub,
         },
+        MachineOpcode::NativeLeafProbe { stub, .. } => MachineOpcode::NativeLeafProbe {
+            byte_pc: 0,
+            stub: *stub,
+        },
         MachineOpcode::LooseEqualityProbe { equal, .. } => MachineOpcode::LooseEqualityProbe {
             byte_pc: 0,
             equal: *equal,
@@ -309,6 +313,12 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             shape: *shape,
         },
+        MachineOpcode::CacheIrGuardDictionaryLayout { layout, .. } => {
+            MachineOpcode::CacheIrGuardDictionaryLayout {
+                byte_pc: 0,
+                layout: *layout,
+            }
+        }
         MachineOpcode::CacheIrGuardOrdinaryState { .. } => {
             MachineOpcode::CacheIrGuardOrdinaryState { byte_pc: 0 }
         }

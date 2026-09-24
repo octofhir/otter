@@ -1,19 +1,27 @@
-//! Native identity probes, Int32 hits and committed method/resolved-call siblings.
+//! Native identity probes, generated hits and committed method/resolved-call
+//! siblings.
 //!
 //! # Contents
 //! - Selection eligibility from existing method and static-native snapshots.
-//! - Ordinary CacheIR receiver/holder/slot proofs and native identity probes.
-//! - A shared pure Int32 Math hit joined with the canonical boxed completion.
+//! - Ordinary CacheIR receiver/holder/slot proofs, pinned intrinsic-prototype
+//!   proofs for exotic receivers, and native identity probes.
+//! - [`HitKind`]: a pure Int32 Math hit or a bounded no-allocation leaf hit,
+//!   joined with the canonical boxed completion.
 //!
 //! # Invariants
-//! - Every guard and arithmetic miss precedes effects and enters one cold call.
-//! - Receiver and holder state exclude descriptor overrides and exotic lookup
-//!   before a shape-derived method slot is read; symbol sidecars remain eligible.
+//! - Every guard, arithmetic and leaf miss precedes effects and enters one cold
+//!   call, which performs the complete JavaScript operation exactly once.
+//! - Shaped receiver and holder state exclude descriptor overrides and exotic
+//!   lookup before a shape-derived method slot is read; symbol sidecars remain
+//!   eligible. An exotic receiver is proven by type tag and latch, and its
+//!   pinned prototype by fast mode and shape; the builtin identity guard then
+//!   rejects any slot that no longer holds the declared data function.
 //! - Resolved calls consume their loaded callee after argument evaluation; a
 //!   cold miss never repeats the property lookup that produced it.
-//! - Only the cold sibling boxes arguments, publishes roots and enters the VM.
+//! - Only the cold sibling publishes roots, a frame state or a safepoint and
+//!   enters the VM. A leaf hit calls a declared entry that cannot allocate,
+//!   collect, throw or reenter JavaScript, so its operands need no roots.
 //! - The cold call retains its source function and pre-call frame state.
-//! - The hit uses the shared native declaration without a runtime ABI call.
 //!
 //! # See also
 //! - `super::property_cfg` — the corresponding named-property CFG.
@@ -36,10 +44,25 @@ pub(super) struct Values {
     pub cold_payload: MachineValue,
 }
 
+/// Generated completion selected for one native call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HitKind {
+    /// Proven Int32 `Math.abs` / `max` / `min` replacement.
+    Int32Math,
+    /// Declared no-allocation leaf entry returning a boxed value or a miss.
+    Leaf,
+}
+
 impl Values {
-    pub fn new(representations: &mut Vec<MachineRepresentation>) -> Self {
+    pub fn new(representations: &mut Vec<MachineRepresentation>, kind: HitKind) -> Self {
         Self {
-            result: push_value(representations, MachineRepresentation::Int32),
+            result: push_value(
+                representations,
+                match kind {
+                    HitKind::Int32Math => MachineRepresentation::Int32,
+                    HitKind::Leaf => MachineRepresentation::Tagged,
+                },
+            ),
             hit: push_value(representations, MachineRepresentation::Boolean),
             payload: push_value(representations, MachineRepresentation::Tagged),
             cold_payload: push_value(representations, MachineRepresentation::Tagged),
@@ -47,15 +70,43 @@ impl Values {
     }
 }
 
-pub(super) fn supports_method(
+/// Generated hit for a guarded method site, or `None` when it stays generic.
+///
+/// A shaped receiver with an Int32 Math declaration keeps its pure hit. Every
+/// other declared no-allocation leaf is called directly; an exotic receiver
+/// is the entry's first operand, so at most one argument fits its two words.
+pub(super) fn method_hit(
     view: &JitCompileSnapshot,
     call: otter_vm::JitGuardedMethodCall,
     argument_count: usize,
-) -> bool {
-    matches!(call.receiver, otter_vm::JitGuardedReceiver::Shape { shape } if shape != 0)
-        && call.safepoint_id == otter_vm::native_abi::NO_SAFEPOINT
-        && call.method_value_byte.is_multiple_of(8)
-        && view.cage_base != 0
+) -> Option<HitKind> {
+    use otter_vm::JitMethodHolder;
+    let receiver_word = match (call.receiver, call.holder) {
+        (
+            otter_vm::JitGuardedReceiver::Shape { shape },
+            JitMethodHolder::Receiver | JitMethodHolder::Shape(_),
+        ) if shape != 0 => 0,
+        (
+            otter_vm::JitGuardedReceiver::Exotic(target),
+            JitMethodHolder::Shape(_) | JitMethodHolder::Dictionary(_),
+        ) if target.is_generated_receiver() => 1,
+        _ => return None,
+    };
+    if matches!(
+        call.holder,
+        JitMethodHolder::Shape(0) | JitMethodHolder::Dictionary(0)
+    ) {
+        return None;
+    }
+    if call.safepoint_id != otter_vm::native_abi::NO_SAFEPOINT
+        || !call.method_value_byte.is_multiple_of(8)
+        || view.cage_base == 0
+        || view.native_ref_byte == 0
+        || argument_count != usize::from(call.argument_count)
+    {
+        return None;
+    }
+    if receiver_word == 0
         && super::super::native_leaf::supports_int32(call.entry_stub_id)
         && super::super::native_leaf::supports_site(
             view,
@@ -66,6 +117,20 @@ pub(super) fn supports_method(
             },
             argument_count,
         )
+    {
+        return Some(HitKind::Int32Math);
+    }
+    (receiver_word + argument_count <= 2
+        && super::super::native_leaf::supports_leaf_probe(call.entry_stub_id))
+    .then_some(HitKind::Leaf)
+}
+
+/// Generated hit already admitted for the native call ending `block`.
+pub(super) fn hit_kind(hir: &NumericFunction, block: usize) -> HitKind {
+    match site(hir, block).map(|node| hir.nodes[node.0]) {
+        Some(NumericNode::NativeCall { hit, .. }) => hit,
+        _ => HitKind::Int32Math,
+    }
 }
 
 pub(super) fn supports_resolved(
@@ -117,6 +182,7 @@ pub(super) fn select_probe(
 ) -> Result<(), super::super::VerificationError> {
     let NumericNode::NativeCall {
         target,
+        hit,
         argument_start,
         byte_pc,
         ..
@@ -167,6 +233,51 @@ pub(super) fn select_probe(
         .ok_or(super::super::VerificationError::InvalidValue(
             machine_value(values, node),
         ))?;
+    if hit == HitKind::Leaf {
+        // An exotic receiver is the entry's first operand word, exactly as the
+        // Template guarded method call passes it.
+        let receiver_word = matches!(
+            target,
+            NumericNativeCallTarget::Method(otter_vm::JitGuardedMethodCall {
+                receiver: otter_vm::JitGuardedReceiver::Exotic(_),
+                ..
+            })
+        )
+        .then_some(receiver);
+        let words = receiver_word
+            .into_iter()
+            .chain(args.iter().map(|&argument| {
+                tagged_call_argument(hir, values, representations, instructions, argument)
+            }))
+            .collect::<Vec<_>>();
+        let mut operands = words
+            .into_iter()
+            .enumerate()
+            .map(|(index, word)| {
+                MachineOperand::fixed_register_input(
+                    word,
+                    target_spec
+                        .integer_argument(index + 1)
+                        .expect("bounded native leaf operand"),
+                )
+            })
+            .collect::<Vec<_>>();
+        operands.extend([
+            MachineOperand::location_input(identity_hit),
+            MachineOperand::fixed_register_output(outputs.result, target_spec.integer_result()),
+            MachineOperand::register_output(outputs.hit),
+        ]);
+        let mut leaf = MachineInstruction::plain(
+            MachineOpcode::NativeLeafProbe {
+                stub: call.leaf_stub_id,
+                byte_pc,
+            },
+            operands,
+        );
+        leaf.clobbers = super::super::native_leaf::leaf_probe_clobbers(target_spec);
+        instructions.push(leaf);
+        return Ok(());
+    }
     let mut operands = args
         .iter()
         .enumerate()
@@ -204,79 +315,141 @@ fn select_method_lookup(
     representations: &mut Vec<MachineRepresentation>,
     instructions: &mut Vec<MachineInstruction>,
 ) -> Result<(MachineValue, MachineValue), super::super::VerificationError> {
-    let otter_vm::JitGuardedReceiver::Shape { shape } = call.receiver else {
-        return Err(super::super::VerificationError::InvalidValue(receiver));
-    };
     let active = boolean(representations);
     instructions.push(MachineInstruction::plain(
         MachineOpcode::BooleanConstant(true),
         vec![MachineOperand::register_output(active)],
     ));
-    let mut hit = boolean(representations);
+    let (holder, active) = match call.receiver {
+        otter_vm::JitGuardedReceiver::Shape { shape } => {
+            let hit = guard_shaped(
+                target_spec,
+                receiver,
+                active,
+                shape,
+                byte_pc,
+                representations,
+                instructions,
+            );
+            if call.holder == otter_vm::JitMethodHolder::Receiver {
+                (receiver, hit)
+            } else {
+                let holder = tagged(representations);
+                let prototype_hit = boolean(representations);
+                push_probe(
+                    target_spec,
+                    instructions,
+                    MachineOpcode::CacheIrLoadPrototype { byte_pc },
+                    vec![
+                        MachineOperand::location_input(receiver),
+                        MachineOperand::register_input(hit),
+                        MachineOperand::register_output(holder),
+                        MachineOperand::register_output(prototype_hit),
+                    ],
+                );
+                (holder, prototype_hit)
+            }
+        }
+        otter_vm::JitGuardedReceiver::Exotic(target) => {
+            let holder = tagged(representations);
+            let receiver_hit = boolean(representations);
+            push_probe(
+                target_spec,
+                instructions,
+                MachineOpcode::CacheIrLoadIntrinsicPrototype { byte_pc, target },
+                vec![
+                    MachineOperand::location_input(receiver),
+                    MachineOperand::register_input(active),
+                    MachineOperand::register_output(holder),
+                    MachineOperand::register_output(receiver_hit),
+                ],
+            );
+            (holder, receiver_hit)
+        }
+    };
+    let hit = match call.holder {
+        otter_vm::JitMethodHolder::Receiver => active,
+        otter_vm::JitMethodHolder::Shape(shape) => guard_shaped(
+            target_spec,
+            holder,
+            active,
+            shape,
+            byte_pc,
+            representations,
+            instructions,
+        ),
+        otter_vm::JitMethodHolder::Dictionary(layout) => {
+            let hit = boolean(representations);
+            push_probe(
+                target_spec,
+                instructions,
+                MachineOpcode::CacheIrGuardDictionaryLayout { byte_pc, layout },
+                vec![
+                    MachineOperand::location_input(holder),
+                    MachineOperand::register_input(active),
+                    MachineOperand::register_output(hit),
+                ],
+            );
+            hit
+        }
+    };
+    Ok(load_method(
+        target_spec,
+        call,
+        byte_pc,
+        holder,
+        hit,
+        representations,
+        instructions,
+    ))
+}
+
+/// Prove a fast object's hidden class and that its shape authorizes named
+/// lookup without descriptor overrides or opaque lookup state.
+fn guard_shaped(
+    target_spec: &TargetSpec,
+    object: MachineValue,
+    active: MachineValue,
+    shape: u32,
+    byte_pc: u32,
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> MachineValue {
+    let shape_hit = boolean(representations);
     push_probe(
         target_spec,
         instructions,
         MachineOpcode::CacheIrGuardShape { byte_pc, shape },
         vec![
-            MachineOperand::location_input(receiver),
+            MachineOperand::location_input(object),
             MachineOperand::register_input(active),
-            MachineOperand::register_output(hit),
+            MachineOperand::register_output(shape_hit),
         ],
     );
-    let receiver_state_hit = boolean(representations);
+    let state_hit = boolean(representations);
     push_probe(
         target_spec,
         instructions,
         MachineOpcode::CacheIrGuardOrdinaryState { byte_pc },
         vec![
-            MachineOperand::location_input(receiver),
-            MachineOperand::register_input(hit),
-            MachineOperand::register_output(receiver_state_hit),
+            MachineOperand::location_input(object),
+            MachineOperand::register_input(shape_hit),
+            MachineOperand::register_output(state_hit),
         ],
     );
-    hit = receiver_state_hit;
-    let mut holder = receiver;
-    if call.holder_shape != 0 {
-        holder = tagged(representations);
-        let prototype_hit = boolean(representations);
-        push_probe(
-            target_spec,
-            instructions,
-            MachineOpcode::CacheIrLoadPrototype { byte_pc },
-            vec![
-                MachineOperand::location_input(receiver),
-                MachineOperand::register_input(hit),
-                MachineOperand::register_output(holder),
-                MachineOperand::register_output(prototype_hit),
-            ],
-        );
-        hit = boolean(representations);
-        push_probe(
-            target_spec,
-            instructions,
-            MachineOpcode::CacheIrGuardShape {
-                byte_pc,
-                shape: call.holder_shape,
-            },
-            vec![
-                MachineOperand::location_input(holder),
-                MachineOperand::register_input(prototype_hit),
-                MachineOperand::register_output(hit),
-            ],
-        );
-        let holder_state_hit = boolean(representations);
-        push_probe(
-            target_spec,
-            instructions,
-            MachineOpcode::CacheIrGuardOrdinaryState { byte_pc },
-            vec![
-                MachineOperand::location_input(holder),
-                MachineOperand::register_input(hit),
-                MachineOperand::register_output(holder_state_hit),
-            ],
-        );
-        hit = holder_state_hit;
-    }
+    state_hit
+}
+
+/// Read the method slot from an already-proven holder.
+fn load_method(
+    target_spec: &TargetSpec,
+    call: otter_vm::JitGuardedMethodCall,
+    byte_pc: u32,
+    holder: MachineValue,
+    hit: MachineValue,
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> (MachineValue, MachineValue) {
     let callee = tagged(representations);
     let field_hit = boolean(representations);
     push_probe(
@@ -293,7 +466,7 @@ fn select_method_lookup(
             MachineOperand::register_output(field_hit),
         ],
     );
-    Ok((callee, field_hit))
+    (callee, field_hit)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -318,6 +491,7 @@ pub(super) fn select_block(
     ))?;
     let NumericNode::NativeCall {
         target,
+        hit,
         argument_start,
         logical_pc,
         byte_pc,
@@ -338,17 +512,23 @@ pub(super) fn select_block(
     };
     match selected {
         SelectedBlock::NativeCallHit(_) => {
-            instructions.push(MachineInstruction::plain(
-                MachineOpcode::BoxInt32,
-                vec![
-                    MachineOperand::register_input(outputs.result),
-                    MachineOperand::register_output(outputs.payload),
-                ],
-            ));
+            let payload = match hit {
+                HitKind::Int32Math => {
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::BoxInt32,
+                        vec![
+                            MachineOperand::register_input(outputs.result),
+                            MachineOperand::register_output(outputs.payload),
+                        ],
+                    ));
+                    outputs.payload
+                }
+                HitKind::Leaf => outputs.result,
+            };
             jump(instructions);
             result.predecessors = vec![cfg.originals[block_index]];
             result.successors = vec![selected_blocks.join];
-            result.successor_arguments = vec![vec![outputs.payload]];
+            result.successor_arguments = vec![vec![payload]];
         }
         SelectedBlock::NativeCallCold(_) => {
             let state_index = hir

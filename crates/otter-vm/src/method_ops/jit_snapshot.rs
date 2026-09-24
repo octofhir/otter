@@ -20,6 +20,7 @@ use super::MethodCallIc;
 use crate::Interpreter;
 use crate::jit::{
     JitBodyGuard, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver, JitIntrinsicPrototype,
+    JitMethodHolder,
 };
 
 fn value_slot_byte(slot: u16) -> u32 {
@@ -95,7 +96,7 @@ impl Interpreter {
                 guard: Some(dense_array_guard()),
                 proto_offset: proto.offset(),
             }),
-            holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            holder: JitMethodHolder::of(proto, &self.gc_heap)?,
             method_value_byte: value_slot_byte(ic.proto_slot),
             builtin_native_ref,
             entry_stub_id: stub_id,
@@ -110,7 +111,8 @@ impl Interpreter {
     /// The receiver's cell type tag stands in for a collection's latch word: a
     /// primitive body carries no expando or override state, so proving the tag
     /// plus the realm prototype's shape and method-slot identity is the whole
-    /// guard.
+    /// guard. `%String.prototype%` is a String wrapper and never adopts a
+    /// hidden class, so its slot layout is pinned by its dictionary id.
     pub(crate) fn jit_primitive_method_call(
         &self,
         hint: crate::jit::JitMethodHint,
@@ -151,7 +153,7 @@ impl Interpreter {
                 guard: None,
                 proto_offset: proto.offset(),
             }),
-            holder_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            holder: JitMethodHolder::of(proto, &self.gc_heap)?,
             method_value_byte: value_slot_byte(hit.slot),
             builtin_native_ref,
             entry_stub_id: stub_id,
@@ -227,7 +229,7 @@ impl Interpreter {
                 guard: Some(collection_guard()),
                 proto_offset: proto.offset(),
             }),
-            holder_shape: holder_shape.offset(),
+            holder: JitMethodHolder::Shape(holder_shape.offset()),
             method_value_byte: value_slot_byte(hit.slot),
             builtin_native_ref,
             entry_stub_id: stub_id,

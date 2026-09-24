@@ -734,6 +734,19 @@ pub enum MachineOpcode {
         /// Source byte offset for structural attribution.
         byte_pc: u32,
     },
+    /// Call one declared no-allocation leaf after a native identity hit.
+    ///
+    /// The entry reads the heap and at most two tagged operand words and
+    /// returns a boxed value or a miss. It cannot allocate, collect, throw or
+    /// reenter JavaScript, so it publishes no safepoint and its operands need
+    /// no roots. A false incoming condition or a miss produces `undefined` and
+    /// a false hit without an observable effect.
+    NativeLeafProbe {
+        /// Declared `LeafNoAllocStub2` entry.
+        stub: otter_vm::native_abi::RuntimeStubId,
+        /// Source byte offset for structural attribution.
+        byte_pc: u32,
+    },
     /// Materialize an incoming ABI value.
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
@@ -1023,6 +1036,20 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Shared receiver proof and pinned prototype identity.
         target: otter_vm::jit::JitIntrinsicPrototype,
+    },
+    /// Prove a dictionary-mode method holder keeps one key/slot layout: its
+    /// shape is null and its dictionary structural id is unchanged. Every add,
+    /// delete or descriptor change assigns a fresh id, so the slot named at
+    /// compile time still belongs to the same key; the following builtin
+    /// identity guard proves that slot's live value. Opaque index/`length`
+    /// state is irrelevant because only declared method names are selected.
+    /// A false incoming condition keeps the result false without touching the
+    /// object.
+    CacheIrGuardDictionaryLayout {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Captured dictionary structural id; never unassigned.
+        layout: u64,
     },
     /// Prove that an object's direct prototype is null under a prior CacheIR
     /// condition.
@@ -2116,11 +2143,19 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::CacheIrGuardShape { shape, .. } => {
+                    MachineOpcode::CacheIrGuardShape { .. }
+                    | MachineOpcode::CacheIrGuardDictionaryLayout { .. } => {
                         let [object, active, output] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
-                        if *shape == 0
+                        let unnamed = match instruction.opcode {
+                            MachineOpcode::CacheIrGuardShape { shape, .. } => shape == 0,
+                            MachineOpcode::CacheIrGuardDictionaryLayout { layout, .. } => {
+                                layout == 0
+                            }
+                            _ => true,
+                        };
+                        if unnamed
                             || *object != MachineOperand::location_input(object.value)
                             || self.representations[object.value.0 as usize]
                                 != MachineRepresentation::Tagged
@@ -2191,7 +2226,8 @@ impl InstructionSequence {
                         }
                     }
                     MachineOpcode::NativeLeafIdentity { .. }
-                    | MachineOpcode::NativeInt32Math { .. } => {
+                    | MachineOpcode::NativeInt32Math { .. }
+                    | MachineOpcode::NativeLeafProbe { .. } => {
                         if !native_leaf::method_probe_is_valid(
                             target_spec,
                             instruction,
@@ -2208,7 +2244,7 @@ impl InstructionSequence {
                         };
                         if matches!(instruction.opcode,
                             MachineOpcode::CacheIrLoadIntrinsicPrototype { target, .. }
-                                if !target.is_property_receiver())
+                                if !target.is_generated_receiver())
                             || *object != MachineOperand::location_input(object.value)
                             || self.representations[object.value.0 as usize]
                                 != MachineRepresentation::Tagged

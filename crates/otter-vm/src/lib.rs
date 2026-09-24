@@ -297,8 +297,8 @@ pub use jit::{
     JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase, JitElementFamily,
     JitElementRepr, JitExecOutcome, JitFunctionCode, JitGuardWidth, JitGuardedMethodCall,
     JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitMapTableLayout, JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout,
-    VmRuntimeActivation,
+    JitMapTableLayout, JitMethodHolder, JitRuntimeStubBinding, JitStaticNativeCall,
+    JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,

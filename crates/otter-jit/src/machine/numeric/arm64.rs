@@ -1914,6 +1914,35 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::CacheIrGuardDictionaryLayout { byte_pc, layout } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                crate::template::arm64::ic_probe::emit_dictionary_layout_guard(
+                    &mut ops, view, 13, layout, miss,
+                );
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                structural_regions.push((
+                    "machineCacheIrGuardDictionaryLayout",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrGuardOrdinaryState { byte_pc }
             | MachineOpcode::CacheIrGuardAtomSlot { byte_pc, .. } => {
                 let start = ops.offset().0;
@@ -2554,6 +2583,42 @@ pub(super) fn emit(
                 emit_store_allocated_integer(&mut ops, frame, locations[argument_count + 2], 9, 0)?;
                 structural_regions.push((
                     "machineMethodIntrinsic",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::NativeLeafProbe { stub, byte_pc } => {
+                let words = locations
+                    .len()
+                    .checked_sub(3)
+                    .filter(|words| (1..=2).contains(words))
+                    .ok_or(Unsupported::OperandShape("native leaf probe operands"))?;
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[words], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                // The operand words are already in x1/x2; only an unfilled
+                // word is materialized as `undefined`.
+                crate::template::arm64::ic_probe::emit_native_entry_call(
+                    &mut ops,
+                    &mut relocations,
+                    stub,
+                    otter_vm::native_abi::NO_SAFEPOINT,
+                    words as u8,
+                    19,
+                    |_ops, _index, _register| Ok(()),
+                    miss,
+                )?;
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[words + 2], 9, 0)?;
+                structural_regions.push((
+                    "machineNativeLeafProbe",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

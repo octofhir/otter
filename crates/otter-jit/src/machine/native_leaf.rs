@@ -5,6 +5,8 @@
 //! - [`is_valid`] checks the complete physical call and exact-deopt contract.
 //! - [`diagnostics`] attributes final lowering only when event capture is enabled.
 //! - Method and resolved-call probes reuse declarations with result/hit values.
+//! - [`supports_leaf_probe`] and [`leaf_probe_clobbers`] admit a guarded
+//!   method's own declared no-allocation leaf as a direct call.
 //!
 //! # Invariants
 //! - Bootstrap identity and argument count come from one VM declaration.
@@ -14,6 +16,9 @@
 //!   `Op::Call` leaves retain exact pre-call deoptimization on misses. Method
 //!   and resolved `CallWithThis` probes select their committed cold sibling;
 //!   resolved calls retain the already-loaded callee without repeating lookup.
+//! - A leaf probe call publishes no safepoint, frame or root record; its
+//!   tagged operands stay in argument registers across the call only because
+//!   the entry cannot move them.
 //! - The target specification owns the callee, argument, result, and clobber
 //!   registers. Identity-guard scratch never overlaps the arguments.
 //!
@@ -57,6 +62,22 @@ pub(super) fn supports_int32(stub: otter_vm::native_abi::RuntimeStubId) -> bool 
         STUB_MATH_MIN_LEAF.id,
     ]
     .contains(&stub)
+}
+
+/// Whether a guarded method's declared entry can be called as a leaf probe.
+///
+/// The entry comes from the method snapshot, not the static-call registry: an
+/// exotic receiver's builtin (a String or collection method) has no ordinary
+/// static-call identity, only the guarded prototype slot it occupies.
+pub(super) fn supports_leaf_probe(stub: otter_vm::native_abi::RuntimeStubId) -> bool {
+    otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(stub).is_some_and(|leaf| leaf.is_valid())
+}
+
+/// A leaf probe is an ordinary scalar call except for its fixed boxed result.
+pub(super) fn leaf_probe_clobbers(target_spec: &TargetSpec) -> Vec<super::PhysicalRegister> {
+    let mut clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
+    clobbers.retain(|register| *register != target_spec.integer_result());
+    clobbers
 }
 
 /// Scratch for the pure method probe, including its fixed Math operands.
@@ -130,6 +151,40 @@ pub(super) fn method_probe_is_valid(
                 && *hit == super::MachineOperand::register_output(hit.value)
                 && representation(hit) == MachineRepresentation::Boolean
                 && instruction.clobbers == method_math_clobbers(target_spec)
+        }
+        super::MachineOpcode::NativeLeafProbe { stub, .. } => {
+            let Some(words) = instruction.operands.len().checked_sub(3) else {
+                return false;
+            };
+            if !target_spec.supports(TargetCapability::NativeLeaf)
+                || !supports_leaf_probe(stub)
+                || !(1..=2).contains(&words)
+            {
+                return false;
+            }
+            let (operands, tail) = instruction.operands.split_at(words);
+            let [active, result, hit] = tail else {
+                return false;
+            };
+            operands.iter().enumerate().all(|(index, operand)| {
+                target_spec
+                    .integer_argument(index + 1)
+                    .is_some_and(|register| {
+                        *operand
+                            == super::MachineOperand::fixed_register_input(operand.value, register)
+                    })
+                    && representation(operand) == MachineRepresentation::Tagged
+            }) && *active == super::MachineOperand::location_input(active.value)
+                && representation(active) == MachineRepresentation::Boolean
+                && *result
+                    == super::MachineOperand::fixed_register_output(
+                        result.value,
+                        target_spec.integer_result(),
+                    )
+                && representation(result) == MachineRepresentation::Tagged
+                && *hit == super::MachineOperand::register_output(hit.value)
+                && representation(hit) == MachineRepresentation::Boolean
+                && instruction.clobbers == leaf_probe_clobbers(target_spec)
         }
         _ => false,
     }
@@ -375,6 +430,100 @@ mod tests {
             let mut wrong = instruction;
             wrong.clobbers.pop();
             assert!(!method_probe_is_valid(&target, &wrong, &representations));
+        }
+    }
+
+    fn leaf_probe(
+        target: &TargetSpec,
+        words: usize,
+    ) -> (MachineInstruction, Vec<MachineRepresentation>) {
+        let mut representations = vec![MachineRepresentation::Tagged; words];
+        representations.extend([
+            MachineRepresentation::Boolean,
+            MachineRepresentation::Tagged,
+            MachineRepresentation::Boolean,
+        ]);
+        let mut operands = (0..words)
+            .map(|index| {
+                MachineOperand::fixed_register_input(
+                    MachineValue(index as u32),
+                    target.integer_argument(index + 1).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        operands.extend([
+            MachineOperand::location_input(MachineValue(words as u32)),
+            MachineOperand::fixed_register_output(
+                MachineValue(words as u32 + 1),
+                target.integer_result(),
+            ),
+            MachineOperand::register_output(MachineValue(words as u32 + 2)),
+        ]);
+        let mut instruction = MachineInstruction::plain(
+            MachineOpcode::NativeLeafProbe {
+                stub: otter_vm::native_abi::STUB_STRING_INDEX_OF_LEAF.id,
+                byte_pc: 4,
+            },
+            operands,
+        );
+        instruction.clobbers = leaf_probe_clobbers(target);
+        (instruction, representations)
+    }
+
+    #[test]
+    fn leaf_probes_require_a_declared_leaf_and_complete_call_contract() {
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            for words in 1..=2 {
+                let (instruction, representations) = leaf_probe(&target, words);
+                assert!(method_probe_is_valid(
+                    &target,
+                    &instruction,
+                    &representations
+                ));
+                let effects = instruction.opcode.effects();
+                assert!(effects.writes.is_empty());
+                assert!(
+                    !effects.allocates
+                        && !effects.safepoint
+                        && !effects.reentrant
+                        && !effects.throws
+                );
+                assert!(!leaf_probe_clobbers(&target).contains(&target.integer_result()));
+                for index in 0..representations.len() {
+                    let mut wrong = representations.clone();
+                    wrong[index] = if representations[index] == MachineRepresentation::Tagged {
+                        MachineRepresentation::Int32
+                    } else {
+                        MachineRepresentation::Tagged
+                    };
+                    assert!(!method_probe_is_valid(&target, &instruction, &wrong));
+                }
+                let mut wrong = instruction.clone();
+                wrong.operands[0] = MachineOperand::register_input(MachineValue(0));
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction.clone();
+                wrong.opcode = MachineOpcode::NativeLeafProbe {
+                    stub: otter_vm::native_abi::STUB_ARRAY_PUSH_ALLOC.id,
+                    byte_pc: 4,
+                };
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction.clone();
+                wrong.safepoint = Some(SafepointId(0));
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+                let mut wrong = instruction;
+                wrong.clobbers.pop();
+                assert!(!method_probe_is_valid(&target, &wrong, &representations));
+            }
+            let (mut three, mut representations) = leaf_probe(&target, 2);
+            three.operands.insert(
+                0,
+                MachineOperand::fixed_register_input(
+                    MachineValue(9),
+                    target.integer_argument(3).unwrap(),
+                ),
+            );
+            representations.push(MachineRepresentation::Tagged);
+            assert!(!method_probe_is_valid(&target, &three, &representations));
         }
     }
 

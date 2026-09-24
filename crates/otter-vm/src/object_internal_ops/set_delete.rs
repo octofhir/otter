@@ -713,7 +713,22 @@ impl Interpreter {
             // own accessor invokes its setter; an own miss continues the
             // walk through the collection's [[Prototype]] (Map.prototype
             // / Set.prototype, whose `size` accessor has no setter).
-            let bag = self.collection_ensure_expando(&target)?;
+            // The lazy expando allocation can move the collection, the value
+            // and the receiver, so all three are re-read from rooted slots.
+            let (bag, target, value, receiver) = self.with_handle_scope(
+                |interp, scope| -> Result<(object::JsObject, Value, Value, Value), VmError> {
+                    let target = interp.scoped_value(scope, target);
+                    let value = interp.scoped_value(scope, value);
+                    let receiver = interp.scoped_value(scope, receiver);
+                    let bag = interp.collection_ensure_expando(&interp.escape_scoped(target))?;
+                    Ok((
+                        bag,
+                        interp.escape_scoped(target),
+                        interp.escape_scoped(value),
+                        interp.escape_scoped(receiver),
+                    ))
+                },
+            )?;
             let same_receiver = if target.is_map() {
                 receiver
                     .as_map()

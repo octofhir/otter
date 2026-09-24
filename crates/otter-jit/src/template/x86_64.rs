@@ -728,7 +728,8 @@ pub(super) fn compile(
                         crate::machine::native_leaf::x86_64::emit_tagged_call(
                             &mut ops,
                             &mut relocations,
-                            *target,
+                            target.leaf_stub_id,
+                            target.argument_count,
                             type_mismatch,
                         )?;
                         emit_store_reg(&mut ops, 0, dst);

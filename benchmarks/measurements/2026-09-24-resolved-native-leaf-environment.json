@@ -1,0 +1,49 @@
+{
+  "baseEngineCommit": "d99630e8c2ce1695a8d9fa3d7442df647c8f9cc4",
+  "candidateEngine": "this_operand leaf declarations for String/Map/Set builtins; Machine resolved CallWithThis leaf probe; Template AArch64 explicit-receiver leaf with committed-call miss.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "source": "benchmarks/scripts/native-boundary.js",
+  "sourceSha256": "60bb4c98c42472fc2db9473646f6b54c9990479fc1870a5ded93e5706b54faf4",
+  "expectedChecksum": 27000000,
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "add8bc03729070c029e90c86d29ac2f56eff894195e4a14d0e0be70ece30ec13",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "29b0cbd9740e4dea69a0ea161140dc88bc3bdad418b2bd9198d2c1cf2b861270",
+    "afterIsFullGateBuild": true,
+    "pilotCandidate": "bbf32598470a1e8fe826d72d9e7dee7ae2a3562fbae250e45cf0bf6b0bc1858d"
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/native-boundary.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "27000000",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "diagnostics": "JIT/GC counters total 28 invocations (8 warmups + 20 samples); process hardware counters include setup and compilation.",
+  "acceptedSeries": "closed",
+  "runCount": 18,
+  "wallSampleCount": 360,
+  "excludedSeries": {
+    "pilot": "One before/cand1 run per tier before the test-contract updates (engine source identical to final except rustfmt): Production 97.591 -> 63.619 ms, Template 131.948 -> 61.336 ms, Interpreter 340.137 -> 339.251 ms. Not scored."
+  },
+  "rawEvidence": "benchmarks/results/resolved-leaf-2026-09-24/ (ignored local artifacts)",
+  "measurementDate": "2026-09-24"
+}

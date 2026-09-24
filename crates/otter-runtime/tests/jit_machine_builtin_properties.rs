@@ -277,10 +277,12 @@ fn native_boundary_kernel_prepares_collection_prototypes_without_javascript_read
             .expect("UTF-8 kernel code map");
             // Two Map get/set property loads plus the String `indexOf` method
             // proof, whose dictionary-mode prototype is pinned by layout id.
+            // `indexOf`, and the already-loaded `charCodeAt` and Map `get`
+            // callees, complete in declared leaves.
             for (region, count) in [
                 ("machineCacheIrLoadIntrinsicPrototype", 3),
                 ("machineCacheIrGuardDictionaryLayout", 1),
-                ("machineNativeLeafProbe", 1),
+                ("machineNativeLeafProbe", 3),
             ] {
                 assert_eq!(
                     code_map.matches(region).count(),
@@ -307,13 +309,12 @@ fn native_boundary_kernel_prepares_collection_prototypes_without_javascript_read
             "{selection:?}: only the existing non-Map property paths may remain cold"
         );
         if selection == JitSelection::ProductionTiered {
-            // `charCodeAt` and Map get/set remain explicit native calls and
-            // `new Map()` one construct; the String `indexOf` site completes
-            // in its generated leaf hit.
+            // Only Map `set` (an allocating write) and `new Map()` cross;
+            // `indexOf`, `charCodeAt` and Map `get` complete in leaf hits.
             assert_eq!(
                 after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions,
-                600_001,
-                "only charCodeAt, Map get/set and the Map construct may cross"
+                200_001,
+                "only Map set and the Map construct may cross"
             );
         }
         assert_eq!(after.jit_optimized_deopts, before.jit_optimized_deopts);

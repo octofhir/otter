@@ -43,8 +43,9 @@ use otter_vm::native_abi as abi;
 use otter_vm::{JitCompileSnapshot, JitInlineCallee, JitInlineMethod};
 
 use super::ic_probe::{
-    emit_guarded_method_call, emit_native_leaf_call, guarded_method_call_is_supported,
-    native_leaf_call_is_supported, native_leaf_call_name,
+    emit_guarded_method_call, emit_native_entry_call, emit_native_leaf_call,
+    emit_native_leaf_guard, guarded_method_call_is_supported, native_leaf_call_is_supported,
+    native_leaf_call_name,
 };
 use super::transitions::TransitionTable;
 use super::values::{
@@ -921,6 +922,87 @@ pub(super) fn emit_call_with_receiver(
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
+    if let Some(receiver) = receiver
+        && let Some(target) = view.static_native_calls.get(&byte_pc)
+        && let Some(declaration) =
+            otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)
+        && view.native_ref_byte != 0
+        && usize::from(argc) == usize::from(declaration.argument_count)
+        && declaration.operand_words() <= 2
+        && otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)
+            .is_some_and(|stub| stub.is_valid())
+    {
+        // An explicit-receiver call owns its loaded callee and `this`, so the
+        // declared leaf needs only the callee identity; the entry proves its
+        // own receiver. A miss enters the ordinary call, which performs the
+        // complete call once.
+        let start = ops.offset().0;
+        let miss = ops.new_dynamic_label();
+        let hit = ops.new_dynamic_label();
+        let this_word = u8::from(declaration.this_operand);
+        emit_load_reg(ops, 9, callee)?;
+        emit_native_leaf_guard(ops, view, target.builtin_native_ref, 9, miss)?;
+        emit_native_entry_call(
+            ops,
+            relocations,
+            target.leaf_stub_id,
+            abi::NO_SAFEPOINT,
+            this_word + declaration.argument_count,
+            20,
+            |ops, index, register| {
+                if this_word == 1 && index == 0 {
+                    return emit_load_reg(ops, register, receiver);
+                }
+                let source = argument_registers
+                    .get(usize::from(index - this_word))
+                    .copied()
+                    .ok_or(Unsupported::OperandShape("native leaf call argument"))?;
+                emit_load_reg(ops, register, source)
+            },
+            miss,
+        )?;
+        emit_store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>hit ; =>miss);
+        let leaf_end = ops.offset().0;
+        // Static-native feedback names no bytecode callee, so the ordinary
+        // call is the generic transition, exactly as for an unsupported arity.
+        emit_generic_call_transition(
+            ops,
+            relocations,
+            table,
+            dst,
+            callee,
+            Some(receiver),
+            argument_registers,
+            throw_value,
+            fatal,
+        )?;
+        dynasm!(ops ; .arch aarch64 ; =>hit);
+        let name = native_leaf_call_name(target.leaf_stub_id);
+        if let Some(code_map) = code_map.as_deref_mut() {
+            code_map.record(CodeRegion::static_native_structural(
+                "nativeLeafCall",
+                start,
+                leaf_end,
+                view.code_block.id,
+                logical_pc,
+                byte_pc,
+                name,
+            ));
+        }
+        if let Some(events) = direct_call_events.as_deref_mut() {
+            events.insert(
+                (byte_pc, 0),
+                otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                    instruction_pc: logical_pc,
+                    byte_pc,
+                    target: name,
+                    outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
+                },
+            );
+        }
+        return Ok(());
+    }
     if let Some(target) = view
         .static_native_calls
         .get(&byte_pc)

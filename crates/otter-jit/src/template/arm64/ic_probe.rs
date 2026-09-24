@@ -1207,6 +1207,7 @@ pub(crate) fn native_leaf_call_is_supported(
         return false;
     };
     view.native_ref_byte != 0
+        && !declaration.this_operand
         && argc == usize::from(declaration.argument_count)
         && leaf_no_alloc_stub2_by_id(stub_id).is_some()
 }

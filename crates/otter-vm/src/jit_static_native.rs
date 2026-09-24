@@ -15,6 +15,11 @@
 //!   never a property name or mutable global slot.
 //! - A declaration's argument count is exact. All other call shapes retain the
 //!   canonical ordinary-call path.
+//! - A declaration with [`JitLeafBuiltin::this_operand`] reads the call's
+//!   `this` as its first operand word. Only an explicit-receiver call
+//!   (`CallWithThis`) may lower it; plain calls and shaped method sites, which
+//!   pass no receiver word, keep the canonical path for it. Its entry proves
+//!   the receiver's own type and misses on anything else.
 //! - Every declared leaf id resolves through the shared runtime-stub inventory.
 //!
 //! # See also
@@ -35,12 +40,27 @@ pub struct JitLeafBuiltin {
     pub leaf_stub_id: crate::native_abi::RuntimeStubId,
     /// Exact JavaScript argument count the entry implements.
     pub argument_count: u8,
+    /// Whether the entry reads the call's `this` as its first operand word,
+    /// ahead of the arguments. The entry itself proves that receiver.
+    pub this_operand: bool,
+}
+
+impl JitLeafBuiltin {
+    /// Operand words the entry reads at a site that passes `this` when
+    /// [`Self::this_operand`] asks for it.
+    #[must_use]
+    pub fn operand_words(&self) -> usize {
+        usize::from(self.this_operand) + usize::from(self.argument_count)
+    }
 }
 
 #[derive(Clone, Copy)]
 enum BootstrapNative {
     Math(otter_bytecode::method_id::MathMethod),
     ParseInt,
+    StringPrototype(&'static str),
+    MapPrototype(&'static str),
+    SetPrototype(&'static str),
 }
 
 impl BootstrapNative {
@@ -48,7 +68,26 @@ impl BootstrapNative {
         match self {
             Self::Math(method) => crate::math::original_native_fn(method),
             Self::ParseInt => crate::intrinsics::number::number_parse_int_native,
+            Self::StringPrototype(name) => crate::string::prototype::prototype_bridge(name)
+                .expect("declared String.prototype leaf has a bridge"),
+            Self::MapPrototype(name) => crate::bootstrap_collections::map_prototype_native(name)
+                .expect("declared Map.prototype leaf is installed"),
+            Self::SetPrototype(name) => crate::bootstrap_collections::set_prototype_native(name)
+                .expect("declared Set.prototype leaf is installed"),
         }
+    }
+}
+
+/// One `this`-reading declaration.
+const fn receiver_leaf(
+    identity: BootstrapNative,
+    leaf_stub_id: crate::native_abi::RuntimeStubId,
+) -> JitLeafBuiltin {
+    JitLeafBuiltin {
+        identity,
+        leaf_stub_id,
+        argument_count: 1,
+        this_operand: true,
     }
 }
 
@@ -61,32 +100,74 @@ const JIT_LEAF_BUILTINS: &[JitLeafBuiltin] = &[
         identity: BootstrapNative::Math(otter_bytecode::method_id::MathMethod::Abs),
         leaf_stub_id: crate::native_abi::STUB_MATH_ABS_LEAF.id,
         argument_count: 1,
+        this_operand: false,
     },
     JitLeafBuiltin {
         identity: BootstrapNative::Math(otter_bytecode::method_id::MathMethod::Floor),
         leaf_stub_id: crate::native_abi::STUB_MATH_FLOOR_LEAF.id,
         argument_count: 1,
+        this_operand: false,
     },
     JitLeafBuiltin {
         identity: BootstrapNative::Math(otter_bytecode::method_id::MathMethod::Sqrt),
         leaf_stub_id: crate::native_abi::STUB_MATH_SQRT_LEAF.id,
         argument_count: 1,
+        this_operand: false,
     },
     JitLeafBuiltin {
         identity: BootstrapNative::Math(otter_bytecode::method_id::MathMethod::Max),
         leaf_stub_id: crate::native_abi::STUB_MATH_MAX_LEAF.id,
         argument_count: 2,
+        this_operand: false,
     },
     JitLeafBuiltin {
         identity: BootstrapNative::Math(otter_bytecode::method_id::MathMethod::Min),
         leaf_stub_id: crate::native_abi::STUB_MATH_MIN_LEAF.id,
         argument_count: 2,
+        this_operand: false,
     },
     JitLeafBuiltin {
         identity: BootstrapNative::ParseInt,
         leaf_stub_id: crate::native_abi::STUB_PARSE_INT_I32_LEAF.id,
         argument_count: 1,
+        this_operand: false,
     },
+    receiver_leaf(
+        BootstrapNative::StringPrototype("charCodeAt"),
+        crate::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::StringPrototype("codePointAt"),
+        crate::native_abi::STUB_STRING_CODE_POINT_AT_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::StringPrototype("indexOf"),
+        crate::native_abi::STUB_STRING_INDEX_OF_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::StringPrototype("includes"),
+        crate::native_abi::STUB_STRING_INCLUDES_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::StringPrototype("startsWith"),
+        crate::native_abi::STUB_STRING_STARTS_WITH_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::StringPrototype("endsWith"),
+        crate::native_abi::STUB_STRING_ENDS_WITH_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::MapPrototype("get"),
+        crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::MapPrototype("has"),
+        crate::native_abi::STUB_COLLECTION_MAP_HAS_LEAF.id,
+    ),
+    receiver_leaf(
+        BootstrapNative::SetPrototype("has"),
+        crate::native_abi::STUB_COLLECTION_SET_HAS_LEAF.id,
+    ),
 ];
 
 /// Classify a callee against the guarded leaf-callable builtin table.
@@ -141,5 +222,26 @@ mod tests {
     fn invalid_stub_id_has_no_static_call_ref() {
         let heap = otter_gc::GcHeap::new().expect("gc heap");
         assert_eq!(jit_static_call_ref(u32::MAX, &heap), None);
+    }
+
+    #[test]
+    fn every_declaration_resolves_a_leaf_that_fits_its_operand_words() {
+        let interpreter = crate::Interpreter::new();
+        for row in JIT_LEAF_BUILTINS {
+            let _ = row.identity.original_native_fn();
+            assert!(
+                crate::runtime_stubs::leaf_no_alloc_stub2_by_id(row.leaf_stub_id)
+                    .is_some_and(|stub| stub.is_valid()),
+                "{} must name a valid no-allocation leaf",
+                crate::native_abi::runtime_stub_name(row.leaf_stub_id)
+            );
+            assert!(row.operand_words() <= 2);
+            assert!(
+                jit_static_call_ref(row.leaf_stub_id, &interpreter.gc_heap).is_some(),
+                "{} must be installed in a fresh isolate",
+                crate::native_abi::runtime_stub_name(row.leaf_stub_id)
+            );
+        }
+        assert!(JIT_LEAF_BUILTINS.iter().any(|row| row.this_operand));
     }
 }

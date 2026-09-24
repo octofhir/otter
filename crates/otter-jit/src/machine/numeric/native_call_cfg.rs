@@ -72,13 +72,16 @@ impl Values {
 
 /// Generated hit for a guarded method site, or `None` when it stays generic.
 ///
-/// A shaped receiver with an Int32 Math declaration keeps its pure hit. Every
-/// other declared no-allocation leaf is called directly; an exotic receiver
-/// is the entry's first operand, so at most one argument fits its two words.
+/// A shaped receiver with an Int32 Math declaration and Int32 operands keeps
+/// its pure hit. Every other declared no-allocation leaf is called directly;
+/// an exotic receiver is the entry's first operand, so at most one argument
+/// fits its two words. A shaped site never passes its receiver, so it admits
+/// no declaration that reads `this`.
 pub(super) fn method_hit(
     view: &JitCompileSnapshot,
     call: otter_vm::JitGuardedMethodCall,
     argument_count: usize,
+    int32_operands: bool,
 ) -> Option<HitKind> {
     use otter_vm::JitMethodHolder;
     let receiver_word = match (call.receiver, call.holder) {
@@ -107,6 +110,13 @@ pub(super) fn method_hit(
         return None;
     }
     if receiver_word == 0
+        && otter_vm::jit_static_native::jit_leaf_builtin(call.entry_stub_id)
+            .is_some_and(|declaration| declaration.this_operand)
+    {
+        return None;
+    }
+    if receiver_word == 0
+        && int32_operands
         && super::super::native_leaf::supports_int32(call.entry_stub_id)
         && super::super::native_leaf::supports_site(
             view,
@@ -133,14 +143,36 @@ pub(super) fn hit_kind(hir: &NumericFunction, block: usize) -> HitKind {
     }
 }
 
-pub(super) fn supports_resolved(
+/// Generated hit for an explicit-receiver call whose callee was already
+/// loaded, or `None` when it stays generic.
+///
+/// The site owns both its callee and its `this`, so any declared leaf
+/// qualifies: Int32 Math with Int32 operands keeps its pure hit, and every
+/// other declaration calls its entry with `this` as the first word when it
+/// reads one. The entry proves its own receiver and operands.
+pub(super) fn resolved_hit(
     view: &JitCompileSnapshot,
     call: otter_vm::JitStaticNativeCall,
     argument_count: usize,
-) -> bool {
-    view.cage_base != 0
+    int32_operands: bool,
+) -> Option<HitKind> {
+    let declaration = otter_vm::jit_static_native::jit_leaf_builtin(call.leaf_stub_id)?;
+    if view.cage_base == 0
+        || view.native_ref_byte == 0
+        || argument_count != usize::from(declaration.argument_count)
+        || call.argument_count != declaration.argument_count
+    {
+        return None;
+    }
+    if int32_operands
         && super::super::native_leaf::supports_int32(call.leaf_stub_id)
         && super::super::native_leaf::supports_site(view, call, argument_count)
+    {
+        return Some(HitKind::Int32Math);
+    }
+    (declaration.operand_words() <= 2
+        && super::super::native_leaf::supports_leaf_probe(call.leaf_stub_id))
+    .then_some(HitKind::Leaf)
 }
 
 pub(super) fn site(hir: &NumericFunction, block: usize) -> Option<NumericValue> {
@@ -234,15 +266,17 @@ pub(super) fn select_probe(
             machine_value(values, node),
         ))?;
     if hit == HitKind::Leaf {
-        // An exotic receiver is the entry's first operand word, exactly as the
-        // Template guarded method call passes it.
-        let receiver_word = matches!(
-            target,
-            NumericNativeCallTarget::Method(otter_vm::JitGuardedMethodCall {
-                receiver: otter_vm::JitGuardedReceiver::Exotic(_),
-                ..
-            })
-        )
+        // An exotic receiver, or the `this` of a declaration that reads one,
+        // is the entry's first operand word.
+        let receiver_word = match target {
+            NumericNativeCallTarget::Method(method) => {
+                matches!(method.receiver, otter_vm::JitGuardedReceiver::Exotic(_))
+            }
+            NumericNativeCallTarget::Resolved { call, .. } => {
+                otter_vm::jit_static_native::jit_leaf_builtin(call.leaf_stub_id)
+                    .is_some_and(|declaration| declaration.this_operand)
+            }
+        }
         .then_some(receiver);
         let words = receiver_word
             .into_iter()

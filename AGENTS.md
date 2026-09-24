@@ -563,6 +563,15 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     (`Receiver` / `Shape` / `Dictionary`) is the one holder contract; Template
     guards the same layout. A proof or leaf miss enters the committed method
     call once, without deopt or replay.
+  - Explicit-receiver calls (`LoadProperty` + `CallWithThis`) whose loaded
+    callee is a `jit_static_native` declaration use the same
+    `machineNativeLeafProbe` after `machineNativeLeafIdentity`; Template
+    AArch64 emits `nativeLeafCall` for them. A declaration with
+    `this_operand` (String search/charCode methods, Map `get`/`has`, Set
+    `has`) receives `this` as its first word and proves it itself; plain calls
+    and shaped method sites pass no receiver word and never lower it. Int32
+    Math with non-Int32 operands takes the tagged leaf instead of the generic
+    call. Misses enter the ordinary call once, never a bail.
     Separately evaluated Map/Set named property loads use
     `machineCacheIrLoadIntrinsicPrototype`: exact type and the existing clean
     instance latch select the pinned realm prototype, followed by ordinary

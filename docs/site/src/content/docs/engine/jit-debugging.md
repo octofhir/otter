@@ -572,6 +572,20 @@ descriptor change replaces. The Template guarded method call checks the same
 layout, so a deleted method whose slot shifted to another key misses instead of
 calling the stale builtin.
 
+Explicit-receiver calls such as `word.charCodeAt(index & 3)` or
+`table.get(index & 63)` load the callee first and evaluate arguments after, so
+they compile to `LoadProperty` plus `CallWithThis`. When call feedback names a
+declared static native, Machine guards the already-loaded callee with
+`machineNativeLeafIdentity` and calls its leaf in `machineNativeLeafProbe`;
+Template on AArch64 emits a `nativeLeafCall` region. Declarations marked
+`this_operand` (String `charCodeAt`/`codePointAt`/`indexOf`/`includes`/
+`startsWith`/`endsWith`, Map `get`/`has`, Set `has`) receive the call's `this`
+as their first operand word and prove its type themselves, so `.call` with a
+foreign receiver simply misses. Plain calls and shaped method sites pass no
+receiver word and keep the ordinary call for these declarations. A miss enters
+the ordinary call, which performs the complete call once; the loaded callee is
+never looked up again.
+
 ### Optimizing loop proofs and LICM
 
 Optimizing artifacts report `licm-hoisted` and `versioned-loops` before the

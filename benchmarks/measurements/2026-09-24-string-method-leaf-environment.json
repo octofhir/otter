@@ -1,0 +1,48 @@
+{
+  "baseEngineCommit": "df21bd23ab318cf5712b51087a01865196ecb6ab",
+  "candidateEngine": "Machine guarded-method leaf probe, JitMethodHolder layout contract with dictionary-layout guard, collection [[Set]] and String search operand rooting.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "source": "benchmarks/scripts/native-boundary.js",
+  "sourceSha256": "60bb4c98c42472fc2db9473646f6b54c9990479fc1870a5ded93e5706b54faf4",
+  "expectedChecksum": 27000000,
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "be5679f77e6f7ff7c9c3c3855c4b6535d201a5ee67e96a9a6dbd8524eb0093fc",
+    "after": "add8bc03729070c029e90c86d29ac2f56eff894195e4a14d0e0be70ece30ec13",
+    "afterIsFullGateBuild": true,
+    "pilotCandidate": "72ae1876d5166f04e93edcdcd817f154379cbef2eb22192419c60018971c4c6b"
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/native-boundary.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "27000000",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same paired aggregation for process instructions and cycles.",
+  "diagnostics": "JIT/GC counters total 28 invocations (8 warmups + 20 samples); process hardware counters include setup and compilation.",
+  "acceptedSeries": "closed",
+  "runCount": 18,
+  "wallSampleCount": 360,
+  "excludedSeries": {
+    "pilot": "One before/cand1 run per tier (8 warmups + 20 samples). cand1 already had the leaf probe and dictionary-layout proof but preceded the collection [[Set]] and String search rooting corrections. Production 143.255 -> 97.667 ms, Template 132.554 -> 132.175 ms, Interpreter 341.861 -> 338.073 ms. Not scored."
+  },
+  "rawEvidence": "benchmarks/results/indexof-leaf-2026-09-24/ (ignored local artifacts: binaries, logs, JIT events, artifacts, native profile)",
+  "measurementDate": "2026-09-24"
+}

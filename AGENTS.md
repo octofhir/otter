@@ -550,7 +550,19 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     evaluated `LoadProperty` plus `CallWithThis` share the arithmetic CFG.
     Explicit calls guard the already-loaded callee after argument evaluation;
     their cold sibling retains that callee and receiver without another lookup.
-    Map/string method calls currently retain the canonical Machine call boundary.
+  - Other guarded `CallMethodValue` sites whose declared entry is a
+    no-allocation leaf (String `indexOf`/`charCodeAt`/…, Map `get`/`has`,
+    Set `has`) expose `machineNativeLeafProbe`: the receiver and at most one
+    argument sit in the leaf ABI registers and the entry is called directly,
+    with no root record, safepoint, VM PC or status decode. An exotic receiver
+    is proven by `machineCacheIrLoadIntrinsicPrototype`; its pinned holder by
+    `machineCacheIrGuardShape` plus ordinary state when fast, or by
+    `machineCacheIrGuardDictionaryLayout` (null shape plus unchanged
+    `dictionary_shape_id`) when in dictionary mode, which is always the case
+    for the String-wrapper `%String.prototype%`. `JitGuardedMethodCall::holder`
+    (`Receiver` / `Shape` / `Dictionary`) is the one holder contract; Template
+    guards the same layout. A proof or leaf miss enters the committed method
+    call once, without deopt or replay.
     Separately evaluated Map/Set named property loads use
     `machineCacheIrLoadIntrinsicPrototype`: exact type and the existing clean
     instance latch select the pinned realm prototype, followed by ordinary

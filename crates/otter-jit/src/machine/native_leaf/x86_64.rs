@@ -3,7 +3,8 @@
 //! # Contents
 //! - [`emit_guard`] proves the exact bootstrap native-function identity.
 //! - [`emit_int32`] replaces proven `Math.abs` / `max` / `min` leaves.
-//! - [`emit_tagged_call`] enters the shared no-allocation leaf ABI.
+//! - [`emit_tagged_call`] enters the shared no-allocation leaf ABI for static
+//!   calls and guarded method leaf probes.
 //!
 //! # Invariants
 //! - The identity guard completes before an intrinsic or native call has an
@@ -14,7 +15,7 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::{
-    JitCompileSnapshot, JitStaticNativeCall, Value,
+    JitCompileSnapshot, Value,
     native_abi::{RuntimeStubId, STUB_MATH_ABS_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF},
 };
 
@@ -87,19 +88,23 @@ pub(crate) fn emit_int32(
     Ok(())
 }
 
-/// Call the shared no-allocation leaf entry after [`emit_guard`] succeeded.
+/// Call the shared no-allocation leaf entry once its guards passed.
+///
+/// `words` operand words are already in `rsi`/`rdx`; an unfilled word is
+/// `undefined`. The boxed result is left in `rax`; a miss branches to `miss`.
 pub(crate) fn emit_tagged_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    target: JitStaticNativeCall,
+    stub: RuntimeStubId,
+    words: u8,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let Some(stub) = otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(target.leaf_stub_id)
-        .filter(|stub| stub.is_valid())
+    let Some(stub) =
+        otter_vm::runtime_stubs::leaf_no_alloc_stub2_by_id(stub).filter(|stub| stub.is_valid())
     else {
         return Err(Unsupported::OperandShape("x86-64 native leaf entry"));
     };
-    if target.argument_count < 2 {
+    if words < 2 {
         load_u64(ops, 2, Value::undefined().to_bits());
     }
     dynasm!(ops

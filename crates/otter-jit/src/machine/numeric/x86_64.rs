@@ -845,6 +845,34 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::CacheIrGuardDictionaryLayout { byte_pc, layout } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[1], 10)?;
+                dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
+                object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
+                load64(&mut ops, 10, layout);
+                dynasm!(ops
+                    ; .arch x64
+                    ; cmp DWORD [r11 + view.object_shape_byte as i32], 0
+                    ; jne =>miss
+                    ; cmp [r11 + view.object_dictionary_shape_id_byte as i32], r10
+                    ; jne =>miss
+                    ; mov r10d, 1
+                    ; jmp =>done
+                    ; =>miss
+                    ; xor r10d, r10d
+                    ; =>done
+                );
+                store_integer(&mut ops, frame, loc[2], 10)?;
+                structural_regions.push((
+                    "machineCacheIrGuardDictionaryLayout",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrGuardOrdinaryState { byte_pc }
             | MachineOpcode::CacheIrGuardAtomSlot { byte_pc, .. } => {
                 let start = ops.offset().0;
@@ -1544,6 +1572,37 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::NativeLeafProbe { stub, byte_pc } => {
+                let words = loc
+                    .len()
+                    .checked_sub(3)
+                    .filter(|words| (1..=2).contains(words))
+                    .ok_or(Unsupported::OperandShape(
+                        "x86-64 native leaf probe operands",
+                    ))?;
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[words], 9)?;
+                dynasm!(ops ; .arch x64 ; test r9d, r9d ; jz =>miss);
+                super::super::native_leaf::x86_64::emit_tagged_call(
+                    &mut ops,
+                    &mut relocations,
+                    stub,
+                    words as u8,
+                    miss,
+                )?;
+                dynasm!(ops ; .arch x64 ; mov r9d, 1 ; jmp =>done ; =>miss);
+                load64(&mut ops, 0, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; xor r9d, r9d ; =>done);
+                store_integer(&mut ops, frame, loc[words + 2], 9)?;
+                structural_regions.push((
+                    "machineNativeLeafProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::Call(descriptor_index) => {
                 let descriptor = sequence
                     .call_descriptors()
@@ -1569,7 +1628,8 @@ pub(super) fn emit(
                         super::super::native_leaf::x86_64::emit_tagged_call(
                             &mut ops,
                             &mut relocations,
-                            target,
+                            target.leaf_stub_id,
+                            target.argument_count,
                             exit,
                         )?;
                     }

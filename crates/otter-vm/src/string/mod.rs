@@ -412,6 +412,13 @@ impl JsString {
         })
     }
 
+    /// Whether the body already reads as one contiguous code-unit run, so
+    /// [`Self::flatten_in_place`] would neither allocate nor change it.
+    #[must_use]
+    pub fn is_contiguous(self, heap: &GcHeap) -> bool {
+        gc_body::is_contiguous(heap, self.handle)
+    }
+
     /// Flatten a rope / slice body **in place** so this handle (and every other
     /// handle to the same body) reads as a flat string thereafter. A no-op for
     /// contiguous strings, including collapsed slices, without constructing a
@@ -421,7 +428,7 @@ impl JsString {
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn flatten_in_place(self, heap: &mut GcHeap) -> Result<(), OutOfMemory> {
-        if gc_body::is_contiguous(heap, self.handle) {
+        if self.is_contiguous(heap) {
             return Ok(());
         }
         let mut source = self.handle;

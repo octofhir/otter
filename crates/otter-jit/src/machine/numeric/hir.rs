@@ -304,10 +304,11 @@ pub(super) enum NumericNode {
         argument_start: u32,
         byte_pc: u32,
     },
-    /// Native call with a generated Int32 hit and its committed cold sibling.
+    /// Native call with a generated hit and its committed cold sibling.
     NativeCall {
         receiver: NumericValue,
         target: NumericNativeCallTarget,
+        hit: super::native_call_cfg::HitKind,
         argument_start: u32,
         logical_pc: u32,
         byte_pc: u32,
@@ -1731,7 +1732,7 @@ fn build_raw_blocks(
                         .const_index(code, 3)
                         .and_then(|count| usize::try_from(count).ok())
                         .is_some_and(|count| {
-                            super::native_call_cfg::supports_method(view, call, count)
+                            super::native_call_cfg::method_hit(view, call, count).is_some()
                         })
                 }),
             Op::CallWithThis => view
@@ -2991,6 +2992,7 @@ fn lower_instruction(
                             callee: source,
                             call,
                         },
+                        hit: super::native_call_cfg::HitKind::Int32Math,
                         argument_start,
                         logical_pc,
                         byte_pc: instruction.byte_pc,
@@ -3279,10 +3281,11 @@ fn lower_instruction(
                 .collect::<Option<Vec<_>>>()?;
             if exceptional_edge.is_none()
                 && let Some(call) = view.guarded_method_calls.get(&instruction.byte_pc).copied()
-                && super::native_call_cfg::supports_method(view, call, argument_count)
-                && arguments
-                    .iter()
-                    .all(|argument| nodes[argument.0].value_type() == NumericType::Int32)
+                && let Some(hit) = super::native_call_cfg::method_hit(view, call, argument_count)
+                && (hit == super::native_call_cfg::HitKind::Leaf
+                    || arguments
+                        .iter()
+                        .all(|argument| nodes[argument.0].value_type() == NumericType::Int32))
             {
                 let (argument_start, _) = append_operand_values(operand_values, arguments)?;
                 let value = push(
@@ -3290,6 +3293,7 @@ fn lower_instruction(
                     NumericNode::NativeCall {
                         receiver: source,
                         target: NumericNativeCallTarget::Method(call),
+                        hit,
                         argument_start,
                         logical_pc,
                         byte_pc: instruction.byte_pc,

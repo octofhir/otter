@@ -1,18 +1,19 @@
-//! Regression coverage for optimizing primitive-string intrinsics.
+//! Regression coverage for optimizing primitive-string method calls.
 //!
 //! # Contents
-//! - Direct `charCodeAt(Int32)` and single-unit `indexOf(String)` completion.
+//! - `charCodeAt(Int32)` and `indexOf(String)` completion.
 //! - Latin-1 / UTF-16 inline and sequential bodies.
 //! - Canonical fallbacks for ropes, slices, coercion, long search, and method
 //!   replacement after tier-up.
 //! - Address-stable literal cells surviving cache growth and moving GC.
-//! - Artifact proof that supported calls do not retain their Rust leaf ABI.
+//! - Artifact proof that a guarded `indexOf` site calls its declared
+//!   no-allocation leaf behind the `%String.prototype%` dictionary-layout
+//!   proof instead of the general method boundary.
 //!
 //! # Invariants
 //! - Optimizing results match the interpreter oracle exactly.
 //! - Speculative checks run before effects and a miss remains reusable.
-//! - Supported generated operations contain no relocation to the replaced
-//!   string leaf.
+//! - A leaf hit publishes no safepoint; its miss enters one committed call.
 //! - Literal relocations name traced cells, never moving string handles.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
@@ -284,7 +285,7 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn optimizing_string_artifacts_have_no_replaced_leaf_relocations() {
+fn optimizing_string_methods_call_declared_leaves_behind_layout_proofs() {
     use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier};
 
     let mut runtime = Runtime::builder()
@@ -316,13 +317,26 @@ fn optimizing_string_artifacts_have_no_replaced_leaf_relocations() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        !optimizing_relocations.contains("string_char_code_at_leaf"),
-        "charCodeAt must complete without the Rust leaf ABI: {optimizing_relocations}"
+        optimizing_relocations.contains("string_index_of_leaf"),
+        "indexOf must call its declared no-allocation leaf: {optimizing_relocations}"
     );
-    assert!(
-        !optimizing_relocations.contains("string_index_of_leaf"),
-        "indexOf must complete without the Rust leaf ABI: {optimizing_relocations}"
-    );
+    let code_maps = optimizing
+        .iter()
+        .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
+        .map(|file| std::str::from_utf8(file.contents()).expect("code maps are UTF-8"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for region in [
+        "machineCacheIrLoadIntrinsicPrototype",
+        "machineCacheIrGuardDictionaryLayout",
+        "machineNativeLeafIdentity",
+        "machineNativeLeafProbe",
+    ] {
+        assert!(
+            code_maps.contains(region),
+            "guarded String method hit must contain {region}: {code_maps}"
+        );
+    }
     let all_relocations = artifacts
         .bundles()
         .iter()

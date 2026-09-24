@@ -275,13 +275,19 @@ fn native_boundary_kernel_prepares_collection_prototypes_without_javascript_read
                     .contents(),
             )
             .expect("UTF-8 kernel code map");
-            assert_eq!(
-                code_map
-                    .matches("machineCacheIrLoadIntrinsicPrototype")
-                    .count(),
-                2,
-                "the original Map get/set lookup sites must have generated proofs: {code_map}"
-            );
+            // Two Map get/set property loads plus the String `indexOf` method
+            // proof, whose dictionary-mode prototype is pinned by layout id.
+            for (region, count) in [
+                ("machineCacheIrLoadIntrinsicPrototype", 3),
+                ("machineCacheIrGuardDictionaryLayout", 1),
+                ("machineNativeLeafProbe", 1),
+            ] {
+                assert_eq!(
+                    code_map.matches(region).count(),
+                    count,
+                    "the original kernel must generate {region}: {code_map}"
+                );
+            }
         }
         let before = runtime.execution_stats();
         assert_eq!(completion(&mut runtime, "engineKernel();"), "27000000");
@@ -300,6 +306,16 @@ fn native_boundary_kernel_prepares_collection_prototypes_without_javascript_read
             expected_property_stubs,
             "{selection:?}: only the existing non-Map property paths may remain cold"
         );
+        if selection == JitSelection::ProductionTiered {
+            // `charCodeAt` and Map get/set remain explicit native calls and
+            // `new Map()` one construct; the String `indexOf` site completes
+            // in its generated leaf hit.
+            assert_eq!(
+                after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions,
+                600_001,
+                "only charCodeAt, Map get/set and the Map construct may cross"
+            );
+        }
         assert_eq!(after.jit_optimized_deopts, before.jit_optimized_deopts);
         assert_eq!(
             after.jit_generated_call_deopts,

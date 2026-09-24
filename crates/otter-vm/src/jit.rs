@@ -591,7 +591,7 @@ impl JitBodyGuard {
 pub enum JitGuardedReceiver {
     /// An ordinary object named by its hidden class. The method is in the
     /// receiver's own slab, or in a prototype resolved at run time when
-    /// [`JitGuardedMethodCall::holder_shape`] is set, because `setPrototypeOf`
+    /// [`JitGuardedMethodCall::holder`] names one, because `setPrototypeOf`
     /// moves the holder while the shape stays put. The entry reads only the
     /// call's arguments.
     Shape {
@@ -620,16 +620,56 @@ pub struct JitIntrinsicPrototype {
 }
 
 impl JitIntrinsicPrototype {
-    /// Whether this proof admits an ordinary named data load from the pinned
-    /// prototype. The collection latch excludes every instance override.
+    /// Whether generated code may prove this receiver and continue at the
+    /// pinned prototype.
+    ///
+    /// A latched `Map`/`Set` body has no instance override. A primitive string
+    /// body owns only `length` and its indices, so every other name resolves on
+    /// `%String.prototype%`. The proof establishes only the receiver; the
+    /// following holder guards decide which names that prototype answers. A
+    /// String wrapper prototype stays opaque to ordinary lookup guards, so no
+    /// `length`/index load can be answered from its shape.
     #[must_use]
-    pub fn is_property_receiver(self) -> bool {
-        matches!(
-            self.type_tag,
-            crate::collections::MAP_BODY_TYPE_TAG | crate::collections::SET_BODY_TYPE_TAG
-        ) && self.guard == Some(crate::method_ops::collection_guard())
-            && self.proto_offset != 0
-            && self.proto_offset.is_multiple_of(8)
+    pub fn is_generated_receiver(self) -> bool {
+        let receiver = match self.type_tag {
+            crate::collections::MAP_BODY_TYPE_TAG | crate::collections::SET_BODY_TYPE_TAG => {
+                self.guard == Some(crate::method_ops::collection_guard())
+            }
+            crate::string::JS_STRING_BODY_TYPE_TAG => self.guard.is_none(),
+            _ => false,
+        };
+        receiver && self.proto_offset != 0 && self.proto_offset.is_multiple_of(8)
+    }
+}
+
+/// Layout proof for the object owning a guarded method slot.
+///
+/// Either form pins which key the slot at
+/// [`JitGuardedMethodCall::method_value_byte`] belongs to; the builtin identity
+/// guard then proves the slot's live value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitMethodHolder {
+    /// The shaped receiver owns the slot.
+    Receiver,
+    /// A fast-mode holder with this nonzero hidden-class handle offset.
+    Shape(u32),
+    /// A dictionary-mode holder with this nonzero structural id. Every add,
+    /// delete or descriptor change of a dictionary object assigns a fresh id,
+    /// so an unchanged id keeps each key at its captured slot. This is the
+    /// only proof available for a String wrapper such as
+    /// `%String.prototype%`, which never adopts a hidden class.
+    Dictionary(u64),
+}
+
+impl JitMethodHolder {
+    /// The live layout of `holder`: its hidden class, else its dictionary id.
+    pub(crate) fn of(holder: crate::object::JsObject, heap: &otter_gc::GcHeap) -> Option<Self> {
+        let shape = crate::object::shape(holder, heap);
+        if !shape.is_null() {
+            return Some(Self::Shape(shape.offset()));
+        }
+        let layout = crate::object::shape_id(holder, heap).raw();
+        (layout != 0).then_some(Self::Dictionary(layout))
     }
 }
 
@@ -646,10 +686,10 @@ impl JitIntrinsicPrototype {
 pub struct JitGuardedMethodCall {
     /// How the receiver is proven before the method slot is read.
     pub receiver: JitGuardedReceiver,
-    /// Guarded holder shape handle offset: the hopped prototype's shape for a
-    /// [`JitGuardedReceiver::Shape`] receiver (`0` when it owns the slot), or
-    /// the pinned prototype's shape for an exotic one.
-    pub holder_shape: u32,
+    /// Live layout proof for the object that owns the method slot: the hopped
+    /// prototype of a [`JitGuardedReceiver::Shape`] receiver, or the pinned
+    /// prototype of an exotic one.
+    pub holder: JitMethodHolder,
     /// Byte offset of the method slot inside the holder's value slab.
     pub method_value_byte: u32,
     /// External-reference index of the exact bootstrap function guarded before

@@ -432,7 +432,8 @@ in the same slot remains a generated hit; accessors, instance shadows and
 prototype overrides enter the existing committed load once. The hit has no
 runtime call, allocation, frame publication or safepoint. It returns the loaded
 callable before argument evaluation, preserving explicit-call ordering.
-Collection `size` and primitive String lookups retain their existing paths.
+Collection `size` and primitive String property loads retain their existing
+paths; String method calls use the leaf probe described below.
 Snapshot construction prepares collection prototype shapes before nested
 property or method proofs. Method-only snapshots also prepare their holder and
 resolve its live own slot, so later property compilation cannot invalidate an
@@ -551,9 +552,25 @@ without repeating lookup. Only the cold sibling owns a safepoint and transition
 frame; its tagged result joins the generated result through SSA. Replacement, accessors,
 proxies, and exceptions execute once without site deopt or replay. Tagged
 operands retain the canonical method call, including coercion; independently
-inferred function parameter guards can still deopt at function entry. Map and
-string method calls currently retain the canonical Machine call boundary
-rather than this arithmetic specialization.
+inferred function parameter guards can still deopt at function entry.
+
+Other guarded method sites whose declared entry is a no-allocation leaf, such
+as `"s".indexOf("e")`, `"s".charCodeAt(1)` or `map.get("k")` reached through
+`CallMethodValue`, use `machineNativeLeafProbe`. The receiver and at most one
+argument occupy the leaf ABI registers and the declared entry (for example
+`string_index_of_leaf`, visible as a runtime-stub relocation) runs directly:
+no root record, safepoint, VM PC publication, argument packet or status decode.
+The leaf cannot allocate, collect, throw or reenter JavaScript; a miss (a rope,
+a coercive operand) returns to the committed method call, which performs the
+complete operation once. Exotic receivers are proven with
+`machineCacheIrLoadIntrinsicPrototype`. A fast holder such as `Map.prototype`
+is guarded with `machineCacheIrGuardShape` and ordinary state.
+`%String.prototype%` is a String wrapper and never adopts a hidden class, so
+its method slot is pinned by `machineCacheIrGuardDictionaryLayout`: a null
+shape plus the unchanged dictionary structural id that every add, delete or
+descriptor change replaces. The Template guarded method call checks the same
+layout, so a deleted method whose slot shifted to another key misses instead of
+calling the stale builtin.
 
 ### Optimizing loop proofs and LICM
 

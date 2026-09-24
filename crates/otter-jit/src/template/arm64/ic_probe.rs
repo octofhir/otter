@@ -20,6 +20,8 @@
 //!   or an optimizing-tier tagged machine register; the preserving guard keeps
 //!   the exotic body available for immediate allocation-free completion.
 //! - [`emit_native_entry_call`] — one call sequence per declared ABI family.
+//! - [`emit_dictionary_layout_guard`] — pin a dictionary-mode method holder's
+//!   key/slot layout by its structural id, for Template and Machine alike.
 //!
 //! # Invariants
 //! - Every tier emits property probes from here. A cache program has exactly one
@@ -58,7 +60,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
     JitBodyGuard, JitCompileSnapshot, JitElementAccess, JitElementBase, JitElementRepr,
-    JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
+    JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver, JitMethodHolder,
 };
 
 use otter_vm::native_abi::{NO_SAFEPOINT, RuntimeStubId, SafepointId, runtime_stub_name};
@@ -323,7 +325,7 @@ pub(crate) fn emit_intrinsic_prototype_header(
     byte_pc: u32,
     miss: DynamicLabel,
 ) {
-    if !target.is_property_receiver() {
+    if !target.is_generated_receiver() {
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return;
     }
@@ -1577,12 +1579,18 @@ fn emit_guarded_method_guard_impl(
                 ; cmp w14, w12
                 ; b.ne =>miss
             );
-            // `0` means the receiver owns the slot. Otherwise the way's guarded
+            // A receiver-owned slot needs no hop. Otherwise the way's guarded
             // prototype hop runs, which reads `[[Prototype]]` at run time
             // because `setPrototypeOf` moves it while the shape stays put.
-            if call.holder_shape != 0 {
-                emit_load_u64(ops, 7, u64::from(call.holder_shape));
-                emit_resolve_holder(ops, relocations, view, miss);
+            match call.holder {
+                JitMethodHolder::Receiver => {}
+                JitMethodHolder::Shape(holder_shape) => {
+                    emit_load_u64(ops, 7, u64::from(holder_shape));
+                    emit_resolve_holder(ops, relocations, view, miss);
+                }
+                JitMethodHolder::Dictionary(_) => {
+                    return Err(Unsupported::OperandShape("dictionary method prototype hop"));
+                }
             }
             super::values::emit_slab_base(ops, view, 13, 14);
             dynasm!(ops
@@ -1621,11 +1629,11 @@ fn emit_guarded_method_guard_impl(
                 relocations,
                 view,
                 proto_offset,
-                call.holder_shape,
+                call.holder,
                 byte_pc,
                 call.entry_stub_id,
                 miss,
-            );
+            )?;
         }
     }
     emit_builtin_identity_guard(
@@ -1698,7 +1706,27 @@ fn emit_body_guard(ops: &mut Assembler, guard: JitBodyGuard, miss: DynamicLabel)
     }
 }
 
-/// Prove the realm prototype still has the expected identity and shape. On
+/// Prove a dictionary-mode holder in `header` keeps its captured key/slot
+/// layout: a null shape and an unchanged dictionary structural id. Every add,
+/// delete or descriptor change assigns a fresh id. Clobbers `x12` and `x14`.
+pub(crate) fn emit_dictionary_layout_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    layout: u64,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [X(header), view.object_shape_byte]
+        ; cbnz w14, =>miss
+        ; ldr x14, [X(header), view.object_dictionary_shape_id_byte]
+    );
+    emit_load_u64(ops, 12, layout);
+    dynasm!(ops ; .arch aarch64 ; cmp x14, x12 ; b.ne =>miss);
+}
+
+/// Prove the realm prototype still has the expected identity and layout. On
 /// success `x15` holds its value-slab pointer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_prototype_guard(
@@ -1706,11 +1734,11 @@ pub(crate) fn emit_prototype_guard(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     proto_offset: u32,
-    proto_shape: u32,
+    holder: JitMethodHolder,
     byte_pc: u32,
     runtime_stub_id: RuntimeStubId,
     miss: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
     let object_shape_byte = view.object_shape_byte;
     let object_values_ptr_byte = view.object_values_ptr_byte;
     emit_load_symbol_u64(
@@ -1737,26 +1765,38 @@ pub(crate) fn emit_prototype_guard(
         ; ldrb w14, [x15]
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>miss
-        ; ldr w14, [x15, object_shape_byte]
     );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        12,
-        u64::from(proto_shape),
-        RelocationTarget::GuardedHeapReference {
-            component: GuardedHeapComponent::PrototypeShape,
-            byte_pc,
-            runtime_stub_id,
-        },
-    );
+    match holder {
+        JitMethodHolder::Shape(proto_shape) => {
+            dynasm!(ops ; .arch aarch64 ; ldr w14, [x15, object_shape_byte]);
+            emit_load_symbol_u64(
+                ops,
+                relocations,
+                12,
+                u64::from(proto_shape),
+                RelocationTarget::GuardedHeapReference {
+                    component: GuardedHeapComponent::PrototypeShape,
+                    byte_pc,
+                    runtime_stub_id,
+                },
+            );
+            dynasm!(ops ; .arch aarch64 ; cmp w14, w12 ; b.ne =>miss);
+        }
+        JitMethodHolder::Dictionary(layout) => {
+            emit_dictionary_layout_guard(ops, view, 15, layout, miss);
+        }
+        JitMethodHolder::Receiver => {
+            return Err(Unsupported::OperandShape(
+                "exotic method without a prototype",
+            ));
+        }
+    }
     dynasm!(ops
         ; .arch aarch64
-        ; cmp w14, w12
-        ; b.ne =>miss
         ; ldr x15, [x15, object_values_ptr_byte]
         ; cbz x15, =>miss
     );
+    Ok(())
 }
 
 /// Guard the method slot against the exact static builtin address. Expects

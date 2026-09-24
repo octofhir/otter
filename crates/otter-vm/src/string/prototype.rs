@@ -608,23 +608,62 @@ fn impl_substring(
     Ok(Value::string(out))
 }
 
+/// `ToString(this)` and `ToString(search)` for the search methods, each
+/// flattened once so this and later scans use the Latin-1 / flat fast path
+/// instead of re-materializing a rope on every call. The two-sided fast path
+/// needs *both* sides flat, so a rope needle would otherwise defeat it.
+///
+/// Rendering a primitive receiver or search value and flattening either
+/// operand can each allocate, so both live in rooted slots until the flat
+/// handles are returned. The caller must not allocate before its scan.
+fn flat_search_operands(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<(JsString, JsString), NativeError> {
+    // Two already-contiguous strings need no rendering or flattening, so
+    // nothing can allocate and no operand needs a rooted slot.
+    let heap = ctx.heap();
+    if let (Some(recv), Some(needle)) = (
+        receiver.as_string(heap),
+        args.first().and_then(|search| search.as_string(heap)),
+    ) && recv.is_contiguous(heap)
+        && needle.is_contiguous(heap)
+    {
+        return Ok((recv, needle));
+    }
+    ctx.scope(|mut scope| {
+        let search = scope.value(args.first().copied().unwrap_or_else(Value::undefined));
+        let receiver_value = *receiver;
+        let recv = receiver_string(scope.context(), &receiver_value)?;
+        let recv = scope.value(Value::string(recv));
+        let search_value = scope.raw(search);
+        let needle = arg_to_string(scope.context(), std::slice::from_ref(&search_value), 0)?;
+        let needle = scope.value(Value::string(needle));
+        for operand in [recv, needle] {
+            scope
+                .raw(operand)
+                .as_string(scope.context().heap())
+                .expect("search operand is a string")
+                .flatten_in_place(scope.context().heap_mut())
+                .map_err(|_| type_error("String.prototype", "out of memory"))?;
+        }
+        let (recv, needle) = (scope.raw(recv), scope.raw(needle));
+        let heap = scope.context().heap();
+        Ok((
+            recv.as_string(heap).expect("search receiver is a string"),
+            needle.as_string(heap).expect("search needle is a string"),
+        ))
+    })
+}
+
 fn impl_index_of(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    let needle = arg_to_string(ctx, args, 0)?;
     let from = arg_u32_or(ctx, args, 1, 0)?;
-    // Flatten both operands once so this and later scans use the Latin-1 / flat
-    // fast path instead of re-materializing a rope on every call. The two-sided
-    // fast path needs *both* sides flat, so a rope needle would otherwise defeat
-    // it and force the haystack to re-materialize too.
-    recv.flatten_in_place(ctx.heap_mut())
-        .map_err(|_| type_error("String.prototype", "out of memory"))?;
-    needle
-        .flatten_in_place(ctx.heap_mut())
-        .map_err(|_| type_error("String.prototype", "out of memory"))?;
+    let (recv, needle) = flat_search_operands(ctx, receiver, args)?;
     let pos = recv
         .index_of(needle, from, None, ctx.heap_mut())
         .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;
@@ -2602,8 +2641,7 @@ fn impl_last_index_of(
     receiver: &Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let recv = receiver_string(ctx, receiver)?;
-    let needle = arg_to_string(ctx, args, 0)?;
+    let (recv, needle) = flat_search_operands(ctx, receiver, args)?;
     // §22.1.3.9 step 5 — `numPos = ToNumber(position)`; if it is NaN the
     // search position is +∞ (the whole string), otherwise
     // ToIntegerOrInfinity clamped to `[0, len]`. `position` is already
@@ -2623,11 +2661,6 @@ fn impl_last_index_of(
         }
         _ => len,
     };
-    recv.flatten_in_place(ctx.heap_mut())
-        .map_err(|_| type_error("String.prototype", "out of memory"))?;
-    needle
-        .flatten_in_place(ctx.heap_mut())
-        .map_err(|_| type_error("String.prototype", "out of memory"))?;
     let pos = recv
         .last_index_of(needle, position, None, ctx.heap_mut())
         .map_err(|Interrupted| type_error("String.prototype", "interrupted"))?;

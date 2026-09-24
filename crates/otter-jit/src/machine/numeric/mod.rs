@@ -592,7 +592,15 @@ fn select_with_loop_entries(
     let native_call_values = selection_cfg
         .native_calls
         .keys()
-        .map(|&block| (block, native_call_cfg::Values::new(&mut representations)))
+        .map(|&block| {
+            (
+                block,
+                native_call_cfg::Values::new(
+                    &mut representations,
+                    native_call_cfg::hit_kind(hir, block),
+                ),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let mut native_call_inputs = BTreeMap::new();
     let element_values = selection_cfg

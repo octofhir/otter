@@ -74,6 +74,10 @@ pub enum TargetClobberSet {
     NativeLeafInt32,
     /// Number fast path of a committed generic binary operator.
     NumberProbe,
+    /// Generated direct call linkage, including inline-frame publication.
+    /// x86-64 linkage uses `r12`–`r14` as scratch; AArch64 linkage saves its
+    /// one callee-saved scratch (`x25`) in the linkage frame.
+    DirectCall,
 }
 
 /// Target legalization features admitted by neutral instruction selection.
@@ -284,7 +288,7 @@ pub struct TargetSpec {
     registers: TargetRegisterFile,
     calls: TargetCallConvention,
     frame: TargetFrameSpec,
-    clobbers: [Box<[PhysicalRegister]>; 17],
+    clobbers: [Box<[PhysicalRegister]>; 18],
     capabilities: [bool; 4],
 }
 
@@ -298,6 +302,8 @@ impl TargetSpec {
             .map(integer)
             .chain((0..=7).map(float))
             .collect::<Box<[_]>>();
+        // The linkage saves x25, its one callee-saved scratch, in its own frame.
+        let scalar_call_direct = scalar_call.clone();
         Self {
             architecture: TargetArchitecture::Aarch64,
             registers: TargetRegisterFile::aarch64_scalar_function(),
@@ -346,6 +352,7 @@ impl TargetSpec {
                 (12..=14).map(integer).collect(),
                 // x15/x16 and v30/v31 lie outside the scalar allocation file.
                 Box::new([]),
+                scalar_call_direct,
             ],
             capabilities: [true; 4],
         }
@@ -396,6 +403,14 @@ impl TargetSpec {
                     // r11 and xmm15 are the reserved scratch pair; the probe
                     // additionally holds one decoded operand in xmm14.
                     Box::new([float(14)]) as Box<[PhysicalRegister]>
+                } else if set == TargetClobberSet::DirectCall as usize {
+                    // Direct linkage holds its entry cell, new.target and the
+                    // inline frame cursor in r12-r14 while publishing frames.
+                    scalar_call
+                        .iter()
+                        .copied()
+                        .chain([12, 13, 14].map(integer))
+                        .collect()
                 } else {
                     scalar_call.clone()
                 }

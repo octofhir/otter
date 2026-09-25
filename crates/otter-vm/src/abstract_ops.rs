@@ -445,11 +445,11 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
 
     // Steps 4, 5: Number x String — ToNumber the string.
     if let (Some(n), Some(s)) = (x.as_number(), y.as_string(heap)) {
-        let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
+        let parsed = number::to_number_from_js_string(s, heap);
         return number::strict_equals(n, parsed);
     }
     if let (Some(s), Some(n)) = (x.as_string(heap), y.as_number()) {
-        let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
+        let parsed = number::to_number_from_js_string(s, heap);
         return number::strict_equals(n, parsed);
     }
 
@@ -711,9 +711,7 @@ pub fn to_numeric_kind(value: &Value, heap: &otter_gc::GcHeap) -> Option<Numeric
     } else if let Some(b) = value.as_big_int() {
         Some(NumericKind::Big(b.clone_inner(heap)))
     } else if let Some(s) = value.as_string(heap) {
-        Some(NumericKind::Num(number::to_number_from_string(
-            &s.to_lossy_string(heap),
-        )))
+        Some(NumericKind::Num(number::to_number_from_js_string(s, heap)))
     } else if let Some(b) = value.as_boolean() {
         Some(NumericKind::Num(NumberValue::from_i32(if b {
             1

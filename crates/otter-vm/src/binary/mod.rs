@@ -69,7 +69,7 @@ pub fn to_index(value: &Value, heap: &otter_gc::GcHeap) -> Option<u64> {
         0.0
     } else {
         let s = value.as_string(heap)?;
-        crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
+        crate::number::to_number_from_js_string(s, heap).as_f64()
     };
     if n.is_nan() {
         return Some(0);

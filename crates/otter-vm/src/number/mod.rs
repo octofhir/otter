@@ -54,8 +54,8 @@ pub use bitwise::{
     to_uint32,
 };
 pub use parse::{
-    is_finite, is_integer, is_nan, is_safe_integer, parse_float, parse_int, to_number_from_string,
-    to_number_value,
+    is_finite, is_integer, is_nan, is_safe_integer, parse_float, parse_int,
+    to_number_from_js_string, to_number_from_string, to_number_value,
 };
 
 /// JavaScript Number value.

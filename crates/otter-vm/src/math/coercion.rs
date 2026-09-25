@@ -111,9 +111,7 @@ fn number_argument(
     } else if value.is_undefined() {
         Ok(NumberValue::Double(f64::NAN))
     } else if let Some(string) = value.as_string(heap) {
-        Ok(crate::number::parse::to_number_from_string(
-            &string.to_lossy_string(heap),
-        ))
+        Ok(crate::number::to_number_from_js_string(string, heap))
     } else if value.is_big_int() || value.is_symbol() {
         Err(MathError::BadArgument {
             name,

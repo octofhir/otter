@@ -425,7 +425,7 @@ fn value_to_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
         return NumberValue::from_f64(f64::NAN);
     }
     if let Some(s) = value.as_string(heap) {
-        return crate::number::to_number_from_string(&s.to_lossy_string(heap));
+        return crate::number::to_number_from_js_string(s, heap);
     }
     NumberValue::from_f64(f64::NAN)
 }

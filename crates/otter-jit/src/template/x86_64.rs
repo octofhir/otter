@@ -20,8 +20,13 @@
 //! - Structured try/catch/finally operations through the VM-owned exception
 //!   transition protocol.
 //! - Cooperative interrupt/work-budget polling on every generated backedge.
+//! - Delete, super, private, value-load, structural, module, variadic and
+//!   static-call opcodes, `bind`, RegExp/built-in error literals and
+//!   `Array()` allocation through their shared typed runtime boundaries.
 //!
 //! # Invariants
+//! - Emission covers the whole [`TemplateOp`] vocabulary: a function the plan
+//!   accepts is never declined for this target.
 //! - The input is the same target-neutral [`super::TemplatePlan`] consumed by
 //!   the AArch64 backend; operand decoding and branch validation are not
 //!   repeated here.
@@ -94,26 +99,12 @@ pub(super) fn compile(
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
     let plan = TemplatePlan::build(view)?;
     let tier_input = artifact_request.as_ref().map(|_| plan.render_artifact());
-    for instruction in &plan.instructions {
-        if !supports(instruction.op) {
-            return Err(Unsupported::Constraint {
-                op: view
-                    .instructions
-                    .iter()
-                    .find(|candidate| candidate.instruction_pc(&view.code_block) == instruction.pc)
-                    .map_or(otter_bytecode::Op::Nop, |candidate| {
-                        candidate.op(&view.code_block)
-                    }),
-                constraint: "opcode outside the x86-64 template emitter",
-            });
-        }
-    }
 
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
-    let mut diagnostics = capture_events.then(Vec::new);
+    let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
     let mut load_ic_cells =
         vec![crate::entry::PropertySourceCell::default(); plan.load_property_count]
             .into_boxed_slice();
@@ -126,6 +117,7 @@ pub(super) fn compile(
     let identity_guard = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
     let runtime_transition = ops.new_dynamic_label();
+    let allocation_miss = ops.new_dynamic_label();
     let backedge_relink = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
     let pair_exit = ops.new_dynamic_label();
@@ -445,10 +437,11 @@ pub(super) fn compile(
                 arg0,
                 arg1,
                 arg2,
-            } => emit_construct_op(
+            } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_CONSTRUCT_OP,
                 opcode,
                 arg0,
                 arg1,
@@ -462,10 +455,11 @@ pub(super) fn compile(
                 arg0,
                 arg1,
                 arg2,
-            } => emit_class_op(
+            } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_CLASS_OP,
                 opcode,
                 arg0,
                 arg1,
@@ -488,6 +482,8 @@ pub(super) fn compile(
                         &mut relocations,
                         transitions,
                         view,
+                        code_map.as_mut(),
+                        direct_call_events.as_mut(),
                         lane(0),
                         lane(1),
                         lane(2),
@@ -508,12 +504,14 @@ pub(super) fn compile(
                         transitions,
                         view,
                         code_map.as_mut(),
+                        direct_call_events.as_mut(),
                         arg0 as u16,
                         arg1 as u16,
                         arg2 as u16,
                         instruction.pc,
                         instruction.byte_pc,
                         opcode == otter_bytecode::Op::SuperConstructSpread as u8,
+                        threw,
                         committed_throw,
                         fatal,
                         direct_done,
@@ -521,10 +519,11 @@ pub(super) fn compile(
                 } else {
                     false
                 };
-                emit_spread_call_op(
+                emit_opcode_transition(
                     &mut ops,
                     &mut relocations,
                     transitions,
+                    abi::STUB_JIT_SPREAD_CALL_OP,
                     opcode,
                     arg0,
                     arg1,
@@ -537,15 +536,215 @@ pub(super) fn compile(
                     dynasm!(ops ; .arch x64 ; =>direct_done);
                 }
             }
+            TemplateOp::DeleteOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_DELETE_OP,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::SuperOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_SUPER_OP,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::PrivateOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_PRIVATE_OP,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::ValueLoadOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_VALUE_LOAD_OP,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::StructuralOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_STRUCTURAL_OP,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::ModuleOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_MODULE_OP,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::VariadicOp {
+                opcode,
+                prefix,
+                argc,
+                packed_args,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_VARIADIC_OP,
+                opcode,
+                u64::from(prefix),
+                u64::from(argc),
+                packed_args,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::StaticCallOp {
+                opcode,
+                packed_head,
+                method,
+                packed_args,
+            } => emit_opcode_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_STATIC_CALL_OP,
+                opcode,
+                packed_head,
+                method,
+                packed_args,
+                runtime_transition,
+                threw,
+                fatal,
+            ),
+            TemplateOp::BindFunction {
+                dst,
+                callee,
+                bound_this,
+                argc,
+                packed_args,
+            } => {
+                let packed_meta = u64::from(dst)
+                    | (u64::from(callee) << 16)
+                    | (u64::from(bound_this) << 32)
+                    | (u64::from(argc) << 48);
+                dynasm!(ops ; .arch x64 ; mov rdi, r15);
+                emit_load_u64(&mut ops, 6, packed_meta);
+                emit_load_u64(&mut ops, 2, packed_args);
+                emit_load_runtime_stub(
+                    &mut ops,
+                    &mut relocations,
+                    transitions.variadic_entry(abi::STUB_JIT_BIND_FUNCTION),
+                    abi::STUB_JIT_BIND_FUNCTION,
+                );
+                dynasm!(ops ; .arch x64 ; call r11);
+                emit_side_exit_status_result(&mut ops, runtime_transition, threw, fatal);
+            }
+            TemplateOp::LoadRegExp { dst, constant } => emit_constant_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_LOAD_REGEXP,
+                dst,
+                constant,
+                threw,
+                fatal,
+            ),
+            TemplateOp::LoadBuiltinError { dst, constant } => emit_constant_transition(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                abi::STUB_JIT_LOAD_BUILTIN_ERROR,
+                dst,
+                constant,
+                threw,
+                fatal,
+            ),
+            TemplateOp::ArrayConstruct {
+                dst,
+                length,
+                safepoint,
+            } => emit_array_construct_alloc_call(
+                &mut ops,
+                &mut relocations,
+                dst,
+                length,
+                safepoint,
+                allocation_miss,
+            )?,
             TemplateOp::ClassValueOp {
                 opcode,
                 arg0,
                 arg1,
                 arg2,
-            } => emit_class_value_op(
+            } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_CLASS_VALUE_OP,
                 opcode,
                 arg0,
                 arg1,
@@ -751,8 +950,9 @@ pub(super) fn compile(
                                 name,
                             ));
                         }
-                        if let Some(diagnostics) = diagnostics.as_mut() {
-                            diagnostics.push(
+                        if let Some(events) = direct_call_events.as_mut() {
+                            events.insert(
+                                (byte_pc, 0),
                                 otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                                     instruction_pc: instruction.pc,
                                     byte_pc,
@@ -777,8 +977,9 @@ pub(super) fn compile(
                         }
                         continue;
                     }
-                    if let Some(diagnostics) = diagnostics.as_mut() {
-                        diagnostics.push(
+                    if let Some(events) = direct_call_events.as_mut() {
+                        events.insert(
+                            (byte_pc, 0),
                             otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
                                 instruction_pc: instruction.pc,
                                 byte_pc,
@@ -797,6 +998,8 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     view,
+                    code_map.as_mut(),
+                    direct_call_events.as_mut(),
                     dst,
                     callee,
                     &arguments,
@@ -859,12 +1062,14 @@ pub(super) fn compile(
                     transitions,
                     view,
                     code_map.as_mut(),
+                    direct_call_events.as_mut(),
                     dst,
                     callee,
                     &arguments,
                     instruction.pc,
                     byte_pc,
                     super_construct,
+                    threw,
                     committed_throw,
                     fatal,
                     direct_done,
@@ -901,6 +1106,8 @@ pub(super) fn compile(
                     &mut relocations,
                     transitions,
                     view,
+                    code_map.as_mut(),
+                    direct_call_events.as_mut(),
                     dst,
                     receiver,
                     argument_registers,
@@ -1030,10 +1237,11 @@ pub(super) fn compile(
                 value_dst,
                 done_dst,
                 iterator,
-            } => emit_iterator_op(
+            } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_ITERATOR_OP,
                 otter_bytecode::Op::IteratorNext as u8,
                 u64::from(value_dst),
                 u64::from(done_dst),
@@ -1042,10 +1250,11 @@ pub(super) fn compile(
                 threw,
                 fatal,
             ),
-            TemplateOp::IteratorClose { iterator } => emit_iterator_op(
+            TemplateOp::IteratorClose { iterator } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_ITERATOR_OP,
                 otter_bytecode::Op::IteratorClose as u8,
                 u64::from(iterator),
                 0,
@@ -1054,10 +1263,11 @@ pub(super) fn compile(
                 threw,
                 fatal,
             ),
-            TemplateOp::IteratorCloseStart { iterator } => emit_iterator_op(
+            TemplateOp::IteratorCloseStart { iterator } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_ITERATOR_OP,
                 otter_bytecode::Op::IteratorCloseStart as u8,
                 u64::from(iterator),
                 0,
@@ -1066,10 +1276,11 @@ pub(super) fn compile(
                 threw,
                 fatal,
             ),
-            TemplateOp::IteratorCloseEnd { iterator } => emit_iterator_op(
+            TemplateOp::IteratorCloseEnd { iterator } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_ITERATOR_OP,
                 otter_bytecode::Op::IteratorCloseEnd as u8,
                 u64::from(iterator),
                 0,
@@ -1092,10 +1303,11 @@ pub(super) fn compile(
                 fatal,
             ),
             TemplateOp::NoOp => {}
-            TemplateOp::GetIterator { dst, src } => emit_iterator_op(
+            TemplateOp::GetIterator { dst, src } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_ITERATOR_OP,
                 otter_bytecode::Op::GetIterator as u8,
                 u64::from(dst),
                 u64::from(src),
@@ -1104,10 +1316,11 @@ pub(super) fn compile(
                 threw,
                 fatal,
             ),
-            TemplateOp::GetAsyncIterator { dst, src } => emit_iterator_op(
+            TemplateOp::GetAsyncIterator { dst, src } => emit_opcode_transition(
                 &mut ops,
                 &mut relocations,
                 transitions,
+                abi::STUB_JIT_ITERATOR_OP,
                 otter_bytecode::Op::GetAsyncIterator as u8,
                 u64::from(dst),
                 u64::from(src),
@@ -1125,7 +1338,6 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch x64 ; jmp =>returned);
             }
             TemplateOp::UnsupportedBail => dynasm!(ops ; .arch x64 ; jmp =>unsupported),
-            _ => unreachable!("support preflight and emission must stay exhaustive"),
         }
         if let Some(code_map) = code_map.as_mut() {
             code_map.record(CodeRegion::instruction(
@@ -1181,6 +1393,12 @@ pub(super) fn compile(
         identity_guard,
         abi::ExitReason::IdentityGuard,
         abi::ExitAction::Recompile,
+    );
+    emit_side_exit(
+        &mut ops,
+        allocation_miss,
+        abi::ExitReason::AllocationMiss,
+        abi::ExitAction::Resume,
     );
     emit_side_exit(
         &mut ops,
@@ -1293,79 +1511,11 @@ pub(super) fn compile(
     Ok(NativeCompileOutput {
         code,
         artifact,
-        diagnostics: diagnostics.map(Vec::into_boxed_slice).unwrap_or_default(),
+        diagnostics: direct_call_events
+            .map(|events| events.into_values().collect::<Vec<_>>().into_boxed_slice())
+            .unwrap_or_default(),
         ir_node_count: instructions.len() as u64,
     })
-}
-
-fn supports(op: TemplateOp) -> bool {
-    matches!(
-        op,
-        TemplateOp::LoadImmediate { .. }
-            | TemplateOp::Move { .. }
-            | TemplateOp::Jump { .. }
-            | TemplateOp::Branch { .. }
-            | TemplateOp::BranchNullish { .. }
-            | TemplateOp::Truthiness { .. }
-            | TemplateOp::FusedNumericChain { .. }
-            | TemplateOp::BinaryArith { .. }
-            | TemplateOp::Compare { .. }
-            | TemplateOp::LooseCompare { .. }
-            | TemplateOp::IntBitwise { .. }
-            | TemplateOp::UnsignedShiftRight { .. }
-            | TemplateOp::Increment { .. }
-            | TemplateOp::Negate { .. }
-            | TemplateOp::BitwiseNot { .. }
-            | TemplateOp::ToNumeric { .. }
-            | TemplateOp::ToPrimitive { .. }
-            | TemplateOp::AddGeneric { .. }
-            | TemplateOp::LoadThis { .. }
-            | TemplateOp::LoadSelfClosure { .. }
-            | TemplateOp::ClassSuperConstructor { .. }
-            | TemplateOp::MakeFunction { .. }
-            | TemplateOp::NewObject { .. }
-            | TemplateOp::CollectArguments { .. }
-            | TemplateOp::CallForwardArguments { .. }
-            | TemplateOp::NewArray { .. }
-            | TemplateOp::FreshUpvalue { .. }
-            | TemplateOp::DefineDataProperty { .. }
-            | TemplateOp::DefineOwnProperty { .. }
-            | TemplateOp::ConstructOp { .. }
-            | TemplateOp::ClassOp { .. }
-            | TemplateOp::SpreadCallOp { .. }
-            | TemplateOp::ClassValueOp { .. }
-            | TemplateOp::MakeClosure { .. }
-            | TemplateOp::BindingValue { .. }
-            | TemplateOp::GlobalDeclarationValue { .. }
-            | TemplateOp::ObjectProtocolValue { .. }
-            | TemplateOp::LoadStringConstant { .. }
-            | TemplateOp::LoadProperty { .. }
-            | TemplateOp::StoreProperty { .. }
-            | TemplateOp::LoadElement { .. }
-            | TemplateOp::StoreElement { .. }
-            | TemplateOp::Call { .. }
-            | TemplateOp::CallWithThis { .. }
-            | TemplateOp::Construct { .. }
-            | TemplateOp::MethodCall { .. }
-            | TemplateOp::EnterTry { .. }
-            | TemplateOp::LeaveTry
-            | TemplateOp::Throw { .. }
-            | TemplateOp::ScalarValue { .. }
-            | TemplateOp::TdzError { .. }
-            | TemplateOp::EndFinally
-            | TemplateOp::PopParkedFinally { .. }
-            | TemplateOp::JumpViaFinally { .. }
-            | TemplateOp::IteratorNext { .. }
-            | TemplateOp::IteratorClose { .. }
-            | TemplateOp::IteratorCloseStart { .. }
-            | TemplateOp::IteratorCloseEnd { .. }
-            | TemplateOp::GetIterator { .. }
-            | TemplateOp::GetAsyncIterator { .. }
-            | TemplateOp::NoOp
-            | TemplateOp::Return { .. }
-            | TemplateOp::ReturnUndefined
-            | TemplateOp::UnsupportedBail
-    )
 }
 
 fn requires_pc_stamp(op: TemplateOp) -> bool {
@@ -2159,11 +2309,15 @@ fn emit_define_own_property(
     emit_status_word_result(ops, threw, fatal);
 }
 
+/// Calls one typed opcode boundary with `(ctx, opcode, arg0, arg1, arg2)`.
+/// The VM helper commits the whole opcode before returning success; the only
+/// side exit is a missing published activation, raised before any effect.
 #[allow(clippy::too_many_arguments)]
-fn emit_construct_op(
+fn emit_opcode_transition(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
+    stub: abi::RuntimeStubDescriptor,
     opcode: u8,
     arg0: u64,
     arg1: u64,
@@ -2180,15 +2334,20 @@ fn emit_construct_op(
     emit_load_u64(ops, 2, arg0);
     emit_load_u64(ops, 1, arg1);
     emit_load_u64(ops, 8, arg2);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_CONSTRUCT_OP),
-        abi::STUB_JIT_CONSTRUCT_OP,
-    );
+    emit_load_runtime_stub(ops, relocations, transitions.variadic_entry(stub), stub);
+    dynasm!(ops ; .arch x64 ; call r11);
+    emit_side_exit_status_result(ops, bail, threw, fatal);
+}
+
+/// Routes a status word that may also request an exact pre-effect side exit.
+fn emit_side_exit_status_result(
+    ops: &mut Assembler,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) {
     dynasm!(ops
         ; .arch x64
-        ; call r11
         ; test rax, rax
         ; je >completed
         ; cmp eax, abi::NativeResultStatus::SideExit as i32
@@ -2200,168 +2359,76 @@ fn emit_construct_op(
     );
 }
 
+/// Calls a `(ctx, dst, constant)` materialization boundary.
 #[allow(clippy::too_many_arguments)]
-fn emit_class_value_op(
+fn emit_constant_transition(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
-    opcode: u8,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    bail: DynamicLabel,
+    stub: abi::RuntimeStubDescriptor,
+    dst: u16,
+    constant: u32,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) {
     dynasm!(ops
         ; .arch x64
         ; mov rdi, r15
-        ; mov esi, i32::from(opcode)
+        ; mov esi, i32::from(dst)
+        ; mov edx, constant as i32
     );
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 1, arg1);
-    emit_load_u64(ops, 8, arg2);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_CLASS_VALUE_OP),
-        abi::STUB_JIT_CLASS_VALUE_OP,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rax, rax
-        ; je >completed
-        ; cmp eax, abi::NativeResultStatus::SideExit as i32
-        ; je =>bail
-        ; cmp eax, abi::NativeResultStatus::Throw as i32
-        ; je =>threw
-        ; jmp =>fatal
-        ; completed:
-    );
+    emit_load_runtime_stub(ops, relocations, transitions.variadic_entry(stub), stub);
+    dynasm!(ops ; .arch x64 ; call r11);
+    emit_status_word_result(ops, threw, fatal);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_class_op(
+/// Allocates `Array()` or `Array(Int32)` through the shared `AllocValue3`
+/// boundary. The VM stub rejects a non-Int32 or negative length before any
+/// allocation, so every non-success status exits at the original
+/// `ArrayConstruct` and the interpreter owns wide lengths, `RangeError`, and
+/// OOM reporting.
+fn emit_array_construct_alloc_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    opcode: u8,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
+    dst: u16,
+    length: Option<u16>,
+    safepoint: abi::SafepointId,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let descriptor = abi::STUB_ARRAY_CONSTRUCT_ALLOC;
+    let stub_addr = alloc_value_stub_by_id(descriptor.id)
+        .and_then(|stub| stub.entry_addr())
+        .ok_or(Unsupported::OperandShape(
+            "ArrayConstruct allocating stub entry",
+        ))?;
     dynasm!(ops
         ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, i32::from(opcode)
+        ; sub rsp, ALLOC_CTX_STACK_SIZE as i32
+        ; mov r11, [r15 + THREAD_OFFSET as i32]
+        ; mov [rsp + ALLOC_CTX_THREAD_OFFSET as i32], r11
+        ; mov DWORD [rsp + ALLOC_CTX_SAFEPOINT_ID_OFFSET as i32], safepoint as i32
+        ; mov QWORD [rsp + ALLOC_CTX_SPILL_SLOTS_OFFSET as i32], 0
+        ; mov WORD [rsp + ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET as i32], 0
+        ; mov rdi, rsp
+        ; mov esi, safepoint as i32
     );
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 1, arg1);
-    emit_load_u64(ops, 8, arg2);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_CLASS_OP),
-        abi::STUB_JIT_CLASS_OP,
-    );
+    if let Some(length) = length {
+        emit_load_reg(ops, 2, length);
+    } else {
+        emit_load_u64(ops, 2, otter_vm::Value::number_i32(0).to_bits());
+    }
+    emit_load_u64(ops, 1, VALUE_UNDEFINED);
+    emit_load_u64(ops, 8, VALUE_UNDEFINED);
+    emit_load_runtime_stub(ops, relocations, stub_addr as u64, descriptor);
     dynasm!(ops
         ; .arch x64
         ; call r11
-        ; test rax, rax
-        ; je >completed
-        ; cmp eax, abi::NativeResultStatus::SideExit as i32
-        ; je =>bail
-        ; cmp eax, abi::NativeResultStatus::Throw as i32
-        ; je =>threw
-        ; jmp =>fatal
-        ; completed:
+        ; add rsp, ALLOC_CTX_STACK_SIZE as i32
+        ; test rdx, rdx
+        ; jne =>miss
     );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_spread_call_op(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    opcode: u8,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, i32::from(opcode)
-    );
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 1, arg1);
-    emit_load_u64(ops, 8, arg2);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_SPREAD_CALL_OP),
-        abi::STUB_JIT_SPREAD_CALL_OP,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rax, rax
-        ; je >completed
-        ; cmp eax, abi::NativeResultStatus::SideExit as i32
-        ; je =>bail
-        ; cmp eax, abi::NativeResultStatus::Throw as i32
-        ; je =>threw
-        ; jmp =>fatal
-        ; completed:
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_iterator_op(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    opcode: u8,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, i32::from(opcode)
-    );
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 1, arg1);
-    emit_load_u64(ops, 8, arg2);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_ITERATOR_OP),
-        abi::STUB_JIT_ITERATOR_OP,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rax, rax
-        ; je >completed
-        ; cmp eax, abi::NativeResultStatus::SideExit as i32
-        ; je =>bail
-        ; cmp eax, abi::NativeResultStatus::Throw as i32
-        ; je =>threw
-        ; jmp =>fatal
-        ; completed:
-    );
+    emit_store_reg(ops, 0, dst);
+    Ok(())
 }
 
 fn emit_make_closure(

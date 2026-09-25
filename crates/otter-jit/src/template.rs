@@ -58,6 +58,84 @@ pub(crate) use plan::{
 
 use crate::entry::{TransitionTable, Unsupported};
 
+/// Compile-time direct-call and static-native lowering events, keyed by
+/// `(byte_pc, target_index)` so a backend's final decision replaces the seed.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) type DirectCallEvents =
+    std::collections::BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>;
+
+/// Seeds one `Eliminated` event per available plain and method direct-call
+/// target and per static-native call site. A backend that reaches the site
+/// replaces it with its lowering.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) fn seed_direct_call_events(view: &JitCompileSnapshot) -> DirectCallEvents {
+    let eliminated = otter_vm::JitDirectCallLoweringOutcome::Rejected {
+        reason: otter_vm::JitDirectCallLoweringRejectionReason::Eliminated,
+    };
+    let instruction_pc = |byte_pc: u32| {
+        view.instructions
+            .iter()
+            .find(|instruction| instruction.byte_pc == byte_pc)
+            .map(|instruction| instruction.instruction_pc(&view.code_block))
+    };
+    let mut events = DirectCallEvents::new();
+    for (&byte_pc, targets) in &view.direct_callees {
+        let Some(instruction_pc) = instruction_pc(byte_pc) else {
+            continue;
+        };
+        for (target_index, target) in targets.iter().enumerate() {
+            events.insert(
+                (byte_pc, target_index as u32),
+                otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+                    call_kind: otter_vm::JitDirectCallKind::Plain,
+                    instruction_pc,
+                    byte_pc,
+                    callee_function_id: target.plan.function_id,
+                    target_index: target_index as u32,
+                    target_count: targets.len() as u32,
+                    outcome: eliminated,
+                },
+            );
+        }
+    }
+    for (&byte_pc, methods) in &view.direct_methods {
+        let Some(instruction_pc) = instruction_pc(byte_pc) else {
+            continue;
+        };
+        for method in methods {
+            events.insert(
+                (byte_pc, method.target_index),
+                otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+                    call_kind: otter_vm::JitDirectCallKind::Method,
+                    instruction_pc,
+                    byte_pc,
+                    callee_function_id: method.callee.plan.function_id,
+                    target_index: method.target_index,
+                    target_count: method.target_count,
+                    outcome: eliminated,
+                },
+            );
+        }
+    }
+    for (&byte_pc, target) in &view.static_native_calls {
+        let Some(instruction_pc) = instruction_pc(byte_pc) else {
+            continue;
+        };
+        events.insert(
+            (byte_pc, 0),
+            otter_vm::JitCompilerDiagnostic::StaticNativeCallLowered {
+                instruction_pc,
+                byte_pc,
+                target: otter_vm::native_abi::runtime_stub_name(target.leaf_stub_id),
+                outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Rejected {
+                    reason: otter_vm::JitStaticNativeCallLoweringRejectionReason::Eliminated,
+                },
+            },
+        );
+    }
+    events
+}
+
 /// Compile a function view to template machine code under the
 /// isolate-assigned unique code-object identity, or report why not. The
 /// caller provides the hook-lifetime [`TransitionTable`] so per-compile work

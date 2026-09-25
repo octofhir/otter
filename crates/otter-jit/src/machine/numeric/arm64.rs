@@ -2277,6 +2277,158 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::PropertyStoreDispatch { byte_pc, ref cases } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let hit = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_object_header(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    13,
+                    miss,
+                )?;
+                emit_ordinary_lookup_state_guard(&mut ops, view, 13, miss);
+                // x12 keeps the receiver header for the whole case.
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr w15, [x13, view.object_shape_byte]
+                    ; cbz w15, =>miss
+                    ; mov x12, x13
+                );
+                let labels = cases
+                    .iter()
+                    .map(|_| ops.new_dynamic_label())
+                    .collect::<Vec<_>>();
+                for (case, &label) in cases.iter().zip(&labels) {
+                    emit_load_u64(&mut ops, 16, u64::from(case.shape));
+                    dynasm!(ops ; .arch aarch64 ; cmp w15, w16 ; b.eq =>label);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>miss);
+                for (case, &label) in cases.iter().zip(&labels) {
+                    dynasm!(ops ; .arch aarch64 ; =>label);
+                    if let Some(transition) = &case.transition {
+                        // Missing-key proof: each prototype keeps its shape and
+                        // chain-link state, and the chain ends in null.
+                        dynasm!(ops ; .arch aarch64 ; mov x11, x12);
+                        for &prototype in transition.prototype_shapes.iter() {
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr w14, [x11, view.jit_proto_byte]
+                                ; cbz w14, =>miss
+                            );
+                            emit_load_symbolic_u64(
+                                &mut ops,
+                                &mut relocations,
+                                13,
+                                view.cage_base as u64,
+                                RelocationTarget::GcCageBase,
+                            );
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; add x11, x13, x14
+                                ; ldrb w14, [x11]
+                                ; cmp w14, u32::from(otter_vm::object::OBJECT_BODY_TYPE_TAG)
+                                ; b.ne =>miss
+                            );
+                            emit_shape_state_guard(&mut ops, view, 11, miss);
+                            emit_load_u64(&mut ops, 16, u64::from(prototype));
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr w14, [x11, view.object_shape_byte]
+                                ; cmp w14, w16
+                                ; b.ne =>miss
+                            );
+                        }
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr w14, [x11, view.jit_proto_byte]
+                            ; cbnz w14, =>miss
+                        );
+                        // Exact append into existing capacity of an
+                        // extensible receiver.
+                        let slot = case.value_byte / 8;
+                        let inline_storage = ops.new_dynamic_label();
+                        let fits = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr w14, [x12, view.object_slab_handle_byte]
+                            ; cbz w14, =>inline_storage
+                        );
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
+                        emit_load_u64(&mut ops, 16, u64::from(slot));
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x14
+                            ; ldr w14, [x13, view.object_slab_capacity_byte]
+                            ; cmp w16, w14
+                            ; b.hs =>miss
+                            ; b =>fits
+                            ; =>inline_storage
+                        );
+                        if slot >= view.object_inline_slot_cap {
+                            dynasm!(ops ; .arch aarch64 ; b =>miss);
+                        }
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; =>fits
+                            ; ldrb w14, [x12, view.object_extensible_byte]
+                            ; cbz w14, =>miss
+                            ; ldrh w14, [x12, view.object_slab_len_byte]
+                        );
+                        emit_load_u64(&mut ops, 16, u64::from(slot));
+                        dynasm!(ops ; .arch aarch64 ; cmp w14, w16 ; b.ne =>miss);
+                    }
+                    // Every guard passed: store, then publish the transition.
+                    dynasm!(ops ; .arch aarch64 ; mov x13, x12);
+                    emit_slab_base(&mut ops, view, 13, 14);
+                    dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                    emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                    emit_load_u64(&mut ops, 17, u64::from(case.value_byte));
+                    dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
+                    if let Some(transition) = &case.transition {
+                        if transition.initialize_inline {
+                            dynasm!(ops ; .arch aarch64 ; mov x13, x12);
+                            emit_initialize_inline_values_ptr(&mut ops, view, 13, 16);
+                        }
+                        emit_load_u64(&mut ops, 14, u64::from(transition.new_len));
+                        emit_load_u64(&mut ops, 17, u64::from(transition.child_shape));
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; strh w14, [x12, view.object_slab_len_byte]
+                            ; str w17, [x12, view.object_shape_byte]
+                        );
+                    } else {
+                        emit_load_u64(&mut ops, 17, VALUE_UNDEFINED);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; b =>hit);
+                }
+                // Results live in x15 (owner) and x17 (child), outside the
+                // allocation file; the hit bit is stored first.
+                dynasm!(ops ; .arch aarch64 ; =>hit ; mov x15, x12);
+                emit_load_u64(&mut ops, 10, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss ; mov x15, xzr);
+                emit_load_u64(&mut ops, 17, VALUE_UNDEFINED);
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[4], 10, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 15, 0)?;
+                emit_store_allocated_tagged(&mut ops, frame, locations[3], 17, 0)?;
+                structural_regions.push((
+                    "machinePropertyStoreDispatch",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrStoreField {
                 byte_pc,
                 value_byte,

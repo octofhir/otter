@@ -165,12 +165,11 @@ never replays prototype lookup or `super(...)`.
 
 Non-simple class-constructor fields and exact ordinary function-constructor
 fields that can append an own data slot remain at their original bytecode
-position. They use the ordinary `machineCacheIrGuardShape`,
-`machineCacheIrGuardExtensible`, `machineCacheIrLoadPrototype`,
-`machineCacheIrGuardPrototypeNull`, `machineCacheIrStoreField`,
-`machineCacheIrPublishShape`, and `machineCacheIrWriteBarrier` regions. The
-complete guard chain precedes the no-fail store, shape publication, and
-barriers. Ordinary functions use this
+position. They use one `machinePropertyStoreDispatch` region followed by
+`machineCacheIrWriteBarrier` regions for the value and the published child
+shape. The dispatch proves the receiver shape, the prototype chain, receiver
+extensibility, and storage capacity before the no-fail store and shape
+publication. Ordinary functions use this
 path only when `new.target` is the entered function; a distinct ordinary target
 retains the canonical path. Allocation caches only the immutable plan and
 reserved capacity; a guard miss deoptimizes before the source `StoreProperty`
@@ -449,7 +448,15 @@ Property regions transpile immutable CacheIR programs into
 (receiver shape guard, optional atom-slot guard, field read) instead share one
 `machinePolymorphicPropertyLoad` region: it decodes the receiver and loads its
 hidden class once, compares that class with every program's shape, and reads
-the matching slot. A miss enters the same committed cold load. Unsupported
+the matching slot. A miss enters the same committed cold load. The store
+programs of one site (existing writable slot, own-data add transition) likewise
+share one `machinePropertyStoreDispatch` region. It decodes the receiver once,
+selects the case by hidden class, walks the transition's prototype contract
+with one decode per link, checks extensibility, append position, and capacity,
+then stores and publishes the child shape. It returns the stored owner, the
+published child, and a hit flag. The hit flag feeds the site's value and child
+barriers. On a miss, nothing has been written and the committed cold store runs.
+Unsupported
 programs use the fixed boxed-value boundary as a whole. A code-owned `propertySourceCell` carries only
 function/logical-PC identity for that boundary; it never learns semantic proof
 data. Generated add transitions prove their complete prototype contract,

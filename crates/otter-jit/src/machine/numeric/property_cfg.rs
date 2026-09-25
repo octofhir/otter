@@ -480,6 +480,116 @@ mod tests {
     }
 
     #[test]
+    fn store_dispatch_owns_existing_and_transition_programs_of_one_site() {
+        use otter_vm::{JitCacheIrOp, JitCacheIrProgram};
+        let existing = JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 7,
+                },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 5,
+                    value_byte: 8,
+                    writable: true,
+                },
+                JitCacheIrOp::StoreField {
+                    object: 0,
+                    value_byte: 8,
+                },
+            ]
+            .into_boxed_slice(),
+        };
+        let transition = JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 9,
+                },
+                JitCacheIrOp::LoadPrototype {
+                    object: 0,
+                    result: 1,
+                },
+                JitCacheIrOp::GuardShape {
+                    object: 1,
+                    shape: 13,
+                },
+                JitCacheIrOp::GuardPrototypeNull { object: 1 },
+                JitCacheIrOp::GuardExtensible {
+                    object: 0,
+                    value_byte: 16,
+                },
+                JitCacheIrOp::StoreField {
+                    object: 0,
+                    value_byte: 16,
+                },
+                JitCacheIrOp::PublishShape {
+                    object: 0,
+                    shape: 21,
+                    new_len: 3,
+                    initialize_inline: false,
+                },
+            ]
+            .into_boxed_slice(),
+        };
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let mut hir = super::super::tests::property_selection_hir();
+            let site = hir.property_sites.get_mut(&hir::NumericValue(3)).unwrap();
+            site.program = vec![existing.clone(), transition.clone()].into_boxed_slice();
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+                .expect("store dispatch selection");
+            let dispatches = sequence
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match &instruction.opcode {
+                    MachineOpcode::PropertyStoreDispatch { byte_pc: 40, cases } => {
+                        Some((instruction, cases))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [(dispatch, cases)] = dispatches.as_slice() else {
+                panic!("one dispatch per store site: {dispatches:?}");
+            };
+            assert_eq!(cases.len(), 2);
+            assert!(cases[0].transition.is_none() && cases[0].value_byte == 8);
+            let added = cases[1].transition.as_ref().expect("transition case");
+            assert_eq!(
+                (
+                    cases[1].shape,
+                    added.prototype_shapes.as_ref(),
+                    added.child_shape
+                ),
+                (9, &[13][..], 21)
+            );
+            assert_eq!(
+                dispatch.clobbers,
+                target.clobbers(TargetClobberSet::PropertyStore)
+            );
+            assert!(!sequence.instructions().iter().any(|instruction| matches!(
+                instruction.opcode,
+                MachineOpcode::CacheIrStoreField { byte_pc: 40, .. }
+                    | MachineOpcode::CacheIrPublishShape { byte_pc: 40, .. }
+            )));
+            assert_eq!(
+                sequence
+                    .instructions()
+                    .iter()
+                    .filter(|instruction| matches!(
+                        instruction.opcode,
+                        MachineOpcode::CacheIrWriteBarrier { byte_pc: 40, .. }
+                    ))
+                    .count(),
+                2
+            );
+            sequence
+                .allocate(&target)
+                .expect("store dispatch register allocation");
+        }
+    }
+
+    #[test]
     fn megamorphic_store_commits_once_before_the_existing_cold_call() {
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
             let mut hir = super::super::tests::property_selection_hir();

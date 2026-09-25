@@ -604,9 +604,7 @@ fn assert_machine_array_field_constructor(
     let regions = code_map["regions"].as_array().expect("constructor regions");
     for (kind, byte_pc) in [
         ("machineArrayConstruct", array_byte_pc),
-        ("machineCacheIrGuardExtensible", store_byte_pc),
-        ("machineCacheIrStoreField", store_byte_pc),
-        ("machineCacheIrPublishShape", store_byte_pc),
+        ("machinePropertyStoreDispatch", store_byte_pc),
         ("machineCacheIrWriteBarrier", store_byte_pc),
     ] {
         assert!(
@@ -690,7 +688,7 @@ fn assert_machine_constructor_field_regions(
             .expect("constructor code-map regions");
         let store_effect_byte_pcs = regions
             .iter()
-            .filter(|region| region["kind"] == "machineCacheIrStoreField")
+            .filter(|region| region["kind"] == "machinePropertyStoreDispatch")
             .filter_map(|region| region["bytePc"].as_u64())
             .filter_map(|byte_pc| u32::try_from(byte_pc).ok())
             .collect::<Vec<_>>();

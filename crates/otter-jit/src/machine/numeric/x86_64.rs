@@ -1176,6 +1176,142 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::PropertyStoreDispatch { byte_pc, ref cases } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let hit = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
+                ordinary_lookup_state_guard(&mut ops, view, miss);
+                // rsi keeps the receiver header; r11 names the object a
+                // shared helper inspects.
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r9d, [r11 + view.object_shape_byte as i32]
+                    ; test r9d, r9d
+                    ; jz =>miss
+                    ; mov rsi, r11
+                );
+                let labels = cases
+                    .iter()
+                    .map(|_| ops.new_dynamic_label())
+                    .collect::<Vec<_>>();
+                for (case, &label) in cases.iter().zip(&labels) {
+                    dynasm!(ops ; .arch x64 ; cmp r9d, case.shape as i32 ; je =>label);
+                }
+                dynasm!(ops ; .arch x64 ; jmp =>miss);
+                for (case, &label) in cases.iter().zip(&labels) {
+                    dynasm!(ops ; .arch x64 ; =>label);
+                    if let Some(transition) = &case.transition {
+                        for &prototype in transition.prototype_shapes.iter() {
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov r10d, [r11 + view.jit_proto_byte as i32]
+                                ; test r10d, r10d
+                                ; jz =>miss
+                            );
+                            symbolic(
+                                &mut ops,
+                                &mut relocations,
+                                8,
+                                view.cage_base as u64,
+                                RelocationTarget::GcCageBase,
+                            );
+                            dynasm!(ops
+                                ; .arch x64
+                                ; lea r11, [r8 + r10]
+                                ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
+                                ; jne =>miss
+                            );
+                            shape_state_guard(&mut ops, view, miss);
+                            dynasm!(ops
+                                ; .arch x64
+                                ; cmp DWORD [r11 + view.object_shape_byte as i32], prototype as i32
+                                ; jne =>miss
+                            );
+                        }
+                        let slot = case.value_byte / 8;
+                        let inline_storage = ops.new_dynamic_label();
+                        let fits = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp DWORD [r11 + view.jit_proto_byte as i32], 0
+                            ; jne =>miss
+                            ; mov r11, rsi
+                            ; mov r9d, [r11 + view.object_slab_handle_byte as i32]
+                            ; test r9d, r9d
+                            ; jz =>inline_storage
+                        );
+                        symbolic(
+                            &mut ops,
+                            &mut relocations,
+                            8,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
+                        dynasm!(ops
+                            ; .arch x64
+                            ; add r8, r9
+                            ; movzx r9d, WORD [r8 + view.object_slab_capacity_byte as i32]
+                            ; cmp r9d, slot as i32
+                            ; jbe =>miss
+                            ; jmp =>fits
+                            ; =>inline_storage
+                        );
+                        if slot >= view.object_inline_slot_cap {
+                            dynasm!(ops ; .arch x64 ; jmp =>miss);
+                        }
+                        dynasm!(ops
+                            ; .arch x64
+                            ; =>fits
+                            ; cmp BYTE [r11 + view.object_extensible_byte as i32], 0
+                            ; je =>miss
+                            ; movzx r9d, WORD [r11 + view.object_slab_len_byte as i32]
+                            ; cmp r9d, slot as i32
+                            ; jne =>miss
+                        );
+                    }
+                    slab_base(&mut ops, view, miss);
+                    load_integer(&mut ops, frame, loc[1], 10)?;
+                    dynasm!(ops ; .arch x64 ; mov [r8 + case.value_byte as i32], r10);
+                    if let Some(transition) = &case.transition {
+                        if transition.initialize_inline {
+                            let ready = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch x64
+                                ; cmp DWORD [r11 + view.object_slab_handle_byte as i32], 0
+                                ; jne =>ready
+                                ; lea r10, [r11 + view.object_inline_values_byte as i32]
+                                ; mov [r11 + view.object_values_ptr_byte as i32], r10
+                                ; =>ready
+                            );
+                        }
+                        dynasm!(ops
+                            ; .arch x64
+                            ; mov WORD [r11 + view.object_slab_len_byte as i32], transition.new_len as i16
+                            ; mov DWORD [r11 + view.object_shape_byte as i32], transition.child_shape as i32
+                            ; mov r9d, transition.child_shape as i32
+                        );
+                    } else {
+                        load64(&mut ops, 9, VALUE_UNDEFINED);
+                    }
+                    dynasm!(ops ; .arch x64 ; jmp =>hit);
+                }
+                dynasm!(ops ; .arch x64 ; =>hit ; mov r10d, 1 ; jmp =>done ; =>miss ; xor r11d, r11d);
+                load64(&mut ops, 9, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; xor r10d, r10d ; =>done);
+                // r11 (owner) is outside the allocation file; write the child
+                // and hit outputs in an order that never overwrites an unread
+                // source.
+                store_outputs_ordered(&mut ops, frame, [(loc[3], 9), (loc[4], 10)])?;
+                store_integer(&mut ops, frame, loc[2], 11)?;
+                structural_regions.push((
+                    "machinePropertyStoreDispatch",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::CacheIrStoreField {
                 byte_pc,
                 value_byte,
@@ -4327,6 +4463,33 @@ fn store_integer(
         _ => return Err(Unsupported::OperandShape("x86-64 integer destination")),
     }
     Ok(())
+}
+
+/// Store two integer results whose sources are allocatable registers.
+///
+/// A destination may be the other result's source: that result is written
+/// first, and a two-register cycle swaps in place.
+fn store_outputs_ordered(
+    ops: &mut Assembler,
+    frame: MachineFrameLayout,
+    outputs: [(AllocatedLocation, u8); 2],
+) -> Result<(), Unsupported> {
+    let [(first_location, first), (second_location, second)] = outputs;
+    let writes = |location: AllocatedLocation, source: u8| {
+        matches!(location, AllocatedLocation::Register(register)
+            if register.is_integer() && register.encoding() == source)
+    };
+    if writes(first_location, second) && writes(second_location, first) {
+        dynasm!(ops ; .arch x64 ; xchg Rq(first), Rq(second));
+        return Ok(());
+    }
+    if writes(first_location, second) {
+        store_integer(ops, frame, second_location, second)?;
+        store_integer(ops, frame, first_location, first)
+    } else {
+        store_integer(ops, frame, first_location, first)?;
+        store_integer(ops, frame, second_location, second)
+    }
 }
 
 fn load_float(

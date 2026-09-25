@@ -52,7 +52,7 @@ for(var i=0;i<70000;i++)caller((i&1)?o2:o,payload,mark);
     assert!(
         ir.contains("GuardCallTarget { guard: Plain")
             && ir.contains("inline-frames=")
-            && ir.contains("CacheIrStoreField {"),
+            && ir.contains("PropertyStoreDispatch {"),
         "{ir}"
     );
     assert!(

@@ -886,9 +886,10 @@ fn run_phases(sources: &[&str], name: &str, selection: JitSelection) -> RunResul
         || artifact_has("\"callKind\":\"superConstruct\"", false);
     let used_machine_spread_arguments = artifact_has("\"argumentMode\": \"spread\"", false)
         || artifact_has("\"argumentMode\":\"spread\"", false);
-    let used_machine_constructor_field = code_map_has("machineCacheIrStoreField")
-        && code_map_has("machineCacheIrPublishShape")
-        && code_map_has("machineCacheIrWriteBarrier");
+    // The field store, shape publication and guards share one dispatch region;
+    // its value and child-shape barriers stay separate.
+    let used_machine_constructor_field =
+        code_map_has("machinePropertyStoreDispatch") && code_map_has("machineCacheIrWriteBarrier");
     let used_machine_class_super_load = code_map_has("machineClassSuperLoad");
     let used_machine_derived_this_bind =
         code_map_has("machineDerivedThisBindFast") && code_map_has("machineDerivedThisBindCold");

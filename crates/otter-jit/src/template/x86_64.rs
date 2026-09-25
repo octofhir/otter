@@ -1459,9 +1459,7 @@ pub(super) fn compile(
         osr_entries.insert(header_pc, offset);
     }
 
-    let buffer = ops
-        .finalize()
-        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
+    let buffer = crate::entry::finalize_assembler(ops)?;
     let TemplatePlan {
         register_count,
         register_operands,

@@ -63,6 +63,24 @@ pub enum BackendFailure {
     AssemblerAllocation,
     /// W^X finalization or executable-memory publication failed.
     Finalization,
+    /// A label reference could not be encoded: its target lies outside the
+    /// displacement range of the branch or address form that names it.
+    Relocation,
+}
+
+/// Commit and finalize a machine assembler into executable code.
+///
+/// `dynasmrt::Assembler::finalize` panics when a pending relocation cannot be
+/// encoded, so the relocations are committed explicitly first and a failure
+/// surfaces as [`BackendFailure::Relocation`] — an interpreter fallback for
+/// this one function, never a process abort.
+pub(crate) fn finalize_assembler<R: dynasmrt::relocations::Relocation>(
+    mut ops: dynasmrt::Assembler<R>,
+) -> Result<dynasmrt::ExecutableBuffer, Unsupported> {
+    ops.commit()
+        .map_err(|_| Unsupported::Backend(BackendFailure::Relocation))?;
+    ops.finalize()
+        .map_err(|_| Unsupported::Backend(BackendFailure::Finalization))
 }
 
 /// Typed destination register for fixed-operand loads.

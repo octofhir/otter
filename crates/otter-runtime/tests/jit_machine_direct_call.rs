@@ -1155,10 +1155,16 @@ fn simple_constructor_shapes_cover_fixed_spread_and_super_linkage() {
             + production.stats.jit_receiver_alloc_guard_misses
             + production.stats.jit_receiver_alloc_space_misses
     );
-    assert_eq!(
-        production.stats.jit_receiver_alloc_cold_transitions,
-        production.stats.jit_receiver_alloc_guard_misses
-            + production.stats.jit_receiver_alloc_space_misses
+    // A linkage probe miss reaches the cold allocation sibling; an inlined
+    // construct's probe miss exits exactly or completes through the ordinary
+    // construct linkage, which allocates without a planned probe.
+    assert!(
+        production.stats.jit_receiver_alloc_cold_transitions
+            + production.stats.jit_receiver_alloc_deopts
+            <= production.stats.jit_receiver_alloc_guard_misses
+                + production.stats.jit_receiver_alloc_space_misses,
+        "stats={:?}",
+        production.stats
     );
     assert_eq!(
         production.stats.jit_receiver_alloc_rust_transitions,
@@ -1198,17 +1204,29 @@ fn generated_receiver_allocation_owns_super_hot_path_and_refills() {
     assert_eq!(production.stats.jit_receiver_alloc_oom, 0);
     if gc_stress_stride() != 0 {
         // Stress keeps the nursery fast window unavailable. Every attempt
-        // misses the generated window, and every transition that reaches the
-        // rooted allocation sibling must collect there. Spread preparation
+        // misses the generated window and reaches the rooted allocation
+        // sibling. Stride 1 collects on every allocation there; a wider stride
+        // collects on every stride-th heap allocation, which the stride counter
+        // shares with every other allocation in the run. Spread preparation
         // may instead commit through its reentrant construct sibling.
         assert_eq!(production.stats.jit_receiver_alloc_generated, 0);
         assert_eq!(production.stats.jit_receiver_alloc_refills, 0);
-        assert_eq!(
-            production.stats.jit_receiver_alloc_gc_transitions,
-            production.stats.jit_receiver_alloc_cold_transitions,
-            "stats={:?}",
-            production.stats
-        );
+        if gc_stress_stride() == 1 {
+            assert_eq!(
+                production.stats.jit_receiver_alloc_gc_transitions,
+                production.stats.jit_receiver_alloc_cold_transitions,
+                "stats={:?}",
+                production.stats
+            );
+        } else {
+            assert!(
+                production.stats.jit_receiver_alloc_gc_transitions > 0
+                    && production.stats.jit_receiver_alloc_gc_transitions
+                        <= production.stats.jit_receiver_alloc_cold_transitions,
+                "stats={:?}",
+                production.stats
+            );
+        }
         assert!(
             production.stats.jit_alloc_stub_transitions
                 >= production.stats.jit_receiver_alloc_cold_transitions

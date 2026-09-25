@@ -45,14 +45,18 @@ const SETUP: &str = r#"
     globalThis.rmwB = [0.5, 1, 1.5, 2];
     globalThis.growWarm = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-    let warmStores = "";
-    for (let warm = 0; warm < 4010; warm++) {
-      warmStores += "hotStoreZero(storeInts, 7);";
-      warmStores += "hotStoreZero(storeFloats, 1.25);";
-      warmStores += "hotFloatRmw(rmwA, rmwB, 0.5);";
-      warmStores += "hotGrowEight(growWarm, 9.5);";
+    // A compiled hot caller reaches each callee through generated linkage;
+    // interpreted straight-line calls never repay a native entry transition
+    // for bodies this small.
+    function warmStores() {
+      for (let warm = 0; warm < 4010; warm++) {
+        hotStoreZero(storeInts, 7);
+        hotStoreZero(storeFloats, 1.25);
+        hotFloatRmw(rmwA, rmwB, 0.5);
+        hotGrowEight(growWarm, 9.5);
+      }
     }
-    eval(warmStores);
+    warmStores();
 "#;
 
 const FINAL_CALLS: [(&str, &str); 5] = [
@@ -144,8 +148,11 @@ fn optimized_element_stores_match_interpreter() {
         ("int", 0),
         ("float", 0),
         ("read-modify-write", 0),
-        ("growth", 1),
-        ("throw", 1),
+        // The out-of-bounds append completes through the committed element
+        // sibling in place.
+        ("growth", 0),
+        // A null receiver throws the canonical TypeError from the same sibling.
+        ("throw", 0),
     ]
     .into_iter()
     .zip(deltas)

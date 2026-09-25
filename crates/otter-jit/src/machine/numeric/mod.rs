@@ -3748,7 +3748,7 @@ fn committed_value_descriptor(
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
+        clobbers: target_spec.clobbers(TargetClobberSet::DirectCall).to_vec(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),

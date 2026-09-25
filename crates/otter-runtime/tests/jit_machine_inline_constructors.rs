@@ -209,7 +209,10 @@ fn inline_constructor_roots_receiver_across_getter_collection() {
                 r#"
 class Cell {constructor(p){p.saved=this;this.value=p.value;this.target=new.target;}}
 function cell(p){return new Cell(p);}
-var p={saved:null,value:null};for(var i=0;i<70000;i++)cell(p);
+// A second receiver shape keeps `p.value` on the committed cold path instead of
+// a monomorphic speculation that exits once when the accessor appears.
+var p={saved:null,value:null},q={value:null,saved:null};
+for(var i=0;i<70000;i++)cell((i&1)?q:p);
 "#,
             ),
             "inline-construct-gc-warm.js",

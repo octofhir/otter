@@ -28,7 +28,7 @@ use otter_bytecode::{
 };
 use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, SourceInput};
-use otter_vm::{ExecutionContext, Interpreter, JitRuntimeStats, Value};
+use otter_vm::{ExecutionContext, Interpreter, JitRuntimeStats, PersistentRootId, Value};
 use smallvec::{SmallVec, smallvec};
 
 fn fixture_module() -> BytecodeModule {
@@ -224,12 +224,27 @@ fn fixture_module() -> BytecodeModule {
     }
 }
 
+/// Root a host-created value across every later allocation of the test.
+fn root(interp: &mut Interpreter, value: Value) -> PersistentRootId {
+    interp.persistent_root_insert(value)
+}
+
+/// Current (possibly relocated) value of a rooted host allocation.
+fn rooted(interp: &Interpreter, id: PersistentRootId) -> Value {
+    interp
+        .persistent_root_get(id)
+        .expect("live persistent root")
+}
+
+/// Call `function_id` with arguments built after every earlier allocation, so
+/// rooted host arrays are read at their current addresses.
 fn call(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     function_id: u32,
-    args: SmallVec<[Value; 8]>,
+    args: impl FnOnce(&Interpreter) -> SmallVec<[Value; 8]>,
 ) -> Result<Value, otter_vm::VmError> {
+    let args = args(interp);
     interp.run_callable_sync(
         context,
         &Value::function_id(function_id),
@@ -260,6 +275,7 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRunti
             )
             .expect("array allocation"),
     );
+    let array = root(&mut interp, array);
     let float_array = Value::array(
         interp
             .array_from_elements_host_rooted(
@@ -274,110 +290,87 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRunti
             )
             .expect("float array allocation"),
     );
+    let float_array = root(&mut interp, float_array);
     let many_arrays =
         [[1, 2, 3, 4], [10, 20, 30, 40], [2, 4, 6, 8], [1, 2, 3, 4]].map(|elements| {
-            Value::array(
+            let array = Value::array(
                 interp
                     .array_from_elements_host_rooted(elements.map(Value::number_i32), &[], &[])
                     .expect("many-array allocation"),
-            )
+            );
+            root(&mut interp, array)
         });
 
     for _ in 0..4010 {
         assert_eq!(
-            call(
-                &mut interp,
-                &context,
-                1,
-                smallvec![array, Value::number_i32(1)],
-            )
+            call(&mut interp, &context, 1, |i| smallvec![
+                rooted(i, array),
+                Value::number_i32(1)
+            ],)
             .expect("load warmup")
             .to_bits(),
             Value::number_i32(2).to_bits()
         );
         assert_eq!(
-            call(
-                &mut interp,
-                &context,
-                2,
-                smallvec![array, Value::number_i32(4)],
-            )
+            call(&mut interp, &context, 2, |i| smallvec![
+                rooted(i, array),
+                Value::number_i32(4)
+            ],)
             .expect("sum warmup")
             .to_bits(),
             Value::number_i32(10).to_bits()
         );
         assert_eq!(
-            call(
-                &mut interp,
-                &context,
-                3,
-                smallvec![float_array, Value::number_i32(4)],
-            )
+            call(&mut interp, &context, 3, |i| smallvec![
+                rooted(i, float_array),
+                Value::number_i32(4)
+            ],)
             .expect("float sum warmup")
             .to_bits(),
             Value::number_f64(12.75).to_bits()
         );
         assert_eq!(
-            call(
-                &mut interp,
-                &context,
-                4,
-                smallvec![
-                    many_arrays[0],
-                    many_arrays[1],
-                    many_arrays[2],
-                    many_arrays[3],
-                    Value::number_i32(4),
-                ],
-            )
+            call(&mut interp, &context, 4, |i| smallvec![
+                rooted(i, many_arrays[0]),
+                rooted(i, many_arrays[1]),
+                rooted(i, many_arrays[2]),
+                rooted(i, many_arrays[3]),
+                Value::number_i32(4),
+            ],)
             .expect("many-array warmup")
             .to_bits(),
             Value::number_i32(140).to_bits()
         );
     }
 
-    let loaded = call(
-        &mut interp,
-        &context,
-        1,
-        smallvec![array, Value::number_i32(3)],
-    )
+    let loaded = call(&mut interp, &context, 1, |i| {
+        smallvec![rooted(i, array), Value::number_i32(3)]
+    })
     .expect("optimized load");
-    let summed = call(
-        &mut interp,
-        &context,
-        2,
-        smallvec![array, Value::number_i32(4)],
-    )
+    let summed = call(&mut interp, &context, 2, |i| {
+        smallvec![rooted(i, array), Value::number_i32(4)]
+    })
     .expect("optimized sum");
-    let float_summed = call(
-        &mut interp,
-        &context,
-        3,
-        smallvec![float_array, Value::number_i32(4)],
-    )
+    let float_summed = call(&mut interp, &context, 3, |i| {
+        smallvec![rooted(i, float_array), Value::number_i32(4)]
+    })
     .expect("optimized float sum");
-    let many_summed = call(
-        &mut interp,
-        &context,
-        4,
+    let many_summed = call(&mut interp, &context, 4, |i| {
         smallvec![
-            many_arrays[0],
-            many_arrays[1],
-            many_arrays[2],
-            many_arrays[3],
+            rooted(i, many_arrays[0]),
+            rooted(i, many_arrays[1]),
+            rooted(i, many_arrays[2]),
+            rooted(i, many_arrays[3]),
             Value::number_i32(4),
-        ],
-    )
+        ]
+    })
     .expect("optimized many-array sum");
     let thrown = format!(
         "{:?}",
-        call(
-            &mut interp,
-            &context,
-            1,
-            smallvec![Value::null(), Value::number_i32(0)],
-        )
+        call(&mut interp, &context, 1, |_| smallvec![
+            Value::null(),
+            Value::number_i32(0)
+        ],)
         .expect_err("null element load must throw")
     );
     (
@@ -440,14 +433,13 @@ fn float_array_loop_enters_optimized_code() {
             )
             .expect("float array allocation"),
     );
+    let array = root(&mut interp, array);
     for _ in 0..4010 {
         assert_eq!(
-            call(
-                &mut interp,
-                &context,
-                3,
-                smallvec![array, Value::number_i32(4)],
-            )
+            call(&mut interp, &context, 3, |i| smallvec![
+                rooted(i, array),
+                Value::number_i32(4)
+            ],)
             .expect("float loop warmup")
             .to_bits(),
             Value::number_f64(12.75).to_bits()
@@ -468,26 +460,22 @@ fn several_live_arrays_enter_optimized_code() {
         .link_module(fixture_module())
         .expect("valid bytecode fixture");
     let arrays = [[1, 2, 3, 4], [10, 20, 30, 40], [2, 4, 6, 8], [1, 2, 3, 4]].map(|elements| {
-        Value::array(
+        let array = Value::array(
             interp
                 .array_from_elements_host_rooted(elements.map(Value::number_i32), &[], &[])
                 .expect("many-array allocation"),
-        )
+        );
+        root(&mut interp, array)
     });
     for _ in 0..4010 {
         assert_eq!(
-            call(
-                &mut interp,
-                &context,
-                4,
-                smallvec![
-                    arrays[0],
-                    arrays[1],
-                    arrays[2],
-                    arrays[3],
-                    Value::number_i32(4),
-                ],
-            )
+            call(&mut interp, &context, 4, |i| smallvec![
+                rooted(i, arrays[0]),
+                rooted(i, arrays[1]),
+                rooted(i, arrays[2]),
+                rooted(i, arrays[3]),
+                Value::number_i32(4),
+            ],)
             .expect("many-array loop warmup")
             .to_bits(),
             Value::number_i32(140).to_bits()
@@ -514,11 +502,15 @@ fn source_element_load_enters_optimized_code() {
                       return values[index];
                     }
                     globalThis.values = [1, 2.5, 3, 4.5];
-                    let warmSource = "";
-                    for (let i = 0; i < 4010; i++) {
-                      warmSource += "hotElement(values, 0);";
+                    // A compiled hot caller reaches the callee through generated
+                    // linkage; interpreted straight-line calls never repay a
+                    // native entry transition for a body this small.
+                    function warmElement() {
+                      let total = 0;
+                      for (let i = 0; i < 4010; i++) total += hotElement(values, 0);
+                      return total;
                     }
-                    eval(warmSource);
+                    warmElement();
                 "#,
             ),
             "optimizing-source-load-element.js",
@@ -564,11 +556,14 @@ fn source_tagged_array_chain_enters_optimized_code() {
                     globalThis.chainB = [0];
                     globalThis.chainC = [0];
                     globalThis.chainD = [42.5];
-                    let warmChain = "";
-                    for (let i = 0; i < 4010; i++) {
-                      warmChain += "hotTaggedChain(chainA, chainB, chainC, chainD, 0);";
+                    function warmChain() {
+                      let total = 0;
+                      for (let i = 0; i < 4010; i++) {
+                        total += hotTaggedChain(chainA, chainB, chainC, chainD, 0);
+                      }
+                      return total;
                     }
-                    eval(warmChain);
+                    warmChain();
                 "#,
             ),
             "optimizing-source-tagged-chain.js",

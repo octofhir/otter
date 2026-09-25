@@ -398,23 +398,26 @@ fn assert_machine_property_artifact(
         proven_pcs.len() >= shape_proven_loads,
         "{function_name} must expose {shape_proven_loads} shape-proven loads: {code_map}"
     );
-    for (kind, cold_kind, generated_minimum, minimum) in [
+    // Own-data loads share one hidden-class dispatch; other CacheIR load
+    // programs keep their explicit field read.
+    for (kinds, cold_kind, generated_minimum, minimum) in [
         (
-            "machineCacheIrLoadField",
+            &["machinePolymorphicPropertyLoad", "machineCacheIrLoadField"][..],
             "machinePropertyLoadCold",
             cache_ir_loads,
             cold_loads,
         ),
         (
-            "machineCacheIrStoreField",
+            &["machineCacheIrStoreField"][..],
             "machinePropertyStoreCold",
             stores,
             stores,
         ),
     ] {
+        let kind = kinds.join("|");
         let generated = regions
             .iter()
-            .filter(|region| region["kind"] == kind)
+            .filter(|region| kinds.iter().any(|kind| region["kind"] == *kind))
             .collect::<Vec<_>>();
         assert!(
             generated_minimum == 0 || !generated.is_empty(),

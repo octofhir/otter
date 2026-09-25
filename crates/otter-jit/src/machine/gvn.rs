@@ -358,6 +358,12 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             value_byte: *value_byte,
         },
+        MachineOpcode::PropertyPolymorphicLoad { cases, .. } => {
+            MachineOpcode::PropertyPolymorphicLoad {
+                byte_pc: 0,
+                cases: cases.clone(),
+            }
+        }
         MachineOpcode::PropertyMegamorphicLoad { atom, .. } => {
             MachineOpcode::PropertyMegamorphicLoad {
                 byte_pc: 0,

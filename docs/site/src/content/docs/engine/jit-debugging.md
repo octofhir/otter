@@ -434,8 +434,12 @@ Property regions transpile immutable CacheIR programs into
 `machineCacheIrLoadPrototype`, `machineCacheIrGuardPrototypeNull`,
 `machineCacheIrGuardExtensible`, `machineCacheIrLoadField`,
 `machineCacheIrStoreField`, `machineCacheIrPublishShape`, and
-`machineCacheIrWriteBarrier` regions. Unsupported programs use the fixed
-boxed-value boundary as a whole. A code-owned `propertySourceCell` carries only
+`machineCacheIrWriteBarrier` regions. The own-data programs of one load site
+(receiver shape guard, optional atom-slot guard, field read) instead share one
+`machinePolymorphicPropertyLoad` region: it decodes the receiver and loads its
+hidden class once, compares that class with every program's shape, and reads
+the matching slot. A miss enters the same committed cold load. Unsupported
+programs use the fixed boxed-value boundary as a whole. A code-owned `propertySourceCell` carries only
 function/logical-PC identity for that boundary; it never learns semantic proof
 data. Generated add transitions prove their complete prototype contract,
 receiver extensibility, exact append position, and existing storage capacity

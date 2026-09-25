@@ -339,13 +339,15 @@ impl MachineOpcode {
             Self::CacheIrLoadField { .. } | Self::PropertySlotLoad { .. } => {
                 MachineEffects::read(PROPERTY_FIELD, Value)
             }
-            Self::PropertyMegamorphicLoad { .. } => MachineEffects::read(
+            Self::PropertyPolymorphicLoad { .. } | Self::PropertyMegamorphicLoad { .. } => {
+                MachineEffects::read(
                 SHAPE
                     .union(PROPERTY_METADATA)
                     .union(PROPERTY_FIELD)
                     .union(PROTOTYPE),
                 Value,
-            ),
+                )
+            }
             Self::PropertyMegamorphicStore { .. } => MachineEffects {
                 reads: SHAPE.union(PROPERTY_METADATA).union(PROPERTY_FIELD),
                 writes: PROPERTY_FIELD,

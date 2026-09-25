@@ -823,6 +823,55 @@ pub(super) fn emit(
                 );
                 store_integer(&mut ops, frame, loc[0], 11)?;
             }
+            MachineOpcode::PropertyPolymorphicLoad { byte_pc, ref cases } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let hit = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
+                shape_state_guard(&mut ops, view, miss);
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r9d, [r11 + view.object_shape_byte as i32]
+                    ; test r9d, r9d
+                    ; jz =>miss
+                );
+                let labels = cases
+                    .iter()
+                    .map(|_| ops.new_dynamic_label())
+                    .collect::<Vec<_>>();
+                for (case, &label) in cases.iter().zip(&labels) {
+                    dynasm!(ops ; .arch x64 ; cmp r9d, case.shape as i32 ; je =>label);
+                }
+                dynasm!(ops ; .arch x64 ; jmp =>miss);
+                for (case, &label) in cases.iter().zip(&labels) {
+                    dynasm!(ops ; .arch x64 ; =>label);
+                    if case.ordinary {
+                        dynasm!(ops
+                            ; .arch x64
+                            ; cmp BYTE [r11 + view.object_slot_attrs_overridden_byte as i32], 0
+                            ; jne =>miss
+                        );
+                    }
+                    slab_base(&mut ops, view, miss);
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r8, [r8 + case.value_byte as i32]
+                        ; jmp =>hit
+                    );
+                }
+                dynasm!(ops ; .arch x64 ; =>hit ; mov r9d, 1 ; jmp =>done ; =>miss);
+                load64(&mut ops, 8, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; xor r9d, r9d ; =>done);
+                store_integer(&mut ops, frame, loc[1], 8)?;
+                store_integer(&mut ops, frame, loc[2], 9)?;
+                structural_regions.push((
+                    "machinePolymorphicPropertyLoad",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::PropertyMegamorphicLoad { byte_pc, atom } => {
                 let start = ops.offset().0;
                 megamorphic_property::emit(&mut ops, &mut relocations, view, frame, loc, atom)?;

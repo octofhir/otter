@@ -66,7 +66,8 @@ for (var i=0;i<70000;i++) caller(a,(i&1)?b2:b,mark);
         "dot must have no native call descriptor: {ir}"
     );
     assert!(
-        ir.matches("CacheIrLoadField {").count() >= 6,
+        ir.matches("CacheIrLoadField {").count() + ir.matches("PolymorphicPropertyCase {").count()
+            >= 6,
         "callee field reads must exist: {ir}"
     );
     let before = runtime.execution_stats();

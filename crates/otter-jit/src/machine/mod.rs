@@ -719,6 +719,17 @@ fn is_caught_throw_acknowledgement_target(descriptor: &CallDescriptor) -> bool {
     )
 }
 
+/// One receiver hidden class of a polymorphic own-data property load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolymorphicPropertyCase {
+    /// Stable compressed hidden-class token; never zero.
+    pub shape: u32,
+    /// Byte offset of the data slot inside the receiver's value slab.
+    pub value_byte: u32,
+    /// Whether the case also requires ordinary named-lookup state.
+    pub ordinary: bool,
+}
+
 /// Target-neutral name of a selected machine operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineOpcode {
@@ -1096,6 +1107,15 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Byte offset inside the object's value slab.
         value_byte: u32,
+    },
+    /// Decode an ordinary fast receiver once and dispatch on its hidden class
+    /// over every own-data program of one load site. A matched case reads its
+    /// slot; no match returns undefined/false without effects.
+    PropertyPolymorphicLoad {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Receiver hidden classes in program order, each with its slot.
+        cases: Box<[PolymorphicPropertyCase]>,
     },
     /// Probe the isolate's existing shape/atom table and read a live own or
     /// direct-prototype data slot. Miss returns undefined/false without effects.
@@ -2412,6 +2432,7 @@ impl InstructionSequence {
                         }
                     }
                     MachineOpcode::ExoticLength { .. }
+                    | MachineOpcode::PropertyPolymorphicLoad { .. }
                     | MachineOpcode::PropertyMegamorphicLoad { .. } => {
                         let [receiver, payload, hit] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2419,6 +2440,12 @@ impl InstructionSequence {
                         if matches!(
                             instruction.opcode,
                             MachineOpcode::PropertyMegamorphicLoad { atom: u32::MAX, .. }
+                        ) || matches!(
+                            &instruction.opcode,
+                            MachineOpcode::PropertyPolymorphicLoad { cases, .. }
+                                if cases.is_empty() || cases.iter().any(|case| {
+                                    case.shape == 0 || case.value_byte % 8 != 0
+                                })
                         ) || *receiver != MachineOperand::location_input(receiver.value)
                             || self.representations[receiver.value.0 as usize]
                                 != MachineRepresentation::Tagged

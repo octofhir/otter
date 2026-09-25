@@ -410,6 +410,76 @@ mod tests {
     }
 
     #[test]
+    fn polymorphic_own_data_load_decodes_once_and_dispatches_every_shape() {
+        use otter_vm::{JitCacheIrOp, JitCacheIrProgram};
+        let own = |shape, value_byte, ordinary: bool| {
+            let mut ops = vec![JitCacheIrOp::GuardShape { object: 0, shape }];
+            if ordinary {
+                ops.push(JitCacheIrOp::GuardAtomSlot {
+                    object: 0,
+                    atom: 5,
+                    value_byte,
+                    writable: false,
+                });
+            }
+            ops.push(JitCacheIrOp::LoadField {
+                object: 0,
+                value_byte,
+            });
+            JitCacheIrProgram {
+                ops: ops.into_boxed_slice(),
+            }
+        };
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let mut hir = super::super::tests::property_selection_hir();
+            let site = hir.property_sites.get_mut(&hir::NumericValue(2)).unwrap();
+            site.program =
+                vec![own(7, 8, false), own(9, 16, true), own(11, 24, false)].into_boxed_slice();
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+                .expect("polymorphic property selection");
+            let loads = sequence
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        instruction.opcode,
+                        MachineOpcode::PropertyPolymorphicLoad { byte_pc: 24, .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            let [load] = loads.as_slice() else {
+                panic!("one dispatch per site: {loads:?}");
+            };
+            let MachineOpcode::PropertyPolymorphicLoad { cases, .. } = &load.opcode else {
+                unreachable!();
+            };
+            assert_eq!(
+                cases
+                    .iter()
+                    .map(|case| (case.shape, case.value_byte, case.ordinary))
+                    .collect::<Vec<_>>(),
+                [(7, 8, false), (9, 16, true), (11, 24, false)]
+            );
+            assert_eq!(
+                load.clobbers,
+                target.clobbers(TargetClobberSet::PropertyLoad)
+            );
+            assert!(load.safepoint.is_none() && load.exits.is_empty());
+            let effects = load.opcode.effects();
+            assert!(effects.writes.is_empty());
+            assert!(!effects.allocates && !effects.reentrant && !effects.safepoint);
+            assert!(!sequence.instructions().iter().any(|instruction| matches!(
+                instruction.opcode,
+                MachineOpcode::CacheIrGuardShape { byte_pc: 24, .. }
+                    | MachineOpcode::CacheIrLoadField { byte_pc: 24, .. }
+            )));
+            sequence
+                .allocate(&target)
+                .expect("polymorphic register allocation");
+        }
+    }
+
+    #[test]
     fn megamorphic_store_commits_once_before_the_existing_cold_call() {
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
             let mut hir = super::super::tests::property_selection_hir();

@@ -9,6 +9,9 @@
 //!   interpreter stack indices to the JIT.
 //! - Only a baseline frame is asked to relink: its registers already live in
 //!   the interpreter window, so resuming at the loop header replays nothing.
+//! - A poll from any other frame runs under an always-allocate scope: the
+//!   frame's live registers are not rooted at the poll, so tier-up work that
+//!   allocates must not start a collection.
 //!
 //! # See also
 //! - `Interpreter::take_backedge_relink` owns the relink decision.
@@ -39,9 +42,14 @@ impl RuntimeCall<'_> {
         // short operation and retains only a raw descriptor afterwards.
         let context = &self.context;
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let checkpoint = vm.jit_backedge_poll(context)?;
         // SAFETY: the polling frame stays published for this call.
         let header = unsafe { self.frame.as_ref() }.header;
+        // An optimizing frame reaches this poll without a safepoint: its live
+        // tagged registers are not rooted. Tier-up work the poll performs may
+        // allocate, so it must not collect while that frame is suspended here.
+        let _no_collection =
+            (header.kind != NativeFrameKind::Baseline).then(|| vm.gc_heap.always_allocate_scope());
+        let checkpoint = vm.jit_backedge_poll(context)?;
         if header.kind == NativeFrameKind::Baseline
             && vm.take_backedge_relink(context, header.function_id)
         {

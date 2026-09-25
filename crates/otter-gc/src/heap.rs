@@ -288,6 +288,11 @@ pub struct GcHeap {
     /// the same rooting contract; delaying stress would hide initialization
     /// roots that are just as load-bearing as runtime roots.
     gc_stress_armed: bool,
+    /// Open [`AlwaysAllocateScope`]s. While non-zero, allocation never starts
+    /// a collection: a full nursery overflows into old space, due major and
+    /// stress collections wait, and the byte cap is checked without an
+    /// emergency collection.
+    always_allocate_depth: u32,
     stats: HeapStats,
     gc_stats: GcStats,
     /// Cooperative-cancellation flag; flipped to `true` when the
@@ -297,6 +302,22 @@ pub struct GcHeap {
     /// the alloc is **never** materialised on a cap miss
     /// (architecture plan §2.1 caveat).
     oom_flag: Arc<AtomicBool>,
+}
+
+/// RAII guard returned by [`GcHeap::always_allocate_scope`].
+#[must_use = "dropping the scope immediately re-enables collection"]
+pub struct AlwaysAllocateScope {
+    heap: *mut GcHeap,
+}
+
+impl Drop for AlwaysAllocateScope {
+    fn drop(&mut self) {
+        // SAFETY: the heap outlives every scope opened on it; scopes nest.
+        unsafe {
+            (*self.heap).always_allocate_depth =
+                (*self.heap).always_allocate_depth.saturating_sub(1);
+        }
+    }
 }
 
 /// Debug-only stale-handle trap. A live handle is always updated to its
@@ -433,6 +454,7 @@ impl GcHeap {
             gc_stress_full,
             gc_stress_counter: 0,
             gc_stress_armed: gc_stress_stride != 0,
+            always_allocate_depth: 0,
             oom_flag: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -466,6 +488,26 @@ impl GcHeap {
     ) {
         self.frame_root_providers
             .push_scope_slot(owner, slot, tracer);
+    }
+
+    /// Whether an allocation-driven stress collection may run now.
+    fn stress_collection_armed(&self) -> bool {
+        self.gc_stress_stride != 0
+            && self.gc_stress_armed
+            && !self.in_major_gc
+            && self.always_allocate_depth == 0
+    }
+
+    /// Open a scope in which allocation never starts a collection.
+    ///
+    /// For VM work that must allocate while some mutator values are held
+    /// where no collector can see them, such as a compile requested from a
+    /// generated loop's back-edge poll whose live registers are not rooted.
+    /// Allocations still fail with an ordinary [`OutOfMemory`] when the cage
+    /// or the byte cap cannot satisfy them.
+    pub fn always_allocate_scope(&mut self) -> AlwaysAllocateScope {
+        self.always_allocate_depth = self.always_allocate_depth.saturating_add(1);
+        AlwaysAllocateScope { heap: self }
     }
 
     /// Truncate active frame-root providers back to `depth`.
@@ -809,6 +851,13 @@ impl GcHeap {
             self.tracked_bytes = projected;
             return Ok(());
         }
+        if self.always_allocate_depth != 0 {
+            self.oom_flag.store(true, Ordering::Relaxed);
+            return Err(OutOfMemory::HeapCapExceeded {
+                requested_bytes: bytes,
+                heap_limit_bytes: cap,
+            });
+        }
         self.collect_full(external_visit)?;
         self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
         let projected = self.tracked_bytes.saturating_add(bytes);
@@ -1140,7 +1189,7 @@ impl GcHeap {
     #[doc(hidden)]
     pub fn machine_allocation_window<T: Traceable>(&mut self) -> MachineAllocationWindow {
         if self.tenure_all
-            || (self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc)
+            || (self.stress_collection_armed())
             || self.major_gc_due()
             || self.marking.is_marking()
         {
@@ -1216,7 +1265,7 @@ impl GcHeap {
         if self.tenure_all {
             return Err(value);
         }
-        if self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc {
+        if self.stress_collection_armed() {
             return Err(value);
         }
         if self.major_gc_due() {
@@ -1365,7 +1414,7 @@ impl GcHeap {
         // a moved object and fails deterministically. Off unless
         // `OTTER_GC_STRESS` is set. `allocation_roots` keeps the pending
         // payload + caller's roots safe; everything else is meant to move.
-        if self.gc_stress_stride != 0 && self.gc_stress_armed && !self.in_major_gc {
+        if self.stress_collection_armed() {
             self.gc_stress_counter = self.gc_stress_counter.saturating_add(1);
             if self.gc_stress_counter >= self.gc_stress_stride {
                 self.gc_stress_counter = 0;
@@ -1404,6 +1453,10 @@ impl GcHeap {
             // Try young-gen first; if full, scavenge then retry.
             match self.new_space.alloc(aligned) {
                 Some(off) => off,
+                None if self.always_allocate_depth != 0 => {
+                    placed_in_old = true;
+                    self.old_space.alloc(aligned)?
+                }
                 None => {
                     // Trigger scavenge with caller-supplied
                     // external roots; handle stack + globals are
@@ -1849,7 +1902,7 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        if !self.major_gc_due() {
+        if self.always_allocate_depth != 0 || !self.major_gc_due() {
             return Ok(());
         }
         let occupancy = self.major_gc_occupancy_bytes();
@@ -2745,6 +2798,31 @@ mod tests {
             Ok(_) => panic!("allocation should not fit under the cap"),
             Err(returned) => assert_eq!(returned.payload, 42),
         }
+    }
+
+    #[test]
+    fn always_allocate_scope_never_collects() {
+        let mut heap = GcHeap::new().expect("heap");
+        heap.gc_stress_stride = 1;
+        heap.gc_stress_armed = true;
+        let before = (heap.gc_stats().minor_gc_cycles, heap.gc_stats().gc_cycles);
+        let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        {
+            let _scope = heap.always_allocate_scope();
+            // Stride 1 would collect on every allocation, and this many
+            // leaves overflow the default nursery; neither may collect here.
+            for payload in 0..300_000 {
+                heap.alloc_with_roots(OpaqueLeaf { payload }, &mut noop)
+                    .expect("allocation inside the scope");
+            }
+            assert_eq!(
+                (heap.gc_stats().minor_gc_cycles, heap.gc_stats().gc_cycles),
+                before
+            );
+        }
+        heap.alloc_with_roots(OpaqueLeaf { payload: 0 }, &mut noop)
+            .expect("allocation after the scope");
+        assert!(heap.gc_stats().minor_gc_cycles > before.0);
     }
 
     #[test]

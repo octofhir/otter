@@ -38,6 +38,7 @@ use crate::Value;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::number::NumberValue;
 use crate::object::{self, PartialPropertyDescriptor};
+use crate::rooting::RootScopeExt;
 use crate::string::JsString;
 use crate::symbol::{WellKnown, WellKnownSymbols};
 use crate::{
@@ -1826,11 +1827,21 @@ impl Interpreter {
         roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         // §23.1.3.16 step 1 — O = ToObject(this value).
-        let o = if receiver.is_object_type() {
+        let mut o = if receiver.is_object_type() {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
         };
+        // `undefined` and an absent separator both select ",".
+        let mut separator_value = separator_arg.unwrap_or(Value::undefined());
+        // The length accessor, the separator's ToString and every element's
+        // ToString may run user code that allocates and scavenges.
+        let mut join_roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: both slots precede the scope and stay in place until it drops.
+        unsafe {
+            join_roots.add_value(&mut o);
+            join_roots.add_value(&mut separator_value);
+        }
         // §23.1.3.16 step 2 — len = ? LengthOfArrayLike(O). Reads
         // `O.length` through `[[Get]]`, so a `get length()` accessor
         // fires here exactly once.
@@ -1839,13 +1850,11 @@ impl Interpreter {
         // : ? ToString(separator). Ordered AFTER the length read.
         // Kept as UTF-16 units end to end: a lossy Rust-string detour would
         // replace lone surrogates with U+FFFD, which join must preserve.
-        let separator: Vec<u16> = match separator_arg {
-            None => vec![b',' as u16],
-            Some(v) if v.is_undefined() => vec![b',' as u16],
-            Some(v) => {
-                let js = crate::coerce::to_js_string_or_throw(self, stack, context, &v)?;
-                js.to_utf16_vec(&self.gc_heap)
-            }
+        let separator: Vec<u16> = if separator_value.is_undefined() {
+            vec![b',' as u16]
+        } else {
+            let js = crate::coerce::to_js_string_or_throw(self, stack, context, &separator_value)?;
+            js.to_utf16_vec(&self.gc_heap)
         };
         // Allocation is bounded by `MAX_ARRAY_LIKE_PROBE_LEN`, matching
         // `impl_join`, so a pathological `length` (`2**32`) never sizes a
@@ -1893,8 +1902,14 @@ impl Interpreter {
                 Some(elems)
             })
         });
-        if let Some(elems) = dense_snapshot {
-            for (k, v) in elems.into_iter().enumerate() {
+        if let Some(mut elems) = dense_snapshot {
+            // An element's ToString can scavenge; the not-yet-visited snapshot
+            // values must follow their cells.
+            let mut element_roots = otter_gc::RootScope::new(&mut self.gc_heap);
+            // SAFETY: `elems` precedes the scope and never reallocates under it.
+            unsafe { element_roots.add_value_vec(&mut elems) };
+            for k in 0..elems.len() {
+                let v = elems[k];
                 if v.is_hole() || v.is_undefined() || v.is_null() {
                     continue;
                 }

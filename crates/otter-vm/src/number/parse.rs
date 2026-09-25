@@ -8,6 +8,8 @@
 //!
 //! # Contents
 //! - [`to_number_from_string`] — §7.1.4 string → Number coercion.
+//! - [`to_number_from_js_string`] — the same over a heap string, parsing an
+//!   all-ASCII Latin-1 body without a copy.
 //! - [`to_number_value`] — §7.1.4 Value → Number coercion (used by
 //!   global `isNaN` / `isFinite` after their ToNumber step).
 //! - [`parse_int`] — §19.2.5 ParseInt(string, radix).
@@ -104,18 +106,38 @@ pub fn to_number_from_string(text: &str) -> NumberValue {
     // `f64::parse` is case-insensitive and also accepts `inf` / `nan`,
     // so reject any case-folded "infinity" / "inf" / "nan" variant
     // that did not already match the spec-exact constants.
-    let folded = trimmed.to_ascii_lowercase();
-    let stripped = folded
+    let stripped = trimmed
         .strip_prefix('+')
-        .or_else(|| folded.strip_prefix('-'))
-        .unwrap_or(&folded);
-    if matches!(stripped, "infinity" | "inf" | "nan") {
+        .or_else(|| trimmed.strip_prefix('-'))
+        .unwrap_or(trimmed);
+    if ["infinity", "inf", "nan"]
+        .iter()
+        .any(|word| stripped.eq_ignore_ascii_case(word))
+    {
         return NumberValue::Double(f64::NAN);
     }
     match trimmed.parse::<f64>() {
         Ok(d) => NumberValue::Double(d).canonicalize(),
         Err(_) => NumberValue::Double(f64::NAN),
     }
+}
+
+/// §7.1.4 ToNumber over a JavaScript string. An all-ASCII Latin-1 body is
+/// parsed in place; any other body is widened once for the general parser.
+#[must_use]
+pub fn to_number_from_js_string(string: crate::JsString, heap: &otter_gc::GcHeap) -> NumberValue {
+    string
+        .with_latin1(heap, |bytes| {
+            // Every StringNumericLiteral character outside StrWhiteSpace is
+            // ASCII; a non-ASCII Latin-1 byte (such as NBSP) takes the
+            // general path.
+            bytes.is_ascii().then(|| {
+                // SAFETY: ASCII bytes are valid UTF-8.
+                to_number_from_string(unsafe { std::str::from_utf8_unchecked(bytes) })
+            })
+        })
+        .flatten()
+        .unwrap_or_else(|| to_number_from_string(&string.to_lossy_string(heap)))
 }
 
 fn parse_radix_digits(digits: &str, radix: u32) -> NumberValue {
@@ -151,7 +173,7 @@ pub fn to_number_value(value: &Value, heap: &otter_gc::GcHeap) -> f64 {
     } else if value.is_undefined() {
         f64::NAN
     } else if let Some(s) = value.as_string(heap) {
-        match to_number_from_string(&s.to_lossy_string(heap)) {
+        match to_number_from_js_string(s, heap) {
             NumberValue::Smi(v) => v as f64,
             NumberValue::Double(d) => d,
         }
@@ -394,5 +416,45 @@ mod tests {
             NumberValue::Double(d) => assert!((d - 1.5).abs() < 1e-12),
             other => panic!("expected Double, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn heap_string_parse_matches_the_text_parser_for_every_body() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let latin1_nbsp = "\u{a0}12\u{a0}";
+        let utf16 = "\u{2003}0x1F\u{2003}";
+        for text in [
+            "42",
+            " 17 ",
+            "1.5",
+            "-0",
+            "0x1F",
+            "0b101",
+            "1e3",
+            "",
+            "Infinity",
+            "-Infinity",
+            "infinity",
+            "INF",
+            "+nan",
+            "NaN",
+            "foo",
+            "1_000",
+            latin1_nbsp,
+            utf16,
+        ] {
+            let string = crate::JsString::from_str(text, &mut heap).expect("heap string");
+            let parsed = to_number_from_js_string(string, &heap);
+            let expected = to_number_from_string(text);
+            assert_eq!(
+                parsed.as_f64().to_bits(),
+                expected.as_f64().to_bits(),
+                "{text:?}"
+            );
+        }
+        let nbsp = crate::JsString::from_str(latin1_nbsp, &mut heap).expect("heap string");
+        assert_eq!(to_number_from_js_string(nbsp, &heap), NumberValue::Smi(12));
+        let wide = crate::JsString::from_str(utf16, &mut heap).expect("heap string");
+        assert_eq!(to_number_from_js_string(wide, &heap), NumberValue::Smi(31));
     }
 }

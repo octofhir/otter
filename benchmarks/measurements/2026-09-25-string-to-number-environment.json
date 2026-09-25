@@ -1,0 +1,56 @@
+{
+  "baseEngineCommit": "8bd47e4a9e1191363472ce16232c6df61cda6271",
+  "candidateEngine": "ToNumber(string) parses an all-ASCII Latin-1 heap string in place (to_number_from_js_string) and no longer lower-cases the literal to reject inf/nan spellings.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "sources": {
+    "mixed-relational": {
+      "path": "benchmarks/scripts/mixed-relational.js",
+      "sha256": "3c0d20c1e0a10c5caea05f8616e11f0a882ee38fc05305b0dee4d1773dbd2d40",
+      "expected": 4787500
+    },
+    "string-concat": {
+      "path": "benchmarks/scripts/string-concat.js",
+      "sha256": "68210e34b0543d9ed84b028b60d37cca1eff5ab4cbb80aed968892da1131a137",
+      "expected": 600000
+    },
+    "polluted-feedback": {
+      "path": "benchmarks/scripts/polluted-feedback.js",
+      "sha256": "0f3f1abc0f29e1f952209fbd7b0b5a5641745175105a50f1b2684a4609d4c303",
+      "expected": 4287494
+    }
+  },
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "d7d3f0b9c12f6a7f06f5ced1f889ec3ad0c8648ec45ea58296ea0fb36da312f2",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "99f5fbfdd2275ce2f3b700e7e778afca839d47e911c738548dd84ca37bfc8bb4",
+    "afterIsFullGateBuild": true
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/<kernel>.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "<checksum>",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per kernel and tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series. Load average about 2.8.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "excludedFromResult": [
+    "development quick measurements"
+  ]
+}

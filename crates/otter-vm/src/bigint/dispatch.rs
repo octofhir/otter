@@ -204,7 +204,7 @@ fn expect_bits(arg: Option<&Value>, interp: &crate::Interpreter) -> Result<u32, 
     } else if let Some(b) = v.as_boolean() {
         if b { 1.0 } else { 0.0 }
     } else if let Some(s) = v.as_string(interp.gc_heap()) {
-        crate::number::parse::to_number_from_string(&s.to_lossy_string(interp.gc_heap())).as_f64()
+        crate::number::to_number_from_js_string(s, interp.gc_heap()).as_f64()
     } else if v.is_symbol() {
         return Err(
             interp.err_type(("Cannot convert a Symbol value to a number".to_string()).into())

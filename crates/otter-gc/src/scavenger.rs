@@ -304,9 +304,7 @@ pub unsafe fn scavenge(
     // 9) Flip from↔to.
     ctx.new_space().flip();
 
-    let stats = ctx.stats;
-    ctx.old_space().release_unused_promotion_pages();
-    Ok(stats)
+    Ok(ctx.stats)
 }
 
 /// Run reclamation hooks for every young body that was not evacuated.

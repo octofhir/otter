@@ -21,6 +21,9 @@
 //! - Old allocation reuses swept holes, then available page tails. Promotion
 //!   preflight guarantees capacity before the first forwarding write; existing
 //!   contiguous tail space can satisfy that guarantee without standby pages.
+//! - Unused standby pages stay reserved across scavenges, so a steady nursery
+//!   cycle neither zeroes nor re-faults promotion pages. A full collection's
+//!   page reap returns them to the cage.
 //!
 //! # See also
 //!
@@ -347,7 +350,8 @@ pub struct OldSpace {
     /// out of the bump scan preserves the partially-filled tail page as
     /// the primary bump target across scavenges (appending reserves to
     /// `pages` used to bury it behind fresh empties, leaking one
-    /// near-empty page per scavenge).
+    /// near-empty page per scavenge). Unused pages stay here for the next
+    /// scavenge and return to the cage when a full collection reaps pages.
     standby: Vec<Page>,
 }
 
@@ -443,8 +447,10 @@ impl OldSpace {
     ///
     /// `max_promotion_bytes` bounds all bytes that may be promoted, including
     /// descendants. When the newest page can hold that entire bound, its tail
-    /// already proves capacity: reserving and immediately releasing empty
-    /// pages would only zero memory and call the OS on every tiny scavenge.
+    /// already proves capacity. Pages still held from an earlier reservation
+    /// count toward `count`; only the shortfall comes from the cage, because
+    /// returning a page zeroes it and advises the OS, and the next reservation
+    /// would fault it back in.
     pub(crate) fn reserve_promotion_pages(
         &mut self,
         count: usize,
@@ -457,14 +463,19 @@ impl OldSpace {
         {
             return Ok(());
         }
-        let reserved = Page::new_many(SpaceKind::Old, count).ok_or(OutOfMemory::CageExhausted)?;
+        let missing = count.saturating_sub(self.standby.len());
+        if missing == 0 {
+            return Ok(());
+        }
+        let reserved = Page::new_many(SpaceKind::Old, missing).ok_or(OutOfMemory::CageExhausted)?;
         self.standby.extend(reserved);
         Ok(())
     }
 
-    /// Drop every unused standby page back to the cage after a scavenge.
-    pub(crate) fn release_unused_promotion_pages(&mut self) {
-        self.standby.clear();
+    /// Empty pages currently held for promotion.
+    #[must_use]
+    pub fn standby_page_count(&self) -> usize {
+        self.standby.len()
     }
 
     /// Take ownership of a page whose objects are already live.
@@ -506,9 +517,11 @@ impl OldSpace {
 
     /// Drop pages whose `live_bytes` is zero after a sweep.
     /// Returns the number of pages reclaimed.
+    /// Return fully dead pages and every unused standby page to the cage.
     pub fn reap_dead_pages(&mut self) -> usize {
         let before = self.pages.len();
         self.pages.retain(|p| p.header().live_bytes > 0);
+        self.standby.clear();
         before - self.pages.len()
     }
 }
@@ -663,8 +676,44 @@ mod tests {
         // …so the next allocation keeps filling the same tail page.
         let second = old.alloc(64).expect("second alloc");
         assert_eq!(second, first + 64, "tail page keeps filling");
-        old.release_unused_promotion_pages();
-        assert_eq!(old.page_count(), pages_after_first);
+        old.reap_dead_pages();
+        assert!(old.standby.is_empty());
+    }
+
+    #[test]
+    fn standby_pages_survive_scavenges_until_a_full_reap() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        ensure_cage();
+        let mut old = OldSpace::new();
+        old.alloc(64).expect("tail page");
+        old.reserve_promotion_pages(3, PAGE_PAYLOAD_SIZE * 3)
+            .expect("reserve");
+        assert_eq!(old.standby.len(), 3);
+        let free_before = crate::compressed::cage_stats()
+            .expect("cage stats")
+            .free_pages;
+        // The next scavenge's reservation is covered by the held pages and
+        // takes nothing from the cage; a larger one takes only the shortfall.
+        old.reserve_promotion_pages(3, PAGE_PAYLOAD_SIZE * 3)
+            .expect("reuse");
+        assert_eq!(old.standby.len(), 3);
+        old.reserve_promotion_pages(4, PAGE_PAYLOAD_SIZE * 4)
+            .expect("shortfall");
+        assert_eq!(old.standby.len(), 4);
+        assert_eq!(
+            crate::compressed::cage_stats()
+                .expect("cage stats")
+                .free_pages,
+            free_before - 1
+        );
+        let reaped = old.reap_dead_pages();
+        assert!(old.standby.is_empty());
+        assert_eq!(
+            crate::compressed::cage_stats()
+                .expect("cage stats")
+                .free_pages,
+            free_before + 3 + reaped
+        );
     }
 
     #[test]
@@ -698,7 +747,7 @@ mod tests {
         old.reserve_promotion_pages(2, CELL_SIZE)
             .expect("exhausted tail reserves");
         assert_eq!(old.standby.len(), 2);
-        old.release_unused_promotion_pages();
+        old.reap_dead_pages();
         assert!(old.standby.is_empty());
     }
 

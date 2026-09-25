@@ -256,7 +256,9 @@ impl MachineOpcode {
             | Self::BooleanOr
             | Self::TaggedSelect
             | Self::NativeInt32Math { .. }
-            | Self::CacheIrJoin { .. } => MachineEffects::PURE_VALUE,
+            | Self::CacheIrJoin { .. }
+            // Decodes value bits only: a cell operand misses without a load.
+            | Self::BinaryNumberProbe { .. } => MachineEffects::PURE_VALUE,
 
             Self::DecodeNumber | Self::DecodeInt32 | Self::GuardCondition => {
                 MachineEffects::PURE_GUARD

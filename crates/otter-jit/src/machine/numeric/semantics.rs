@@ -27,7 +27,7 @@ use otter_bytecode::{
 };
 use otter_vm::{
     JitCompileSnapshot,
-    native_abi::{ObjectProtocolValueOp, ScalarValueOp},
+    native_abi::{ExitReason, ObjectProtocolValueOp, ScalarValueOp},
 };
 
 const EFFECTS_NONE: OpcodeEffects = OpcodeEffects {
@@ -114,7 +114,9 @@ fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<Commit
         Op::LoadNewTarget => CommittedValueOperation::Scalar(ScalarValueOp::LoadNewTarget),
         Op::SameValue => CommittedValueOperation::Scalar(ScalarValueOp::SameValue),
         Op::BindThisValue => CommittedValueOperation::Scalar(ScalarValueOp::BindThisValue),
-        _ => return None,
+        _ => CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::Binary(
+            otter_vm::native_abi::BinaryOperator::from_opcode(op)?,
+        )),
     })
 }
 
@@ -133,14 +135,34 @@ fn classify_instruction(
     // Only observed numeric operands justify numeric speculation. Unseen or
     // coercive sites retain a generated comparison proof with one committed
     // cold sibling, so their first real operands cannot start a deopt loop.
+    // A binary arithmetic or relational site that observed a non-numeric
+    // operand completes through the committed generic operator: unseen sites
+    // keep the exact numeric decode, and primitive-string `+` its concat node
+    // until that node exits once.
     let committed_value = opcode_schema(op)
         .global_declaration
         .map(CommittedValueOperation::GlobalDeclaration)
         .or_else(|| {
-            committed_value_operation(op, view.derived_constructor).filter(|_| {
-                !matches!(op, Op::LooseEqual | Op::LooseNotEqual) || {
-                    let feedback = instruction.arith_feedback();
-                    !feedback.is_numeric_only()
+            committed_value_operation(op, view.derived_constructor).filter(|operation| {
+                let feedback = instruction.arith_feedback();
+                match operation {
+                    CommittedValueOperation::ObjectProtocol(
+                        ObjectProtocolValueOp::LooseEqual | ObjectProtocolValueOp::LooseNotEqual,
+                    ) => !feedback.is_numeric_only(),
+                    CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::Binary(_)) => {
+                        // A concat node that already exited on a non-String
+                        // pair must not be rebuilt: its site turns generic.
+                        let concat_exited = view
+                            .optimized_exit_reasons
+                            .get(&(logical_pc as u32))
+                            .is_some_and(|reasons| reasons.contains(&ExitReason::TypeMismatch));
+                        !feedback.is_numeric_only()
+                            && !feedback.is_empty()
+                            && !(op == Op::Add
+                                && feedback.is_primitive_string_concat_only()
+                                && !concat_exited)
+                    }
+                    _ => true,
                 }
             })
         });

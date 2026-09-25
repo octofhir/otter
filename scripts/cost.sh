@@ -36,6 +36,8 @@ KERNELS=(
   "property-polymorphic   80011800000"
   "native-boundary       27000000"
   "arith-exit-repair       150000"
+  "polluted-feedback      4287494"
+  "mixed-relational       4787500"
 )
 
 # Use Cargo's fresh artifact path, including configured target directories.

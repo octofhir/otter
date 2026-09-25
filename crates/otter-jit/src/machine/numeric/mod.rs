@@ -1828,6 +1828,18 @@ fn select_with_loop_entries(
                         ) => {
                             Some(super::committed_probe::ProbeKind::LooseEquality { equal: false })
                         }
+                        // `%` and `**` have no inline Number form; their
+                        // committed call is the whole operation.
+                        CommittedValueOperation::ObjectProtocol(
+                            otter_vm::native_abi::ObjectProtocolValueOp::Binary(operator),
+                        ) if !matches!(
+                            operator,
+                            otter_vm::native_abi::BinaryOperator::Rem
+                                | otter_vm::native_abi::BinaryOperator::Pow
+                        ) =>
+                        {
+                            Some(super::committed_probe::ProbeKind::BinaryNumber { operator })
+                        }
                         _ => None,
                     };
                     if let Some(probe) = probe

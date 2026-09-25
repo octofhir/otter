@@ -1650,12 +1650,14 @@ fn infer_instruction_parameters(
             if instruction
                 .arith_feedback()
                 .is_primitive_string_concat_only() => {}
+        // A site whose feedback saw a non-Number completes through the
+        // committed generic operator, so it proves nothing about its operands.
         Op::Add | Op::Sub | Op::Mul => {
             let left = read(0)?;
             let right = read(1)?;
             let mut inputs = left;
             inputs.extend(right);
-            if !instruction.arith_feedback().is_empty() {
+            if instruction.arith_feedback().is_numeric_only() {
                 number_parameters.extend(inputs.iter().copied());
             }
             if instruction.arith_feedback().is_int32_only() {
@@ -1676,7 +1678,7 @@ fn infer_instruction_parameters(
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             let mut inputs = read(0)?;
             inputs.extend(read(1)?);
-            if !instruction.arith_feedback().is_empty() {
+            if instruction.arith_feedback().is_numeric_only() {
                 number_parameters.extend(inputs.iter().copied());
             }
             if instruction.arith_feedback().is_int32_only() {
@@ -1692,15 +1694,14 @@ fn infer_instruction_parameters(
                 int32_parameters.extend(source);
             }
         }
-        Op::Div
-        | Op::Rem
-        | Op::Pow
-        | Op::BitwiseAnd
-        | Op::BitwiseOr
-        | Op::BitwiseXor
-        | Op::Shl
-        | Op::Shr
-        | Op::Ushr => {
+        Op::Div | Op::Rem | Op::Pow => {
+            let mut inputs = read(0)?;
+            inputs.extend(read(1)?);
+            if instruction.arith_feedback().is_numeric_only() {
+                number_parameters.extend(inputs);
+            }
+        }
+        Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
             let mut inputs = read(0)?;
             inputs.extend(read(1)?);
             if !instruction.arith_feedback().is_empty() {

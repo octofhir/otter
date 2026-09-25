@@ -25,6 +25,8 @@ mod inline_calls;
 mod loose_equality;
 #[path = "x86_64/megamorphic_property.rs"]
 mod megamorphic_property;
+#[path = "x86_64/number_probe.rs"]
+mod number_probe;
 
 pub(crate) use direct_call::{emit_generated_receiver_allocation, emit_increment_runtime_counter};
 
@@ -686,6 +688,21 @@ pub(super) fn emit(
                 );
                 structural_regions.push((
                     "machineLooseEqualityProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::BinaryNumberProbe { byte_pc, operator } => {
+                let start = ops.offset().0;
+                number_probe::emit(
+                    &mut ops,
+                    operator,
+                    [ireg(loc[0])?, ireg(loc[1])?],
+                    [ireg(loc[2])?, ireg(loc[3])?],
+                );
+                structural_regions.push((
+                    "machineBinaryNumberProbe",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

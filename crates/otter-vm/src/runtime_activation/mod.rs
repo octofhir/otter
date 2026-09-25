@@ -48,7 +48,9 @@ mod value_loads;
 mod value_ops;
 
 pub use class_ops::ClassRuntimeOp;
-pub use committed_values::{CommittedValueError, ObjectProtocolValueOp, ScalarValueOp};
+pub use committed_values::{
+    BinaryOperator, CommittedValueError, ObjectProtocolValueOp, ScalarValueOp,
+};
 pub use iterators::IteratorRuntimeOutcome;
 pub use value_loads::ValueLoadRuntimeOp;
 

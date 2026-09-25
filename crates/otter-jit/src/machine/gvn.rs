@@ -281,6 +281,10 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             equal: *equal,
         },
+        MachineOpcode::BinaryNumberProbe { operator, .. } => MachineOpcode::BinaryNumberProbe {
+            byte_pc: 0,
+            operator: *operator,
+        },
         MachineOpcode::TaggedNullishEqual { equal, .. } => MachineOpcode::TaggedNullishEqual {
             byte_pc: 0,
             equal: *equal,

@@ -244,6 +244,14 @@ Tagged loose comparisons with a static `null` or `undefined` operand expose a
 cases and ordinary cells complete without reentry; a native-function cell
 exact-deoptimizes before writing the Boolean result so HTMLDDA semantics remain
 canonical.
+Binary `+ - * / % **` and `< <= > >=` sites whose feedback observed a
+non-Number operand (and `+` sites whose primitive-String concat node already
+exited once) complete through the committed generic operator instead of
+declining the function. All but `%` and `**` first run `machineBinaryNumberProbe`:
+two Number operands finish there in IEEE double arithmetic with the ordinary
+`BoxNumber` result, and any other operand enters `machineCommittedValueEffect`
+once. Such a site never deoptimizes. Its operands prove nothing about parameter
+types, so a function taking a String argument has no Number entry guard.
 Other non-numeric or unseen loose comparisons expose `machineLooseEqualityProbe`.
 Identity, homogeneous Number, nullish-pair and ordinary object-pair proofs finish
 without calls. Uncertain or coercive operands enter `machineCommittedValueEffect`

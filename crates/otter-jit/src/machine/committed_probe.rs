@@ -1,7 +1,8 @@
 //! Explicit fast/cold CFG for committed operations with a generated probe.
 //!
 //! # Contents
-//! - [`expand`] splits derived-this and loose-equality calls before allocation.
+//! - [`expand`] splits derived-this, loose-equality and generic binary-operator
+//!   calls before allocation.
 //!
 //! # Invariants
 //! - Each probe owns its complete no-call proof and reports whether it finished.
@@ -29,7 +30,12 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeKind {
     DerivedThis,
-    LooseEquality { equal: bool },
+    LooseEquality {
+        equal: bool,
+    },
+    BinaryNumber {
+        operator: otter_vm::native_abi::BinaryOperator,
+    },
 }
 
 pub(super) fn expand(
@@ -65,7 +71,7 @@ pub(super) fn expand(
                 let kind = *sites.get(&index)?;
                 let expected = match kind {
                     ProbeKind::DerivedThis => otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
-                    ProbeKind::LooseEquality { .. } => {
+                    ProbeKind::LooseEquality { .. } | ProbeKind::BinaryNumber { .. } => {
                         otter_vm::native_abi::STUB_JIT_OBJECT_PROTOCOL_VALUE
                     }
                 };
@@ -87,7 +93,7 @@ pub(super) fn expand(
             if inputs.len()
                 != match kind {
                     ProbeKind::DerivedThis => 1,
-                    ProbeKind::LooseEquality { .. } => 2,
+                    ProbeKind::LooseEquality { .. } | ProbeKind::BinaryNumber { .. } => 2,
                 }
             {
                 return Err(VerificationError::InvalidEntry);
@@ -195,6 +201,19 @@ pub(super) fn expand(
                             MachineOperand::register_output(condition),
                         ],
                     ))
+                }
+                ProbeKind::BinaryNumber { operator } => {
+                    let mut probe = MachineInstruction::plain(
+                        MachineOpcode::BinaryNumberProbe { byte_pc, operator },
+                        vec![
+                            MachineOperand::register_input(inputs[0]),
+                            MachineOperand::register_input(inputs[1]),
+                            MachineOperand::register_output(fast_result),
+                            MachineOperand::register_output(condition),
+                        ],
+                    );
+                    probe.clobbers = target_spec.clobbers(TargetClobberSet::NumberProbe).to_vec();
+                    bodies[current].push(probe);
                 }
             }
             let mut branch = MachineInstruction::plain(

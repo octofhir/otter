@@ -879,6 +879,16 @@ pub enum MachineOpcode {
         /// True for ==, false for !=.
         equal: bool,
     },
+    /// No-call Number fast path of a committed generic binary operator:
+    /// tagged pair, tagged result, Boolean hit. Two Number operands complete
+    /// in IEEE double arithmetic; any other operand, and `%` / `**`, miss to
+    /// the canonical committed cold sibling.
+    BinaryNumberProbe {
+        /// Source bytecode offset for structural attribution.
+        byte_pc: u32,
+        /// The generic operator the committed site completes.
+        operator: otter_vm::native_abi::BinaryOperator,
+    },
     /// Invert canonical Boolean bits.
     BooleanNot,
     /// Compare one tagged value with a statically known `null` or `undefined`.
@@ -2597,7 +2607,9 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::TruthinessProbe | MachineOpcode::LooseEqualityProbe { .. } => {
+                    MachineOpcode::TruthinessProbe
+                    | MachineOpcode::LooseEqualityProbe { .. }
+                    | MachineOpcode::BinaryNumberProbe { .. } => {
                         let (input_count, result_type) =
                             if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {
                                 (1, MachineRepresentation::Boolean)
@@ -2629,7 +2641,15 @@ impl InstructionSequence {
                                     },
                                 );
                         if !valid
-                            || !instruction.clobbers.is_empty()
+                            || instruction.clobbers
+                                != if matches!(
+                                    instruction.opcode,
+                                    MachineOpcode::BinaryNumberProbe { .. }
+                                ) {
+                                    target_spec.clobbers(TargetClobberSet::NumberProbe)
+                                } else {
+                                    &[]
+                                }
                             || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()
                         {

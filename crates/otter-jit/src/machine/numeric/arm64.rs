@@ -94,6 +94,7 @@
 mod forward_call;
 mod loose_equality;
 mod megamorphic_property;
+mod number_probe;
 mod truthiness;
 mod value_span;
 use value_span::emit_value_span_arguments;
@@ -1740,6 +1741,27 @@ pub(super) fn emit(
                 );
                 structural_regions.push((
                     "machineLooseEqualityProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::BinaryNumberProbe { byte_pc, operator } => {
+                let start = ops.offset().0;
+                number_probe::emit(
+                    &mut ops,
+                    operator,
+                    [
+                        integer_register(locations[0])?,
+                        integer_register(locations[1])?,
+                    ],
+                    [
+                        integer_register(locations[2])?,
+                        integer_register(locations[3])?,
+                    ],
+                );
+                structural_regions.push((
+                    "machineBinaryNumberProbe",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

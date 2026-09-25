@@ -108,6 +108,40 @@ impl Interpreter {
     /// normally; `Ok(Some(popped))` when the JIT ran and the callee returned,
     /// where `popped` mirrors [`Self::return_running_finally`] (`Some(v)` means
     /// the return unwound the dispatch entry and the loop should yield `v`).
+    /// Count a generated receiver-allocation miss that left compiled code
+    /// through an exact `AllocationMiss` exit instead of the cold allocation
+    /// sibling, so every counted probe miss has exactly one completion.
+    pub(crate) fn note_receiver_allocation_exit(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        pc: u32,
+        exit: SideExit,
+    ) {
+        if exit.reason() != native_abi::ExitReason::AllocationMiss {
+            return;
+        }
+        let construct = context
+            .exec_function(fid)
+            .and_then(|function| {
+                function
+                    .instr_at_index(pc as usize)
+                    .map(|instruction| function.op(instruction))
+            })
+            .is_some_and(|op| {
+                matches!(
+                    op,
+                    Op::New | Op::NewSpread | Op::SuperConstruct | Op::SuperConstructSpread
+                )
+            });
+        if construct {
+            self.jit_runtime_stats.receiver_alloc_deopts = self
+                .jit_runtime_stats
+                .receiver_alloc_deopts
+                .saturating_add(1);
+        }
+    }
+
     pub(crate) fn record_jit_bail(
         &mut self,
         context: &ExecutionContext,
@@ -117,6 +151,10 @@ impl Interpreter {
         exit: SideExit,
     ) {
         let pc = exit.logical_pc();
+        // Optimizing exits are counted by their site-aware owner.
+        if tier == jit_debug::JitDebugTier::Template {
+            self.note_receiver_allocation_exit(context, fid, pc, exit);
+        }
         self.record_jit_debug_event(|| {
             let owner = context.for_function(fid).ok();
             let context = owner.as_deref().unwrap_or(context);
@@ -308,7 +346,10 @@ impl Interpreter {
         // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
         self.jit_osr_counts.remove(&key);
-        self.maybe_osr(stack, context, top_idx, floor, optimizing)
+        self.jit_osr_trigger = Some((key.0, key.1, u64::from(count)));
+        let outcome = self.maybe_osr(stack, context, top_idx, floor, optimizing);
+        self.jit_osr_trigger = None;
+        outcome
     }
 
     /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
@@ -415,8 +456,13 @@ impl Interpreter {
                 if !optimized && self.reoptimize_arith_overflow_bail(context, fid, exit) {
                     return Ok(None);
                 }
-                let tier_still_installed =
-                    !optimized || matches!(self.jit_optimized_code.get(&fid), Some(Some(_)));
+                // A back-edge relink or a repair already unlinked the body;
+                // the header must stay eligible for its replacement.
+                let tier_still_installed = if optimized {
+                    matches!(self.jit_optimized_code.get(&fid), Some(Some(_)))
+                } else {
+                    matches!(self.jit_code.get(&fid), Some(Some(_)))
+                };
                 if tier_still_installed
                     && Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc)
                 {
@@ -655,6 +701,7 @@ impl Interpreter {
         let resume_pc = exit.logical_pc();
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
+        self.note_receiver_allocation_exit(context, site_fid, site_pc, exit);
         let profile = self
             .jit_optimized_exit_profiles
             .entry((fid, resume_pc, exit.reason()))
@@ -1364,6 +1411,131 @@ impl Interpreter {
                     .and_then(|target| self.current_direct_callee_plan(target))
                     .is_some()
             })
+    }
+
+    /// Record that compiled code reached `callee` through the generic call
+    /// boundary from `caller_fid`.
+    ///
+    /// A site that had no feedback, or whose target was cold, when its body
+    /// was compiled keeps calling through Rust. Once the target's executions
+    /// repay a direct-call-target compile, it joins the caller's pending
+    /// targets and the next compiled back-edge polls, so a running baseline
+    /// loop relinks instead of paying the boundary until it exits.
+    pub(crate) fn note_generic_call_target(
+        &mut self,
+        context: &ExecutionContext,
+        caller_fid: u32,
+        callee: Value,
+    ) {
+        let callee = callee
+            .as_class_constructor()
+            .map(|class| class.ctor(&self.gc_heap))
+            .unwrap_or(callee);
+        let Some(target_fid) = callee.as_function().or_else(|| {
+            callee
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        }) else {
+            return;
+        };
+        if self
+            .jit_relinked_direct_targets
+            .contains(&(caller_fid, target_fid))
+            || self
+                .jit_pending_direct_targets
+                .get(&caller_fid)
+                .is_some_and(|targets| targets.contains(&target_fid))
+        {
+            return;
+        }
+        let Ok(owner) = context.for_function(target_fid) else {
+            return;
+        };
+        let Some(target) = owner.exec_function(target_fid) else {
+            return;
+        };
+        if self.current_direct_callee_plan(target).is_none() {
+            let executions = u64::from(self.jit_call_counts.get(&target_fid).copied().unwrap_or(0));
+            if !self
+                .jit_tier_cost_decision(
+                    &owner,
+                    target_fid,
+                    crate::tier_policy::CostedTier::Template,
+                    crate::tier_policy::TierTrigger::DirectCallTarget,
+                    executions,
+                    0,
+                    0,
+                )
+                .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
+            {
+                return;
+            }
+        }
+        self.jit_pending_direct_targets
+            .entry(caller_fid)
+            .or_default()
+            .insert(target_fid);
+        self.request_next_backedge_poll();
+    }
+
+    /// Discard a running baseline body at a loop back-edge once every call
+    /// target that lacked entry code when it was compiled owns one.
+    ///
+    /// Entry refresh only rebuilds at function entry, so a long loop entered
+    /// through OSR would otherwise pay the generic call boundary until it
+    /// ends. The body is unlinked here, while its activation still pins the
+    /// code; the caller resumes the interpreter at the loop header, whose next
+    /// OSR compiles direct linkage. Each `(caller, target)` pair relinks once.
+    pub(crate) fn take_backedge_relink(&mut self, context: &ExecutionContext, fid: u32) -> bool {
+        let Some(pending_targets) = self.jit_pending_direct_targets.get(&fid) else {
+            return false;
+        };
+        // The polling frame is a baseline activation of `fid`; its body may be
+        // an OSR generation the entry table does not own. Pairs that already
+        // relinked once never return here (see `note_generic_call_target`).
+        let pending_targets: Vec<u32> = pending_targets
+            .iter()
+            .copied()
+            .filter(|&target| !self.jit_relinked_direct_targets.contains(&(fid, target)))
+            .collect();
+        if pending_targets.is_empty() {
+            self.jit_pending_direct_targets.remove(&fid);
+            return false;
+        }
+        // A small callee may never repay an entry compile on its own; the
+        // generic sites this body reaches it through are what make it hot.
+        // Offer each target the same direct-call-target compile a caller
+        // compile would. The polling frame is baseline, so every live value
+        // is already rooted in its interpreter window while this compiles.
+        let mut pending_targets = pending_targets;
+        pending_targets.sort_unstable();
+        let mut linked = false;
+        for &target_fid in &pending_targets {
+            let planned = context.for_function(target_fid).ok().is_some_and(|owner| {
+                owner.exec_function(target_fid).is_some_and(|target| {
+                    self.ensure_direct_callee_plan(
+                        &owner,
+                        target,
+                        super::jit_compile::EAGER_DIRECT_TARGET_DEPTH,
+                        false,
+                        0,
+                    )
+                    .is_some()
+                })
+            });
+            linked |= planned;
+        }
+        if !linked {
+            return false;
+        }
+        self.jit_relinked_direct_targets
+            .extend(pending_targets.iter().map(|&target| (fid, target)));
+        self.jit_feedback_refresh_attempted.insert(fid);
+        self.jit_pending_direct_targets.remove(&fid);
+        self.jit_runtime_stats.feedback_refreshes =
+            self.jit_runtime_stats.feedback_refreshes.saturating_add(1);
+        self.invalidate_jit_baseline_generation(fid);
+        true
     }
 
     /// Rebuild one successful hot baseline generation against mature call

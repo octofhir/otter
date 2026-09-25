@@ -186,6 +186,7 @@ impl Interpreter {
             return Ok(());
         }
 
+        self.note_receiver_allocation_exit(context, callee_function_id, callee_resume_pc, exit);
         // Only a linked generation may charge the shared cost policy:
         // invalidation unlinks it, while already-active callers can still
         // report later deopts during unwind.

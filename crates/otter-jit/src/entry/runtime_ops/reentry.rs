@@ -1618,8 +1618,10 @@ pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     };
     let result = runtime.backedge_poll();
     match result {
-        Ok(false) => NativeResultStatus::Success as u64,
-        Ok(true) => NativeResultStatus::Yield as u64,
+        Ok(otter_vm::BackedgePollOutcome::Continue) => NativeResultStatus::Success as u64,
+        Ok(otter_vm::BackedgePollOutcome::Yield) => NativeResultStatus::Yield as u64,
+        // Baseline frames only: resume the interpreter at the loop header.
+        Ok(otter_vm::BackedgePollOutcome::Relink) => NativeResultStatus::SideExit as u64,
         Err(err) => {
             park_jit_error(ctx, err);
             NativeResultStatus::Throw as u64

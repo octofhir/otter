@@ -258,8 +258,8 @@ pub use run_control::{
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
 pub use runtime_activation::{
-    BinaryOperator, ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome,
-    ObjectProtocolValueOp, RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
+    BackedgePollOutcome, BinaryOperator, ClassRuntimeOp, CommittedValueError,
+    IteratorRuntimeOutcome, ObjectProtocolValueOp, RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
 };
 
 #[cfg(test)]
@@ -957,6 +957,10 @@ pub struct Interpreter {
     /// unit at a time per iteration. Reset to [`JIT_BACKEDGE_POLL_BATCH`] by the
     /// checkpoint.
     jit_backedge_fuel: u64,
+    /// Back-edges the current fuel window started with, so a checkpoint
+    /// charges exactly the back-edges it consumed even when the VM shortened
+    /// the window to request an early poll.
+    jit_backedge_fuel_window: u64,
     /// Per-isolate GC heap. Owned here so allocator-bearing
     /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since
     /// task 76) reach it through `&mut self`. The `Runtime`
@@ -1188,6 +1192,10 @@ pub struct Interpreter {
     /// waits until every recorded target is live instead of blindly rebuilding
     /// leaf functions or publishing another partial caller.
     jit_pending_direct_targets: rustc_hash::FxHashMap<u32, rustc_hash::FxHashSet<u32>>,
+    /// `(caller, target)` pairs a back-edge relink already linked. Each pair
+    /// relinks at most once, which bounds rebuilds without blocking a site
+    /// that turns hot after an earlier relink of the same caller.
+    jit_relinked_direct_targets: rustc_hash::FxHashSet<(u32, u32)>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
@@ -1204,6 +1212,11 @@ pub struct Interpreter {
     /// its header tiers up (or is recorded disabled), so the map holds only the
     /// handful of loop headers currently warming up.
     jit_osr_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// The loop whose back-edge count triggered the OSR compile in progress:
+    /// `(function, header pc, back-edges observed)`. Call sites inside that
+    /// loop take the observed trip count as execution evidence for their
+    /// direct-call targets.
+    jit_osr_trigger: Option<(u32, u32, u64)>,
     /// Canonical Template code cache keyed by global function id and shared by
     /// ordinary entry and every loop-OSR header. `Some(code)` is the sole
     /// installed Template body for the function; `None` records a permanent

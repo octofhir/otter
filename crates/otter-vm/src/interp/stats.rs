@@ -220,13 +220,28 @@ impl Interpreter {
         // that whole batch of work in one step and re-arm the counter, then
         // run the (possibly early-returning) budget checkpoint.
         self.work_budget_stats
-            .record_work(Self::JIT_BACKEDGE_POLL_BATCH);
+            .record_work(self.jit_backedge_fuel_window);
         self.jit_backedge_fuel = Self::JIT_BACKEDGE_POLL_BATCH;
+        self.jit_backedge_fuel_window = Self::JIT_BACKEDGE_POLL_BATCH;
         let checkpoint = self.poll_work_budget_checkpoint()?;
         if checkpoint == WorkBudgetCheckpoint::Yield {
             self.rotate_work_budget_slice();
         }
         Ok(checkpoint)
+    }
+
+    /// Make the next compiled back-edge re-enter [`Self::jit_backedge_poll`].
+    ///
+    /// Back-edges already consumed from the current window are charged now;
+    /// the one remaining unit is charged by that poll, so budget accounting
+    /// stays exact.
+    pub(crate) fn request_next_backedge_poll(&mut self) {
+        let consumed = self
+            .jit_backedge_fuel_window
+            .saturating_sub(self.jit_backedge_fuel);
+        self.work_budget_stats.record_work(consumed);
+        self.jit_backedge_fuel = 1;
+        self.jit_backedge_fuel_window = 1;
     }
 
     /// Address of the inline back-edge fuel counter, handed to compiled code so

@@ -9,6 +9,8 @@
 //! - Synchronous `in` / `HasProperty` checks through the shared object resolver.
 //! - Synchronous property and element load/store tails, including the shared
 //!   named-value `[[Set]]` entry used by JIT miss transitions.
+//! - [`get_walks_prototype_chain`] — the receiver families whose named
+//!   `[[Get]]` always walks the live prototype chain, in every tier.
 //! - Allocation-free completion for plain dense-array slots after a generated
 //!   element guard rejects a hole or pointer-valued store.
 //!
@@ -1055,6 +1057,31 @@ impl Interpreter {
             ),
         }
     }
+}
+
+/// Whether a named `[[Get]]` on this non-ordinary heap receiver resolves
+/// through [`Interpreter::ordinary_get_value`]: own expando slots first, then
+/// the receiver's live `[[Prototype]]` chain.
+///
+/// Proxies, generators, builtin iterators, keyed collections, weak
+/// references, promises, array buffers and data views all carry a real
+/// prototype (possibly a subclass or cross-realm one), so no receiver family
+/// may substitute a fixed constructor prototype. The interpreter opcode and
+/// every compiled miss transition consult this one predicate, so both tiers
+/// resolve such a load exactly one way.
+pub(crate) fn get_walks_prototype_chain(receiver: Value) -> bool {
+    receiver.is_proxy()
+        || receiver.is_generator()
+        || receiver.is_iterator()
+        || receiver.is_map()
+        || receiver.is_set()
+        || receiver.is_weak_map()
+        || receiver.is_weak_set()
+        || receiver.is_weak_ref()
+        || receiver.is_finalization_registry()
+        || receiver.is_promise()
+        || receiver.is_array_buffer()
+        || receiver.is_data_view()
 }
 
 pub(crate) fn string_index_property_name(key: &str) -> Option<u32> {

@@ -40,6 +40,7 @@ use crate::{
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
     },
+    template::DirectCallEvents,
 };
 
 const MAX_DIRECT_CALL_FRAME_BYTES: u32 = 4_080;
@@ -145,6 +146,8 @@ pub(super) fn emit_plain(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    code_map: Option<&mut CodeMapCapture>,
+    events: Option<&mut DirectCallEvents>,
     dst: u16,
     callee: u16,
     arguments: &[u16],
@@ -166,6 +169,8 @@ pub(super) fn emit_plain(
         relocations,
         transitions,
         view,
+        code_map,
+        events,
         dst,
         CallArguments::Fixed(arguments),
         logical_pc,
@@ -187,6 +192,8 @@ pub(super) fn emit_method(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    mut code_map: Option<&mut CodeMapCapture>,
+    mut events: Option<&mut DirectCallEvents>,
     dst: u16,
     receiver: u16,
     arguments: &[u16],
@@ -207,6 +214,8 @@ pub(super) fn emit_method(
             relocations,
             transitions,
             view,
+            code_map.as_deref_mut(),
+            events.as_deref_mut(),
             dst,
             CallArguments::Fixed(arguments),
             logical_pc,
@@ -233,6 +242,8 @@ pub(super) fn emit_spread_plain(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    code_map: Option<&mut CodeMapCapture>,
+    events: Option<&mut DirectCallEvents>,
     dst: u16,
     callee: u16,
     receiver: u16,
@@ -255,6 +266,8 @@ pub(super) fn emit_spread_plain(
         relocations,
         transitions,
         view,
+        code_map,
+        events,
         dst,
         CallArguments::Spread(arguments),
         logical_pc,
@@ -277,12 +290,14 @@ pub(super) fn emit_construct(
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
     code_map: Option<&mut CodeMapCapture>,
+    events: Option<&mut DirectCallEvents>,
     dst: u16,
     callee: u16,
     arguments: &[u16],
     logical_pc: u32,
     byte_pc: u32,
     super_construct: bool,
+    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -293,12 +308,14 @@ pub(super) fn emit_construct(
         transitions,
         view,
         code_map,
+        events,
         dst,
         callee,
         CallArguments::Fixed(arguments),
         logical_pc,
         byte_pc,
         super_construct,
+        finish_error,
         throw_value,
         fatal,
         done,
@@ -312,12 +329,14 @@ pub(super) fn emit_spread_construct(
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
     code_map: Option<&mut CodeMapCapture>,
+    events: Option<&mut DirectCallEvents>,
     dst: u16,
     callee: u16,
     arguments: u16,
     logical_pc: u32,
     byte_pc: u32,
     super_construct: bool,
+    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -328,12 +347,14 @@ pub(super) fn emit_spread_construct(
         transitions,
         view,
         code_map,
+        events,
         dst,
         callee,
         CallArguments::Spread(arguments),
         logical_pc,
         byte_pc,
         super_construct,
+        finish_error,
         throw_value,
         fatal,
         done,
@@ -347,12 +368,14 @@ fn emit_construct_with_arguments(
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
     mut code_map: Option<&mut CodeMapCapture>,
+    events: Option<&mut DirectCallEvents>,
     dst: u16,
     callee: u16,
     arguments: CallArguments<'_>,
     logical_pc: u32,
     byte_pc: u32,
     super_construct: bool,
+    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -360,13 +383,29 @@ fn emit_construct_with_arguments(
     let Some(target) = view.direct_constructs.get(&byte_pc) else {
         return Ok(false);
     };
-    if target.plan.is_derived_constructor
-        || target.plan.own_upvalue_count != 0
+    let call_kind = if super_construct {
+        otter_vm::JitDirectCallKind::SuperConstruct
+    } else {
+        otter_vm::JitDirectCallKind::Construct
+    };
+    let layout = if target.plan.is_derived_constructor
         || (matches!(arguments, CallArguments::Spread(_)) && target.plan.needs_incoming_arguments)
     {
-        return Ok(false);
-    }
-    let Some(layout) = StackLayout::for_target(target, arguments.fixed_len()) else {
+        None
+    } else {
+        StackLayout::for_target(target, arguments.fixed_len())
+    };
+    record_lowering(
+        events,
+        call_kind,
+        logical_pc,
+        byte_pc,
+        target,
+        0,
+        1,
+        layout.is_some(),
+    );
+    let Some(layout) = layout else {
         return Ok(false);
     };
     let artifact = construct_artifact(target, layout, arguments.artifact_mode(), super_construct)?;
@@ -382,6 +421,7 @@ fn emit_construct_with_arguments(
     let started_fatal = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
     let fallback = ops.new_dynamic_label();
+    let prepare_pending = ops.new_dynamic_label();
 
     dynasm!(ops
         ; .arch x64
@@ -610,6 +650,14 @@ fn emit_construct_with_arguments(
         ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
     initialize_inherited_state(ops, view, target);
+    if target.plan.own_upvalue_count != 0 {
+        dynasm!(ops
+            ; .arch x64
+            ; lea r10, [rsp + layout.upvalue_base as i32]
+            ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
+            ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
+        );
+    }
     match arguments {
         CallArguments::Fixed(arguments) => {
             for (index, &argument) in arguments.iter().enumerate() {
@@ -642,6 +690,34 @@ fn emit_construct_with_arguments(
             );
             dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
         }
+    }
+    if target.plan.own_upvalue_count != 0 {
+        // The receiver is already prepared, which may have run observable
+        // prototype lookup; no exact exit remains. The stub only side-exits
+        // without an activation, which receiver preparation already proved.
+        dynasm!(ops
+            ; .arch x64
+            ; mov rdi, r15
+            ; mov rsi, rsp
+            ; mov edx, target.plan.own_upvalue_count as i32
+            ; mov ecx, target.plan.inherited_upvalue_count as i32
+        );
+        emit_load_runtime_stub(
+            ops,
+            relocations,
+            transitions.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
+            abi::STUB_JIT_INITIALIZE_UPVALUES,
+        );
+        dynasm!(ops
+            ; .arch x64
+            ; call r11
+            ; test rdx, rdx
+            ; je >captures_ready
+            ; cmp edx, abi::NativeResultStatus::Throw as i32
+            ; je =>prepare_pending
+            ; jmp =>prepare_fatal
+            ; captures_ready:
+        );
     }
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::call_structural(
@@ -763,6 +839,9 @@ fn emit_construct_with_arguments(
         ; =>prepare_throw
         ; add rsp, layout.frame_bytes as i32
         ; jmp =>throw_value
+        ; =>prepare_pending
+        ; add rsp, layout.frame_bytes as i32
+        ; jmp =>finish_error
         ; =>prepare_fatal
         ; add rsp, layout.frame_bytes as i32
         ; jmp =>fatal
@@ -777,6 +856,8 @@ fn emit_candidate(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
+    mut code_map: Option<&mut CodeMapCapture>,
+    events: Option<&mut DirectCallEvents>,
     dst: u16,
     arguments: CallArguments<'_>,
     logical_pc: u32,
@@ -790,6 +871,24 @@ fn emit_candidate(
     fatal: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<bool, Unsupported> {
+    let call_kind = if matches!(form, CallForm::Method { .. }) {
+        otter_vm::JitDirectCallKind::Method
+    } else {
+        otter_vm::JitDirectCallKind::Plain
+    };
+    let reject = |events: Option<&mut DirectCallEvents>| {
+        record_lowering(
+            events,
+            call_kind,
+            logical_pc,
+            byte_pc,
+            target,
+            target_index,
+            target_count,
+            false,
+        );
+        Ok(false)
+    };
     if (matches!(form, CallForm::Plain { .. } | CallForm::CallWithThis { .. })
         && !matches!(
             target.plan.this_mode,
@@ -797,13 +896,13 @@ fn emit_candidate(
                 | otter_vm::JitDirectCallThisMode::SloppyGlobal
         ))
     {
-        return Ok(false);
+        return reject(events);
     }
     if matches!(arguments, CallArguments::Spread(_)) && target.plan.needs_incoming_arguments {
-        return Ok(false);
+        return reject(events);
     }
     let Some(layout) = StackLayout::for_target(target, arguments.fixed_len()) else {
-        return Ok(false);
+        return reject(events);
     };
     let artifact = artifact(
         target,
@@ -832,7 +931,19 @@ fn emit_candidate(
         ; cmp r11, [r15 + ACTIVATION_LIMIT_OFFSET as i32]
         ; jae =>guard_fail
     );
+    let guard_start = ops.offset().0;
     emit_load_and_guard_callable(ops, relocations, view, target, form, guard_fail)?;
+    let frame_setup_start = ops.offset().0;
+    record_phase(
+        &mut code_map,
+        "directCallGuard",
+        guard_start,
+        frame_setup_start,
+        view,
+        logical_pc,
+        byte_pc,
+        artifact,
+    );
 
     dynasm!(ops ; .arch x64 ; sub rsp, layout.frame_bytes as i32);
     emit_load_symbol_u64(
@@ -960,6 +1071,17 @@ fn emit_candidate(
         );
     }
 
+    let native_entry_start = ops.offset().0;
+    record_phase(
+        &mut code_map,
+        "directCallFrameSetup",
+        frame_setup_start,
+        native_entry_start,
+        view,
+        logical_pc,
+        byte_pc,
+        artifact,
+    );
     dynasm!(ops
         ; .arch x64
         ; mov r12, [rsp + layout.target_cell as i32]
@@ -1050,6 +1172,26 @@ fn emit_candidate(
         ; returned:
     );
     emit_store_reg(ops, 0, dst);
+    record_phase(
+        &mut code_map,
+        "directCallNativeEntry",
+        native_entry_start,
+        ops.offset().0,
+        view,
+        logical_pc,
+        byte_pc,
+        artifact,
+    );
+    record_lowering(
+        events,
+        call_kind,
+        logical_pc,
+        byte_pc,
+        target,
+        target_index,
+        target_count,
+        true,
+    );
     dynasm!(ops
         ; .arch x64
         ; jmp =>done
@@ -1071,6 +1213,74 @@ fn emit_candidate(
         ; =>finished
     );
     Ok(true)
+}
+
+/// Records one generated-call phase with its exact target contract.
+#[allow(clippy::too_many_arguments)]
+fn record_phase(
+    code_map: &mut Option<&mut CodeMapCapture>,
+    kind: &'static str,
+    start: usize,
+    end: usize,
+    view: &JitCompileSnapshot,
+    logical_pc: u32,
+    byte_pc: u32,
+    direct_call: DirectCallArtifact,
+) {
+    if let Some(code_map) = code_map.as_deref_mut() {
+        code_map.record(CodeRegion::call_structural(
+            kind,
+            start,
+            end,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            direct_call,
+        ));
+    }
+}
+
+/// Records the backend's final lowering of one direct-call target.
+#[allow(clippy::too_many_arguments)]
+fn record_lowering(
+    events: Option<&mut DirectCallEvents>,
+    call_kind: otter_vm::JitDirectCallKind,
+    logical_pc: u32,
+    byte_pc: u32,
+    target: &otter_vm::JitDirectCallee,
+    target_index: u32,
+    target_count: u32,
+    generated: bool,
+) {
+    let Some(events) = events else {
+        return;
+    };
+    let outcome = if generated {
+        otter_vm::JitDirectCallLoweringOutcome::Generated {
+            code_object_id: target.plan.code_object_id,
+            target_tier: match target.plan.tier {
+                abi::NativeFrameKind::Optimizing => otter_vm::JitDebugTier::Optimizing,
+                _ => otter_vm::JitDebugTier::Template,
+            },
+            this_mode: target.plan.this_mode,
+        }
+    } else {
+        otter_vm::JitDirectCallLoweringOutcome::Rejected {
+            reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
+        }
+    };
+    events.insert(
+        (byte_pc, target_index),
+        otter_vm::JitCompilerDiagnostic::DirectCallLowered {
+            call_kind,
+            instruction_pc: logical_pc,
+            byte_pc,
+            callee_function_id: target.plan.function_id,
+            target_index,
+            target_count,
+            outcome,
+        },
+    );
 }
 
 fn initialize_frame(ops: &mut Assembler, target: &otter_vm::JitDirectCallee, layout: StackLayout) {

@@ -6,6 +6,10 @@
 //! `async fn` exports run the promise protocol, `raw` keeps the
 //! lodge-native signature, and `capabilities = true` threads the
 //! install-time snapshot into exports that ask for it.
+//!
+//! A native export that blocks without polling also proves that a timed-out
+//! command releases its host: the final handle drop detaches an isolate that
+//! is still inside non-polling native code instead of blocking on it.
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -78,6 +82,13 @@ impl MathModule {
         !matches!(caps.net, otter_runtime::Permission::Deny)
     }
 
+    /// Park the isolate thread without reaching any VM interrupt poll.
+    #[export(name = "block")]
+    fn block(ms: f64) -> f64 {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+        ms
+    }
+
     #[export(name = "rawEcho", length = 1, raw)]
     fn raw_echo(
         _ctx: &mut NativeCtx<'_>,
@@ -131,4 +142,34 @@ async fn typed_module_exports_work_end_to_end() -> Result<(), OtterError> {
         ]
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_isolate_in_blocking_native_does_not_park_the_host() {
+    let otter = Otter::builder()
+        .hosted_module(MATH_HOSTED_MODULE)
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .expect("otter");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = dir.path().join("main.mjs");
+    std::fs::write(
+        &entry,
+        br#"import { block } from "test:math"; block(30000);"#,
+    )
+    .expect("write entry");
+
+    let started = std::time::Instant::now();
+    let error = otter
+        .handle()
+        .run_module(&entry)
+        .await
+        .expect_err("command must time out");
+    assert!(matches!(error, OtterError::Timeout { .. }), "{error:?}");
+    drop(otter);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "dropping a timed-out isolate parked the host for {elapsed:?}"
+    );
 }

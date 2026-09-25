@@ -25,6 +25,10 @@
 //!   they never begin or drain a public top-level capture.
 //! - Dropping a waiting future does not drop the isolate mid-turn; the
 //!   runner observes the cancelled reply channel at the completion point.
+//! - Dropping the last handle joins the runner, except after a timed-out
+//!   command: the interrupted runner may still be inside native code that
+//!   does not poll, so the drop detaches it and never blocks the host; the
+//!   runner tears its `Runtime` down itself.
 //! - Public commands never execute recursively. Commands received while the
 //!   current turn drains Ref'd work are deferred in FIFO order, and the shared
 //!   queue bound accounts for both channel-resident and deferred commands.
@@ -2481,9 +2485,21 @@ impl Drop for RuntimeHandleInner {
         // traced host payloads are gone when the last handle has dropped.
         // Explicit `shutdown()` remains the non-blocking signal for callers
         // that must initiate teardown from a latency-sensitive thread.
-        if let Some(runner) = self.runner.lock().expect("runner mutex poisoned").take() {
-            let _ = runner.join();
+        let Some(runner) = self.runner.lock().expect("runner mutex poisoned").take() else {
+            return;
+        };
+        // A command that timed out left the isolate interrupted, but the
+        // interrupt is cooperative: native code that never reaches a VM poll
+        // keeps the runner busy for as long as that code runs. Its reply is
+        // already abandoned, so the final drop detaches the runner instead of
+        // parking the host (possibly a UI thread) behind it. The runner owns
+        // its `Runtime` and finishes teardown on its own once it observes the
+        // shutdown signal sent above.
+        if self.counters.timed_out_commands.load(Ordering::Acquire) > 0 {
+            drop(runner);
+            return;
         }
+        let _ = runner.join();
     }
 }
 

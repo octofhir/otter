@@ -1,22 +1,31 @@
-//! Active interpreter frame-root providers.
+//! Active interpreter frame-root providers and scoped root slots.
 //!
 //! # Contents
 //! - [`FrameRoots`] — safe trait implemented by VM-owned frame-stack tracers.
-//! - [`FrameRootProviders`] — LIFO registry of active dispatch-loop stacks.
+//! - [`FrameRootProviders`] — LIFO registry of active dispatch-loop stacks and
+//!   of the slots declared by open [`crate::RootScope`]s.
 //! - [`FrameRootsGuard`] — RAII provider registration.
 //!
 //! # Invariants
 //! - Providers are pushed on dispatch-loop entry and popped before the
 //!   provider object goes out of scope.
+//! - A root scope occupies one marker entry in the provider stack; its slots
+//!   live in one registry-owned slot stack tagged with that marker depth.
+//!   Slots are appended in non-decreasing owner depth, so popping to a depth
+//!   removes exactly the trailing slots of every scope at or above it.
+//! - Both stacks keep their capacity across pops: opening a scope and rooting
+//!   slots performs no heap allocation once the stacks have grown.
 //! - Root tracing happens during a stop-the-world GC pause.
 //! - Raw provider dereference is kept in this crate; VM crates only create raw
 //!   provider pointers.
 //!
 //! # See also
 //! - [`crate::heap::GcHeap::register_frame_roots`]
+//! - [`crate::root_scope`] — the RAII scope over the slot stack.
 
 use crate::compressed::RawGc;
 use crate::heap::GcHeap;
+use crate::root_scope::ErasedSlotTracer;
 
 /// Safe callback surface for VM-owned active frame stacks.
 pub trait FrameRoots {
@@ -24,10 +33,21 @@ pub trait FrameRoots {
     fn trace(&self, visitor: &mut dyn FnMut(*mut RawGc));
 }
 
+/// One slot rooted by an open root scope.
+#[derive(Clone, Copy)]
+struct ScopeSlot {
+    /// Provider-stack index of the owning scope marker.
+    owner: usize,
+    slot: *mut (),
+    tracer: ErasedSlotTracer,
+}
+
 /// LIFO registry of active frame-stack root providers.
 #[derive(Default)]
 pub struct FrameRootProviders {
-    providers: Vec<*const dyn FrameRoots>,
+    /// `None` marks an open root scope whose slots live in `scope_slots`.
+    providers: Vec<Option<*const dyn FrameRoots>>,
+    scope_slots: Vec<ScopeSlot>,
 }
 
 impl FrameRootProviders {
@@ -39,33 +59,73 @@ impl FrameRootProviders {
 
     /// Push `provider` and return the new stack depth.
     pub fn push(&mut self, provider: *const dyn FrameRoots) -> usize {
-        self.providers.push(provider);
+        self.providers.push(Some(provider));
         self.providers.len()
+    }
+
+    /// Push one root-scope marker and return the new stack depth.
+    pub(crate) fn push_scope(&mut self) -> usize {
+        self.providers.push(None);
+        self.providers.len()
+    }
+
+    /// Root `slot` for the scope marker at provider index `owner`.
+    pub(crate) fn push_scope_slot(
+        &mut self,
+        owner: usize,
+        slot: *mut (),
+        tracer: ErasedSlotTracer,
+    ) {
+        debug_assert!(matches!(self.providers.get(owner), Some(None)));
+        debug_assert!(
+            self.scope_slots
+                .last()
+                .is_none_or(|last| last.owner <= owner),
+            "an outer root scope must not add slots while an inner scope is open"
+        );
+        self.scope_slots.push(ScopeSlot {
+            owner,
+            slot,
+            tracer,
+        });
     }
 
     /// Pop entries back down to `depth`.
     pub fn pop_to(&mut self, depth: usize) {
         debug_assert!(depth <= self.providers.len());
         self.providers.truncate(depth);
-    }
-
-    /// Visit every registered provider in registration order.
-    pub fn trace(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        for &provider in &self.providers {
-            // SAFETY: providers are pushed only for lexical scopes where the
-            // pointed-to `FrameRoots` object remains alive, and GC root tracing
-            // runs synchronously before the matching pop.
-            unsafe { (&*provider).trace(visitor) };
+        while self
+            .scope_slots
+            .last()
+            .is_some_and(|slot| slot.owner >= depth)
+        {
+            self.scope_slots.pop();
         }
     }
 
-    /// Number of currently registered providers.
+    /// Visit every registered provider in registration order, then every
+    /// scoped slot.
+    pub fn trace(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for provider in self.providers.iter().flatten() {
+            // SAFETY: providers are pushed only for lexical scopes where the
+            // pointed-to `FrameRoots` object remains alive, and GC root tracing
+            // runs synchronously before the matching pop.
+            unsafe { (&**provider).trace(visitor) };
+        }
+        for slot in &self.scope_slots {
+            // SAFETY: `RootScope`'s contract — every registered slot outlives
+            // its scope, and the tracer matches the slot type.
+            unsafe { (slot.tracer)(slot.slot, visitor) };
+        }
+    }
+
+    /// Number of currently registered providers and root-scope markers.
     #[must_use]
     pub fn len(&self) -> usize {
         self.providers.len()
     }
 
-    /// `true` when no providers are registered.
+    /// `true` when no providers or root scopes are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()

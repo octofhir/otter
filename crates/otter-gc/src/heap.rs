@@ -452,6 +452,22 @@ impl GcHeap {
         FrameRootsGuard::new(self, depth)
     }
 
+    /// Open one root-scope marker and return its provider index.
+    pub(crate) fn push_root_scope(&mut self) -> usize {
+        self.frame_root_providers.push_scope() - 1
+    }
+
+    /// Root `slot` for the open root scope at provider index `owner`.
+    pub(crate) fn push_root_scope_slot(
+        &mut self,
+        owner: usize,
+        slot: *mut (),
+        tracer: crate::root_scope::ErasedSlotTracer,
+    ) {
+        self.frame_root_providers
+            .push_scope_slot(owner, slot, tracer);
+    }
+
     /// Truncate active frame-root providers back to `depth`.
     #[doc(hidden)]
     pub fn pop_frame_roots_to(&mut self, depth: usize) {

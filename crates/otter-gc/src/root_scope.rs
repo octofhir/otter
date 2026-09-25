@@ -23,7 +23,7 @@
 //! representation is a VM concern).
 //!
 //! # Contents
-//! - [`RootScope`] — RAII guard registered as a frame-root provider.
+//! - [`RootScope`] — RAII guard registered as a frame-root scope marker.
 //! - [`ErasedSlotTracer`] — type-erased per-slot tracer callback.
 //!
 //! # Invariants
@@ -32,14 +32,16 @@
 //! - Scopes nest LIFO by construction (Rust drop order); `Drop` truncates
 //!   the provider stack back to the scope's entry depth, so a leaked or
 //!   out-of-order drop can only over-pop its own descendants.
-//! - The slot list lives in a `Box` so the provider pointer registered
-//!   with the heap stays stable even if the guard value moves.
+//! - Slots live in the heap's registry-owned slot stack, tagged with the
+//!   scope's marker depth. Opening a scope and adding slots allocate nothing
+//!   once that stack has grown; an outer scope never adds slots while an
+//!   inner scope is open.
 //!
 //! # See also
-//! - [`crate::frame_roots`] — the provider registry this builds on.
+//! - [`crate::frame_roots`] — the provider registry and slot stack this
+//!   builds on.
 
 use crate::compressed::RawGc;
-use crate::frame_roots::FrameRoots;
 use crate::heap::GcHeap;
 
 /// Type-erased tracer for one rooted slot: forwards every `RawGc` the
@@ -59,37 +61,18 @@ pub unsafe fn trace_raw_handle_slot(slot: *mut (), visitor: &mut dyn FnMut(*mut 
     visitor(slot.cast::<RawGc>());
 }
 
-struct RootScopeSlots {
-    entries: Vec<(*mut (), ErasedSlotTracer)>,
-}
-
-impl FrameRoots for RootScopeSlots {
-    fn trace(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        for &(slot, tracer) in &self.entries {
-            // SAFETY: `RootScope`'s contract — every registered slot
-            // outlives the scope, and the tracer matches the slot type.
-            unsafe { tracer(slot, visitor) };
-        }
-    }
-}
-
 /// RAII rooting scope. See the module docs for usage.
 pub struct RootScope {
     heap: *mut GcHeap,
     depth: usize,
-    slots: Box<RootScopeSlots>,
 }
 
 impl RootScope {
     /// Open a scope on `heap`. The guard registers itself as a
-    /// frame-root provider and unregisters on drop.
+    /// frame-root marker and unregisters on drop.
     pub fn new(heap: &mut GcHeap) -> Self {
-        let slots = Box::new(RootScopeSlots {
-            entries: Vec::new(),
-        });
-        let provider: *const dyn FrameRoots = &*slots;
-        let depth = heap.push_frame_roots(provider) - 1;
-        Self { heap, depth, slots }
+        let depth = heap.push_root_scope();
+        Self { heap, depth }
     }
 
     /// Root a slot that is a bare GC handle (`Gc<T>`, `RawGc`, or any
@@ -98,9 +81,8 @@ impl RootScope {
     /// # Safety
     /// `slot` must point at such a handle and outlive this scope.
     pub unsafe fn add_raw_slot(&mut self, slot: *mut RawGc) {
-        self.slots
-            .entries
-            .push((slot.cast::<()>(), trace_raw_handle_slot));
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.add_erased(slot.cast::<()>(), trace_raw_handle_slot) };
     }
 
     /// Root an arbitrary slot with a matching type-erased tracer.
@@ -109,7 +91,9 @@ impl RootScope {
     /// `slot` must outlive this scope and `tracer` must interpret it at
     /// its concrete type.
     pub unsafe fn add_erased(&mut self, slot: *mut (), tracer: ErasedSlotTracer) {
-        self.slots.entries.push((slot, tracer));
+        // SAFETY: the heap owns the slot stack and outlives every scope
+        // opened on it; no collection runs while the slot is pushed.
+        unsafe { (*self.heap).push_root_scope_slot(self.depth, slot, tracer) };
     }
 }
 

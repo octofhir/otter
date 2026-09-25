@@ -358,6 +358,18 @@ impl MachineOpcode {
                 commoning: Never,
             },
             Self::CacheIrStoreField { .. } => MachineEffects::write(PROPERTY_FIELD),
+            Self::PropertyStoreDispatch { .. } => MachineEffects {
+                reads: SHAPE
+                    .union(PROPERTY_METADATA)
+                    .union(PROPERTY_FIELD)
+                    .union(PROTOTYPE),
+                writes: PROPERTY_FIELD.union(SHAPE).union(PROPERTY_METADATA),
+                allocates: false,
+                reentrant: false,
+                throws: false,
+                safepoint: false,
+                commoning: Never,
+            },
             Self::CacheIrPublishShape { .. } => {
                 MachineEffects::write(SHAPE.union(PROPERTY_METADATA))
             }

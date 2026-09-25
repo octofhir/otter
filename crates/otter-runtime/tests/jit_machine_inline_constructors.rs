@@ -49,7 +49,7 @@ var payload={count:0,saved:null,value:1.25};for(var i=0;i<70000;i++)make(payload
                     && ir.contains("AllocationHit")
                     && ir.contains("PublishObject {")
                     && ir.contains("BaseConstructResult")
-                    && ir.contains("CacheIrStoreField {")),
+                    && ir.contains("PropertyStoreDispatch {")),
             "factory must splice constructor allocation and fields: {irs:#?}; {:?}",
             warm.jit_debug_report()
         );

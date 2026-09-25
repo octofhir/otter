@@ -408,7 +408,7 @@ fn assert_machine_property_artifact(
             cold_loads,
         ),
         (
-            &["machineCacheIrStoreField"][..],
+            &["machinePropertyStoreDispatch", "machineCacheIrStoreField"][..],
             "machinePropertyStoreCold",
             stores,
             stores,

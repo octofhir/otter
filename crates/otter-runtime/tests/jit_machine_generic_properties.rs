@@ -834,12 +834,12 @@ fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
         });
     let code_map = artifact_json(machine, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"].as_array().expect("code-map regions");
-    for kind in ["machineCacheIrGuardShape", "machineCacheIrStoreField"] {
-        assert!(
-            regions.iter().any(|region| region["kind"] == kind),
-            "live-payload Machine body must retain {kind}: {code_map}",
-        );
-    }
+    assert!(
+        regions
+            .iter()
+            .any(|region| region["kind"] == "machinePropertyStoreDispatch"),
+        "live-payload Machine body must retain machinePropertyStoreDispatch: {code_map}",
+    );
     assert!(
         regions
             .iter()

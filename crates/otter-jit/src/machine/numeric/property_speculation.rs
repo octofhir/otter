@@ -103,6 +103,92 @@ pub(super) fn own_data_slot(program: &otter_vm::JitCacheIrProgram) -> Option<Sha
     })
 }
 
+/// Recognize a store program the store dispatch can own: an existing
+/// writable own slot, or an add transition whose missing-key proof is a null
+/// prototype or a guarded prototype chain ending in null.
+pub(super) fn store_case(
+    program: &otter_vm::JitCacheIrProgram,
+) -> Option<super::super::PropertyStoreCase> {
+    use otter_vm::JitCacheIrOp as Op;
+    match *program.ops {
+        [
+            Op::GuardShape { object: 0, shape },
+            Op::GuardAtomSlot {
+                object: 0,
+                value_byte: slot,
+                writable: true,
+                ..
+            },
+            Op::StoreField {
+                object: 0,
+                value_byte,
+            },
+        ] if slot == value_byte && shape != 0 && value_byte % 8 == 0 => {
+            Some(super::super::PropertyStoreCase {
+                shape,
+                value_byte,
+                transition: None,
+            })
+        }
+        [Op::GuardShape { object: 0, shape }, ref rest @ ..] if shape != 0 => {
+            let (links, tail) = rest.split_last_chunk::<4>()?;
+            let [
+                Op::GuardPrototypeNull { object: last },
+                Op::GuardExtensible {
+                    object: 0,
+                    value_byte: slot,
+                },
+                Op::StoreField {
+                    object: 0,
+                    value_byte,
+                },
+                Op::PublishShape {
+                    object: 0,
+                    shape: child_shape,
+                    new_len,
+                    initialize_inline,
+                },
+            ] = *tail
+            else {
+                return None;
+            };
+            if slot != value_byte || value_byte % 8 != 0 || child_shape == 0 {
+                return None;
+            }
+            let mut prototype_shapes = Vec::with_capacity(links.len() / 2);
+            let mut holder = 0u8;
+            for link in links.chunks(2) {
+                let [
+                    Op::LoadPrototype { object, result: 1 },
+                    Op::GuardShape {
+                        object: 1,
+                        shape: prototype,
+                    },
+                ] = *link
+                else {
+                    return None;
+                };
+                if object != holder || prototype == 0 {
+                    return None;
+                }
+                prototype_shapes.push(prototype);
+                holder = 1;
+            }
+            (last == holder).then(|| super::super::PropertyStoreCase {
+                shape,
+                value_byte,
+                transition: Some(super::super::PropertyStoreTransition {
+                    prototype_shapes: prototype_shapes.into_boxed_slice(),
+                    child_shape,
+                    new_len,
+                    initialize_inline,
+                }),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Select the proof, its exact pre-operation exit, and the slot read.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select(

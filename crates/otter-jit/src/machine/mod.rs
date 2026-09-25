@@ -730,6 +730,31 @@ pub struct PolymorphicPropertyCase {
     pub ordinary: bool,
 }
 
+/// One receiver hidden class of a dispatched own-data property store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyStoreCase {
+    /// Stable compressed hidden-class token of the receiver; never zero.
+    pub shape: u32,
+    /// Byte offset of the data slot inside the receiver's value slab.
+    pub value_byte: u32,
+    /// Add-transition contract, or `None` for an existing writable slot.
+    pub transition: Option<PropertyStoreTransition>,
+}
+
+/// The missing-key and append contract of one add-transition store case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyStoreTransition {
+    /// Hidden classes of the prototype chain in order; the link after the
+    /// last one must be null. Empty for a receiver without a prototype.
+    pub prototype_shapes: Box<[u32]>,
+    /// Child hidden class published after the value store.
+    pub child_shape: u32,
+    /// Logical slot length after publication.
+    pub new_len: u16,
+    /// Whether slot zero initializes the inline values pointer.
+    pub initialize_inline: bool,
+}
+
 /// Target-neutral name of a selected machine operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineOpcode {
@@ -1134,6 +1159,19 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Exact interned property key, owned by the source operation.
         atom: u32,
+    },
+    /// Decode an ordinary fast receiver once, dispatch on its hidden class over
+    /// the existing-slot and add-transition programs of one store site, prove
+    /// the matched case's prototype and append contract, and commit the value
+    /// store and, for a transition, the child shape. Every guard precedes the
+    /// first write; a miss performs no effect. `owner` is valid only for the
+    /// immediately following barriers; `child` is the published shape handle
+    /// or `undefined` for an existing-slot store.
+    PropertyStoreDispatch {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Receiver hidden classes in program order.
+        cases: Box<[PropertyStoreCase]>,
     },
     /// Commit one existing own-data field store under a complete CacheIR guard
     /// chain. The parent address output is valid only for the immediately
@@ -2379,6 +2417,44 @@ impl InstructionSequence {
                         }) || *owner != MachineOperand::register_output(owner.value)
                             || self.representations[owner.value.0 as usize]
                                 != MachineRepresentation::Int64
+                            || *hit != MachineOperand::register_output(hit.value)
+                            || self.representations[hit.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyStore)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::PropertyStoreDispatch { cases, .. } => {
+                        let [object, value, owner, child, hit] = instruction.operands.as_slice()
+                        else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let cases_valid = !cases.is_empty()
+                            && cases.iter().all(|case| {
+                                case.shape != 0
+                                    && case.value_byte % 8 == 0
+                                    && case.transition.as_ref().is_none_or(|transition| {
+                                        transition.child_shape != 0
+                                            && transition.new_len != 0
+                                            && transition.prototype_shapes.iter().all(|&s| s != 0)
+                                    })
+                            });
+                        if !cases_valid
+                            || [object, value].iter().any(|operand| {
+                                **operand != MachineOperand::location_input(operand.value)
+                                    || self.representations[operand.value.0 as usize]
+                                        != MachineRepresentation::Tagged
+                            })
+                            || *owner != MachineOperand::register_output(owner.value)
+                            || self.representations[owner.value.0 as usize]
+                                != MachineRepresentation::Int64
+                            || *child != MachineOperand::register_output(child.value)
+                            || self.representations[child.value.0 as usize]
+                                != MachineRepresentation::Tagged
                             || *hit != MachineOperand::register_output(hit.value)
                             || self.representations[hit.value.0 as usize]
                                 != MachineRepresentation::Boolean

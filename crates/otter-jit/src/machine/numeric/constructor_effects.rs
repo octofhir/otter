@@ -1,15 +1,18 @@
 //! Explicit constructor field guards, store, publication, and barriers.
 //!
 //! # Contents
-//! - Source-owned receiver/prototype proof selection.
-//! - A single pre-effect condition exit.
-//! - No-fail field store, shape publication, and GC barriers.
+//! - One `PropertyStoreDispatch` case owning the receiver, prototype,
+//!   extensibility, length and capacity proofs plus the committed store and
+//!   shape publication.
+//! - A single pre-effect condition exit on the dispatch's hit bit.
+//! - Value and child-shape GC barriers.
 //!
 //! # Invariants
 //! - Every shape, prototype, extensibility, length, and capacity proof precedes
-//!   the first store.
+//!   the first store; a dispatch miss performs no effect.
 //! - No exit is legal after the condition has been accepted.
-//! - Field data and structural publication are distinct Machine effects.
+//! - Field data and structural publication commit inside the one dispatch
+//!   effect, after every guard.
 
 use super::*;
 
@@ -31,96 +34,41 @@ pub(super) fn select(
         .last()
         .map(|frame| frame.byte_pc)
         .ok_or(super::super::VerificationError::InvalidValue(object))?;
-    let active = push_value(representations, MachineRepresentation::Boolean);
-    instructions.push(MachineInstruction::plain(
-        MachineOpcode::BooleanConstant(true),
-        vec![MachineOperand::register_output(active)],
-    ));
-    let mut condition = active;
-    let mut current = object;
-
-    let next = push_value(representations, MachineRepresentation::Boolean);
-    push_guard(
-        target_spec,
-        MachineOpcode::CacheIrGuardShape {
+    // One store dispatch owns every shape, prototype, extensibility, length
+    // and capacity proof and commits the store and publication together. A
+    // miss performs no effect, so the following condition exits exactly at
+    // the pre-operation state.
+    let owner = push_value(representations, MachineRepresentation::Int64);
+    let child = push_value(representations, MachineRepresentation::Tagged);
+    let stored = push_value(representations, MachineRepresentation::Boolean);
+    let mut store = MachineInstruction::plain(
+        MachineOpcode::PropertyStoreDispatch {
             byte_pc,
-            shape: transition.from_shape,
-        },
-        vec![
-            MachineOperand::location_input(current),
-            MachineOperand::register_input(condition),
-            MachineOperand::register_output(next),
-        ],
-        state_index,
-        instructions,
-    );
-    condition = next;
-
-    let next = push_value(representations, MachineRepresentation::Boolean);
-    push_guard(
-        target_spec,
-        MachineOpcode::CacheIrGuardExtensible {
-            byte_pc,
-            value_byte: u32::from(transition.slot) * 8,
+            cases: Box::new([super::super::PropertyStoreCase {
+                shape: transition.from_shape,
+                value_byte: u32::from(transition.slot) * 8,
+                transition: Some(super::super::PropertyStoreTransition {
+                    prototype_shapes: transition.prototype_shapes.clone().into_boxed_slice(),
+                    child_shape: transition.to_shape,
+                    new_len: transition.slot + 1,
+                    initialize_inline: transition.slot == 0,
+                }),
+            }]),
         },
         vec![
             MachineOperand::location_input(object),
-            MachineOperand::register_input(condition),
-            MachineOperand::register_output(next),
+            MachineOperand::location_input(value),
+            MachineOperand::register_output(owner),
+            MachineOperand::register_output(child),
+            MachineOperand::register_output(stored),
         ],
-        state_index,
-        instructions,
     );
-    condition = next;
-
-    for &shape in &transition.prototype_shapes {
-        let prototype = push_value(representations, MachineRepresentation::Tagged);
-        let next = push_value(representations, MachineRepresentation::Boolean);
-        push_guard(
-            target_spec,
-            MachineOpcode::CacheIrLoadPrototype { byte_pc },
-            vec![
-                MachineOperand::location_input(current),
-                MachineOperand::register_input(condition),
-                MachineOperand::register_output(prototype),
-                MachineOperand::register_output(next),
-            ],
-            state_index,
-            instructions,
-        );
-        current = prototype;
-        condition = next;
-        let next = push_value(representations, MachineRepresentation::Boolean);
-        push_guard(
-            target_spec,
-            MachineOpcode::CacheIrGuardShape { byte_pc, shape },
-            vec![
-                MachineOperand::location_input(current),
-                MachineOperand::register_input(condition),
-                MachineOperand::register_output(next),
-            ],
-            state_index,
-            instructions,
-        );
-        condition = next;
-    }
-    let next = push_value(representations, MachineRepresentation::Boolean);
-    push_guard(
-        target_spec,
-        MachineOpcode::CacheIrGuardPrototypeNull { byte_pc },
-        vec![
-            MachineOperand::location_input(current),
-            MachineOperand::register_input(condition),
-            MachineOperand::register_output(next),
-        ],
-        state_index,
-        instructions,
-    );
-    condition = next;
+    store.clobbers = property_store_clobbers(target_spec, false);
+    instructions.push(store);
 
     let mut require = MachineInstruction::plain(
         MachineOpcode::GuardCondition,
-        vec![MachineOperand::register_input(condition)],
+        vec![MachineOperand::register_input(stored)],
     );
     require.clobbers = target_spec
         .clobbers(TargetClobberSet::StatusScratch)
@@ -128,24 +76,6 @@ pub(super) fn select(
     attach_frame_state(hir, machine_values, state_index, exits, &mut require);
     instructions.push(require);
 
-    let owner = push_value(representations, MachineRepresentation::Int64);
-    let stored = push_value(representations, MachineRepresentation::Boolean);
-    let mut store = MachineInstruction::plain(
-        MachineOpcode::CacheIrStoreField {
-            byte_pc,
-            value_byte: u32::from(transition.slot) * 8,
-        },
-        vec![
-            MachineOperand::location_input(object),
-            MachineOperand::location_input(value),
-            MachineOperand::register_input(condition),
-            MachineOperand::register_output(owner),
-            MachineOperand::register_output(stored),
-        ],
-    );
-    store.clobbers = property_store_clobbers(target_spec, false);
-    store.frame_state = Some(state_index as u32);
-    instructions.push(store);
     push_barrier(
         target_spec,
         byte_pc,
@@ -155,50 +85,16 @@ pub(super) fn select(
         state_index,
         instructions,
     );
-
-    let mut publish = MachineInstruction::plain(
-        MachineOpcode::CacheIrPublishShape {
-            byte_pc,
-            shape: transition.to_shape,
-            new_len: transition.slot + 1,
-            initialize_inline: transition.slot == 0,
-        },
-        vec![
-            MachineOperand::location_input(owner),
-            MachineOperand::register_input(stored),
-        ],
-    );
-    publish.clobbers = property_store_clobbers(target_spec, false);
-    publish.frame_state = Some(state_index as u32);
-    instructions.push(publish);
-    let shape = push_value(representations, MachineRepresentation::Tagged);
-    instructions.push(MachineInstruction::plain(
-        MachineOpcode::TaggedConstant(u64::from(transition.to_shape)),
-        vec![MachineOperand::register_output(shape)],
-    ));
     push_barrier(
         target_spec,
         byte_pc,
         owner,
-        shape,
+        child,
         stored,
         state_index,
         instructions,
     );
     Ok(())
-}
-
-fn push_guard(
-    target_spec: &TargetSpec,
-    opcode: MachineOpcode,
-    operands: Vec<MachineOperand>,
-    state_index: usize,
-    instructions: &mut Vec<MachineInstruction>,
-) {
-    let mut guard = MachineInstruction::plain(opcode, operands);
-    guard.clobbers = property_load_clobbers(target_spec);
-    guard.frame_state = Some(state_index as u32);
-    instructions.push(guard);
 }
 
 fn push_barrier(

@@ -3253,8 +3253,66 @@ fn select_cache_ir_property_programs(
         accumulated_hit = append_boolean_or(accumulated_hit, hit, representations, instructions);
     }
 
+    // Existing-slot and add-transition programs of a store likewise share one
+    // receiver decode, one hidden-class dispatch and one committed effect.
+    let store_cases = if stored.is_some() {
+        source
+            .program
+            .iter()
+            .filter_map(property_speculation::store_case)
+            .collect::<Box<[_]>>()
+    } else {
+        Box::default()
+    };
+    if let Some(value) = stored
+        && !store_cases.is_empty()
+    {
+        let transitions = store_cases.iter().any(|case| case.transition.is_some());
+        let owner = push_value(representations, MachineRepresentation::Int64);
+        let child = push_value(representations, MachineRepresentation::Tagged);
+        let hit = push_value(representations, MachineRepresentation::Boolean);
+        let mut store = MachineInstruction::plain(
+            MachineOpcode::PropertyStoreDispatch {
+                byte_pc: source.byte_pc,
+                cases: store_cases,
+            },
+            vec![
+                MachineOperand::location_input(receiver),
+                MachineOperand::location_input(value),
+                MachineOperand::register_output(owner),
+                MachineOperand::register_output(child),
+                MachineOperand::register_output(hit),
+            ],
+        );
+        store.clobbers = property_store_clobbers(target_spec, value_is_non_cell);
+        instructions.push(store);
+        for (barrier_value, non_cell) in [(value, value_is_non_cell), (child, false)]
+            .into_iter()
+            .take(if transitions { 2 } else { 1 })
+        {
+            let mut barrier = MachineInstruction::plain(
+                MachineOpcode::CacheIrWriteBarrier {
+                    byte_pc: source.byte_pc,
+                    value_is_non_cell: non_cell,
+                },
+                vec![
+                    MachineOperand::location_input(owner),
+                    MachineOperand::location_input(barrier_value),
+                    MachineOperand::register_input(hit),
+                ],
+            );
+            barrier.clobbers = property_store_clobbers(target_spec, non_cell);
+            instructions.push(barrier);
+        }
+        accumulated_hit = append_boolean_or(accumulated_hit, hit, representations, instructions);
+    }
+
     for program in source.program.iter().filter(|program| {
-        stored.is_some() || property_speculation::own_data_slot(program).is_none()
+        if stored.is_some() {
+            property_speculation::store_case(program).is_none()
+        } else {
+            property_speculation::own_data_slot(program).is_none()
+        }
     }) {
         let active = push_value(representations, MachineRepresentation::Boolean);
         instructions.push(MachineInstruction::plain(
@@ -7846,20 +7904,20 @@ mod tests {
             .1
             .to_shape = 17;
         assert!(sequence.instructions().iter().any(|instruction| matches!(
-            instruction.opcode,
-            MachineOpcode::CacheIrGuardShape {
-                byte_pc: 40,
-                shape: 7
-            }
+            &instruction.opcode,
+            MachineOpcode::PropertyStoreDispatch { byte_pc: 40, cases }
+                if matches!(cases.as_ref(), [super::super::PropertyStoreCase {
+                    shape: 7,
+                    value_byte: 0,
+                    transition: Some(transition),
+                }] if transition.child_shape == 11
+                    && transition.prototype_shapes.as_ref() == [13]
+                    && transition.new_len == 1
+                    && transition.initialize_inline)
         )));
-        assert!(sequence.instructions().iter().any(|instruction| matches!(
-            instruction.opcode,
-            MachineOpcode::CacheIrPublishShape {
-                byte_pc: 40,
-                shape: 11,
-                ..
-            }
-        )));
+        assert!(sequence.instructions().iter().any(|instruction| {
+            instruction.opcode == MachineOpcode::GuardCondition && instruction.frame_state.is_some()
+        }));
         hir.constructor_field_sites.get_mut(&site).unwrap().0 = 95;
         assert!(
             select(&hir).is_err(),
@@ -9058,33 +9116,39 @@ mod tests {
             .iter()
             .map(|instruction| &instruction.opcode)
             .collect::<Vec<_>>();
-        let position = |predicate: fn(&MachineOpcode) -> bool| {
-            opcodes
-                .iter()
-                .position(|opcode| predicate(opcode))
-                .expect("transition opcode")
+        let dispatch = opcodes
+            .iter()
+            .position(|opcode| matches!(opcode, MachineOpcode::PropertyStoreDispatch { .. }))
+            .expect("one store dispatch");
+        let MachineOpcode::PropertyStoreDispatch { cases, .. } = opcodes[dispatch] else {
+            unreachable!();
         };
-        let guard_shape =
-            position(|opcode| matches!(opcode, MachineOpcode::CacheIrGuardShape { .. }));
-        let guard_prototype =
-            position(|opcode| matches!(opcode, MachineOpcode::CacheIrGuardPrototypeNull { .. }));
-        let guard_extensible =
-            position(|opcode| matches!(opcode, MachineOpcode::CacheIrGuardExtensible { .. }));
-        let store = position(|opcode| matches!(opcode, MachineOpcode::CacheIrStoreField { .. }));
-        let publish =
-            position(|opcode| matches!(opcode, MachineOpcode::CacheIrPublishShape { .. }));
-        assert!(guard_shape < guard_prototype);
-        assert!(guard_prototype < guard_extensible);
-        assert!(guard_extensible < store);
-        assert!(store < publish);
+        let [case] = cases.as_ref() else {
+            panic!("one add-transition case: {cases:?}");
+        };
+        let transition = case.transition.as_ref().expect("add-transition contract");
+        assert!(transition.child_shape != 0 && transition.new_len != 0);
+        // Guards, store and publication live inside the dispatch; the value
+        // and child-shape edges follow it as explicit barriers.
+        assert!(!opcodes.iter().any(|opcode| matches!(
+            opcode,
+            MachineOpcode::CacheIrGuardShape { .. }
+                | MachineOpcode::CacheIrGuardExtensible { .. }
+                | MachineOpcode::CacheIrStoreField { .. }
+                | MachineOpcode::CacheIrPublishShape { .. }
+        )));
+        let barriers = opcodes
+            .iter()
+            .enumerate()
+            .filter(|(_, opcode)| matches!(opcode, MachineOpcode::CacheIrWriteBarrier { .. }))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
         assert_eq!(
-            opcodes
-                .iter()
-                .filter(|opcode| matches!(opcode, MachineOpcode::CacheIrWriteBarrier { .. }))
-                .count(),
+            barriers.len(),
             2,
             "value and child-shape edges each need an explicit barrier"
         );
+        assert!(barriers.iter().all(|&index| index > dispatch));
         sequence
             .allocate(&TargetSpec::aarch64())
             .expect("transition allocation");

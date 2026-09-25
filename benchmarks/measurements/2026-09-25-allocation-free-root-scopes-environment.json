@@ -1,0 +1,57 @@
+{
+  "baseEngineCommit": "d76edec5f6ac88a1103a2b1e331f1f644864e3b0",
+  "candidateEngine": "RootScope keeps its slots in the heap's frame-root registry (one marker entry plus a capacity-retaining slot stack) instead of a boxed provider with its own Vec.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "sources": {
+    "string-concat": {
+      "path": "benchmarks/scripts/string-concat.js",
+      "sha256": "68210e34b0543d9ed84b028b60d37cca1eff5ab4cbb80aed968892da1131a137",
+      "expected": 600000
+    },
+    "native-boundary": {
+      "path": "benchmarks/scripts/native-boundary.js",
+      "sha256": "60bb4c98c42472fc2db9473646f6b54c9990479fc1870a5ded93e5706b54faf4",
+      "expected": 27000000
+    },
+    "polluted-feedback": {
+      "path": "benchmarks/scripts/polluted-feedback.js",
+      "sha256": "0f3f1abc0f29e1f952209fbd7b0b5a5641745175105a50f1b2684a4609d4c303",
+      "expected": 4287494
+    }
+  },
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "99f5fbfdd2275ce2f3b700e7e778afca839d47e911c738548dd84ca37bfc8bb4",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "31760c8b854db1e90667a0bf981050e322720f1c637decfab794abbebb572357",
+    "afterIsFullGateBuild": true
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/<kernel>.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "<checksum>",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per kernel and tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series. Load average about 3.1.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "excludedFromResult": [
+    "development quick measurements (rootscope-dev, rootscope-all)"
+  ],
+  "interveningCommit": "afd276f232eeac283fffd9bffb590d3ac524ccab changes only String/RegExp-string iterator tracing and Array.prototype.join rooting, which no measured kernel executes."
+}

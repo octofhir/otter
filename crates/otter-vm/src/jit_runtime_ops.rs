@@ -279,13 +279,18 @@ impl Interpreter {
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)?;
         let saved_pc = frame.pc();
+        // §10.2.1.1 — an arrow closes over the enclosing activation's
+        // `new.target`. The published frame carries it for both native and
+        // materialized activations; undefined is the unbound state.
+        let new_target = frame.new_target_value();
+        let lexical_new_target = (!new_target.is_undefined()).then_some(new_target);
         let result = self.run_make_closure_active_regs(
             &resolved,
             frame,
             dst,
             function_index,
             parent_indices,
-            None,
+            lexical_new_target,
             None,
         );
         frame.set_pc(saved_pc);

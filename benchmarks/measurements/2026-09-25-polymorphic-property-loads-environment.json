@@ -1,0 +1,67 @@
+{
+  "baseEngineCommit": "14df4248edeb6f137246a37bd24a3e3915acbe31",
+  "candidateEngine": "Every own-data CacheIR program of a load site lowers to one PropertyPolymorphicLoad Machine operation: one receiver decode, one hidden-class load, N shape compares, one slot read.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "sources": {
+    "property-polymorphic": {
+      "path": "benchmarks/scripts/property-polymorphic.js",
+      "sha256": "8a9eac3c9bdb84649b32a6dfc639237893a1695d8512b5c95932da25f5e3d2f6",
+      "expected": 80011800000
+    },
+    "derived-constructor": {
+      "path": "benchmarks/scripts/derived-constructor.js",
+      "sha256": "dc0b765b4c0ab280c358e213c795116254fb0a2c3a5470a4cc46282fdaf0a336",
+      "expected": 10000200000
+    },
+    "string-concat": {
+      "path": "benchmarks/scripts/string-concat.js",
+      "sha256": "68210e34b0543d9ed84b028b60d37cca1eff5ab4cbb80aed968892da1131a137",
+      "expected": 600000
+    },
+    "method-call-monomorphic": {
+      "path": "benchmarks/scripts/method-call-monomorphic.js",
+      "sha256": "22b3ffbdec9ce88d5f05040ee8153a9d94d339d1150f1b71d2e1ba43370e95bf",
+      "expected": 500003500000
+    },
+    "dense-array": {
+      "path": "benchmarks/scripts/dense-array.js",
+      "sha256": "a8c524cab08039335d4bf3d8ed3e8a0a6a4c8264ef86c6f6028264ef2115cf85",
+      "expected": 5234688
+    }
+  },
+  "warmups": 8,
+  "samples": 20,
+  "gcStress": "unset",
+  "binarySha256": {
+    "before": "31760c8b854db1e90667a0bf981050e322720f1c637decfab794abbebb572357",
+    "beforeIsPreviousSliceGateBuild": true,
+    "after": "63a0b7659f11e0eb455dca1ac7af8170e96ae51c4c05149dbf7a095c6dcf174e",
+    "afterIsFullGateBuild": true
+  },
+  "sharedSeries": "One gate build carries this slice together with the polymorphic-load, standby-page, x86 direct-call clobber and back-edge relink changes; each kernel's attribution is stated in the report.",
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<binary>",
+    "kernel",
+    "--source",
+    "benchmarks/scripts/<kernel>.js",
+    "--function",
+    "engineKernel",
+    "--expected",
+    "<checksum>",
+    "--jit-tier",
+    "<tier>",
+    "--samples",
+    "20",
+    "--warmup",
+    "8"
+  ],
+  "runOrder": "Per kernel and tier: pairs 1 and 3 before->after, pair 2 after->before. No builds, tests or agents ran during the series. Load average about 2.3.",
+  "aggregation": "Geometric mean of after/before wall-median ratios across three pairs; same for process instructions and cycles.",
+  "excludedFromResult": [
+    "development quick measurements (poly-dev, rootscope-dev)"
+  ]
+}

@@ -843,7 +843,10 @@ fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
     assert!(
         regions
             .iter()
-            .filter(|region| region["kind"] == "machineCacheIrLoadField")
+            .filter(|region| {
+                region["kind"] == "machineCacheIrLoadField"
+                    || region["kind"] == "machinePolymorphicPropertyLoad"
+            })
             .count()
             >= 2,
         "the tagged result must remain live across another CacheIR load: {code_map}",

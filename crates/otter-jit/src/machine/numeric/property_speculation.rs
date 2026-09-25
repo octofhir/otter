@@ -6,6 +6,8 @@
 //!   probe plus committed cold call.
 //! - [`select`] — its Machine form: a receiver shape proof, one exact
 //!   pre-operation `GuardCondition` exit, and an unchecked slot read.
+//! - [`own_data_slot`] — the CacheIR program pattern of one hidden class's own
+//!   data slot, shared with the non-deopting polymorphic shape dispatch.
 //!
 //! # Invariants
 //! - Only a site whose single baked CacheIR program is an own data slot of one
@@ -64,6 +66,13 @@ pub(super) fn speculated_load(view: &JitCompileSnapshot, logical_pc: u32) -> Opt
     let [program] = view.property_programs.get(&instruction.byte_pc)?.as_slice() else {
         return None;
     };
+    own_data_slot(program)
+}
+
+/// Recognize a program that reads one own data slot of one hidden class:
+/// `GuardShape`, an optional read-only `GuardAtomSlot` naming the same slot,
+/// and `LoadField`, all on the receiver.
+pub(super) fn own_data_slot(program: &otter_vm::JitCacheIrProgram) -> Option<ShapeLoad> {
     let (shape, value_byte, ordinary) = match *program.ops {
         [
             otter_vm::JitCacheIrOp::GuardShape { object: 0, shape },

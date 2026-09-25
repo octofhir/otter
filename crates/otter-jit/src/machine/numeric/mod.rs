@@ -3211,7 +3211,51 @@ fn select_cache_ir_property_programs(
         accumulated_hit = append_boolean_or(accumulated_hit, hit, representations, instructions);
     }
 
-    for program in source.program.iter() {
+    // Own-data programs of a load share one receiver decode and one hidden-class
+    // dispatch instead of re-proving the receiver in every program.
+    let cases = if stored.is_none() {
+        source
+            .program
+            .iter()
+            .filter_map(property_speculation::own_data_slot)
+            .map(|slot| super::PolymorphicPropertyCase {
+                shape: slot.shape,
+                value_byte: slot.value_byte,
+                ordinary: slot.ordinary,
+            })
+            .collect::<Box<[_]>>()
+    } else {
+        Box::default()
+    };
+    if !cases.is_empty() {
+        let payload = push_value(representations, MachineRepresentation::Tagged);
+        let hit = push_value(representations, MachineRepresentation::Boolean);
+        let mut dispatch = MachineInstruction::plain(
+            MachineOpcode::PropertyPolymorphicLoad {
+                byte_pc: source.byte_pc,
+                cases,
+            },
+            vec![
+                MachineOperand::location_input(receiver),
+                MachineOperand::register_output(payload),
+                MachineOperand::register_output(hit),
+            ],
+        );
+        dispatch.clobbers = property_load_clobbers(target_spec);
+        instructions.push(dispatch);
+        accumulated_payload = append_tagged_select(
+            hit,
+            payload,
+            accumulated_payload,
+            representations,
+            instructions,
+        );
+        accumulated_hit = append_boolean_or(accumulated_hit, hit, representations, instructions);
+    }
+
+    for program in source.program.iter().filter(|program| {
+        stored.is_some() || property_speculation::own_data_slot(program).is_none()
+    }) {
         let active = push_value(representations, MachineRepresentation::Boolean);
         instructions.push(MachineInstruction::plain(
             MachineOpcode::BooleanConstant(true),
@@ -3682,7 +3726,7 @@ fn direct_call_descriptor(
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
+        clobbers: target_spec.clobbers(TargetClobberSet::DirectCall).to_vec(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),
@@ -3748,7 +3792,7 @@ fn committed_value_descriptor(
             .union(CallEffects::WRITES_HEAP)
             .union(CallEffects::INVALIDATES_SHAPES)
             .union(CallEffects::REENTRANT),
-        clobbers: target_spec.clobbers(TargetClobberSet::DirectCall).to_vec(),
+        clobbers: target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec(),
         exceptional: landing_pad
             .map(ExceptionalEdge::LandingPad)
             .unwrap_or(ExceptionalEdge::Propagate),

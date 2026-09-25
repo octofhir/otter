@@ -346,7 +346,7 @@ pub(crate) fn compile_class_constructor(
         hoist_function_declarations(parent, &body.statements)?;
         let mut fields_emitted = !is_derived;
         for stmt in &body.statements {
-            compile_statement(parent, stmt)?;
+            compile_discarded_statement(parent, stmt)?;
             // Inject the field initialisers as soon as the user's
             // first statement-level `super(...)` call has run. This
             // mirrors the spec's "after the super call returns" rule

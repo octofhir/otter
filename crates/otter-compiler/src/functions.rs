@@ -307,7 +307,7 @@ pub(crate) fn compile_function_full(
             parent.emit(Op::GeneratorStart, vec![], span);
         }
         for stmt in &body.statements {
-            compile_statement(parent, stmt)?;
+            compile_discarded_statement(parent, stmt)?;
         }
         if !param_shadowed.is_empty() {
             parent.exit_scope();
@@ -693,7 +693,7 @@ pub(crate) fn compile_arrow_function(
         pre_declare_lexical_bindings(parent, &lex_names, span)?;
         hoist_function_declarations(parent, &arrow.body.statements)?;
         for stmt in &arrow.body.statements {
-            compile_statement(parent, stmt)?;
+            compile_discarded_statement(parent, stmt)?;
         }
         if contains_direct_eval {
             capture_lexical_environment_for_eval(parent);

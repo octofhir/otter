@@ -452,7 +452,7 @@ pub(crate) fn compile_for_in_statement(
     // reassign in place.
     cx.enter_scope();
     bind_for_in_of_head(cx, &s.left, value_reg, span)?;
-    compile_statement(cx, &s.body)?;
+    compile_discarded_statement(cx, &s.body)?;
     cx.exit_scope();
 
     let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);

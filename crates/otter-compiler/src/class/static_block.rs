@@ -55,7 +55,7 @@ pub(crate) fn compile_static_block(
     pre_declare_lexical_bindings(parent, &lex_names, span)?;
     hoist_function_declarations(parent, body)?;
     for stmt in body {
-        compile_statement(parent, stmt)?;
+        compile_discarded_statement(parent, stmt)?;
     }
     // §19.2.1.3 — a direct eval inside the block resolves the caller
     // chain's bindings (the inner class-name binding included) through

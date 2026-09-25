@@ -72,7 +72,7 @@ pub(crate) fn compile_try_statement(
 
         cx.enter_scope();
         for inner_stmt in &s.block.body {
-            compile_statement(cx, inner_stmt)?;
+            compile_discarded_statement(cx, inner_stmt)?;
         }
         cx.exit_scope();
         cx.emit(Op::LeaveTry, vec![], span);
@@ -98,7 +98,7 @@ pub(crate) fn compile_try_statement(
         cx.active_handlers += 1;
         cx.enter_scope();
         for inner_stmt in &s.block.body {
-            compile_statement(cx, inner_stmt)?;
+            compile_discarded_statement(cx, inner_stmt)?;
         }
         cx.exit_scope();
         cx.emit(Op::LeaveTry, vec![], span);
@@ -118,7 +118,7 @@ pub(crate) fn compile_try_statement(
     cx.active_finally += 1;
     cx.enter_scope();
     for inner_stmt in &s.block.body {
-        compile_statement(cx, inner_stmt)?;
+        compile_discarded_statement(cx, inner_stmt)?;
     }
     cx.exit_scope();
     cx.emit(Op::LeaveTry, vec![], span);
@@ -184,7 +184,7 @@ pub(crate) fn compile_catch_clause(
     }
     crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
     for inner in &handler.body.body {
-        compile_statement(cx, inner)?;
+        compile_discarded_statement(cx, inner)?;
     }
     cx.exit_scope();
     Ok(())
@@ -233,7 +233,7 @@ pub(crate) fn compile_finalizer(
         }
         crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, fspan)?;
         for inner in &finalizer.body {
-            compile_statement(cx, inner)?;
+            compile_discarded_statement(cx, inner)?;
         }
         Ok(())
     })();

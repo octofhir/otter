@@ -51,6 +51,7 @@ pub use class_ops::ClassRuntimeOp;
 pub use committed_values::{
     BinaryOperator, CommittedValueError, ObjectProtocolValueOp, ScalarValueOp,
 };
+pub use control::BackedgePollOutcome;
 pub use iterators::IteratorRuntimeOutcome;
 pub use value_loads::ValueLoadRuntimeOp;
 

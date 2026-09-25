@@ -222,6 +222,7 @@ pub(super) fn compile(
     let allocation_miss_exit = ops.new_dynamic_label();
     let unsupported_exit = ops.new_dynamic_label();
     let runtime_transition_exit = ops.new_dynamic_label();
+    let backedge_relink_exit = ops.new_dynamic_label();
     // Runtime-transition helpers share this local name; representation,
     // identity, allocation, and unsupported sites select dedicated labels.
     let bail = runtime_transition_exit;
@@ -293,7 +294,15 @@ pub(super) fn compile(
             TemplateOp::Jump { target, back_edge } => {
                 let tgt = labels[&target];
                 if back_edge {
-                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw, fatal);
+                    emit_backedge_poll(
+                        &mut ops,
+                        &mut relocations,
+                        poll_entry,
+                        target,
+                        backedge_relink_exit,
+                        threw,
+                        fatal,
+                    );
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt);
             }
@@ -318,7 +327,15 @@ pub(super) fn compile(
                         dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw, fatal);
+                    emit_backedge_poll(
+                        &mut ops,
+                        &mut relocations,
+                        poll_entry,
+                        target,
+                        backedge_relink_exit,
+                        threw,
+                        fatal,
+                    );
                     dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
                 } else if when_truthy {
                     dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -344,7 +361,15 @@ pub(super) fn compile(
                 let fallthrough = ops.new_dynamic_label();
                 dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
                 if back_edge {
-                    emit_backedge_poll(&mut ops, &mut relocations, poll_entry, threw, fatal);
+                    emit_backedge_poll(
+                        &mut ops,
+                        &mut relocations,
+                        poll_entry,
+                        target,
+                        backedge_relink_exit,
+                        threw,
+                        fatal,
+                    );
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
             }
@@ -1535,6 +1560,12 @@ pub(super) fn compile(
         abi::ExitReason::RuntimeTransition,
         abi::ExitAction::Resume,
     );
+    emit_side_exit_epilogue(
+        &mut ops,
+        backedge_relink_exit,
+        abi::ExitReason::Interrupt,
+        abi::ExitAction::Resume,
+    );
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "bailEpilogue",
@@ -1902,12 +1933,16 @@ fn emit_truthiness_bool(
 /// Inline cooperative poll at a back edge: read the interrupt byte and
 /// decrement the fuel counter, re-entering the poll stub only when the
 /// interrupt is set or the counter reaches zero. `poll_entry` is the
-/// descriptor-resolved poll transition; unknown status words branch directly
-/// to the fatal epilogue.
+/// descriptor-resolved poll transition. A side-exit status resumes the
+/// interpreter at the loop header `target` (the VM relinked this body); unknown
+/// status words branch directly to the fatal epilogue.
+#[allow(clippy::too_many_arguments)]
 fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     poll_entry: u64,
+    target: u32,
+    relink: DynamicLabel,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) {
@@ -1943,7 +1978,9 @@ fn emit_backedge_poll(
         ; b.eq =>cont
         ; cmp x0, abi::NativeResultStatus::Throw as u32
         ; b.eq =>threw
-        ; b =>fatal
-        ; =>cont
+        ; cmp x0, abi::NativeResultStatus::SideExit as u32
+        ; b.ne =>fatal
     );
+    emit_stamp_pc(ops, target);
+    dynasm!(ops ; .arch aarch64 ; b =>relink ; =>cont);
 }

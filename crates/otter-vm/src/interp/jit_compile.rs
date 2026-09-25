@@ -32,7 +32,7 @@ use crate::*;
 mod inline_snapshot_budget;
 use inline_snapshot_budget::InlineSnapshotBudget;
 
-const EAGER_DIRECT_TARGET_DEPTH: u8 = 2;
+pub(super) const EAGER_DIRECT_TARGET_DEPTH: u8 = 2;
 
 /// Internal result of one Template compiler invocation.
 ///
@@ -122,6 +122,16 @@ impl Interpreter {
                     self.jit_entry_osr_only.insert(fid);
                 } else {
                     self.jit_entry_osr_only.remove(&fid);
+                    // A running baseline loop may be reaching this function
+                    // through the generic call boundary; let its next back-edge
+                    // relink instead of waiting out the poll window.
+                    if self
+                        .jit_pending_direct_targets
+                        .values()
+                        .any(|targets| targets.contains(&fid))
+                    {
+                        self.request_next_backedge_poll();
+                    }
                 }
             }
             TemplateCompileOutcome::Unsupported => {
@@ -1363,7 +1373,7 @@ impl Interpreter {
         context: &ExecutionContext,
         function: &CodeBlock,
     ) -> Option<jit::JitDirectCallPlan> {
-        self.ensure_direct_callee_plan(context, function, EAGER_DIRECT_TARGET_DEPTH, true)
+        self.ensure_direct_callee_plan(context, function, EAGER_DIRECT_TARGET_DEPTH, true, 0)
     }
 
     /// Resolve the stable entry cell for one compiler-native call.
@@ -1389,12 +1399,13 @@ impl Interpreter {
     /// bounds recursive planning even for cyclic call graphs while allowing a
     /// hot closure-backed caller to bring its already-observed nested target
     /// into the same sealed generation.
-    fn ensure_direct_callee_plan(
+    pub(super) fn ensure_direct_callee_plan(
         &mut self,
         context: &ExecutionContext,
         function: &CodeBlock,
         eager_depth: u8,
         runtime_selected: bool,
+        site_executions: u64,
     ) -> Option<jit::JitDirectCallPlan> {
         if let Some(plan) = self.current_direct_callee_plan(function) {
             return Some(plan);
@@ -1432,11 +1443,14 @@ impl Interpreter {
         if self.jit_code.contains_key(&function.id) {
             return None;
         }
+        // `site_executions` is the caller's own evidence that this site runs
+        // again: the trip count of the hot loop being compiled around it.
         let executions = u64::from(self.jit_call_counts.get(&function.id).copied().unwrap_or(0))
             .saturating_add(
                 self.jit_code_registry
                     .generated_entries_for_function(function.id),
-            );
+            )
+            .max(site_executions);
         let resident_code_bytes = self.jit_code_residency().code_bytes;
         if !runtime_selected
             && !replaces_entry_generation
@@ -1791,6 +1805,23 @@ impl Interpreter {
                 Some((instruction_pc, instr.byte_pc, op, state))
             })
             .collect();
+        // Sites inside the loop whose back-edges triggered this OSR compile run
+        // once per iteration; that observed trip count is the same evidence
+        // the cost model already trusts for the loop itself.
+        let osr_loop = self
+            .jit_osr_trigger
+            .filter(|&(trigger_fid, _, _)| trigger_fid == fid)
+            .and_then(|(_, header, backedges)| {
+                view.code_block
+                    .control_flow()
+                    .loop_latch(header)
+                    .map(|latch| (header, latch, backedges))
+            });
+        let site_executions = |instruction_pc: u32| {
+            osr_loop
+                .filter(|&(header, latch, _)| (header..=latch).contains(&instruction_pc))
+                .map_or(0, |(_, _, backedges)| backedges)
+        };
         for (instruction_pc, call_byte_pc, op, state) in call_sites {
             let is_construct = matches!(
                 op,
@@ -1953,6 +1984,7 @@ impl Interpreter {
                     callee,
                     eager_direct_target_depth,
                     false,
+                    site_executions(instruction_pc),
                 ) {
                     debug_assert_eq!(plan.function_id, callee_fid);
                     let receiver_allocation = if is_construct && !callee.is_derived_constructor {
@@ -2122,6 +2154,7 @@ impl Interpreter {
                     u32::try_from(target_index).unwrap_or(u32::MAX),
                     target_count,
                     eager_direct_target_depth,
+                    site_executions(snap.instruction_pc),
                 ) {
                     Ok(method) => {
                         let plan = method.callee.plan;
@@ -2248,6 +2281,7 @@ impl Interpreter {
         target_index: u32,
         target_count: u32,
         eager_direct_target_depth: u8,
+        site_executions: u64,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
         let method_context = context
             .for_function(target.method_fid)
@@ -2262,7 +2296,13 @@ impl Interpreter {
             .bake_method_guard(target)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MethodGuardUnavailable)?;
         let plan = self
-            .ensure_direct_callee_plan(&method_context, method, eager_direct_target_depth, false)
+            .ensure_direct_callee_plan(
+                &method_context,
+                method,
+                eager_direct_target_depth,
+                false,
+                site_executions,
+            )
             .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
         debug_assert_eq!(plan.function_id, target.method_fid);
         Ok(jit::JitDirectMethod {

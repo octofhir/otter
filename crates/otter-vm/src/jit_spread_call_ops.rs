@@ -213,6 +213,7 @@ impl Interpreter {
             .jit_to_rust_call_transitions
             .saturating_add(1);
         self.record_resolved_call_feedback(function, call_pc, function_id, callee);
+        self.note_generic_call_target(context, function_id, callee);
         self.run_rooted_call_values(stack, context, callee, receiver, args)
     }
 
@@ -256,6 +257,7 @@ impl Interpreter {
             }
         }
         self.observe_class_constructor_field_transitions(context, callee)?;
+        self.note_generic_call_target(context, function_id, callee);
         self.run_rooted_construct_values(stack, context, callee, callee, args)
     }
 

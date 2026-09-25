@@ -1,0 +1,35 @@
+{
+  "baseEngineCommit": "14df4248edeb6f137246a37bd24a3e3915acbe31",
+  "candidateEngine": "Baseline loops relink at a back-edge: generic call sites whose targets repay a direct-call-target compile (or gained entry code) join the body's pending targets, the next back-edge polls, the VM compiles the targets and unlinks the body, and the poll resumes the interpreter at the loop header; OSR compiles count the triggering loop's trip count as target evidence; relinks are bounded per (caller, target) pair.",
+  "machine": "Apple M1, 16 GiB",
+  "os": "macOS 26.5 (25F71)",
+  "rustc": "1.97.1 (8bab26f4f 2026-07-14), LLVM 22.1.6",
+  "sources": {
+    "relink-early": {
+      "path": "benchmarks/results/session-2026-09-25b/relink-early.js",
+      "sha256": "0e842b03a5242deaf14bb6ed71762eaa8ef8b2392daad3bc8536233109ef454c",
+      "expected": 3068983632
+    },
+    "relink-late": {
+      "path": "benchmarks/results/session-2026-09-25b/relink-late.js",
+      "sha256": "20f5c5b4fac0b33df8a8fabd0c586a4c1f60e4f82a726c10eed781232fdf5a63",
+      "expected": 3068983632
+    }
+  },
+  "binarySha256": {
+    "before": "ce417a1ef90554beb94724c77f2c6ced58851e62e24a12c74357efc4211000e9",
+    "beforeDescription": "previous gate build: back-edge relink limited to one relink per function",
+    "after": "1fb2ba263dd1c329401b1bceeb893c83a48f39f0c423e0fd38e68944329bc68f",
+    "afterIsFullGateBuild": true
+  },
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "<otter>",
+    "run",
+    "[--jitless]",
+    "<script>"
+  ],
+  "runOrder": "Per script and mode: pairs 1 and 3 before->after, pair 2 after->before; one process per run; no builds, tests or agents ran; load average about 2.4.",
+  "aggregation": "Geometric mean of after/before ratios of in-script wall milliseconds, process instructions and cycles across three pairs."
+}

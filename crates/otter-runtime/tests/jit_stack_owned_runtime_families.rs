@@ -64,6 +64,28 @@ fn run(source: &str, selection: JitSelection) -> (String, RuntimeExecutionStats)
     (completion, runtime.execution_stats())
 }
 
+/// Generic call transitions of one more `run(1000)` after the script warmed.
+fn steady_generic_calls(source: &str, selection: JitSelection) -> u64 {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .build()
+        .expect("runtime");
+    runtime
+        .run_script(
+            SourceInput::from_javascript(source.to_string()),
+            "jit-stack-owned-runtime-families-warm.js",
+        )
+        .expect("runtime-family warmup");
+    let before = runtime.execution_stats().jit_to_rust_call_transitions;
+    runtime
+        .run_script(
+            SourceInput::from_javascript("run(1000);"),
+            "jit-stack-owned-runtime-families-steady.js",
+        )
+        .expect("runtime-family steady run");
+    runtime.execution_stats().jit_to_rust_call_transitions - before
+}
+
 fn run_with_events(source: &str, selection: JitSelection) -> (String, Vec<JitDebugEvent>) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
@@ -89,6 +111,7 @@ fn direct_generated_runtime_families_match_interpreter_without_deopt() {
     let (oracle, _) = run(DIRECT_FAMILIES, JitSelection::InterpreterOnly);
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let (compiled, stats) = run(DIRECT_FAMILIES, selection);
+        let steady = steady_generic_calls(DIRECT_FAMILIES, selection);
         assert_eq!(compiled, oracle);
         assert_eq!(compiled, "1004000");
         assert!(
@@ -103,12 +126,13 @@ fn direct_generated_runtime_families_match_interpreter_without_deopt() {
             stats.jit_generated_template_deopts, 0,
             "template callees must complete on their stack-owned windows"
         );
-        // Only sites without a direct target take the generic boundary: the
-        // top-level `run(1000)` entered from the OSR-compiled script body and
-        // the native `String(checksum)` call. Both direct targets stay native.
+        // Warmup may cross the generic boundary until a callee repays its own
+        // compile; the running body then relinks. Once warm, only the native
+        // `String(checksum)` call and the script-level `run` call remain.
         assert!(
-            stats.jit_to_rust_call_transitions <= 2,
-            "stable direct targets must not fall back to the generic call boundary: {stats:?}"
+            steady <= 2,
+            "stable direct targets must not fall back to the generic call boundary: \
+             steady={steady} {stats:?}"
         );
     }
 }
@@ -345,6 +369,33 @@ fn upvalue_spine_abrupt_paths_commit_once_across_generated_side_exits() {
         assert!(
             stats.jit_generated_call_deopts <= 3,
             "each first abrupt family may side-exit once, never replay: {stats:?}"
+        );
+    }
+}
+
+const SECOND_SITE_RELINK: &str = r#"
+function laterCallee(value) { return (value * 3 + 1) & 1023; }
+function earlierCallee(value) { return (value * 5 + 7) & 1023; }
+for (let i = 0; i < 3000; i++) laterCallee(i);
+let checksum = 0;
+for (let i = 0; i < 200000; i++) {
+  checksum += i < 2000 ? earlierCallee(i) : laterCallee(i);
+}
+String(checksum);
+"#;
+
+#[test]
+fn a_site_that_turns_hot_after_an_earlier_relink_still_relinks() {
+    let (oracle, _) = run(SECOND_SITE_RELINK, JitSelection::InterpreterOnly);
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let (compiled, stats) = run(SECOND_SITE_RELINK, selection);
+        assert_eq!(compiled, oracle);
+        // The loop body is compiled before its `laterCallee` site runs. The
+        // earlier site relinks first; the later one must relink as well
+        // instead of crossing the generic boundary for the rest of the loop.
+        assert!(
+            stats.jit_to_rust_call_transitions < 10_000,
+            "{selection:?}: {stats:?}"
         );
     }
 }

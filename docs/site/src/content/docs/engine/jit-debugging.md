@@ -94,7 +94,18 @@ separately from `inlineCallees` /
 `thisMode` (`constructReceiver` or `derivedConstructor` for construct
 planning), or
 `rejected` with one of `missingCallee`, `ineligibleFunction`,
-`methodGuardUnavailable`, or `noEntryGeneration`. Fresh callee-owned capture
+`methodGuardUnavailable`, or `noEntryGeneration`. A `noEntryGeneration`
+target, or a target a baseline body keeps reaching through the generic call
+boundary once its executions repay a direct-call-target compile, becomes a
+pending target of that body. Entry refresh rebuilds a pending body at function
+entry; a running baseline loop relinks at its next back-edge instead: the VM
+compiles the pending targets, unlinks the body, and the poll resumes the
+interpreter at the loop header (`Interrupt`/`Resume` side exit), whose next
+OSR lowers the sites as generated calls. Installing a pending target's entry
+code shortens the current back-edge poll window to one back-edge, and the
+checkpoint charges exactly the back-edges consumed. An OSR compile also counts
+the triggering loop's observed trip count as execution evidence for direct
+targets inside that loop. Fresh callee-owned capture
 cells no longer reject direct linkage: generated entry allocates them into a
 caller-reserved upvalue spine and appends the closure's inherited cells before
 publishing the callee frame.

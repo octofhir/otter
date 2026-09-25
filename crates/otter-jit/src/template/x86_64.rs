@@ -126,6 +126,7 @@ pub(super) fn compile(
     let identity_guard = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
     let runtime_transition = ops.new_dynamic_label();
+    let backedge_relink = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
     let pair_exit = ops.new_dynamic_label();
     let committed_throw = ops.new_dynamic_label();
@@ -164,6 +165,8 @@ pub(super) fn compile(
                         &mut ops,
                         &mut relocations,
                         transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
+                        target,
+                        backedge_relink,
                         threw,
                         fatal,
                     );
@@ -191,6 +194,8 @@ pub(super) fn compile(
                         &mut ops,
                         &mut relocations,
                         transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
+                        target,
+                        backedge_relink,
                         threw,
                         fatal,
                     );
@@ -215,6 +220,8 @@ pub(super) fn compile(
                         &mut ops,
                         &mut relocations,
                         transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
+                        target,
+                        backedge_relink,
                         threw,
                         fatal,
                     );
@@ -1187,6 +1194,12 @@ pub(super) fn compile(
         abi::ExitReason::RuntimeTransition,
         abi::ExitAction::Resume,
     );
+    emit_side_exit(
+        &mut ops,
+        backedge_relink,
+        abi::ExitReason::Interrupt,
+        abi::ExitAction::Resume,
+    );
     dynasm!(ops
         ; .arch x64
         ; =>threw
@@ -1423,10 +1436,15 @@ fn emit_side_exit(
     emit_epilogue(ops);
 }
 
+/// Inline cooperative poll at a back edge. A side-exit status resumes the
+/// interpreter at the loop header `target` after the VM relinked this body.
+#[allow(clippy::too_many_arguments)]
 fn emit_backedge_poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     poll_entry: u64,
+    target: u32,
+    relink: DynamicLabel,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) {
@@ -1454,9 +1472,11 @@ fn emit_backedge_poll(
         ; je =>done
         ; cmp eax, abi::NativeResultStatus::Throw as i32
         ; je =>threw
-        ; jmp =>fatal
-        ; =>done
+        ; cmp eax, abi::NativeResultStatus::SideExit as i32
+        ; jne =>fatal
     );
+    emit_stamp_pc(ops, target);
+    dynasm!(ops ; .arch x64 ; jmp =>relink ; =>done);
 }
 
 fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {

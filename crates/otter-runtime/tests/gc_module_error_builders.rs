@@ -674,7 +674,14 @@ fn direct_derived_super_construct_keeps_one_rooted_boundary() {
         };
         let prototypeReads = 0;
         let ProxiedDerived;
-        ProxiedDerived = new Proxy(DerivedError, {
+        // A class `prototype` is non-writable and non-configurable, so a get
+        // trap may not replace it. Proxy a plain function instead and forward
+        // construction to the class with the proxy as new.target.
+        function DerivedShell() {}
+        ProxiedDerived = new Proxy(DerivedShell, {
+            construct(target, args, newTarget) {
+                return Reflect.construct(DerivedError, args, newTarget);
+            },
             get(target, key, receiver) {
                 if (key === "prototype") {
                     events.push("prototype");

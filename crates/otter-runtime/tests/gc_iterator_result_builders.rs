@@ -16,7 +16,7 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 struct RunResult {
     completion: String,
-    compile_attempts: u64,
+    code_generations: u64,
 }
 
 fn run(selection: JitSelection, source: &str, name: &str) -> String {
@@ -60,7 +60,7 @@ fn run_warmed_probe(
         .to_owned();
     RunResult {
         completion,
-        compile_attempts: warm_stats.jit_compile_attempts,
+        code_generations: warm_stats.jit_code_generations,
     }
 }
 
@@ -93,7 +93,7 @@ fn assert_warmed_interpreter_and_template(
         "{name}: unexpected completion"
     );
     assert!(
-        template.compile_attempts > 0,
+        template.code_generations > 0,
         "{name}: warmup must request compilation"
     );
 }

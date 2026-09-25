@@ -174,8 +174,7 @@ pub enum IteratorState {
     /// Walks `string`'s WTF-16 code units while yielding full
     /// code-point strings; surrogate pairs advance as one item.
     String {
-        /// Backing string.
-        #[pelt(skip)]
+        /// Backing string (traced: a moving collection rewrites it).
         string: JsString,
         /// Next code-unit index.
         #[pelt(skip)]
@@ -186,8 +185,7 @@ pub enum IteratorState {
     RegExpString {
         /// The cloned matcher object used for iteration.
         matcher: Value,
-        /// Input string being matched.
-        #[pelt(skip)]
+        /// Input string being matched (traced: a moving collection rewrites it).
         input: JsString,
         /// Whether the matcher has the `g` flag.
         #[pelt(skip)]

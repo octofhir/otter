@@ -155,19 +155,7 @@ impl Interpreter {
         // the Object / Proxy fast paths already use so static-key
         // reads (`iter.next`, `map.size`, `prom.then`, …) resolve
         // consistently.
-        if receiver.is_proxy()
-            || receiver.is_generator()
-            || receiver.is_iterator()
-            || receiver.is_map()
-            || receiver.is_set()
-            || receiver.is_weak_map()
-            || receiver.is_weak_set()
-            || receiver.is_weak_ref()
-            || receiver.is_finalization_registry()
-            || receiver.is_promise()
-            || receiver.is_array_buffer()
-            || receiver.is_data_view()
-        {
+        if super::get_walks_prototype_chain(receiver) {
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx].advance_pc()?;
             match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
@@ -434,21 +422,10 @@ impl Interpreter {
 
         // Heap values that walk a prototype chain via `ordinary_get_value`.
         let prototype_routed = receiver.is_object()
-            || receiver.is_proxy()
-            || receiver.is_generator()
-            || receiver.is_iterator()
-            || receiver.is_map()
-            || receiver.is_set()
-            || receiver.is_weak_map()
-            || receiver.is_weak_set()
-            || receiver.is_weak_ref()
-            || receiver.is_finalization_registry()
-            || receiver.is_promise()
-            || receiver.is_array_buffer()
+            || super::get_walks_prototype_chain(receiver)
             || receiver.is_typed_array()
             || receiver.is_class_constructor()
-            || receiver.as_native_function().is_some()
-            || receiver.is_data_view();
+            || receiver.as_native_function().is_some();
         if prototype_routed {
             stack[top_idx].advance_pc()?;
             match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {

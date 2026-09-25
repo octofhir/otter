@@ -15,8 +15,8 @@ use super::{canonical_numeric_index_string, typed_array_valid_index};
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, binary, collections_prototype, descriptor_value, read_register,
-    rooting::RootScopeExt, symbol, write_register,
+    abstract_ops, binary, descriptor_value, read_register, rooting::RootScopeExt, symbol,
+    write_register,
 };
 
 impl Interpreter {
@@ -456,69 +456,6 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(m) = recv.as_map() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if sym
-                    .well_known_tag()
-                    .is_some_and(|t| t == symbol::WellKnown::Iterator)
-                {
-                    collections_prototype::make_map_iterator_factory(m, &mut self.gc_heap)?
-                } else {
-                    let key = VmPropertyKey::Symbol(sym);
-                    match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
-                        crate::VmGetOutcome::Value(v) => v,
-                        crate::VmGetOutcome::InvokeGetter { getter } => {
-                            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
-                        }
-                    }
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(set) = recv.as_set() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if sym
-                    .well_known_tag()
-                    .is_some_and(|t| t == symbol::WellKnown::Iterator)
-                {
-                    collections_prototype::make_set_iterator_factory(set, &mut self.gc_heap)?
-                } else {
-                    let key = VmPropertyKey::Symbol(sym);
-                    match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
-                        crate::VmGetOutcome::Value(v) => v,
-                        crate::VmGetOutcome::InvokeGetter { getter } => {
-                            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
-                        }
-                    }
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if recv.is_class_constructor()
-            || recv.is_weak_map()
-            || recv.is_weak_set()
-            || recv.is_weak_ref()
-            || recv.is_finalization_registry()
-            || recv.is_promise()
-            || recv.is_array_buffer()
-            || recv.is_data_view()
-        {
-            // §10.2 — symbol-keyed access on callable / class /
-            // collection exotics walks via ordinary [[Get]].
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
-                    crate::VmGetOutcome::Value(v) => v,
-                    crate::VmGetOutcome::InvokeGetter { getter } => {
-                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
-                    }
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
         } else if recv.is_symbol() || recv.is_boolean() || recv.is_number() || recv.is_big_int() {
             // §7.1.18 ToObject — primitive receivers walk wrapper
             // prototype for string/symbol/number key access.
@@ -553,9 +490,10 @@ impl Interpreter {
                 }
             }
         } else {
-            // Remaining object-typed receivers (class constructors,
-            // module namespaces, ...) resolve through the generic
-            // value-level [[Get]] funnel.
+            // Remaining heap receivers — class constructors, proxies and every
+            // family `get_walks_prototype_chain` names — resolve through the
+            // generic value-level [[Get]] funnel, exactly as the interpreter
+            // opcode routes them.
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
             } else if let Some(k) = idx_value.as_string(&self.gc_heap) {

@@ -21,8 +21,8 @@ use super::{
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
-    binary, collections_prototype, function_metadata, object, property_atom::AtomizedPropertyKey,
-    read_register, regexp_prototype, symbol_prototype, temporal, value_kind_name, write_register,
+    binary, function_metadata, object, property_atom::AtomizedPropertyKey, read_register,
+    regexp_prototype, symbol_prototype, temporal, value_kind_name, write_register,
 };
 
 impl Interpreter {
@@ -62,7 +62,8 @@ impl Interpreter {
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())
             );
         }
-        let value = if receiver.as_object().is_some() {
+        let value = if receiver.as_object().is_some() || super::get_walks_prototype_chain(receiver)
+        {
             let key = VmPropertyKey::String(name);
             match self.ordinary_get_value(stack, context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => value,
@@ -377,91 +378,6 @@ impl Interpreter {
             }
         } else if let Some(s) = receiver.as_symbol(&self.gc_heap) {
             symbol_prototype::load_property(s, name)
-        } else if receiver.is_iterator() {
-            // §27.1.5 — read string-keyed properties through
-            // `Iterator.prototype` so the new spec-mandated
-            // `next` / `return` / `throw` natives (and the helper
-            // terminals like `map` / `forEach` / `toArray`) all
-            // resolve uniformly via the realm prototype.
-            self.load_from_constructor_prototype(stack, context, "Iterator", &receiver, name)?
-        } else if receiver.is_weak_ref() || receiver.is_finalization_registry() {
-            let proto_name = if receiver.is_weak_ref() {
-                "WeakRef"
-            } else {
-                "FinalizationRegistry"
-            };
-            self.load_from_constructor_prototype(stack, context, proto_name, &receiver, name)?
-        } else if let Some(p) = receiver.as_promise() {
-            // §27.2.5 — user-installed own properties
-            // (`promise.then = fn`) live in a lazy expando bag;
-            // honour them before the prototype walk.
-            if let Some(bag) = p.expando(&self.gc_heap)
-                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
-            {
-                value
-            } else {
-                // §27.2.4.7.1 OrdinaryCreateFromConstructor —
-                // when `new SubPromise(executor)` set
-                // `prototype_override` to `SubPromise.prototype`,
-                // walk *that* chain.
-                let proto = match p.prototype_override(&self.gc_heap) {
-                    Some(proto) => proto,
-                    None => self.constructor_prototype_value("Promise")?,
-                };
-                if proto.is_nullish() {
-                    Value::undefined()
-                } else {
-                    let key = VmPropertyKey::String(name);
-                    match self.ordinary_get_value(stack, context, proto, receiver, &key, 0)? {
-                        VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            receiver,
-                            smallvec::SmallVec::new(),
-                        )?,
-                    }
-                }
-            }
-        } else if receiver.is_map()
-            || receiver.is_set()
-            || receiver.is_weak_map()
-            || receiver.is_weak_set()
-        {
-            // A user-assigned own property (`m.x = 5`,
-            // `Object.defineProperty(m, …)`) lives in the lazy expando
-            // and shadows the prototype methods.
-            if let Some(bag) = self.collection_expando(&receiver)
-                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
-            {
-                match outcome {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
-                    }
-                }
-            } else {
-                let direct =
-                    collections_prototype::load_property_with_heap(&receiver, name, &self.gc_heap);
-                if direct.is_undefined() {
-                    let proto_name = if receiver.is_map() {
-                        "Map"
-                    } else if receiver.is_set() {
-                        "Set"
-                    } else if receiver.is_weak_map() {
-                        "WeakMap"
-                    } else {
-                        "WeakSet"
-                    };
-                    self.load_from_constructor_prototype(
-                        stack, context, proto_name, &receiver, name,
-                    )?
-                } else {
-                    direct
-                }
-            }
         } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
             // An ordinary own property (installed via defineProperty /
             // assignment) lives in the expando and shadows the prototype
@@ -509,60 +425,6 @@ impl Interpreter {
                     } else {
                         direct
                     }
-                } else {
-                    direct
-                }
-            }
-        } else if let Some(b) = receiver.as_array_buffer() {
-            // Own expando bag (species `constructor` override, or a
-            // cross-brand accessor installed via defineProperty) wins
-            // over the data shortcuts and the prototype walk. An own
-            // accessor fires with the buffer as receiver.
-            if let Some(bag) = b.expando(&self.gc_heap)
-                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
-            {
-                match outcome {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
-                    }
-                }
-            } else {
-                let direct = binary::array_buffer_prototype::load_property(b, &self.gc_heap, name);
-                if direct.is_undefined() {
-                    let proto_name = if b.is_shared() {
-                        "SharedArrayBuffer"
-                    } else {
-                        "ArrayBuffer"
-                    };
-                    self.load_from_constructor_prototype(
-                        stack, context, proto_name, &receiver, name,
-                    )?
-                } else {
-                    direct
-                }
-            }
-        } else if let Some(dv) = receiver.as_data_view() {
-            // §25.3 — a `DataView` is an ordinary object; user-installed
-            // own properties (`dv.x = 1`, or an own accessor) live in the
-            // lazy expando bag and win over the prototype walk.
-            if let Some(bag) = dv.expando(&self.gc_heap)
-                && let Some(outcome) = Self::expando_own_get_outcome(bag, &self.gc_heap, name)
-            {
-                match outcome {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, receiver, args)?
-                    }
-                }
-            } else {
-                let direct = binary::data_view_prototype::load_property(&dv, &self.gc_heap, name);
-                if direct.is_undefined() {
-                    self.load_from_constructor_prototype(
-                        stack, context, "DataView", &receiver, name,
-                    )?
                 } else {
                     direct
                 }

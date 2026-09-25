@@ -2444,9 +2444,7 @@ pub(super) fn emit(
     let (osr_entries, osr_regions) = emit_osr_entries(
         &mut ops, sequence, allocation, frame, saved, has_poll, &osr_sites,
     )?;
-    let buffer = ops
-        .finalize()
-        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
+    let buffer = crate::entry::finalize_assembler(ops)?;
     Ok(Emission {
         code: CompiledCode::new(buffer, AssemblyOffset(0)),
         generated_stack_frame_bytes: frame.frame_bytes()

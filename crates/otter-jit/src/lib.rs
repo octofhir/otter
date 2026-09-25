@@ -197,7 +197,12 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 diagnostics: output.diagnostics,
                 ir_node_count: output.ir_node_count,
             }),
-            Err(Unsupported::Backend(_)) => Ok(otter_vm::JitCompileStatus::Unavailable),
+            // An unencodable label reference is a property of this function's
+            // code size, not a transient resource failure: retrying cannot
+            // succeed, so it reports as an ordinary unsupported shape.
+            Err(Unsupported::Backend(failure)) if failure != BackendFailure::Relocation => {
+                Ok(otter_vm::JitCompileStatus::Unavailable)
+            }
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in template subset: {reason:?}"),
             }),

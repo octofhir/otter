@@ -3973,9 +3973,7 @@ pub(super) fn emit(
         osr_regions.push((site.logical_pc, offset, end));
     }
 
-    let buffer = ops
-        .finalize()
-        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
+    let buffer = crate::entry::finalize_assembler(ops)?;
     let deopt_cold_bytes = if deopt_labels.is_empty() {
         0
     } else {

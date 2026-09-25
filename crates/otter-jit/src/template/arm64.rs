@@ -1596,9 +1596,7 @@ pub(super) fn compile(
         osr_entries.insert(header_pc, offset);
     }
 
-    let buf = ops
-        .finalize()
-        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
+    let buf = crate::entry::finalize_assembler(ops)?;
     let tier_input = artifact_request.as_ref().map(|_| plan.render_artifact());
     let TemplatePlan {
         register_count,

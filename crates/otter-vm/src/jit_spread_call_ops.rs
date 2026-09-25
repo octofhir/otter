@@ -234,6 +234,12 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         self.record_call_attempt_feedback(function, call_pc, function_id);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        // §13.3.5.1.1 step 7 — `new` of a value without [[Construct]] throws,
+        // exactly as the interpreter's `Op::New`; natives that are callable
+        // but not constructors must never run as a construct.
+        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
+            return Err(VmError::NotCallable);
+        }
         self.jit_runtime_stats.jit_to_rust_call_transitions = self
             .jit_runtime_stats
             .jit_to_rust_call_transitions

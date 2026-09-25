@@ -9,6 +9,10 @@
 //! # Invariants
 //! - Statement lowering keeps transient results in scratch registers and may
 //!   lower a declaration initializer directly into its register-backed binding.
+//! - A statement releases its temporaries when it completes: only bindings it
+//!   declared into the enclosing scope, and an observable completion result the
+//!   enclosing form still reads, keep their registers. A statement list
+//!   therefore needs the window of its widest statement, not the sum.
 //!
 //! # See also
 //! - `for_loops` and `try_catch`
@@ -186,7 +190,71 @@ fn compile_if_branch_statement(
     compile_statement(cx, stmt)
 }
 
+/// Compile one statement whose completion value the caller may consume.
+///
+/// Every temporary the statement allocated is released when it finishes, so a
+/// statement list costs the register window of its largest statement rather
+/// than the sum of all of them. Two kinds of register outlive the statement and
+/// stay reserved: a binding the statement declared into the enclosing scope,
+/// and — while a completion value is observable — the returned result register,
+/// which the enclosing form reads right after this call.
 pub(crate) fn compile_statement(
+    cx: &mut Compiler,
+    stmt: &Statement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    compile_statement_releasing(cx, stmt, true)
+}
+
+/// Compile one statement of a list whose completion value the caller discards.
+///
+/// The statement's result register is released with its other temporaries;
+/// an observable completion value already reached the completion register
+/// through [`FunctionContext::emit_completion_value`].
+pub(crate) fn compile_discarded_statement(
+    cx: &mut Compiler,
+    stmt: &Statement<'_>,
+) -> Result<(), CompileError> {
+    compile_statement_releasing(cx, stmt, false).map(drop)
+}
+
+fn compile_statement_releasing(
+    cx: &mut Compiler,
+    stmt: &Statement<'_>,
+    keep_result: bool,
+) -> Result<Option<u16>, CompileError> {
+    let mark = cx.scratch;
+    let scope_depth = cx.scopes.len();
+    let scope_bindings = cx.scopes.last().map_or(0, |scope| scope.bindings.len());
+    let result = compile_statement_body(cx, stmt)?;
+    let mut floor = mark;
+    // A fallback declaration (one no pre-pass reserved) lands in the
+    // enclosing scope and must keep its register for the rest of that scope.
+    if cx.scopes.len() == scope_depth
+        && let Some(scope) = cx.scopes.last()
+        && scope.bindings.len() != scope_bindings
+    {
+        for info in scope.bindings.values() {
+            if let BindingStorage::Register { reg } = info.storage
+                && reg >= floor
+            {
+                floor = reg.saturating_add(1);
+            }
+        }
+    }
+    if keep_result
+        && cx.completion_tracking()
+        && let Some(reg) = result
+        && reg >= floor
+    {
+        floor = reg.saturating_add(1);
+    }
+    if floor < cx.scratch {
+        cx.reset_scratch(floor);
+    }
+    Ok(result)
+}
+
+fn compile_statement_body(
     cx: &mut Compiler,
     stmt: &Statement<'_>,
 ) -> Result<Option<u16>, CompileError> {

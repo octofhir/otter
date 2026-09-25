@@ -354,6 +354,9 @@ impl FunctionContext {
             mark <= self.scratch,
             "reset_scratch above current watermark"
         );
+        // The window must cover every register ever handed out, including
+        // bindings reserved above an earlier rollback point.
+        self.scratch_peak = self.scratch_peak.max(self.scratch);
         self.scratch = mark;
     }
 
@@ -478,8 +481,7 @@ impl FunctionContext {
         let storage = if allow_capture && let Some(idx) = self.allocate_own_upvalue(name) {
             BindingStorage::Upvalue { idx }
         } else {
-            let reg = self.scratch;
-            self.scratch = self.scratch.checked_add(1).expect("register overflow");
+            let reg = self.alloc_scratch();
             BindingStorage::Register { reg }
         };
         self.insert_binding_info(name, storage, is_const);

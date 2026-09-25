@@ -356,7 +356,7 @@ fn compile_binary_to(
             Some(reg) if reg != lhs => reg,
             _ => {
                 let mut candidate = cx.alloc_scratch();
-                while candidate == lhs {
+                while candidate == lhs && !cx.register_overflow {
                     candidate = cx.alloc_scratch();
                 }
                 candidate
@@ -415,7 +415,7 @@ fn compile_binary_to(
     // template tier. Take the first recycled register the operands do not hold.
     let dst = destination.unwrap_or_else(|| {
         let mut candidate = cx.alloc_scratch();
-        while candidate == lhs_in || candidate == rhs_in {
+        while (candidate == lhs_in || candidate == rhs_in) && !cx.register_overflow {
             candidate = cx.alloc_scratch();
         }
         candidate

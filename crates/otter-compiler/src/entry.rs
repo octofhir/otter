@@ -1147,7 +1147,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
         cx.emit_completion_value(dst, (directive.span.start, directive.span.end));
     }
     for stmt in program.body {
-        compile_statement(&mut cx, stmt)?;
+        compile_discarded_statement(&mut cx, stmt)?;
     }
     // The chunk's full cell-backed scope table. The runtime adopts
     // the var-shaped entries that were not part of the caller scope
@@ -1923,7 +1923,7 @@ pub fn compile_module_program(
     cx.patch_branch_to_here(eval_phase_jump);
 
     for stmt in &program.body {
-        compile_statement(&mut cx, stmt)?;
+        compile_discarded_statement(&mut cx, stmt)?;
     }
     cx.exit_scope();
 

@@ -13,6 +13,7 @@
 //! - Unary/update feedback publication for optimizing-tier specialization.
 //! - `+` string-or-numeric dispatch.
 //! - Relational comparison dispatch.
+//! - Generic binary-operator completion for committed compiled sites.
 //! - BigInt adapter functions used by opcode arms.
 //!
 //! # Invariants
@@ -623,6 +624,60 @@ impl Interpreter {
                 }
             }
         })
+    }
+
+    /// Complete one generic binary operator over boxed operands through the
+    /// interpreter's own kernels, including every observable coercion. A
+    /// committed compiled site uses this when its feedback is not numeric.
+    pub(crate) fn binary_operator_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        operator: crate::BinaryOperator,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<Value, VmError> {
+        use crate::BinaryOperator as B;
+        match operator {
+            B::Add => self.add_value(stack, context, lhs, rhs),
+            B::Sub => {
+                numeric_binary_value(self, stack, context, lhs, rhs, number::sub, bigint_sub_op)
+            }
+            B::Mul => {
+                numeric_binary_value(self, stack, context, lhs, rhs, number::mul, bigint_mul_op)
+            }
+            B::Div => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                rhs,
+                number::div,
+                bigint::ops::div,
+            ),
+            B::Rem => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                rhs,
+                number::rem,
+                bigint::ops::rem,
+            ),
+            B::Pow => numeric_binary_value(
+                self,
+                stack,
+                context,
+                lhs,
+                rhs,
+                number::pow,
+                bigint::ops::pow,
+            ),
+            B::LessThan => compare_value(self, stack, context, lhs, rhs, Op::LessThan),
+            B::LessEq => compare_value(self, stack, context, lhs, rhs, Op::LessEq),
+            B::GreaterThan => compare_value(self, stack, context, lhs, rhs, Op::GreaterThan),
+            B::GreaterEq => compare_value(self, stack, context, lhs, rhs, Op::GreaterEq),
+        }
     }
 
     pub(crate) fn run_compare_regs(

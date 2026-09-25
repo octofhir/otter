@@ -3,6 +3,8 @@
 //! # Contents
 //! - Typed operation families for object-protocol and scalar bytecodes,
 //!   including error allocation, throw origins and derived-`this` binding.
+//! - Generic binary arithmetic and relational operators for compiled sites
+//!   whose feedback is not numeric ([`BinaryOperator`]).
 //! - Rooted value kernels shared by interpreter and compiled callers.
 //! - [`RuntimeCall`] site decoding with no opcode/register ABI.
 //! - Side-channel-free JavaScript exception materialization for the committed
@@ -10,7 +12,9 @@
 //!
 //! # Invariants
 //! - `value0` and `value1` are rooted as VM locals before any allocation,
-//!   collection, Proxy trap, getter, coercion, or nested JavaScript call.
+//!   collection, Proxy trap, getter, coercion, or nested JavaScript call. The
+//!   binary-operator kernels are the interpreter's and root both operands in
+//!   their own handle scope before the first coercion.
 //! - Function/PC identity is authoritative for the semantic operation; the
 //!   native ABI never receives an opcode, destination, or register index.
 //! - Once a kernel begins it returns only a normal value or an error. Compiled
@@ -62,6 +66,56 @@ pub enum ObjectProtocolValueOp {
     LooseEqual,
     /// The negation of [`Self::LooseEqual`].
     LooseNotEqual,
+    /// A binary arithmetic or relational operator (`+ - * / % **`,
+    /// `< <= > >=`) over operands whose feedback is not numeric, including
+    /// every observable `ToPrimitive` / `ToNumeric` coercion and `+` string
+    /// concatenation.
+    Binary(BinaryOperator),
+}
+
+/// The generic binary operator a committed site completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOperator {
+    /// `+` — string concatenation or numeric addition.
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/`
+    Div,
+    /// `%`
+    Rem,
+    /// `**`
+    Pow,
+    /// `<`
+    LessThan,
+    /// `<=`
+    LessEq,
+    /// `>`
+    GreaterThan,
+    /// `>=`
+    GreaterEq,
+}
+
+impl BinaryOperator {
+    /// The operator a bytecode binary opcode denotes, if it is generic.
+    #[must_use]
+    pub fn from_opcode(op: Op) -> Option<Self> {
+        Some(match op {
+            Op::Add => Self::Add,
+            Op::Sub => Self::Sub,
+            Op::Mul => Self::Mul,
+            Op::Div => Self::Div,
+            Op::Rem => Self::Rem,
+            Op::Pow => Self::Pow,
+            Op::LessThan => Self::LessThan,
+            Op::LessEq => Self::LessEq,
+            Op::GreaterThan => Self::GreaterThan,
+            Op::GreaterEq => Self::GreaterEq,
+            _ => return None,
+        })
+    }
 }
 
 impl ObjectProtocolValueOp {
@@ -73,7 +127,9 @@ impl ObjectProtocolValueOp {
             Op::SetPrototype => Ok(Self::SetPrototype),
             Op::LooseEqual => Ok(Self::LooseEqual),
             Op::LooseNotEqual => Ok(Self::LooseNotEqual),
-            _ => Err(VmError::InvalidOperand),
+            _ => BinaryOperator::from_opcode(op)
+                .map(Self::Binary)
+                .ok_or(VmError::InvalidOperand),
         }
     }
 }
@@ -137,6 +193,12 @@ impl Interpreter {
         mut value0: Value,
         mut value1: Value,
     ) -> Result<Value, VmError> {
+        // The binary kernels are the interpreter's own: they root both
+        // operands in a handle scope before their first coercion, so they need
+        // no second root frame here.
+        if let ObjectProtocolValueOp::Binary(operator) = operation {
+            return self.binary_operator_value(stack, context, operator, value0, value1);
+        }
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: all three locals precede `roots` and remain stationary until
@@ -157,6 +219,7 @@ impl Interpreter {
             ObjectProtocolValueOp::LooseNotEqual => {
                 Value::boolean(!self.loose_equal_with_context(stack, context, &value0, &value1)?)
             }
+            ObjectProtocolValueOp::Binary(_) => unreachable!("binary operators return above"),
             ObjectProtocolValueOp::HasProperty => {
                 if !value1.is_object_type() {
                     return Err(VmError::TypeMismatch);

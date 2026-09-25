@@ -481,6 +481,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     (`property_speculation::speculated_load`). GVN commons identical proofs and
     LICM may hoist a proof; the header's OSR entry leads the split preheader,
     so OSR performs the hoisted proof itself.
+    Binary arithmetic/relational sites with non-Number feedback are committed
+    `ObjectProtocolValueOp::Binary` operations (`otter_vm::BinaryOperator`),
+    never a Machine decline; except `%`/`**` they carry a
+    `machineBinaryNumberProbe` Number fast path (`ProbeKind::BinaryNumber`,
+    `TargetClobberSet::NumberProbe`). A primitive-String `+` concat node that
+    exited with `typeMismatch` is rebuilt generic. Only Number-only feedback
+    types a parameter as Number.
     Other named loads and stores expose their probe, hit edge,
     `machinePropertyLoadCold` / `machinePropertyStoreCold` call,
     Success/Throw/Fatal control and join before register allocation.

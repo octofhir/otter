@@ -72,6 +72,8 @@ pub enum TargetClobberSet {
     FloatElementIndex,
     /// Proven Int32 native leaf.
     NativeLeafInt32,
+    /// Number fast path of a committed generic binary operator.
+    NumberProbe,
 }
 
 /// Target legalization features admitted by neutral instruction selection.
@@ -282,7 +284,7 @@ pub struct TargetSpec {
     registers: TargetRegisterFile,
     calls: TargetCallConvention,
     frame: TargetFrameSpec,
-    clobbers: [Box<[PhysicalRegister]>; 16],
+    clobbers: [Box<[PhysicalRegister]>; 17],
     capabilities: [bool; 4],
 }
 
@@ -342,6 +344,8 @@ impl TargetSpec {
                 [0, 9, 10, 11].map(integer).into(),
                 [integer(16), float(31)].into(),
                 (12..=14).map(integer).collect(),
+                // x15/x16 and v30/v31 lie outside the scalar allocation file.
+                Box::new([]),
             ],
             capabilities: [true; 4],
         }
@@ -387,7 +391,15 @@ impl TargetSpec {
             // every neutral operation conservatively reserves the complete
             // System V caller-saved set. This is safe input to verifier and
             // regalloc tests, not a claim of implemented x86 lowering.
-            clobbers: std::array::from_fn(|_| scalar_call.clone()),
+            clobbers: std::array::from_fn(|set| {
+                if set == TargetClobberSet::NumberProbe as usize {
+                    // r11 and xmm15 are the reserved scratch pair; the probe
+                    // additionally holds one decoded operand in xmm14.
+                    Box::new([float(14)]) as Box<[PhysicalRegister]>
+                } else {
+                    scalar_call.clone()
+                }
+            }),
             capabilities: [true; 4],
         }
     }

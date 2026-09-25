@@ -258,8 +258,8 @@ pub use run_control::{
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
 pub use runtime_activation::{
-    ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome, ObjectProtocolValueOp,
-    RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
+    BinaryOperator, ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome,
+    ObjectProtocolValueOp, RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
 };
 
 #[cfg(test)]

@@ -91,6 +91,8 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `upvalue-call-families.js` | Closure-backed plain, method, and base-constructor linkage with stack-owned upvalues | `15000450000` |
 | `base-construct-receiver.js` | Pre-shaped fixed, spread, and derived/super receiver preparation with two own fields | `15001950000` |
 | `arith-exit-repair.js` | Int32 negation producing `-0` and an accumulator leaving Int32, repaired by one widening recompile | `150000` |
+| `polluted-feedback.js` | Relational and additive sites that saw `undefined` once per call; Number operands take the generic operator's inline probe | `4287494` |
+| `mixed-relational.js` | A relational site whose right operand is always a String, completed by the committed generic operator | `4787500` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the

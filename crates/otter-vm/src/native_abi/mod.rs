@@ -40,8 +40,8 @@ pub use safepoints::*;
 // Reentrant runtime-call surface re-exported beside the stub descriptors, so
 // generated-code entry points import one ABI namespace.
 pub use crate::runtime_activation::{
-    ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome, ObjectProtocolValueOp,
-    RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
+    BinaryOperator, ClassRuntimeOp, CommittedValueError, IteratorRuntimeOutcome,
+    ObjectProtocolValueOp, RuntimeCall, ScalarValueOp, ValueLoadRuntimeOp,
 };
 pub use crate::{ActiveFrameMut, ActiveFrameRef};
 

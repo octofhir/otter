@@ -338,8 +338,9 @@ impl OldFreeList {
 }
 
 /// Old-generation space: a list of pages plus a size-classed free list
-/// over swept holes. Allocation takes a fitting free range first, then
-/// bumps in the newest page, then grows by one page.
+/// over swept holes and retired page tails. Allocation takes a fitting free
+/// range first, then bumps in one of the few pages that still have room,
+/// then grows by one page; it never walks the full page list.
 pub struct OldSpace {
     pages: Vec<Page>,
     free_list: OldFreeList,
@@ -353,7 +354,16 @@ pub struct OldSpace {
     /// near-empty page per scavenge). Unused pages stay here for the next
     /// scavenge and return to the cage when a full collection reaps pages.
     standby: Vec<Page>,
+    /// Cage offsets of the pages that still offer bump room, oldest first.
+    /// A page leaves the set once its tail falls below
+    /// [`OPEN_PAGE_MIN_ROOM`]; that tail joins the free list. Allocation
+    /// therefore probes only pages with real room instead of every page.
+    open: Vec<u32>,
 }
+
+/// Bump room below which an old page closes: its tail becomes one free-list
+/// range and the page stops being probed for bump allocation.
+const OPEN_PAGE_MIN_ROOM: usize = 2048;
 
 impl OldSpace {
     /// Empty old-space; pages are added lazily as old-gen alloc
@@ -363,6 +373,7 @@ impl OldSpace {
             pages: Vec::new(),
             free_list: OldFreeList::default(),
             standby: Vec::new(),
+            open: Vec::new(),
         }
     }
 
@@ -407,9 +418,28 @@ impl OldSpace {
             page_header.allocated_bytes += size_aligned;
             return Ok(entry.offset);
         }
-        for page in self.pages.iter().rev() {
-            if let Some(offset) = page.bump_alloc(size_aligned) {
-                return Ok(offset);
+        // Probe only pages that still have bump room, newest first. A page
+        // whose room drops below `OPEN_PAGE_MIN_ROOM` hands its tail to the
+        // free list and closes, so a full heap never costs a page scan.
+        let mut index = self.open.len();
+        while index > 0 {
+            index -= 1;
+            let page_offset = self.open[index];
+            // SAFETY: `open` names only live old pages owned by this space;
+            // `reap_dead_pages` drops the offsets of every page it releases.
+            let header = unsafe {
+                &mut *(crate::page::page_base_from_offset(page_offset)
+                    as *mut crate::page::PageHeader)
+            };
+            let cursor = header.bump_cursor;
+            if cursor + size_aligned <= header.span_bytes() {
+                header.bump_cursor = cursor + size_aligned;
+                header.allocated_bytes += size_aligned;
+                return Ok(page_offset + cursor as u32);
+            }
+            if header.span_bytes() - cursor < OPEN_PAGE_MIN_ROOM {
+                Self::retire_bump_tail(&mut self.free_list, page_offset, header);
+                self.open.swap_remove(index);
             }
         }
         let page = match self.standby.pop() {
@@ -422,8 +452,52 @@ impl OldSpace {
                 requested_bytes: size_aligned as u64,
                 max_bytes: PAGE_PAYLOAD_SIZE as u64,
             })?;
+        self.open.push(page.cage_offset());
         self.pages.push(page);
         Ok(offset)
+    }
+
+    /// Close a page's bump area: cap the unused tail with a free filler so the
+    /// page's linear header walk stays intact, hand the tail to the free
+    /// list, and move the cursor to the end.
+    fn retire_bump_tail(
+        free_list: &mut OldFreeList,
+        page_offset: u32,
+        header: &mut crate::page::PageHeader,
+    ) {
+        let end = header.span_bytes();
+        let cursor = header.bump_cursor;
+        if cursor >= end {
+            return;
+        }
+        let remaining = end - cursor;
+        let tail_offset = page_offset + cursor as u32;
+        // SAFETY: `[cursor, end)` is the page's unallocated tail inside its
+        // own live mapping; fillers are never traced.
+        unsafe {
+            let header_ptr = crate::page::page_base_from_offset(tail_offset).add(cursor)
+                as *mut crate::header::GcHeader;
+            std::ptr::write(
+                header_ptr,
+                crate::header::GcHeader::new_free(remaining as u32),
+            );
+        }
+        header.bump_cursor = end;
+        free_list.push(tail_offset, remaining);
+    }
+
+    /// Rebuild the open-page set from the pages' bump cursors after a sweep
+    /// moved dead tails back into bump range.
+    pub(crate) fn reopen_bump_pages(&mut self) {
+        self.open = self
+            .pages
+            .iter()
+            .filter(|page| {
+                let header = page.header();
+                header.span_bytes() - header.bump_cursor >= OPEN_PAGE_MIN_ROOM
+            })
+            .map(Page::cage_offset)
+            .collect();
     }
 
     /// Drop every free-list entry; the sweep that follows rebuilds the
@@ -522,6 +596,9 @@ impl OldSpace {
         let before = self.pages.len();
         self.pages.retain(|p| p.header().live_bytes > 0);
         self.standby.clear();
+        let pages = &self.pages;
+        self.open
+            .retain(|offset| pages.iter().any(|page| page.cage_offset() == *offset));
         before - self.pages.len()
     }
 }
@@ -660,6 +737,38 @@ mod tests {
         // The split tail was re-listed and serves the next fit.
         let tail = old.alloc(64).expect("tail alloc");
         assert_eq!(tail, first + 64, "split tail must be reused next");
+    }
+
+    #[test]
+    fn a_page_with_little_room_closes_and_its_tail_serves_the_free_list() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
+        ensure_cage();
+        let mut old = OldSpace::new();
+        // Fill the first page until less than OPEN_PAGE_MIN_ROOM remains.
+        let chunk = 1024;
+        let first = old.alloc(chunk).expect("first alloc");
+        let fill = PAGE_PAYLOAD_SIZE / chunk - 1;
+        for _ in 1..fill {
+            old.alloc(chunk).expect("fill alloc");
+        }
+        assert_eq!(old.page_count(), 1);
+        assert_eq!(old.open.len(), 1);
+        // A request larger than the remaining room opens a second page and
+        // closes the first; its tail joins the free list.
+        let big = old.alloc(OPEN_PAGE_MIN_ROOM * 2).expect("big alloc");
+        assert_eq!(old.page_count(), 2);
+        assert_eq!(old.open.len(), 1, "only the new page stays open");
+        assert_ne!(
+            crate::page::page_base_from_offset(big),
+            crate::page::page_base_from_offset(first)
+        );
+        // A small request reuses the closed page's tail before bumping.
+        let small = old.alloc(64).expect("small alloc");
+        assert_eq!(
+            crate::page::page_base_from_offset(small),
+            crate::page::page_base_from_offset(first),
+            "the retired tail must be reused"
+        );
     }
 
     #[test]

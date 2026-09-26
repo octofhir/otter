@@ -398,6 +398,24 @@ pub(super) fn compile(
                     fatal,
                 )?;
             }
+            TemplateOp::NewObjectLiteral { dst, elements } => {
+                let words = plan
+                    .register_tail(elements)
+                    .iter()
+                    .copied()
+                    .map(PacketWord::Register)
+                    .collect::<Vec<_>>();
+                emit_value_packet_transition(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    abi::STUB_JIT_NEW_OBJECT_LITERAL,
+                    &words,
+                    dst,
+                    committed_throw,
+                    fatal,
+                )?;
+            }
             TemplateOp::FreshUpvalue { index } => {
                 emit_fresh_upvalue(&mut ops, &mut relocations, transitions, index, threw, fatal)
             }

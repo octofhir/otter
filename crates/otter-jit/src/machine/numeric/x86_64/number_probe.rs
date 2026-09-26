@@ -7,7 +7,8 @@
 //!
 //! # Invariants
 //! - No allocation, VM transition, deopt or user code occurs in the probe.
-//!   A cell, immediate, `%` or `**` misses to the committed cold sibling.
+//!   A cell, immediate, `%`, `**`, a shift, or a bitwise operator over a
+//!   double misses to the committed cold sibling.
 //! - Both inputs are fully read before either output is defined, so outputs
 //!   may share registers with inputs.
 //! - The Int32 path defers overflow, a zero product and division to the
@@ -76,7 +77,16 @@ pub(super) fn emit(
             load64(ops, result, Value::boolean(true).to_bits());
             dynasm!(ops ; .arch x64 ; =>chosen);
         }
-        BinaryOperator::Rem | BinaryOperator::Pow => {
+        // Double operands owe ToInt32, and a shift count needs `cl`: both
+        // complete through the committed operator.
+        BinaryOperator::Rem
+        | BinaryOperator::Pow
+        | BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::Shl
+        | BinaryOperator::Shr
+        | BinaryOperator::Ushr => {
             dynasm!(ops ; .arch x64 ; jmp =>miss);
         }
     }
@@ -100,7 +110,12 @@ fn integer(
     let [result, hit] = outputs;
     if matches!(
         operator,
-        BinaryOperator::Div | BinaryOperator::Rem | BinaryOperator::Pow
+        BinaryOperator::Div
+            | BinaryOperator::Rem
+            | BinaryOperator::Pow
+            | BinaryOperator::Shl
+            | BinaryOperator::Shr
+            | BinaryOperator::Ushr
     ) {
         return;
     }
@@ -126,6 +141,15 @@ fn integer(
                     ; test r11d, r11d
                     ; jz =>double
                 ),
+            }
+            box_int32(ops, 11, result);
+        }
+        BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOr | BinaryOperator::BitwiseXor => {
+            dynasm!(ops ; .arch x64 ; mov r11d, Rd(left));
+            match operator {
+                BinaryOperator::BitwiseAnd => dynasm!(ops ; .arch x64 ; and r11d, Rd(right)),
+                BinaryOperator::BitwiseOr => dynasm!(ops ; .arch x64 ; or r11d, Rd(right)),
+                _ => dynasm!(ops ; .arch x64 ; xor r11d, Rd(right)),
             }
             box_int32(ops, 11, result);
         }

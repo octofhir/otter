@@ -49,7 +49,7 @@ fn load_slot(
         let address = root_offset(frame, root.save_slot)?
             .checked_add(MACHINE_ROOT_RECORD_SIZE)
             .ok_or(Unsupported::OperandShape("inline native root offset"))?;
-        emit_sp_ldr_x(ops, target, address);
+        emit_frame_ldr_x(ops, target, address);
     } else {
         emit_load_u64(ops, target, VALUE_UNDEFINED);
     }
@@ -83,7 +83,7 @@ pub(super) fn enter(
         ; cmp x10, x11
         ; b.hi =>fail
         ; ldr x12, [x19, NATIVE_FRAME_OFFSET]);
-    emit_sp_str_x(ops, 12, offset(frame, first)?);
+    emit_frame_str_x(ops, 12, offset(frame, first)?);
     emit_load_u64(ops, 15, u64::from(parent_pc));
     dynasm!(ops ; .arch aarch64 ; str w15, [x12, NATIVE_FRAME_PC_OFFSET]);
     let mut word = usize::from(first) + 1;
@@ -104,7 +104,7 @@ pub(super) fn enter(
             u16::try_from(word).map_err(|_| Unsupported::OperandShape("inline native start"))?,
         )?;
         for slot in 0..HEADER_WORDS {
-            emit_sp_str_x(ops, 31, start + slot as u32 * 8);
+            emit_frame_str_x(ops, 31, start + slot as u32 * 8);
         }
         emit_sp_address_x9(ops, start);
         dynasm!(ops ; .arch aarch64 ; mov x13, x9);
@@ -155,7 +155,7 @@ pub(super) fn enter(
             ; =>no_spine);
         for (index, value) in recipe.slots.iter().enumerate() {
             load_slot(ops, frame, site, *value, 14)?;
-            emit_sp_str_x(ops, 14, start + (HEADER_WORDS + index) as u32 * 8);
+            emit_frame_str_x(ops, 14, start + (HEADER_WORDS + index) as u32 * 8);
         }
         dynasm!(ops ; .arch aarch64
             ; ldr x9, [x19, ACTIVATION_TOP_PTR_OFFSET]
@@ -183,7 +183,7 @@ pub(super) fn leave(
         return Ok(());
     }
     let count = instruction.inline_frames.len() - 1;
-    emit_sp_ldr_x(ops, 12, offset(frame, first)?);
+    emit_frame_ldr_x(ops, 12, offset(frame, first)?);
     dynasm!(ops ; .arch aarch64
         ; str x12, [x19, NATIVE_FRAME_OFFSET]
         ; ldr x9, [x19, THREAD_OFFSET]

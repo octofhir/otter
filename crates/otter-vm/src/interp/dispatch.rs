@@ -1641,6 +1641,11 @@ impl Interpreter {
                     self.run_new_array_operands(&mut *stack, top_idx, operands)?;
                     continue;
                 }
+                Op::NewObjectLiteral => {
+                    let operands = function.operand_view(instr);
+                    self.run_new_object_literal_operands(&mut *stack, top_idx, context, operands)?;
+                    continue;
+                }
                 Op::LoadRegExp => {
                     let dst = instr.reg(0);
                     let idx = instr.const_word(1);

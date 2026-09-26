@@ -96,6 +96,18 @@ pub enum BinaryOperator {
     GreaterThan,
     /// `>=`
     GreaterEq,
+    /// `&`
+    BitwiseAnd,
+    /// `|`
+    BitwiseOr,
+    /// `^`
+    BitwiseXor,
+    /// `<<`
+    Shl,
+    /// `>>`
+    Shr,
+    /// `>>>`
+    Ushr,
 }
 
 impl BinaryOperator {
@@ -113,6 +125,12 @@ impl BinaryOperator {
             Op::LessEq => Self::LessEq,
             Op::GreaterThan => Self::GreaterThan,
             Op::GreaterEq => Self::GreaterEq,
+            Op::BitwiseAnd | Op::BitwiseAndImm => Self::BitwiseAnd,
+            Op::BitwiseOr => Self::BitwiseOr,
+            Op::BitwiseXor => Self::BitwiseXor,
+            Op::Shl => Self::Shl,
+            Op::Shr => Self::Shr,
+            Op::Ushr => Self::Ushr,
             _ => return None,
         })
     }

@@ -944,6 +944,11 @@ pub struct Interpreter {
     /// Monotonic version of `array_index_accessor_protector`. Advances exactly
     /// once, on the latch's sole `false -> true` transition.
     array_index_accessor_protector_epoch: u64,
+    /// `true` once any `ArrayBuffer` has been detached or transferred (V8's
+    /// ArrayBufferDetachingProtector). While it stays `false`, a fixed-length
+    /// typed array's cached element base is live, so generated element
+    /// access needs no per-buffer detach proof.
+    array_buffer_detach_protector: bool,
     interrupt: InterruptFlag,
     /// Non-reused ECMA agent identity for `Atomics.wait` lifecycle control.
     /// Host shutdown holds a cloneable handle while this owner token ensures
@@ -1013,6 +1018,9 @@ pub struct Interpreter {
     /// These handles are traced explicitly because a moving GC must rewrite the
     /// cache slot, not only the owning `shape_runtime` transition table.
     simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
+    /// Final hidden class of each `Op::NewObjectLiteral` site, keyed by the
+    /// owning function id and the site's first key constant.
+    object_literal_layouts: rustc_hash::FxHashMap<(u32, u32), handles::ObjectLayout>,
     /// Generated constructor-field transition programs learned while the
     /// exact receiver prototype is rooted during allocation.
     constructor_field_transition_cache: rustc_hash::FxHashMap<

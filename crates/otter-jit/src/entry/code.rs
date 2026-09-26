@@ -91,6 +91,8 @@ pub(crate) unsafe fn enter_compiled(
         let global_lexical_epoch = unsafe { (*vm).jit_global_lexical_epoch_addr() };
         let array_index_protector = unsafe { (*vm).jit_array_index_protector_addr() };
         let active_realm = unsafe { (*vm).jit_active_realm_addr() };
+        let array_buffer_detach_protector =
+            unsafe { (*vm).jit_array_buffer_detach_protector_addr() };
         let native_stack_marker = 0_u8;
         let native_stack_limit = unsafe {
             (*vm).jit_native_stack_limit(std::ptr::from_ref(&native_stack_marker).addr())
@@ -131,6 +133,7 @@ pub(crate) unsafe fn enter_compiled(
         thread.marking_flag_cell = marking_flag as u64;
         thread.array_index_protector_cell = array_index_protector as u64;
         thread.active_realm_cell = active_realm as u64;
+        thread.array_buffer_detach_protector_cell = array_buffer_detach_protector as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),

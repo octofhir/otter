@@ -47,6 +47,28 @@ pub enum AllocationPoint {
     After(MachineInstructionId),
 }
 
+impl AllocationPoint {
+    /// Position in program order: every edit before instruction `i`, then
+    /// every edit after it, then instruction `i + 1`.
+    #[must_use]
+    pub const fn program_order(self) -> (u32, u8) {
+        match self {
+            Self::Before(instruction) => (instruction.0, 0),
+            Self::After(instruction) => (instruction.0, 1),
+        }
+    }
+}
+
+/// The contiguous run of `edits` (kept in program-point order) that executes
+/// at `point`, in emission order.
+#[must_use]
+pub fn edits_at(edits: &[AllocationEdit], point: AllocationPoint) -> &[AllocationEdit] {
+    let target = point.program_order();
+    let start = edits.partition_point(|edit| edit.point.program_order() < target);
+    let len = edits[start..].partition_point(|edit| edit.point.program_order() == target);
+    &edits[start..start + len]
+}
+
 /// Register/spill move inserted by allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationEdit {
@@ -355,6 +377,12 @@ pub(super) fn allocate(
             })
         })
         .collect::<Result<Vec<_>, AllocationError>>()?;
+    debug_assert!(
+        edits
+            .windows(2)
+            .all(|pair| pair[0].point.program_order() <= pair[1].point.program_order()),
+        "regalloc2 reports edits in program-point order"
+    );
 
     Ok(AllocatedSequence {
         architecture: target.architecture(),

@@ -322,6 +322,23 @@ impl Interpreter {
         std::ptr::addr_of!(self.array_index_accessor_protector)
     }
 
+    /// Stable address of the ArrayBuffer detach protector byte (non-zero once
+    /// any buffer was detached). Generated typed-array access trusts a view's
+    /// cached element base only while it reads zero.
+    #[must_use]
+    pub fn jit_array_buffer_detach_protector_addr(&self) -> *const bool {
+        std::ptr::addr_of!(self.array_buffer_detach_protector)
+    }
+
+    /// Detach `buffer` (§25.1.3.5 DetachArrayBuffer), first invalidating the
+    /// detach protector so no generated access reads a view's cached base.
+    pub fn detach_array_buffer(&mut self, buffer: crate::binary::array_buffer::JsArrayBuffer) {
+        if !buffer.is_shared() {
+            self.array_buffer_detach_protector = true;
+        }
+        buffer.detach(&mut self.gc_heap);
+    }
+
     /// Stable address of the active realm id.
     ///
     /// Generated proofs that resolve a prototype in the active realm compare

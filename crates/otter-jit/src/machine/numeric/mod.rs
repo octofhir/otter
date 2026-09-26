@@ -129,6 +129,7 @@ mod partial_escape;
 mod property_cfg;
 mod property_speculation;
 mod semantics;
+mod truncation;
 
 use otter_vm::{
     JitArtifactFileName, JitCompileSnapshot,
@@ -261,6 +262,70 @@ fn inline_frame_words(sequence: &InstructionSequence) -> Result<u16, Unsupported
     u16::try_from(max).map_err(|_| Unsupported::OperandShape("inline native frame capacity"))
 }
 
+/// Allocation failure text naming, for an SSA rejection, the using
+/// instruction and every definition of the value together with their blocks,
+/// so a failing compile explains itself without an artifact.
+fn allocation_failure_context(
+    sequence: &InstructionSequence,
+    error: &super::regalloc::AllocationError,
+) -> String {
+    let mut text = format!("{error:?}");
+    let super::regalloc::AllocationError::RegisterAllocation(regalloc2::RegAllocError::SSA(
+        vreg,
+        inst,
+    )) = error
+    else {
+        return text;
+    };
+    let block_of = |index: usize| {
+        sequence
+            .blocks()
+            .iter()
+            .position(|block| (block.first.0 as usize..block.end.0 as usize).contains(&index))
+    };
+    let value = vreg.vreg();
+    if let Some(user) = sequence.instructions().get(inst.index()) {
+        text.push_str(&format!(
+            "; use i{} {:?} in b{:?}",
+            inst.index(),
+            user.opcode,
+            block_of(inst.index())
+        ));
+    }
+    for (index, instruction) in sequence.instructions().iter().enumerate() {
+        if instruction.operands.iter().any(|operand| {
+            operand.value.0 as usize == value && operand.purpose == super::OperandPurpose::Output
+        }) {
+            text.push_str(&format!(
+                "; def i{index} {:?} in b{:?}",
+                instruction.opcode,
+                block_of(index)
+            ));
+        }
+    }
+    for (index, block) in sequence.blocks().iter().enumerate() {
+        if block
+            .parameters
+            .iter()
+            .any(|parameter| parameter.0 as usize == value)
+        {
+            text.push_str(&format!("; parameter of b{index}"));
+        }
+    }
+    if let Some(block) = block_of(inst.index()).map(|index| &sequence.blocks()[index]) {
+        for index in block.first.0..block.end.0 {
+            let instruction = &sequence.instructions()[index as usize];
+            let values = instruction
+                .operands
+                .iter()
+                .map(|operand| format!("{:?}:v{}", operand.purpose, operand.value.0))
+                .collect::<Vec<_>>();
+            text.push_str(&format!("; i{index} {:?} {values:?}", instruction.opcode));
+        }
+    }
+    text
+}
+
 pub(crate) fn try_compile(
     target_spec: &TargetSpec,
     view: &JitCompileSnapshot,
@@ -277,6 +342,7 @@ pub(crate) fn try_compile(
     })?;
     let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
     let partial_escape = partial_escape::optimize(&mut hir);
+    truncation::optimize(&mut hir);
     let loop_entries = hir.plan_loop_entries();
     let sequence = select_with_loop_entries(target_spec, &hir, &loop_entries).map_err(|error| {
         Unsupported::MachineVerification {
@@ -320,7 +386,7 @@ pub(crate) fn try_compile(
             .allocate(target_spec)
             .map_err(|error| Unsupported::MachineVerification {
                 stage: "scalar Machine IR allocation",
-                error: format!("{error:?}"),
+                error: allocation_failure_context(&sequence, &error),
             })?;
     let mut machine_safepoints = lower_safepoints(&sequence, &allocation).map_err(|error| {
         Unsupported::MachineVerification {
@@ -1264,19 +1330,33 @@ fn select_with_loop_entries(
                     index,
                 );
                 let stored_fast = stored.map(|value| {
-                    if access == Some(NumericElementAccess::PackedDouble)
-                        && hir.nodes[value.0].value_type() == NumericType::Number
-                    {
-                        machine_value(&values, value)
-                    } else {
-                        tagged_call_argument(
+                    // Packed-double storage takes the raw double, so a number
+                    // or integer operand never round-trips through a box.
+                    let widen = match hir.nodes[value.0].value_type() {
+                        _ if access != Some(NumericElementAccess::PackedDouble) => None,
+                        NumericType::Number => return machine_value(&values, value),
+                        NumericType::Int32 => Some(MachineOpcode::Int32ToFloat64),
+                        NumericType::Uint32 => Some(MachineOpcode::Uint32ToFloat64),
+                        _ => None,
+                    };
+                    let Some(widen) = widen else {
+                        return tagged_call_argument(
                             hir,
                             &values,
                             &mut representations,
                             &mut instructions,
                             value,
-                        )
-                    }
+                        );
+                    };
+                    let widened = push_value(&mut representations, MachineRepresentation::Float64);
+                    instructions.push(MachineInstruction::plain(
+                        widen,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, value)),
+                            MachineOperand::register_output(widened),
+                        ],
+                    ));
+                    widened
                 });
                 let stored_tagged = stored.map(|value| {
                     tagged_call_argument(
@@ -1440,22 +1520,17 @@ fn select_with_loop_entries(
                         MachineInstructionId(instructions.len() as u32),
                     ));
                 }
-                let mut call = MachineInstruction::plain(
+                let mut convert = MachineInstruction::plain(
                     MachineOpcode::Float64ToInt32,
                     vec![
-                        MachineOperand::fixed_register_input(
-                            machine_value(&values, source),
-                            target_spec
-                                .float_argument(0)
-                                .ok_or(super::VerificationError::InvalidEntry)?,
-                        ),
-                        MachineOperand::fixed_register_output(result, target_spec.integer_result()),
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_output(result),
                     ],
                 );
-                call.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
-                call.clobbers
-                    .retain(|register| *register != target_spec.integer_result());
-                instructions.push(call);
+                convert.clobbers = target_spec
+                    .clobbers(TargetClobberSet::FloatToInt32)
+                    .to_vec();
+                instructions.push(convert);
                 continue;
             }
             if let NumericNode::Rem(left, right) | NumericNode::Pow(left, right) = node {
@@ -2038,9 +2113,13 @@ fn select_with_loop_entries(
                 NumericNode::IntegerAnd(left, right)
                 | NumericNode::IntegerOr(left, right)
                 | NumericNode::IntegerXor(left, right)
+                | NumericNode::IntegerAddWrapping(left, right)
+                | NumericNode::IntegerSubWrapping(left, right)
                 | NumericNode::IntegerShiftLeft(left, right)
                 | NumericNode::IntegerShiftRight(left, right) => {
                     let opcode = match node {
+                        NumericNode::IntegerAddWrapping(..) => MachineOpcode::IntegerAddWrapping,
+                        NumericNode::IntegerSubWrapping(..) => MachineOpcode::IntegerSubWrapping,
                         NumericNode::IntegerAnd(..) => MachineOpcode::IntegerAnd,
                         NumericNode::IntegerOr(..) => MachineOpcode::IntegerOr,
                         NumericNode::IntegerXor(..) => MachineOpcode::IntegerXor,
@@ -11607,30 +11686,27 @@ mod tests {
                 >= 2
         );
         let sequence = select(&hir).expect("float-bitwise-loop Machine IR");
-        let leaf = sequence
+        let convert = sequence
             .instructions()
             .iter()
             .find(|instruction| instruction.opcode == MachineOpcode::Float64ToInt32)
-            .expect("fixed-ABI ToInt32 leaf");
+            .expect("inline ToInt32");
         assert_eq!(
-            leaf.operands
+            convert
+                .operands
                 .iter()
                 .map(|operand| operand.constraint)
                 .collect::<Vec<_>>(),
-            [
-                OperandConstraint::Fixed(target.float_argument(0).expect("float argument 0")),
-                OperandConstraint::Fixed(target.integer_result()),
-            ]
+            [OperandConstraint::Register, OperandConstraint::Register]
         );
-        let allocation = sequence
+        assert_eq!(
+            convert.clobbers,
+            target.clobbers(TargetClobberSet::FloatToInt32),
+            "AArch64 converts in place without the call-clobbered register file"
+        );
+        sequence
             .allocate(&target)
             .expect("float-bitwise-loop allocation");
-        assert!(
-            allocation
-                .used_registers()
-                .any(|register| target.is_callee_saved(register)),
-            "loop-carried values live across ToInt32 leaves must occupy callee-saved registers"
-        );
 
         let output = crate::optimizing::compile_optimized_with_artifacts(
             &view,

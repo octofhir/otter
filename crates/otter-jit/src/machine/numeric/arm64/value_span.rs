@@ -38,7 +38,7 @@ pub(super) fn emit_value_span_arguments(
         let offset = raw_offset(frame, packet.raw_start + index as u16)?
             .checked_add(MACHINE_ROOT_RECORD_SIZE)
             .ok_or(Unsupported::OperandShape("scalar value-span slot"))?;
-        emit_sp_str_x(ops, 16, offset);
+        emit_frame_str_x(ops, 16, offset);
     }
     let offset = raw_offset(frame, packet.raw_start)?
         .checked_add(MACHINE_ROOT_RECORD_SIZE)

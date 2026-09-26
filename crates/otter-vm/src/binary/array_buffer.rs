@@ -596,6 +596,22 @@ impl JsArrayBuffer {
         }
     }
 
+    /// Base of a fixed-length local buffer's byte storage, the pointer a
+    /// view may cache: such storage never moves or resizes, and only a detach
+    /// (behind the isolate's detach protector) empties it. `None` for shared,
+    /// resizable, detached or empty storage.
+    #[must_use]
+    pub fn fixed_data_base(self, heap: &otter_gc::GcHeap) -> Option<*mut u8> {
+        let BufferStorage::Local(h) = self.storage else {
+            return None;
+        };
+        heap.read_payload(h, |body| {
+            (!body.detached && body.max_byte_length.is_none())
+                .then(|| body.data.get())
+                .filter(|data| !data.is_null())
+        })
+    }
+
     /// `true` when the buffer was constructed with a `maxByteLength`
     /// argument (§25.1.4.7 `get ArrayBuffer.prototype.resizable`).
     #[must_use]
@@ -659,8 +675,10 @@ impl JsArrayBuffer {
 
     /// Detach the buffer. Idempotent; subsequent calls are no-ops.
     /// `SharedArrayBuffer` rejects detach per §25.2.4.1 step 2 —
-    /// the call is a no-op there.
-    pub fn detach(self, heap: &mut otter_gc::GcHeap) {
+    /// the call is a no-op there. Callers go through
+    /// [`crate::Interpreter::detach_array_buffer`], which first invalidates
+    /// the isolate's detach protector.
+    pub(crate) fn detach(self, heap: &mut otter_gc::GcHeap) {
         let BufferStorage::Local(h) = self.storage else {
             return;
         };

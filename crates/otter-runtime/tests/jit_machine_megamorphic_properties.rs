@@ -367,12 +367,10 @@ const megaStored = { marker: 97 };
 const megaStoreResult = sharedMegamorphicStore(megaStoreReceivers[2], megaStored);
 const megaStorePressure = [];
 for (let index = 0; index < 128; index++) megaStorePressure.push({ index });
-JSON.stringify([
-    megaStoreResult === megaStored,
-    megaStoreReceivers[2].value === megaStored,
-    megaStoreReceivers[2].value.marker,
-    megaStorePressure[127].index,
-]);
+// The pressure loop may tier up through OSR; the tail below makes no call
+// that has never run, so it completes without a feedback deopt.
+`[${megaStoreResult === megaStored},${megaStoreReceivers[2].value === megaStored},${
+    megaStoreReceivers[2].value.marker},${megaStorePressure[127].index}]`;
 "#,
         ),
         "[true,true,97,127]",

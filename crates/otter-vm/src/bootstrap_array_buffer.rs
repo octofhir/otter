@@ -870,7 +870,7 @@ fn ab_transfer_inner(
                 name,
                 reason: "ArrayBuffer root changed kind during allocation".to_string(),
             })?;
-        buf.detach(scope.context().heap_mut());
+        scope.context().interp_mut().detach_array_buffer(buf);
         Ok(scope.finish(new_buffer))
     })
 }

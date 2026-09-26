@@ -80,6 +80,12 @@ impl ObjectLayout {
         self.len as usize
     }
 
+    /// Interned hidden-class id every object of this layout starts with.
+    #[must_use]
+    pub(crate) const fn shape_id(&self) -> crate::object::ShapeId {
+        self.shape
+    }
+
     /// Whether the layout has no properties at all.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -717,6 +723,34 @@ impl Interpreter {
                 // handle reads back the live one. The slot already exists,
                 // so the write cannot allocate and the fresh string needs no
                 // root of its own.
+                let array = interp
+                    .escape_scoped(parked)
+                    .as_array()
+                    .ok_or(VmError::InvalidOperand)?;
+                crate::array::define_index_value(
+                    array,
+                    &mut interp.gc_heap,
+                    index,
+                    Value::string(string),
+                )?;
+            }
+            Ok(interp.escape_scoped(parked))
+        })
+    }
+
+    /// Build an array holding one single-code-unit string per unit, in
+    /// order, with the same allocate-then-fill discipline as
+    /// [`Self::scoped_key_strings`]. Lone surrogates stay exact.
+    pub(crate) fn scoped_code_unit_strings(&mut self, units: &[u16]) -> Result<Value, VmError> {
+        let array = self.alloc_runtime_rooted_array_from_values(
+            std::iter::repeat_n(Value::undefined(), units.len()),
+            &[],
+            &[],
+        )?;
+        self.with_handle_scope(|interp, scope| {
+            let parked = interp.scoped_value(scope, Value::array(array));
+            for (index, unit) in units.iter().enumerate() {
+                let string = JsString::from_utf16_units(&[*unit], &mut interp.gc_heap)?;
                 let array = interp
                     .escape_scoped(parked)
                     .as_array()

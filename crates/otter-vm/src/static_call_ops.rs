@@ -818,14 +818,7 @@ impl Interpreter {
                     Some(target) if target.is_string() => {
                         let s = target.as_string(&self.gc_heap).expect("guarded");
                         let units = s.to_utf16_vec(&self.gc_heap);
-                        units
-                            .into_iter()
-                            .map(|u| {
-                                crate::string::JsString::from_utf16_units(&[u], self.gc_heap_mut())
-                                    .map(Value::string)
-                                    .unwrap_or(Value::undefined())
-                            })
-                            .collect()
+                        return Ok(Some(self.scoped_code_unit_strings(&units)?));
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
                         enumerable_own_string_entries(self, stack, context, target)?
@@ -844,6 +837,9 @@ impl Interpreter {
                 Ok(Some(Value::array(array)))
             }
             M::Entries => {
+                // A string's entries are its code units; each value string is
+                // created inside the builder scope below, parked on creation.
+                let mut units: Option<Vec<u16>> = None;
                 let raw: Vec<(String, Value)> = match args.first() {
                     None => {
                         return Err(self.err_type(
@@ -865,20 +861,12 @@ impl Interpreter {
                     }
                     Some(target) if target.is_string() => {
                         let s = target.as_string(&self.gc_heap).expect("guarded");
-                        let units = s.to_utf16_vec(&self.gc_heap);
-                        units
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, u)| {
-                                let v = crate::string::JsString::from_utf16_units(
-                                    &[u],
-                                    self.gc_heap_mut(),
-                                )
-                                .map(Value::string)
-                                .unwrap_or(Value::undefined());
-                                (i.to_string(), v)
-                            })
-                            .collect()
+                        let code_units = s.to_utf16_vec(&self.gc_heap);
+                        let raw = (0..code_units.len())
+                            .map(|index| (index.to_string(), Value::undefined()))
+                            .collect();
+                        units = Some(code_units);
+                        raw
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
                         enumerable_own_string_entries(self, stack, context, target)?
@@ -890,10 +878,22 @@ impl Interpreter {
                     // would otherwise be stranded by the key-string and pair
                     // allocations below. The arena keeps each current across
                     // every collection those allocations drive.
-                    let value_handles: Vec<Local> = raw
-                        .iter()
-                        .map(|(_, value)| interp.scoped_value(scope, *value))
-                        .collect();
+                    let value_handles: Vec<Local> = match &units {
+                        Some(units) => units
+                            .iter()
+                            .map(|unit| {
+                                let string = crate::string::JsString::from_utf16_units(
+                                    &[*unit],
+                                    &mut interp.gc_heap,
+                                )?;
+                                Ok(interp.scoped_value(scope, Value::string(string)))
+                            })
+                            .collect::<Result<_, VmError>>()?,
+                        None => raw
+                            .iter()
+                            .map(|(_, value)| interp.scoped_value(scope, *value))
+                            .collect(),
+                    };
                     let mut pair_handles: Vec<Local> = Vec::with_capacity(raw.len());
                     for ((key, _), value_h) in raw.iter().zip(value_handles) {
                         let key_h = interp.scoped_string(scope, key)?;
@@ -1809,35 +1809,55 @@ pub(crate) fn enumerable_own_string_entries(
     context: &ExecutionContext,
     target: &Value,
 ) -> Result<Vec<(String, Value)>, VmError> {
-    let keys = interp.own_property_keys_value(stack, context, target)?;
-    let mut entries = Vec::new();
-    for key_value in &keys {
-        let Some(name) = key_value.as_string(interp.gc_heap()) else {
-            continue;
-        };
-        let key_name = name.to_lossy_string(interp.gc_heap());
-        let key = VmPropertyKey::OwnedString(key_name.clone());
-        let desc =
-            interp.ordinary_get_own_property_descriptor_value(stack, context, *target, &key, 0)?;
-        let Some(desc) = desc else {
-            continue;
-        };
-        if !desc.enumerable() {
-            continue;
+    // Collecting the keys, each descriptor read and every getter can
+    // allocate and move the target and the values gathered so far, so all of
+    // them live in the handle scope and are re-read after each step.
+    interp.with_handle_scope(|interp, scope| {
+        let target = interp.scoped_value(scope, *target);
+        let live = interp.escape_scoped(target);
+        let keys = interp.own_property_keys_value(stack, context, &live)?;
+        let keys = keys
+            .into_iter()
+            .map(|key| interp.scoped_value(scope, key))
+            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for key_handle in keys {
+            let key_value = interp.escape_scoped(key_handle);
+            let Some(name) = key_value.as_string(interp.gc_heap()) else {
+                continue;
+            };
+            let key_name = name.to_lossy_string(interp.gc_heap());
+            let key = VmPropertyKey::OwnedString(key_name.clone());
+            let live = interp.escape_scoped(target);
+            let desc =
+                interp.ordinary_get_own_property_descriptor_value(stack, context, live, &key, 0)?;
+            let Some(desc) = desc else {
+                continue;
+            };
+            if !desc.enumerable() {
+                continue;
+            }
+            let live = interp.escape_scoped(target);
+            let value = match interp.ordinary_get_value(stack, context, live, live, &key, 0)? {
+                crate::VmGetOutcome::Value(value) => value,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let live = interp.escape_scoped(target);
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        live,
+                        SmallVec::new(),
+                    )?
+                }
+            };
+            entries.push((key_name, interp.scoped_value(scope, value)));
         }
-        let value = match interp.ordinary_get_value(stack, context, *target, *target, &key, 0)? {
-            crate::VmGetOutcome::Value(value) => value,
-            crate::VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
-                stack,
-                context,
-                &getter,
-                *target,
-                SmallVec::new(),
-            )?,
-        };
-        entries.push((key_name, value));
-    }
-    Ok(entries)
+        Ok(entries
+            .into_iter()
+            .map(|(name, value)| (name, interp.escape_scoped(value)))
+            .collect())
+    })
 }
 
 fn assign_source_uses_own_property_keys(source: &Value) -> bool {

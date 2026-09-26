@@ -2113,21 +2113,43 @@ impl Interpreter {
         let keys: Vec<Value> = (0..array::len(keys, &self.gc_heap))
             .map(|index| array::get(keys, &self.gc_heap, index))
             .collect();
-        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[results, &keys])?;
-        // Each define can relocate the receiver; the in-place form
-        // writes the new location back into `object`.
-        let mut object = object;
-        for (key, value) in keys.iter().zip(results.iter()) {
-            let descriptor = crate::object::PropertyDescriptor::data(*value, true, true, true);
-            let heap = &mut self.gc_heap;
-            if let Some(text) = key.as_string(heap) {
-                let text = text.to_lossy_string(heap);
-                crate::object::define_own_property_in_place(&mut object, heap, &text, descriptor);
-            } else if let Some(symbol) = key.as_symbol(heap) {
-                crate::object::define_own_symbol_property(object, heap, symbol, descriptor);
+        // Every define below can allocate (a shape transition, a wider slot
+        // slab) and move the receiver, the keys and the values. All of them
+        // live in the handle scope and are re-read for each property.
+        self.with_handle_scope(|interp, scope| {
+            let keys = keys
+                .iter()
+                .map(|key| interp.scoped_value(scope, *key))
+                .collect::<Vec<_>>();
+            let results = results
+                .iter()
+                .map(|value| interp.scoped_value(scope, *value))
+                .collect::<Vec<_>>();
+            let object = interp.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+            let object = interp.scoped_value(scope, Value::object(object));
+            for (key, value) in keys.iter().zip(&results) {
+                let key = interp.escape_scoped(*key);
+                let value = interp.escape_scoped(*value);
+                let mut target = interp
+                    .escape_scoped(object)
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                let descriptor = crate::object::PropertyDescriptor::data(value, true, true, true);
+                let heap = &mut interp.gc_heap;
+                if let Some(text) = key.as_string(heap) {
+                    let text = text.to_lossy_string(heap);
+                    crate::object::define_own_property_in_place(
+                        &mut target,
+                        heap,
+                        &text,
+                        descriptor,
+                    );
+                } else if let Some(symbol) = key.as_symbol(heap) {
+                    crate::object::define_own_symbol_property(target, heap, symbol, descriptor);
+                }
             }
-        }
-        Ok(Value::object(object))
+            Ok(interp.escape_scoped(object))
+        })
     }
 
     /// Current element buffer of a lazy `chunks` / `windows` helper.

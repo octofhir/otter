@@ -689,6 +689,18 @@ pub const STUB_JIT_NEW_ARRAY: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Committed,
 );
+/// Static-key object literal allocation (`Op::NewObjectLiteral`) from boxed
+/// values copied before collection; the published instruction names the keys.
+pub const STUB_JIT_NEW_OBJECT_LITERAL: RuntimeStubDescriptor = descriptor(
+    99,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::ReentrantValueSpan,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::allocating(true, false),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
 /// Fresh loop-iteration upvalue cell allocation.
 pub const STUB_JIT_FRESH_UPVALUE: RuntimeStubDescriptor = descriptor(
     25,
@@ -1842,6 +1854,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         96 => "jit_copy_forwarded_arguments",
         97 => "jit_forward_call_plan",
         98 => "jit_forward_source_ready",
+        99 => "jit_new_object_literal",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1946,6 +1959,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_COPY_FORWARDED_ARGUMENTS,
     STUB_JIT_FORWARD_CALL_PLAN,
     STUB_JIT_FORWARD_SOURCE_READY,
+    STUB_JIT_NEW_OBJECT_LITERAL,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

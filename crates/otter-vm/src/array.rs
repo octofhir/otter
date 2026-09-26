@@ -2371,6 +2371,51 @@ pub(crate) fn set_property_flags(
     });
 }
 
+/// Drop descriptor flags recorded for a string-keyed array own property, so
+/// it reads back with the attributes its kind implies when absent. Never
+/// creates the exotic sidecar.
+pub(crate) fn clear_property_flags(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &str) {
+    heap.with_payload(arr, |body| {
+        if let Some(exotic) = body.exotic_opt_mut()
+            && let Some(flags) = exotic.property_flags.as_mut()
+            && flags.remove(key).is_some()
+        {
+            if flags.is_empty() {
+                exotic.property_flags = None;
+            }
+            body.mark_dirty();
+        }
+    });
+}
+
+/// Complete an ordinary `[[Set]]` that creates index `idx` on a plain dense
+/// array: the `CreateDataProperty` of a writable, enumerable, configurable
+/// element, growing dense storage when needed.
+///
+/// The caller must have proved that no prototype of the array can observe
+/// the index (the array-index accessor protector is intact). A plain array has
+/// no sidecar, so it is extensible, its `length` is writable and its prototype
+/// is the realm's `%Array.prototype%`. Returns `Ok(false)` without effect for
+/// any other array, or when the index belongs in sparse storage.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if growing dense storage would exceed
+/// the configured heap cap.
+pub(crate) fn create_plain_dense_element(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    idx: usize,
+    value: Value,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    if !heap.read_payload(arr, |body| body.exotic.is_null()) || should_store_sparse(arr, heap, idx)
+    {
+        return Ok(false);
+    }
+    set_index_value(arr, heap, idx, value, false)?;
+    Ok(true)
+}
+
 /// Read a string-keyed own property. Numeric strings route to indexed
 /// elements; `length` returns the array length.
 #[must_use]

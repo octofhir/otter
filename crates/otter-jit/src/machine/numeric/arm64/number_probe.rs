@@ -8,6 +8,7 @@
 //! # Invariants
 //! - No allocation, VM transition, deopt or user code occurs in the probe.
 //!   A cell, immediate, `%` or `**` misses to the committed cold sibling.
+//! - Bitwise operators convert double operands with the inline ToInt32.
 //! - Both inputs are fully read before either output is defined, so outputs
 //!   may share registers with inputs.
 //! - The Int32 path defers overflow, a zero product and division to the
@@ -75,6 +76,18 @@ pub(super) fn emit(
         BinaryOperator::Rem | BinaryOperator::Pow => {
             dynasm!(ops ; .arch aarch64 ; b =>miss);
         }
+        BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::Shl
+        | BinaryOperator::Shr
+        | BinaryOperator::Ushr => {
+            // Both inputs are decoded, so the result register is free for
+            // the right operand's ToInt32.
+            super::emit_float_to_int32(ops, 30, 15);
+            super::emit_float_to_int32(ops, 31, result);
+            bitwise(ops, operator, 15, result, result);
+        }
     }
     dynasm!(ops ; .arch aarch64 ; movz W(hit), 1 ; b =>done ; =>miss);
     emit_load_u64(ops, result, Value::undefined().to_bits());
@@ -111,6 +124,12 @@ fn integer(
         ; b.ne =>double
     );
     match operator {
+        BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::Shl
+        | BinaryOperator::Shr
+        | BinaryOperator::Ushr => bitwise(ops, operator, left, right, result),
         BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul => {
             match operator {
                 BinaryOperator::Add => {
@@ -148,6 +167,39 @@ fn integer(
         }
     }
     dynasm!(ops ; .arch aarch64 ; movz W(hit), 1 ; b =>done);
+}
+
+/// Apply one int32 bitwise operator to `W(left)` and `W(right)` and box the
+/// result into `X(result)`. AArch64 variable shifts take the count modulo 32,
+/// exactly as ECMAScript masks it; an unsigned `>>>` result of 2^31 or more
+/// is no Int32 and boxes as a double. Clobbers x15-x16 and v30.
+fn bitwise(ops: &mut Assembler, operator: BinaryOperator, left: u8, right: u8, result: u8) {
+    match operator {
+        BinaryOperator::BitwiseAnd => dynasm!(ops ; .arch aarch64 ; and w15, W(left), W(right)),
+        BinaryOperator::BitwiseOr => dynasm!(ops ; .arch aarch64 ; orr w15, W(left), W(right)),
+        BinaryOperator::BitwiseXor => dynasm!(ops ; .arch aarch64 ; eor w15, W(left), W(right)),
+        BinaryOperator::Shl => dynasm!(ops ; .arch aarch64 ; lsl w15, W(left), W(right)),
+        BinaryOperator::Shr => dynasm!(ops ; .arch aarch64 ; asr w15, W(left), W(right)),
+        _ => dynasm!(ops ; .arch aarch64 ; lsr w15, W(left), W(right)),
+    }
+    let boxed = ops.new_dynamic_label();
+    if operator == BinaryOperator::Ushr {
+        let small = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; tbz w15, #31, =>small
+            ; ucvtf d30, w15
+        );
+        emit_box_number(ops, 30, result);
+        dynasm!(ops ; .arch aarch64 ; b =>boxed ; =>small);
+    }
+    // A 32-bit result register write already cleared the upper half.
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x16, NUMBER_TAG_HI16, lsl #48
+        ; orr X(result), x15, x16
+        ; =>boxed
+    );
 }
 
 /// Decode the tagged Number in `source` into `D(target)`, or branch to `miss`.

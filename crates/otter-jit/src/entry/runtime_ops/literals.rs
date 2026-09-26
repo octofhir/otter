@@ -57,3 +57,30 @@ pub(crate) extern "C" fn jit_new_array_stub(
     });
     committed_vm_result(ctx, result)
 }
+
+/// Complete one `Op::NewObjectLiteral`: the published instruction names the
+/// keys, the packet carries the evaluated values in property order.
+pub(crate) extern "C" fn jit_new_object_literal_stub(
+    ctx: *mut JitCtx,
+    values: *const Value,
+    count: u32,
+) -> NativeResultPair {
+    let copied = if count == 0 {
+        Ok(smallvec::SmallVec::<[Value; 8]>::new())
+    } else if values.is_null() || !(values as usize).is_multiple_of(std::mem::align_of::<Value>()) {
+        Err(VmError::InvalidOperand)
+    } else {
+        // SAFETY: generated code owns count initialized, aligned Value words
+        // for this synchronous call. The u32 extent fits isize on supported
+        // 64-bit targets. No VM operation happens before the copy completes.
+        let values = unsafe { std::slice::from_raw_parts(values, count as usize) };
+        Ok(smallvec::SmallVec::<[Value; 8]>::from_slice(values))
+    };
+    // SAFETY: as above; the stack packet is no longer borrowed.
+    let ctx = unsafe { &mut *ctx };
+    let result = copied.and_then(|values| {
+        ctx.runtime_call()
+            .and_then(|mut runtime| runtime.new_object_literal_value(&values))
+    });
+    committed_vm_result(ctx, result)
+}

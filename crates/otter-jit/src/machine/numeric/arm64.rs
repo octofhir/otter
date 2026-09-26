@@ -116,8 +116,8 @@ use otter_vm::{
         STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
         STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_DEOPT_WRITEBACK,
         STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_STRICT_EQ_LEAF,
+        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
     },
 };
 
@@ -309,19 +309,41 @@ fn emit_float_leaf_binary(
     dynasm!(ops ; .arch aarch64 ; blr x16);
 }
 
-fn emit_float_to_int32_leaf(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    relocations: &mut RelocationCapture,
-    entry: u64,
-) {
-    emit_load_symbolic_u64(
-        ops,
-        relocations,
-        16,
-        entry,
-        RelocationTarget::runtime_stub(STUB_NUMBER_TO_INT32_F64_LEAF),
+/// ECMAScript ToInt32 of `D(source)` into the zero-extended `W(destination)`.
+///
+/// `fcvtzs` truncates exactly whenever the magnitude is below 2^63, and the low
+/// 32 bits of that integer are the modular result; NaN converts to zero. Only a
+/// saturated conversion (Infinity, or a magnitude of at least 2^63) takes the
+/// out-of-line bit extraction: such a double is an integer `m * 2^shift` with
+/// `shift >= 11`, so its low 32 bits are `m << shift` when `shift < 32` and zero
+/// otherwise (Infinity and NaN included), negated modulo 2^32 for a negative
+/// input. Clobbers `x16` and `x17`.
+fn emit_float_to_int32(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destination: u8) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; fcvtzs X(destination), D(source)
+        // V is set exactly for i64::MIN (first compare) or i64::MAX (second).
+        ; cmp XSP(destination), #1
+        ; ccmn X(destination), #1, #1, vc
+        ; b.vs >saturated
+        ; mov W(destination), W(destination)
+        ; b >done
+        ; saturated:
+        ; fmov x16, D(source)
+        ; ubfx x17, x16, #52, #11
+        ; sub x17, x17, #1075
+        ; cmp x17, #32
+        ; b.hs >zero
+        ; ubfx X(destination), x16, #0, #52
+        ; orr XSP(destination), X(destination), #0x0010_0000_0000_0000
+        ; lsl X(destination), X(destination), x17
+        ; tst x16, #0x8000_0000_0000_0000
+        ; cneg W(destination), W(destination), mi
+        ; b >done
+        ; zero:
+        ; mov W(destination), wzr
+        ; done:
     );
-    dynasm!(ops ; .arch aarch64 ; blr x16);
 }
 
 #[cfg(test)]
@@ -971,6 +993,10 @@ fn emit_binding_hit(
     Ok(())
 }
 
+/// Bytes of code between two Machine veneer islands; see
+/// [`emit_with_reach`].
+const VENEER_ISLAND_INTERVAL: usize = 256 * 1024;
+
 pub(super) fn emit(
     view: &JitCompileSnapshot,
     sequence: &InstructionSequence,
@@ -992,7 +1018,8 @@ pub(super) fn emit(
     array_construct_entry: u64,
     number_rem_entry: u64,
     number_pow_entry: u64,
-    number_to_int32_entry: u64,
+    // AArch64 converts inline; x86-64 calls this leaf out of range.
+    _number_to_int32_entry: u64,
     strict_eq_entry: u64,
     to_boolean_entry: u64,
     call_method_value_entry: u64,
@@ -1003,6 +1030,121 @@ pub(super) fn emit(
     vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
+    // Near branches are one instruction; only a body whose control flow
+    // spans more than a conditional branch reaches pays for the far form.
+    match emit_with_reach(
+        view,
+        sequence,
+        allocation,
+        frame,
+        deopt_runtime,
+        safepoints,
+        transitions,
+        poll_entry,
+        deopt_writeback_entry,
+        deopt_stack_call_entry,
+        resolve_direct_entry,
+        try_prepare_construct_entry,
+        prepare_construct_entry,
+        derived_construct_result_entry,
+        copy_spread_arguments_entry,
+        initialize_upvalues_entry,
+        string_concat_entry,
+        array_construct_entry,
+        number_rem_entry,
+        number_pow_entry,
+        _number_to_int32_entry,
+        strict_eq_entry,
+        to_boolean_entry,
+        call_method_value_entry,
+        call_with_this_value_entry,
+        construct_value_entry,
+        load_ic_cells,
+        store_ic_cells,
+        vm_register_count,
+        capture_artifacts,
+        false,
+    ) {
+        Err(Unsupported::Backend(crate::BackendFailure::Relocation)) => {
+            load_ic_cells.fill(PropertySourceCell::default());
+            store_ic_cells.fill(PropertySourceCell::default());
+            emit_with_reach(
+                view,
+                sequence,
+                allocation,
+                frame,
+                deopt_runtime,
+                safepoints,
+                transitions,
+                poll_entry,
+                deopt_writeback_entry,
+                deopt_stack_call_entry,
+                resolve_direct_entry,
+                try_prepare_construct_entry,
+                prepare_construct_entry,
+                derived_construct_result_entry,
+                copy_spread_arguments_entry,
+                initialize_upvalues_entry,
+                string_concat_entry,
+                array_construct_entry,
+                number_rem_entry,
+                number_pow_entry,
+                _number_to_int32_entry,
+                strict_eq_entry,
+                to_boolean_entry,
+                call_method_value_entry,
+                call_with_this_value_entry,
+                construct_value_entry,
+                load_ic_cells,
+                store_ic_cells,
+                vm_register_count,
+                capture_artifacts,
+                true,
+            )
+        }
+        result => result,
+    }
+}
+
+/// Emit one Machine body. With `far_branches`, conditional branches between
+/// blocks become an inverted local branch around `b` (±128 MiB), and every
+/// `VENEER_ISLAND_INTERVAL` bytes an island defines the segment's exit and
+/// deoptimization labels as trampolines to their final stubs: the veneer
+/// pool V8's arm64 assembler emits for out-of-range branches.
+fn emit_with_reach(
+    view: &JitCompileSnapshot,
+    sequence: &InstructionSequence,
+    allocation: &AllocatedSequence,
+    frame: MachineFrameLayout,
+    deopt_runtime: &DeoptRuntime,
+    safepoints: &MachineSafepointTable,
+    transitions: &TransitionTable,
+    poll_entry: u64,
+    deopt_writeback_entry: u64,
+    deopt_stack_call_entry: u64,
+    resolve_direct_entry: u64,
+    try_prepare_construct_entry: u64,
+    prepare_construct_entry: u64,
+    derived_construct_result_entry: u64,
+    copy_spread_arguments_entry: u64,
+    initialize_upvalues_entry: u64,
+    string_concat_entry: u64,
+    array_construct_entry: u64,
+    number_rem_entry: u64,
+    number_pow_entry: u64,
+    // AArch64 converts inline; x86-64 calls this leaf out of range.
+    _number_to_int32_entry: u64,
+    strict_eq_entry: u64,
+    to_boolean_entry: u64,
+    call_method_value_entry: u64,
+    call_with_this_value_entry: u64,
+    construct_value_entry: u64,
+    load_ic_cells: &mut [PropertySourceCell],
+    store_ic_cells: &mut [PropertySourceCell],
+    vm_register_count: u16,
+    capture_artifacts: bool,
+    far_branches: bool,
+) -> Result<Emission, Unsupported> {
     reject_unimplemented_locations(sequence, allocation)?;
     let saved = SavedFrame::from_allocation(allocation);
     if frame.fixed_bytes() != saved.fixed_bytes() {
@@ -1012,16 +1154,29 @@ pub(super) fn emit(
     }
     let mut ops = dynasmrt::aarch64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let bail = ops.new_dynamic_label();
-    let finish_error = ops.new_dynamic_label();
-    let throw_value = ops.new_dynamic_label();
-    let fatal = ops.new_dynamic_label();
+    let mut bail = ops.new_dynamic_label();
+    let mut finish_error = ops.new_dynamic_label();
+    let mut throw_value = ops.new_dynamic_label();
+    let mut fatal = ops.new_dynamic_label();
     let shared_deopt = ops.new_dynamic_label();
     let deopt_labels = deopt_runtime
         .exits
         .iter()
         .map(|_| ops.new_dynamic_label())
         .collect::<Vec<_>>();
+    // Labels the current code segment branches to. A far body starts with
+    // segment-local labels so its first island can define them without
+    // touching the final stubs.
+    let final_exits = [bail, finish_error, throw_value, fatal];
+    let mut deopt_targets = deopt_labels.clone();
+    if far_branches {
+        [bail, finish_error, throw_value, fatal] = std::array::from_fn(|_| ops.new_dynamic_label());
+        for target in &mut deopt_targets {
+            *target = ops.new_dynamic_label();
+        }
+    }
+    let mut segment_deopts = Vec::new();
+    let mut island_base = 0usize;
     let mut relocations = RelocationCapture::new(capture_artifacts);
     let mut structural_regions = Vec::new();
     let mut next_load_ic = 0usize;
@@ -1061,6 +1216,32 @@ pub(super) fn emit(
     }
 
     for (index, instruction) in sequence.instructions().iter().enumerate() {
+        if far_branches && ops.offset().0 - island_base >= VENEER_ISLAND_INTERVAL {
+            let island_start = ops.offset().0;
+            let resume = ops.new_dynamic_label();
+            dynasm!(ops ; .arch aarch64 ; b =>resume);
+            for (segment, target) in [bail, finish_error, throw_value, fatal]
+                .into_iter()
+                .zip(final_exits)
+            {
+                dynasm!(ops ; .arch aarch64 ; =>segment ; b =>target);
+            }
+            [bail, finish_error, throw_value, fatal] =
+                std::array::from_fn(|_| ops.new_dynamic_label());
+            for exit in std::mem::take(&mut segment_deopts) {
+                if deopt_targets[exit] != deopt_labels[exit] {
+                    let (segment, target) = (deopt_targets[exit], deopt_labels[exit]);
+                    dynasm!(ops ; .arch aarch64 ; =>segment ; b =>target);
+                    deopt_targets[exit] = ops.new_dynamic_label();
+                }
+            }
+            dynasm!(ops ; .arch aarch64 ; =>resume);
+            island_base = ops.offset().0;
+            structural_regions.push(("machineVeneerIsland", None, island_start, island_base));
+        }
+        if far_branches {
+            segment_deopts.extend(instruction.exits.iter().map(|exit| exit.id.0 as usize));
+        }
         let id = MachineInstructionId(index as u32);
         let block_index = block_for_instruction(sequence, id)?;
         if sequence.blocks()[block_index].first == id {
@@ -1222,7 +1403,7 @@ pub(super) fn emit(
                 guard: MachineCallGuard::Method(ref guard),
             } => {
                 let start = ops.offset().0;
-                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 emit_method_guard_from_tagged_register(
                     &mut ops,
@@ -1246,7 +1427,7 @@ pub(super) fn emit(
                     },
             } => {
                 let start = ops.offset().0;
-                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
                 crate::arm64::inline_guard::emit_inline_this(
@@ -1263,7 +1444,7 @@ pub(super) fn emit(
             MachineOpcode::GuardCallTarget {
                 guard: MachineCallGuard::Construct { function_id },
             } => {
-                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 let callable = ops.new_dynamic_label();
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
                 crate::template::arm64::values::emit_cell_test(
@@ -1363,7 +1544,7 @@ pub(super) fn emit(
             }
             MachineOpcode::DecodeNumber => {
                 let miss = if !instruction.exits.is_empty() {
-                    instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?
+                    instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?
                 } else {
                     bail
                 };
@@ -1383,7 +1564,7 @@ pub(super) fn emit(
                     ));
                 }
                 let miss = if !instruction.exits.is_empty() {
-                    instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?
+                    instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?
                 } else {
                     bail
                 };
@@ -1432,10 +1613,9 @@ pub(super) fn emit(
                 emit_float_leaf_binary(&mut ops, &mut relocations, entry, descriptor);
             }
             MachineOpcode::Float64ToInt32 => {
-                if float_register(locations[0])? != 0 || integer_register(locations[1])? != 0 {
-                    return Err(Unsupported::OperandShape("numeric ToInt32 leaf ABI"));
-                }
-                emit_float_to_int32_leaf(&mut ops, &mut relocations, number_to_int32_entry);
+                let source = float_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                emit_float_to_int32(&mut ops, source, destination);
             }
             MachineOpcode::FloatNeg => {
                 let source = float_register(locations[0])?;
@@ -1500,7 +1680,7 @@ pub(super) fn emit(
                 let left = integer_register(locations[0])?;
                 let right = integer_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
-                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 if instruction.opcode == MachineOpcode::IntegerAdd {
                     dynasm!(ops
                         ; .arch aarch64
@@ -1521,11 +1701,11 @@ pub(super) fn emit(
                 let destination = integer_register(locations[2])?;
                 let overflow = instruction_deopt_label(
                     instruction.exit_id(ExitReason::Int32Overflow),
-                    &deopt_labels,
+                    &deopt_targets,
                 )?;
                 let negative_zero = instruction_deopt_label(
                     instruction.exit_id(ExitReason::NegativeZero),
-                    &deopt_labels,
+                    &deopt_targets,
                 )?;
                 let nonzero = ops.new_dynamic_label();
                 // A test-bit branch reaches only 32 KiB, so the negative-zero
@@ -1550,11 +1730,11 @@ pub(super) fn emit(
                 let destination = integer_register(locations[1])?;
                 let overflow = instruction_deopt_label(
                     instruction.exit_id(ExitReason::Int32Overflow),
-                    &deopt_labels,
+                    &deopt_targets,
                 )?;
                 let negative_zero = instruction_deopt_label(
                     instruction.exit_id(ExitReason::NegativeZero),
-                    &deopt_labels,
+                    &deopt_targets,
                 )?;
                 dynasm!(ops
                     ; .arch aarch64
@@ -1568,7 +1748,7 @@ pub(super) fn emit(
             | MachineOpcode::IntegerSubImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_load_u64(&mut ops, 16, immediate as u32 as u64);
                 if matches!(instruction.opcode, MachineOpcode::IntegerAddImmediate(_)) {
                     dynasm!(ops
@@ -1587,12 +1767,20 @@ pub(super) fn emit(
             MachineOpcode::IntegerAnd
             | MachineOpcode::IntegerOr
             | MachineOpcode::IntegerXor
+            | MachineOpcode::IntegerAddWrapping
+            | MachineOpcode::IntegerSubWrapping
             | MachineOpcode::IntegerShiftLeft
             | MachineOpcode::IntegerShiftRight => {
                 let left = integer_register(locations[0])?;
                 let right = integer_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
                 match instruction.opcode {
+                    MachineOpcode::IntegerAddWrapping => {
+                        dynasm!(ops ; .arch aarch64 ; add W(destination), W(left), W(right));
+                    }
+                    MachineOpcode::IntegerSubWrapping => {
+                        dynasm!(ops ; .arch aarch64 ; sub W(destination), W(left), W(right));
+                    }
                     MachineOpcode::IntegerAnd => {
                         dynasm!(ops ; .arch aarch64 ; and W(destination), W(left), W(right));
                     }
@@ -1793,7 +1981,7 @@ pub(super) fn emit(
             MachineOpcode::TaggedNullishEqual { byte_pc, equal } => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 let nullish = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
@@ -1837,7 +2025,7 @@ pub(super) fn emit(
                 ));
             }
             MachineOpcode::BackedgePoll => {
-                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let exit = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_backedge_poll(
                     &mut ops,
                     &mut relocations,
@@ -2681,6 +2869,7 @@ pub(super) fn emit(
                     &mut relocations,
                     view,
                     &access,
+                    19,
                     |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
                     miss,
                 )?;
@@ -2827,7 +3016,7 @@ pub(super) fn emit(
                 ));
             }
             MachineOpcode::GuardCondition => {
-                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
             }
@@ -2859,7 +3048,15 @@ pub(super) fn emit(
                 };
                 let taken = block_labels[taken.0 as usize];
                 let fallthrough = block_labels[fallthrough.0 as usize];
-                if when_true {
+                if far_branches {
+                    let not_taken = ops.new_dynamic_label();
+                    if when_true {
+                        dynasm!(ops ; .arch aarch64 ; cbz W(condition), =>not_taken);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; cbnz W(condition), =>not_taken);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; b =>taken ; =>not_taken);
+                } else if when_true {
                     dynasm!(ops ; .arch aarch64 ; cbnz W(condition), =>taken);
                 } else {
                     dynasm!(ops ; .arch aarch64 ; cbz W(condition), =>taken);
@@ -2877,13 +3074,29 @@ pub(super) fn emit(
                 let throw = block_labels[throw.0 as usize];
                 let fatal_target = block_labels[fatal_target.0 as usize];
                 emit_load_u64(&mut ops, 16, u64::from(throw_status));
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cbz X(status), =>success
-                    ; cmp X(status), x16
-                    ; b.eq =>throw
-                    ; b =>fatal_target
-                );
+                if far_branches {
+                    let failed = ops.new_dynamic_label();
+                    let not_thrown = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cbnz X(status), =>failed
+                        ; b =>success
+                        ; =>failed
+                        ; cmp X(status), x16
+                        ; b.ne =>not_thrown
+                        ; b =>throw
+                        ; =>not_thrown
+                        ; b =>fatal_target
+                    );
+                } else {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cbz X(status), =>success
+                        ; cmp X(status), x16
+                        ; b.eq =>throw
+                        ; b =>fatal_target
+                    );
+                }
             }
             MachineOpcode::Throw => {
                 let exception = integer_register(locations[0])?;
@@ -3000,7 +3213,7 @@ pub(super) fn emit(
                         .site(id)
                         .filter(|site| instruction.safepoint == Some(site.id))
                         .ok_or(Unsupported::OperandShape("scalar direct call safepoint"))?;
-                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                     let direct_done = ops.new_dynamic_label();
                     let direct_threw = ops.new_dynamic_label();
                     let direct_bail = ops.new_dynamic_label();
@@ -3217,7 +3430,7 @@ pub(super) fn emit(
                                         .ok_or(Unsupported::OperandShape(
                                             "scalar direct call canonical root offset",
                                         ))?;
-                                    emit_sp_ldr_x(ops, target, offset);
+                                    emit_frame_ldr_x(ops, target, offset);
                                     return Ok(());
                                 }
                                 let location = locations[usize::from(source)];
@@ -3271,7 +3484,7 @@ pub(super) fn emit(
                                     .ok_or(Unsupported::OperandShape(
                                         "scalar construct receiver root offset",
                                     ))?;
-                                dynasm!(ops ; .arch aarch64 ; str X(source), [sp, offset]);
+                                emit_frame_str_x(ops, source, offset);
                                 Ok(())
                             },
                             |ops, sp_bias| {
@@ -3470,7 +3683,8 @@ pub(super) fn emit(
                     dynasm!(ops ; .arch aarch64 ; =>direct_done);
                 } else {
                     if let CallTarget::NativeLeaf { target, byte_pc } = &descriptor.target {
-                        let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                        let deopt =
+                            instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                         let start = ops.offset().0;
                         let int32 = descriptor.results == [MachineRepresentation::Int32];
                         if int32 {
@@ -3520,7 +3734,8 @@ pub(super) fn emit(
                         continue;
                     }
                     if let CallTarget::ColdCallExit { byte_pc, .. } = &descriptor.target {
-                        let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                        let deopt =
+                            instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                         let start = ops.offset().0;
                         dynasm!(ops ; .arch aarch64 ; b =>deopt);
                         structural_regions.push((
@@ -3668,7 +3883,8 @@ pub(super) fn emit(
                         if locations.len() < 2 {
                             return Err(Unsupported::OperandShape("scalar class-super load call"));
                         }
-                        let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                        let deopt =
+                            instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                         let start = ops.offset().0;
                         emit_load_allocated_tagged(&mut ops, frame, locations[0], 1, 0)?;
                         dynasm!(ops
@@ -3774,7 +3990,7 @@ pub(super) fn emit(
                     if integer_register(locations[result_index])? != 0 {
                         return Err(Unsupported::OperandShape("scalar runtime call result"));
                     }
-                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_labels)?;
+                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                     let array_construct_region = if target == STUB_ARRAY_CONSTRUCT_ALLOC {
                         let byte_pc = instruction
                             .deopt_id()
@@ -3856,6 +4072,26 @@ pub(super) fn emit(
         ));
     }
 
+    // The last segment's labels become trampolines next to the final stubs.
+    if far_branches {
+        let skip = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; b =>skip);
+        for (segment, target) in [bail, finish_error, throw_value, fatal]
+            .into_iter()
+            .zip(final_exits)
+        {
+            dynasm!(ops ; .arch aarch64 ; =>segment ; b =>target);
+        }
+        for exit in segment_deopts {
+            if deopt_targets[exit] != deopt_labels[exit] {
+                let (segment, target) = (deopt_targets[exit], deopt_labels[exit]);
+                dynasm!(ops ; .arch aarch64 ; =>segment ; b =>target);
+                deopt_targets[exit] = deopt_labels[exit];
+            }
+        }
+        dynasm!(ops ; .arch aarch64 ; =>skip);
+        [bail, finish_error, throw_value, fatal] = final_exits;
+    }
     dynasm!(ops ; .arch aarch64 ; =>bail);
     emit_materialize_vm_window(&mut ops, vm_register_count);
     let entry_bail = SideExit::new(0, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits();
@@ -4162,15 +4398,12 @@ fn emit_save_safepoint_roots(
         let destination = root_offset(frame, root.save_slot)?;
         match root.source {
             AllocatedLocation::Register(register) if register.is_integer() => {
-                dynasm!(ops ; .arch aarch64 ; str X(register.encoding()), [sp, destination]);
+                emit_frame_str_x(ops, register.encoding(), destination);
             }
             AllocatedLocation::Stack(slot) => {
                 let source = spill_offset(frame, slot)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x16, [sp, source]
-                    ; str x16, [sp, destination]
-                );
+                emit_frame_ldr_x(ops, 16, source);
+                emit_frame_str_x(ops, 16, destination);
             }
             AllocatedLocation::Register(_) => {
                 return Err(Unsupported::OperandShape("scalar tagged root source"));
@@ -4200,7 +4433,7 @@ fn emit_load_safepoint_root(
         .ok_or(Unsupported::OperandShape(
             "scalar safepoint argument root offset",
         ))?;
-    emit_sp_ldr_x(ops, target, offset);
+    emit_frame_ldr_x(ops, target, offset);
     Ok(())
 }
 
@@ -4224,17 +4457,14 @@ fn emit_reload_safepoint_roots_with_bias(
             .ok_or(Unsupported::OperandShape("scalar root reload stack bias"))?;
         match root.source {
             AllocatedLocation::Register(register) if register.is_integer() => {
-                dynasm!(ops ; .arch aarch64 ; ldr X(register.encoding()), [sp, source]);
+                emit_frame_ldr_x(ops, register.encoding(), source);
             }
             AllocatedLocation::Stack(slot) => {
                 let destination = spill_offset(frame, slot)?
                     .checked_add(sp_bias)
                     .ok_or(Unsupported::OperandShape("scalar spill reload stack bias"))?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x16, [sp, source]
-                    ; str x16, [sp, destination]
-                );
+                emit_frame_ldr_x(ops, 16, source);
+                emit_frame_str_x(ops, 16, destination);
             }
             AllocatedLocation::Register(_) => {
                 return Err(Unsupported::OperandShape("scalar tagged root reload"));
@@ -4328,12 +4558,7 @@ fn emit_load_allocated_integer(
             let offset = spill_offset(frame, slot)?
                 .checked_add(sp_bias)
                 .ok_or(Unsupported::OperandShape("scalar direct call spill offset"))?;
-            if offset <= 32_760 {
-                dynasm!(ops ; .arch aarch64 ; ldr X(target), [sp, offset]);
-            } else {
-                emit_load_u64(ops, 16, u64::from(offset));
-                dynasm!(ops ; .arch aarch64 ; ldr X(target), [sp, x16]);
-            }
+            emit_frame_ldr_x(ops, target, offset);
         }
         AllocatedLocation::Register(_) => {
             return Err(Unsupported::OperandShape("scalar allocated integer source"));
@@ -4357,12 +4582,7 @@ fn emit_store_allocated_tagged(
             let offset = spill_offset(frame, slot)?
                 .checked_add(sp_bias)
                 .ok_or(Unsupported::OperandShape("scalar direct call spill offset"))?;
-            if offset <= 32_760 {
-                dynasm!(ops ; .arch aarch64 ; str X(source), [sp, offset]);
-            } else {
-                emit_load_u64(ops, 16, u64::from(offset));
-                dynasm!(ops ; .arch aarch64 ; str X(source), [sp, x16]);
-            }
+            emit_frame_str_x(ops, source, offset);
         }
         AllocatedLocation::Register(_) => {
             return Err(Unsupported::OperandShape(
@@ -4418,10 +4638,13 @@ fn block_for_instruction(
     sequence: &InstructionSequence,
     instruction: MachineInstructionId,
 ) -> Result<usize, Unsupported> {
-    sequence
-        .blocks()
-        .iter()
-        .position(|block| block.first.0 <= instruction.0 && instruction.0 < block.end.0)
+    // Verified blocks own contiguous, ascending instruction ranges.
+    let blocks = sequence.blocks();
+    let index = blocks.partition_point(|block| block.end.0 <= instruction.0);
+    blocks
+        .get(index)
+        .filter(|block| block.first.0 <= instruction.0 && instruction.0 < block.end.0)
+        .map(|_| index)
         .ok_or(Unsupported::OperandShape("numeric instruction block"))
 }
 
@@ -4460,7 +4683,7 @@ fn emit_edits(
     point: AllocationPoint,
     frame: MachineFrameLayout,
 ) -> Result<(), Unsupported> {
-    for edit in edits.iter().filter(|edit| edit.point == point) {
+    for edit in super::super::regalloc::edits_at(edits, point) {
         if edit.from == edit.to {
             continue;
         }
@@ -4478,9 +4701,9 @@ fn emit_edits(
             (AllocatedLocation::Register(from), AllocatedLocation::Stack(slot)) => {
                 let offset = spill_offset(frame, slot)?;
                 if from.is_integer() {
-                    dynasm!(ops ; .arch aarch64 ; str X(from.encoding()), [sp, offset]);
+                    emit_frame_str_x(ops, from.encoding(), offset);
                 } else if from.is_float() {
-                    dynasm!(ops ; .arch aarch64 ; str D(from.encoding()), [sp, offset]);
+                    emit_frame_str_d(ops, from.encoding(), offset);
                 } else {
                     return Err(Unsupported::OperandShape("numeric spill register class"));
                 }
@@ -4488,9 +4711,9 @@ fn emit_edits(
             (AllocatedLocation::Stack(slot), AllocatedLocation::Register(to)) => {
                 let offset = spill_offset(frame, slot)?;
                 if to.is_integer() {
-                    dynasm!(ops ; .arch aarch64 ; ldr X(to.encoding()), [sp, offset]);
+                    emit_frame_ldr_x(ops, to.encoding(), offset);
                 } else if to.is_float() {
-                    dynasm!(ops ; .arch aarch64 ; ldr D(to.encoding()), [sp, offset]);
+                    emit_frame_ldr_d(ops, to.encoding(), offset);
                 } else {
                     return Err(Unsupported::OperandShape("numeric reload register class"));
                 }
@@ -4498,11 +4721,8 @@ fn emit_edits(
             (AllocatedLocation::Stack(from), AllocatedLocation::Stack(to)) => {
                 let from = spill_offset(frame, from)?;
                 let to = spill_offset(frame, to)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x16, [sp, from]
-                    ; str x16, [sp, to]
-                );
+                emit_frame_ldr_x(ops, 16, from);
+                emit_frame_str_x(ops, 16, to);
             }
             (AllocatedLocation::Register(_), AllocatedLocation::Register(_)) => {
                 return Err(Unsupported::OperandShape("numeric edit register class"));
@@ -4698,7 +4918,7 @@ fn emit_store_osr_integer(
         }
         AllocatedLocation::Stack(slot) => {
             let offset = spill_offset(frame, slot)?;
-            dynasm!(ops ; .arch aarch64 ; str x16, [sp, offset]);
+            emit_frame_str_x(ops, 16, offset);
         }
         AllocatedLocation::Register(_) => {
             return Err(Unsupported::OperandShape("scalar OSR integer location"));
@@ -4719,7 +4939,7 @@ fn emit_store_osr_tagged(
         }
         AllocatedLocation::Stack(slot) => {
             let offset = spill_offset(frame, slot)?;
-            dynasm!(ops ; .arch aarch64 ; str x16, [sp, offset]);
+            emit_frame_str_x(ops, 16, offset);
         }
         AllocatedLocation::Register(_) => {
             return Err(Unsupported::OperandShape("scalar OSR tagged location"));
@@ -4740,7 +4960,7 @@ fn emit_store_osr_float(
         }
         AllocatedLocation::Stack(slot) => {
             let offset = spill_offset(frame, slot)?;
-            dynasm!(ops ; .arch aarch64 ; str d31, [sp, offset]);
+            emit_frame_str_d(ops, 31, offset);
         }
         AllocatedLocation::Register(_) => {
             return Err(Unsupported::OperandShape("scalar OSR float location"));
@@ -4908,21 +5128,53 @@ fn emit_sp_address_x9(ops: &mut dynasmrt::aarch64::Assembler, offset: u32) {
     }
 }
 
-fn emit_sp_ldr_x(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
-    if offset <= 32_760 && offset.is_multiple_of(8) {
-        dynasm!(ops ; .arch aarch64 ; ldr X(register), [sp, offset]);
+/// Largest byte offset a scaled unsigned 64-bit `[sp, #imm]` access encodes.
+const FRAME_IMMEDIATE_LIMIT: u32 = 32_760;
+
+/// Materialize an out-of-range frame offset in `x30`. The prologue saved the
+/// return address and inside the body only calls write `x30`, so it is the one
+/// scratch that never carries an operand, a callee address or allocated data.
+fn emit_far_frame_offset(ops: &mut dynasmrt::aarch64::Assembler, offset: u32) -> bool {
+    if offset <= FRAME_IMMEDIATE_LIMIT && offset.is_multiple_of(8) {
+        return false;
+    }
+    emit_load_u64(ops, 30, u64::from(offset));
+    true
+}
+
+/// Load the frame word at `sp + offset` into `X(register)`, at any offset.
+fn emit_frame_ldr_x(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
+    if emit_far_frame_offset(ops, offset) {
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), [sp, x30]);
     } else {
-        emit_sp_address_x9(ops, offset);
-        dynasm!(ops ; .arch aarch64 ; ldr X(register), [x9]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), [sp, offset]);
     }
 }
 
-fn emit_sp_str_x(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
-    if offset <= 32_760 && offset.is_multiple_of(8) {
-        dynasm!(ops ; .arch aarch64 ; str X(register), [sp, offset]);
+/// Store `X(register)` to the frame word at `sp + offset`, at any offset.
+fn emit_frame_str_x(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
+    if emit_far_frame_offset(ops, offset) {
+        dynasm!(ops ; .arch aarch64 ; str X(register), [sp, x30]);
     } else {
-        emit_sp_address_x9(ops, offset);
-        dynasm!(ops ; .arch aarch64 ; str X(register), [x9]);
+        dynasm!(ops ; .arch aarch64 ; str X(register), [sp, offset]);
+    }
+}
+
+/// Load the frame double at `sp + offset` into `D(register)`, at any offset.
+fn emit_frame_ldr_d(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
+    if emit_far_frame_offset(ops, offset) {
+        dynasm!(ops ; .arch aarch64 ; ldr D(register), [sp, x30]);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; ldr D(register), [sp, offset]);
+    }
+}
+
+/// Store `D(register)` to the frame double at `sp + offset`, at any offset.
+fn emit_frame_str_d(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset: u32) {
+    if emit_far_frame_offset(ops, offset) {
+        dynasm!(ops ; .arch aarch64 ; str D(register), [sp, x30]);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; str D(register), [sp, offset]);
     }
 }
 

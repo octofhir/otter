@@ -194,11 +194,17 @@ pub(super) fn emit_binary_arith(
     );
     match kind {
         ArithKind::Sub => dynasm!(ops ; .arch aarch64 ; subs w13, w9, w10 ; b.vs =>float_path),
+        // The product is formed in 64 bits for the overflow test. The int32 box
+        // takes its payload from the low word with a clear upper half, so the
+        // accepted product is narrowed with a 32-bit write: a sign-extended
+        // negative product would otherwise leave bit 48 set, a non-canonical
+        // box that exact int32 tag tests reject.
         ArithKind::Mul => dynasm!(ops
             ; .arch aarch64
             ; smull x13, w9, w10
             ; cmp x13, w13, sxtw
             ; b.ne =>float_path
+            ; mov w13, w13
         ),
         _ => unreachable!("Div/Rem returned above"),
     }

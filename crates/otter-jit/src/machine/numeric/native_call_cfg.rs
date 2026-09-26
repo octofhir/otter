@@ -653,19 +653,13 @@ pub(super) fn select_block(
             jump(instructions);
             result.predecessors = vec![selected_blocks.hit, selected_blocks.cold];
             result.parameters = vec![machine_value(values, node)];
-            for (edge, &successor) in hir.blocks[block_index].successors.iter().enumerate() {
-                result.successors.push(
-                    cfg.split_edges
-                        .get(&(block_index, edge))
-                        .copied()
-                        .unwrap_or(cfg.originals[successor]),
-                );
-                result.successor_arguments.push(
-                    hir.blocks[block_index].successor_arguments[edge]
-                        .iter()
-                        .map(|&value| machine_value(values, value))
-                        .collect(),
-                );
+            for edge in 0..hir.blocks[block_index].successors.len() {
+                result
+                    .successors
+                    .push(cfg.edge_target(hir, block_index, edge));
+                result
+                    .successor_arguments
+                    .push(cfg.edge_arguments(hir, block_index, edge, values));
             }
         }
         _ => {

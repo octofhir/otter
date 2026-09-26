@@ -1,7 +1,10 @@
 //! Effect-aware loop-invariant code motion over Machine SSA.
 //!
 //! # Contents
-//! - Natural-loop discovery from CFG dominance.
+//! - Natural-loop discovery from the shared dominator tree
+//!   (`super::dominance`).
+//! - One analysis per innermost loop: splitting a loop appends its body block
+//!   and leaves every other innermost loop's invariants unchanged.
 //! - Conservative invariant selection through the shared effect table.
 //! - Explicit preheader splitting shared by ordinary and OSR entry.
 //!
@@ -13,6 +16,8 @@
 //!   preheader; generated backedges target its split body.
 //! - The header's OSR entry leads the preheader, so it is not a loop boundary:
 //!   an OSR entry performs every hoisted read after its own frame mapping.
+//! - Safepoint ids are renumbered in the new instruction order after every
+//!   split, because the split body block is appended after all others.
 //! - The transform owns no raw-pointer cache or alternate semantic lowering.
 //!
 //! # See also
@@ -24,7 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     ControlFlow, InstructionSequence, MachineBlock, MachineBlockData, MachineCommoning,
     MachineInstruction, MachineInstructionId, MachineOpcode, MachineValue, OperandPurpose,
-    OperandRole, TargetSpec, VerificationError, effects::effects_for_instruction,
+    OperandRole, TargetSpec, VerificationError, dominance::Dominance,
+    effects::effects_for_instruction,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,8 +50,15 @@ pub(super) fn optimize(
     target: &TargetSpec,
 ) -> Result<(InstructionSequence, LicmStats), VerificationError> {
     let mut stats = LicmStats::default();
-    while let Some((natural_loop, candidates)) = next_loop(&sequence) {
+    // Headers whose loop is already analyzed. Innermost loops are disjoint,
+    // so splitting one loop never changes another loop's invariants; block
+    // indices are stable because a split only appends the new body block.
+    let mut settled = vec![false; sequence.blocks.len()];
+    while let Some((natural_loop, candidates)) = next_loop(&sequence, &mut settled) {
+        let body = sequence.blocks.len();
         split_preheader_and_hoist(&mut sequence, &natural_loop, &candidates);
+        settled.resize(sequence.blocks.len(), false);
+        settled[body] = true;
         stats.hoisted_instructions = stats
             .hoisted_instructions
             .saturating_add(candidates.len() as u32);
@@ -56,9 +69,79 @@ pub(super) fn optimize(
     Ok((sequence, stats))
 }
 
-fn next_loop(sequence: &InstructionSequence) -> Option<(NaturalLoop, BTreeSet<usize>)> {
-    let definitions = value_definition_blocks(sequence);
+/// Function-wide value facts shared by every loop analyzed against one CFG.
+struct ValueFacts {
+    definitions: Vec<Option<usize>>,
+    /// Values passed along a CFG edge.
+    edge_values: Vec<bool>,
+    /// Values read by a non-input operand or by deopt reconstruction.
+    reconstruction_values: Vec<bool>,
+}
+
+impl ValueFacts {
+    fn compute(sequence: &InstructionSequence) -> Self {
+        let count = sequence.representations.len();
+        let mut edge_values = vec![false; count];
+        for value in sequence
+            .blocks
+            .iter()
+            .flat_map(|block| block.successor_arguments.iter().flatten())
+        {
+            edge_values[value.0 as usize] = true;
+        }
+        let mut reconstruction_values = vec![false; count];
+        let frame_values = sequence.frame_states.iter().flat_map(|state| {
+            state
+                .frames
+                .iter()
+                .flat_map(|frame| {
+                    frame
+                        .entry
+                        .iter()
+                        .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
+                        .chain(frame.slots.iter())
+                })
+                .chain(
+                    state
+                        .virtual_objects
+                        .iter()
+                        .flat_map(|object| object.fields.iter()),
+                )
+        });
+        for value in sequence
+            .instructions
+            .iter()
+            .flat_map(|instruction| instruction.operands.iter())
+            .filter(|operand| {
+                operand.role == OperandRole::Use && operand.purpose != OperandPurpose::Input
+            })
+            .map(|operand| operand.value)
+            .chain(frame_values.filter_map(|slot| match slot {
+                super::MachineFrameSlot::Value(value) => Some(*value),
+                super::MachineFrameSlot::TaggedLiteral(_)
+                | super::MachineFrameSlot::VirtualObject(_) => None,
+            }))
+        {
+            reconstruction_values[value.0 as usize] = true;
+        }
+        Self {
+            definitions: value_definition_blocks(sequence),
+            edge_values,
+            reconstruction_values,
+        }
+    }
+}
+
+fn next_loop(
+    sequence: &InstructionSequence,
+    settled: &mut [bool],
+) -> Option<(NaturalLoop, BTreeSet<usize>)> {
+    let mut facts = None;
     for natural_loop in innermost_natural_loops(sequence) {
+        if settled[natural_loop.header] {
+            continue;
+        }
+        settled[natural_loop.header] = true;
         if natural_loop.header == sequence.entry.0 as usize
             || !sequence.blocks[natural_loop.header]
                 .predecessors
@@ -67,7 +150,8 @@ fn next_loop(sequence: &InstructionSequence) -> Option<(NaturalLoop, BTreeSet<us
         {
             continue;
         }
-        let candidates = invariant_instructions(sequence, &natural_loop, &definitions);
+        let facts = facts.get_or_insert_with(|| ValueFacts::compute(sequence));
+        let candidates = invariant_instructions(sequence, &natural_loop, facts);
         if !candidates.is_empty() {
             return Some((natural_loop, candidates));
         }
@@ -78,55 +162,26 @@ fn next_loop(sequence: &InstructionSequence) -> Option<(NaturalLoop, BTreeSet<us
 fn invariant_instructions(
     sequence: &InstructionSequence,
     natural_loop: &NaturalLoop,
-    definitions: &[Option<usize>],
+    facts: &ValueFacts,
 ) -> BTreeSet<usize> {
-    let edge_values = sequence
-        .blocks
-        .iter()
-        .flat_map(|block| block.successor_arguments.iter().flatten().copied())
-        .collect::<BTreeSet<_>>();
-    let mut use_blocks = vec![BTreeSet::new(); sequence.representations.len()];
+    let definitions = &facts.definitions;
+    let mut in_loop = vec![false; sequence.blocks.len()];
+    for &block in &natural_loop.blocks {
+        in_loop[block] = true;
+    }
+    let mut used_outside = vec![false; sequence.representations.len()];
     for (block_index, block) in sequence.blocks.iter().enumerate() {
+        if in_loop[block_index] {
+            continue;
+        }
         for index in block.first.0 as usize..block.end.0 as usize {
             for operand in &sequence.instructions[index].operands {
                 if operand.role == OperandRole::Use {
-                    use_blocks[operand.value.0 as usize].insert(block_index);
+                    used_outside[operand.value.0 as usize] = true;
                 }
             }
         }
     }
-    let reconstruction_values = sequence
-        .instructions
-        .iter()
-        .flat_map(|instruction| instruction.operands.iter())
-        .filter(|operand| {
-            operand.role == OperandRole::Use && operand.purpose != OperandPurpose::Input
-        })
-        .map(|operand| operand.value)
-        .chain(sequence.frame_states.iter().flat_map(|state| {
-            state.frames.iter().flat_map(|frame| {
-                frame
-                    .entry
-                    .iter()
-                    .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
-                    .chain(frame.slots.iter())
-                    .filter_map(|slot| match slot {
-                        super::MachineFrameSlot::Value(value) => Some(*value),
-                        super::MachineFrameSlot::TaggedLiteral(_)
-                        | super::MachineFrameSlot::VirtualObject(_) => None,
-                    })
-            })
-        }))
-        .chain(sequence.frame_states.iter().flat_map(|state| {
-            state.virtual_objects.iter().flat_map(|object| {
-                object.fields.iter().filter_map(|slot| match slot {
-                    super::MachineFrameSlot::Value(value) => Some(*value),
-                    super::MachineFrameSlot::TaggedLiteral(_)
-                    | super::MachineFrameSlot::VirtualObject(_) => None,
-                })
-            })
-        }))
-        .collect::<BTreeSet<_>>();
     let mut writes = super::MachineAliasSet::NONE;
     let mut invalidating_boundary = false;
     for &block in &natural_loop.blocks {
@@ -156,25 +211,20 @@ fn invariant_instructions(
     }
     let mut invariant_values = definitions
         .iter()
-        .enumerate()
-        .filter_map(|(value, block)| {
-            block
-                .is_some_and(|block| !natural_loop.blocks.contains(&block))
-                .then_some(MachineValue(value as u32))
-        })
-        .collect::<BTreeSet<_>>();
-    let loop_parameters = natural_loop
-        .blocks
-        .iter()
-        .flat_map(|&block| sequence.blocks[block].parameters.iter().copied())
-        .collect::<BTreeSet<_>>();
+        .map(|block| block.is_some_and(|block| !in_loop[block]))
+        .collect::<Vec<_>>();
     let invariant_header_parameters =
         invariant_header_parameters(sequence, natural_loop, definitions);
-    invariant_values.extend(invariant_header_parameters.iter().copied());
-    let variant_loop_parameters = loop_parameters
-        .difference(&invariant_header_parameters)
-        .copied()
-        .collect::<BTreeSet<_>>();
+    for parameter in &invariant_header_parameters {
+        invariant_values[parameter.0 as usize] = true;
+    }
+    let mut variant_loop_parameters = vec![false; sequence.representations.len()];
+    for &block in &natural_loop.blocks {
+        for parameter in &sequence.blocks[block].parameters {
+            variant_loop_parameters[parameter.0 as usize] =
+                !invariant_header_parameters.contains(parameter);
+        }
+    }
     let mut candidates = BTreeSet::new();
     loop {
         let mut changed = false;
@@ -205,8 +255,8 @@ fn invariant_instructions(
                 if !instruction.operands.iter().all(|operand| {
                     operand.role != OperandRole::Use
                         || operand.purpose != OperandPurpose::Input
-                        || (invariant_values.contains(&operand.value)
-                            && !variant_loop_parameters.contains(&operand.value))
+                        || (invariant_values[operand.value.0 as usize]
+                            && !variant_loop_parameters[operand.value.0 as usize])
                 }) {
                     continue;
                 }
@@ -223,14 +273,9 @@ fn invariant_instructions(
                     continue;
                 }
                 if outputs.iter().any(|output| {
-                    edge_values.contains(output) || reconstruction_values.contains(output)
-                }) {
-                    continue;
-                }
-                if outputs.iter().any(|output| {
-                    use_blocks[output.0 as usize]
-                        .iter()
-                        .any(|block| !natural_loop.blocks.contains(block))
+                    facts.edge_values[output.0 as usize]
+                        || facts.reconstruction_values[output.0 as usize]
+                        || used_outside[output.0 as usize]
                 }) {
                     continue;
                 }
@@ -246,7 +291,9 @@ fn invariant_instructions(
                     continue;
                 }
                 candidates.insert(index);
-                invariant_values.extend(outputs);
+                for output in outputs {
+                    invariant_values[output.0 as usize] = true;
+                }
                 changed = true;
             }
         }
@@ -469,6 +516,8 @@ fn rebuild_instruction_ranges(
         sequence.instructions.append(instructions);
         block.end = MachineInstructionId(sequence.instructions.len() as u32);
     }
+    // The split body now follows every other block in the array.
+    super::renumber_safepoints(&mut sequence.instructions);
 }
 
 fn value_definition_blocks(sequence: &InstructionSequence) -> Vec<Option<usize>> {
@@ -491,12 +540,17 @@ fn value_definition_blocks(sequence: &InstructionSequence) -> Vec<Option<usize>>
 }
 
 fn innermost_natural_loops(sequence: &InstructionSequence) -> Vec<NaturalLoop> {
-    let dominators = dominators(sequence);
+    let dominance = Dominance::compute(sequence.blocks.len(), sequence.entry.0 as usize, |block| {
+        sequence.blocks[block]
+            .successors
+            .iter()
+            .map(|successor| successor.0 as usize)
+    });
     let mut by_header = BTreeMap::<usize, BTreeSet<usize>>::new();
     for (latch, block) in sequence.blocks.iter().enumerate() {
         for successor in &block.successors {
             let header = successor.0 as usize;
-            if !dominators[latch].contains(&header) {
+            if !dominance.dominates(header, latch) {
                 continue;
             }
             let loop_blocks = by_header
@@ -520,54 +574,20 @@ fn innermost_natural_loops(sequence: &InstructionSequence) -> Vec<NaturalLoop> {
         .into_iter()
         .map(|(header, blocks)| NaturalLoop { header, blocks })
         .collect::<Vec<_>>();
-    let mut innermost = loops
+    // A loop nested in `candidate` has its header inside `candidate`, so only
+    // those loops need the subset test.
+    loops
         .iter()
         .filter(|candidate| {
             !loops.iter().any(|other| {
                 other.header != candidate.header
+                    && candidate.blocks.contains(&other.header)
                     && other.blocks.len() < candidate.blocks.len()
                     && other.blocks.is_subset(&candidate.blocks)
             })
         })
         .cloned()
-        .collect::<Vec<_>>();
-    innermost.sort_by_key(|natural_loop| natural_loop.header);
-    innermost
-}
-
-fn dominators(sequence: &InstructionSequence) -> Vec<BTreeSet<usize>> {
-    let block_count = sequence.blocks.len();
-    let entry = sequence.entry.0 as usize;
-    let universe = (0..block_count).collect::<BTreeSet<_>>();
-    let mut result = vec![universe.clone(); block_count];
-    result[entry] = BTreeSet::from([entry]);
-    loop {
-        let mut changed = false;
-        for block in 0..block_count {
-            if block == entry {
-                continue;
-            }
-            let mut predecessors = sequence.blocks[block].predecessors.iter();
-            let mut next = predecessors
-                .next()
-                .map(|predecessor| result[predecessor.0 as usize].clone())
-                .unwrap_or_default();
-            for predecessor in predecessors {
-                next = next
-                    .intersection(&result[predecessor.0 as usize])
-                    .copied()
-                    .collect();
-            }
-            next.insert(block);
-            if next != result[block] {
-                result[block] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            return result;
-        }
-    }
+        .collect()
 }
 
 #[cfg(test)]

@@ -26,6 +26,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use otter_vm::deopt::{VirtualObject, VirtualObjectId, VirtualObjectKind};
 
+use crate::machine::dominance::Dominance;
+
 use super::hir::{
     NumericDirectCallArguments, NumericFrameSlot, NumericFunction, NumericNode, NumericTerminator,
     NumericType, NumericValue,
@@ -309,9 +311,9 @@ fn region_is_virtualizable(
     let Some((block_index, allocation_position)) = node_position(function, candidate.value) else {
         return false;
     };
-    let Some(dominators) = numeric_dominators(&function.blocks) else {
-        return false;
-    };
+    let dominance = Dominance::compute(function.blocks.len(), 0, |block| {
+        function.blocks[block].successors.iter().copied()
+    });
     let mut endpoint_positions = BTreeMap::new();
     for value in loads
         .iter()
@@ -321,7 +323,7 @@ fn region_is_virtualizable(
         let Some((use_block, position)) = node_position(function, value) else {
             return false;
         };
-        if !dominators[use_block].contains(&block_index)
+        if !dominance.dominates(block_index, use_block)
             || (use_block == block_index && position < allocation_position)
         {
             return false;
@@ -351,7 +353,7 @@ fn region_is_virtualizable(
         let Some((state_block, position)) = node_position(function, point) else {
             return false;
         };
-        if !dominators[state_block].contains(&block_index)
+        if !dominance.dominates(block_index, state_block)
             || (state_block == block_index && position < allocation_position)
         {
             return false;
@@ -378,7 +380,7 @@ fn region_is_virtualizable(
             continue;
         }
         for &predecessor in &function.blocks[active].predecessors {
-            if dominators[predecessor].contains(&block_index) && active_blocks.insert(predecessor) {
+            if dominance.dominates(block_index, predecessor) && active_blocks.insert(predecessor) {
                 pending.push(predecessor);
             }
         }
@@ -400,36 +402,6 @@ fn region_is_virtualizable(
                     != Some(super::frame_state::NumericFrameStatePurpose::TaggedRoots)
         })
     })
-}
-
-fn numeric_dominators(blocks: &[super::hir::NumericBlock]) -> Option<Vec<BTreeSet<usize>>> {
-    if blocks.is_empty() {
-        return None;
-    }
-    let all = (0..blocks.len()).collect::<BTreeSet<_>>();
-    let mut dominators = vec![all; blocks.len()];
-    dominators[0] = BTreeSet::from([0]);
-    loop {
-        let mut changed = false;
-        for block_index in 1..blocks.len() {
-            let block = blocks.get(block_index)?;
-            let mut next = block
-                .predecessors
-                .iter()
-                .map(|&predecessor| dominators.get(predecessor).cloned())
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .reduce(|left, right| left.intersection(&right).copied().collect())?;
-            next.insert(block_index);
-            if next != dominators[block_index] {
-                dominators[block_index] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            return Some(dominators);
-        }
-    }
 }
 
 fn node_position(function: &NumericFunction, value: NumericValue) -> Option<(usize, usize)> {

@@ -1,9 +1,11 @@
 //! Effect-aware global value numbering for verified Machine SSA.
 //!
 //! # Contents
-//! - Iterative dominator computation over the complete normal/exception CFG.
-//! - Dominator-scoped value/proof tables keyed by canonical operands,
-//!   representation, dependency epoch, alias class, and memory version.
+//! - A walk of the shared dominator tree (`super::dominance`) over the
+//!   complete normal/exception CFG.
+//! - A scoped available-expression table keyed by canonical operands,
+//!   representation, dependency epoch, alias class, and memory version, with
+//!   a fingerprint index so each lookup is constant time.
 //! - Dense instruction/root/exit repair after redundant nodes are removed.
 //!
 //! # Invariants
@@ -22,12 +24,15 @@
 //! - `super::effects` is the sole opcode/effect classification table.
 
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
+
+use rustc_hash::{FxHashMap, FxHasher};
 
 use super::{
     ControlFlow, DeoptId, InstructionSequence, MachineAliasClass, MachineCommoning, MachineEffects,
     MachineFrameSlot, MachineInstruction, MachineInstructionId, MachineOpcode,
     MachineRepresentation, MachineValue, OperandPurpose, OperandRole, TargetSpec,
-    VerificationError, effects::effects_for_instruction,
+    VerificationError, dominance::Dominance, effects::effects_for_instruction,
 };
 
 const ALIASES: [MachineAliasClass; MachineAliasClass::COUNT] = [
@@ -68,9 +73,10 @@ struct AvailableExpression {
     outputs: Vec<MachineValue>,
 }
 
-#[derive(Clone)]
+/// Dependency epoch and per-alias memory versions in effect at one program
+/// point. Every expression key embeds the parts it depends on.
+#[derive(Clone, Copy)]
 struct ScopeState {
-    available: Vec<AvailableExpression>,
     dependency_epoch: u64,
     memory_versions: [u64; MachineAliasClass::COUNT],
 }
@@ -78,15 +84,16 @@ struct ScopeState {
 impl ScopeState {
     fn entry() -> Self {
         Self {
-            available: Vec::new(),
             dependency_epoch: 0,
             memory_versions: [0; MachineAliasClass::COUNT],
         }
     }
 
+    /// Starts the unique epoch of merge block `block`. No key recorded under
+    /// another epoch can equal a key formed after this point, so dominating
+    /// entries stay in the table but can no longer be matched.
     fn fresh_merge(&mut self, block: usize) {
         let epoch = ((block as u64) + 1) << 32;
-        self.available.clear();
         self.dependency_epoch = epoch;
         self.memory_versions.fill(epoch);
     }
@@ -115,50 +122,120 @@ impl ScopeState {
     }
 }
 
+/// Expressions available along the current dominator-tree path.
+///
+/// A stack of entries plus a fingerprint index: entering a block pushes, and
+/// leaving its subtree truncates back to the length saved on entry, so every
+/// visible entry was produced by a dominating instruction.
+#[derive(Default)]
+struct AvailableTable {
+    entries: Vec<(u64, AvailableExpression)>,
+    index: FxHashMap<u64, Vec<usize>>,
+}
+
+impl AvailableTable {
+    fn fingerprint(key: &ExpressionKey) -> u64 {
+        let mut hasher = FxHasher::default();
+        std::mem::discriminant(&key.opcode).hash(&mut hasher);
+        for input in &key.inputs {
+            input.0.hash(&mut hasher);
+        }
+        key.dependency_epoch.hash(&mut hasher);
+        for (alias, version) in &key.memory_versions {
+            (*alias as usize).hash(&mut hasher);
+            version.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Most recently recorded dominating entry equal to `key`.
+    fn find(&self, key: &ExpressionKey) -> Option<&AvailableExpression> {
+        self.index
+            .get(&Self::fingerprint(key))?
+            .iter()
+            .rev()
+            .map(|&entry| &self.entries[entry].1)
+            .find(|available| available.key == *key)
+    }
+
+    fn push(&mut self, expression: AvailableExpression) {
+        let fingerprint = Self::fingerprint(&expression.key);
+        self.index
+            .entry(fingerprint)
+            .or_default()
+            .push(self.entries.len());
+        self.entries.push((fingerprint, expression));
+    }
+
+    fn truncate(&mut self, len: usize) {
+        while self.entries.len() > len {
+            let (fingerprint, _) = self.entries.pop().expect("length checked");
+            if let Some(bucket) = self.index.get_mut(&fingerprint) {
+                bucket.pop();
+            }
+        }
+    }
+}
+
+enum Visit {
+    Enter(usize, ScopeState),
+    Leave(usize),
+}
+
 pub(super) fn optimize(
     mut sequence: InstructionSequence,
     target: &TargetSpec,
 ) -> Result<(InstructionSequence, MachineOptimizationStats), VerificationError> {
-    let (dominator_children, reachable) = dominator_tree(&sequence);
-    let edge_values = sequence
+    let dominance = Dominance::compute(sequence.blocks.len(), sequence.entry.0 as usize, |block| {
+        sequence.blocks[block]
+            .successors
+            .iter()
+            .map(|successor| successor.0 as usize)
+    });
+    let mut edge_values = vec![false; sequence.representations.len()];
+    for value in sequence
         .blocks
         .iter()
-        .flat_map(|block| block.successor_arguments.iter().flatten().copied())
-        .collect::<BTreeSet<_>>();
+        .flat_map(|block| block.successor_arguments.iter().flatten())
+    {
+        edge_values[value.0 as usize] = true;
+    }
     let mut replacements = (0..sequence.representations.len())
         .map(|value| MachineValue(value as u32))
         .collect::<Vec<_>>();
     let mut eliminated = vec![false; sequence.instructions.len()];
     let mut stats = MachineOptimizationStats::default();
     let mut visited = vec![false; sequence.blocks.len()];
+    let mut available = AvailableTable::default();
 
     let mut roots = vec![sequence.entry.0 as usize];
-    roots.extend(
-        reachable
-            .iter()
-            .enumerate()
-            .filter_map(|(block, &is_reachable)| (!is_reachable).then_some(block)),
-    );
+    roots.extend((0..sequence.blocks.len()).filter(|&block| !dominance.is_reachable(block)));
     for root in roots {
         if visited[root] {
             continue;
         }
-        let mut stack = vec![(root, ScopeState::entry())];
-        while let Some((block_index, mut state)) = stack.pop() {
+        let mut stack = vec![Visit::Enter(root, ScopeState::entry())];
+        while let Some(visit) = stack.pop() {
+            let (block_index, mut state) = match visit {
+                Visit::Enter(block, state) => (block, state),
+                Visit::Leave(len) => {
+                    available.truncate(len);
+                    continue;
+                }
+            };
             if visited[block_index] {
                 continue;
             }
             visited[block_index] = true;
-            let block = sequence.blocks[block_index].clone();
+            stack.push(Visit::Leave(available.entries.len()));
+            let block = &sequence.blocks[block_index];
+            let (first, end) = (block.first.0 as usize, block.end.0 as usize);
             if block_index != sequence.entry.0 as usize && block.predecessors.len() != 1 {
                 state.fresh_merge(block_index);
             }
 
-            for (instruction_index, eliminated_slot) in eliminated
-                .iter_mut()
-                .enumerate()
-                .take(block.end.0 as usize)
-                .skip(block.first.0 as usize)
+            for (instruction_index, eliminated_slot) in
+                eliminated.iter_mut().enumerate().take(end).skip(first)
             {
                 let instruction = &mut sequence.instructions[instruction_index];
                 rewrite_uses(instruction, &replacements);
@@ -173,17 +250,13 @@ pub(super) fn optimize(
                     })
                     .map(|operand| operand.value)
                     .collect::<Vec<_>>();
-                let candidate = (!outputs.iter().any(|output| edge_values.contains(output)))
+                let candidate = (!outputs.iter().any(|output| edge_values[output.0 as usize]))
                     .then(|| {
                         expression_key(instruction, &sequence.representations, effects, &state)
                     })
                     .flatten();
                 if let Some(key) = candidate {
-                    if let Some(leader) = state
-                        .available
-                        .iter()
-                        .rev()
-                        .find(|available| available.key == key)
+                    if let Some(leader) = available.find(&key)
                         && leader.outputs.len() == outputs.len()
                     {
                         for (&output, &leader_output) in outputs.iter().zip(&leader.outputs) {
@@ -200,13 +273,13 @@ pub(super) fn optimize(
                         }
                         continue;
                     }
-                    state.available.push(AvailableExpression { key, outputs });
+                    available.push(AvailableExpression { key, outputs });
                 }
                 state.apply_effects(effects);
             }
 
-            for &child in dominator_children[block_index].iter().rev() {
-                stack.push((child, state.clone()));
+            for &child in dominance.children(block_index).iter().rev() {
+                stack.push(Visit::Enter(child, state));
             }
         }
     }
@@ -385,12 +458,25 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
     }
 }
 
+/// Redirect every use to its representative value.
+///
+/// Frame-state and tagged-root operands are sets of values an exit or a
+/// safepoint keeps alive, not positional arguments: once two members resolve
+/// to the same representative, the duplicate is dropped so the set stays
+/// exact.
 fn rewrite_uses(instruction: &mut MachineInstruction, replacements: &[MachineValue]) {
     for operand in &mut instruction.operands {
         if operand.role == OperandRole::Use {
             operand.value = resolve(replacements, operand.value);
         }
     }
+    let mut seen = BTreeSet::new();
+    instruction.operands.retain(|operand| {
+        !matches!(
+            operand.purpose,
+            OperandPurpose::FrameState | OperandPurpose::TaggedRoot
+        ) || seen.insert((operand.purpose == OperandPurpose::TaggedRoot, operand.value))
+    });
 }
 
 fn resolve(replacements: &[MachineValue], mut value: MachineValue) -> MachineValue {
@@ -475,92 +561,6 @@ fn rebuild(sequence: &mut InstructionSequence, eliminated: &[bool], replacements
     }
     sequence.instructions = instructions;
     sequence.complete_gc_root_liveness();
-}
-
-fn dominator_tree(sequence: &InstructionSequence) -> (Vec<Vec<usize>>, Vec<bool>) {
-    let block_count = sequence.blocks.len();
-    let entry = sequence.entry.0 as usize;
-    let mut reachable = vec![false; block_count];
-    let mut stack = vec![entry];
-    while let Some(block) = stack.pop() {
-        if reachable[block] {
-            continue;
-        }
-        reachable[block] = true;
-        stack.extend(
-            sequence.blocks[block]
-                .successors
-                .iter()
-                .map(|successor| successor.0 as usize),
-        );
-    }
-
-    let universe = reachable
-        .iter()
-        .enumerate()
-        .filter_map(|(block, &is_reachable)| is_reachable.then_some(block))
-        .collect::<BTreeSet<_>>();
-    let mut dominators = vec![BTreeSet::new(); block_count];
-    for block in 0..block_count {
-        if !reachable[block] {
-            continue;
-        }
-        dominators[block] = if block == entry {
-            BTreeSet::from([entry])
-        } else {
-            universe.clone()
-        };
-    }
-
-    loop {
-        let mut changed = false;
-        for block in 0..block_count {
-            if !reachable[block] || block == entry {
-                continue;
-            }
-            let mut predecessors = sequence.blocks[block]
-                .predecessors
-                .iter()
-                .map(|predecessor| predecessor.0 as usize)
-                .filter(|&predecessor| reachable[predecessor]);
-            let mut next = predecessors
-                .next()
-                .map(|predecessor| dominators[predecessor].clone())
-                .unwrap_or_default();
-            for predecessor in predecessors {
-                next = next
-                    .intersection(&dominators[predecessor])
-                    .copied()
-                    .collect();
-            }
-            next.insert(block);
-            if next != dominators[block] {
-                dominators[block] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let mut children = vec![Vec::new(); block_count];
-    for block in 0..block_count {
-        if !reachable[block] || block == entry {
-            continue;
-        }
-        let idom = dominators[block]
-            .iter()
-            .copied()
-            .filter(|&dominator| dominator != block)
-            .max_by_key(|&dominator| dominators[dominator].len())
-            .expect("every reachable non-entry block has an immediate dominator");
-        children[idom].push(block);
-    }
-    for successors in &mut children {
-        successors.sort_unstable();
-    }
-    (children, reachable)
 }
 
 #[cfg(test)]

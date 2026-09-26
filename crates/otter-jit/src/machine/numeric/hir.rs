@@ -967,7 +967,7 @@ impl NumericFunction {
 
         for (block_index, raw) in raw_blocks.iter().enumerate() {
             let merged = if block_index == 0 {
-                Some((entry.clone(), Vec::new(), Vec::new()))
+                Ok((entry.clone(), Vec::new(), Vec::new()))
             } else if raw
                 .predecessors
                 .iter()
@@ -1003,9 +1003,12 @@ impl NumericFunction {
                     &mut requires_mixed_join,
                 )
             };
-            let Some((mut registers, mut parameters, mut parameter_regs)) = merged else {
-                note_structural(decline, "predecessor state merge");
-                return None;
+            let (mut registers, mut parameters, mut parameter_regs) = match merged {
+                Ok(merged) => merged,
+                Err(constraint) => {
+                    note_structural(decline, constraint);
+                    return None;
+                }
             };
             if raw
                 .predecessors
@@ -2106,6 +2109,10 @@ fn target_block(
         .and_then(|target| by_pc.get(&target).copied())
 }
 
+/// Register states entering a block, its block parameters, and the register
+/// each parameter carries.
+type MergedEntryState = (Vec<RegisterState>, Vec<NumericValue>, Vec<u16>);
+
 fn merge_predecessors(
     predecessors: &[usize],
     successor: usize,
@@ -2116,7 +2123,9 @@ fn merge_predecessors(
     nodes: &mut Vec<NumericNode>,
     phi_types: &PhiTypeOverrides,
     requires_mixed_join: &mut bool,
-) -> Option<(Vec<RegisterState>, Vec<NumericValue>, Vec<u16>)> {
+) -> Result<MergedEntryState, &'static str> {
+    const MISSING_EDGE: &str = "predecessor state merge: missing edge state";
+    const MALFORMED: &str = "predecessor state merge: malformed value";
     let state = |predecessor: usize| {
         let edge = blocks
             .get(predecessor)?
@@ -2131,7 +2140,13 @@ fn merge_predecessors(
             exceptional_out_states,
         )
     };
-    let first = state(*predecessors.first()?)?.to_vec();
+    let first = state(
+        *predecessors
+            .first()
+            .ok_or("predecessor state merge: no forward predecessor")?,
+    )
+    .ok_or(MISSING_EDGE)?
+    .to_vec();
     let mut merged = first.clone();
     let mut parameters = Vec::new();
     let mut parameter_registers = Vec::new();
@@ -2143,33 +2158,33 @@ fn merge_predecessors(
         let states = predecessors
             .iter()
             .map(|&predecessor| state(predecessor)?.get(register).copied())
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()
+            .ok_or(MISSING_EDGE)?;
         if states.iter().all(|&state| state == states[0]) {
             continue;
         }
         let mut merged_type = None;
         for state in states {
             let RegisterState::Value(value) = state else {
-                return None;
+                return Err("predecessor state merge: live register unset on one path");
             };
-            let current = nodes.get(value.0)?.value_type();
+            let current = nodes.get(value.0).ok_or(MALFORMED)?.value_type();
             merged_type = Some(match merged_type {
                 Some(previous) if previous != current => {
                     *requires_mixed_join = true;
-                    join_representation_types(previous, current)?
+                    join_representation_types(previous, current)
+                        .ok_or("predecessor state merge: incompatible representations")?
                 }
                 Some(previous) => previous,
                 None => current,
             });
         }
-        let mut merged_type = merged_type?;
-        if let Some(requested) = phi_types
-            .get(&(successor, u16::try_from(register).ok()?))
-            .copied()
-        {
-            let widened = join_representation_types(merged_type, requested)?;
-            if widened != requested {
-                return None;
+        let mut merged_type = merged_type.ok_or(MALFORMED)?;
+        let register_index = u16::try_from(register).map_err(|_| MALFORMED)?;
+        if let Some(requested) = phi_types.get(&(successor, register_index)).copied() {
+            let widened = join_representation_types(merged_type, requested);
+            if widened != Some(requested) {
+                return Err("predecessor state merge: phi type override narrower than join");
             }
             *requires_mixed_join |= requested != merged_type;
             merged_type = requested;
@@ -2177,9 +2192,9 @@ fn merge_predecessors(
         let parameter = push(nodes, NumericNode::BlockParameter(merged_type));
         *merged_state = RegisterState::Value(parameter);
         parameters.push(parameter);
-        parameter_registers.push(u16::try_from(register).ok()?);
+        parameter_registers.push(register_index);
     }
-    Some((merged, parameters, parameter_registers))
+    Ok((merged, parameters, parameter_registers))
 }
 
 fn edge_state<'a>(

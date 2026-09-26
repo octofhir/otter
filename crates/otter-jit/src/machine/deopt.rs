@@ -261,13 +261,9 @@ fn lower_slot(
         }
     };
     let location = allocation
-        .metadata()
+        .metadata_for(instruction)
         .iter()
-        .find(|metadata| {
-            metadata.instruction == instruction
-                && metadata.frame_state == Some(frame_state)
-                && metadata.value == value
-        })
+        .find(|metadata| metadata.frame_state == Some(frame_state) && metadata.value == value)
         .map(|metadata| metadata.location)
         .ok_or(MachineDeoptError::MissingLocation(
             sequence.instructions()[instruction.0 as usize].exits[0].id,

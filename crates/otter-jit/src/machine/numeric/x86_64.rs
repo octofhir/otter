@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 mod direct_call;
 #[path = "x86_64/inline_calls.rs"]
 mod inline_calls;
+#[path = "x86_64/instanceof.rs"]
+mod instanceof;
 #[path = "x86_64/loose_equality.rs"]
 mod loose_equality;
 #[path = "x86_64/megamorphic_property.rs"]
@@ -688,6 +690,22 @@ pub(super) fn emit(
                 );
                 structural_regions.push((
                     "machineLooseEqualityProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::InstanceofProbe { byte_pc } => {
+                let start = ops.offset().0;
+                instanceof::emit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    [ireg(loc[0])?, ireg(loc[1])?],
+                    [ireg(loc[2])?, ireg(loc[3])?],
+                );
+                structural_regions.push((
+                    "machineInstanceofProbe",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

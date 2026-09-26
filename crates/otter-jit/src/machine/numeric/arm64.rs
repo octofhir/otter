@@ -92,6 +92,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod forward_call;
+mod instanceof;
 mod loose_equality;
 mod megamorphic_property;
 mod number_probe;
@@ -1741,6 +1742,28 @@ pub(super) fn emit(
                 );
                 structural_regions.push((
                     "machineLooseEqualityProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::InstanceofProbe { byte_pc } => {
+                let start = ops.offset().0;
+                instanceof::emit(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    [
+                        integer_register(locations[0])?,
+                        integer_register(locations[1])?,
+                    ],
+                    [
+                        integer_register(locations[2])?,
+                        integer_register(locations[3])?,
+                    ],
+                );
+                structural_regions.push((
+                    "machineInstanceofProbe",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

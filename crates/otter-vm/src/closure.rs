@@ -225,7 +225,7 @@ pub const CLOSURE_LOOKUP_ORDINARY: u8 = 1 << 0;
 #[must_use]
 pub(crate) fn ordinary_named_lookup_guard() -> crate::jit::JitBodyGuard {
     crate::jit::JitBodyGuard {
-        byte: otter_gc::header::HEADER_SIZE as u32 + CLOSURE_BODY_NAMED_LOOKUP_OFFSET as u32,
+        byte: CLOSURE_NAMED_LOOKUP_BYTE,
         width: crate::jit::JitGuardWidth::Byte,
         expect: u32::from(CLOSURE_LOOKUP_ORDINARY),
     }
@@ -308,6 +308,10 @@ pub const CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET: usize =
 /// Byte offset of [`JsClosureBody::named_lookup`] in the payload.
 pub const CLOSURE_BODY_NAMED_LOOKUP_OFFSET: usize =
     std::mem::offset_of!(JsClosureBody, named_lookup);
+/// Byte offset of [`JsClosureBody::named_lookup`] from the cell header, as
+/// generated code addresses it.
+pub const CLOSURE_NAMED_LOOKUP_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + CLOSURE_BODY_NAMED_LOOKUP_OFFSET) as u32;
 
 /// Byte offset of canonical constructor own_props state.
 pub const CLOSURE_BODY_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, construct)

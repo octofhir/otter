@@ -293,6 +293,14 @@ impl MachineOpcode {
             Self::TruthinessProbe
             | Self::LooseEqualityProbe { .. }
             | Self::TaggedNullishEqual { .. } => MachineEffects::read(SHAPE, Guard),
+            // Reads the target's bag slot and the value's prototype chain.
+            Self::InstanceofProbe { .. } => MachineEffects::read(
+                SHAPE
+                    .union(PROPERTY_METADATA)
+                    .union(PROPERTY_FIELD)
+                    .union(PROTOTYPE),
+                Guard,
+            ),
 
             Self::AllocateObject { .. } => {
                 MachineEffects::allocation(SHAPE.union(PROTOTYPE).union(ALLOCATION))

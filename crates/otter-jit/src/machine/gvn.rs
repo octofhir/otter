@@ -350,6 +350,7 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             stub: *stub,
         },
+        MachineOpcode::InstanceofProbe { .. } => MachineOpcode::InstanceofProbe { byte_pc: 0 },
         MachineOpcode::LooseEqualityProbe { equal, .. } => MachineOpcode::LooseEqualityProbe {
             byte_pc: 0,
             equal: *equal,

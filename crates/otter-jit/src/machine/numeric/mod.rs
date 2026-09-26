@@ -1847,6 +1847,9 @@ fn select_with_loop_entries(
                         ) => {
                             Some(super::committed_probe::ProbeKind::LooseEquality { equal: false })
                         }
+                        CommittedValueOperation::ObjectProtocol(
+                            otter_vm::native_abi::ObjectProtocolValueOp::Instanceof,
+                        ) => Some(super::committed_probe::ProbeKind::Instanceof),
                         // `%` and `**` have no inline Number form; their
                         // committed call is the whole operation.
                         CommittedValueOperation::ObjectProtocol(

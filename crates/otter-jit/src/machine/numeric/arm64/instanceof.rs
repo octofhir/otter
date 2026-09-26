@@ -1,0 +1,151 @@
+//! No-call proof for `value instanceof target` over an ordinary closure.
+//!
+//! # Contents
+//! - Target proof: an ordinary closure (plain kind, no `[[Prototype]]`
+//!   override) whose own bag carries no symbol properties, so
+//!   `@@hasInstance` resolves to the non-writable, non-configurable
+//!   `%Function.prototype%[@@hasInstance]`, i.e. OrdinaryHasInstance.
+//! - `target.prototype` read through the closure's cached bag shape and slot,
+//!   the same proof generated construction uses.
+//! - A bounded walk of an ordinary object's `[[Prototype]]` chain; primitive
+//!   values answer `false`.
+//!
+//! # Invariants
+//! - No allocation, VM transition, deopt or user code occurs inside the probe.
+//!   Proxies, opaque chain links, exotic receivers, a missing prototype proof
+//!   and chains longer than [`MAX_CHAIN`] miss into the committed operation.
+//! - Both inputs are copied into the reserved `x15`/`x16` before any scratch
+//!   register is written; outputs are written last.
+//!
+//! # See also
+//! - `machine::committed_probe` — cold call, catch edge and SSA result join.
+//! - `otter_vm::closure::CLOSURE_LOOKUP_ORDINARY` — the named-lookup byte.
+
+use super::emit_load_symbolic_u64;
+use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
+use crate::entry::OBJECT_BODY_TYPE_TAG;
+use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
+use dynasmrt::aarch64::Assembler;
+use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
+use otter_vm::{JitCompileSnapshot, Value};
+
+/// Prototype links the probe follows before handing the walk to the VM.
+pub(super) const MAX_CHAIN: u32 = 32;
+
+pub(super) fn emit(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    inputs: [u8; 2],
+    outputs: [u8; 2],
+) {
+    let [value, target] = inputs;
+    let [result, hit] = outputs;
+    let yes = ops.new_dynamic_label();
+    let no = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let walk = ops.new_dynamic_label();
+    let step = ops.new_dynamic_label();
+    // x15/x16 lie outside the allocation file, so neither input can be there.
+    dynasm!(ops ; .arch aarch64 ; mov x15, X(value) ; mov x16, X(target));
+    if view.cage_base == 0 || view.closure_call_layout.prototype_shape_byte == 0 {
+        dynasm!(ops ; .arch aarch64 ; b =>miss);
+    } else {
+        let layout = view.closure_call_layout;
+        let named_lookup = otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE;
+        emit_load_symbolic_u64(
+            ops,
+            relocations,
+            11,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
+        // Target: an ordinary closure; a bag may exist but no override.
+        emit_cell_test(ops, 16, 9, CellTest::IsNotCell, miss);
+        dynasm!(ops ; .arch aarch64
+            ; cbz x16, =>miss
+            ; mov w9, w16 ; add x16, x11, x9
+            ; ldrb w9, [x16]
+            ; cmp w9, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
+            ; b.ne =>miss
+            ; ldrb w9, [x16, named_lookup]
+            ; and w9, w9, !u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
+            ; cmp w9, u32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
+            ; b.ne =>miss
+            // `prototype` lives in the bag once observed; without a bag it is
+            // still virtual and the committed operation materializes it.
+            ; ldr w10, [x16, layout.own_props_byte]
+            ; cbz w10, =>miss
+            ; add x10, x11, x10
+            // Symbol-keyed own properties live in the exotic sidecar's table;
+            // none may exist, so the bag cannot own `@@hasInstance`.
+            ; ldr w9, [x10, view.object_exotic_handle_byte]
+            ; cbz w9, >symbols_absent
+            ; add x9, x11, x9
+            ; ldr w9, [x9, otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE]
+            ; cbnz w9, =>miss
+            ; symbols_absent:
+            ; ldr w12, [x16, layout.prototype_shape_byte]
+            ; cbz w12, =>miss
+            ; ldr w9, [x10, view.object_shape_byte]
+            ; cmp w9, w12
+            ; b.ne =>miss
+            ; ldr w12, [x16, layout.prototype_slot_byte]
+            ; ldrh w9, [x10, view.object_slab_len_byte]
+            ; cmp w12, w9
+            ; b.hs =>miss
+            ; ldr x13, [x10, view.object_values_ptr_byte]
+            ; cbz x13, =>miss
+            ; ldr x12, [x13, x12, lsl #3]
+        );
+        // The prototype must be an ordinary object; anything else throws.
+        emit_cell_test(ops, 12, 9, CellTest::IsNotCell, miss);
+        dynasm!(ops ; .arch aarch64
+            ; cbz x12, =>miss
+            ; mov w9, w12 ; add x12, x11, x9
+            ; ldrb w9, [x12]
+            ; cmp w9, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+        );
+        // Value: a non-cell answers false; a primitive cell answers false; an
+        // ordinary object is walked; every other cell misses.
+        emit_cell_test(ops, 15, 9, CellTest::IsNotCell, no);
+        dynasm!(ops ; .arch aarch64
+            ; cbz x15, =>miss
+            ; mov w9, w15 ; add x13, x11, x9
+            ; ldrb w9, [x13]
+            ; cmp w9, OBJECT_BODY_TYPE_TAG
+            ; b.eq =>walk
+        );
+        for primitive_tag in view.primitive_cell_type_tags {
+            dynasm!(ops ; .arch aarch64 ; cmp w9, u32::from(primitive_tag) ; b.eq =>no);
+        }
+        dynasm!(ops ; .arch aarch64
+            ; b =>miss
+            ; =>walk
+            ; movz w14, MAX_CHAIN
+            ; =>step
+            ; ldrb w9, [x13, view.object_chain_link_opaque_byte]
+            ; cbnz w9, =>miss
+            ; ldr w9, [x13, view.jit_proto_byte]
+            ; cbz w9, =>no
+            ; add x13, x11, x9
+            ; cmp x13, x12
+            ; b.eq =>yes
+            ; ldrb w9, [x13]
+            ; cmp w9, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; subs w14, w14, #1
+            ; b.ne =>step
+            ; b =>miss
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; =>yes);
+    emit_load_u64(ops, result, Value::boolean(true).to_bits());
+    dynasm!(ops ; .arch aarch64 ; mov W(hit), #1 ; b =>done ; =>no);
+    emit_load_u64(ops, result, Value::boolean(false).to_bits());
+    dynasm!(ops ; .arch aarch64 ; mov W(hit), #1 ; b =>done ; =>miss);
+    emit_load_u64(ops, result, Value::boolean(false).to_bits());
+    dynasm!(ops ; .arch aarch64 ; mov W(hit), wzr ; =>done);
+}

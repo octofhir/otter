@@ -1086,9 +1086,10 @@ pub enum MachineOpcode {
         target: otter_vm::jit::JitIntrinsicPrototype,
     },
     /// Prove a dictionary-mode method holder keeps one key/slot layout: its
-    /// shape is null and its dictionary structural id is unchanged. Every add,
-    /// delete or descriptor change assigns a fresh id, so the slot named at
-    /// compile time still belongs to the same key; the following builtin
+    /// shape is null and its dictionary slot-layout epoch is unchanged. Every
+    /// delete, descriptor change or re-entry into dictionary mode advances the
+    /// epoch, so the slot named at compile time still belongs to the same key
+    /// even after unrelated keys are appended; the following builtin
     /// identity guard proves that slot's live value. Opaque index/`length`
     /// state is irrelevant because only declared method names are selected.
     /// A false incoming condition keeps the result false without touching the
@@ -1096,7 +1097,7 @@ pub enum MachineOpcode {
     CacheIrGuardDictionaryLayout {
         /// Source byte offset used by artifacts.
         byte_pc: u32,
-        /// Captured dictionary structural id; never unassigned.
+        /// Captured dictionary slot-layout epoch; never zero or saturated.
         layout: u64,
     },
     /// Prove that an object's direct prototype is null under a prior CacheIR

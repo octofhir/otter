@@ -326,9 +326,10 @@ pub struct JitCompileSnapshot {
     /// emitter reads `[obj_ptr + object_shape_byte]` for CacheIR shape guards
     /// `LoadProperty` cell guard, staying layout-agnostic.
     pub object_shape_byte: u32,
-    /// Byte offset from a decompressed object pointer to its dictionary-mode
-    /// structural identity. Read only after the ordinary shape handle is null.
-    pub object_dictionary_shape_id_byte: u32,
+    /// Byte offset from a decompressed object pointer to its `u32`
+    /// dictionary slot-layout epoch. Read only after the ordinary shape handle
+    /// is null; a match keeps every existing key at its captured slot.
+    pub object_dictionary_layout_byte: u32,
     /// Byte offset from a decompressed object pointer to its cached
     /// string-keyed value slab pointer (`HEADER_SIZE +
     /// OBJECT_BODY_VALUES_PTR_OFFSET`). The emitter reads this pointer after a
@@ -653,23 +654,25 @@ pub enum JitMethodHolder {
     Receiver,
     /// A fast-mode holder with this nonzero hidden-class handle offset.
     Shape(u32),
-    /// A dictionary-mode holder with this nonzero structural id. Every add,
-    /// delete or descriptor change of a dictionary object assigns a fresh id,
-    /// so an unchanged id keeps each key at its captured slot. This is the
-    /// only proof available for a String wrapper such as
-    /// `%String.prototype%`, which never adopts a hidden class.
+    /// A dictionary-mode holder with this slot-layout epoch. Every delete,
+    /// descriptor change or re-entry into dictionary mode advances it, so an
+    /// unchanged epoch keeps each existing key at its captured slot; appending
+    /// an unrelated key does not disturb it. This is the only proof available
+    /// for a String wrapper such as `%String.prototype%`, which never adopts a
+    /// hidden class.
     Dictionary(u64),
 }
 
 impl JitMethodHolder {
-    /// The live layout of `holder`: its hidden class, else its dictionary id.
+    /// The live layout of `holder`: its hidden class, else its dictionary
+    /// slot-layout epoch.
     pub(crate) fn of(holder: crate::object::JsObject, heap: &otter_gc::GcHeap) -> Option<Self> {
         let shape = crate::object::shape(holder, heap);
         if !shape.is_null() {
             return Some(Self::Shape(shape.offset()));
         }
-        let layout = crate::object::shape_id(holder, heap).raw();
-        (layout != 0).then_some(Self::Dictionary(layout))
+        crate::object::dictionary_layout(holder, heap)
+            .map(|layout| Self::Dictionary(u64::from(layout)))
     }
 }
 
@@ -870,13 +873,13 @@ pub enum JitCacheIrOp {
         shape: u32,
     },
     /// Continue only while a dictionary-mode object keeps one key/slot
-    /// layout: a null shape and an unchanged dictionary structural id, which
+    /// layout: a null shape and an unchanged dictionary slot-layout epoch, which
     /// every add, delete or descriptor change replaces. Emitted only for a
     /// pinned intrinsic prototype whose captured key it cannot shadow.
     GuardDictionaryLayout {
         /// CacheIR object operand to inspect.
         object: u8,
-        /// Captured dictionary structural id; never unassigned.
+        /// Captured dictionary slot-layout epoch; never zero or saturated.
         layout: u64,
     },
     /// Prove that the immutable shape mapping still authorizes the atom's data
@@ -1062,9 +1065,11 @@ pub enum BindingHitProof {
     },
     /// Guarded own-data slot in the global object record.
     GlobalObject {
-        /// Expected ordinary shape handle or dictionary structural id.
+        /// Expected ordinary shape handle, or the dictionary slot-layout
+        /// epoch that keeps this key at `value_byte` while unrelated globals
+        /// are added.
         shape: u64,
-        /// Whether `shape` names a dictionary structural id.
+        /// Whether `shape` names a dictionary slot-layout epoch.
         dictionary: bool,
         /// Byte offset of the property inside the object's value slab.
         value_byte: u32,
@@ -1103,10 +1108,10 @@ impl std::fmt::Debug for JitStringConstantCell {
 /// One guarded own-data load from the global object record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitGlobalObjectLoad {
-    /// Expected ordinary shape-handle offset or dictionary structural id.
+    /// Expected ordinary shape-handle offset or dictionary slot-layout epoch.
     pub shape: u64,
-    /// Whether [`Self::shape`] names the dictionary structural id rather than
-    /// an ordinary compressed shape handle.
+    /// Whether [`Self::shape`] names the dictionary slot-layout epoch rather
+    /// than an ordinary compressed shape handle.
     pub dictionary: bool,
     /// Byte offset of the property inside the object's value slab.
     pub value_byte: u32,
@@ -1502,7 +1507,7 @@ impl JitCompileSnapshot {
             element_accesses: rustc_hash::FxHashMap::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
-            object_dictionary_shape_id_byte: 0,
+            object_dictionary_layout_byte: 0,
             object_values_ptr_byte: 0,
             object_inline_values_byte: 0,
             object_slab_handle_byte: 0,

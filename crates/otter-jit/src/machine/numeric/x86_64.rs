@@ -923,7 +923,7 @@ pub(super) fn emit(
                     ; .arch x64
                     ; cmp DWORD [r11 + view.object_shape_byte as i32], 0
                     ; jne =>miss
-                    ; cmp [r11 + view.object_dictionary_shape_id_byte as i32], r10
+                    ; cmp [r11 + view.object_dictionary_layout_byte as i32], r10d
                     ; jne =>miss
                     ; mov r10d, 1
                     ; jmp =>done
@@ -3184,7 +3184,7 @@ fn binding_guard(
                 load64(ops, 8, shape);
                 dynasm!(ops
                     ; .arch x64
-                    ; cmp [r11 + view.object_dictionary_shape_id_byte as i32], r8
+                    ; cmp [r11 + view.object_dictionary_layout_byte as i32], r8d
                     ; jne =>miss
                 );
             } else {

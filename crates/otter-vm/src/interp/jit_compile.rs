@@ -1489,10 +1489,11 @@ impl Interpreter {
     /// code may therefore read the live cell directly; a TDZ hole still enters
     /// the canonical `LoadGlobalOrThrow` stub to construct the named error.
     /// Object-record reads additionally guard the live declarative-record epoch
-    /// and global-object shape, so later eval/script lexicals and structural
-    /// mutations miss before reading the baked slot.
+    /// and the global object's hidden class or dictionary slot layout, so later
+    /// eval/script lexicals, deletions and redefinitions miss before reading
+    /// the baked slot; appending unrelated globals keeps the proof.
     fn bake_global_lexical_loads(
-        &self,
+        &mut self,
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
@@ -1523,7 +1524,23 @@ impl Interpreter {
             };
             let shape = crate::object::shape(self.global_this, &self.gc_heap);
             let (shape, dictionary) = if shape.is_null() {
-                (hit.shape_id.raw(), true)
+                // A dictionary global object is proven by its slot layout, so
+                // globals the program adds later do not retire the proof. The
+                // generated read trusts this slot's kind; watching it makes a
+                // redefinition advance the layout the proof guards.
+                let Some(layout) =
+                    crate::object::dictionary_layout(self.global_this, &self.gc_heap)
+                else {
+                    continue;
+                };
+                if !crate::object::watch_dictionary_slot(
+                    self.global_this,
+                    &mut self.gc_heap,
+                    hit.slot,
+                ) {
+                    continue;
+                }
+                (u64::from(layout), true)
             } else {
                 (u64::from(shape.offset()), false)
             };
@@ -1549,10 +1566,11 @@ impl Interpreter {
     /// code may therefore read the live cell directly; a TDZ hole enters the
     /// schema-decoded committed binding boundary to construct the named error.
     /// Object-record reads additionally guard the live declarative-record epoch
-    /// and global-object shape, so later eval/script lexicals and structural
-    /// mutations miss before reading the baked slot.
+    /// and the global object's hidden class or dictionary slot layout, so later
+    /// eval/script lexicals, deletions and redefinitions miss before reading
+    /// the baked slot; appending unrelated globals keeps the proof.
     fn bake_binding_hit_proofs(
-        &self,
+        &mut self,
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
@@ -1598,7 +1616,23 @@ impl Interpreter {
             };
             let shape = crate::object::shape(self.global_this, &self.gc_heap);
             let (shape, dictionary) = if shape.is_null() {
-                (hit.shape_id.raw(), true)
+                // A dictionary global object is proven by its slot layout, so
+                // globals the program adds later do not retire the proof. The
+                // generated read trusts this slot's kind; watching it makes a
+                // redefinition advance the layout the proof guards.
+                let Some(layout) =
+                    crate::object::dictionary_layout(self.global_this, &self.gc_heap)
+                else {
+                    continue;
+                };
+                if !crate::object::watch_dictionary_slot(
+                    self.global_this,
+                    &mut self.gc_heap,
+                    hit.slot,
+                ) {
+                    continue;
+                }
+                (u64::from(layout), true)
             } else {
                 (u64::from(shape.offset()), false)
             };

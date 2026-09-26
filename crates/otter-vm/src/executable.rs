@@ -328,8 +328,8 @@ impl CodeBlock {
             // pointer to its shape handle for native CacheIR guards.
             object_shape_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
-            object_dictionary_shape_id_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET as u32,
+            object_dictionary_layout_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET as u32,
             object_values_ptr_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_VALUES_PTR_OFFSET as u32,
             object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32

@@ -485,6 +485,11 @@ struct SlotMeta {
     /// authoritative source for attribute-overridden and dictionary-mode
     /// objects whose slots have diverged from the shape.
     is_accessor: bool,
+    /// `true` once a compiled proof reads this dictionary slot's value
+    /// directly (see [`watch_dictionary_slot`]). Redefining a watched slot's
+    /// kind or attributes advances the object's slot-layout epoch; an
+    /// unwatched slot's redefinition leaves every other key's proof intact.
+    watched: bool,
 }
 
 impl SlotMeta {
@@ -494,6 +499,7 @@ impl SlotMeta {
         Self {
             flags: PropertyFlags::data_default(),
             is_accessor: false,
+            watched: false,
         }
     }
 }
@@ -547,6 +553,7 @@ impl SlotData {
                 SlotMeta {
                     flags: self.flags,
                     is_accessor: false,
+                    watched: false,
                 },
                 self.value,
             )),
@@ -556,6 +563,7 @@ impl SlotData {
                     SlotMeta {
                         flags: self.flags,
                         is_accessor: true,
+                        watched: false,
                     },
                     cell,
                 ))
@@ -802,6 +810,19 @@ pub struct ObjectBody {
     /// call metadata alone do not make a link opaque. Lives in the padding after
     /// [`Self::slot_attrs_overridden`], so it adds no object size.
     chain_link_opaque: bool,
+    /// Slot-layout epoch of a dictionary-mode object: which key occupies
+    /// which slot with which kind and attributes. Unlike
+    /// [`Self::dictionary_shape_id`] it survives appending a new key to an
+    /// object already in dictionary mode — no existing key moves or changes
+    /// kind — and advances on every other structural change: entering
+    /// dictionary mode, deleting a key, or redefining a slot a compiled proof
+    /// watches ([`watch_dictionary_slot`]). Generated
+    /// proofs about one existing key (a global binding, a dictionary
+    /// prototype's method) guard this word, so unrelated globals added after
+    /// compilation do not retire them. `0` means "never in dictionary mode";
+    /// the counter saturates at `u32::MAX`, a value no proof may capture.
+    /// Lives in the padding before [`Self::exotic`], so it adds no size.
+    dictionary_layout: u32,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
     /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
     /// slots, and the Date/Error/raw-JSON/arguments markers. `None` for plain
@@ -1992,11 +2013,12 @@ where
 /// JIT reads the shape handle here for the monomorphic IC guard.
 pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
 
-/// Byte offset of the structural identity used when [`ObjectBody::shape`] is
-/// null. Generated dictionary-mode guards compare this word after proving the
+/// Byte offset of the dictionary slot-layout epoch
+/// ([`ObjectBody::dictionary_layout`]). Generated proofs about one existing
+/// key of a dictionary-mode object compare this `u32` after proving the
 /// ordinary shape handle is absent.
-pub(crate) const OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, dictionary_shape_id);
+pub(crate) const OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, dictionary_layout);
 
 /// Byte offset of the string-keyed value slab pointer within an [`ObjectBody`]
 /// payload. The JIT reads this pointer after its shape guard and then indexes
@@ -2059,7 +2081,6 @@ const fn align_object_cell_bytes() -> usize {
 // these literals deliberately, in lockstep with the JIT, when the body changes.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
 const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET == 8);
-const _: () = assert!(OBJECT_BODY_DICTIONARY_SHAPE_ID_OFFSET == 24);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 36);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 56);
 const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
@@ -2068,6 +2089,7 @@ const _: () = assert!(OBJECT_BODY_EXTENSIBLE_OFFSET == 40);
 const _: () = assert!(OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET == 32);
 const _: () = assert!(OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET == 41);
 const _: () = assert!(OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET == 42);
+const _: () = assert!(OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET == 44);
 const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 48);
 const _: () = assert!(OBJECT_BODY_CELL_BYTES == 96);
 // The shape guard word must sit at offset 0 (single-compare guard) and the
@@ -2081,6 +2103,27 @@ const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));
 const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
 
 impl ObjectBody {
+    /// Assign a fresh dictionary structural id for a key-set change.
+    ///
+    /// `append` marks a change that only appends a new key: when the object is
+    /// already in dictionary mode every existing key keeps its slot, kind and
+    /// attributes, so [`Self::dictionary_layout`] survives. Every other change
+    /// passed here — entering dictionary mode, deleting a key, clearing the
+    /// key set — also advances the layout epoch. Call before clearing a shape
+    /// handle, so the current mode is still observable.
+    fn replace_dictionary_identity(&mut self, append: bool) {
+        self.dictionary_shape_id = next_shape_id();
+        if !append || !self.shape.is_null() {
+            self.advance_dictionary_layout();
+        }
+    }
+
+    /// Advance the slot-layout epoch, saturating at the unprovable
+    /// `u32::MAX`.
+    pub(super) fn advance_dictionary_layout(&mut self) {
+        self.dictionary_layout = self.dictionary_layout.saturating_add(1);
+    }
+
     /// Number of live string-keyed slots.
     #[inline]
     pub(crate) fn slab_len(&self) -> usize {
@@ -2282,13 +2325,22 @@ impl ObjectBody {
                 );
                 let entry = &mut self.slots_mut().entries_mut()[i];
                 let redefined = entry.flags != meta.flags || entry.is_accessor != meta.is_accessor;
-                *entry = meta;
+                let retires_proofs = redefined && entry.watched;
+                *entry = SlotMeta {
+                    watched: entry.watched && !redefined,
+                    ..meta
+                };
                 // A dictionary object's structural id stands for its whole
                 // key/slot/attribute layout, as a hidden class does for a
                 // shaped object: changing a slot's kind or attributes in place
-                // must retire every guard captured under the old id.
+                // must retire every guard captured under the old id. Only a
+                // slot some compiled proof reads directly moves the slot-layout
+                // epoch those proofs guard.
                 if redefined && self.shape.is_null() {
                     self.dictionary_shape_id = next_shape_id();
+                    if retires_proofs {
+                        self.advance_dictionary_layout();
+                    }
                 }
             }
         }
@@ -2961,6 +3013,7 @@ fn empty_object_body() -> ObjectBody {
         extensible: true,
         slot_attrs_overridden: false,
         chain_link_opaque: false,
+        dictionary_layout: 0,
         exotic: ExoticSlot::null(),
     }
 }
@@ -2992,7 +3045,7 @@ fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
 
 fn empty_dictionary_object_body() -> ObjectBody {
     let mut body = empty_object_body();
-    body.dictionary_shape_id = next_shape_id();
+    body.replace_dictionary_identity(false);
     body
 }
 
@@ -3095,6 +3148,7 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
         extensible: true,
         slot_attrs_overridden: false,
         chain_link_opaque: false,
+        dictionary_layout: 0,
         exotic: ExoticSlot::null(),
     };
     body.refresh_values_ptr();
@@ -3259,6 +3313,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             extensible: true,
             slot_attrs_overridden: false,
             chain_link_opaque: true,
+            dictionary_layout: 1,
             exotic: slot,
         },
         &mut visit,
@@ -3302,6 +3357,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             extensible: true,
             slot_attrs_overridden: false,
             chain_link_opaque: true,
+            dictionary_layout: 0,
             exotic: slot,
         },
         &mut visit,
@@ -3346,6 +3402,7 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
             extensible: true,
             slot_attrs_overridden: false,
             chain_link_opaque: true,
+            dictionary_layout: 0,
             exotic: slot,
         },
         &mut visit,
@@ -3558,6 +3615,39 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 
 /// Return the object's current hidden-class id.
 #[must_use]
+/// Slot-layout epoch of a dictionary-mode `obj`, or `None` when it is shaped,
+/// was never in dictionary mode, or has saturated past any provable value.
+/// See [`ObjectBody::dictionary_layout`].
+pub(crate) fn dictionary_layout(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<u32> {
+    heap.read_payload(obj, |body| {
+        (body.shape.is_null() && body.dictionary_layout != 0 && body.dictionary_layout != u32::MAX)
+            .then_some(body.dictionary_layout)
+    })
+}
+
+/// Mark `slot` of dictionary-mode `obj` as read directly by a compiled
+/// slot-layout proof.
+///
+/// A proof captures [`dictionary_layout`] and then reads the slot's value
+/// without re-checking its kind or attributes; redefining a watched slot
+/// advances the layout epoch and so retires the proof. Returns `false` — and
+/// the caller must not emit the proof — when `obj` is not in dictionary mode
+/// or `slot` has no metadata record.
+pub(crate) fn watch_dictionary_slot(obj: JsObject, heap: &mut otter_gc::GcHeap, slot: u16) -> bool {
+    heap.with_payload(obj, |body| {
+        if !body.shape.is_null() || !body.slots_materialized() {
+            return false;
+        }
+        match body.slots_mut().entries_mut().get_mut(usize::from(slot)) {
+            Some(entry) if !entry.is_accessor => {
+                entry.watched = true;
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
     heap.read_payload(obj, |body| body_shape_id(heap, body))
 }
@@ -4954,7 +5044,7 @@ fn set_inner(
         return;
     };
     heap.with_payload(*obj, |body| {
-        body.dictionary_shape_id = next_shape_id();
+        body.replace_dictionary_identity(true);
         if let Some(table) = dict_table {
             body.exotic_mut().dictionary_keys = table;
         }
@@ -5284,7 +5374,7 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
             return false;
         }
         body.remove_slot(offset as usize);
-        body.dictionary_shape_id = next_shape_id();
+        body.replace_dictionary_identity(false);
         if let Some(table) = replacement_table {
             body.exotic_mut().dictionary_keys = table;
         }
@@ -5354,7 +5444,7 @@ pub(crate) fn delete_if_same_data(
     let obj = obj_for_table;
     heap.with_payload(obj, |body| {
         body.remove_slot(offset as usize);
-        body.dictionary_shape_id = next_shape_id();
+        body.replace_dictionary_identity(false);
         if let Some(table) = replacement_table {
             body.exotic_mut().dictionary_keys = table;
         }
@@ -5520,7 +5610,7 @@ pub fn define_own_property_partial(
             if !body.extensible {
                 return false;
             }
-            body.dictionary_shape_id = next_shape_id();
+            body.replace_dictionary_identity(true);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;
             }
@@ -5796,7 +5886,7 @@ pub fn define_own_property_in_place(
             if !body.extensible {
                 return false;
             }
-            body.dictionary_shape_id = next_shape_id();
+            body.replace_dictionary_identity(true);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;
             }
@@ -6643,7 +6733,11 @@ fn materialized_slot_metas(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<Sl
     (0..count)
         .map(|i| {
             let (flags, is_accessor) = body.slot_attrs(heap, i);
-            SlotMeta { flags, is_accessor }
+            SlotMeta {
+                flags,
+                is_accessor,
+                watched: false,
+            }
         })
         .collect()
 }
@@ -6950,7 +7044,7 @@ mod tests {
             .expect("set x");
         interp.gc_heap_mut().with_payload(o, |body| {
             dict_clear_keys(body);
-            body.dictionary_shape_id = next_shape_id();
+            body.replace_dictionary_identity(false);
         });
 
         assert_eq!(len(o, interp.gc_heap()), 1);

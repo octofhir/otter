@@ -2,9 +2,14 @@
 //!
 //! # Contents
 //! - Generated hits, getter reentry and unresolved-binding throws.
+//! - Global-object proofs that survive unrelated global additions and miss
+//!   into exact semantics after delete / redefinition.
 //!
 //! # Invariants
 //! - An inlined body's global reads carry the body's own baked proofs.
+//! - A dictionary global object is proven by its slot layout: appending a key
+//!   keeps every existing key at its slot, while delete / redefine / re-entry
+//!   into dictionary mode retire the proof.
 //! - Cold reads commit once in the callee's source activation and return to SSA.
 //! - Code-owned safepoints preserve exact roots and source stacks across GC.
 
@@ -187,5 +192,87 @@ JSON.stringify([result,reads,coercions,mark.before-beforeCount,mark.after-afterC
                     ..
                 }
             ))
+    );
+}
+
+fn tiered() -> Runtime {
+    Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn appended_globals_keep_generated_global_reads() {
+    let mut runtime = tiered();
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var provenGlobal = 5;
+function readGlobal(n) { var s = 0; for (var i = 0; i < n; i++) s += provenGlobal; return s; }
+for (var k = 0; k < 400; k++) readGlobal(200);
+"#,
+            ),
+            "layout-warm.js",
+        )
+        .unwrap();
+    // Unrelated globals appear after the reader was compiled.
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "globalThis.lateGlobalA = 1; var lateGlobalB = 2; globalThis.lateGlobalC = 3;",
+            ),
+            "layout-append.js",
+        )
+        .unwrap();
+    let before = runtime.execution_stats();
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript("readGlobal(20000)"),
+            "layout-read.js",
+        )
+        .unwrap();
+    assert_eq!(result.completion_string(), "100000");
+    let after = runtime.execution_stats();
+    let stubs = after.jit_reentrant_stub_transitions - before.jit_reentrant_stub_transitions;
+    assert!(
+        stubs < 100,
+        "appending globals must not retire the read's proof: {stubs} reentrant transitions"
+    );
+}
+
+#[test]
+fn deleted_or_redefined_globals_miss_to_exact_semantics() {
+    let mut runtime = tiered();
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+globalThis.movingGlobal = 3;
+function readMoving() { return movingGlobal; }
+var warm = 0;
+for (var k = 0; k < 20000; k++) warm += readMoving();
+var observed = [warm];
+delete globalThis.movingGlobal;
+try { readMoving(); observed.push("no throw"); } catch (e) { observed.push(e.name); }
+var getterCalls = 0;
+Object.defineProperty(globalThis, "movingGlobal", { get() { getterCalls++; return 11; }, configurable: true });
+var afterGetter = 0;
+for (var k = 0; k < 20000; k++) afterGetter += readMoving();
+observed.push(afterGetter, getterCalls);
+Object.defineProperty(globalThis, "movingGlobal", { value: 7, writable: true, configurable: true });
+var afterData = 0;
+for (var k = 0; k < 20000; k++) afterData += readMoving();
+observed.push(afterData);
+JSON.stringify(observed);
+"#,
+            ),
+            "layout-delete.js",
+        )
+        .unwrap();
+    assert_eq!(
+        result.completion_string(),
+        "[60000,\"ReferenceError\",220000,20000,140000]"
     );
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # Run Google's Octane benchmark suite. Higher scores are better.
+# Suites run unmodified after a d8-shell prelude (`print`, `read`).
 # Set OCTANE=/path/to/octane to use an existing checkout.
 
 set -euo pipefail
@@ -49,7 +50,16 @@ done
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 DRIVER="$WORK/octane-driver.js"
-perl -pe 's/^load\(.*\n//; s/(?<![A-Za-z0-9_\$])print\(/console.log(/g' "$OCTANE/run.js" > "$DRIVER"
+perl -pe 's/^load\(.*\n//' "$OCTANE/run.js" > "$DRIVER"
+# Octane targets the d8 shell. Suites run unmodified after a prelude that
+# provides the shell's `print` / `read`: emscripten suites (zlib) bind them
+# inside eval'd code, and rewriting `print(` in sources corrupts the
+# TypeScript suite's compiler input.
+PRELUDE="$WORK/octane-prelude.js"
+cat > "$PRELUDE" <<'JS'
+if (typeof print === "undefined") globalThis.print = function (s) { console.log(s); };
+if (typeof read === "undefined") globalThis.read = function (name) { throw new Error("read(" + name + ") is not available"); };
+JS
 
 OTTER="$(ensure_otter_bin)"
 OUT="$RESULTS_DIR/octane-$(timestamp).log"
@@ -75,18 +85,17 @@ run_suite() {
   local suite="$1"
   local suite_work="$WORK/$suite"
   mkdir -p "$suite_work"
-  local patched_files=()
+  local suite_paths=()
   local file
   while IFS= read -r file; do
-    patched="$suite_work/$(basename "$file")"
-    perl -pe 's/(?<![A-Za-z0-9_\$])print\(/console.log(/g' "$file" > "$patched"
-    patched_files+=("$patched")
+    suite_paths+=("$file")
   done < <(suite_files "$suite")
 
   local combined="$suite_work/octane-combined.js"
   {
+    cat "$PRELUDE"
     cat "$OCTANE/base.js"
-    for file in "${patched_files[@]}"; do
+    for file in "${suite_paths[@]}"; do
       cat "$file"
     done
     cat "$DRIVER"
@@ -95,7 +104,7 @@ run_suite() {
   echo "### $suite"
   run_capped "node" run_external_file node "$combined"
   run_capped "bun" run_external_file bun "$combined"
-  run_capped "otter" run_otter_files "$OTTER" "$OCTANE/base.js" "${patched_files[@]}" "$DRIVER"
+  run_capped "otter" run_otter_files "$OTTER" "$PRELUDE" "$OCTANE/base.js" "${suite_paths[@]}" "$DRIVER"
 }
 
 status=0

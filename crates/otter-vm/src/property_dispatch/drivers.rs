@@ -346,9 +346,11 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         }) {
             let owner = receiver.as_closure(&self.gc_heap);
+            // A read never materializes the own-property bag: an absent bag
+            // owns nothing, and the inherited accessors were probed above.
             match self.callable_bag_read(owner, fid) {
                 Some(bag) => bag,
-                None => self.function_user_bag_with_stack_roots(stack, owner, fid, &[&receiver])?,
+                None => return Ok(false),
             }
         } else {
             return Ok(false);

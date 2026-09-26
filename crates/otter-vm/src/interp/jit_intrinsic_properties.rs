@@ -4,6 +4,8 @@
 //! - Collection receiver proofs composed with ordinary slot guards.
 //! - Primitive string receiver proofs composed with the `%String.prototype%`
 //!   dictionary-layout guard, for every name a primitive string cannot own.
+//! - Ordinary closure proofs (no bag, no prototype override, plain kind, the
+//!   compiling realm active) composed with `%Function.prototype%` slot guards.
 //!
 //! # Invariants
 //! - Only own data slots of pinned realm prototypes are captured.
@@ -42,20 +44,53 @@ impl Interpreter {
         ]
         .into_iter()
         .filter_map(|(prototype, type_tag)| {
-            self.collection_property_program(prototype?, type_tag, key)
+            self.shaped_prototype_program(prototype?, key, |proto_offset| JitIntrinsicPrototype {
+                type_tag,
+                guard: Some(crate::method_ops::collection_guard()),
+                proto_offset,
+                active_realm: None,
+            })
         })
         .collect::<Vec<_>>();
         programs.extend(self.string_property_program(key));
+        programs.extend(self.closure_property_program(key));
         programs
     }
 
-    /// Collection receivers: the latch proof, then the prepared prototype's
-    /// fast shape and immutable atom slot.
-    fn collection_property_program(
+    /// Ordinary closures own only virtual `name` / `length` / `prototype`
+    /// (and the sloppy `caller` / `arguments` metadata) until a bag
+    /// materializes, so every other name resolves on the active realm's
+    /// `%Function.prototype%` — the load behind `f.apply(...)` and
+    /// `f.call(...)`. The named-lookup byte excludes bags, prototype
+    /// overrides and generator/async kinds; the realm id pins which
+    /// `%Function.prototype%` the program read.
+    fn closure_property_program(
+        &mut self,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<JitCacheIrProgram> {
+        if matches!(
+            key.name(),
+            "name" | "length" | "prototype" | "caller" | "arguments"
+        ) {
+            return None;
+        }
+        let prototype = self.realm_intrinsics.function_prototype()?;
+        let active_realm = self.active_realm_id;
+        self.shaped_prototype_program(prototype, key, |proto_offset| JitIntrinsicPrototype {
+            type_tag: crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+            guard: Some(crate::closure::ordinary_named_lookup_guard()),
+            proto_offset,
+            active_realm: Some(active_realm),
+        })
+    }
+
+    /// An exotic receiver proof, then the prepared prototype's fast shape and
+    /// immutable atom slot.
+    fn shaped_prototype_program(
         &mut self,
         mut prototype: object::JsObject,
-        type_tag: u8,
         key: AtomizedPropertyKey<'_>,
+        proof: impl FnOnce(u32) -> JitIntrinsicPrototype,
     ) -> Option<JitCacheIrProgram> {
         if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
             return None;
@@ -82,11 +117,7 @@ impl Interpreter {
                 JitCacheIrOp::LoadIntrinsicPrototype {
                     object: 0,
                     result: 1,
-                    target: JitIntrinsicPrototype {
-                        type_tag,
-                        guard: Some(crate::method_ops::collection_guard()),
-                        proto_offset: prototype.offset(),
-                    },
+                    target: proof(prototype.offset()),
                 },
                 JitCacheIrOp::GuardShape {
                     object: 1,
@@ -146,6 +177,7 @@ impl Interpreter {
                         type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
                         guard: None,
                         proto_offset: prototype.offset(),
+                        active_realm: None,
                     },
                 },
                 JitCacheIrOp::GuardDictionaryLayout { object: 1, layout },

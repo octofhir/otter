@@ -618,6 +618,11 @@ pub struct JitIntrinsicPrototype {
     pub guard: Option<JitBodyGuard>,
     /// Compressed offset of the pinned realm prototype.
     pub proto_offset: u32,
+    /// Realm whose intrinsic `proto_offset` names, when the receiver's
+    /// prototype is resolved in the *active* realm rather than recorded on
+    /// the body: generated code then also compares the isolate's active
+    /// realm id. `None` when the body proof alone pins the prototype.
+    pub active_realm: Option<u32>,
 }
 
 impl JitIntrinsicPrototype {
@@ -628,7 +633,10 @@ impl JitIntrinsicPrototype {
     /// body owns only `length` and its indices, so every other name resolves on
     /// `%String.prototype%`. An array body without an exotic sidecar likewise
     /// owns only `length` and its elements, and its `[[Prototype]]` is still the
-    /// realm `%Array.prototype%`. The proof establishes only the receiver; the
+    /// realm `%Array.prototype%`. A closure whose named-lookup byte reads
+    /// exactly ordinary has no own bag and no prototype override, and its
+    /// kind resolves every non-virtual name on the active realm's
+    /// `%Function.prototype%`, so its proof also pins that realm. The proof establishes only the receiver; the
     /// following holder guards decide which names that prototype answers. A
     /// String wrapper prototype stays opaque to ordinary lookup guards, so no
     /// `length`/index load can be answered from its shape.
@@ -641,6 +649,10 @@ impl JitIntrinsicPrototype {
             crate::string::JS_STRING_BODY_TYPE_TAG => self.guard.is_none(),
             crate::array::ARRAY_BODY_TYPE_TAG => {
                 self.guard == Some(crate::method_ops::dense_array_guard())
+            }
+            crate::closure::JS_CLOSURE_BODY_TYPE_TAG => {
+                self.guard == Some(crate::closure::ordinary_named_lookup_guard())
+                    && self.active_realm.is_some()
             }
             _ => false,
         };

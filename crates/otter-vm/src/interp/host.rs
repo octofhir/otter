@@ -322,6 +322,15 @@ impl Interpreter {
         std::ptr::addr_of!(self.array_index_accessor_protector)
     }
 
+    /// Stable address of the active realm id.
+    ///
+    /// Generated proofs that resolve a prototype in the active realm compare
+    /// it before trusting their baked prototype. The interpreter is exclusively
+    /// borrowed and cannot move for the complete compiled activation.
+    pub fn jit_active_realm_addr(&self) -> *const u32 {
+        std::ptr::addr_of!(self.active_realm_id)
+    }
+
     /// Current logical JavaScript frame depth across materialized interpreter
     /// frames and generated frames that still live only on the native stack.
     ///

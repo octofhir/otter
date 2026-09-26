@@ -78,7 +78,8 @@ use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16,
     OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
-    VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_ACTIVE_REALM_CELL_OFFSET, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET,
+    VM_THREAD_GC_HEAP_OFFSET,
 };
 
 /// Prove the live object can still participate in an immutable hidden-class
@@ -323,6 +324,7 @@ pub(crate) fn emit_intrinsic_prototype_header(
     view: &JitCompileSnapshot,
     target: otter_vm::jit::JitIntrinsicPrototype,
     byte_pc: u32,
+    context: u8,
     miss: DynamicLabel,
 ) {
     if !target.is_generated_receiver() {
@@ -340,6 +342,9 @@ pub(crate) fn emit_intrinsic_prototype_header(
     );
     if let Some(guard) = target.guard {
         emit_body_guard(ops, guard, miss);
+    }
+    if let Some(realm) = target.active_realm {
+        emit_active_realm_guard(ops, context, realm, miss);
     }
     emit_load_symbol_u64(
         ops,
@@ -418,7 +423,15 @@ where
                     result: 1,
                     target,
                 } => {
-                    emit_intrinsic_prototype_header(ops, relocations, view, target, byte_pc, next);
+                    emit_intrinsic_prototype_header(
+                        ops,
+                        relocations,
+                        view,
+                        target,
+                        byte_pc,
+                        20,
+                        next,
+                    );
                 }
                 otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. } => {
                     return Err(Unsupported::OperandShape(
@@ -1616,6 +1629,26 @@ where
     )
 }
 
+/// Miss unless the isolate's active realm is `realm`, the realm whose
+/// intrinsic prototype a proof baked. `context` holds the tier's native
+/// context pointer. Clobbers `x12` and `x14`.
+pub(crate) fn emit_active_realm_guard(
+    ops: &mut Assembler,
+    context: u8,
+    realm: u32,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x14, [X(context), THREAD_OFFSET]
+        ; ldr x14, [x14, VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+        ; cbz x14, =>miss
+        ; ldr w14, [x14]
+    );
+    emit_load_u64(ops, 12, u64::from(realm));
+    dynasm!(ops ; .arch aarch64 ; cmp w14, w12 ; b.ne =>miss);
+}
+
 /// Miss unless the isolate's array-index accessor protector is intact: no
 /// indexed accessor exists anywhere, so creating an array index cannot reach
 /// an inherited setter. Clobbers `x14`.
@@ -1734,6 +1767,7 @@ fn emit_guarded_method_guard_impl(
             type_tag,
             guard,
             proto_offset,
+            active_realm,
         }) => {
             emit_receiver_type_guard_impl(
                 ops,
@@ -1749,6 +1783,9 @@ fn emit_guarded_method_guard_impl(
             }
             if let Some(guard) = guard {
                 emit_body_guard(ops, guard, miss);
+            }
+            if let Some(realm) = active_realm {
+                emit_active_realm_guard(ops, 20, realm, miss);
             }
             emit_prototype_guard(
                 ops,

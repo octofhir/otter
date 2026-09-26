@@ -78,7 +78,7 @@ use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16,
     OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
-    VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
 };
 
 /// Prove the live object can still participate in an immutable hidden-class
@@ -1590,6 +1590,11 @@ where
     // the operation is on that body; a shaped receiver only supplies arguments.
     let receiver_is_operand = matches!(call.receiver, JitGuardedReceiver::Exotic(_));
     emit_guarded_method_guard(ops, relocations, view, call, receiver, byte_pc, miss)?;
+    if otter_vm::runtime_stubs::leaf_entry_shape(call.entry_stub_id)
+        .is_some_and(|shape| shape.array_index_protector)
+    {
+        emit_array_index_protector_guard(ops, miss);
+    }
     // An exotic receiver occupies the entry's first operand word, so the call's
     // own arguments shift one place along.
     let receiver_word = u8::from(receiver_is_operand);
@@ -1609,6 +1614,20 @@ where
         },
         miss,
     )
+}
+
+/// Miss unless the isolate's array-index accessor protector is intact: no
+/// indexed accessor exists anywhere, so creating an array index cannot reach
+/// an inherited setter. Clobbers `x14`.
+fn emit_array_index_protector_guard(ops: &mut Assembler, miss: DynamicLabel) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x14, [x20, THREAD_OFFSET]
+        ; ldr x14, [x14, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET]
+        ; cbz x14, =>miss
+        ; ldrb w14, [x14]
+        ; cbnz w14, =>miss
+    );
 }
 
 /// Guard the receiver, pinned method holder, and exact builtin identity while

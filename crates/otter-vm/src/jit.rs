@@ -626,7 +626,9 @@ impl JitIntrinsicPrototype {
     ///
     /// A latched `Map`/`Set` body has no instance override. A primitive string
     /// body owns only `length` and its indices, so every other name resolves on
-    /// `%String.prototype%`. The proof establishes only the receiver; the
+    /// `%String.prototype%`. An array body without an exotic sidecar likewise
+    /// owns only `length` and its elements, and its `[[Prototype]]` is still the
+    /// realm `%Array.prototype%`. The proof establishes only the receiver; the
     /// following holder guards decide which names that prototype answers. A
     /// String wrapper prototype stays opaque to ordinary lookup guards, so no
     /// `length`/index load can be answered from its shape.
@@ -637,6 +639,9 @@ impl JitIntrinsicPrototype {
                 self.guard == Some(crate::method_ops::collection_guard())
             }
             crate::string::JS_STRING_BODY_TYPE_TAG => self.guard.is_none(),
+            crate::array::ARRAY_BODY_TYPE_TAG => {
+                self.guard == Some(crate::method_ops::dense_array_guard())
+            }
             _ => false,
         };
         receiver && self.proto_offset != 0 && self.proto_offset.is_multiple_of(8)

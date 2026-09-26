@@ -1108,6 +1108,12 @@ pub fn len(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(arr, |body| body.length)
 }
 
+/// Elements the dense buffer holds without growing (O(1)).
+#[must_use]
+pub(crate) fn dense_capacity(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(arr, |body| body.dense_capacity())
+}
+
 /// `true` for an empty array.
 #[must_use]
 pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {

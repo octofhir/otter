@@ -336,6 +336,12 @@ impl MachineOpcode {
                 MachineEffects::read(PROPERTY_METADATA.union(PROTOTYPE), Guard)
             }
             Self::CacheIrGuardPrototypeNull { .. } => MachineEffects::read(PROTOTYPE, Guard),
+            // The latch flips only when some object gains an indexed accessor,
+            // a prototype-contents change that every reentrant or writing
+            // boundary already invalidates.
+            Self::CacheIrGuardArrayIndexProtector { .. } => {
+                MachineEffects::read(PROTOTYPE.union(PROPERTY_METADATA), Guard)
+            }
             Self::CacheIrLoadField { .. } | Self::PropertySlotLoad { .. } => {
                 MachineEffects::read(PROPERTY_FIELD, Value)
             }

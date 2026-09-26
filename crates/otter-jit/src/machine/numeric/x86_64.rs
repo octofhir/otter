@@ -83,8 +83,8 @@ use crate::{
         RECEIVER_ALLOC_TRACKED_BYTES_OFFSET, RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
         RECEIVER_ALLOC_TYPE_COUNT_OFFSET, RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
         RUNTIME_STATS_OFFSET, THREAD_OFFSET, TransitionTable, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
-        VM_THREAD_CURRENT_FRAME_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
         VM_THREAD_MARKING_FLAG_CELL_OFFSET,
     },
@@ -1026,6 +1026,35 @@ pub(super) fn emit(
                 store_integer(&mut ops, frame, loc[3], 9)?;
                 structural_regions.push((
                     "machineCacheIrLoadPrototype",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[0], 10)?;
+                dynasm!(ops
+                    ; .arch x64
+                    ; test r10d, r10d
+                    ; jz =>miss
+                    ; mov r11, [r15 + THREAD_OFFSET as i32]
+                    ; mov r11, [r11 + VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET as i32]
+                    ; test r11, r11
+                    ; jz =>miss
+                    ; cmp BYTE [r11], 0
+                    ; jne =>miss
+                    ; mov r10d, 1
+                    ; jmp =>done
+                    ; =>miss
+                    ; xor r10d, r10d
+                    ; =>done
+                );
+                store_integer(&mut ops, frame, loc[1], 10)?;
+                structural_regions.push((
+                    "machineCacheIrGuardArrayIndexProtector",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

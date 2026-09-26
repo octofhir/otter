@@ -11,6 +11,8 @@
 //! # Invariants
 //! - Every guard, arithmetic and leaf miss precedes effects and enters one cold
 //!   call, which performs the complete JavaScript operation exactly once.
+//! - A leaf that creates an array index (`push`) is preceded by the isolate's
+//!   array-index accessor protector guard; the entry itself cannot read it.
 //! - Shaped receiver and holder state exclude descriptor overrides and exotic
 //!   lookup before a shape-derived method slot is read; symbol sidecars remain
 //!   eligible. An exotic receiver is proven by type tag and latch, and its
@@ -259,6 +261,26 @@ pub(super) fn select_probe(
             MachineOperand::register_output(identity_hit),
         ],
     );
+    // An entry that creates an array index resolves that index through the
+    // prototype chain; it cannot read the isolate protector, so the hit
+    // proves it first.
+    let identity_hit = if hit == HitKind::Leaf
+        && super::super::native_leaf::leaf_probe_needs_array_index_protector(call.leaf_stub_id)
+    {
+        let protected = boolean(representations);
+        push_probe(
+            target_spec,
+            instructions,
+            MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc },
+            vec![
+                MachineOperand::register_input(identity_hit),
+                MachineOperand::register_output(protected),
+            ],
+        );
+        protected
+    } else {
+        identity_hit
+    };
     let start = argument_start as usize;
     let args = hir
         .operand_values

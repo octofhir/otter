@@ -1116,6 +1116,14 @@ pub enum MachineOpcode {
         /// Captured dictionary slot-layout epoch; never zero or saturated.
         layout: u64,
     },
+    /// Prove the isolate's array-index accessor protector intact under a prior
+    /// CacheIR condition: no indexed accessor exists anywhere, so creating an
+    /// array index cannot reach an inherited setter. A false incoming
+    /// condition keeps the result false.
+    CacheIrGuardArrayIndexProtector {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+    },
     /// Prove that an object's direct prototype is null under a prior CacheIR
     /// condition.
     CacheIrGuardPrototypeNull {
@@ -2293,6 +2301,24 @@ impl InstructionSequence {
                             || self.representations[object.value.0 as usize]
                                 != MachineRepresentation::Tagged
                             || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrGuardArrayIndexProtector { .. } => {
+                        let [active, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *active != MachineOperand::register_input(active.value)
                             || self.representations[active.value.0 as usize]
                                 != MachineRepresentation::Boolean
                             || *output != MachineOperand::register_output(output.value)

@@ -1261,17 +1261,20 @@ pub const STUB_ARRAY_POP_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Probe,
 );
-/// Allocating dense-array `Array.prototype.push` mutation.
+/// Leaf dense-array `Array.prototype.push` mutation.
 ///
-/// Appending may grow the dense buffer, so the site publishes a precise
-/// safepoint. Like the `pop` entry it re-checks the dense preconditions and
-/// misses instead of falling back internally.
-pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
+/// Appends into the dense buffer's existing capacity and never grows it, so
+/// it neither allocates nor collects. `push` creates a new index, which the
+/// spec resolves through the prototype chain: the caller must prove the
+/// array-index accessor protector intact before the call (see
+/// [`crate::runtime_stubs::LeafEntryShape::array_index_protector`]). The entry
+/// re-checks the dense preconditions and misses on a full buffer.
+pub const STUB_ARRAY_PUSH_LEAF: RuntimeStubDescriptor = descriptor(
     66,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, true),
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
     RuntimeStubException::Never,
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Probe,
@@ -1806,7 +1809,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         63 => "string_starts_with_leaf",
         64 => "string_ends_with_leaf",
         65 => "array_pop_leaf",
-        66 => "array_push_alloc",
+        66 => "array_push_leaf",
         67 => "array_shift_leaf",
         68 => "array_unshift_alloc",
         69 => "math_abs_leaf",
@@ -1910,7 +1913,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_STRING_STARTS_WITH_LEAF,
     STUB_STRING_ENDS_WITH_LEAF,
     STUB_ARRAY_POP_LEAF,
-    STUB_ARRAY_PUSH_ALLOC,
+    STUB_ARRAY_PUSH_LEAF,
     STUB_ARRAY_SHIFT_LEAF,
     STUB_ARRAY_UNSHIFT_ALLOC,
     STUB_MATH_ABS_LEAF,

@@ -147,9 +147,9 @@ use crate::{
         NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
         NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16, PropertySourceCell, THREAD_OFFSET,
         TransitionTable, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_CODE_OBJECT_ID_OFFSET,
-        VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
+        VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
         DenseIndexForm, element_access_for, emit_check_shape_identity,
@@ -2055,6 +2055,32 @@ pub(super) fn emit(
                 emit_store_allocated_integer(&mut ops, frame, locations[3], 11, 0)?;
                 structural_regions.push((
                     "machineCacheIrLoadPrototype",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cbz w9, =>miss
+                    ; ldr x10, [x19, THREAD_OFFSET]
+                    ; ldr x10, [x10, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET]
+                    ; cbz x10, =>miss
+                    ; ldrb w10, [x10]
+                    ; cbnz w10, =>miss
+                );
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                structural_regions.push((
+                    "machineCacheIrGuardArrayIndexProtector",
                     Some(byte_pc),
                     start,
                     ops.offset().0,

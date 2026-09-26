@@ -40,7 +40,7 @@ pub(crate) fn collection_guard() -> JitBodyGuard {
 /// `%Array.prototype%` is still the receiver's `[[Prototype]]` and nothing on
 /// the instance can shadow the method or override an element's attributes,
 /// which is what makes the prototype-slot guard sufficient.
-fn dense_array_guard() -> JitBodyGuard {
+pub(crate) fn dense_array_guard() -> JitBodyGuard {
     // The sidecar is a 4-byte GC handle; a wider read would take the
     // neighbouring field with it and can land on a byte offset a 64-bit
     // load cannot encode.
@@ -55,9 +55,10 @@ impl Interpreter {
     /// Snapshot a monomorphic dense-array mutation site (`push` / `pop` /
     /// `shift` / `unshift`) into JIT-readable guard metadata.
     ///
-    /// `pop` / `shift` only rewrite the dense buffer, so they run as mutating
-    /// leaves with no safepoint; `push` / `unshift` may grow it and need the
-    /// allocating entry with a precise root map. Returns `None` for any other
+    /// `pop` / `shift` / `push` only rewrite the dense buffer in place, so they
+    /// run as mutating leaves with no safepoint (`push` misses on a full
+    /// buffer); `unshift` may grow it and needs the allocating entry with a
+    /// precise root map. Returns `None` for any other
     /// method, family, or when the prototype slot no longer holds the original
     /// native builtin.
     pub(crate) fn jit_array_method_call(
@@ -66,7 +67,7 @@ impl Interpreter {
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
         use crate::native_abi::{
-            NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_SHIFT_LEAF,
+            NO_SAFEPOINT, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_LEAF, STUB_ARRAY_SHIFT_LEAF,
             STUB_ARRAY_UNSHIFT_ALLOC,
         };
 
@@ -78,7 +79,7 @@ impl Interpreter {
         let (stub_id, safepoint_id, argument_count) = match ic.tag {
             Tag::Pop => (STUB_ARRAY_POP_LEAF.id, NO_SAFEPOINT, 0),
             Tag::Shift => (STUB_ARRAY_SHIFT_LEAF.id, NO_SAFEPOINT, 0),
-            Tag::Push => (STUB_ARRAY_PUSH_ALLOC.id, alloc_safepoint_id, 1),
+            Tag::Push => (STUB_ARRAY_PUSH_LEAF.id, NO_SAFEPOINT, 1),
             Tag::Unshift => (STUB_ARRAY_UNSHIFT_ALLOC.id, alloc_safepoint_id, 1),
             _ => return None,
         };

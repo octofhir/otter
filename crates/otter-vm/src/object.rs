@@ -1500,6 +1500,12 @@ fn error_stack_body_of(handle: ErrorStackHandle) -> Option<*mut ErrorStackBody> 
     })
 }
 
+/// Byte offset, from the sidecar's cell header, of the symbol-keyed
+/// property table handle in [`ExoticSlots`]. Generated proofs that no
+/// symbol-keyed own property exists read it through the object's sidecar.
+pub const EXOTIC_SLOTS_SYMBOL_PROPS_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::offset_of!(ExoticSlots, symbol_props)) as u32;
+
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolPropsBody`].
 pub const SYMBOL_PROPS_BODY_TYPE_TAG: u8 = 0x3b;
 

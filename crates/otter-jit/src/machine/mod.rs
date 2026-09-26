@@ -931,6 +931,14 @@ pub enum MachineOpcode {
         /// True for ==, false for !=.
         equal: bool,
     },
+    /// No-call `instanceof` proof over an ordinary closure target: tagged
+    /// value and target, tagged Boolean result, Boolean hit. A `@@hasInstance`
+    /// override, a missing prototype proof, a Proxy or an opaque chain link
+    /// uses the canonical committed cold sibling.
+    InstanceofProbe {
+        /// Source bytecode offset for structural attribution.
+        byte_pc: u32,
+    },
     /// No-call Number fast path of a committed generic binary operator:
     /// tagged pair, tagged result, Boolean hit. Two Number operands complete
     /// in IEEE double arithmetic; any other operand, and `%` / `**`, miss to
@@ -2755,6 +2763,7 @@ impl InstructionSequence {
                     }
                     MachineOpcode::TruthinessProbe
                     | MachineOpcode::LooseEqualityProbe { .. }
+                    | MachineOpcode::InstanceofProbe { .. }
                     | MachineOpcode::BinaryNumberProbe { .. } => {
                         let (input_count, result_type) =
                             if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {
@@ -2788,13 +2797,14 @@ impl InstructionSequence {
                                 );
                         if !valid
                             || instruction.clobbers
-                                != if matches!(
-                                    instruction.opcode,
-                                    MachineOpcode::BinaryNumberProbe { .. }
-                                ) {
-                                    target_spec.clobbers(TargetClobberSet::NumberProbe)
-                                } else {
-                                    &[]
+                                != match instruction.opcode {
+                                    MachineOpcode::BinaryNumberProbe { .. } => {
+                                        target_spec.clobbers(TargetClobberSet::NumberProbe)
+                                    }
+                                    MachineOpcode::InstanceofProbe { .. } => {
+                                        target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                                    }
+                                    _ => &[],
                                 }
                             || !instruction.exits.is_empty()
                             || instruction.safepoint.is_some()

@@ -2707,8 +2707,8 @@ fn emit_existing_property_load(
                         ; .arch x64
                         ; cmp DWORD [r8 + view.object_shape_byte as i32], 0
                         ; jne =>next
-                        ; mov r11, QWORD layout as i64
-                        ; cmp [r8 + view.object_dictionary_shape_id_byte as i32], r11
+                        ; mov r11d, layout as u32 as i32
+                        ; cmp [r8 + view.object_dictionary_layout_byte as i32], r11d
                         ; jne =>next
                     );
                 }

@@ -29,7 +29,7 @@ use crate::Value;
 
 use super::{
     DescriptorKind, JsObject, JsSymbol, PartialPropertyDescriptor, PropertyDescriptor,
-    PropertyFlags, ShapeHandle, SlotData, SlotKind, SlotMeta, next_shape_id,
+    PropertyFlags, ShapeHandle, SlotData, SlotKind, SlotMeta,
 };
 
 pub(super) fn ordinary_set_data_property(
@@ -103,7 +103,7 @@ pub(super) fn ordinary_set_data_property(
         if !body.extensible {
             return false;
         }
-        body.dictionary_shape_id = next_shape_id();
+        body.replace_dictionary_identity(true);
         if let Some(table) = dict_table {
             body.exotic_mut().dictionary_keys = table;
         }

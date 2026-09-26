@@ -110,7 +110,10 @@ impl Interpreter {
     /// every other name resolves on `%String.prototype%`. That String wrapper
     /// never adopts a hidden class; its dictionary layout id pins the slot and
     /// the load reads the slot's live data value.
-    fn string_property_program(&self, key: AtomizedPropertyKey<'_>) -> Option<JitCacheIrProgram> {
+    fn string_property_program(
+        &mut self,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<JitCacheIrProgram> {
         let name = key.name();
         if name == "length"
             || crate::property_dispatch::canonical_numeric_index_string(name).is_some()
@@ -126,6 +129,11 @@ impl Interpreter {
         let (hit, lookup) = object::lookup_own_slot(prototype, &self.gc_heap, name);
         let hit = hit?;
         if !matches!(lookup, object::PropertyLookup::Data { .. }) {
+            return None;
+        }
+        // The program loads this slot's value directly; watching it makes a
+        // redefinition advance the layout the guard below compares.
+        if !object::watch_dictionary_slot(prototype, &mut self.gc_heap, hit.slot) {
             return None;
         }
         let value_byte = u32::from(hit.slot) * std::mem::size_of::<crate::Value>() as u32;

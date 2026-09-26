@@ -1721,8 +1721,9 @@ fn emit_body_guard(ops: &mut Assembler, guard: JitBodyGuard, miss: DynamicLabel)
 }
 
 /// Prove a dictionary-mode holder in `header` keeps its captured key/slot
-/// layout: a null shape and an unchanged dictionary structural id. Every add,
-/// delete or descriptor change assigns a fresh id. Clobbers `x12` and `x14`.
+/// layout: a null shape and an unchanged `u32` slot-layout epoch. Every
+/// delete, descriptor change or re-entry into dictionary mode advances the
+/// epoch; appending an unrelated key does not. Clobbers `x12` and `x14`.
 pub(crate) fn emit_dictionary_layout_guard(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
@@ -1734,10 +1735,10 @@ pub(crate) fn emit_dictionary_layout_guard(
         ; .arch aarch64
         ; ldr w14, [X(header), view.object_shape_byte]
         ; cbnz w14, =>miss
-        ; ldr x14, [X(header), view.object_dictionary_shape_id_byte]
+        ; ldr w14, [X(header), view.object_dictionary_layout_byte]
     );
     emit_load_u64(ops, 12, layout);
-    dynasm!(ops ; .arch aarch64 ; cmp x14, x12 ; b.ne =>miss);
+    dynasm!(ops ; .arch aarch64 ; cmp w14, w12 ; b.ne =>miss);
 }
 
 /// Prove the realm prototype still has the expected identity and layout. On

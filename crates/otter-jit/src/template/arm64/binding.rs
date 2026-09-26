@@ -95,10 +95,10 @@ fn emit_global_object_guard(
         dynasm!(ops
             ; .arch aarch64
             ; cbnz w14, =>miss
-            ; ldr x14, [x13, view.object_dictionary_shape_id_byte]
+            ; ldr w14, [x13, view.object_dictionary_layout_byte]
         );
         emit_load_u64(ops, 11, shape);
-        dynasm!(ops ; .arch aarch64 ; cmp x14, x11 ; b.ne =>miss);
+        dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);
     } else {
         emit_load_u64(ops, 11, shape);
         dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);

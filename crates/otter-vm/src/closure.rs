@@ -209,7 +209,32 @@ pub struct JsClosureBody {
     /// closure still walks the realm's `%Function.prototype%`; a
     /// stored `Value::null()` is an explicit null prototype.
     pub proto_override: Option<Value>,
+    /// Named-lookup summary read by generated property guards: the
+    /// `CLOSURE_LOOKUP_*` bits. Exactly [`CLOSURE_LOOKUP_ORDINARY`] means a
+    /// name the closure does not own virtually resolves on the active realm's
+    /// `%Function.prototype%`.
+    pub(crate) named_lookup: u8,
 }
+
+/// [`JsClosureBody::named_lookup`] bit: the function kind's default
+/// `[[Prototype]]` is `%Function.prototype%` (not a generator or async kind).
+pub const CLOSURE_LOOKUP_ORDINARY: u8 = 1 << 0;
+/// Generated proof that a closure's named lookup is ordinary: its
+/// [`JsClosureBody::named_lookup`] byte reads exactly
+/// [`CLOSURE_LOOKUP_ORDINARY`].
+#[must_use]
+pub(crate) fn ordinary_named_lookup_guard() -> crate::jit::JitBodyGuard {
+    crate::jit::JitBodyGuard {
+        byte: otter_gc::header::HEADER_SIZE as u32 + CLOSURE_BODY_NAMED_LOOKUP_OFFSET as u32,
+        width: crate::jit::JitGuardWidth::Byte,
+        expect: u32::from(CLOSURE_LOOKUP_ORDINARY),
+    }
+}
+
+/// [`JsClosureBody::named_lookup`] bit: an own-property bag exists.
+pub const CLOSURE_LOOKUP_OWN_PROPS: u8 = 1 << 1;
+/// [`JsClosureBody::named_lookup`] bit: a `[[Prototype]]` override is installed.
+pub const CLOSURE_LOOKUP_PROTO_OVERRIDE: u8 = 1 << 2;
 
 impl otter_gc::SafeTraceable for JsClosureBody {
     const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
@@ -279,6 +304,10 @@ pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::offset_of!(JsClosure
 /// Byte offset of canonical `bound_new_target` in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET: usize =
     std::mem::offset_of!(JsClosureBody, bound_new_target);
+
+/// Byte offset of [`JsClosureBody::named_lookup`] in the payload.
+pub const CLOSURE_BODY_NAMED_LOOKUP_OFFSET: usize =
+    std::mem::offset_of!(JsClosureBody, named_lookup);
 
 /// Byte offset of canonical constructor own_props state.
 pub const CLOSURE_BODY_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, construct)
@@ -362,6 +391,7 @@ impl JsClosureBody {
             length_deleted: false,
             non_extensible: false,
             proto_override: None,
+            named_lookup: 0,
         }
     }
 
@@ -550,6 +580,14 @@ impl JsClosure {
         heap.read_payload(self.handle, JsClosureBody::eval_env_option)
     }
 
+    /// Record that this closure's function kind defaults its
+    /// `[[Prototype]]` to `%Function.prototype%`. Set once at creation.
+    pub(crate) fn mark_ordinary_lookup(self, heap: &mut GcHeap) {
+        heap.with_payload(self.handle, |body| {
+            body.named_lookup |= CLOSURE_LOOKUP_ORDINARY;
+        });
+    }
+
     /// This closure instance's own-property bag, if it has been
     /// materialized. The zero compressed handle denotes an absent bag.
     #[must_use]
@@ -564,7 +602,10 @@ impl JsClosure {
     /// closure→bag edge with the GC write barrier (the body lives in
     /// old space; the bag may be younger).
     pub fn set_own_props(self, heap: &mut GcHeap, bag: JsObject) {
-        heap.with_payload(self.handle, |body| body.construct.own_props = bag);
+        heap.with_payload(self.handle, |body| {
+            body.construct.own_props = bag;
+            body.named_lookup |= CLOSURE_LOOKUP_OWN_PROPS;
+        });
         heap.write_barrier(self.handle, bag);
     }
 
@@ -589,7 +630,10 @@ impl JsClosure {
     /// Drop the per-instance `[[Prototype]]` override, restoring the
     /// intrinsic `%Function.prototype%` walk.
     pub fn clear_proto_override(self, heap: &mut GcHeap) {
-        heap.with_payload(self.handle, |body| body.proto_override = None);
+        heap.with_payload(self.handle, |body| {
+            body.proto_override = None;
+            body.named_lookup &= !CLOSURE_LOOKUP_PROTO_OVERRIDE;
+        });
     }
 
     /// Install the per-instance `[[Prototype]]` override. The body lives
@@ -598,7 +642,10 @@ impl JsClosure {
     pub fn set_proto_override(self, heap: &mut GcHeap, proto: Value) {
         use crate::pelt::PeltField as _;
 
-        heap.with_payload(self.handle, |body| body.proto_override = Some(proto));
+        heap.with_payload(self.handle, |body| {
+            body.proto_override = Some(proto);
+            body.named_lookup |= CLOSURE_LOOKUP_PROTO_OVERRIDE;
+        });
         let mut child = proto;
         let handle = self.handle;
         let mut visit = |slot: *mut RawGc| {

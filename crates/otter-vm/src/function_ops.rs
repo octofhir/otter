@@ -51,6 +51,22 @@ pub(crate) enum BindMetadataGet {
 // Mirrors the matches! variant list used by `OrdinaryHasInstance` and
 
 impl Interpreter {
+    /// Publish a new closure's named-lookup summary: whether its function
+    /// kind defaults `[[Prototype]]` to `%Function.prototype%`.
+    fn mark_closure_lookup(
+        &mut self,
+        context: &ExecutionContext,
+        closure: crate::closure::JsClosure,
+    ) {
+        let function_id = closure.cached_function_id;
+        if self
+            .function_kind_prototype_for(context, function_id)
+            .is_none()
+        {
+            closure.mark_ordinary_lookup(&mut self.gc_heap);
+        }
+    }
+
     pub(crate) fn run_make_function_reg(
         &mut self,
         context: &ExecutionContext,
@@ -96,6 +112,7 @@ impl Interpreter {
                 Some(env),
             )
             .map_err(crate::oom_to_vm)?;
+            self.mark_closure_lookup(context, closure);
             frame.write(dst, Value::closure(closure))?;
             frame.advance_pc()?;
             return Ok(());
@@ -129,6 +146,7 @@ impl Interpreter {
             None,
         )
         .map_err(crate::oom_to_vm)?;
+        self.mark_closure_lookup(context, closure);
         frame.write(dst, Value::closure(closure))?;
         frame.advance_pc()?;
         Ok(())
@@ -249,6 +267,7 @@ impl Interpreter {
             eval_env,
         )
         .map_err(crate::oom_to_vm)?;
+        self.mark_closure_lookup(context, closure);
         frame.write(dst, Value::closure(closure))?;
         frame.advance_pc()?;
         Ok(())

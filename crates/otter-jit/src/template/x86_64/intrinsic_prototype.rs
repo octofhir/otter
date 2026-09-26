@@ -1,8 +1,9 @@
 //! Shared x86-64 receiver proofs for intrinsic-prototype CacheIR loads.
 //!
 //! # Contents
-//! - [`emit`] validates the cell type and optional instance latch, then loads
-//!   the pinned realm prototype used by Template and Machine property programs.
+//! - [`emit`] validates the cell type, optional instance latch and optional
+//!   active-realm id, then loads the pinned realm prototype used by Template
+//!   and Machine property programs.
 //!
 //! # Invariants
 //! - Receiver checks precede every body read; misses have no effects.
@@ -70,6 +71,18 @@ pub(crate) fn emit(
             ; .arch x64
             ; mov r8d, guard.expect as i32
             ; cmp r10, r8
+            ; jne =>miss
+        );
+    }
+    if let Some(realm) = target.active_realm {
+        // Both x86-64 tiers keep the native context in `r15`.
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov r10, [r10 + crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
+            ; test r10, r10
+            ; jz =>miss
+            ; cmp DWORD [r10], realm as i32
             ; jne =>miss
         );
     }

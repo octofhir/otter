@@ -262,6 +262,7 @@ mod tests {
                 otter_vm::JitGuardWidth::Word32,
             )),
             proto_offset: 0x1000,
+            active_realm: None,
         };
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
             let mut hir = super::super::tests::property_selection_hir();

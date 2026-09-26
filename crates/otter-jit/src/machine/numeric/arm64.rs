@@ -2013,6 +2013,7 @@ pub(super) fn emit(
                     view,
                     target,
                     byte_pc,
+                    19,
                     miss,
                 );
                 dynasm!(ops ; .arch aarch64 ; mov x10, x15 ; movz w11, 1 ; b =>done ; =>miss);

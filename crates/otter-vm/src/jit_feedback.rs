@@ -74,15 +74,16 @@ const ARITH_WIDEN_FLOAT: u8 = 1 << 7;
 
 const ELEMENT_UNSEEN: u8 = 0;
 const ELEMENT_DENSE_TAGGED: u8 = 1;
-const ELEMENT_TYPED_INT32: u8 = 2;
-const ELEMENT_TYPED_FLOAT64: u8 = 3;
-const ELEMENT_GENERIC: u8 = 4;
-const ELEMENT_DENSE_FLOAT64: u8 = 5;
-const ELEMENT_MASK: u8 = 0b0000_0111;
+const ELEMENT_DENSE_FLOAT64: u8 = 2;
+const ELEMENT_GENERIC: u8 = 3;
+/// `ELEMENT_TYPED_BASE + kind` for the nine converted typed-array kinds
+/// (`Int8` = 0 … `Float64` = 8).
+const ELEMENT_TYPED_BASE: u8 = 4;
+const ELEMENT_MASK: u8 = 0b0000_1111;
 
-const CALL_ATTEMPTED_SEEN: u8 = 1 << 3;
-const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
-const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
+const CALL_ATTEMPTED_SEEN: u8 = 1 << 4;
+const BRANCH_TAKEN_SEEN: u8 = 1 << 5;
+const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 6;
 
 /// Material transition made while recording an ordinary call target.
 ///
@@ -828,8 +829,10 @@ impl InstructionFeedback {
             Family::Unseen => None,
             Family::DenseTagged => Some(ELEMENT_DENSE_TAGGED),
             Family::DenseFloat64 => Some(ELEMENT_DENSE_FLOAT64),
-            Family::TypedInt32 => Some(ELEMENT_TYPED_INT32),
-            Family::TypedFloat64 => Some(ELEMENT_TYPED_FLOAT64),
+            Family::Typed(kind) => Some(match crate::jit::JitElementRepr::for_typed_kind(kind) {
+                Some(_) => ELEMENT_TYPED_BASE + kind as u8,
+                None => ELEMENT_GENERIC,
+            }),
             Family::Generic => Some(ELEMENT_GENERIC),
         };
         let mut states = self.states.load(Ordering::Relaxed);
@@ -865,9 +868,11 @@ impl InstructionFeedback {
         match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
             ELEMENT_DENSE_TAGGED => Family::DenseTagged,
             ELEMENT_DENSE_FLOAT64 => Family::DenseFloat64,
-            ELEMENT_TYPED_INT32 => Family::TypedInt32,
-            ELEMENT_TYPED_FLOAT64 => Family::TypedFloat64,
             ELEMENT_GENERIC => Family::Generic,
+            code if (ELEMENT_TYPED_BASE..=ELEMENT_TYPED_BASE + 8).contains(&code) => {
+                crate::binary::TypedArrayKind::from_u32(u32::from(code - ELEMENT_TYPED_BASE))
+                    .map_or(Family::Generic, Family::Typed)
+            }
             _ => Family::Unseen,
         }
     }

@@ -2716,13 +2716,22 @@ pub(super) fn emit(
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
+                // A raw double operand is selected only for packed-double
+                // Array stores and needs no guard; every other store value is
+                // tagged and proves it is storable in the view's representation.
+                let value_is_float = sequence.representations()
+                    [instruction.operands[1].value.0 as usize]
+                    == MachineRepresentation::Float64;
+                if value_is_float && access.element != otter_vm::JitElementRepr::Float64 {
+                    return Err(Unsupported::OperandShape("scalar raw double element store"));
+                }
                 emit_load_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
                 if access.element == otter_vm::JitElementRepr::Boxed {
                     emit_element_read(&mut ops, access.element, miss);
                 }
-                if access.element != otter_vm::JitElementRepr::Float64 {
+                if !value_is_float {
                     emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                     emit_element_write_guard(&mut ops, access.element, miss);
                 }
@@ -2746,16 +2755,19 @@ pub(super) fn emit(
                             "scalar element value store access",
                         ))?;
                 let start = ops.offset().0;
+                let value_is_float = sequence.representations()
+                    [instruction.operands[1].value.0 as usize]
+                    == MachineRepresentation::Float64;
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
-                match access.element {
-                    otter_vm::JitElementRepr::Float64 => {
-                        let source = float_register(locations[1])?;
-                        dynasm!(ops ; .arch aarch64 ; str D(source), [x16]);
+                if value_is_float {
+                    if access.element != otter_vm::JitElementRepr::Float64 {
+                        return Err(Unsupported::OperandShape("scalar raw double element store"));
                     }
-                    _ => {
-                        emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
-                        emit_element_write_proven(&mut ops, access.element);
-                    }
+                    let source = float_register(locations[1])?;
+                    dynasm!(ops ; .arch aarch64 ; str D(source), [x16]);
+                } else {
+                    emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
+                    emit_element_write_proven(&mut ops, access.element);
                 }
                 structural_regions.push((
                     "machineElementValueStore",

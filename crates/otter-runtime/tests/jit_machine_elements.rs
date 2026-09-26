@@ -9,6 +9,8 @@
 //!   an inherited index while the reusable Machine generation stays installed.
 //! - Fixed-length typed-array load/store misses after resizable-buffer
 //!   shrinkage, including regrowth proof that an out-of-bounds store never ran.
+//! - Narrow integer and Float32 typed views stay in generated code in both the
+//!   template and the optimizing tier.
 //! - A generated constructor with fresh capture cells between element
 //!   accesses, covering allocator-root refresh, direct-call linkage state, and
 //!   a direct Machine IR read of the captured constructor binding.
@@ -608,4 +610,45 @@ fn element_roots_survive_generated_constructor_capture_initialization() {
         compiled.optimized_deopts, 0,
         "generated constructor linkage must preserve Machine element roots: {compiled:?}"
     );
+}
+
+#[test]
+fn narrow_and_float32_typed_elements_stay_in_generated_code() {
+    for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
+        let mut runtime = runtime(selection);
+        runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    r#"
+var heap8 = new Uint8Array(4096), heap16 = new Int16Array(2048), heapf = new Float32Array(1024);
+function pump(n) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    heap8[i & 4095] = i;
+    heap16[i & 2047] = -i;
+    heapf[i & 1023] = i * 0.5;
+    t += heap8[(i * 7) & 4095] + heap16[i & 2047] + heapf[i & 1023];
+  }
+  return t;
+}
+for (var k = 0; k < 60; k++) pump(4096);
+"#,
+                ),
+                "typed-kinds-warm.js",
+            )
+            .unwrap();
+        let before = runtime.execution_stats();
+        runtime
+            .run_script(
+                SourceInput::from_javascript("pump(100000)"),
+                "typed-kinds-run.js",
+            )
+            .unwrap();
+        let after = runtime.execution_stats();
+        let stubs = after.jit_runtime_property_stubs - before.jit_runtime_property_stubs;
+        assert!(
+            stubs < 1_000,
+            "{selection:?}: {stubs} element accesses left generated code"
+        );
+    }
 }

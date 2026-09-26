@@ -949,14 +949,12 @@ impl Interpreter {
                 .feedback_at(pc as usize)
                 .map_or(jit::JitElementFamily::Unseen, |cell| cell.element_family());
             let access = match family {
-                jit::JitElementFamily::TypedInt32 => Self::typed_element_access(
-                    crate::binary::TypedArrayKind::Int32,
-                    jit::JitElementRepr::Int32,
-                ),
-                jit::JitElementFamily::TypedFloat64 => Self::typed_element_access(
-                    crate::binary::TypedArrayKind::Float64,
-                    jit::JitElementRepr::Float64,
-                ),
+                jit::JitElementFamily::Typed(kind) => {
+                    let Some(element) = jit::JitElementRepr::for_typed_kind(kind) else {
+                        continue;
+                    };
+                    Self::typed_element_access(kind, element)
+                }
                 jit::JitElementFamily::DenseTagged => Self::dense_element_access(
                     jit::JitElementRepr::Boxed,
                     crate::array::DENSE_ELEMENT_KIND_TAGGED,

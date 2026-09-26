@@ -980,7 +980,16 @@ where
                 ; cbnz w15, =>miss
                 ; ldr x15, [x13, view_offset_byte]
             );
+            // Byte extent of the view: length << stride, rejecting a length
+            // whose extent overflows 64 bits.
             match shift {
+                0 => dynasm!(ops ; .arch aarch64 ; mov x12, x14),
+                1 => dynasm!(ops
+                    ; .arch aarch64
+                    ; lsr x12, x14, #63
+                    ; cbnz x12, =>miss
+                    ; lsl x12, x14, #1
+                ),
                 2 => dynasm!(ops
                     ; .arch aarch64
                     ; lsr x12, x14, #62
@@ -1053,6 +1062,8 @@ where
         ),
     }
     match access.element.stride_shift() {
+        0 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw),
+        1 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #1),
         2 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #2),
         _ => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #3),
     }
@@ -1100,8 +1111,10 @@ where
 ///
 /// A boxed hole is an absent property — the prototype chain answers a read, and
 /// a prototype setter may observe a write — so it is a guard failure. A scalar
-/// element has no such state and always produces a value. Clobbers `x10`–`x12`,
-/// `x14`, `x15`, `d30`, and `d31`.
+/// element has no such state and always produces a value; narrow integer
+/// kinds extend into an int32 box, `Uint32` and `Float32` box through the
+/// canonical number encoding. Clobbers `x10`–`x12`, `x14`, `x15`, `d30`, and
+/// `d31`.
 pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
     match element {
         JitElementRepr::Boxed => {
@@ -1118,6 +1131,34 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
             // payload is the low 32 bits and the tag occupies the top.
             dynasm!(ops ; .arch aarch64 ; ldr w9, [x16]);
             emit_box_int32(ops, 9, 11);
+        }
+        // Narrow loads sign- or zero-extend into the W register, whose write
+        // clears the upper half: exactly the int32 box payload.
+        JitElementRepr::Int8 => {
+            dynasm!(ops ; .arch aarch64 ; ldrsb w9, [x16]);
+            emit_box_int32(ops, 9, 11);
+        }
+        JitElementRepr::Uint8 | JitElementRepr::Uint8Clamped => {
+            dynasm!(ops ; .arch aarch64 ; ldrb w9, [x16]);
+            emit_box_int32(ops, 9, 11);
+        }
+        JitElementRepr::Int16 => {
+            dynasm!(ops ; .arch aarch64 ; ldrsh w9, [x16]);
+            emit_box_int32(ops, 9, 11);
+        }
+        JitElementRepr::Uint16 => {
+            dynasm!(ops ; .arch aarch64 ; ldrh w9, [x16]);
+            emit_box_int32(ops, 9, 11);
+        }
+        JitElementRepr::Uint32 => {
+            // Values above i32::MAX are not int32s: convert exactly and let
+            // the canonical number box pick the representation.
+            dynasm!(ops ; .arch aarch64 ; ldr w9, [x16] ; ucvtf d31, w9);
+            emit_box_number_with_scratch(ops, 31, 9, 30);
+        }
+        JitElementRepr::Float32 => {
+            dynasm!(ops ; .arch aarch64 ; ldr s31, [x16] ; fcvt d31, s31);
+            emit_box_number_with_scratch(ops, 31, 9, 30);
         }
         JitElementRepr::Float64 => {
             // Match `NumberValue::from_f64`: exact int32 values use the Smi
@@ -1159,15 +1200,33 @@ pub(crate) fn emit_element_write_guard(
             // A heap cell would owe the generational barrier only the stub runs.
             emit_cell_test(ops, 9, 11, CellTest::IsCell, miss);
         }
-        JitElementRepr::Int32 => {
-            // Only a value already boxed as an int32 stores exactly. A double
-            // would owe `ToInt32`, whose modular truncation is not `fcvtzs`.
+        JitElementRepr::Int8
+        | JitElementRepr::Uint8
+        | JitElementRepr::Uint8Clamped
+        | JitElementRepr::Int16
+        | JitElementRepr::Uint16
+        | JitElementRepr::Int32
+        | JitElementRepr::Uint32 => {
+            // Only a value already boxed as an int32 stores exactly: its low
+            // bits are the modular `ToInt8`…`ToUint32` result (and the clamp
+            // is exact on an int32). A double would owe the modular
+            // truncation, which is not `fcvtzs`.
             dynasm!(ops
                 ; .arch aarch64
                 ; lsr x11, x9, #48
                 ; movz x12, NUMBER_TAG_HI16
                 ; cmp x11, x12
                 ; b.ne =>miss
+            );
+        }
+        JitElementRepr::Float32 => {
+            // Any number stores: an int32 converts exactly through `scvtf`,
+            // a double rounds through `fcvt` (both are §6.1.6.1 ToFloat32).
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz x11, NUMBER_TAG_HI16, lsl #48
+                ; tst x9, x11
+                ; b.eq =>miss
             );
         }
         JitElementRepr::Float64 => {
@@ -1192,10 +1251,44 @@ pub(crate) fn emit_element_write_guard(
 /// Store boxed value `x9` after [`emit_element_write_guard`] succeeded.
 ///
 /// The operation contains no condition or exit. `x16` is the proved address.
+/// Clobbers `x9`, `x11`, `x12`, `x14` and `d31`.
 pub(crate) fn emit_element_write_proven(ops: &mut Assembler, element: JitElementRepr) {
     match element {
         JitElementRepr::Boxed => dynasm!(ops ; .arch aarch64 ; str x9, [x16]),
-        JitElementRepr::Int32 => dynasm!(ops ; .arch aarch64 ; str w9, [x16]),
+        JitElementRepr::Int8 | JitElementRepr::Uint8 => {
+            dynasm!(ops ; .arch aarch64 ; strb w9, [x16]);
+        }
+        JitElementRepr::Uint8Clamped => dynasm!(ops
+            ; .arch aarch64
+            ; cmp w9, #0
+            ; csel w9, wzr, w9, lt
+            ; mov w11, #255
+            ; cmp w9, w11
+            ; csel w9, w11, w9, gt
+            ; strb w9, [x16]
+        ),
+        JitElementRepr::Int16 | JitElementRepr::Uint16 => {
+            dynasm!(ops ; .arch aarch64 ; strh w9, [x16]);
+        }
+        JitElementRepr::Int32 | JitElementRepr::Uint32 => {
+            dynasm!(ops ; .arch aarch64 ; str w9, [x16]);
+        }
+        JitElementRepr::Float32 => dynasm!(ops
+            ; .arch aarch64
+            ; lsr x12, x9, #48
+            ; movz x14, NUMBER_TAG_HI16
+            ; cmp x12, x14
+            ; b.ne >double
+            ; scvtf s31, w9
+            ; b >store
+            ; double:
+            ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
+            ; sub x11, x9, x11
+            ; fmov d31, x11
+            ; fcvt s31, d31
+            ; store:
+            ; str s31, [x16]
+        ),
         JitElementRepr::Float64 => dynasm!(ops
             ; .arch aarch64
             ; movz x11, DOUBLE_OFFSET_HI16, lsl #48

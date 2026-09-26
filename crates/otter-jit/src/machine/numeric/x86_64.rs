@@ -1634,6 +1634,38 @@ pub(super) fn emit(
                         load64(&mut ops, 11, NUMBER_TAG);
                         dynasm!(ops ; .arch x64 ; or r10, r11);
                     }
+                    // Narrow loads extend into the 32-bit register, whose write
+                    // clears the upper half: exactly the int32 box payload.
+                    otter_vm::jit::JitElementRepr::Int8 => {
+                        dynasm!(ops ; .arch x64 ; movsx r10d, BYTE [r8]);
+                        load64(&mut ops, 11, NUMBER_TAG);
+                        dynasm!(ops ; .arch x64 ; or r10, r11);
+                    }
+                    otter_vm::jit::JitElementRepr::Uint8
+                    | otter_vm::jit::JitElementRepr::Uint8Clamped => {
+                        dynasm!(ops ; .arch x64 ; movzx r10d, BYTE [r8]);
+                        load64(&mut ops, 11, NUMBER_TAG);
+                        dynasm!(ops ; .arch x64 ; or r10, r11);
+                    }
+                    otter_vm::jit::JitElementRepr::Int16 => {
+                        dynasm!(ops ; .arch x64 ; movsx r10d, WORD [r8]);
+                        load64(&mut ops, 11, NUMBER_TAG);
+                        dynasm!(ops ; .arch x64 ; or r10, r11);
+                    }
+                    otter_vm::jit::JitElementRepr::Uint16 => {
+                        dynasm!(ops ; .arch x64 ; movzx r10d, WORD [r8]);
+                        load64(&mut ops, 11, NUMBER_TAG);
+                        dynasm!(ops ; .arch x64 ; or r10, r11);
+                    }
+                    otter_vm::jit::JitElementRepr::Uint32 => {
+                        // The zero-extended 64-bit integer converts exactly.
+                        dynasm!(ops ; .arch x64 ; mov r10d, [r8] ; cvtsi2sd xmm14, r10);
+                        box_number(&mut ops, 14, 10);
+                    }
+                    otter_vm::jit::JitElementRepr::Float32 => {
+                        dynasm!(ops ; .arch x64 ; cvtss2sd xmm14, DWORD [r8]);
+                        box_number(&mut ops, 14, 10);
+                    }
                     otter_vm::jit::JitElementRepr::Float64 => {
                         dynasm!(ops ; .arch x64 ; movsd xmm14, [r8]);
                         box_number(&mut ops, 14, 10);
@@ -1664,17 +1696,34 @@ pub(super) fn emit(
                     load64(&mut ops, 11, Value::hole().to_bits());
                     dynasm!(ops ; .arch x64 ; cmp r10, r11 ; je =>miss);
                 }
-                if access.element != otter_vm::jit::JitElementRepr::Float64 {
+                // A raw double operand is selected only for packed-double
+                // Array stores and needs no guard; every other store value is
+                // tagged and proves it is storable in the view's representation.
+                if !element_value_is_float(sequence, instruction, &access)? {
                     load_integer(&mut ops, frame, loc[1], 10)?;
                     match access.element {
                         otter_vm::jit::JitElementRepr::Boxed => {
                             load64(&mut ops, 11, NOT_CELL_MASK);
                             dynasm!(ops ; .arch x64 ; test r10, r11 ; jz =>miss);
                         }
-                        otter_vm::jit::JitElementRepr::Int32 => {
+                        element if element.stores_int32() => {
                             dynasm!(ops ; .arch x64 ; mov r11, r10 ; shr r11, 48 ; cmp r11w, NUMBER_TAG_HI16 as i16 ; jne =>miss);
                         }
-                        otter_vm::jit::JitElementRepr::Float64 => unreachable!(),
+                        otter_vm::jit::JitElementRepr::Float32 => {
+                            dynasm!(ops ; .arch x64 ; mov r11, r10 ; shr r11, 48 ; test r11w, NUMBER_TAG_HI16 as i16 ; jz =>miss);
+                        }
+                        _ => {
+                            // Float64: a boxed double, not an int32.
+                            dynasm!(ops
+                                ; .arch x64
+                                ; mov r11, r10
+                                ; shr r11, 48
+                                ; cmp r11w, NUMBER_TAG_HI16 as i16
+                                ; je =>miss
+                                ; test r11w, NUMBER_TAG_HI16 as i16
+                                ; jz =>miss
+                            );
+                        }
                     }
                 }
                 dynasm!(ops
@@ -1697,18 +1746,53 @@ pub(super) fn emit(
                 let access = element_access(view, byte_pc)?;
                 let start = ops.offset().0;
                 load_integer(&mut ops, frame, loc[0], 11)?;
-                match access.element {
-                    otter_vm::jit::JitElementRepr::Boxed => {
-                        load_integer(&mut ops, frame, loc[1], 10)?;
-                        dynasm!(ops ; .arch x64 ; mov [r11], r10);
-                    }
-                    otter_vm::jit::JitElementRepr::Int32 => {
-                        load_integer(&mut ops, frame, loc[1], 10)?;
-                        dynasm!(ops ; .arch x64 ; mov [r11], r10d);
-                    }
-                    otter_vm::jit::JitElementRepr::Float64 => {
-                        load_float(&mut ops, frame, loc[1], 14)?;
-                        dynasm!(ops ; .arch x64 ; movsd [r11], xmm14);
+                if element_value_is_float(sequence, instruction, &access)? {
+                    load_float(&mut ops, frame, loc[1], 14)?;
+                    dynasm!(ops ; .arch x64 ; movsd [r11], xmm14);
+                } else {
+                    load_integer(&mut ops, frame, loc[1], 10)?;
+                    match access.element {
+                        otter_vm::jit::JitElementRepr::Boxed => {
+                            dynasm!(ops ; .arch x64 ; mov [r11], r10);
+                        }
+                        otter_vm::jit::JitElementRepr::Int8
+                        | otter_vm::jit::JitElementRepr::Uint8 => {
+                            dynasm!(ops ; .arch x64 ; mov [r11], r10b);
+                        }
+                        otter_vm::jit::JitElementRepr::Uint8Clamped => dynasm!(ops
+                            ; .arch x64
+                            ; xor r9d, r9d
+                            ; cmp r10d, 0
+                            ; cmovl r10d, r9d
+                            ; mov r9d, 255
+                            ; cmp r10d, r9d
+                            ; cmovg r10d, r9d
+                            ; mov [r11], r10b
+                        ),
+                        otter_vm::jit::JitElementRepr::Int16
+                        | otter_vm::jit::JitElementRepr::Uint16 => {
+                            dynasm!(ops ; .arch x64 ; mov [r11], r10w);
+                        }
+                        otter_vm::jit::JitElementRepr::Int32
+                        | otter_vm::jit::JitElementRepr::Uint32 => {
+                            dynasm!(ops ; .arch x64 ; mov [r11], r10d);
+                        }
+                        otter_vm::jit::JitElementRepr::Float32 => {
+                            // The guard proved a number; decoding cannot miss.
+                            let unreachable = ops.new_dynamic_label();
+                            dynasm!(ops ; .arch x64 ; mov r8, r11);
+                            decode_number(&mut ops, 10, 14, unreachable);
+                            dynasm!(ops
+                                ; .arch x64
+                                ; =>unreachable
+                                ; cvtsd2ss xmm14, xmm14
+                                ; movss [r8], xmm14
+                            );
+                        }
+                        otter_vm::jit::JitElementRepr::Float64 => {
+                            load64(&mut ops, 9, DOUBLE_OFFSET);
+                            dynasm!(ops ; .arch x64 ; sub r10, r9 ; mov [r11], r10);
+                        }
                     }
                 }
                 structural_regions.push((
@@ -2923,6 +3007,26 @@ fn decode_number(ops: &mut Assembler, src: u8, dst: u8, bail: DynamicLabel) {
         ; psubq Rx(dst), xmm15
         ; =>done
     );
+}
+
+/// Whether an element store's value operand is the raw double selected for a
+/// packed-double Array store. Such a value is never guarded; a raw double for
+/// any other representation is a selection contract violation.
+fn element_value_is_float(
+    sequence: &InstructionSequence,
+    instruction: &super::super::MachineInstruction,
+    access: &otter_vm::JitElementAccess,
+) -> Result<bool, Unsupported> {
+    let value = instruction
+        .operands
+        .get(1)
+        .ok_or(Unsupported::OperandShape("x86-64 element store value"))?;
+    let is_float =
+        sequence.representations()[value.value.0 as usize] == MachineRepresentation::Float64;
+    if is_float && access.element != otter_vm::jit::JitElementRepr::Float64 {
+        return Err(Unsupported::OperandShape("x86-64 raw double element store"));
+    }
+    Ok(is_float)
 }
 
 fn guard_int32(ops: &mut Assembler, src: u8, bail: DynamicLabel) {
@@ -4684,9 +4788,23 @@ fn element_view(
                 ; cmp BYTE [rax + detached_byte as i32], 0
                 ; jne =>miss
                 ; mov rdx, [r11 + view_offset_byte as i32]
+            );
+            // Byte extent of the view: length << stride, rejecting a length
+            // whose extent overflows 64 bits (`shl` sets OF only for 1-bit
+            // shifts, so the discarded high bits are tested explicitly).
+            let shift = access.element.stride_shift() as i8;
+            if shift != 0 {
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r10, r9
+                    ; shr r10, 64 - shift
+                    ; jnz =>miss
+                );
+            }
+            dynasm!(ops
+                ; .arch x64
                 ; mov r10, r9
-                ; shl r10, access.element.stride_shift() as i8
-                ; jo =>miss
+                ; shl r10, shift
                 ; add r10, rdx
                 ; jc =>miss
                 ; cmp r10, [rax + byte_len_byte as i32]

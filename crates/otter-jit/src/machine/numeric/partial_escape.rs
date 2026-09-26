@@ -456,6 +456,8 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         | N::TaggedConstant(_)
         | N::This
         | N::StringConstantCell { .. }
+        | N::BindingGuardedRead { .. }
+        | N::ElementUnseenExit { .. }
         | N::ColdCallExit { .. }
         | N::IntegerConstant(_)
         | N::BooleanConstant(_)
@@ -500,8 +502,17 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         }
         N::ElementLoad {
             receiver, index, ..
+        }
+        | N::ElementGuardedLoad {
+            receiver, index, ..
         } => inputs.extend([receiver, index]),
         N::ElementStore {
+            receiver,
+            index,
+            value,
+            ..
+        }
+        | N::ElementGuardedStore {
             receiver,
             index,
             value,
@@ -705,11 +716,20 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         }
         N::ElementLoad {
             receiver, index, ..
+        }
+        | N::ElementGuardedLoad {
+            receiver, index, ..
         } => {
             replacement(receiver);
             replacement(index);
         }
         N::ElementStore {
+            receiver,
+            index,
+            value,
+            ..
+        }
+        | N::ElementGuardedStore {
             receiver,
             index,
             value,
@@ -772,6 +792,8 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         | N::TaggedConstant(_)
         | N::This
         | N::StringConstantCell { .. }
+        | N::BindingGuardedRead { .. }
+        | N::ElementUnseenExit { .. }
         | N::LiteralAllocation { .. }
         | N::ColdCallExit { .. }
         | N::IntegerConstant(_)

@@ -1092,6 +1092,165 @@ fn select_with_loop_entries(
                 )?;
                 continue;
             }
+            if let NumericNode::ElementUnseenExit { .. } = node {
+                let never = push_value(&mut representations, MachineRepresentation::Boolean);
+                instructions.push(MachineInstruction::plain(
+                    MachineOpcode::BooleanConstant(false),
+                    vec![MachineOperand::register_output(never)],
+                ));
+                let point = NumericFramePoint::Node(node_value);
+                let mut exit = MachineInstruction::plain(
+                    MachineOpcode::GuardCondition,
+                    vec![MachineOperand::register_input(never)],
+                );
+                exit.clobbers = target_spec
+                    .clobbers(TargetClobberSet::StatusScratch)
+                    .to_vec();
+                attach_frame_state(
+                    hir,
+                    &values,
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &mut exit,
+                );
+                instructions.push(exit);
+                instructions.push(MachineInstruction::plain(
+                    MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                    vec![MachineOperand::register_output(machine_value(
+                        &values, node_value,
+                    ))],
+                ));
+                continue;
+            }
+            if let NumericNode::BindingGuardedRead {
+                semantics,
+                target,
+                byte_pc,
+            } = node
+            {
+                let target = machine_binding_target(target);
+                let condition = push_value(&mut representations, MachineRepresentation::Boolean);
+                let owner = push_value(&mut representations, MachineRepresentation::Int64);
+                let storage = push_value(&mut representations, MachineRepresentation::Int64);
+                let mut guard = MachineInstruction::plain(
+                    MachineOpcode::BindingGuard {
+                        byte_pc,
+                        semantics,
+                        target,
+                    },
+                    vec![
+                        MachineOperand::register_output(condition),
+                        MachineOperand::register_output(owner),
+                        MachineOperand::register_output(storage),
+                    ],
+                );
+                guard.clobbers = binding_guard_clobbers(target_spec);
+                instructions.push(guard);
+                let point = NumericFramePoint::Node(node_value);
+                let mut require = MachineInstruction::plain(
+                    MachineOpcode::GuardCondition,
+                    vec![MachineOperand::register_input(condition)],
+                );
+                require.clobbers = target_spec
+                    .clobbers(TargetClobberSet::StatusScratch)
+                    .to_vec();
+                attach_frame_state(
+                    hir,
+                    &values,
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &mut require,
+                );
+                instructions.push(require);
+                let mut operands = vec![
+                    MachineOperand::location_input(owner),
+                    MachineOperand::location_input(storage),
+                ];
+                if semantics.result_operand().is_some() {
+                    operands.push(MachineOperand::register_output(machine_value(
+                        &values, node_value,
+                    )));
+                }
+                let mut hit = MachineInstruction::plain(
+                    MachineOpcode::BindingHit {
+                        byte_pc,
+                        semantics,
+                        target,
+                    },
+                    operands,
+                );
+                hit.clobbers = binding_hit_clobbers(target_spec);
+                instructions.push(hit);
+                continue;
+            }
+            if let NumericNode::ElementGuardedLoad {
+                receiver,
+                index,
+                byte_pc,
+                access,
+            }
+            | NumericNode::ElementGuardedStore {
+                receiver,
+                index,
+                byte_pc,
+                access,
+                ..
+            } = node
+            {
+                let stored = match node {
+                    NumericNode::ElementGuardedStore { value, .. } => Some(value),
+                    _ => None,
+                };
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                let index = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    index,
+                );
+                let stored_fast = stored.map(|value| {
+                    if access == NumericElementAccess::PackedDouble
+                        && hir.nodes[value.0].value_type() == NumericType::Number
+                    {
+                        machine_value(&values, value)
+                    } else {
+                        tagged_call_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            value,
+                        )
+                    }
+                });
+                let point = NumericFramePoint::Node(node_value);
+                element_cfg::select_guarded(
+                    target_spec,
+                    hir,
+                    byte_pc,
+                    access,
+                    element_cfg::Inputs {
+                        receiver,
+                        index,
+                        stored_fast,
+                        stored_tagged: None,
+                    },
+                    stored.is_none().then(|| machine_value(&values, node_value)),
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                )?;
+                continue;
+            }
             if let NumericNode::PropertyShapeLoad {
                 receiver,
                 byte_pc,
@@ -1971,6 +2130,13 @@ fn select_with_loop_entries(
                 }
                 NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. } => {
                     unreachable!("element nodes select their explicit CFG before ordinary nodes")
+                }
+                NumericNode::ElementGuardedLoad { .. }
+                | NumericNode::ElementGuardedStore { .. } => {
+                    unreachable!("speculative element accesses select before ordinary nodes")
+                }
+                NumericNode::BindingGuardedRead { .. } | NumericNode::ElementUnseenExit { .. } => {
+                    unreachable!("speculative binding and unseen element sites select first")
                 }
                 NumericNode::ArrayConstruct { length, byte_pc: _ } => {
                     if hir.nodes[length.0].value_type() != NumericType::Int32 {
@@ -4097,6 +4263,12 @@ fn frame_state_exits(
             NumericNode::ConstructorFieldStore { .. } | NumericNode::PropertyShapeLoad { .. } => {
                 &[(ExitReason::ShapeGuard, ExitAction::Recompile)]
             }
+            NumericNode::ElementGuardedLoad { .. }
+            | NumericNode::ElementGuardedStore { .. }
+            | NumericNode::BindingGuardedRead { .. }
+            | NumericNode::ElementUnseenExit { .. } => {
+                &[(ExitReason::TypeMismatch, ExitAction::Recompile)]
+            }
             NumericNode::TaggedToNumber(..)
             | NumericNode::TaggedToInt32(..)
             | NumericNode::ClassSuperConstructor(..)
@@ -4466,12 +4638,17 @@ fn exceptional_hir_edge_source(
     })
 }
 
+/// Every `(predecessor, edge)` naming `successor`, in predecessor and edge
+/// order. Only the block's recorded predecessors are visited, so the query
+/// costs their edges rather than a scan of the whole function.
 fn incoming_edges(hir: &NumericFunction, successor: usize) -> Vec<(usize, usize)> {
-    hir.blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(predecessor, block)| {
-            block
+    let mut predecessors = hir.blocks[successor].predecessors.clone();
+    predecessors.sort_unstable();
+    predecessors.dedup();
+    let edges = predecessors
+        .into_iter()
+        .flat_map(|predecessor| {
+            hir.blocks[predecessor]
                 .successors
                 .iter()
                 .enumerate()
@@ -4479,7 +4656,20 @@ fn incoming_edges(hir: &NumericFunction, successor: usize) -> Vec<(usize, usize)
                     (target == successor).then_some((predecessor, edge))
                 })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    debug_assert_eq!(
+        edges.len(),
+        hir.blocks
+            .iter()
+            .map(|block| block
+                .successors
+                .iter()
+                .filter(|&&target| target == successor)
+                .count())
+            .sum::<usize>(),
+        "HIR predecessor lists name every incoming edge"
+    );
+    edges
 }
 
 fn is_critical_edge(hir: &NumericFunction, predecessor: usize, successor: usize) -> bool {
@@ -7628,6 +7818,10 @@ mod tests {
                 writable: true,
             },
         );
+        // A binding site that already left an optimized generation selects the
+        // committed hit/cold pair instead of the speculative guarded read.
+        view.optimized_exit_reasons
+            .extend([0, 1].map(|pc| (pc, [ExitReason::TypeMismatch].into())));
         NumericFunction::build(&view).expect("typed binding HIR")
     }
 
@@ -7830,6 +8024,8 @@ mod tests {
                 writable: true,
             },
         );
+        view.optimized_exit_reasons
+            .extend([0, 1].map(|pc| (pc, [ExitReason::TypeMismatch].into())));
         NumericFunction::build(&view).expect("binding-to-deopt HIR")
     }
 

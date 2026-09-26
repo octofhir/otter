@@ -231,6 +231,20 @@ pub(super) enum NumericNode {
         byte_pc: u32,
         exceptional_edge: Option<u16>,
     },
+    /// An indexed site that has never executed: reaching it deoptimizes, as
+    /// V8 does on insufficient feedback, so the next generation compiles it
+    /// from the feedback the interpreter then records.
+    ElementUnseenExit {
+        byte_pc: u32,
+    },
+    /// Speculative binding read through its generated cell proof: a failed
+    /// proof deoptimizes before any effect instead of completing in a cold
+    /// call, so the loop around it owns no call.
+    BindingGuardedRead {
+        semantics: BindingSemantics,
+        target: NumericBindingTarget,
+        byte_pc: u32,
+    },
     StringConstantCell {
         byte_pc: u32,
         target: otter_vm::jit::JitStringConstantCell,
@@ -282,6 +296,24 @@ pub(super) enum NumericNode {
         byte_pc: u32,
         access: Option<NumericElementAccess>,
         exceptional_edge: Option<u16>,
+    },
+    /// Speculative indexed read: a failed view, bounds or slot proof
+    /// deoptimizes before any effect and the interpreter re-executes the
+    /// load, so the loop around it owns no cold call.
+    ElementGuardedLoad {
+        receiver: NumericValue,
+        index: NumericValue,
+        byte_pc: u32,
+        access: NumericElementAccess,
+    },
+    /// Speculative indexed write with the same exit discipline: the store
+    /// happens only after every proof held.
+    ElementGuardedStore {
+        receiver: NumericValue,
+        index: NumericValue,
+        value: NumericValue,
+        byte_pc: u32,
+        access: NumericElementAccess,
     },
     LiteralAllocation {
         target: otter_vm::native_abi::RuntimeStubDescriptor,
@@ -609,6 +641,10 @@ impl NumericNode {
             | Self::PropertyShapeLoad { .. }
             | Self::PropertyStore { .. }
             | Self::ElementStore { .. }
+            | Self::ElementGuardedLoad { .. }
+            | Self::ElementGuardedStore { .. }
+            | Self::BindingGuardedRead { .. }
+            | Self::ElementUnseenExit { .. }
             | Self::ArrayConstruct { .. }
             | Self::LiteralAllocation { .. }
             | Self::TaggedStringConcat(..)
@@ -699,6 +735,10 @@ impl NumericNode {
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyShapeLoad { .. }
+            | Self::ElementGuardedLoad { .. }
+            | Self::ElementGuardedStore { .. }
+            | Self::BindingGuardedRead { .. }
+            | Self::ElementUnseenExit { .. }
             | Self::ArrayConstruct { .. }
             | Self::DirectCall { .. }
             | Self::NativeCall { .. }
@@ -2416,6 +2456,7 @@ fn lower_binding(
     logical_pc: u32,
     binding_hit_proofs: &rustc_hash::FxHashMap<u32, otter_vm::jit::BindingHitProof>,
     cage_available: bool,
+    speculate: bool,
     exceptional_edge: Option<usize>,
     exceptional_value: &mut Option<NumericValue>,
 ) -> Option<()> {
@@ -2479,6 +2520,35 @@ fn lower_binding(
         ) => None,
     };
 
+    if let (BindingSemantics::Read(_), Some(target), true, None) =
+        (semantics, target, speculate, exceptional_edge)
+    {
+        let value = push(
+            nodes,
+            NumericNode::BindingGuardedRead {
+                semantics,
+                target,
+                byte_pc: instruction.byte_pc,
+            },
+        );
+        block_nodes.push(value);
+        push_frame_state(
+            frame_states,
+            NumericFramePoint::Node(value),
+            function_id,
+            instruction.byte_pc,
+            registers,
+            live_in,
+        );
+        if let Some(destination) = semantics.result_operand() {
+            write(
+                registers,
+                register(instruction, code, usize::from(destination))?,
+                RegisterState::Value(value),
+            )?;
+        }
+        return Some(());
+    }
     let value = push(
         nodes,
         NumericNode::Binding {
@@ -2594,6 +2664,7 @@ fn lower_instruction(
             logical_pc,
             binding_hit_proofs,
             cage_available,
+            !view.optimized_exit_reasons.contains_key(&logical_pc),
             exceptional_edge,
             exceptional_value,
         );
@@ -2820,6 +2891,63 @@ fn lower_instruction(
                         | NumericType::Number
                 );
             let access = access.filter(|_| direct);
+            if element_site_unseen(
+                view,
+                instruction.byte_pc,
+                logical_pc,
+                access,
+                exceptional_edge,
+            ) {
+                let value = push(
+                    nodes,
+                    NumericNode::ElementUnseenExit {
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                )?;
+                return Some(());
+            }
+            if let Some(access) =
+                access.filter(|_| element_speculation_allowed(view, logical_pc, exceptional_edge))
+            {
+                let value = push(
+                    nodes,
+                    NumericNode::ElementGuardedLoad {
+                        receiver,
+                        index,
+                        byte_pc: instruction.byte_pc,
+                        access,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                )?;
+                return Some(());
+            }
             let value = push(
                 nodes,
                 NumericNode::ElementLoad {
@@ -2874,6 +3002,30 @@ fn lower_instruction(
             };
             let access = access
                 .filter(|_| receiver_type == NumericType::Tagged && direct_index && direct_value);
+            if element_site_unseen(
+                view,
+                instruction.byte_pc,
+                logical_pc,
+                access,
+                exceptional_edge,
+            ) {
+                let value = push(
+                    nodes,
+                    NumericNode::ElementUnseenExit {
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return Some(());
+            }
             if access == Some(NumericElementAccess::PackedDouble) {
                 stored = match value_type(nodes, stored)? {
                     NumericType::Number => stored,
@@ -2893,6 +3045,30 @@ fn lower_instruction(
                     }
                     NumericType::Boolean => return None,
                 };
+            }
+            if let Some(access) =
+                access.filter(|_| element_speculation_allowed(view, logical_pc, exceptional_edge))
+            {
+                let value = push(
+                    nodes,
+                    NumericNode::ElementGuardedStore {
+                        receiver,
+                        index,
+                        value: stored,
+                        byte_pc: instruction.byte_pc,
+                        access,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return Some(());
             }
             let value = push(
                 nodes,
@@ -4005,6 +4181,33 @@ fn has_local_exception_handler(code: &otter_vm::CodeBlock, logical_pc: u32) -> b
         .is_some_and(|region| region.catch_pc.is_some())
 }
 
+/// Whether an indexed site may speculate: outside a local handler, and no
+/// earlier optimized generation exited at it. A site that exited completes
+/// through its committed cold call instead, as V8 recompiles a deoptimized
+/// access with the widened feedback.
+fn element_speculation_allowed(
+    view: &JitCompileSnapshot,
+    logical_pc: u32,
+    exceptional_edge: Option<usize>,
+) -> bool {
+    exceptional_edge.is_none() && !view.optimized_exit_reasons.contains_key(&logical_pc)
+}
+
+/// Whether an indexed site without a baked access has simply never run: its
+/// first execution deoptimizes rather than pinning a cold call into this
+/// generation.
+fn element_site_unseen(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    logical_pc: u32,
+    access: Option<NumericElementAccess>,
+    exceptional_edge: Option<usize>,
+) -> bool {
+    access.is_none()
+        && view.unseen_element_sites.contains(&byte_pc)
+        && element_speculation_allowed(view, logical_pc, exceptional_edge)
+}
+
 fn element_access_kind(
     element_accesses: &rustc_hash::FxHashMap<u32, otter_vm::JitElementAccess>,
     byte_pc: u32,
@@ -4578,6 +4781,15 @@ mod tests {
             *access = JitElementAccess::packed_double_array();
         }
         view
+    }
+
+    /// Records an earlier optimized exit at each logical PC, so those sites
+    /// select their committed form instead of a speculative guard.
+    fn exited_at(view: &mut JitCompileSnapshot, logical_pcs: &[u32]) {
+        for pc in logical_pcs {
+            view.optimized_exit_reasons
+                .insert(*pc, [otter_vm::native_abi::ExitReason::TypeMismatch].into());
+        }
     }
 
     fn global_load_view() -> JitCompileSnapshot {
@@ -5305,6 +5517,14 @@ mod tests {
             let mut view = global_load_view();
             view.cage_base = 0x1000;
             view.binding_hit_proofs.insert(24, target);
+            let speculative = NumericFunction::build(&view).expect("speculative binding HIR");
+            assert!(
+                speculative.nodes.iter().any(|node| matches!(
+                    node,
+                    NumericNode::BindingGuardedRead { byte_pc: 24, .. }
+                ))
+            );
+            exited_at(&mut view, &[0]);
             let hir = NumericFunction::build(&view).expect("typed global-binding HIR");
             let global = hir
                 .nodes
@@ -5399,6 +5619,7 @@ mod tests {
     #[test]
     fn global_binding_without_proof_keeps_committed_cold_sibling() {
         let mut view = global_load_view();
+        exited_at(&mut view, &[0]);
         let hir = NumericFunction::build(&view).expect("cold global-binding HIR");
         assert!(hir.nodes.iter().any(|node| {
             matches!(
@@ -6042,8 +6263,25 @@ mod tests {
 
     #[test]
     fn unseen_number_product_remains_an_admissible_element_index() {
-        let hir =
-            NumericFunction::build(&number_index_element_view()).expect("Number-index element HIR");
+        let speculative =
+            NumericFunction::build(&number_index_element_view()).expect("speculative element HIR");
+        let guarded = speculative
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node,
+                    NumericNode::ElementGuardedLoad { index, byte_pc: 8, .. }
+                        | NumericNode::ElementGuardedStore { index, byte_pc: 16, .. }
+                        if matches!(speculative.nodes[index.0], NumericNode::Mul(..))
+                )
+            })
+            .count();
+        assert_eq!(guarded, 2, "both sites speculate on the Number product");
+
+        let mut view = number_index_element_view();
+        exited_at(&mut view, &[1, 2]);
+        let hir = NumericFunction::build(&view).expect("Number-index element HIR");
         let product = hir
             .nodes
             .iter()
@@ -6096,6 +6334,7 @@ mod tests {
     #[test]
     fn packed_double_elements_box_loads_and_decode_stores_as_separate_values() {
         let mut incomplete = packed_double_number_index_element_view();
+        exited_at(&mut incomplete, &[1, 2]);
         incomplete
             .element_accesses
             .get_mut(&8)
@@ -6115,8 +6354,9 @@ mod tests {
             "raw Float64 InBody storage must never select the direct packed path"
         );
 
-        let hir = NumericFunction::build(&packed_double_number_index_element_view())
-            .expect("PackedDouble Number-index element HIR");
+        let mut view = packed_double_number_index_element_view();
+        exited_at(&mut view, &[1, 2]);
+        let hir = NumericFunction::build(&view).expect("PackedDouble Number-index element HIR");
         let product = hir
             .nodes
             .iter()

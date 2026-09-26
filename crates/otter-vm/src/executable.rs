@@ -323,6 +323,7 @@ impl CodeBlock {
             // element access on `cage_base != 0`.
             array_layout: crate::jit::JitArrayLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
+            unseen_element_sites: rustc_hash::FxHashSet::default(),
             string_layout: crate::jit::JitStringLayout::default(),
             // `#[repr(C)]` constant: offset from the decompressed object
             // pointer to its shape handle for native CacheIR guards.

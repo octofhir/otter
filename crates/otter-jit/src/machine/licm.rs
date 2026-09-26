@@ -234,7 +234,11 @@ fn invariant_instructions(
                 let instruction = &sequence.instructions[index];
                 let effects =
                     effects_for_instruction(&instruction.opcode, &sequence.call_descriptors);
-                if effects.commoning == MachineCommoning::Never
+                // A binding proof yields raw cell addresses; the loop's back-edge
+                // poll may run a moving collection, so they never leave their
+                // iteration.
+                if matches!(instruction.opcode, MachineOpcode::BindingGuard { .. })
+                    || effects.commoning == MachineCommoning::Never
                     || effects.allocates
                     || effects.throws
                     || effects.safepoint

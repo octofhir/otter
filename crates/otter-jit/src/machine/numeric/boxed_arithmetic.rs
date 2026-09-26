@@ -144,6 +144,8 @@ fn visit_inputs(
         | TaggedConstant(_)
         | This
         | StringConstantCell { .. }
+        | BindingGuardedRead { .. }
+        | ElementUnseenExit { .. }
         | ColdCallExit { .. }
         | IntegerConstant(_)
         | BooleanConstant(_)
@@ -179,9 +181,23 @@ fn visit_inputs(
         | BoxTagged(source) => visit(source, true),
         ElementLoad {
             receiver, index, ..
+        }
+        | ElementGuardedLoad {
+            receiver, index, ..
         } => {
             visit(receiver, true);
             visit(index, false);
+        }
+        ElementGuardedStore {
+            receiver,
+            index,
+            value,
+            access,
+            ..
+        } => {
+            visit(receiver, true);
+            visit(index, false);
+            visit(value, access != NumericElementAccess::PackedDouble);
         }
         ElementStore {
             receiver,

@@ -316,6 +316,10 @@ pub struct JitCompileSnapshot {
     /// layout never reaches the emitter, so a second element-bearing family
     /// costs a declaration.
     pub element_accesses: rustc_hash::FxHashMap<u32, JitElementAccess>,
+    /// Byte-PCs of indexed sites that have never executed. An optimizing
+    /// compile deoptimizes when it reaches one ("insufficient feedback"), so
+    /// the next generation specializes it instead of calling cold forever.
+    pub unseen_element_sites: rustc_hash::FxHashSet<u32>,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
     /// Byte offset from a decompressed upvalue-cell pointer to its captured
@@ -1579,6 +1583,7 @@ impl JitCompileSnapshot {
             cage_base: 0,
             array_layout: JitArrayLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
+            unseen_element_sites: rustc_hash::FxHashSet::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             object_dictionary_layout_byte: 0,

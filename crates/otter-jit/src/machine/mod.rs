@@ -3047,6 +3047,26 @@ impl InstructionSequence {
                         let hit_block = (!matches!(target, MachineBindingTarget::Cold))
                             .then(|| block.successors.first().copied())
                             .flatten();
+                        // A speculative read proves its cell in place: a later
+                        // `GuardCondition` on the guard's condition in the same
+                        // block deoptimizes on failure, and only instructions
+                        // after it may use the raw cell addresses.
+                        let own_block = values.block_of(id.0);
+                        let in_place_guard = (!matches!(target, MachineBindingTarget::Cold))
+                            .then(|| {
+                                values
+                                    .uses(outputs[0].value)
+                                    .iter()
+                                    .map(|&(user, _)| user)
+                                    .filter(|&user| {
+                                        user > id.0
+                                            && values.block_of(user) == own_block
+                                            && self.instructions[user as usize].opcode
+                                                == MachineOpcode::GuardCondition
+                                    })
+                                    .min()
+                            })
+                            .flatten();
                         let raw_addresses_are_hit_local = raw_addresses.iter().all(|raw| {
                             !values.crosses_block_edge(*raw)
                                 && values.uses(*raw).iter().all(
@@ -3060,7 +3080,10 @@ impl InstructionSequence {
                                             &self.instructions[candidate_index as usize];
                                         let operand = &candidate.operands[operand_index as usize];
                                         let operand_index = operand_index as usize;
-                                        hit_block == Some(MachineBlock(candidate_block_index))
+                                        (hit_block == Some(MachineBlock(candidate_block_index))
+                                            || (Some(candidate_block_index) == own_block
+                                                && in_place_guard
+                                                    .is_some_and(|guard| candidate_index > guard)))
                                             && operand.purpose == OperandPurpose::Input
                                             && match candidate.opcode {
                                                 MachineOpcode::BindingHit { .. } => {

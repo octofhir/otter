@@ -37,8 +37,9 @@ Queue.prototype.removeFirst = function () { return this.items.shift(); };
 function churn(queue, count) {
     let total = 0;
     for (let index = 0; index < count; index++) {
+        const next = index + 1;
         queue.add(index);
-        queue.add(index + 1);
+        queue.add(next);
         total += queue.removeLast();
         total += queue.removeFirst();
     }
@@ -118,7 +119,7 @@ fn warm_array_leaves_skip_the_general_method_boundary() {
     assert_eq!(
         after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions,
         0,
-        "every warm push/pop/shift must stay a leaf hit"
+        "every warm push/pop/shift must stay a leaf hit: before={before:?} after={after:?}"
     );
 }
 

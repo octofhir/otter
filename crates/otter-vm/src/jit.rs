@@ -1240,8 +1240,23 @@ pub enum JitElementRepr {
     /// path.
     #[default]
     Boxed,
+    /// A raw signed 8-bit scalar, sign-extended and boxed as an int32.
+    Int8,
+    /// A raw unsigned 8-bit scalar, boxed as an int32.
+    Uint8,
+    /// A raw unsigned 8-bit scalar whose stores clamp to `0..=255`
+    /// (§7.1.12 `ToUint8Clamp` over an int32).
+    Uint8Clamped,
+    /// A raw signed 16-bit scalar, sign-extended and boxed as an int32.
+    Int16,
+    /// A raw unsigned 16-bit scalar, boxed as an int32.
+    Uint16,
     /// A raw signed 32-bit scalar, boxed on the way out.
     Int32,
+    /// A raw unsigned 32-bit scalar. Values above `i32::MAX` box as doubles.
+    Uint32,
+    /// A raw IEEE-754 single, widened to a double and boxed on the way out.
+    Float32,
     /// A raw IEEE-754 double, canonicalized and boxed on the way out.
     Float64,
 }
@@ -1251,9 +1266,46 @@ impl JitElementRepr {
     #[must_use]
     pub const fn stride_shift(self) -> u32 {
         match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 0,
+            Self::Int16 | Self::Uint16 => 1,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 2,
             Self::Boxed | Self::Float64 => 3,
-            Self::Int32 => 2,
         }
+    }
+
+    /// Whether a store takes an int32-boxed value and writes its low bits
+    /// (modular `ToInt8`/`ToUint16`/… of an int32 is its truncation).
+    #[must_use]
+    pub const fn stores_int32(self) -> bool {
+        matches!(
+            self,
+            Self::Int8
+                | Self::Uint8
+                | Self::Uint8Clamped
+                | Self::Int16
+                | Self::Uint16
+                | Self::Int32
+                | Self::Uint32
+        )
+    }
+
+    /// The raw representation of one typed-array element kind, or `None` for
+    /// the BigInt and Float16 kinds generated code does not convert.
+    #[must_use]
+    pub const fn for_typed_kind(kind: crate::binary::TypedArrayKind) -> Option<Self> {
+        use crate::binary::TypedArrayKind as Kind;
+        Some(match kind {
+            Kind::Int8 => Self::Int8,
+            Kind::Uint8 => Self::Uint8,
+            Kind::Uint8Clamped => Self::Uint8Clamped,
+            Kind::Int16 => Self::Int16,
+            Kind::Uint16 => Self::Uint16,
+            Kind::Int32 => Self::Int32,
+            Kind::Uint32 => Self::Uint32,
+            Kind::Float32 => Self::Float32,
+            Kind::Float64 => Self::Float64,
+            Kind::BigInt64 | Kind::BigUint64 | Kind::Float16 => return None,
+        })
     }
 }
 
@@ -1708,10 +1760,9 @@ pub enum JitElementFamily {
     DenseTagged,
     /// Ordinary dense arrays whose complete live prefix contains raw `f64`s.
     DenseFloat64,
-    /// `Int32Array` receivers only.
-    TypedInt32,
-    /// `Float64Array` receivers only.
-    TypedFloat64,
+    /// Fixed-length typed views of exactly this element kind. BigInt and
+    /// Float16 views are recorded as [`Self::Generic`].
+    Typed(crate::binary::TypedArrayKind),
     /// More than one family, or one no instance describes.
     Generic,
 }

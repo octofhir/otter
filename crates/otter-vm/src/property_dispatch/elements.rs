@@ -38,8 +38,9 @@ impl Interpreter {
             };
         }
         match recv.as_typed_array(&self.gc_heap).map(|view| view.kind()) {
-            Some(crate::binary::TypedArrayKind::Int32) => Family::TypedInt32,
-            Some(crate::binary::TypedArrayKind::Float64) => Family::TypedFloat64,
+            Some(kind) if crate::jit::JitElementRepr::for_typed_kind(kind).is_some() => {
+                Family::Typed(kind)
+            }
             _ => Family::Generic,
         }
     }

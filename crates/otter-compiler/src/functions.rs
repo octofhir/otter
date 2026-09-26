@@ -48,25 +48,27 @@ pub(crate) fn compile_function_full(
     let contains_direct_eval = body
         .as_ref()
         .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b));
-    // §B.3.6.2 — `fn.arguments` yields the arguments object of a sloppy
-    // ordinary function's running activation, which the body itself never
-    // names. When the unit reads the property anywhere, materialize it.
+    // §B.3.6.2 — `fn.arguments` yields a snapshot of a sloppy ordinary
+    // function's running activation, which the body itself never names.
+    // When the unit reads the property anywhere, the activation keeps its
+    // incoming argument list; the snapshot object is built by the reader.
     let legacy_arguments_observable = parent.dot_arguments_observed
         && !function_is_strict
         && !is_method
         && !is_async
         && !is_generator;
-    let needs_arguments = body_references_arguments(params, body.as_deref())
-        || contains_direct_eval
-        || legacy_arguments_observable;
-    let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
+    // Only the body (or a direct eval in it) observes the arguments object
+    // itself, so only then does the prologue materialize it.
+    let body_needs_arguments_object =
+        body_references_arguments(params, body.as_deref()) || contains_direct_eval;
+    let needs_arguments = body_needs_arguments_object || legacy_arguments_observable;
+    let uses_mapped_arguments = body_needs_arguments_object && !function_is_strict && simple_params;
     // A body that only ever forwards `arguments` through `apply` keeps the
     // incoming argument list but never needs the object on its fast path.
-    // A direct eval or a `fn.arguments` reader may still observe the
-    // object, and an own binding named `arguments` shadows it entirely.
-    let arguments_forward_only = needs_arguments
+    // A direct eval may still observe the object, and an own binding named
+    // `arguments` shadows it entirely.
+    let arguments_forward_only = body_needs_arguments_object
         && !contains_direct_eval
-        && !legacy_arguments_observable
         && !crate::hoist::function_declares_name(params, body.as_deref(), "arguments")
         && crate::hoist::arguments_uses_are_forwarded(params, body.as_deref());
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
@@ -123,7 +125,9 @@ pub(crate) fn compile_function_full(
         // The body-side reference is covered by `analyze_function`; the
         // parameter-default side (`function f(h = () => arguments) {}`)
         // is only visible through the params-aware nested-reference scan.
-        if needs_arguments && capture::inner_references_name(Some(params), b, "arguments") {
+        if body_needs_arguments_object
+            && capture::inner_references_name(Some(params), b, "arguments")
+        {
             child.captured_names.insert("arguments".to_string());
         }
         // §19.2.1.3 — a direct eval body reads and writes caller
@@ -208,7 +212,10 @@ pub(crate) fn compile_function_full(
     // IteratorBindingInitialization (step 24), so a parameter
     // default expression like `x = arguments[0]` resolves the
     // arguments object. Skip if a formal named `arguments` exists.
-    if needs_arguments && !arguments_forward_only && parent.lookup_binding("arguments").is_none() {
+    if body_needs_arguments_object
+        && !arguments_forward_only
+        && parent.lookup_binding("arguments").is_none()
+    {
         let storage = parent.declare_binding("arguments", false, span)?;
         parent.mark_param("arguments");
         let tmp = parent.alloc_scratch();
@@ -374,8 +381,8 @@ pub(crate) fn compile_function_full(
     slot.is_async_generator = is_async_generator;
     slot.is_method = is_method;
     slot.needs_arguments = needs_arguments;
-    slot.uses_arguments_callee =
-        needs_arguments && crate::hoist::body_uses_arguments_callee(params, body.as_deref());
+    slot.uses_arguments_callee = body_needs_arguments_object
+        && crate::hoist::body_uses_arguments_callee(params, body.as_deref());
     slot.arguments_object_kind = if uses_mapped_arguments {
         ArgumentsObjectKind::Mapped
     } else {

@@ -307,6 +307,7 @@ mod tests {
             Op::ForInKeys,
             Op::CopyDataProperties,
             Op::DefineOwnProperty,
+            Op::NewObjectLiteral,
         ]
     }
 
@@ -503,5 +504,6 @@ mod tests {
 000144 FOR_IN_KEYS\n\
 000145 COPY_DATA_PROPERTIES\n\
 000146 DEFINE_OWN_PROPERTY\n\
+000147 NEW_OBJECT_LITERAL\n\
 ";
 }

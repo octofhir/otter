@@ -800,6 +800,104 @@ impl Interpreter {
         Ok(Value::object(obj))
     }
 
+    /// `Op::NewObjectLiteral dst, count, first_key, values...` from a
+    /// materialized frame.
+    pub(crate) fn run_new_object_literal_operands(
+        &mut self,
+        stack: &mut ActivationStack,
+        top_idx: usize,
+        context: &ExecutionContext,
+        operands: impl crate::executable::OperandSource,
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let count = const_operand(operands.get(1))? as usize;
+        let first_key = const_operand(operands.get(2))?;
+        let function_id = stack[top_idx].function_id;
+        // Resolve the layout first: building it allocates shapes, while the
+        // values below are unrooted copies of the frame's registers.
+        let layout = self.object_literal_layout(context, function_id, first_key, count)?;
+        let mut values = smallvec::SmallVec::<[Value; 8]>::with_capacity(count);
+        {
+            let frame = &stack[top_idx];
+            for index in 0..count {
+                values.push(*read_register(
+                    frame,
+                    register_operand(operands.get(3 + index))?,
+                )?);
+            }
+        }
+        let value = self.allocate_object_with_layout(layout, &mut values)?;
+        let frame = &mut stack[top_idx];
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// The complete hidden class of one static object-literal site: an
+    /// ordinary shape chain of default data properties from the root, built
+    /// on the site's first execution and cached by function and key run.
+    pub(crate) fn object_literal_layout(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        first_key: u32,
+        count: usize,
+    ) -> Result<crate::handles::ObjectLayout, VmError> {
+        if let Some(layout) = self.object_literal_layouts.get(&(function_id, first_key)) {
+            return Ok(*layout);
+        }
+        let keys = (0..count as u32)
+            .map(|offset| {
+                context
+                    .string_constant_str_for_function(function_id, first_key + offset)
+                    .map(str::to_owned)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(VmError::InvalidOperand)?;
+        let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        let layout = self.object_layout(&keys)?;
+        self.object_literal_layouts
+            .insert((function_id, first_key), layout);
+        Ok(layout)
+    }
+
+    /// Allocate an ordinary object of `layout` whose slots hold `values` from
+    /// its first observable moment. `values` are rooted, and rewritten in
+    /// place, across the allocation.
+    pub(crate) fn allocate_object_with_layout(
+        &mut self,
+        layout: crate::handles::ObjectLayout,
+        values: &mut [Value],
+    ) -> Result<Value, VmError> {
+        if values.len() != layout.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        let mut shape = self
+            .shape_runtime
+            .handle_for_id(layout.shape_id())
+            .ok_or(VmError::TypeMismatch)?;
+        let mut prototype = self.object_prototype_object_opt();
+        let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
+        let prototype_slot = prototype
+            .as_mut()
+            .map(|prototype| std::ptr::from_mut(prototype).cast::<RawGc>());
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(shape_slot);
+            if let Some(prototype_slot) = prototype_slot {
+                visitor(prototype_slot);
+            }
+        };
+        let object = crate::object::alloc_object_with_shape_and_values_roots(
+            &mut self.gc_heap,
+            shape,
+            prototype,
+            values,
+            &mut roots,
+        )
+        .map_err(VmError::from)?;
+        Ok(Value::object(object))
+    }
+
     pub(crate) fn run_new_array_operands(
         &mut self,
         stack: &mut ActivationStack,

@@ -2427,7 +2427,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
                 reason: "ArrayBuffer is already detached".to_string(),
             });
         }
-        buffer.detach(self.ctx.heap_mut());
+        self.ctx.interp_mut().detach_array_buffer(buffer);
         Ok(())
     }
 

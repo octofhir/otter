@@ -1047,6 +1047,7 @@ opcode_schema! {
     (Op::StorePropertyStrict, 0xBA),
     (Op::StoreElementStrict, 0xBB),
     (Op::CallForwardArguments, 0xBC),
+    (Op::NewObjectLiteral, 0xBD),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1204,6 +1205,7 @@ const CALL_PREFIX: &[OperandSpec] = &[W, R, CONST];
 const CALL_WITH_THIS_PREFIX: &[OperandSpec] = &[W, R, R, CONST];
 const CALL_FORWARD_ARGUMENTS: &[OperandSpec] = &[W, R, R, R];
 const COUNTED_VALUES_PREFIX: &[OperandSpec] = &[W, CONST];
+const OBJECT_LITERAL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
 const METHOD_CALL_PREFIX: &[OperandSpec] = &[W, R, CONST, CONST];
 const NAMESPACE_CALL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
 const ENTER_TRY: &[OperandSpec] = &[IMM, IMM, W];
@@ -1273,6 +1275,11 @@ const fn operand_shape(op: Op) -> OperandShape {
                 tail: R,
             }
         }
+        Op::NewObjectLiteral => OperandShape::Variadic {
+            prefix: OBJECT_LITERAL_PREFIX,
+            count_operand_index: 1,
+            tail: R,
+        },
         Op::CallMethodValue => OperandShape::Variadic {
             prefix: METHOD_CALL_PREFIX,
             count_operand_index: 3,

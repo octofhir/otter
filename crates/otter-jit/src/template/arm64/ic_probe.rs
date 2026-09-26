@@ -78,8 +78,8 @@ use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16,
     OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
-    VM_THREAD_ACTIVE_REALM_CELL_OFFSET, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET,
-    VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_ACTIVE_REALM_CELL_OFFSET, VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET,
+    VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
 };
 
 /// Prove the live object can still participate in an immutable hidden-class
@@ -922,6 +922,7 @@ pub(crate) fn emit_element_view<R>(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     access: &JitElementAccess,
+    context: u8,
     load_receiver: R,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
@@ -969,7 +970,69 @@ where
             data_ptr_byte,
             byte_len_byte,
             view_offset_byte,
+            cached_data_byte,
         } => {
+            // A fixed view's cached base stands for every buffer proof below
+            // while no buffer has ever been detached (V8's
+            // ArrayBufferDetachingProtector): its storage cannot move, grow or
+            // shrink, and its extent was validated at construction.
+            let slow = ops.new_dynamic_label();
+            let ready = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x16, [x13, cached_data_byte]
+                ; cbz x16, =>slow
+                ; ldr x12, [X(context), THREAD_OFFSET]
+                ; ldr x12, [x12, VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET]
+                ; cbz x12, =>slow
+                ; ldrb w12, [x12]
+                ; cbz w12, =>ready
+                ; =>slow
+            );
+            emit_through_local_buffer(
+                ops,
+                relocations,
+                view,
+                shift,
+                [
+                    storage_tag_byte,
+                    local_tag,
+                    handle_byte,
+                    detached_byte,
+                    data_ptr_byte,
+                    byte_len_byte,
+                    view_offset_byte,
+                ],
+                miss,
+            );
+            dynasm!(ops ; .arch aarch64 ; =>ready);
+        }
+    }
+    Ok(())
+}
+
+/// The complete buffer proof for a typed view without a usable cached base:
+/// local storage, live buffer, construction extent inside the live byte
+/// length. On success `x16` is the element base. Clobbers `x11`-`x16`.
+#[allow(clippy::too_many_arguments)]
+fn emit_through_local_buffer(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    shift: u32,
+    [
+        storage_tag_byte,
+        local_tag,
+        handle_byte,
+        detached_byte,
+        data_ptr_byte,
+        byte_len_byte,
+        view_offset_byte,
+    ]: [u32; 7],
+    miss: DynamicLabel,
+) {
+    {
+        {
             dynasm!(ops ; .arch aarch64 ; ldr w15, [x13, storage_tag_byte]);
             emit_load_u64(ops, 12, u64::from(local_tag));
             dynasm!(ops
@@ -1030,7 +1093,6 @@ where
             );
         }
     }
-    Ok(())
 }
 
 /// Prove one index against an already validated in-body dense view.
@@ -1114,7 +1176,8 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    emit_element_view(ops, relocations, view, access, load_receiver, miss)?;
+    // The template tier keeps its runtime context in x20.
+    emit_element_view(ops, relocations, view, access, 20, load_receiver, miss)?;
     emit_element_address_from_dense_view(ops, access, load_index, index_form, miss)
 }
 
@@ -1243,19 +1306,13 @@ pub(crate) fn emit_element_write_guard(
             );
         }
         JitElementRepr::Float64 => {
-            // A number that is not an int32 is a boxed double, so undoing the
-            // encode offset yields the raw bit pattern. An int32 would owe an
-            // integer-to-double conversion, which needs an FP register neither
-            // tier reserves here.
+            // Any number stores: a boxed double's raw bits are one offset
+            // away, and an int32 converts exactly through `scvtf`.
             dynasm!(ops
                 ; .arch aarch64
                 ; movz x11, NUMBER_TAG_HI16, lsl #48
                 ; tst x9, x11
-                ; b.eq =>miss              // not a number at all
-                ; lsr x12, x9, #48
-                ; movz x14, NUMBER_TAG_HI16
-                ; cmp x12, x14
-                ; b.eq =>miss              // int32-boxed, not a double
+                ; b.eq =>miss
             );
         }
     }
@@ -1304,9 +1361,18 @@ pub(crate) fn emit_element_write_proven(ops: &mut Assembler, element: JitElement
         ),
         JitElementRepr::Float64 => dynasm!(ops
             ; .arch aarch64
+            ; lsr x12, x9, #48
+            ; movz x14, NUMBER_TAG_HI16
+            ; cmp x12, x14
+            ; b.ne >double
+            ; scvtf d31, w9
+            ; str d31, [x16]
+            ; b >stored
+            ; double:
             ; movz x11, DOUBLE_OFFSET_HI16, lsl #48
             ; sub x9, x9, x11
             ; str x9, [x16]
+            ; stored:
         ),
     }
 }

@@ -537,16 +537,34 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; mov Rd(dst), Rd(src));
             }
             MachineOpcode::Float64ToInt32 => {
-                if freg(loc[0])? != 0 || ireg(loc[1])? != 0 {
-                    return Err(Unsupported::OperandShape("x86-64 ToInt32 leaf ABI"));
-                }
+                // `cvttsd2si` truncates exactly below 2^63 in magnitude and
+                // the low 32 bits are then the modular ToInt32 result. The
+                // integer-indefinite answer (i64::MIN) marks NaN, Infinity or
+                // an out-of-range magnitude; only those call the leaf, which
+                // the instruction's caller-saved clobbers already permit.
+                let (src, dst) = (freg(loc[0])?, ireg(loc[1])?);
+                dynasm!(ops
+                    ; .arch x64
+                    ; cvttsd2si Rq(dst), Rx(src)
+                    ; cmp Rq(dst), 1
+                    ; jno >fast
+                    ; movsd xmm0, Rx(src)
+                );
                 runtime(
                     &mut ops,
                     &mut relocations,
                     number_to_int32_entry,
                     STUB_NUMBER_TO_INT32_F64_LEAF,
                 );
-                dynasm!(ops ; .arch x64 ; call r11);
+                dynasm!(ops
+                    ; .arch x64
+                    ; call r11
+                    ; mov Rd(dst), eax
+                    ; jmp >done
+                    ; fast:
+                    ; mov Rd(dst), Rd(dst)
+                    ; done:
+                );
             }
             MachineOpcode::FloatAdd
             | MachineOpcode::FloatSub
@@ -607,6 +625,8 @@ pub(super) fn emit(
             MachineOpcode::IntegerAnd
             | MachineOpcode::IntegerOr
             | MachineOpcode::IntegerXor
+            | MachineOpcode::IntegerAddWrapping
+            | MachineOpcode::IntegerSubWrapping
             | MachineOpcode::IntegerShiftLeft
             | MachineOpcode::IntegerShiftRight
             | MachineOpcode::IntegerShiftRightLogical => {
@@ -1756,20 +1776,10 @@ pub(super) fn emit(
                         element if element.stores_int32() => {
                             dynasm!(ops ; .arch x64 ; mov r11, r10 ; shr r11, 48 ; cmp r11w, NUMBER_TAG_HI16 as i16 ; jne =>miss);
                         }
-                        otter_vm::jit::JitElementRepr::Float32 => {
-                            dynasm!(ops ; .arch x64 ; mov r11, r10 ; shr r11, 48 ; test r11w, NUMBER_TAG_HI16 as i16 ; jz =>miss);
-                        }
                         _ => {
-                            // Float64: a boxed double, not an int32.
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov r11, r10
-                                ; shr r11, 48
-                                ; cmp r11w, NUMBER_TAG_HI16 as i16
-                                ; je =>miss
-                                ; test r11w, NUMBER_TAG_HI16 as i16
-                                ; jz =>miss
-                            );
+                            // Float32 and Float64 store any number: a double
+                            // rounds or copies, an int32 converts exactly.
+                            dynasm!(ops ; .arch x64 ; mov r11, r10 ; shr r11, 48 ; test r11w, NUMBER_TAG_HI16 as i16 ; jz =>miss);
                         }
                     }
                 }
@@ -1837,8 +1847,15 @@ pub(super) fn emit(
                             );
                         }
                         otter_vm::jit::JitElementRepr::Float64 => {
-                            load64(&mut ops, 9, DOUBLE_OFFSET);
-                            dynasm!(ops ; .arch x64 ; sub r10, r9 ; mov [r11], r10);
+                            // The guard proved a number; decoding cannot miss.
+                            let unreachable = ops.new_dynamic_label();
+                            dynasm!(ops ; .arch x64 ; mov r8, r11);
+                            decode_number(&mut ops, 10, 14, unreachable);
+                            dynasm!(ops
+                                ; .arch x64
+                                ; =>unreachable
+                                ; movsd [r8], xmm14
+                            );
                         }
                     }
                 }
@@ -2630,10 +2647,13 @@ fn block_for(
     sequence: &InstructionSequence,
     id: MachineInstructionId,
 ) -> Result<usize, Unsupported> {
-    sequence
-        .blocks()
-        .iter()
-        .position(|block| block.first.0 <= id.0 && id.0 < block.end.0)
+    // Verified blocks own contiguous, ascending instruction ranges.
+    let blocks = sequence.blocks();
+    let index = blocks.partition_point(|block| block.end.0 <= id.0);
+    blocks
+        .get(index)
+        .filter(|block| block.first.0 <= id.0 && id.0 < block.end.0)
+        .map(|_| index)
         .ok_or(Unsupported::OperandShape("scalar instruction block"))
 }
 
@@ -2700,7 +2720,7 @@ fn edits(
     point: AllocationPoint,
     frame: MachineFrameLayout,
 ) -> Result<(), Unsupported> {
-    for edit in edits.iter().filter(|edit| edit.point == point) {
+    for edit in super::super::regalloc::edits_at(edits, point) {
         if edit.from == edit.to {
             continue;
         }
@@ -2809,6 +2829,8 @@ fn integer_binary(
         MachineOpcode::IntegerAnd => dynasm!(ops ; .arch x64 ; and r11d, Rd(right)),
         MachineOpcode::IntegerOr => dynasm!(ops ; .arch x64 ; or r11d, Rd(right)),
         MachineOpcode::IntegerXor => dynasm!(ops ; .arch x64 ; xor r11d, Rd(right)),
+        MachineOpcode::IntegerAddWrapping => dynasm!(ops ; .arch x64 ; add r11d, Rd(right)),
+        MachineOpcode::IntegerSubWrapping => dynasm!(ops ; .arch x64 ; sub r11d, Rd(right)),
         MachineOpcode::IntegerShiftLeft => {
             dynasm!(ops ; .arch x64 ; push rcx ; mov ecx, Rd(right) ; shl r11d, cl ; pop rcx)
         }
@@ -4813,6 +4835,7 @@ fn element_view(
             data_ptr_byte,
             byte_len_byte,
             view_offset_byte,
+            cached_data_byte: _,
         } => {
             dynasm!(ops
                 ; .arch x64

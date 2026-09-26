@@ -941,5 +941,6 @@ mod tests {
         Op::EvalRestoreBinding,
         Op::DeleteShadowedUpvalue,
         Op::EvalBindingSeq,
+        Op::NewObjectLiteral,
     ];
 }

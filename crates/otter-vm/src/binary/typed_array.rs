@@ -506,6 +506,23 @@ pub struct TypedArrayBodyGc {
     /// without an explicit length: [[ArrayLength]] is AUTO and tracks
     /// the buffer's current byte length.
     pub length_tracking: bool,
+    /// Cached element base (`buffer data + byte_offset`) for a view over a
+    /// fixed-length local buffer, null otherwise. Such storage never moves,
+    /// so the base stays valid until a detach, which first trips the
+    /// isolate's detach protector; generated access trusts it only while
+    /// that protector is intact.
+    pub data: std::cell::Cell<*mut u8>,
+}
+
+/// Byte offset of [`TypedArrayBodyGc::data`] from the body start.
+pub const TYPED_ARRAY_BODY_DATA_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, data);
+
+impl otter_gc::trace::SeverRestoredPayload for TypedArrayBodyGc {
+    /// A restored image carries another process's address: drop the cache,
+    /// leaving access on the buffer-reading path.
+    fn sever_restored_payload(&mut self) {
+        self.data.set(std::ptr::null_mut());
+    }
 }
 
 /// Byte offset of [`TypedArrayBodyGc::buffer`] from the body start
@@ -574,6 +591,12 @@ pub fn alloc_typed_array(
     byte_offset: usize,
     length: usize,
 ) -> Result<TypedArrayHandle, otter_gc::OutOfMemory> {
+    // SAFETY: construction validated `byte_offset` inside the buffer.
+    let data = buffer
+        .fixed_data_base(heap)
+        .map_or(std::ptr::null_mut(), |base| unsafe {
+            base.add(byte_offset)
+        });
     heap.alloc_old(TypedArrayBodyGc {
         buffer,
         kind,
@@ -582,6 +605,7 @@ pub fn alloc_typed_array(
         length_tracking: false,
         expando: None,
         custom_proto: None,
+        data: std::cell::Cell::new(data),
     })
 }
 
@@ -759,7 +783,10 @@ impl JsTypedArray {
     /// Flip [[ArrayLength]] to AUTO. Called by the constructor path
     /// when the length argument is absent over a resizable buffer.
     pub fn set_length_tracking(self, heap: &mut otter_gc::GcHeap) {
-        heap.with_payload(self.handle, |body| body.length_tracking = true);
+        heap.with_payload(self.handle, |body| {
+            body.length_tracking = true;
+            body.data.set(std::ptr::null_mut());
+        });
     }
 
     /// Construction-time element count, ignoring detached state and

@@ -2409,6 +2409,9 @@ impl GcHeap {
         // ranges recovered from the surviving pages.
         let _ = self.old_space.reap_dead_pages();
         let _ = self.large_space.reap_dead_pages();
+        // A dead tail was handed back to bump allocation above; reopen every
+        // page that has real bump room again.
+        self.old_space.reopen_bump_pages();
         for (offset, bytes) in free_ranges {
             self.old_space.push_free_range(offset, bytes);
         }

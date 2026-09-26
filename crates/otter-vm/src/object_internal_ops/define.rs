@@ -1083,11 +1083,13 @@ impl Interpreter {
                 return Ok(false);
             }
             let completed = descriptor.complete_for_new_property();
+            // §10.4.2.1 step 3 — the element is defined first; `length`
+            // follows from the array the definition left current.
+            let arr = self.store_array_index_descriptor(arr, key, idx, completed)?;
             if idx >= old_len {
                 array::set_length(arr, &mut self.gc_heap, idx + 1)
                     .map_err(|_| VmError::TypeMismatch)?;
             }
-            self.store_array_index_descriptor(arr, key, idx, completed)?;
             return Ok(true);
         }
 
@@ -1212,25 +1214,44 @@ impl Interpreter {
         }
     }
 
+    /// Install a validated descriptor for array index `idx` and return the
+    /// array's current handle: growing dense storage or creating the sidecar
+    /// may collect, so the array stays rooted across every step.
     pub(crate) fn store_array_index_descriptor(
         &mut self,
         arr: array::JsArray,
         key: &str,
         idx: usize,
         descriptor: object::PropertyDescriptor,
-    ) -> Result<(), VmError> {
-        match descriptor.kind.clone() {
-            object::DescriptorKind::Data { value } => {
-                array::delete_accessor(arr, &mut self.gc_heap, key);
-                array::define_index_value(arr, &mut self.gc_heap, idx, value)
-                    .map_err(|_| VmError::TypeMismatch)?;
+    ) -> Result<array::JsArray, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let root = interp.scoped_value(scope, Value::array(arr));
+            let current = |interp: &Interpreter| {
+                interp
+                    .escape_scoped(root)
+                    .as_array()
+                    .ok_or(VmError::InvalidOperand)
+            };
+            match descriptor.kind.clone() {
+                object::DescriptorKind::Data { value } => {
+                    array::delete_accessor(current(interp)?, &mut interp.gc_heap, key);
+                    array::define_index_value(current(interp)?, &mut interp.gc_heap, idx, value)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                    // An absent entry reads back as a default data element, so
+                    // the common `CreateDataProperty` keeps the array free of a
+                    // sidecar and on the dense paths generated code proves.
+                    if descriptor.flags == object::PropertyFlags::data_default() {
+                        array::clear_property_flags(current(interp)?, &mut interp.gc_heap, key);
+                        return current(interp);
+                    }
+                }
+                object::DescriptorKind::Accessor { getter, setter } => {
+                    array::set_accessor(current(interp)?, &mut interp.gc_heap, key, getter, setter);
+                }
             }
-            object::DescriptorKind::Accessor { getter, setter } => {
-                array::set_accessor(arr, &mut self.gc_heap, key, getter, setter);
-            }
-        }
-        array::set_property_flags(arr, &mut self.gc_heap, key, descriptor.flags);
-        Ok(())
+            array::set_property_flags(current(interp)?, &mut interp.gc_heap, key, descriptor.flags);
+            current(interp)
+        })
     }
 
     pub(crate) fn store_array_named_descriptor(

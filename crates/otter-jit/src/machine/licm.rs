@@ -3,13 +3,16 @@
 //! # Contents
 //! - Natural-loop discovery from the shared dominator tree
 //!   (`super::dominance`).
-//! - One analysis per innermost loop: splitting a loop appends its body block
-//!   and leaves every other innermost loop's invariants unchanged.
+//! - One analysis per innermost loop, discovered once: splitting a loop
+//!   appends its body block and leaves every other innermost loop's blocks and
+//!   invariants unchanged.
 //! - Conservative invariant selection through the shared effect table.
 //! - Explicit preheader splitting shared by ordinary and OSR entry.
 //!
 //! # Invariants
 //! - Only non-throwing, non-allocating, non-writing instructions move.
+//! - The preheader holds hoisted instructions in dependency order: block
+//!   indices stop following dominance once splits append body blocks.
 //! - A memory read moves only when the loop has no invalidating boundary or
 //!   overlapping write.
 //! - Loop parameters are variant. External entry and OSR execute the same
@@ -50,15 +53,27 @@ pub(super) fn optimize(
     target: &TargetSpec,
 ) -> Result<(InstructionSequence, LicmStats), VerificationError> {
     let mut stats = LicmStats::default();
-    // Headers whose loop is already analyzed. Innermost loops are disjoint,
-    // so splitting one loop never changes another loop's invariants; block
-    // indices are stable because a split only appends the new body block.
-    let mut settled = vec![false; sequence.blocks.len()];
-    while let Some((natural_loop, candidates)) = next_loop(&sequence, &mut settled) {
-        let body = sequence.blocks.len();
+    // Innermost loops are disjoint, so splitting one never changes another
+    // loop's blocks or invariants, and block indices stay stable because a
+    // split only appends the new body block. The loops are therefore found
+    // once, and the value facts only grow to cover values a split creates.
+    let mut facts: Option<ValueFacts> = None;
+    for natural_loop in innermost_natural_loops(&sequence) {
+        if natural_loop.header == sequence.entry.0 as usize
+            || !sequence.blocks[natural_loop.header]
+                .predecessors
+                .iter()
+                .any(|predecessor| !natural_loop.blocks.contains(&(predecessor.0 as usize)))
+        {
+            continue;
+        }
+        let facts = facts.get_or_insert_with(|| ValueFacts::compute(&sequence));
+        facts.cover(sequence.representations.len());
+        let candidates = invariant_instructions(&sequence, &natural_loop, facts);
+        if candidates.is_empty() {
+            continue;
+        }
         split_preheader_and_hoist(&mut sequence, &natural_loop, &candidates);
-        settled.resize(sequence.blocks.len(), false);
-        settled[body] = true;
         stats.hoisted_instructions = stats
             .hoisted_instructions
             .saturating_add(candidates.len() as u32);
@@ -130,33 +145,15 @@ impl ValueFacts {
             reconstruction_values,
         }
     }
-}
 
-fn next_loop(
-    sequence: &InstructionSequence,
-    settled: &mut [bool],
-) -> Option<(NaturalLoop, BTreeSet<usize>)> {
-    let mut facts = None;
-    for natural_loop in innermost_natural_loops(sequence) {
-        if settled[natural_loop.header] {
-            continue;
-        }
-        settled[natural_loop.header] = true;
-        if natural_loop.header == sequence.entry.0 as usize
-            || !sequence.blocks[natural_loop.header]
-                .predecessors
-                .iter()
-                .any(|predecessor| !natural_loop.blocks.contains(&(predecessor.0 as usize)))
-        {
-            continue;
-        }
-        let facts = facts.get_or_insert_with(|| ValueFacts::compute(sequence));
-        let candidates = invariant_instructions(sequence, &natural_loop, facts);
-        if !candidates.is_empty() {
-            return Some((natural_loop, candidates));
-        }
+    /// Extend the facts to `count` values. A split creates values only for
+    /// the loop it hoists (preheader parameters and carried outputs), which
+    /// no other innermost loop reads, so they enter as undefined elsewhere.
+    fn cover(&mut self, count: usize) {
+        self.definitions.resize(count, None);
+        self.edge_values.resize(count, false);
+        self.reconstruction_values.resize(count, false);
     }
-    None
 }
 
 fn invariant_instructions(
@@ -309,13 +306,20 @@ fn invariant_header_parameters(
     definitions: &[Option<usize>],
 ) -> BTreeSet<MachineValue> {
     let header = &sequence.blocks[natural_loop.header];
+    // Only the header's predecessors carry edges into it.
+    let predecessors = header
+        .predecessors
+        .iter()
+        .map(|predecessor| predecessor.0 as usize)
+        .collect::<BTreeSet<_>>();
     header
         .parameters
         .iter()
         .enumerate()
         .filter_map(|(parameter_index, &parameter)| {
             let mut saw_external = false;
-            for (predecessor, block) in sequence.blocks.iter().enumerate() {
+            for &predecessor in &predecessors {
+                let block = &sequence.blocks[predecessor];
                 for (edge, successor) in block.successors.iter().enumerate() {
                     if successor.0 as usize != natural_loop.header {
                         continue;
@@ -338,6 +342,63 @@ fn invariant_header_parameters(
             saw_external.then_some(parameter)
         })
         .collect()
+}
+
+/// Order hoisted invariants so every definition precedes its uses.
+///
+/// Candidates are gathered block by block, and block indices follow creation
+/// rather than dominance once earlier splits have appended body blocks, so a
+/// use can be gathered ahead of the invariant that defines its operand. The
+/// order is otherwise the gathered one (Kahn's algorithm, ready set ordered by
+/// gathering position), keeping the transform deterministic.
+fn in_dependency_order(invariants: Vec<MachineInstruction>) -> Vec<MachineInstruction> {
+    let mut producer = BTreeMap::new();
+    for (position, instruction) in invariants.iter().enumerate() {
+        for operand in &instruction.operands {
+            if operand.role == OperandRole::Definition && operand.purpose == OperandPurpose::Output
+            {
+                producer.insert(operand.value, position);
+            }
+        }
+    }
+    let mut pending = vec![0usize; invariants.len()];
+    let mut dependents = vec![Vec::new(); invariants.len()];
+    for (position, instruction) in invariants.iter().enumerate() {
+        let inputs = instruction
+            .operands
+            .iter()
+            .filter(|operand| operand.role == OperandRole::Use)
+            .filter_map(|operand| producer.get(&operand.value).copied())
+            .filter(|&source| source != position)
+            .collect::<BTreeSet<_>>();
+        pending[position] = inputs.len();
+        for source in inputs {
+            dependents[source].push(position);
+        }
+    }
+    let mut ready = (0..invariants.len())
+        .filter(|&position| pending[position] == 0)
+        .collect::<BTreeSet<_>>();
+    let mut slots = invariants.into_iter().map(Some).collect::<Vec<_>>();
+    let mut ordered = Vec::with_capacity(slots.len());
+    while let Some(position) = ready.pop_first() {
+        ordered.push(
+            slots[position]
+                .take()
+                .expect("each invariant is emitted once"),
+        );
+        for &dependent in &dependents[position] {
+            pending[dependent] -= 1;
+            if pending[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    debug_assert!(
+        slots.iter().all(Option::is_none),
+        "loop invariants cannot form a dependency cycle"
+    );
+    ordered
 }
 
 fn split_preheader_and_hoist(
@@ -364,13 +425,21 @@ fn split_preheader_and_hoist(
         .zip(new_parameters.iter().copied())
         .collect::<BTreeMap<_, _>>();
 
-    let old_instructions = sequence.instructions.clone();
+    // Verified blocks own contiguous instruction ranges in block order, so the
+    // instructions move into per-block lists without a copy.
+    let mut old_instructions = std::mem::take(&mut sequence.instructions).into_iter();
     let mut block_instructions = sequence
         .blocks
         .iter()
-        .map(|block| old_instructions[block.first.0 as usize..block.end.0 as usize].to_vec())
+        .map(|block| {
+            old_instructions
+                .by_ref()
+                .take((block.end.0 - block.first.0) as usize)
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
-    let mut hoisted = Vec::new();
+    let mut osr_entry = None;
+    let mut invariants = Vec::new();
     for &block in &natural_loop.blocks {
         let first = sequence.blocks[block].first.0 as usize;
         let mut retained = Vec::new();
@@ -381,16 +450,18 @@ fn split_preheader_and_hoist(
             let index = first + offset;
             if block == header && matches!(instruction.opcode, MachineOpcode::OsrEntry { .. }) {
                 rewrite_parameter_uses(&mut instruction, &parameter_map);
-                hoisted.insert(0, instruction);
+                osr_entry = Some(instruction);
             } else if candidates.contains(&index) {
                 rewrite_parameter_uses(&mut instruction, &parameter_map);
-                hoisted.push(instruction);
+                invariants.push(instruction);
             } else {
                 retained.push(instruction);
             }
         }
         block_instructions[block] = retained;
     }
+    let mut hoisted = osr_entry.into_iter().collect::<Vec<_>>();
+    hoisted.extend(in_dependency_order(invariants));
     let hoisted_outputs = hoisted
         .iter()
         .flat_map(|instruction| instruction.operands.iter())
@@ -596,6 +667,49 @@ mod tests {
     use crate::machine::{
         MachineOperand, MachineOsrInput, MachineRepresentation, TargetClobberSet,
     };
+
+    #[test]
+    fn hoisted_invariants_define_before_they_use() {
+        let constant = MachineValue(1);
+        let truth = MachineValue(2);
+        let shifted = MachineValue(3);
+        let outer = MachineValue(0);
+        // Gathered as a later split's body block would leave them: both uses
+        // of the constant ahead of its definition.
+        let gathered = vec![
+            MachineInstruction::plain(
+                MachineOpcode::IntegerToBoolean,
+                vec![
+                    MachineOperand::register_input(constant),
+                    MachineOperand::register_output(truth),
+                ],
+            ),
+            MachineInstruction::plain(
+                MachineOpcode::IntegerShiftRightLogical,
+                vec![
+                    MachineOperand::register_input(outer),
+                    MachineOperand::register_input(constant),
+                    MachineOperand::register_output(shifted),
+                ],
+            ),
+            MachineInstruction::plain(
+                MachineOpcode::IntegerConstant(0),
+                vec![MachineOperand::register_output(constant)],
+            ),
+        ];
+        let ordered = in_dependency_order(gathered)
+            .into_iter()
+            .map(|instruction| instruction.opcode)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            [
+                MachineOpcode::IntegerConstant(0),
+                MachineOpcode::IntegerToBoolean,
+                MachineOpcode::IntegerShiftRightLogical,
+            ]
+        );
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum LoopBoundary {

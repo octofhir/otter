@@ -263,6 +263,9 @@ pub(crate) enum TemplateOp {
     },
     /// `r<dst> = [elements…]` from the plan-owned register tail.
     NewArray { dst: u16, elements: TemplateTail },
+    /// `Op::NewObjectLiteral`: the evaluated values in property order; the
+    /// published instruction names the keys.
+    NewObjectLiteral { dst: u16, elements: TemplateTail },
     /// Refresh the captured binding cell at `index` (per-iteration bindings).
     FreshUpvalue { index: i32 },
     /// `object[key] = value` as a data property definition.
@@ -1014,6 +1017,19 @@ impl TemplatePlan {
                     let start = register_operands.len();
                     register_operands.extend_from_slice(slice);
                     TemplateOp::NewArray {
+                        dst: operands.dst,
+                        elements: TemplateTail {
+                            start,
+                            len: slice.len(),
+                        },
+                    }
+                }
+                Op::NewObjectLiteral => {
+                    let operands = lowered.new_array_operands()?;
+                    let slice = lowering.register_tail(operands.elements)?;
+                    let start = register_operands.len();
+                    register_operands.extend_from_slice(slice);
+                    TemplateOp::NewObjectLiteral {
                         dst: operands.dst,
                         elements: TemplateTail {
                             start,

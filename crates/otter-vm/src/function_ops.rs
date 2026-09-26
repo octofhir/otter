@@ -2030,48 +2030,38 @@ impl Interpreter {
                 // For Proxy targets, route through the full §10.5.11
                 // ownKeys path so trap invariants apply, then filter
                 // to enumerable strings per §20.1.2.17 Object.keys.
+                // Every trap may run user code that collects: key names are
+                // copied out as strings, the proxy is re-read from its root,
+                // and the answer array is built by the rooted key builder.
                 if target.is_proxy() {
-                    let trap_keys = self.own_property_keys_value(stack, context, &target)?;
-                    let mut values: Vec<Value> = Vec::with_capacity(trap_keys.len());
-                    for key in trap_keys {
-                        if !key.is_string() {
-                            continue;
+                    let names = self.with_handle_scope(|interp, scope| {
+                        let root = interp.scoped_value(scope, target);
+                        let names = interp
+                            .own_property_keys_value(stack, context, &target)?
+                            .iter()
+                            .filter_map(|key| key.as_string(&interp.gc_heap))
+                            .map(|name| name.to_lossy_string(&interp.gc_heap))
+                            .collect::<Vec<_>>();
+                        let mut enumerable = Vec::with_capacity(names.len());
+                        for name in names {
+                            let current = interp.escape_scoped(root);
+                            let desc = interp.ordinary_get_own_property_descriptor_value(
+                                stack,
+                                context,
+                                current,
+                                &VmPropertyKey::OwnedString(name.clone()),
+                                0,
+                            )?;
+                            if desc.as_ref().is_some_and(|d| d.enumerable()) {
+                                enumerable.push(name);
+                            }
                         }
-                        let vm_key = if let Some(s) = key.as_string(&self.gc_heap) {
-                            VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-                        } else if let Some(sym) = key.as_symbol(&self.gc_heap) {
-                            VmPropertyKey::Symbol(sym)
-                        } else {
-                            return Err(VmError::TypeMismatch);
-                        };
-                        let desc = self.ordinary_get_own_property_descriptor_value(
-                            stack, context, target, &vm_key, 0,
-                        )?;
-                        if desc.as_ref().is_some_and(|d| d.enumerable()) {
-                            values.push(key);
-                        }
-                    }
-                    return Ok(Some(Value::array(self.function_static_array_from_values(
-                        &*stack,
-                        values,
-                        &[&target],
-                        &[args],
-                    )?)));
+                        Ok::<_, VmError>(enumerable)
+                    })?;
+                    return Ok(Some(self.scoped_key_strings(&names)?));
                 }
                 let keys = self.enumerable_own_string_keys_for_value(stack, context, target, 0)?;
-                let mut values = Vec::with_capacity(keys.len());
-                for key in keys {
-                    values.push(Value::string(
-                        JsString::from_str(&key, self.gc_heap_mut())
-                            .map_err(|_| VmError::TypeMismatch)?,
-                    ));
-                }
-                return Ok(Some(Value::array(self.function_static_array_from_values(
-                    &*stack,
-                    values,
-                    &[&target],
-                    &[args],
-                )?)));
+                return Ok(Some(self.scoped_key_strings(&keys)?));
             }
             let desc =
                 self.get_own_property_descriptor_for_value(stack, context, target, args.get(1))?;

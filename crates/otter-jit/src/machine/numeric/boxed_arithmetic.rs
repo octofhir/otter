@@ -277,6 +277,8 @@ fn visit_inputs(
         | IntegerAnd(left, right)
         | IntegerOr(left, right)
         | IntegerXor(left, right)
+        | IntegerAddWrapping(left, right)
+        | IntegerSubWrapping(left, right)
         | IntegerShiftLeft(left, right)
         | IntegerShiftRight(left, right)
         | IntegerShiftRightLogical(left, right)

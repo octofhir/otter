@@ -112,6 +112,9 @@ pub(crate) fn compile_object_literal(
 ) -> Result<u16, CompileError> {
     let _ = span;
     let span = (obj.span.start, obj.span.end);
+    if let Some(dst) = compile_static_object_literal(cx, obj, span)? {
+        return Ok(dst);
+    }
     let dst = cx.alloc_scratch();
     cx.emit(Op::NewObject, [Operand::Register(dst)], span);
 
@@ -526,6 +529,80 @@ pub(crate) fn compile_object_literal(
         cx.exit_scope();
     }
     Ok(dst)
+}
+
+/// Largest static literal lowered to one `Op::NewObjectLiteral`.
+const STATIC_OBJECT_LITERAL_MAX_KEYS: usize = 64;
+
+/// A literal whose properties are all plain data definitions under distinct
+/// static names: each value evaluates in order, then one
+/// `Op::NewObjectLiteral` creates the object with every key at once.
+///
+/// Creating the empty object first is unobservable — no property value can
+/// reference it — so allocating after the values have been evaluated keeps
+/// §13.2.5.5 PropertyDefinitionEvaluation's observable order. `__proto__`,
+/// array-index names, duplicates, accessors, spreads, computed keys and
+/// methods that need a `[[HomeObject]]` keep the general per-property form.
+fn compile_static_object_literal(
+    cx: &mut Compiler,
+    obj: &ObjectExpression<'_>,
+    span: (u32, u32),
+) -> Result<Option<u16>, CompileError> {
+    if obj.properties.is_empty()
+        || obj.properties.len() > STATIC_OBJECT_LITERAL_MAX_KEYS
+        || object_literal_uses_super_in_methods(obj)
+    {
+        return Ok(None);
+    }
+    let mut keys: Vec<&str> = Vec::with_capacity(obj.properties.len());
+    for prop in &obj.properties {
+        let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
+            return Ok(None);
+        };
+        if p.computed || !matches!(p.kind, oxc_ast::ast::PropertyKind::Init) {
+            return Ok(None);
+        }
+        let key = match &p.key {
+            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.as_str(),
+            _ => return Ok(None),
+        };
+        // Lone surrogates travel through the lossy oxc spelling; keep them
+        // on the general path, which decodes them.
+        if key == "__proto__"
+            || key.contains('\u{FFFD}')
+            || key
+                .parse::<u32>()
+                .is_ok_and(|index| index != u32::MAX && index.to_string() == key)
+            || keys.contains(&key)
+        {
+            return Ok(None);
+        }
+        keys.push(key);
+    }
+    let mut values = Vec::with_capacity(keys.len());
+    for (prop, key) in obj.properties.iter().zip(&keys) {
+        let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
+            unreachable!("checked above");
+        };
+        let key_span = (p.span.start, p.span.end);
+        cx.next_fn_is_method = p.method;
+        if p.method {
+            cx.next_fn_source_text_span = Some(key_span);
+        }
+        values.push(crate::expr::compile_expr_with_inferred_name(
+            cx, &p.value, key, key_span,
+        )?);
+    }
+    let first_key = cx.push_string_constant_run(&keys);
+    let dst = cx.alloc_scratch();
+    let mut operands = Vec::with_capacity(3 + values.len());
+    operands.push(Operand::Register(dst));
+    operands.push(Operand::ConstIndex(values.len() as u32));
+    operands.push(Operand::ConstIndex(first_key));
+    operands.extend(values.into_iter().map(Operand::Register));
+    cx.emit(Op::NewObjectLiteral, operands, span);
+    Ok(Some(dst))
 }
 
 /// Walks an object literal's method / getter / setter bodies looking

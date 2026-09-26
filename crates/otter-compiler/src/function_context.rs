@@ -715,6 +715,21 @@ impl FunctionContext {
         );
     }
 
+    /// Append `values` as one contiguous run of string constants and return
+    /// the index of the first. Unlike [`Self::intern_string_constant`] the run
+    /// is never merged with existing entries, because an operand names it by
+    /// its start and length (`Op::NewObjectLiteral` keys).
+    pub(crate) fn push_string_constant_run(&mut self, values: &[&str]) -> u32 {
+        let mut module = self.module.borrow_mut();
+        let first = module.constants.len() as u32;
+        module
+            .constants
+            .extend(values.iter().map(|value| Constant::String {
+                utf16: value.encode_utf16().collect(),
+            }));
+        first
+    }
+
     pub(crate) fn intern_string_constant(&mut self, value: &str) -> u32 {
         let utf16: Vec<u16> = value.encode_utf16().collect();
         self.intern_utf16_string_constant(utf16)

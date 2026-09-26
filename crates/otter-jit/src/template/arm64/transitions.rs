@@ -287,6 +287,32 @@ pub(super) fn emit_new_array(
     )
 }
 
+pub(super) fn emit_new_object_literal(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    dst: u16,
+    elements: &[u16],
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let words = elements
+        .iter()
+        .copied()
+        .map(super::value_packet::PacketWord::Register)
+        .collect::<Vec<_>>();
+    super::value_packet::emit_value_packet_transition(
+        ops,
+        relocations,
+        table,
+        abi::STUB_JIT_NEW_OBJECT_LITERAL,
+        &words,
+        dst,
+        throw_value,
+        fatal,
+    )
+}
+
 pub(super) fn emit_fresh_upvalue(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

@@ -626,7 +626,7 @@ fn build_worker_object(
                 RuntimeLiveness::Ref,
             )
             .map_err(|err| type_err("Worker.postMessage", err.to_string()))?;
-        detach_worker_transfers(&transfers, ctx.heap_mut());
+        detach_worker_transfers(&transfers, ctx.interp_mut());
         Ok(Value::undefined())
     });
 
@@ -1253,7 +1253,7 @@ fn install_worker_scope_natives(
         // Preserve the transferable on enqueue failure. Detaching before the
         // parent queue accepts ownership would turn a reported failure into
         // silent data loss in the worker.
-        detach_worker_transfers(&transfers, ctx.heap_mut());
+        detach_worker_transfers(&transfers, ctx.interp_mut());
         Ok(Value::undefined())
     });
     runtime.install_native_global_call("postMessage", 2, NativeCall::Dynamic(post))?;
@@ -1540,9 +1540,9 @@ fn parse_worker_transfer_list(
     Ok(out)
 }
 
-fn detach_worker_transfers(transfers: &WorkerTransferList, heap: &mut otter_gc::GcHeap) {
+fn detach_worker_transfers(transfers: &WorkerTransferList, interp: &mut otter_vm::Interpreter) {
     for buffer in &transfers.buffers {
-        buffer.detach(heap);
+        interp.detach_array_buffer(*buffer);
     }
 }
 

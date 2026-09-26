@@ -78,13 +78,16 @@ pub enum TargetClobberSet {
     /// x86-64 linkage uses `r12`–`r14` as scratch; AArch64 linkage saves its
     /// one callee-saved scratch (`x25`) in the linkage frame.
     DirectCall,
+    /// Inline ECMAScript ToInt32 of a Float64. AArch64 converts in place with
+    /// intra-procedure scratch; x86-64 calls the leaf for out-of-range inputs.
+    FloatToInt32,
 }
 
 /// Target legalization features admitted by neutral instruction selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TargetCapability {
-    /// Fixed-register Float64-to-Int32 conversion call.
+    /// Float64-to-Int32 conversion.
     Float64ToInt32,
     /// Fixed-register floating remainder call.
     FloatRemainder,
@@ -288,7 +291,7 @@ pub struct TargetSpec {
     registers: TargetRegisterFile,
     calls: TargetCallConvention,
     frame: TargetFrameSpec,
-    clobbers: [Box<[PhysicalRegister]>; 18],
+    clobbers: [Box<[PhysicalRegister]>; 19],
     capabilities: [bool; 4],
 }
 
@@ -353,6 +356,7 @@ impl TargetSpec {
                 // x15/x16 and v30/v31 lie outside the scalar allocation file.
                 Box::new([]),
                 scalar_call_direct,
+                vec![integer(16)].into_boxed_slice(),
             ],
             capabilities: [true; 4],
         }

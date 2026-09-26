@@ -405,6 +405,27 @@ impl Interpreter {
             frame.advance_pc()?;
             return Ok(true);
         }
+        // Key coercion, accessors and descriptor reads below may collect:
+        // the receiver lives in a scope and is re-read at every use.
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, receiver);
+            interp.drive_load_element_generic(stack, context, receiver, key_value_raw, dst, key_reg)
+        })
+    }
+
+    /// Generic computed `[[Get]]` for [`Self::drive_load_element`] with the
+    /// receiver rooted in the caller's handle scope.
+    fn drive_load_element_generic(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        receiver_root: crate::Local<'_>,
+        key_value_raw: Value,
+        dst: u16,
+        key_reg: u16,
+    ) -> Result<bool, VmError> {
+        let top_idx = stack.len() - 1;
+        let receiver = self.escape_scoped(receiver_root);
         if receiver.is_nullish() {
             return Err(
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())
@@ -412,6 +433,7 @@ impl Interpreter {
         }
         let key_value = self.coerce_property_key_value(stack, context, key_value_raw)?;
         write_register(&mut stack[top_idx], key_reg, key_value)?;
+        let receiver = self.escape_scoped(receiver_root);
         let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
         } else if let Some(n) = key_value.as_number() {
@@ -435,7 +457,14 @@ impl Interpreter {
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, context, &getter, receiver, args, dst)?;
+                        self.invoke(
+                            stack,
+                            context,
+                            &getter,
+                            self.escape_scoped(receiver_root),
+                            args,
+                            dst,
+                        )?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
@@ -455,7 +484,14 @@ impl Interpreter {
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.invoke(stack, context, &callee, receiver, args, dst)?;
+                            self.invoke(
+                                stack,
+                                context,
+                                &callee,
+                                self.escape_scoped(receiver_root),
+                                args,
+                                dst,
+                            )?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                     }
@@ -467,8 +503,12 @@ impl Interpreter {
                     // on a sloppy ordinary function resolves BEFORE the
                     // %Function.prototype% poison accessors.
                     if is_restricted_function_property(key)
-                        && let Some(value) =
-                            self.legacy_restricted_property(stack, context, receiver, key)?
+                        && let Some(value) = self.legacy_restricted_property(
+                            stack,
+                            context,
+                            self.escape_scoped(receiver_root),
+                            key,
+                        )?
                     {
                         write_register(&mut stack[top_idx], dst, value)?;
                         stack[top_idx].advance_pc()?;
@@ -486,7 +526,14 @@ impl Interpreter {
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.invoke(stack, context, &callee, receiver, args, dst)?;
+                                self.invoke(
+                                    stack,
+                                    context,
+                                    &callee,
+                                    self.escape_scoped(receiver_root),
+                                    args,
+                                    dst,
+                                )?;
                             }
                             _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                         }
@@ -496,13 +543,21 @@ impl Interpreter {
                         stack[top_idx].advance_pc()?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        self.invoke(
+                            stack,
+                            context,
+                            &callee,
+                            self.escape_scoped(receiver_root),
+                            args,
+                            dst,
+                        )?;
                         return Ok(true);
                     }
                 }
             }
         }
 
+        let receiver = self.escape_scoped(receiver_root);
         let obj = if let Some(o) = receiver.as_object() {
             o
         } else if let Some(class) = receiver.as_class_constructor() {
@@ -549,7 +604,14 @@ impl Interpreter {
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        self.invoke(
+                            stack,
+                            context,
+                            &callee,
+                            self.escape_scoped(receiver_root),
+                            args,
+                            dst,
+                        )?;
                     }
                     _ => {
                         write_register(&mut stack[top_idx], dst, Value::undefined())?;

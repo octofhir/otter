@@ -348,6 +348,10 @@ pub(super) enum NumericNode {
     IntegerAnd(NumericValue, NumericValue),
     IntegerOr(NumericValue, NumericValue),
     IntegerXor(NumericValue, NumericValue),
+    /// `ToInt32(a + b)` over int32 operands, from the truncation rewrite.
+    IntegerAddWrapping(NumericValue, NumericValue),
+    /// `ToInt32(a - b)` over int32 operands, from the truncation rewrite.
+    IntegerSubWrapping(NumericValue, NumericValue),
     IntegerShiftLeft(NumericValue, NumericValue),
     IntegerShiftRight(NumericValue, NumericValue),
     IntegerShiftRightLogical(NumericValue, NumericValue),
@@ -626,6 +630,8 @@ impl NumericNode {
             | Self::IntegerAnd(..)
             | Self::IntegerOr(..)
             | Self::IntegerXor(..)
+            | Self::IntegerAddWrapping(..)
+            | Self::IntegerSubWrapping(..)
             | Self::IntegerShiftLeft(..)
             | Self::IntegerShiftRight(..)
             | Self::IntegerNot(..)
@@ -2359,6 +2365,17 @@ fn lower_committed_value(
     for (input, register) in inputs.iter_mut().zip(reads) {
         *input = Some(read_value(registers, register)?);
     }
+    // An immediate-right operator completes over its immediate as the
+    // generic operator's right operand.
+    if instruction.op(code) == Op::BitwiseAndImm {
+        let immediate = instruction.imm32(code, 2)?;
+        let constant = push(
+            nodes,
+            NumericNode::TaggedConstant(otter_vm::Value::number_i32(immediate).to_bits()),
+        );
+        block_nodes.push(constant);
+        inputs[1] = Some(constant);
+    }
     let value = push(
         nodes,
         NumericNode::CommittedValue {
@@ -2661,7 +2678,18 @@ fn lower_instruction(
             )?;
             return Some(());
         }
-        Op::StoreProperty if constructor_field_transitions.contains_key(&instruction.byte_pc) => {
+        // A constructor field store that already failed its receiver-shape
+        // proof (a subclass instance reaching `_super.call(this)`, say) keeps
+        // the generic store: re-speculating would only exit again.
+        Op::StoreProperty
+            if constructor_field_transitions.contains_key(&instruction.byte_pc)
+                && !view
+                    .optimized_exit_reasons
+                    .get(&logical_pc)
+                    .is_some_and(|reasons| {
+                        reasons.contains(&otter_vm::native_abi::ExitReason::ShapeGuard)
+                    }) =>
+        {
             let _ = instruction.const_index(code, 1)?;
             let value = push(
                 nodes,
@@ -2896,24 +2924,29 @@ fn lower_instruction(
             instruction.const_index(code, 1)?;
             NumericNode::Constant(instruction.load_number?)
         }
-        Op::NewObject | Op::NewArray => {
-            let count = if op == Op::NewArray {
-                usize::try_from(instruction.const_index(code, 1)?).ok()?
-            } else {
+        Op::NewObject | Op::NewArray | Op::NewObjectLiteral => {
+            let count = if op == Op::NewObject {
                 0
+            } else {
+                usize::try_from(instruction.const_index(code, 1)?).ok()?
             };
+            // `NewObjectLiteral` carries its first key constant before the
+            // values; the stub reads the keys from the published instruction.
+            let first_value = if op == Op::NewObjectLiteral { 3 } else { 2 };
             let arguments = (0..count)
-                .map(|index| read_value(registers, register(instruction, code, index + 2)?))
+                .map(|index| {
+                    read_value(registers, register(instruction, code, index + first_value)?)
+                })
                 .collect::<Option<Vec<_>>>()?;
             let (argument_start, argument_count) =
                 append_operand_values(operand_values, arguments)?;
             let value = push(
                 nodes,
                 NumericNode::LiteralAllocation {
-                    target: if op == Op::NewArray {
-                        otter_vm::native_abi::STUB_JIT_NEW_ARRAY
-                    } else {
-                        otter_vm::native_abi::STUB_JIT_NEW_OBJECT
+                    target: match op {
+                        Op::NewArray => otter_vm::native_abi::STUB_JIT_NEW_ARRAY,
+                        Op::NewObjectLiteral => otter_vm::native_abi::STUB_JIT_NEW_OBJECT_LITERAL,
+                        _ => otter_vm::native_abi::STUB_JIT_NEW_OBJECT,
                     },
                     argument_start,
                     argument_count,

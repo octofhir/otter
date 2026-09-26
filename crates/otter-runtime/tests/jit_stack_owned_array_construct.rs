@@ -1027,20 +1027,19 @@ for (let i = 0; i < {iterations}; i++) {{
   }}
   checksum += marker.value + zeroLength + sizedLength;
 }}
-String(checksum);
+checksum;
 "#
     );
     let expected_checksum =
         u64::from(iterations) * u64::from(iterations - 1) / 2 + u64::from(iterations) * 4;
     let before = runtime.execution_stats();
     let completion = run(&mut runtime, probe, "jit-stack-owned-array-gc-probe.js");
-    let mut delta = CounterDelta::between(before, runtime.execution_stats());
+    let delta = CounterDelta::between(before, runtime.execution_stats());
 
     assert_eq!(completion, expected_checksum.to_string());
-    // The OSR-compiled probe loop reaches the native `String(checksum)` through
-    // the one generic call boundary; every ArrayConstruct edge stays generated.
-    assert!(delta.to_rust_call_transitions <= 1, "{delta:?}");
-    delta.to_rust_call_transitions = 0;
+    // The probe ends on the plain `checksum` completion: an unprofiled call
+    // after the OSR-compiled loop would soft-deopt its first execution, which
+    // says nothing about the ArrayConstruct edges this test covers.
     // Every iteration calls both ArrayConstruct callees through generated
     // linkage; once the probe loop itself enters OSR code, its two outer calls
     // are generated as well.

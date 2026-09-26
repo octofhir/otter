@@ -615,7 +615,14 @@ impl Interpreter {
         {
             return None;
         }
-        match self.compile_optimized_jit_function(context, fid, Some(osr_pc)) {
+        let compiled = self.compile_optimized_jit_function(context, fid, Some(osr_pc));
+        // Every attempt restarts the function's back-edge observation, as
+        // V8's tiering budget restarts after an optimization: a later
+        // replacement must again earn its measured compile cost from loop
+        // executions it actually observed, not from the loop's lifetime.
+        self.jit_osr_counts
+            .retain(|&(function, _), _| function != fid);
+        match compiled {
             Some(compiled) => {
                 self.jit_optimized_code.insert(fid, Some(compiled.clone()));
                 self.jit_optimized_declined_epoch.remove(&fid);
@@ -1041,6 +1048,7 @@ impl Interpreter {
                 data_ptr_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_DATA_OFFSET as u32,
                 byte_len_byte: header + buffer::LOCAL_ARRAY_BUFFER_BODY_BYTE_LEN_OFFSET as u32,
                 view_offset_byte: header + view::TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET as u32,
+                cached_data_byte: header + view::TYPED_ARRAY_BODY_DATA_OFFSET as u32,
             },
             element,
         }

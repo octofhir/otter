@@ -830,57 +830,71 @@ impl Interpreter {
             interp.ensure_deferred_namespace_ready(stack, context, &current, true)?;
             Ok(interp.escape_scoped(target))
         })?;
-        if let Some(proxy) = target.as_proxy() {
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            let trap_result =
-                match self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)? {
-                    ProxyTrap::Trapped(v) => Some(v),
-                    ProxyTrap::NoTrap { .. } => None,
+        if target.as_proxy().is_some() {
+            // The `ownKeys` and `getOwnPropertyDescriptor` traps run user code
+            // that may collect: every use re-reads the rooted proxy, and trap
+            // keys are copied out as strings before anything allocates.
+            enum ProxyKeys {
+                Names(Vec<String>),
+                Target(Value),
+            }
+            let listed = self.with_handle_scope(|interp, scope| -> Result<ProxyKeys, VmError> {
+                let proxy_root = interp.scoped_value(scope, target);
+                let proxy = target.as_proxy().ok_or(VmError::InvalidOperand)?;
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&interp.gc_heap)];
+                let trap_result =
+                    match interp.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)? {
+                        ProxyTrap::Trapped(v) => Some(v),
+                        ProxyTrap::NoTrap { .. } => None,
+                    };
+                let proxy = interp
+                    .escape_scoped(proxy_root)
+                    .as_proxy()
+                    .ok_or(VmError::InvalidOperand)?;
+                let names = match trap_result {
+                    Some(v) if v.as_array().is_some() => {
+                        let arr = v.as_array().ok_or(VmError::InvalidOperand)?;
+                        crate::array::with_elements(arr, &interp.gc_heap, |elements| {
+                            elements
+                                .iter()
+                                .filter_map(|key| key.as_string(&interp.gc_heap))
+                                .map(|name| name.to_lossy_string(&interp.gc_heap))
+                                .collect::<Vec<_>>()
+                        })
+                    }
+                    Some(v) if !v.is_nullish() => {
+                        return Err(interp.err_type(
+                            ("Proxy ownKeys trap returned non-array".to_string()).into(),
+                        ));
+                    }
+                    _ => return Ok(ProxyKeys::Target(proxy.target(&interp.gc_heap))),
                 };
-            let keys = if let Some(arr) = trap_result.and_then(|v| v.as_array()) {
-                crate::array::with_elements(arr, &self.gc_heap, |elements| elements.to_vec())
-            } else if let Some(v) = trap_result {
-                if v.is_nullish() {
-                    return self.enumerable_own_string_keys_for_value(
+                let mut enumerable = Vec::new();
+                for name in names {
+                    let current = interp.escape_scoped(proxy_root);
+                    let desc = interp.ordinary_get_own_property_descriptor_value(
                         stack,
                         context,
-                        proxy.target(&self.gc_heap),
+                        current,
+                        &VmPropertyKey::OwnedString(name.clone()),
                         hops + 1,
-                    );
+                    )?;
+                    if desc
+                        .as_ref()
+                        .is_some_and(object::PropertyDescriptor::enumerable)
+                    {
+                        enumerable.push(name);
+                    }
                 }
-                return Err(
-                    self.err_type(("Proxy ownKeys trap returned non-array".to_string()).into())
-                );
-            } else {
-                return self.enumerable_own_string_keys_for_value(
-                    stack,
-                    context,
-                    proxy.target(&self.gc_heap),
-                    hops + 1,
-                );
+                Ok(ProxyKeys::Names(enumerable))
+            })?;
+            return match listed {
+                ProxyKeys::Names(names) => Ok(names),
+                ProxyKeys::Target(inner) => {
+                    self.enumerable_own_string_keys_for_value(stack, context, inner, hops + 1)
+                }
             };
-            let mut enumerable = Vec::new();
-            for key in &keys {
-                let Some(name) = key.as_string(&self.gc_heap) else {
-                    continue;
-                };
-                let name = name.to_lossy_string(&self.gc_heap);
-                let proxy_root = Value::proxy(proxy);
-                let desc = self.ordinary_get_own_property_descriptor_value(
-                    stack,
-                    context,
-                    proxy_root,
-                    &VmPropertyKey::OwnedString(name.clone()),
-                    hops + 1,
-                )?;
-                if desc
-                    .as_ref()
-                    .is_some_and(object::PropertyDescriptor::enumerable)
-                {
-                    enumerable.push(name);
-                }
-            }
-            return Ok(enumerable);
         }
         if let Some(obj) = target.as_object() {
             // §10.4.6 namespace enumerable string keys are its resolved
@@ -914,27 +928,35 @@ impl Interpreter {
             }));
             return Ok(keys);
         }
-        if let Some(arr) = target.as_array() {
-            let target = Value::array(arr);
-            let own_keys = self.own_property_keys_value(stack, context, &target)?;
-            let mut out = Vec::new();
-            for key_value in own_keys {
-                let Some(name) = key_value.as_string(&self.gc_heap) else {
-                    continue;
-                };
-                let key = name.to_lossy_string(&self.gc_heap);
-                if let Some(desc) = self.ordinary_get_own_property_descriptor_value(
-                    stack,
-                    context,
-                    target,
-                    &VmPropertyKey::OwnedString(key.clone()),
-                    hops + 1,
-                )? && desc.enumerable()
-                {
-                    out.push(key);
+        if target.as_array().is_some() {
+            // Key strings are copied out before the next allocation, and every
+            // descriptor read starts from the rooted array: a collection inside
+            // one may move it.
+            return self.with_handle_scope(|interp, scope| {
+                let target = interp.scoped_value(scope, target);
+                let current = interp.escape_scoped(target);
+                let names = interp
+                    .own_property_keys_value(stack, context, &current)?
+                    .iter()
+                    .filter_map(|key| key.as_string(&interp.gc_heap))
+                    .map(|name| name.to_lossy_string(&interp.gc_heap))
+                    .collect::<Vec<_>>();
+                let mut out = Vec::new();
+                for key in names {
+                    let current = interp.escape_scoped(target);
+                    if let Some(desc) = interp.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        current,
+                        &VmPropertyKey::OwnedString(key.clone()),
+                        hops + 1,
+                    )? && desc.enumerable()
+                    {
+                        out.push(key);
+                    }
                 }
-            }
-            return Ok(out);
+                Ok(out)
+            });
         }
         // §23.2.3.* — a TypedArray's enumerable own string keys are its
         // canonical integer indices (all enumerable) in ascending order,
@@ -1105,39 +1127,55 @@ impl Interpreter {
             }
         }
 
-        for hops in 0..object::PROTO_CHAIN_HARD_CAP {
-            if current.is_null() {
-                break;
-            }
+        // Collecting keys, reading descriptors and walking prototypes can all
+        // allocate and move the object being enumerated, so it and its key
+        // list live in the handle scope and are re-read after each step.
+        self.with_handle_scope(|interp, scope| -> Result<(), VmError> {
+            let current_handle = interp.scoped_value(scope, current);
+            for hops in 0..object::PROTO_CHAIN_HARD_CAP {
+                let current = interp.escape_scoped(current_handle);
+                if current.is_null() {
+                    break;
+                }
+                let keys = interp.own_property_keys_value(stack, context, &current)?;
+                let keys = keys
+                    .into_iter()
+                    .map(|key| interp.scoped_value(scope, key))
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    let key = interp.escape_scoped(key);
+                    let Some(name) = key.as_string(&interp.gc_heap) else {
+                        continue;
+                    };
+                    let name = name.to_lossy_string(&interp.gc_heap);
+                    if !visited.insert(name.clone()) {
+                        continue;
+                    }
 
-            let keys = self.own_property_keys_value(stack, context, &current)?;
-            for key in &keys {
-                let Some(name) = key.as_string(&self.gc_heap) else {
-                    continue;
-                };
-                let name = name.to_lossy_string(&self.gc_heap);
-                if !visited.insert(name.clone()) {
-                    continue;
+                    let key = VmPropertyKey::OwnedString(name.clone());
+                    let current = interp.escape_scoped(current_handle);
+                    let desc = interp.ordinary_get_own_property_descriptor_value(
+                        stack,
+                        context,
+                        current,
+                        &key,
+                        hops + 1,
+                    )?;
+                    if desc
+                        .as_ref()
+                        .is_some_and(object::PropertyDescriptor::enumerable)
+                    {
+                        out.push(name);
+                    }
                 }
 
-                let key = VmPropertyKey::OwnedString(name.clone());
-                let desc = self.ordinary_get_own_property_descriptor_value(
-                    stack,
-                    context,
-                    current,
-                    &key,
-                    hops + 1,
-                )?;
-                if desc
-                    .as_ref()
-                    .is_some_and(object::PropertyDescriptor::enumerable)
-                {
-                    out.push(name);
-                }
+                let current = interp.escape_scoped(current_handle);
+                let next =
+                    interp.ordinary_get_prototype_value(stack, context, current, hops + 1)?;
+                interp.set_scoped(current_handle, next);
             }
-
-            current = self.ordinary_get_prototype_value(stack, context, current, hops + 1)?;
-        }
+            Ok(())
+        })?;
 
         Ok(out)
     }

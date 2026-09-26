@@ -1386,6 +1386,14 @@ pub enum Op {
     /// the name still resolves to the captured declarative binding, leave it
     /// intact and return `false`.
     DeleteShadowedUpvalue,
+    /// Build an ordinary object from a static-key literal
+    /// (`{ a: x, b: y }`) in one step. Operands:
+    /// `dst, count, first_key_const, value0, value1, …`. The keys are the
+    /// `count` string constants starting at `first_key_const`, in property
+    /// order; the compiler emits it only for distinct, non-index,
+    /// non-`__proto__` data keys, so the result equals `NewObject` followed by
+    /// one `DefineDataProperty` per key.
+    NewObjectLiteral,
 }
 
 impl Op {
@@ -1573,6 +1581,7 @@ impl Op {
             Op::StoreShadowedUpvalueCheckedSnap => "STORE_SHADOWED_UPVALUE_CHECKED_SNAP",
             Op::EvalRestoreBinding => "EVAL_RESTORE_BINDING",
             Op::DeleteShadowedUpvalue => "DELETE_SHADOWED_UPVALUE",
+            Op::NewObjectLiteral => "NEW_OBJECT_LITERAL",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
@@ -1752,6 +1761,8 @@ impl Op {
             // dispatcher reads the count and walks the trailing
             // operands.
             Op::NewArray => 2,
+            // `dst, count, first_key_const, values...`.
+            Op::NewObjectLiteral => 3,
             Op::LoadElement | Op::DeleteElement => 3,
             // recv, key, src.
             Op::StoreElement | Op::StoreElementStrict => 3,
@@ -1861,6 +1872,9 @@ impl Op {
             Op::MakeClosure => pos == 1,
             // [reg, recv, name_const, argc, args...]
             Op::CallMethodValue => pos == 2,
+            // [dst, count, first_key_const, values...]; the key run moves
+            // with the constant pool as one block.
+            Op::NewObjectLiteral => pos == 2,
             // Variadic *Call shapes whose pos=1 is a method-id enum
             // (e.g. `PromiseMethod::from_u32`), **not** a
             // constant-pool reference. The linker must NOT

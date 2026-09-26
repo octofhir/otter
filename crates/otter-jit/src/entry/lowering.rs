@@ -992,6 +992,22 @@ impl BaselinePlan {
                         elements,
                     })
                 }
+                // dst, count(const), first_key(const), values…
+                Op::NewObjectLiteral => {
+                    let count = const_index(operands, 1)? as usize;
+                    let elements = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        3,
+                        count,
+                        "object literal register tail",
+                    )?;
+                    LoweredOperands::NewArray(NewArrayOperands {
+                        dst: reg(operands, 0)?,
+                        elements,
+                    })
+                }
                 // Static intrinsic calls carry a method-id constant before the
                 // count: dst, method(const), argc(const), args…
                 Op::ArrayBufferCall

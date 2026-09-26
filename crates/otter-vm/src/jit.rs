@@ -1247,6 +1247,11 @@ pub enum JitElementBase {
         /// Byte offset, in the receiver body, of the view's own byte offset
         /// into the buffer.
         view_offset_byte: u32,
+        /// Byte offset, in the receiver body, of the view's cached element
+        /// base. Non-null only for a view over a fixed-length local buffer;
+        /// while the isolate's detach protector is intact it replaces every
+        /// buffer proof above.
+        cached_data_byte: u32,
     },
 }
 

@@ -110,12 +110,51 @@ const VALUE_UNDEFINED_IMM: u32 = VALUE_UNDEFINED as u32;
 /// Persistent machine-stack reservation held by [`emit_prologue`].
 pub(super) const NATIVE_FRAME_BYTES: u32 = 48;
 
+/// Bytes of code between two veneer islands. A conditional branch or
+/// `cbz`/`cbnz` reaches ±1 MiB; every exit label a segment names is defined
+/// in the island that closes it, so each such branch stays far inside range.
+const VENEER_ISLAND_INTERVAL: usize = 256 * 1024;
+
 pub(super) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
     artifact_request: Option<ArtifactRequest>,
     capture_events: bool,
+) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
+    // Near branches are one instruction; only a body whose own control flow
+    // spans more than a conditional branch reaches pays for the far form.
+    match compile_with_reach(
+        view,
+        code_object_id,
+        transitions,
+        artifact_request.clone(),
+        capture_events,
+        false,
+    ) {
+        Err(Unsupported::Backend(crate::BackendFailure::Relocation)) => compile_with_reach(
+            view,
+            code_object_id,
+            transitions,
+            artifact_request,
+            capture_events,
+            true,
+        ),
+        result => result,
+    }
+}
+
+/// Emit one Template body. `far_branches` lowers every conditional branch to
+/// a bytecode label as an inverted local branch around an unconditional `b`
+/// (±128 MiB), the veneer V8's arm64 assembler places for out-of-range
+/// branches.
+fn compile_with_reach(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &crate::entry::TransitionTable,
+    artifact_request: Option<ArtifactRequest>,
+    capture_events: bool,
+    far_branches: bool,
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
     let plan = TemplatePlan::build(view)?;
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
@@ -139,20 +178,55 @@ pub(super) fn compile(
     let mut numeric_slow_paths = Vec::new();
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let type_mismatch_exit = ops.new_dynamic_label();
-    let identity_guard_exit = ops.new_dynamic_label();
-    let allocation_miss_exit = ops.new_dynamic_label();
-    let unsupported_exit = ops.new_dynamic_label();
-    let runtime_transition_exit = ops.new_dynamic_label();
-    let backedge_relink_exit = ops.new_dynamic_label();
+    // Shared exit labels. Each veneer island defines the labels its segment
+    // named as `b` trampolines to the final epilogues and hands the next
+    // segment fresh ones, so every branch to an exit stays near.
+    let mut type_mismatch_exit = ops.new_dynamic_label();
+    let mut identity_guard_exit = ops.new_dynamic_label();
+    let mut allocation_miss_exit = ops.new_dynamic_label();
+    let mut unsupported_exit = ops.new_dynamic_label();
+    let mut runtime_transition_exit = ops.new_dynamic_label();
+    let mut backedge_relink_exit = ops.new_dynamic_label();
     // Runtime-transition helpers share this local name; representation,
     // identity, allocation, and unsupported sites select dedicated labels.
-    let bail = runtime_transition_exit;
-    let returned = ops.new_dynamic_label();
-    let committed_throw = ops.new_dynamic_label();
-    let threw = ops.new_dynamic_label();
-    let propagate_throw = ops.new_dynamic_label();
-    let fatal = ops.new_dynamic_label();
+    let mut bail = runtime_transition_exit;
+    let mut returned = ops.new_dynamic_label();
+    let mut committed_throw = ops.new_dynamic_label();
+    let mut threw = ops.new_dynamic_label();
+    let mut propagate_throw = ops.new_dynamic_label();
+    let mut fatal = ops.new_dynamic_label();
+    let final_exits = [
+        type_mismatch_exit,
+        identity_guard_exit,
+        allocation_miss_exit,
+        unsupported_exit,
+        runtime_transition_exit,
+        backedge_relink_exit,
+        returned,
+        committed_throw,
+        threw,
+        propagate_throw,
+        fatal,
+    ];
+    // A far body names segment-local exits from its first operation, so its
+    // first island can define them without touching the final epilogues.
+    if far_branches {
+        [
+            type_mismatch_exit,
+            identity_guard_exit,
+            allocation_miss_exit,
+            unsupported_exit,
+            runtime_transition_exit,
+            backedge_relink_exit,
+            returned,
+            committed_throw,
+            threw,
+            propagate_throw,
+            fatal,
+        ] = std::array::from_fn(|_| ops.new_dynamic_label());
+        bail = runtime_transition_exit;
+    }
+    let mut island_base = 0usize;
     let labels: BTreeMap<u32, DynamicLabel> = plan
         .instructions
         .iter()
@@ -184,6 +258,66 @@ pub(super) fn compile(
     // operation sharing the PC must not redefine it.
     let mut labelled_pcs: BTreeSet<u32> = BTreeSet::new();
     for (operation_index, instr) in plan.instructions.iter().enumerate() {
+        if far_branches && ops.offset().0 - island_base >= VENEER_ISLAND_INTERVAL {
+            let island_start = ops.offset().0;
+            let resume = ops.new_dynamic_label();
+            dynasm!(ops ; .arch aarch64 ; b =>resume);
+            emit_numeric_slow_paths(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                std::mem::take(&mut numeric_slow_paths),
+                threw,
+                fatal,
+            );
+            emit_coercion_slow_paths(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                std::mem::take(&mut coercion_slow_paths),
+                threw,
+                fatal,
+            );
+            let segment_exits = [
+                type_mismatch_exit,
+                identity_guard_exit,
+                allocation_miss_exit,
+                unsupported_exit,
+                runtime_transition_exit,
+                backedge_relink_exit,
+                returned,
+                committed_throw,
+                threw,
+                propagate_throw,
+                fatal,
+            ];
+            for (segment, target) in segment_exits.into_iter().zip(final_exits) {
+                dynasm!(ops ; .arch aarch64 ; =>segment ; b =>target);
+            }
+            [
+                type_mismatch_exit,
+                identity_guard_exit,
+                allocation_miss_exit,
+                unsupported_exit,
+                runtime_transition_exit,
+                backedge_relink_exit,
+                returned,
+                committed_throw,
+                threw,
+                propagate_throw,
+                fatal,
+            ] = std::array::from_fn(|_| ops.new_dynamic_label());
+            bail = runtime_transition_exit;
+            dynasm!(ops ; .arch aarch64 ; =>resume);
+            island_base = ops.offset().0;
+            if let Some(code_map) = code_map.as_mut() {
+                code_map.record(CodeRegion::structural(
+                    "veneerIsland",
+                    island_start,
+                    island_base,
+                ));
+            }
+        }
         let instruction_start = ops.offset().0;
         if labelled_pcs.insert(instr.pc) {
             let label = labels[&instr.pc];
@@ -258,6 +392,14 @@ pub(super) fn compile(
                         threw,
                         fatal,
                     );
+                    dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
+                } else if far_branches {
+                    let fallthrough = ops.new_dynamic_label();
+                    if when_truthy {
+                        dynasm!(ops ; .arch aarch64 ; b.ne =>fallthrough);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; b.eq =>fallthrough);
+                    }
                     dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
                 } else if when_truthy {
                     dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -575,6 +717,17 @@ pub(super) fn compile(
             }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    plan.register_tail(elements),
+                    committed_throw,
+                    fatal,
+                )?;
+            }
+            TemplateOp::NewObjectLiteral { dst, elements } => {
+                transitions::emit_new_object_literal(
                     &mut ops,
                     &mut relocations,
                     transitions,
@@ -1401,6 +1554,44 @@ pub(super) fn compile(
             ));
         }
     }
+
+    // The last segment's exits are the final epilogues' own labels once the
+    // island trampolines are in place: alias them here, next to the tail.
+    let segment_exits = [
+        type_mismatch_exit,
+        identity_guard_exit,
+        allocation_miss_exit,
+        unsupported_exit,
+        runtime_transition_exit,
+        backedge_relink_exit,
+        returned,
+        committed_throw,
+        threw,
+        propagate_throw,
+        fatal,
+    ];
+    if segment_exits != final_exits {
+        let skip = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; b =>skip);
+        for (segment, target) in segment_exits.into_iter().zip(final_exits) {
+            dynasm!(ops ; .arch aarch64 ; =>segment ; b =>target);
+        }
+        dynasm!(ops ; .arch aarch64 ; =>skip);
+    }
+    [
+        type_mismatch_exit,
+        identity_guard_exit,
+        allocation_miss_exit,
+        unsupported_exit,
+        runtime_transition_exit,
+        backedge_relink_exit,
+        returned,
+        committed_throw,
+        threw,
+        propagate_throw,
+        fatal,
+    ] = final_exits;
+    bail = runtime_transition_exit;
 
     // Preserve the old end-of-stream exact exit while keeping cold
     // continuations out of line. Each returns to the label immediately after

@@ -82,6 +82,7 @@
 //! - [`crate::optimizing`] — the production Machine compilation entry.
 
 mod committed_probe;
+mod dce;
 mod deopt;
 mod derived_this;
 mod dominance;
@@ -860,6 +861,11 @@ pub enum MachineOpcode {
     IntegerAddImmediate(i32),
     /// Integer subtraction with a baked right operand and overflow exit.
     IntegerSubImmediate(i32),
+    /// Wrapping int32 addition: `ToInt32(a + b)` for int32 operands, whose
+    /// double sum is exact.
+    IntegerAddWrapping,
+    /// Wrapping int32 subtraction: `ToInt32(a - b)` for int32 operands.
+    IntegerSubWrapping,
     /// Integer bitwise AND.
     IntegerAnd,
     /// Integer bitwise OR.
@@ -1497,6 +1503,180 @@ impl std::fmt::Display for VerificationError {
 
 impl std::error::Error for VerificationError {}
 
+/// Dense numbering of the Tagged Machine values, the only class a GC root
+/// set holds; liveness sets are indexed by it.
+struct TaggedUniverse {
+    index: Vec<u32>,
+    values: Vec<MachineValue>,
+}
+
+impl TaggedUniverse {
+    fn new(representations: &[MachineRepresentation]) -> Self {
+        let mut index = vec![u32::MAX; representations.len()];
+        let mut values = Vec::new();
+        for (value, representation) in representations.iter().enumerate() {
+            if *representation == MachineRepresentation::Tagged {
+                index[value] = values.len() as u32;
+                values.push(MachineValue(value as u32));
+            }
+        }
+        Self { index, values }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn index(&self, value: MachineValue) -> Option<usize> {
+        self.index
+            .get(value.0 as usize)
+            .copied()
+            .filter(|index| *index != u32::MAX)
+            .map(|index| index as usize)
+    }
+
+    fn value(&self, index: usize) -> MachineValue {
+        self.values[index]
+    }
+}
+
+/// Dense set of Machine values packed into 64-bit words: liveness keeps one
+/// per block, so union, copy and comparison cost `values / 64` words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValueSet {
+    words: Vec<u64>,
+}
+
+impl ValueSet {
+    fn new(len: usize) -> Self {
+        Self {
+            words: vec![0; len.div_ceil(64)],
+        }
+    }
+
+    fn insert(&mut self, value: usize) {
+        self.words[value / 64] |= 1 << (value % 64);
+    }
+
+    /// Remove `value`, reporting whether it was present.
+    fn remove(&mut self, value: usize) -> bool {
+        let word = &mut self.words[value / 64];
+        let mask = 1 << (value % 64);
+        let present = *word & mask != 0;
+        *word &= !mask;
+        present
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for (word, other) in self.words.iter_mut().zip(&other.words) {
+            *word |= other;
+        }
+    }
+
+    /// Members in ascending order.
+    fn ones(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words.iter().enumerate().flat_map(|(index, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(index * 64 + bit)
+            })
+        })
+    }
+}
+
+/// Definition and use sites of every Machine value, built once per
+/// verification so per-instruction questions ("who produces this status",
+/// "where is this raw address read") cost their answer, not a scan of the
+/// whole sequence.
+struct ValueIndex {
+    producers: Vec<Vec<u32>>,
+    uses: Vec<Vec<(u32, u8)>>,
+    edge_values: Vec<bool>,
+    instruction_blocks: Vec<u32>,
+}
+
+impl ValueIndex {
+    fn build(sequence: &InstructionSequence) -> Self {
+        let count = sequence.representations.len();
+        let mut producers = vec![Vec::new(); count];
+        let mut uses = vec![Vec::new(); count];
+        let mut edge_values = vec![false; count];
+        let mut instruction_blocks = vec![u32::MAX; sequence.instructions.len()];
+        for (block_index, block) in sequence.blocks.iter().enumerate() {
+            for value in block
+                .parameters
+                .iter()
+                .chain(block.successor_arguments.iter().flatten())
+            {
+                if let Some(slot) = edge_values.get_mut(value.0 as usize) {
+                    *slot = true;
+                }
+            }
+            for index in block.first.0..block.end.0 {
+                if let Some(slot) = instruction_blocks.get_mut(index as usize) {
+                    *slot = block_index as u32;
+                }
+            }
+        }
+        for (index, instruction) in sequence.instructions.iter().enumerate() {
+            for (operand_index, operand) in instruction.operands.iter().enumerate() {
+                let Some(value) = operand
+                    .value
+                    .0
+                    .try_into()
+                    .ok()
+                    .filter(|v: &usize| *v < count)
+                else {
+                    continue;
+                };
+                if operand.purpose == OperandPurpose::Output {
+                    producers[value].push(index as u32);
+                }
+                if operand.role == OperandRole::Use {
+                    uses[value].push((index as u32, operand_index as u8));
+                }
+            }
+        }
+        Self {
+            producers,
+            uses,
+            edge_values,
+            instruction_blocks,
+        }
+    }
+
+    fn producers(&self, value: MachineValue) -> &[u32] {
+        self.producers
+            .get(value.0 as usize)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn uses(&self, value: MachineValue) -> &[(u32, u8)] {
+        self.uses.get(value.0 as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the value is a block parameter or a successor argument.
+    fn crosses_block_edge(&self, value: MachineValue) -> bool {
+        self.edge_values
+            .get(value.0 as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Block whose range holds the instruction, if any.
+    fn block_of(&self, instruction: u32) -> Option<u32> {
+        self.instruction_blocks
+            .get(instruction as usize)
+            .copied()
+            .filter(|block| *block != u32::MAX)
+    }
+}
+
 impl InstructionSequence {
     /// Construct and verify one target-selected instruction sequence.
     pub fn new(
@@ -1585,6 +1765,8 @@ impl InstructionSequence {
         let (sequence, mut stats) = gvn::optimize(self, target)?;
         let (sequence, licm) = licm::optimize(sequence, target)?;
         let (sequence, exposed) = gvn::optimize(sequence, target)?;
+        let (sequence, dead) = dce::optimize(sequence, target)?;
+        stats.eliminated_instructions = stats.eliminated_instructions.saturating_add(dead);
         stats.eliminated_instructions = stats
             .eliminated_instructions
             .saturating_add(exposed.eliminated_instructions);
@@ -1688,10 +1870,11 @@ impl InstructionSequence {
 
     fn live_values_on_edge(
         &self,
+        universe: &TaggedUniverse,
         predecessor: usize,
         successor_index: usize,
-        block_live_in: &[Vec<bool>],
-    ) -> Vec<bool> {
+        block_live_in: &[ValueSet],
+    ) -> ValueSet {
         let block = &self.blocks[predecessor];
         let successor = block.successors[successor_index];
         let successor_block = &self.blocks[successor.0 as usize];
@@ -1701,63 +1884,72 @@ impl InstructionSequence {
             .iter()
             .zip(&block.successor_arguments[successor_index])
         {
-            let parameter_is_live = live[parameter.0 as usize];
-            live[parameter.0 as usize] = false;
-            if parameter_is_live {
-                live[argument.0 as usize] = true;
+            let (Some(parameter), Some(argument)) =
+                (universe.index(parameter), universe.index(argument))
+            else {
+                continue;
+            };
+            if live.remove(parameter) {
+                live.insert(argument);
             }
         }
         live
     }
 
-    fn normal_live_out(&self, block_index: usize, block_live_in: &[Vec<bool>]) -> Vec<bool> {
+    fn normal_live_out(
+        &self,
+        universe: &TaggedUniverse,
+        block_index: usize,
+        block_live_in: &[ValueSet],
+    ) -> ValueSet {
         let block = &self.blocks[block_index];
         let exceptional_targets = (block.first.0..block.end.0)
             .filter_map(|instruction_index| {
                 self.exceptional_target(&self.instructions[instruction_index as usize])
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let mut live = vec![false; self.representations.len()];
+        let mut live = ValueSet::new(universe.len());
         for (successor_index, successor) in block.successors.iter().enumerate() {
             if exceptional_targets.contains(successor) {
                 continue;
             }
-            for (destination, source) in live.iter_mut().zip(self.live_values_on_edge(
+            live.union_with(&self.live_values_on_edge(
+                universe,
                 block_index,
                 successor_index,
                 block_live_in,
-            )) {
-                *destination |= source;
-            }
+            ));
         }
         live
     }
 
     fn live_before_instruction(
         &self,
+        universe: &TaggedUniverse,
         block_index: usize,
         instruction: &MachineInstruction,
-        block_live_in: &[Vec<bool>],
-        mut live: Vec<bool>,
-    ) -> Vec<bool> {
+        block_live_in: &[ValueSet],
+        mut live: ValueSet,
+    ) -> ValueSet {
         if let Some(target) = self.exceptional_target(instruction) {
             let successor_index = self.blocks[block_index]
                 .successors
                 .iter()
                 .position(|successor| *successor == target)
                 .expect("verified exceptional edge must name a stored successor");
-            for (destination, source) in live.iter_mut().zip(self.live_values_on_edge(
+            live.union_with(&self.live_values_on_edge(
+                universe,
                 block_index,
                 successor_index,
                 block_live_in,
-            )) {
-                *destination |= source;
-            }
+            ));
         }
         for operand in &instruction.operands {
-            if operand.role == OperandRole::Definition && operand.purpose == OperandPurpose::Output
+            if operand.role == OperandRole::Definition
+                && operand.purpose == OperandPurpose::Output
+                && let Some(index) = universe.index(operand.value)
             {
-                live[operand.value.0 as usize] = false;
+                live.remove(index);
             }
         }
         for operand in &instruction.operands {
@@ -1766,13 +1958,19 @@ impl InstructionSequence {
                     operand.purpose,
                     OperandPurpose::Input | OperandPurpose::FrameState
                 )
+                && let Some(index) = universe.index(operand.value)
             {
-                live[operand.value.0 as usize] = true;
+                live.insert(index);
             }
         }
         live
     }
 
+    /// Tagged values live across every GC safepoint.
+    ///
+    /// Backward dataflow over the tagged values only (the one class a root
+    /// set holds), driven by a predecessor worklist so a block is revisited
+    /// only when a successor's live-in grew.
     fn live_tagged_values_at_gc_safepoints(
         &self,
     ) -> Vec<(MachineInstructionId, Vec<MachineValue>)> {
@@ -1783,49 +1981,54 @@ impl InstructionSequence {
         {
             return Vec::new();
         }
-        let mut block_live_in = vec![vec![false; self.representations.len()]; self.blocks.len()];
-        loop {
-            let mut changed = false;
-            for block_index in (0..self.blocks.len()).rev() {
-                let block = &self.blocks[block_index];
-                let mut live = self.normal_live_out(block_index, &block_live_in);
-                for instruction_index in (block.first.0..block.end.0).rev() {
-                    live = self.live_before_instruction(
-                        block_index,
-                        &self.instructions[instruction_index as usize],
-                        &block_live_in,
-                        live,
-                    );
-                }
-                if live != block_live_in[block_index] {
-                    block_live_in[block_index] = live;
-                    changed = true;
-                }
+        let universe = TaggedUniverse::new(&self.representations);
+        let mut block_live_in = vec![ValueSet::new(universe.len()); self.blocks.len()];
+        let mut queued = vec![true; self.blocks.len()];
+        let mut worklist = (0..self.blocks.len()).collect::<Vec<_>>();
+        while let Some(block_index) = worklist.pop() {
+            queued[block_index] = false;
+            let block = &self.blocks[block_index];
+            let mut live = self.normal_live_out(&universe, block_index, &block_live_in);
+            for instruction_index in (block.first.0..block.end.0).rev() {
+                live = self.live_before_instruction(
+                    &universe,
+                    block_index,
+                    &self.instructions[instruction_index as usize],
+                    &block_live_in,
+                    live,
+                );
             }
-            if !changed {
-                break;
+            if live != block_live_in[block_index] {
+                block_live_in[block_index] = live;
+                for predecessor in &block.predecessors {
+                    let predecessor = predecessor.0 as usize;
+                    if !queued[predecessor] {
+                        queued[predecessor] = true;
+                        worklist.push(predecessor);
+                    }
+                }
             }
         }
 
         let mut safepoints = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
-            let mut live = self.normal_live_out(block_index, &block_live_in);
+            let mut live = self.normal_live_out(&universe, block_index, &block_live_in);
             for instruction_index in (block.first.0..block.end.0).rev() {
                 let id = MachineInstructionId(instruction_index);
                 let instruction = &self.instructions[instruction_index as usize];
-                live = self.live_before_instruction(block_index, instruction, &block_live_in, live);
+                live = self.live_before_instruction(
+                    &universe,
+                    block_index,
+                    instruction,
+                    &block_live_in,
+                    live,
+                );
                 if instruction.safepoint.is_none() {
                     continue;
                 }
-                let mut live_tagged = self
-                    .representations
-                    .iter()
-                    .zip(&live)
-                    .enumerate()
-                    .filter_map(|(value, (&representation, &is_live))| {
-                        (representation == MachineRepresentation::Tagged && is_live)
-                            .then_some(MachineValue(value as u32))
-                    })
+                let mut live_tagged = live
+                    .ones()
+                    .map(|index| universe.value(index))
                     .collect::<std::collections::BTreeSet<_>>();
                 if let Some(state_id) = instruction.frame_state
                     && let Some(state) = self.frame_states.get(state_id as usize)
@@ -1921,6 +2124,7 @@ impl InstructionSequence {
         if self.entry.0 as usize >= self.blocks.len() {
             return Err(VerificationError::InvalidEntry);
         }
+        let values = ValueIndex::build(self);
         for (expected, state) in self.frame_states.iter().enumerate() {
             let expected = expected as FrameStateId;
             if state.id != expected {
@@ -2843,35 +3047,20 @@ impl InstructionSequence {
                         let hit_block = (!matches!(target, MachineBindingTarget::Cold))
                             .then(|| block.successors.first().copied())
                             .flatten();
-                        let raw_addresses_are_hit_local = self.blocks.iter().enumerate().all(
-                            |(candidate_block_index, candidate_block)| {
-                                if candidate_block
-                                    .parameters
-                                    .iter()
-                                    .chain(candidate_block.successor_arguments.iter().flatten())
-                                    .any(|value| raw_addresses.contains(value))
-                                {
-                                    return false;
-                                }
-                                for candidate_index in
-                                    candidate_block.first.0..candidate_block.end.0
-                                {
-                                    let Some(candidate) =
-                                        self.instructions.get(candidate_index as usize)
-                                    else {
-                                        return false;
-                                    };
-                                    for (operand_index, operand) in
-                                        candidate.operands.iter().enumerate()
-                                    {
-                                        if operand.role != OperandRole::Use
-                                            || !raw_addresses.contains(&operand.value)
-                                        {
-                                            continue;
-                                        }
-                                        let in_hit_block = hit_block
-                                            == Some(MachineBlock(candidate_block_index as u32));
-                                        let allowed = in_hit_block
+                        let raw_addresses_are_hit_local = raw_addresses.iter().all(|raw| {
+                            !values.crosses_block_edge(*raw)
+                                && values.uses(*raw).iter().all(
+                                    |&(candidate_index, operand_index)| {
+                                        let Some(candidate_block_index) =
+                                            values.block_of(candidate_index)
+                                        else {
+                                            return true;
+                                        };
+                                        let candidate =
+                                            &self.instructions[candidate_index as usize];
+                                        let operand = &candidate.operands[operand_index as usize];
+                                        let operand_index = operand_index as usize;
+                                        hit_block == Some(MachineBlock(candidate_block_index))
                                             && operand.purpose == OperandPurpose::Input
                                             && match candidate.opcode {
                                                 MachineOpcode::BindingHit { .. } => {
@@ -2885,15 +3074,10 @@ impl InstructionSequence {
                                                         && operand.value == raw_addresses[0]
                                                 }
                                                 _ => false,
-                                            };
-                                        if !allowed {
-                                            return false;
-                                        }
-                                    }
-                                }
-                                true
-                            },
-                        );
+                                            }
+                                    },
+                                )
+                        });
                         let writable = !matches!(
                             semantics,
                             otter_bytecode::opcode_schema::BindingSemantics::Write(_)
@@ -2992,15 +3176,10 @@ impl InstructionSequence {
                         let [status] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
-                        let producers = self
-                            .instructions
+                        let producers = values
+                            .producers(status.value)
                             .iter()
-                            .filter(|candidate| {
-                                candidate.operands.iter().any(|operand| {
-                                    operand.purpose == OperandPurpose::Output
-                                        && operand.value == status.value
-                                })
-                            })
+                            .map(|&index| &self.instructions[index as usize])
                             .collect::<Vec<_>>();
                         let committed_pair_status = if let [producer] = producers.as_slice() {
                             let MachineOpcode::Call(descriptor) = producer.opcode else {
@@ -3299,6 +3478,7 @@ impl InstructionSequence {
                                 *target,
                                 otter_vm::native_abi::STUB_JIT_NEW_OBJECT
                                     | otter_vm::native_abi::STUB_JIT_NEW_ARRAY
+                                    | otter_vm::native_abi::STUB_JIT_NEW_OBJECT_LITERAL
                             ) && (*target != otter_vm::native_abi::STUB_JIT_NEW_OBJECT
                                 || arguments == 0)
                                 && arguments <= usize::from(u8::MAX) - 2

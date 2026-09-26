@@ -211,6 +211,8 @@ impl MachineOpcode {
             | Self::IntegerNeg
             | Self::IntegerAddImmediate(_)
             | Self::IntegerSubImmediate(_)
+            | Self::IntegerAddWrapping
+            | Self::IntegerSubWrapping
             | Self::IntegerAnd
             | Self::IntegerOr
             | Self::IntegerXor

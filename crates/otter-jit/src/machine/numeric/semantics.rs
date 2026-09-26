@@ -150,17 +150,17 @@ fn classify_instruction(
                         ObjectProtocolValueOp::LooseEqual | ObjectProtocolValueOp::LooseNotEqual,
                     ) => !feedback.is_numeric_only(),
                     CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::Binary(_)) => {
-                        // A concat node that already exited on a non-String
-                        // pair must not be rebuilt: its site turns generic.
-                        let concat_exited = view
+                        // A speculation that already exited on an operand of
+                        // another type must not be rebuilt: the site turns
+                        // generic, whatever the interpreter observed since.
+                        let exited = view
                             .optimized_exit_reasons
                             .get(&(logical_pc as u32))
                             .is_some_and(|reasons| reasons.contains(&ExitReason::TypeMismatch));
-                        !feedback.is_numeric_only()
-                            && !feedback.is_empty()
-                            && !(op == Op::Add
-                                && feedback.is_primitive_string_concat_only()
-                                && !concat_exited)
+                        exited
+                            || (!feedback.is_numeric_only()
+                                && !feedback.is_empty()
+                                && !(op == Op::Add && feedback.is_primitive_string_concat_only()))
                     }
                     _ => true,
                 }
@@ -185,7 +185,9 @@ fn classify_instruction(
             {
                 EFFECTS_NONE
             }
-            Op::ArrayConstruct | Op::NewObject | Op::NewArray => EFFECTS_ALLOCATING,
+            Op::ArrayConstruct | Op::NewObject | Op::NewArray | Op::NewObjectLiteral => {
+                EFFECTS_ALLOCATING
+            }
             Op::Add
                 if instruction
                     .arith_feedback()

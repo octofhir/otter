@@ -394,6 +394,46 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_collect_arguments(context, stack, &mut frame, materialized, dst)
     }
 
+    /// Allocate the published `Op::NewObjectLiteral` object from boxed values
+    /// copied before collection.
+    pub fn new_object_literal_value(&mut self, values: &[Value]) -> Result<Value, VmError> {
+        let function_id = self.function_id();
+        let first_key = {
+            let function = self
+                .context
+                .exec_function(function_id)
+                .ok_or(VmError::InvalidOperand)?;
+            let instruction = function
+                .instr_at_index(self.pc() as usize)
+                .ok_or(VmError::InvalidOperand)?;
+            if function.op(instruction) != otter_bytecode::Op::NewObjectLiteral {
+                return Err(VmError::InvalidOperand);
+            }
+            crate::operand_decode::const_operand(function.operand_view(instruction).get(2))?
+        };
+        // SAFETY: as `new_array_value`.
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let mut values = smallvec::SmallVec::<[Value; 8]>::from_slice(values);
+        // The first execution builds the site's shape chain, which allocates;
+        // the copied values stay rooted, and are rewritten, across it.
+        let layout = {
+            use crate::rooting::RootScopeExt as _;
+            let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+            // SAFETY: `values` precedes `roots` and does not move or resize
+            // until the scope drops at the end of this block.
+            unsafe {
+                for value in values.iter_mut() {
+                    roots.add_value(value);
+                }
+            }
+            let layout =
+                vm.object_literal_layout(&self.context, function_id, first_key, values.len());
+            drop(roots);
+            layout?
+        };
+        vm.allocate_object_with_layout(layout, &mut values)
+    }
+
     /// Allocate an ordinary object without an interpreter destination.
     pub fn new_object_value(&mut self) -> Result<Value, VmError> {
         // SAFETY: as `new_array_value`; the returned handle is published by

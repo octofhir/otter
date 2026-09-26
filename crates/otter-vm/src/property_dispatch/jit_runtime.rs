@@ -567,23 +567,31 @@ impl Interpreter {
         force_strict: bool,
     ) -> Result<(), VmError> {
         // Complete the dense-array miss without allocating a property key.
-        // Existing slots need only the write barrier; plain holes are also
-        // safe while no indexed accessor has ever polluted the prototype
-        // universe. Sidecars retain the descriptor-aware authority below.
+        // Existing slots need only the write barrier; plain holes, appends
+        // and dense gaps are also safe while no indexed property has ever
+        // polluted the prototype universe, because the spec's `[[Set]]` then
+        // reduces to the receiver's own `CreateDataProperty`. Sidecars retain
+        // the descriptor-aware authority below.
         let allow_plain_hole = !self.array_index_accessor_protector;
         if let Some(arr) = receiver.as_array()
             && let Some(index) = key_value
                 .as_i32()
                 .and_then(|index| usize::try_from(index).ok())
-            && crate::array::set_plain_dense_slot(
+        {
+            if crate::array::set_plain_dense_slot(
                 arr,
                 &mut self.gc_heap,
                 index,
                 value,
                 allow_plain_hole,
-            )
-        {
-            return Ok(());
+            ) {
+                return Ok(());
+            }
+            if allow_plain_hole
+                && crate::array::create_plain_dense_element(arr, &mut self.gc_heap, index, value)?
+            {
+                return Ok(());
+            }
         }
         let mut property_key = Value::undefined();
         let strict = force_strict || context.function_is_strict(function_id);

@@ -4,6 +4,7 @@
 //! - Generated hits, getter reentry and unresolved-binding throws.
 //!
 //! # Invariants
+//! - An inlined body's global reads carry the body's own baked proofs.
 //! - Cold reads commit once in the callee's source activation and return to SSA.
 //! - Code-owned safepoints preserve exact roots and source stacks across GC.
 
@@ -50,6 +51,14 @@ for(var i=0;i<70000;i++)caller(1.25,mark);
         "{ir}"
     );
     assert!(!ir.contains("Direct {"), "leaf call must disappear: {ir}");
+    // The spliced body bakes its own binding proofs: its global read is a
+    // guarded generated load, not an unconditional runtime binding call.
+    assert!(
+        ir.lines().any(|line| line.contains("BindingGuard")
+            && line.contains("Read(Global")
+            && line.contains("target: Global(")),
+        "inlined global read must carry a generated proof: {ir}"
+    );
     assert!(
         warm.jit_artifacts()
             .unwrap()

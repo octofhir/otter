@@ -1712,6 +1712,7 @@ impl Interpreter {
             Self::bake_string_layout(&mut body);
             self.bake_string_constant_cells(&mut body, context, fid)?;
             self.bake_global_lexical_loads(&mut body, context, fid);
+            self.bake_binding_hit_proofs(&mut body, context, fid);
             self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
             self.bake_guarded_method_calls(&mut body);

@@ -51,6 +51,10 @@ pub struct VmThread {
     /// code runs the generational write barrier inline and reaches the runtime
     /// only when this byte says a marking cycle is in progress.
     pub marking_flag_cell: u64,
+    /// Address of the isolate's array-index accessor protector byte (non-zero
+    /// once any indexed accessor exists anywhere). Generated code tests it
+    /// before a leaf entry that creates an array index, such as `push`.
+    pub array_index_protector_cell: u64,
 }
 
 impl VmThread {
@@ -67,6 +71,7 @@ impl VmThread {
             backedge_fuel_cell: 0,
             global_lexical_epoch_cell: 0,
             marking_flag_cell: 0,
+            array_index_protector_cell: 0,
         }
     }
 }
@@ -371,7 +376,7 @@ impl NativeFrame {
     }
 }
 
-const _: [(); 72] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 80] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 72] = [(); std::mem::size_of::<NativeFrame>()];
@@ -382,6 +387,7 @@ const _: [(); 40] = [(); std::mem::offset_of!(VmThread, gc_heap)];
 const _: [(); 48] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
 const _: [(); 56] = [(); std::mem::offset_of!(VmThread, global_lexical_epoch_cell)];
 const _: [(); 64] = [(); std::mem::offset_of!(VmThread, marking_flag_cell)];
+const _: [(); 72] = [(); std::mem::offset_of!(VmThread, array_index_protector_cell)];
 const _: [(); 4] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 11] = [(); std::mem::offset_of!(VmFrameHeader, flags)];

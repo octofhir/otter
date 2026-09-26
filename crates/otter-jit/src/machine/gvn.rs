@@ -416,6 +416,9 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
         MachineOpcode::CacheIrGuardPrototypeNull { .. } => {
             MachineOpcode::CacheIrGuardPrototypeNull { byte_pc: 0 }
         }
+        MachineOpcode::CacheIrGuardArrayIndexProtector { .. } => {
+            MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc: 0 }
+        }
         MachineOpcode::CacheIrLoadField { value_byte, .. } => MachineOpcode::CacheIrLoadField {
             byte_pc: 0,
             value_byte: *value_byte,

@@ -33,7 +33,7 @@
 use crate::native_abi::{
     CodeRegistryView, NO_SAFEPOINT, NativeResultDomain, NativeResultPair, RuntimeStubAllocContext,
     RuntimeStubDescriptor, RuntimeStubId, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_ARRAY_POP_LEAF,
-    STUB_ARRAY_PUSH_ALLOC, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
+    STUB_ARRAY_PUSH_LEAF, STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
     STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
     STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
     STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
@@ -740,10 +740,10 @@ pub const ARRAY_POP_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
     entry: array_pop_leaf,
 };
 
-/// ABI descriptor for `Array.prototype.push` over a dense array.
-pub const ARRAY_PUSH_ALLOC: AllocValueStub = AllocValueStub {
-    descriptor: STUB_ARRAY_PUSH_ALLOC,
-    entry: Some(array_push_alloc),
+/// Callable ABI entry for `Array.prototype.push` into spare dense capacity.
+pub const ARRAY_PUSH_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
+    descriptor: STUB_ARRAY_PUSH_LEAF,
+    entry: array_push_leaf,
 };
 
 /// Callable ABI entry for `Array.prototype.shift` over a dense array.
@@ -767,6 +767,10 @@ pub struct LeafEntryShape {
     pub words: u8,
     /// Whether the entry writes the heap (with its own write barrier).
     pub mutates: bool,
+    /// Whether the entry's precondition includes the isolate's intact
+    /// array-index accessor protector. The entry cannot read that latch, so
+    /// generated code must test the published protector cell first.
+    pub array_index_protector: bool,
 }
 
 /// Shape of a valid non-allocating leaf entry, or `None` for any other id.
@@ -778,6 +782,7 @@ pub const fn leaf_entry_shape(id: RuntimeStubId) -> Option<LeafEntryShape> {
         return Some(LeafEntryShape {
             words: 2,
             mutates: false,
+            array_index_protector: false,
         });
     }
     if let Some(stub) = mutating_leaf_stub2_by_id(id)
@@ -786,6 +791,7 @@ pub const fn leaf_entry_shape(id: RuntimeStubId) -> Option<LeafEntryShape> {
         return Some(LeafEntryShape {
             words: 2,
             mutates: true,
+            array_index_protector: id == STUB_ARRAY_PUSH_LEAF.id,
         });
     }
     if let Some(stub) = mutating_leaf_stub3_by_id(id)
@@ -794,6 +800,7 @@ pub const fn leaf_entry_shape(id: RuntimeStubId) -> Option<LeafEntryShape> {
         return Some(LeafEntryShape {
             words: 3,
             mutates: true,
+            array_index_protector: false,
         });
     }
     None
@@ -804,6 +811,7 @@ pub const fn leaf_entry_shape(id: RuntimeStubId) -> Option<LeafEntryShape> {
 pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeafStub2> {
     match id {
         id if id == STUB_ARRAY_POP_LEAF.id => Some(ARRAY_POP_LEAF),
+        id if id == STUB_ARRAY_PUSH_LEAF.id => Some(ARRAY_PUSH_LEAF),
         id if id == STUB_ARRAY_SHIFT_LEAF.id => Some(ARRAY_SHIFT_LEAF),
         id if id == crate::native_abi::STUB_WRITE_BARRIER.id => Some(WRITE_BARRIER_MUTATING),
         _ => None,
@@ -877,7 +885,6 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
         id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),
-        id if id == STUB_ARRAY_PUSH_ALLOC.id => Some(ARRAY_PUSH_ALLOC),
         id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
         _ => None,
     }
@@ -2256,82 +2263,45 @@ fn array_pop_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> NativeRe
     NativeResultPair::success(crate::array::pop(arr, heap))
 }
 
-/// Allocating `Array.prototype.push` over a dense array.
+/// Leaf `Array.prototype.push` into spare dense capacity.
 ///
-/// Appending may grow the dense buffer, which can move the receiver, so the
-/// receiver is re-read from the rooted packet and the growth path threads the
-/// caller roots through any emergency collection.
+/// The caller proved the array-index accessor protector intact, so no
+/// prototype in the chain carries an indexed accessor the new index could
+/// reach. A full buffer, a non-dense tail or an attribute override misses and
+/// the site completes through ordinary dispatch, which may grow the buffer.
 #[must_use]
-pub extern "C" fn array_push_alloc(
-    ctx: *mut RuntimeStubAllocContext,
-    safepoint: SafepointId,
+pub extern "C" fn array_push_leaf(
+    heap: *mut otter_gc::GcHeap,
     recv_bits: u64,
     value_bits: u64,
-    unused_bits: u64,
 ) -> NativeResultPair {
-    record_alloc_value_stub_result(
-        ctx,
-        array_push_alloc_inner(ctx, safepoint, recv_bits, value_bits, unused_bits),
-    )
+    array_push_leaf_inner(heap, recv_bits, value_bits)
 }
 
-fn array_push_alloc_inner(
-    ctx: *mut RuntimeStubAllocContext,
-    safepoint: SafepointId,
+fn array_push_leaf_inner(
+    heap: *mut otter_gc::GcHeap,
     recv_bits: u64,
     value_bits: u64,
-    unused_bits: u64,
 ) -> NativeResultPair {
-    let Some(ctx) = alloc_context_mut(ctx) else {
+    let Some(heap) = heap_mut(heap) else {
         return NativeResultPair::miss();
     };
-    let Some(interp) = alloc_interpreter_mut(ctx) else {
+    let Some(arr) = Value::from_abi_bits(recv_bits).as_array() else {
         return NativeResultPair::miss();
     };
-    // `push` creates a *new* index, so the spec consults the prototype chain
-    // for an inherited indexed setter there. The realm protector trips as soon
-    // as any indexed accessor is installed anywhere, and generated code cannot
-    // read it, so it is part of the stub's precondition set.
-    if interp.array_index_accessor_protector {
+    let len = crate::array::len(arr, heap);
+    if len >= crate::array::dense_capacity(arr, heap)
+        || !dense_range_is_fast(arr, heap, len, len + 1)
+    {
         return NativeResultPair::miss();
     }
-    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
-    // table and frame-slot window must remain live for this call.
-    let Ok(roots) = (unsafe {
-        alloc_value_stub_call_roots(
-            ctx,
-            safepoint,
-            [
-                Value::from_abi_bits(recv_bits),
-                Value::from_abi_bits(value_bits),
-                Value::from_abi_bits(unused_bits),
-            ],
-        )
-    }) else {
-        return NativeResultPair::miss();
-    };
-    let _roots_guard = interp
-        .gc_heap
-        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let Some(arr) = roots.value(0).as_array() else {
-        return NativeResultPair::miss();
-    };
-    let len = crate::array::len(arr, &interp.gc_heap);
-    if !dense_range_is_fast(arr, &interp.gc_heap, len, len + 1) {
-        return NativeResultPair::miss();
-    }
-    let value = roots.value(1);
-    // Growth may collect; the rooted receiver and pending value are traced so
-    // the handle survives and the helper republishes the moved array.
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        roots.value(0).trace_value_slots(visitor);
-        value.trace_value_slots(visitor);
-    };
-    match crate::array::push_with_roots(arr, &mut interp.gc_heap, value, &mut visit) {
+    // The capacity check above makes the reservation inside `push` a no-op,
+    // so this cannot allocate.
+    match crate::array::push(arr, heap, Value::from_abi_bits(value_bits)) {
         Ok(new_len) => {
             NativeResultPair::success(Value::number(crate::NumberValue::from_f64(new_len as f64)))
         }
-        Err(_) => NativeResultPair::out_of_memory(),
+        Err(_) => NativeResultPair::miss(),
     }
 }
 

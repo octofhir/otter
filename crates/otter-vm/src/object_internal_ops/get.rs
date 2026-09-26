@@ -1749,26 +1749,28 @@ impl Interpreter {
         }
         match method {
             M::Freeze => {
+                let mut live = *target;
                 if !self.set_integrity_level_value(
                     stack,
                     context,
-                    target,
+                    &mut live,
                     ObjectIntegrityLevel::Frozen,
                 )? {
                     return Err(self.err_type(("Object.freeze failed".to_string()).into()));
                 }
-                Ok(Some(*target))
+                Ok(Some(live))
             }
             M::Seal => {
+                let mut live = *target;
                 if !self.set_integrity_level_value(
                     stack,
                     context,
-                    target,
+                    &mut live,
                     ObjectIntegrityLevel::Sealed,
                 )? {
                     return Err(self.err_type(("Object.seal failed".to_string()).into()));
                 }
-                Ok(Some(*target))
+                Ok(Some(live))
             }
             M::IsFrozen => {
                 let frozen = self.test_integrity_level_value(

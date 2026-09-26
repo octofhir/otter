@@ -196,6 +196,8 @@ pub(crate) const VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET: u32 =
 pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, gc_heap) as u32;
 pub(crate) const VM_THREAD_MARKING_FLAG_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, marking_flag_cell) as u32;
+pub(crate) const VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, array_index_protector_cell) as u32;
 pub(crate) const VM_THREAD_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(VmThread, current_code_object_id) as u32;
 pub(crate) const VM_THREAD_CODE_REGISTRY_OFFSET: u32 =

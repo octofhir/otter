@@ -78,6 +78,20 @@ pub(crate) fn supports_leaf_probe(stub: otter_vm::native_abi::RuntimeStubId, wor
         .is_some_and(|shape| (1..=usize::from(shape.words)).contains(&words))
 }
 
+/// Whether a leaf probe entry requires the array-index accessor protector
+/// guard before it runs.
+pub(super) const fn leaf_probe_needs_array_index_protector(
+    stub: otter_vm::native_abi::RuntimeStubId,
+) -> bool {
+    matches!(
+        otter_vm::runtime_stubs::leaf_entry_shape(stub),
+        Some(otter_vm::runtime_stubs::LeafEntryShape {
+            array_index_protector: true,
+            ..
+        })
+    )
+}
+
 /// Whether a leaf probe entry writes the heap.
 pub(super) const fn leaf_probe_mutates(stub: otter_vm::native_abi::RuntimeStubId) -> bool {
     matches!(
@@ -515,7 +529,7 @@ mod tests {
                 assert!(!method_probe_is_valid(&target, &wrong, &representations));
                 let mut wrong = instruction.clone();
                 wrong.opcode = MachineOpcode::NativeLeafProbe {
-                    stub: otter_vm::native_abi::STUB_ARRAY_PUSH_ALLOC.id,
+                    stub: otter_vm::native_abi::STUB_ARRAY_UNSHIFT_ALLOC.id,
                     byte_pc: 4,
                 };
                 assert!(!method_probe_is_valid(&target, &wrong, &representations));

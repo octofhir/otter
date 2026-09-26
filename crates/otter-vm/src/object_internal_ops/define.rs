@@ -773,62 +773,86 @@ impl Interpreter {
     /// Runs through value-level internal methods so Proxy traps see
     /// `ownKeys`, `preventExtensions`, `getOwnPropertyDescriptor`, and
     /// `defineProperty` in the spec order.
+    ///
+    /// Every step can allocate (the key list, attribute sidecars, trap
+    /// results), so the target and each key live in a handle scope and are
+    /// re-read after every call; `target` holds the live value on return.
     pub(crate) fn set_integrity_level_value(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        target: &Value,
+        target: &mut Value,
         level: ObjectIntegrityLevel,
     ) -> Result<bool, VmError> {
-        // §7.3.15 steps 3-4 — `[[PreventExtensions]]` runs *before*
-        // `[[OwnPropertyKeys]]` (observable through Proxy trap order).
-        if !self.prevent_extensions_value(stack, context, target)? {
-            return Ok(false);
-        }
-        let keys = self.own_property_keys_value(stack, context, target)?;
-        for key_value in &keys {
-            let key = property_key_value_to_vm_key(self, key_value, &self.gc_heap)?;
-            let descriptor = match level {
-                ObjectIntegrityLevel::Sealed => object::PartialPropertyDescriptor {
-                    configurable: Some(false),
-                    ..Default::default()
-                },
-                ObjectIntegrityLevel::Frozen => {
-                    let current = self.ordinary_get_own_property_descriptor_value(
-                        stack, context, *target, &key, 0,
-                    )?;
-                    let Some(current) = current else {
-                        continue;
-                    };
-                    let mut desc = object::PartialPropertyDescriptor {
-                        configurable: Some(false),
-                        ..Default::default()
-                    };
-                    if current.is_data() {
-                        desc.writable = Some(false);
-                    }
-                    desc
+        self.with_handle_scope(|interp, scope| {
+            let target_handle = interp.scoped_value(scope, *target);
+            let result = (|| {
+                // §7.3.15 steps 3-4 — `[[PreventExtensions]]` runs *before*
+                // `[[OwnPropertyKeys]]` (observable through Proxy trap order).
+                let live = interp.escape_scoped(target_handle);
+                if !interp.prevent_extensions_value(stack, context, &live)? {
+                    return Ok(false);
                 }
-            };
-            // §7.3.15 step 5.b / 6.b use DefinePropertyOrThrow, so a
-            // rejected redefinition throws a TypeError rather than making
-            // `SetIntegrityLevel` report `false`. This is what makes
-            // `Object.freeze`/`seal` throw on a non-empty TypedArray: its
-            // integer-indexed elements cannot be made non-configurable /
-            // non-writable, so `[[DefineOwnProperty]]` returns false.
-            if !self.define_own_property_value(stack, context, target, &key, descriptor)? {
-                return Err(self.err_type(
-                    ("Cannot redefine property during SetIntegrityLevel".to_string()).into(),
-                ));
-            }
-        }
-        Ok(true)
+                let live = interp.escape_scoped(target_handle);
+                let keys = interp.own_property_keys_value(stack, context, &live)?;
+                let keys = keys
+                    .into_iter()
+                    .map(|key| interp.scoped_value(scope, key))
+                    .collect::<Vec<_>>();
+                for key_handle in keys {
+                    let key_value = interp.escape_scoped(key_handle);
+                    let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)?;
+                    let descriptor = match level {
+                        ObjectIntegrityLevel::Sealed => object::PartialPropertyDescriptor {
+                            configurable: Some(false),
+                            ..Default::default()
+                        },
+                        ObjectIntegrityLevel::Frozen => {
+                            let live = interp.escape_scoped(target_handle);
+                            let current = interp.ordinary_get_own_property_descriptor_value(
+                                stack, context, live, &key, 0,
+                            )?;
+                            let Some(current) = current else {
+                                continue;
+                            };
+                            let mut desc = object::PartialPropertyDescriptor {
+                                configurable: Some(false),
+                                ..Default::default()
+                            };
+                            if current.is_data() {
+                                desc.writable = Some(false);
+                            }
+                            desc
+                        }
+                    };
+                    // §7.3.15 step 5.b / 6.b use DefinePropertyOrThrow, so a
+                    // rejected redefinition throws a TypeError rather than
+                    // making `SetIntegrityLevel` report `false`. This is what
+                    // makes `Object.freeze`/`seal` throw on a non-empty
+                    // TypedArray: its integer-indexed elements cannot be made
+                    // non-configurable / non-writable, so
+                    // `[[DefineOwnProperty]]` returns false.
+                    let live = interp.escape_scoped(target_handle);
+                    if !interp.define_own_property_value(stack, context, &live, &key, descriptor)? {
+                        return Err(interp.err_type(
+                            ("Cannot redefine property during SetIntegrityLevel".to_string())
+                                .into(),
+                        ));
+                    }
+                }
+                Ok(true)
+            })();
+            *target = interp.escape_scoped(target_handle);
+            result
+        })
     }
 
     /// §7.3.16 `TestIntegrityLevel(O, level)`.
     ///
     /// Uses internal methods for Proxy targets, preserving observable
-    /// trap order and symbol keys from `[[OwnPropertyKeys]]`.
+    /// trap order and symbol keys from `[[OwnPropertyKeys]]`. The target and
+    /// keys are scoped across every step for the same reason as
+    /// [`Self::set_integrity_level_value`].
     pub(crate) fn test_integrity_level_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -836,25 +860,39 @@ impl Interpreter {
         target: &Value,
         level: ObjectIntegrityLevel,
     ) -> Result<bool, VmError> {
-        if self.is_extensible_value(stack, context, target)? {
-            return Ok(false);
-        }
-        let keys = self.own_property_keys_value(stack, context, target)?;
-        for key_value in &keys {
-            let key = property_key_value_to_vm_key(self, key_value, &self.gc_heap)?;
-            let desc =
-                self.ordinary_get_own_property_descriptor_value(stack, context, *target, &key, 0)?;
-            let Some(desc) = desc else {
-                continue;
-            };
-            if desc.configurable() {
+        self.with_handle_scope(|interp, scope| {
+            let target_handle = interp.scoped_value(scope, *target);
+            let live = interp.escape_scoped(target_handle);
+            if interp.is_extensible_value(stack, context, &live)? {
                 return Ok(false);
             }
-            if matches!(level, ObjectIntegrityLevel::Frozen) && desc.is_data() && desc.writable() {
-                return Ok(false);
+            let live = interp.escape_scoped(target_handle);
+            let keys = interp.own_property_keys_value(stack, context, &live)?;
+            let keys = keys
+                .into_iter()
+                .map(|key| interp.scoped_value(scope, key))
+                .collect::<Vec<_>>();
+            for key_handle in keys {
+                let key_value = interp.escape_scoped(key_handle);
+                let key = property_key_value_to_vm_key(interp, &key_value, &interp.gc_heap)?;
+                let live = interp.escape_scoped(target_handle);
+                let desc = interp
+                    .ordinary_get_own_property_descriptor_value(stack, context, live, &key, 0)?;
+                let Some(desc) = desc else {
+                    continue;
+                };
+                if desc.configurable() {
+                    return Ok(false);
+                }
+                if matches!(level, ObjectIntegrityLevel::Frozen)
+                    && desc.is_data()
+                    && desc.writable()
+                {
+                    return Ok(false);
+                }
             }
-        }
-        Ok(true)
+            Ok(true)
+        })
     }
 
     pub(crate) fn define_array_named_property(

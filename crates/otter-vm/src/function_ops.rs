@@ -1915,7 +1915,7 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
         use otter_bytecode::method_id::ObjectMethod as M;
-        let Some(target) = args.first().cloned() else {
+        let Some(mut target) = args.first().cloned() else {
             return Ok(None);
         };
         if (target.is_array() || target.is_function() || target.is_closure() || target.is_regexp())
@@ -1929,7 +1929,7 @@ impl Interpreter {
                     if !self.set_integrity_level_value(
                         stack,
                         context,
-                        &target,
+                        &mut target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
                     )? {
                         return Err(self.err_type(("Object.freeze failed".to_string()).into()));
@@ -1940,7 +1940,7 @@ impl Interpreter {
                     if !self.set_integrity_level_value(
                         stack,
                         context,
-                        &target,
+                        &mut target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
                     )? {
                         return Err(self.err_type(("Object.seal failed".to_string()).into()));

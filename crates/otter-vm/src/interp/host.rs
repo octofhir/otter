@@ -313,6 +313,15 @@ impl Interpreter {
         std::ptr::addr_of!(self.global_lexical_epoch)
     }
 
+    /// Stable address of the array-index accessor protector byte.
+    ///
+    /// Generated code tests it before a leaf entry that creates an array
+    /// index. The interpreter is exclusively borrowed and cannot move for the
+    /// complete compiled activation.
+    pub fn jit_array_index_protector_addr(&self) -> *const bool {
+        std::ptr::addr_of!(self.array_index_accessor_protector)
+    }
+
     /// Current logical JavaScript frame depth across materialized interpreter
     /// frames and generated frames that still live only on the native stack.
     ///

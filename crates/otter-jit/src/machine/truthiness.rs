@@ -104,13 +104,7 @@ pub(super) fn expand(
         block.end = MachineInstructionId(instructions.len() as u32);
         block.predecessors.clear();
     }
-    let mut next = 0;
-    for instruction in instructions {
-        if instruction.safepoint.is_some() {
-            instruction.safepoint = Some(super::SafepointId(next));
-            next += 1;
-        }
-    }
+    super::renumber_safepoints(instructions);
     for source in 0..blocks.len() {
         for target in blocks[source].successors.clone() {
             blocks[target.0 as usize]

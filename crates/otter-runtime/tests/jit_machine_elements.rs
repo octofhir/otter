@@ -11,6 +11,8 @@
 //!   shrinkage, including regrowth proof that an out-of-bounds store never ran.
 //! - Narrow integer and Float32 typed views stay in generated code in both the
 //!   template and the optimizing tier.
+//! - An element store whose join enters a split loop-entry edge selects
+//!   Machine IR instead of declining.
 //! - A generated constructor with fresh capture cells between element
 //!   accesses, covering allocator-root refresh, direct-call linkage state, and
 //!   a direct Machine IR read of the captured constructor binding.
@@ -651,4 +653,58 @@ for (var k = 0; k < 60; k++) pump(4096);
             "{selection:?}: {stubs} element accesses left generated code"
         );
     }
+}
+
+const STORE_THEN_LOOP_SETUP: &str = r#"
+function machineStoreThenCarry(values, n) {
+  let j = 0;
+  values[j] += n;
+  while (values[j] >= 10) {
+    values[j] -= 10;
+    j++;
+  }
+  return j;
+}
+
+for (let warm = 0; warm < 5000; warm++) {
+  machineStoreThenCarry([1, 2, 3, 4, 5, 6, 7, 8, 9], 3);
+}
+"#;
+
+const STORE_THEN_LOOP_FINAL: &str = r#"
+globalThis.__machineCarryValues = [8, 14, 3];
+globalThis.__machineCarryIndex = machineStoreThenCarry(__machineCarryValues, 5);
+JSON.stringify({ index: __machineCarryIndex, values: __machineCarryValues });
+"#;
+
+/// An element store whose join block enters a loop header along a split
+/// loop-entry edge: the split block owns the edge arguments, so the join
+/// jumps into it with none and the function stays in Machine IR.
+#[test]
+fn element_join_entering_a_split_loop_edge_selects_machine_ir() {
+    let oracle = run_fixture(
+        JitSelection::InterpreterOnly,
+        STORE_THEN_LOOP_SETUP,
+        "jit-machine-elements-carry-setup.js",
+        "machineStoreThenCarry",
+        MachineArtifactShape::PackedDoubleElements,
+        STORE_THEN_LOOP_FINAL,
+        "jit-machine-elements-carry-final.js",
+    );
+    let compiled = run_fixture(
+        JitSelection::ProductionTiered,
+        STORE_THEN_LOOP_SETUP,
+        "jit-machine-elements-carry-setup.js",
+        "machineStoreThenCarry",
+        MachineArtifactShape::PackedDoubleElements,
+        STORE_THEN_LOOP_FINAL,
+        "jit-machine-elements-carry-final.js",
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, r#"{"index":2,"values":[3,4,3]}"#);
+    assert!(
+        compiled.optimized_entries > 0,
+        "store-then-loop fixture must enter optimized Machine IR: {compiled:?}"
+    );
 }

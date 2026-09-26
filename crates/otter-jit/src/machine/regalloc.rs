@@ -121,6 +121,19 @@ impl AllocatedSequence {
         &self.metadata
     }
 
+    /// Metadata rows of one instruction. Rows are produced in instruction
+    /// order, so the slice is found by binary search.
+    #[must_use]
+    pub fn metadata_for(&self, instruction: MachineInstructionId) -> &[AllocatedMetadata] {
+        let start = self
+            .metadata
+            .partition_point(|metadata| metadata.instruction < instruction);
+        let end = start
+            + self.metadata[start..]
+                .partition_point(|metadata| metadata.instruction == instruction);
+        &self.metadata[start..end]
+    }
+
     /// Distinct physical registers named by operands or allocator edits.
     ///
     /// Target frame builders use this exact post-allocation set to derive

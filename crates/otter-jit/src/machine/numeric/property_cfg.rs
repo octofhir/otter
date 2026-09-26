@@ -215,22 +215,19 @@ pub(super) fn select_block(
             if stored.is_none() {
                 result.parameters = vec![machine_value(machine_values, node)];
             }
-            for (edge, &successor) in hir.blocks[block_index].successors.iter().enumerate() {
+            for edge in 0..hir.blocks[block_index].successors.len() {
                 if exceptional(hir, block_index) == Some(edge) {
                     continue;
                 }
-                result.successors.push(
-                    cfg.split_edges
-                        .get(&(block_index, edge))
-                        .copied()
-                        .unwrap_or(cfg.originals[successor]),
-                );
-                result.successor_arguments.push(
-                    hir.blocks[block_index].successor_arguments[edge]
-                        .iter()
-                        .map(|&value| machine_value(machine_values, value))
-                        .collect(),
-                );
+                result
+                    .successors
+                    .push(cfg.edge_target(hir, block_index, edge));
+                result.successor_arguments.push(cfg.edge_arguments(
+                    hir,
+                    block_index,
+                    edge,
+                    machine_values,
+                ));
             }
         }
         _ => {

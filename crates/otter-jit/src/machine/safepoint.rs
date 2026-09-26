@@ -156,11 +156,7 @@ pub fn lower_safepoints(
         }
         let mut seen = std::collections::BTreeSet::new();
         let mut roots = Vec::new();
-        for metadata in allocation
-            .metadata()
-            .iter()
-            .filter(|metadata| metadata.instruction == instruction_id)
-        {
+        for metadata in allocation.metadata_for(instruction_id) {
             match metadata.purpose {
                 OperandPurpose::TaggedRoot | OperandPurpose::RuntimeRoot => {}
                 OperandPurpose::CellRoot => {

@@ -84,6 +84,7 @@
 mod committed_probe;
 mod deopt;
 mod derived_this;
+mod dominance;
 mod effects;
 mod frame;
 mod gvn;
@@ -623,6 +624,21 @@ pub enum MachineBindingTarget {
     },
     /// VM-baked global lexical/object proof.
     Global(otter_vm::jit::BindingHitProof),
+}
+
+/// Renumbers safepoint ids densely in instruction order.
+///
+/// Safepoint records are looked up by id, and lowering requires ids to follow
+/// the instruction array. Every pass that reorders or splices blocks restores
+/// that order here.
+fn renumber_safepoints(instructions: &mut [MachineInstruction]) {
+    let mut next = 0;
+    for instruction in instructions {
+        if instruction.safepoint.is_some() {
+            instruction.safepoint = Some(SafepointId(next));
+            next += 1;
+        }
+    }
 }
 
 fn binding_target_matches_semantics(
@@ -3339,7 +3355,13 @@ impl InstructionSequence {
                                 && descriptor.safepoint == SafepointKind::Gc
                                 && instruction.exits.is_empty()
                                 && inputs.len() == semantic_arity
-                                && (!named_property || self.instructions[..id.0 as usize].iter().any(|producer|
+                                // The cell's defining instruction is a matching
+                                // property source. Its position in the dense
+                                // instruction array says nothing about control
+                                // flow: LICM appends a split loop body at the
+                                // end of the block order, so a producer inside
+                                // the loop may follow a call after the loop.
+                                && (!named_property || self.instructions.iter().any(|producer|
                                     matches!(producer.opcode, MachineOpcode::PropertySource { store, .. } if store == named_store)
                                     && producer.operands.first().is_some_and(|cell| cell.value == inputs[cell_index].value)))
                                 && inputs.iter().all(|operand| {

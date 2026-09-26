@@ -54,6 +54,15 @@ pub enum Unsupported {
     /// The selected machine backend could not allocate or finalize executable
     /// code. This is an ordinary interpreter fallback, never a process panic.
     Backend(BackendFailure),
+    /// A Machine IR stage produced a graph its verifier rejects. The rendered
+    /// verification error names the failing block, value or instruction, so
+    /// a decline report points at the exact malformed construct.
+    MachineVerification {
+        /// Pipeline stage whose output failed verification.
+        stage: &'static str,
+        /// Rendered [`crate::machine::VerificationError`].
+        error: String,
+    },
 }
 
 /// Fallible machine-backend operations that must preserve runtime fallback.

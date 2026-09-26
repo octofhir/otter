@@ -278,11 +278,19 @@ pub(crate) fn try_compile(
     let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
     let partial_escape = partial_escape::optimize(&mut hir);
     let loop_entries = hir.plan_loop_entries();
-    let sequence = select_with_loop_entries(target_spec, &hir, &loop_entries)
-        .map_err(|_error| Unsupported::OperandShape("scalar HIR to Machine IR selection"))?;
-    let (sequence, optimization_stats) = sequence
-        .optimize(target_spec)
-        .map_err(|_error| Unsupported::OperandShape("scalar Machine IR optimization"))?;
+    let sequence = select_with_loop_entries(target_spec, &hir, &loop_entries).map_err(|error| {
+        Unsupported::MachineVerification {
+            stage: "scalar HIR to Machine IR selection",
+            error: format!("{error:?}"),
+        }
+    })?;
+    let (sequence, optimization_stats) =
+        sequence
+            .optimize(target_spec)
+            .map_err(|error| Unsupported::MachineVerification {
+                stage: "scalar Machine IR optimization",
+                error: format!("{error:?}"),
+            })?;
     let load_property_sites = sequence
         .instructions()
         .iter()
@@ -307,11 +315,19 @@ pub(crate) fn try_compile(
         vec![crate::entry::PropertySourceCell::default(); load_property_sites].into_boxed_slice();
     let mut store_ic_cells =
         vec![crate::entry::PropertySourceCell::default(); store_property_sites].into_boxed_slice();
-    let allocation = sequence
-        .allocate(target_spec)
-        .map_err(|_| Unsupported::OperandShape("scalar Machine IR allocation"))?;
-    let mut machine_safepoints = lower_safepoints(&sequence, &allocation)
-        .map_err(|_| Unsupported::OperandShape("scalar Machine IR safepoint lowering"))?;
+    let allocation =
+        sequence
+            .allocate(target_spec)
+            .map_err(|error| Unsupported::MachineVerification {
+                stage: "scalar Machine IR allocation",
+                error: format!("{error:?}"),
+            })?;
+    let mut machine_safepoints = lower_safepoints(&sequence, &allocation).map_err(|error| {
+        Unsupported::MachineVerification {
+            stage: "scalar Machine IR safepoint lowering",
+            error: format!("{error:?}"),
+        }
+    })?;
     inline_reentry::prepare_safepoints(view, &sequence, &mut machine_safepoints)?;
     let parameter_prefix_entry = machine_safepoints.is_empty()
         && !hir
@@ -340,7 +356,10 @@ pub(crate) fn try_compile(
         fp_budget,
         sequence.frame_states(),
     )
-    .map_err(|_| Unsupported::OperandShape("scalar Machine IR deopt lowering"))?;
+    .map_err(|error| Unsupported::MachineVerification {
+        stage: "scalar Machine IR deopt lowering",
+        error: format!("{error:?}"),
+    })?;
     let exit_count = sequence
         .instructions()
         .iter()
@@ -2990,25 +3009,11 @@ fn select_binding_join_block(
         .collect::<Vec<_>>();
     let successors = normal_edges
         .iter()
-        .map(|&(edge, &successor)| {
-            cfg.split_edges
-                .get(&(block_index, edge))
-                .copied()
-                .unwrap_or(cfg.originals[successor])
-        })
+        .map(|&(edge, _)| cfg.edge_target(hir, block_index, edge))
         .collect::<Vec<_>>();
     let successor_arguments = normal_edges
         .iter()
-        .map(|&(edge, _)| {
-            if cfg.split_edges.contains_key(&(block_index, edge)) {
-                Vec::new()
-            } else {
-                hir.blocks[block_index].successor_arguments[edge]
-                    .iter()
-                    .map(|&value| machine_value(machine_values, value))
-                    .collect()
-            }
-        })
+        .map(|&(edge, _)| cfg.edge_arguments(hir, block_index, edge, machine_values))
         .collect::<Vec<_>>();
     let selected = cfg.bindings[&block_index];
     let mut predecessors = Vec::with_capacity(2);
@@ -4273,6 +4278,34 @@ impl SelectionCfg {
         }
     }
 
+    /// Machine block that HIR edge `edge` of `block` enters: its split-edge
+    /// block when the edge was split, otherwise the successor's original.
+    fn edge_target(&self, hir: &NumericFunction, block: usize, edge: usize) -> MachineBlock {
+        self.split_edges
+            .get(&(block, edge))
+            .copied()
+            .unwrap_or(self.originals[hir.blocks[block].successors[edge]])
+    }
+
+    /// Arguments the jump along HIR edge `edge` of `block` passes. A split
+    /// edge block owns the edge's arguments (and any representation
+    /// conversion), so the jump into it passes none.
+    fn edge_arguments(
+        &self,
+        hir: &NumericFunction,
+        block: usize,
+        edge: usize,
+        values: &[MachineValue],
+    ) -> Vec<MachineValue> {
+        if self.split_edges.contains_key(&(block, edge)) {
+            return Vec::new();
+        }
+        hir.blocks[block].successor_arguments[edge]
+            .iter()
+            .map(|&value| machine_value(values, value))
+            .collect()
+    }
+
     fn normal_exit(&self, block: usize) -> MachineBlock {
         if let Some(method) = self.native_calls.get(&block) {
             return method.join;
@@ -4463,37 +4496,16 @@ fn machine_block(
         first,
         end,
         predecessors,
-        successors: block
-            .successors
-            .iter()
-            .enumerate()
-            .map(|(edge, &successor)| {
-                selection_cfg
-                    .split_edges
-                    .get(&(block_index, edge))
-                    .copied()
-                    .unwrap_or(selection_cfg.originals[successor])
-            })
+        successors: (0..block.successors.len())
+            .map(|edge| selection_cfg.edge_target(hir, block_index, edge))
             .collect(),
         parameters: block
             .parameters
             .iter()
             .map(|&value| machine_value(values, value))
             .collect(),
-        successor_arguments: block
-            .successor_arguments
-            .iter()
-            .enumerate()
-            .map(|(edge, arguments)| {
-                if selection_cfg.split_edges.contains_key(&(block_index, edge)) {
-                    Vec::new()
-                } else {
-                    arguments
-                        .iter()
-                        .map(|&value| machine_value(values, value))
-                        .collect()
-                }
-            })
+        successor_arguments: (0..block.successor_arguments.len())
+            .map(|edge| selection_cfg.edge_arguments(hir, block_index, edge, values))
             .collect(),
     }
 }

@@ -156,6 +156,61 @@ pub(super) fn select_probe(
     Ok(())
 }
 
+/// Lower a speculative indexed access: the same view, bounds and slot probe
+/// as the committed form, then one exact deoptimization when any proof failed
+/// and, for a store, the no-fail write. Nothing observable happens before the
+/// exit, so the interpreter re-executes the whole access; the site's exit
+/// profile turns its next generation into the committed form.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_guarded(
+    target_spec: &TargetSpec,
+    hir: &NumericFunction,
+    byte_pc: u32,
+    access: NumericElementAccess,
+    inputs: Inputs,
+    result: Option<MachineValue>,
+    state_index: usize,
+    exits: Box<[MachineExit]>,
+    machine_values: &[MachineValue],
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> Result<(), super::super::VerificationError> {
+    let mut values = Values::new(representations);
+    if let Some(result) = result {
+        values.fast_payload = result;
+    }
+    select_probe(
+        target_spec,
+        byte_pc,
+        Some(access),
+        inputs,
+        values,
+        representations,
+        instructions,
+    )?;
+    let mut require = MachineInstruction::plain(
+        MachineOpcode::GuardCondition,
+        vec![MachineOperand::register_input(values.hit)],
+    );
+    require.clobbers = target_spec
+        .clobbers(TargetClobberSet::StatusScratch)
+        .to_vec();
+    attach_frame_state(hir, machine_values, state_index, exits, &mut require);
+    instructions.push(require);
+    if let Some(stored) = inputs.stored_fast {
+        let mut effect = MachineInstruction::plain(
+            MachineOpcode::ElementValueStore { byte_pc },
+            vec![
+                MachineOperand::location_input(values.address),
+                MachineOperand::location_input(stored),
+            ],
+        );
+        effect.clobbers = element_clobbers(target_spec);
+        instructions.push(effect);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_block(
     target_spec: &TargetSpec,

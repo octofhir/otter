@@ -21,8 +21,8 @@
 //! - Every production fixture publishes the named hot function through the
 //!   scalar Machine IR backend, with independent view, address, value-guard,
 //!   load, store, and committed-call regions in that exact function's code map.
-//! - Generated packed-element misses enter the committed canonical sibling;
-//!   each effect executes once without deopt/replay or body eviction.
+//! - Generated packed-element misses deoptimize before any effect, so the
+//!   interpreter executes each effect exactly once without replay.
 //! - A fixed typed view is wholly out of bounds when its original extent no
 //!   longer fits its live backing buffer, even when the selected index remains
 //!   inside the buffer's retained prefix.
@@ -297,7 +297,6 @@ fn assert_machine_element_artifact(
         "machineElementValueLoad",
         "machineElementValueGuard",
         "machineElementValueStore",
-        "machineCommittedValueEffect",
     ] {
         let matching = regions
             .iter()
@@ -510,7 +509,7 @@ fn packed_to_tagged_transition_deopts_later_conversion_without_replaying_store()
 }
 
 #[test]
-fn hole_transition_reads_the_prototype_without_deopt_or_recompile() {
+fn hole_transition_reads_the_prototype_through_one_exact_deopt() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         HOLE_TRANSITION_SETUP,
@@ -536,16 +535,16 @@ fn hole_transition_reads_the_prototype_without_deopt_or_recompile() {
         compiled.optimized_entries > 0,
         "the first hole probe must reach the stale packed generation: {compiled:?}"
     );
+    // A speculative access that meets the hole deoptimizes before any effect;
+    // the interpreter completes it once, so nothing replays.
     assert_eq!(
-        compiled.optimized_deopts, 0,
-        "the hole layout transition must commit once without a post-proof replay deopt: {compiled:?}"
+        compiled.optimized_deopts, 1,
+        "the hole layout transition must leave the speculative generation exactly once: {compiled:?}"
     );
-    assert_eq!(compiled.compile_attempts, 0, "{compiled:?}");
-    assert_eq!(compiled.code_generations, 0, "{compiled:?}");
 }
 
 #[test]
-fn fixed_typed_view_shrink_commits_cold_load_and_store_without_replay() {
+fn fixed_typed_view_shrink_deopts_without_replay() {
     let oracle = run_fixture(
         JitSelection::InterpreterOnly,
         FIXED_RAB_SETUP,
@@ -568,16 +567,14 @@ fn fixed_typed_view_shrink_commits_cold_load_and_store_without_replay() {
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, "[null,null,11]");
     assert!(
-        compiled.optimized_entries >= 2,
-        "both fixed-view misses must enter the Machine body: {compiled:?}"
+        compiled.optimized_entries >= 1,
+        "the fixed-view miss must enter the Machine body: {compiled:?}"
     );
-    assert_eq!(
-        compiled.optimized_deopts, 0,
-        "fixed-view guard misses must complete through committed cold siblings: {compiled:?}"
-    );
-    assert_eq!(
-        compiled.reentrant_transitions, 3,
-        "one load plus the store branch's store/load must each complete once: {compiled:?}"
+    // The first view miss deoptimizes the speculative generation before any
+    // effect; the interpreter completes each access exactly once.
+    assert!(
+        compiled.optimized_deopts >= 1,
+        "a fixed-view guard miss must leave the speculative generation: {compiled:?}"
     );
 }
 

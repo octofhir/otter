@@ -970,7 +970,11 @@ impl Interpreter {
                     jit::JitElementRepr::Float64,
                     crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE,
                 ),
-                jit::JitElementFamily::Unseen | jit::JitElementFamily::Generic => continue,
+                jit::JitElementFamily::Unseen => {
+                    view.unseen_element_sites.insert(byte_pc);
+                    continue;
+                }
+                jit::JitElementFamily::Generic => continue,
             };
             view.element_accesses.insert(byte_pc, access);
         }

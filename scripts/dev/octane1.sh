@@ -9,9 +9,9 @@
 #   CAP         hard wall-clock cap in seconds (default 300)
 #   RUNS        number of runs; the median score is printed last (default 1)
 #
-# The suite is assembled the way benchmarks/run-octane.sh does it: base.js,
-# the suite files with `print(` rewritten to `console.log(`, then the run.js
-# driver without its `load(` lines. The assembled files live under
+# The suite runs unmodified after a d8-shell prelude (`print`, `read`):
+# prelude, base.js, the suite files, then the run.js driver without its
+# `load(` lines. The assembled files live under
 # benchmarks/results/octane1/<suite>/ (ignored).
 
 set -euo pipefail
@@ -36,14 +36,19 @@ esac
 
 work="$ROOT/benchmarks/results/octane1/$suite"
 mkdir -p "$work"
+# Octane targets the d8 shell: emscripten suites (zlib) bind the shell's global
+# `print` / `read` inside eval'd code that no source rewrite can reach.
+cat > "$work/prelude.js" <<'JS'
+if (typeof print === "undefined") globalThis.print = function (s) { console.log(s); };
+if (typeof read === "undefined") globalThis.read = function (name) { throw new Error("read(" + name + ") is not available"); };
+JS
 cp "$OCTANE/base.js" "$work/base.js"
-paths=("$work/base.js")
+paths=("$work/prelude.js" "$work/base.js")
 for f in "${files[@]}"; do
-  perl -pe 's/(?<![A-Za-z0-9_\$])print\(/console.log(/g' "$OCTANE/$f" > "$work/$f"
+  cp "$OCTANE/$f" "$work/$f"
   paths+=("$work/$f")
 done
-perl -pe 's/^load\(.*\n//; s/(?<![A-Za-z0-9_\$])print\(/console.log(/g' \
-  "$OCTANE/run.js" > "$work/driver.js"
+perl -pe 's/^load\(.*\n//' "$OCTANE/run.js" > "$work/driver.js"
 paths+=("$work/driver.js")
 
 flags=()

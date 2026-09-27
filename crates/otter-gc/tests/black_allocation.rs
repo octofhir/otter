@@ -6,7 +6,7 @@
 use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{GcHeap, MarkColor};
 
-struct Tag;
+struct Tag(#[allow(dead_code)] u64);
 impl Traceable for Tag {
     const TYPE_TAG: u8 = 0x70;
     unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
@@ -18,7 +18,7 @@ fn allocation_during_marking_starts_black() {
     heap.register_traceable::<Tag>();
     // Manually drive a marking cycle.
     heap.marking_mut().start_cycle();
-    let g = heap.alloc(Tag).expect("alloc during marking");
+    let g = heap.alloc(Tag(0)).expect("alloc during marking");
     // Header must already be black.
     let header = g.as_header_ptr();
     assert_eq!(unsafe { (*header).mark_color() }, MarkColor::Black);

@@ -16,9 +16,9 @@
 //! - `NewSpace::flip()` swaps `from`/`to` *and* clears the
 //!   freshly-from-space pages so the next mutator alloc sees a
 //!   pristine bump cursor.
-//! - Promotion (young → old) happens inside the scavenger when
-//!   `survival_age >= PROMOTE_AFTER_SURVIVALS`. New-space pages
-//!   carry the survival counter; old-space pages do not.
+//! - Promotion (young → old) happens inside the scavenger for objects
+//!   below their page's `age_mark`, i.e. objects that already survived one
+//!   scavenge. New-space pages carry the mark; old-space pages do not.
 //! - Old allocation reuses swept holes, then available page tails. Promotion
 //!   preflight guarantees capacity before the first forwarding write; existing
 //!   contiguous tail space can satisfy that guarantee without standby pages.

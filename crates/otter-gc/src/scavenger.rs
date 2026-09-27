@@ -22,17 +22,18 @@
 //!    bytes in old-space pages; trace each newly-copied object
 //!    and evacuate children. Iterate until convergence.
 //! 4. Finalize and drop every unforwarded from-space body.
-//! 5. Bump every from-space page's `survival_age` so the next
-//!    scavenge knows whether to promote.
+//! 5. Set every to-space page's `age_mark` to its bump top: everything
+//!    copied there survived this scavenge.
 //! 6. Flip from↔to. The new from-space is recycled and starts
 //!    fresh; the new to-space is the prior from-space.
 //!
 //! # Promotion
 //!
-//! A page's `survival_age` increments on every scavenge it
-//! survives. Once it reaches [`PROMOTE_AFTER_SURVIVALS`], the
-//! scavenger promotes survivors copied off that page into
-//! old-space rather than into to-space.
+//! An object is copied to to-space on its first survival and promoted to
+//! old space on its second (V8's semispace age mark). The to-space pages
+//! that received survivors become the next from-space and the mutator keeps
+//! bump-allocating above their `age_mark`, so a fresh object never inherits
+//! its page's age. Children of remembered old parents are promoted at once.
 //!
 //! # Design
 //!
@@ -46,7 +47,6 @@
 //!
 //! # Contents
 //!
-//! - [`PROMOTE_AFTER_SURVIVALS`] — survival threshold.
 //! - [`ScavengeStats`] — counters returned by `scavenge`.
 //! - [`scavenge`] — the entry point.
 //!
@@ -71,11 +71,6 @@ use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, Page, SpaceKind, align_up};
 use crate::space::{NewSpace, OldSpace};
 use crate::trace::TraceTable;
-
-/// Promote a survivor after this many scavenges it has lived through. One
-/// means a first-survival object is copied to to-space, then promoted on its
-/// next scavenge.
-pub const PROMOTE_AFTER_SURVIVALS: u32 = 1;
 
 /// Stats returned by [`scavenge`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +203,7 @@ pub unsafe fn scavenge(
             .iter()
             .filter(|page| {
                 page.header().allocated_bytes != 0
-                    && page.header().survival_age >= PROMOTE_AFTER_SURVIVALS
+                    && page.header().age_mark > PAGE_HEADER_SIZE
             })
             .count()
     } else {
@@ -289,16 +284,12 @@ pub unsafe fn scavenge(
     // SAFETY: every unforwarded header still precedes its original live body.
     unsafe { finalize_and_drop_dead_from_space(&mut ctx) };
 
-    // 8) Bump survival ages on to-space pages — those are
-    // the pages that received survivors during this scavenge.
-    // After the flip below they become the new from-space; the
-    // next scavenge reads their (now-bumped) survival_age and
-    // promotes accordingly.
+    // 8) Mark the survivors on to-space pages. After the flip below these
+    // pages become the new from-space; the mutator allocates above the mark
+    // and the next scavenge promotes only what lies below it.
     for page in ctx.new_space().to_pages() {
-        if page.header().allocated_bytes > 0 {
-            let h = page.header_mut();
-            h.survival_age = h.survival_age.saturating_add(1);
-        }
+        let h = page.header_mut();
+        h.age_mark = h.bump_cursor;
     }
 
     // 9) Flip from↔to.
@@ -691,7 +682,8 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         // anyway, so this is the standard generational answer.
         let promote = ctx.in_dirty_scan || {
             let page_header = Page::header_of(header as *const u8);
-            page_header.survival_age >= PROMOTE_AFTER_SURVIVALS
+            let page_base = std::ptr::from_ref(page_header) as usize;
+            (header as usize) - page_base < page_header.age_mark
         };
 
         let (new_offset, promoted) = if promote {

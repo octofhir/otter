@@ -19,7 +19,7 @@ impl Traceable for Cell {
     unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
 }
 
-struct DropCell;
+struct DropCell(#[allow(dead_code)] u64);
 
 impl Traceable for DropCell {
     const TYPE_TAG: u8 = 0x41;
@@ -91,7 +91,7 @@ fn scavenge_drops_unreachable_young_bodies() {
     let mut heap = GcHeap::new().expect("heap");
     heap.register_traceable::<DropCell>();
 
-    let _dead = heap.alloc(DropCell).expect("alloc young body");
+    let _dead = heap.alloc(DropCell(0)).expect("alloc young body");
     heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     assert_eq!(YOUNG_DROP_COUNT.load(Ordering::SeqCst), 1);

@@ -15,7 +15,7 @@ const FINALIZER_REGISTERED_TYPE_TAG: u8 = 0xE2;
 const FINALIZER_UNREGISTERED_TYPE_TAG: u8 = 0xE3;
 const FINALIZER_YOUNG_TYPE_TAG: u8 = 0xE4;
 
-struct RegisteredFinalizerBody;
+struct RegisteredFinalizerBody(#[allow(dead_code)] u64);
 
 impl SafeTraceable for RegisteredFinalizerBody {
     const TYPE_TAG: u8 = FINALIZER_REGISTERED_TYPE_TAG;
@@ -29,7 +29,7 @@ impl SafeFinalize for RegisteredFinalizerBody {
     }
 }
 
-struct UnregisteredFinalizerBody;
+struct UnregisteredFinalizerBody(#[allow(dead_code)] u64);
 
 impl SafeTraceable for UnregisteredFinalizerBody {
     const TYPE_TAG: u8 = FINALIZER_UNREGISTERED_TYPE_TAG;
@@ -43,7 +43,7 @@ impl SafeFinalize for UnregisteredFinalizerBody {
     }
 }
 
-struct YoungFinalizerBody;
+struct YoungFinalizerBody(#[allow(dead_code)] u64);
 
 impl SafeTraceable for YoungFinalizerBody {
     const TYPE_TAG: u8 = FINALIZER_YOUNG_TYPE_TAG;
@@ -66,11 +66,11 @@ fn sweep_invokes_safe_finalize_for_dead_bodies() {
     heap.register_finalize::<RegisteredFinalizerBody>();
 
     let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
-    let live = heap.alloc_old(RegisteredFinalizerBody).unwrap();
+    let live = heap.alloc_old(RegisteredFinalizerBody(0)).unwrap();
     let _root = scope.local(live);
     // Allocate a second body directly in old space and keep no
     // root → dead at the next full GC sweep.
-    let _dead = heap.alloc_old(RegisteredFinalizerBody).unwrap();
+    let _dead = heap.alloc_old(RegisteredFinalizerBody(0)).unwrap();
 
     heap.collect_full(&mut |_| {}).expect("full GC");
 
@@ -93,7 +93,7 @@ fn unregistered_body_skips_finalize_dispatch() {
     // intentionally no
     // `register_finalize::<UnregisteredFinalizerBody>()`
 
-    let _dead = heap.alloc_old(UnregisteredFinalizerBody).unwrap();
+    let _dead = heap.alloc_old(UnregisteredFinalizerBody(0)).unwrap();
     heap.collect_full(&mut |_| {}).expect("full GC");
 
     assert_eq!(
@@ -110,7 +110,7 @@ fn scavenge_invokes_safe_finalize_for_dead_young_bodies() {
     let mut heap = GcHeap::new().expect("heap");
     heap.register_traceable::<YoungFinalizerBody>();
     heap.register_finalize::<YoungFinalizerBody>();
-    let _dead = heap.alloc(YoungFinalizerBody).unwrap();
+    let _dead = heap.alloc(YoungFinalizerBody(0)).unwrap();
 
     heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 

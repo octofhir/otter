@@ -522,9 +522,14 @@ pub(crate) fn hoist_function_declarations_from(
         // declaration's instantiation.
         if !script_global && cx.lookup_in_current_scope(&name).is_none() {
             let storage = cx.declare_binding(&name, false, span)?;
+            // The initializer's temporary dies at the store; recycling it
+            // keeps a function with thousands of declarations inside the
+            // register window.
+            let mark = cx.scratch;
             let dst = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
             cx.emit_store_storage(dst, storage, span);
+            cx.reset_scratch(mark);
             cx.mark_initialized(&name);
         }
         cx.top_mut().hoisted_function_names.insert(name);
@@ -564,6 +569,7 @@ pub(crate) fn hoist_function_declarations_from(
             false,
         )?;
         let const_idx = cx.intern_function_id(function_id);
+        let mark = cx.scratch;
         let tmp = cx.alloc_scratch();
         emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
         let script_global =
@@ -622,6 +628,8 @@ pub(crate) fn hoist_function_declarations_from(
         if matches!(stmts.get(idx), Some(Statement::ExportDefaultDeclaration(_))) {
             cx.emit_module_export_default_mirror(tmp, span);
         }
+        // The closure temporary dies once every store above has read it.
+        cx.reset_scratch(mark);
     }
     // §15.2.1.7 / §16.2.1.7.1 — an *anonymous* `export default
     // function/function*` is a HoistableDeclaration named "default":

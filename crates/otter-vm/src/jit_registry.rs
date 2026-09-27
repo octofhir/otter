@@ -345,10 +345,11 @@ impl JitCodeRegistry {
         if generation_addr == 0 {
             return 0;
         }
-        self.entry_cells
-            .values()
-            .find(|cell| std::ptr::from_ref(cell.as_ref()) as u64 == generation_addr)
-            .map_or(0, |cell| cell.generated_entries.get())
+        // SAFETY: a published generation address is the address of a boxed
+        // cell owned by `entry_cells`. Cells are never removed or reused, so
+        // the cell outlives this `&self` borrow.
+        let cell = unsafe { &*(generation_addr as *const CodeEntryCell) };
+        cell.generated_entries.get()
     }
 
     /// Whether this function has ever owned an entry-capable native generation.

@@ -90,6 +90,19 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
+        let function = self.make_function_value(context, frame, idx)?;
+        frame.write(dst, function)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Create the function value one `MakeFunction` site denotes in `frame`.
+    pub(crate) fn make_function_value(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        idx: u32,
+    ) -> Result<Value, VmError> {
         let eval_env = frame.eval_env();
         let function_id = context
             .function_id_constant(idx)
@@ -113,9 +126,7 @@ impl Interpreter {
             )
             .map_err(crate::oom_to_vm)?;
             self.mark_closure_lookup(context, closure);
-            frame.write(dst, Value::closure(closure))?;
-            frame.advance_pc()?;
-            return Ok(());
+            return Ok(Value::closure(closure));
         }
         // §10.2 — the named-function SELF binding (`function_id` is the
         // running function) must resolve to the EXACT instance executing
@@ -124,9 +135,7 @@ impl Interpreter {
         // observe a different per-instance `.prototype` than the one the
         // constructor installed on `this`.
         if function_id == frame.function_id() {
-            self.frame_load_self(frame, dst)?;
-            frame.advance_pc()?;
-            return Ok(());
+            return Ok(frame.self_value());
         }
         // §10.2 OrdinaryFunctionCreate — every evaluation of a function
         // literal produces a DISTINCT function object. A shared interned
@@ -147,9 +156,7 @@ impl Interpreter {
         )
         .map_err(crate::oom_to_vm)?;
         self.mark_closure_lookup(context, closure);
-        frame.write(dst, Value::closure(closure))?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(Value::closure(closure))
     }
 
     pub(crate) fn run_make_closure_operands(

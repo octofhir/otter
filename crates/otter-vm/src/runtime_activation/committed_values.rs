@@ -181,6 +181,10 @@ pub enum ScalarValueOp {
     BindThisValue,
     /// Create the site's closure over the activation's parent upvalue cells.
     MakeClosure,
+    /// Create the site's capture-free function.
+    MakeFunction,
+    /// Materialize the site's fresh RegExp literal.
+    LoadRegExp,
 }
 
 impl ScalarValueOp {
@@ -199,6 +203,8 @@ impl ScalarValueOp {
             Op::NewBuiltinError => Ok(Self::NewBuiltinError),
             Op::BindThisValue => Ok(Self::BindThisValue),
             Op::MakeClosure => Ok(Self::MakeClosure),
+            Op::MakeFunction => Ok(Self::MakeFunction),
+            Op::LoadRegExp => Ok(Self::LoadRegExp),
             _ => Err(VmError::InvalidOperand),
         }
     }
@@ -356,7 +362,9 @@ impl Interpreter {
             | ScalarValueOp::NewError
             | ScalarValueOp::NewBuiltinError
             | ScalarValueOp::PrepareThrow
-            | ScalarValueOp::MakeClosure => {
+            | ScalarValueOp::MakeClosure
+            | ScalarValueOp::MakeFunction
+            | ScalarValueOp::LoadRegExp => {
                 // This operation consumes activation metadata and is completed
                 // by `RuntimeCall::scalar_values`.
                 return Err(VmError::InvalidOperand);
@@ -505,6 +513,24 @@ impl RuntimeCall<'_> {
         if operation == ScalarValueOp::MakeClosure {
             return self.make_closure_value();
         }
+        if operation == ScalarValueOp::MakeFunction {
+            return self.make_function_value();
+        }
+        if operation == ScalarValueOp::LoadRegExp {
+            let index = self
+                .published_const_index(1)
+                .map_err(CommittedValueError::Fatal)?;
+            let function_id = self.function_id();
+            let resolved = self
+                .context
+                .for_function(function_id)
+                .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+            let vm = unsafe { &mut *self.vm.as_ptr() };
+            vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
+            return vm
+                .load_regexp_literal_value(&resolved, function_id, index)
+                .map_err(CommittedValueError::JavaScript);
+        }
         if operation == ScalarValueOp::PrepareThrow {
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
@@ -598,6 +624,25 @@ impl RuntimeCall<'_> {
             None,
         )
         .map_err(CommittedValueError::JavaScript)
+    }
+
+    /// Create the published `MakeFunction` site's function value, exactly as
+    /// the interpreter does.
+    fn make_function_value(&mut self) -> Result<Value, CommittedValueError> {
+        let function_index = self
+            .published_const_index(1)
+            .map_err(CommittedValueError::Fatal)?;
+        let resolved = self
+            .context
+            .for_function(self.function_id())
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
+        // SAFETY: construction validated the frame and owns it exclusively.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        vm.make_function_value(&resolved, &mut frame, function_index)
+            .map_err(CommittedValueError::JavaScript)
     }
 
     /// Convert one catchable VM failure into a JavaScript exception value.

@@ -407,7 +407,17 @@ impl TargetSpec {
             // System V caller-saved set. This is safe input to verifier and
             // regalloc tests, not a claim of implemented x86 lowering.
             clobbers: std::array::from_fn(|set| {
-                if set == TargetClobberSet::NumberProbe as usize {
+                if set == TargetClobberSet::Element as usize {
+                    // Element probes are generated code, not a System V call.
+                    // Preserve scalar FP payloads across adjacent accesses.
+                    // rax/rdx serve body/buffer proofs; r8-r11 address/value
+                    // probes; xmm14/xmm15 number conversion and boxing.
+                    [0, 2, 8, 9, 10, 11]
+                        .map(integer)
+                        .into_iter()
+                        .chain([float(14), float(15)])
+                        .collect()
+                } else if set == TargetClobberSet::NumberProbe as usize {
                     // r11 and xmm15 are the reserved scratch pair; the probe
                     // additionally holds one decoded operand in xmm14.
                     Box::new([float(14)]) as Box<[PhysicalRegister]>

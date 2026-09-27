@@ -832,6 +832,10 @@ pub(crate) fn emit_exotic_length_fast(
 pub(crate) enum DenseIndexForm {
     /// A boxed `Value` whose int32 payload the guard must still prove.
     Tagged,
+    /// A signed scalar index; reject its sign before unsigned bounds.
+    Int32,
+    /// An exact unsigned scalar index.
+    Uint32,
 }
 
 /// Whether a family is baked for the indexed-element program.
@@ -1122,6 +1126,9 @@ where
             ; cmp x11, x12
             ; b.ne =>miss
         );
+    }
+    if matches!(index_form, DenseIndexForm::Tagged | DenseIndexForm::Int32) {
+        dynasm!(ops ; .arch aarch64 ; tbnz w15, #31, =>miss);
     }
     match access.length_width {
         JitGuardWidth::Byte | JitGuardWidth::Word32 => dynasm!(ops

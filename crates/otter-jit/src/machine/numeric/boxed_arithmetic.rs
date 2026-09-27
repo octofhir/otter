@@ -339,6 +339,7 @@ mod tests {
         ];
         NumericFunction {
             property_sites: Default::default(),
+            element_sites: Default::default(),
             constructor_field_sites: Default::default(),
             function_id: 1,
             parameter_count: 1,

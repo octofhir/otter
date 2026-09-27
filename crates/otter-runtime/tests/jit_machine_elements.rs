@@ -18,6 +18,8 @@
 //!   a direct Machine IR read of the captured constructor binding.
 //!
 //! # Invariants
+//! - Standalone-deopt fixtures own a loop so warmup cannot consume all calls
+//!   through scalar-body inlining. Inline element deopt has differential coverage.
 //! - Every production fixture publishes the named hot function through the
 //!   scalar Machine IR backend, with independent view, address, value-guard,
 //!   load, store, and committed-call regions in that exact function's code map.
@@ -67,8 +69,11 @@ JSON.stringify({ total: __machineDenseTotal, values: __machineDenseFinal });
 
 const NO_REPLAY_SETUP: &str = r#"
 function machineElementNoReplay(values, effects) {
-  const loaded = values[0];
-  effects[0] = effects[0] + 1;
+  let loaded = 0;
+  for (let once = 0; once < 1; once++) {
+    loaded = values[0];
+    effects[0] = effects[0] + 1;
+  }
   return loaded * 2;
 }
 
@@ -102,8 +107,11 @@ JSON.stringify([
 
 const HOLE_TRANSITION_SETUP: &str = r#"
 function machineElementHoleTransition(values, effects) {
-  const loaded = values[1];
-  effects[0] = effects[0] + 1;
+  let loaded = 0;
+  for (let once = 0; once < 1; once++) {
+    loaded = values[1];
+    effects[0] = effects[0] + 1;
+  }
   return loaded;
 }
 
@@ -143,9 +151,8 @@ JSON.stringify([
 
 const FIXED_RAB_SETUP: &str = r#"
 function machineFixedRabElement(view, next, write) {
-  if (write) {
-    view[0] = next;
-    return view[0];
+  for (let once = 0; once < 1; once++) {
+    if (write) view[0] = next;
   }
   return view[0];
 }

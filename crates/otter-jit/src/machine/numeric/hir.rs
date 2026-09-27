@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`NumericFunction`] — bounded numeric SSA graph with explicit blocks and
-//!   per-node source-owned property and constructor transition programs.
+//!   per-node source-owned property, element and constructor transition programs.
 //! - [`NumericBlock`] and [`NumericTerminator`] — predecessor/successor edges,
 //!   block parameters, edge arguments, branches, and returns.
 //! - [`NumericNode`] — tagged/scalar parameters, constants, the schema-owned
@@ -31,18 +31,13 @@
 //!   original bytecode before any observable effect can be replayed.
 //! - Parameters outside the exact entry live-in set have no HIR value, load,
 //!   guard, or allocator interval.
-//! - Indexed loads and stores use a baked VM element program plus the GC cage
-//!   when one is available. An ordinary packed-double array produces and
-//!   consumes unboxed Number values. Its scalar Number index is converted to an
-//!   exact Uint32 before the address guard, while a still-tagged index retains
-//!   the ordinary exact int32-tag proof. Neither form boxes an already-scalar
-//!   payload, and every miss remains an exact pre-effect exit. Other prepared
-//!   families retain a distinct fast index and exact boxed key: their fast hit
-//!   is direct, while every miss completes once through the same canonical
-//!   reentrant `[[Get]]`/`[[Set]]` boundary as an unprepared access. Every
-//!   schema-declared may-throw operation inside a local catch must publish its
-//!   committed exception SSA value; otherwise the function stays on the
-//!   Template baseline.
+//! - Indexed operations own their immutable VM layout by node identity.
+//!   Inlining copies that layout with its node; byte PCs are source diagnostics.
+//!   Speculative loads produce exact Int32, Uint32 or Number payloads for typed
+//!   storage. Scalar indices require exact Uint32 conversion before addressing.
+//!   A speculative miss exits before effects; a committed miss publishes roots
+//!   and completes once through canonical [[Get]]/[[Set]]. Protected operations
+//!   require explicit committed exception SSA edges to enter Machine.
 //!   Every conversion and access frame state describes the exact pre-access
 //!   register window.
 //! - Named accesses end their HIR block and select a probe plus committed cold
@@ -169,7 +164,7 @@ impl NumericNativeCallTarget {
 /// Value semantics selected by one immutable element-access snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NumericElementAccess {
-    /// Existing boxed arrays and typed views return/consume tagged values.
+    /// Boxed arrays and typed views; the source layout determines scalar payloads.
     Tagged,
     /// An ordinary Array whose live dense prefix is hole-free raw doubles.
     PackedDouble,
@@ -314,6 +309,7 @@ pub(super) enum NumericNode {
         index: NumericValue,
         byte_pc: u32,
         access: NumericElementAccess,
+        result_type: NumericType,
     },
     /// Speculative indexed write with the same exit discipline: the store
     /// happens only after every proof held.
@@ -650,7 +646,6 @@ impl NumericNode {
             | Self::PropertyShapeLoad { .. }
             | Self::PropertyStore { .. }
             | Self::ElementStore { .. }
-            | Self::ElementGuardedLoad { .. }
             | Self::ElementGuardedStore { .. }
             | Self::BindingGuardedRead { .. }
             | Self::ElementUnseenExit { .. }
@@ -662,6 +657,7 @@ impl NumericNode {
             | Self::ColdCallExit { .. }
             | Self::BlockParameter(NumericType::Tagged) => NumericType::Tagged,
             Self::ElementLoad { .. } => NumericType::Tagged,
+            Self::ElementGuardedLoad { result_type, .. } => result_type,
             Self::IntegerConstant(..)
             | Self::TaggedToInt32(..)
             | Self::FloatToInt32(..)
@@ -804,6 +800,8 @@ pub(super) struct NumericFunction {
     pub(super) function_id: u32,
     pub(super) nodes: Vec<NumericNode>,
     pub(super) property_sites: BTreeMap<NumericValue, super::super::MachineCacheIrSite>,
+    /// Complete source-owned element programs, independent of caller byte PCs.
+    pub(super) element_sites: BTreeMap<NumericValue, otter_vm::JitElementAccess>,
     pub(super) constructor_field_sites:
         BTreeMap<NumericValue, (u32, otter_vm::jit::JitConstructorFieldTransition)>,
     pub(super) blocks: Vec<NumericBlock>,
@@ -1398,6 +1396,33 @@ impl NumericFunction {
                                 .get(byte_pc)
                                 .cloned()
                                 .map(|program| (NumericValue(index), (code.id, program))),
+                        )
+                    })
+                    .collect::<Option<BTreeMap<_, _>>>()?,
+                element_sites: nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, node)| {
+                        let byte_pc = match *node {
+                            NumericNode::ElementLoad {
+                                byte_pc,
+                                access: Some(_),
+                                ..
+                            }
+                            | NumericNode::ElementStore {
+                                byte_pc,
+                                access: Some(_),
+                                ..
+                            }
+                            | NumericNode::ElementGuardedLoad { byte_pc, .. }
+                            | NumericNode::ElementGuardedStore { byte_pc, .. } => byte_pc,
+                            _ => return None,
+                        };
+                        Some(
+                            view.element_accesses
+                                .get(&byte_pc)
+                                .copied()
+                                .map(|layout| (NumericValue(index), layout)),
                         )
                     })
                     .collect::<Option<BTreeMap<_, _>>>()?,
@@ -2960,6 +2985,14 @@ fn lower_instruction(
                         index,
                         byte_pc: instruction.byte_pc,
                         access,
+                        result_type: match element_accesses.get(&instruction.byte_pc)?.element {
+                            JitElementRepr::Boxed => NumericType::Tagged,
+                            JitElementRepr::Uint32 => NumericType::Uint32,
+                            JitElementRepr::Float32 | JitElementRepr::Float64 => {
+                                NumericType::Number
+                            }
+                            _ => NumericType::Int32,
+                        },
                     },
                 );
                 block_nodes.push(value);

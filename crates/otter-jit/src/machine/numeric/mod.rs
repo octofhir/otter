@@ -45,18 +45,12 @@
 //! - Every representation-changing CFG edge is split. Lossless widening or
 //!   boxing executes after any exact backedge poll and before the successor's
 //!   phi moves; deopt state retains the original HIR values.
-//! - Settled element accesses consume late allocator locations and perform no
-//!   allocation or reentry on the generated hit. Ordinary packed-double arrays
-//!   keep payload and scalar index unboxed through an exact
-//!   Float64-to-Uint32 index guard; every miss remains a pre-effect deopt.
-//!   Other prepared families retain an allocation-free fast index. Tagged and
-//!   Number indices are already exact rooted Values; raw Int32/Uint32 indices
-//!   remain in allocator-owned late homes and box only inside the cold sibling.
-//!   Any receiver, index, bounds, layout, or hole miss calls the same canonical
-//!   reentrant boxed-value boundary selected for missing direct metadata, with
-//!   precise moving roots and effect-once completion. Tagged and generic
-//!   committed accesses inside local catch regions remain materialized until
-//!   Machine committed-throw landing is explicit.
+//! - Indexed operations own the complete source layout through HIR, inlining
+//!   and Machine selection. Scalar integer and floating loads preserve their
+//!   representation; scalar indices and compatible store payloads stay unboxed.
+//!   Speculative misses exit before effects. Committed operations box only in
+//!   their rooted cold sibling and complete once through canonical [[Get]]/[[Set]].
+//!   No interior element pointer survives a backedge, safepoint or reentry.
 //! - Named-load probes consume tagged late locations and return payload, hit
 //!   and stable IC-address SSA values without a call or safepoint. Misses enter
 //!   an explicit rooted committed pair call; Success joins, Throw enters the
@@ -120,6 +114,8 @@ pub(crate) use x86_64::emit_increment_runtime_counter as emit_x86_64_increment_r
 mod boxed_arithmetic;
 mod constructor_effects;
 mod element_cfg;
+#[cfg(test)]
+mod element_tests;
 mod frame_state;
 mod hir;
 mod inline_reentry;
@@ -145,11 +141,13 @@ use otter_vm::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+use self::hir::NumericElementAccess;
 use self::hir::{
     NumericBindingTarget, NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
-    NumericDirectCallTarget, NumericElementAccess, NumericFramePoint, NumericFrameStatePurpose,
-    NumericFunction, NumericLoopEntryPlan, NumericNativeCallTarget, NumericNode, NumericTerminator,
-    NumericType, NumericValue,
+    NumericDirectCallTarget, NumericFramePoint, NumericFrameStatePurpose, NumericFunction,
+    NumericLoopEntryPlan, NumericNativeCallTarget, NumericNode, NumericTerminator, NumericType,
+    NumericValue,
 };
 use self::semantics::CommittedValueOperation;
 #[cfg(test)]
@@ -1278,13 +1276,12 @@ fn select_with_loop_entries(
                 receiver,
                 index,
                 byte_pc,
-                access,
+                ..
             }
             | NumericNode::ElementGuardedStore {
                 receiver,
                 index,
                 byte_pc,
-                access,
                 ..
             } = node
             {
@@ -1299,39 +1296,31 @@ fn select_with_loop_entries(
                     &mut instructions,
                     receiver,
                 );
-                let index = tagged_call_argument(
-                    hir,
-                    &values,
-                    &mut representations,
-                    &mut instructions,
-                    index,
-                );
+                let index = machine_value(&values, index);
                 let stored_fast = stored.map(|value| {
-                    if access == NumericElementAccess::PackedDouble
-                        && hir.nodes[value.0].value_type() == NumericType::Number
-                    {
-                        machine_value(&values, value)
-                    } else {
-                        tagged_call_argument(
-                            hir,
-                            &values,
-                            &mut representations,
-                            &mut instructions,
-                            value,
-                        )
-                    }
+                    element_cfg::stored_value(
+                        hir,
+                        node_value,
+                        value,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                    )
                 });
                 let point = NumericFramePoint::Node(node_value);
                 element_cfg::select_guarded(
                     target_spec,
                     hir,
                     byte_pc,
-                    access,
+                    *hir.element_sites.get(&node_value).ok_or(
+                        super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
+                            instructions.len() as u32,
+                        )),
+                    )?,
                     element_cfg::Inputs {
                         receiver,
                         index,
                         stored_fast,
-                        stored_tagged: None,
                     },
                     stored.is_none().then(|| machine_value(&values, node_value)),
                     frame_state_indices[&point],
@@ -1547,22 +1536,20 @@ fn select_with_loop_entries(
                 if block.nodes.last().copied() != Some(node_value) {
                     return Err(super::VerificationError::OpcodeSignatureMismatch(first));
                 }
-                let (receiver, index, stored, access, byte_pc) = match node {
+                let (receiver, index, stored, byte_pc) = match node {
                     NumericNode::ElementLoad {
                         receiver,
                         index,
-                        access,
                         byte_pc,
                         ..
-                    } => (receiver, index, None, access, byte_pc),
+                    } => (receiver, index, None, byte_pc),
                     NumericNode::ElementStore {
                         receiver,
                         index,
                         value,
-                        access,
                         byte_pc,
                         ..
-                    } => (receiver, index, Some(value), access, byte_pc),
+                    } => (receiver, index, Some(value), byte_pc),
                     _ => unreachable!(),
                 };
                 let receiver = tagged_call_argument(
@@ -1572,62 +1559,27 @@ fn select_with_loop_entries(
                     &mut instructions,
                     receiver,
                 );
-                let index = tagged_call_argument(
-                    hir,
-                    &values,
-                    &mut representations,
-                    &mut instructions,
-                    index,
-                );
+                let index = machine_value(&values, index);
                 let stored_fast = stored.map(|value| {
-                    // Packed-double storage takes the raw double, so a number
-                    // or integer operand never round-trips through a box.
-                    let widen = match hir.nodes[value.0].value_type() {
-                        _ if access != Some(NumericElementAccess::PackedDouble) => None,
-                        NumericType::Number => return machine_value(&values, value),
-                        NumericType::Int32 => Some(MachineOpcode::Int32ToFloat64),
-                        NumericType::Uint32 => Some(MachineOpcode::Uint32ToFloat64),
-                        _ => None,
-                    };
-                    let Some(widen) = widen else {
-                        return tagged_call_argument(
-                            hir,
-                            &values,
-                            &mut representations,
-                            &mut instructions,
-                            value,
-                        );
-                    };
-                    let widened = push_value(&mut representations, MachineRepresentation::Float64);
-                    instructions.push(MachineInstruction::plain(
-                        widen,
-                        vec![
-                            MachineOperand::register_input(machine_value(&values, value)),
-                            MachineOperand::register_output(widened),
-                        ],
-                    ));
-                    widened
-                });
-                let stored_tagged = stored.map(|value| {
-                    tagged_call_argument(
+                    element_cfg::stored_value(
                         hir,
+                        node_value,
+                        value,
                         &values,
                         &mut representations,
                         &mut instructions,
-                        value,
                     )
                 });
                 let inputs = element_cfg::Inputs {
                     receiver,
                     index,
                     stored_fast,
-                    stored_tagged,
                 };
                 element_inputs.insert(block_index, inputs);
                 element_cfg::select_probe(
                     target_spec,
                     byte_pc,
-                    access,
+                    hir.element_sites.get(&node_value).copied(),
                     inputs,
                     element_values[&block_index],
                     &mut representations,
@@ -4929,6 +4881,7 @@ mod tests {
         let value = NumericValue;
         let hir = NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 1,
             parameter_count: 2,
@@ -5090,6 +5043,7 @@ mod tests {
         (
             NumericFunction {
                 property_sites: BTreeMap::new(),
+                element_sites: BTreeMap::new(),
                 constructor_field_sites: BTreeMap::new(),
                 function_id: 175,
                 nodes,
@@ -5135,6 +5089,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 176,
             nodes: vec![
@@ -5224,6 +5179,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 150,
             nodes: vec![
@@ -5299,6 +5255,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 152,
             nodes: vec![
@@ -5363,6 +5320,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 151,
             nodes: vec![
@@ -5497,6 +5455,7 @@ mod tests {
         let value = hir::NumericValue;
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 152,
             nodes: vec![
@@ -5619,6 +5578,7 @@ mod tests {
         };
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 153,
             nodes,
@@ -7682,6 +7642,23 @@ mod tests {
         };
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: access
+                .map(|kind| {
+                    (
+                        value(3),
+                        if kind == NumericElementAccess::PackedDouble {
+                            otter_vm::JitElementAccess::packed_double_array()
+                        } else {
+                            otter_vm::JitElementAccess {
+                                type_tag: 1,
+                                base: otter_vm::JitElementBase::InBody { byte: 8 },
+                                ..Default::default()
+                            }
+                        },
+                    )
+                })
+                .into_iter()
+                .collect(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 93,
             nodes: vec![
@@ -7749,6 +7726,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             constructor_field_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             property_sites: [
                 (
                     value(2),
@@ -8178,6 +8156,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![NumericNode::StringConstantCell {
@@ -8210,6 +8189,7 @@ mod tests {
         let value = |index| hir::NumericValue(index);
         NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 96,
             nodes: vec![
@@ -12172,6 +12152,7 @@ mod tests {
         };
         let hir = NumericFunction {
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             function_id: 190,
             nodes: vec![

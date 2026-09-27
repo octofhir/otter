@@ -18,11 +18,17 @@ outdir.mkdir(parents=True, exist_ok=True)
 art = outdir / "art"
 sample = outdir / "sample.txt"
 if not (art.exists() and sample.exists()):
-    proc = subprocess.Popen([binary, "run", f"--jit-artifacts={art}", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(float(os.environ.get("DELAY", "6")))
-    subprocess.run(["sample", str(proc.pid), os.environ.get("SECS", "8"), "-file", str(sample)], capture_output=True)
-    # Artifacts are written when the run finishes.
-    proc.wait()
+    command = [binary, "--timeout", "0", "run", f"--jit-artifacts={art}", script]
+    (outdir / "command.json").write_text(json.dumps(command, indent=2) + "\n")
+    with (outdir / "stdout.txt").open("w") as stdout, (outdir / "stderr.txt").open("w") as stderr:
+        proc = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+        time.sleep(float(os.environ.get("DELAY", "6")))
+        subprocess.run(["sample", str(proc.pid), os.environ.get("SECS", "8"), "-file", str(sample)], capture_output=True)
+        # Artifacts are written when the run finishes. Failed or timed-out runs
+        # cannot silently become a successful full-work profile.
+        status = proc.wait()
+    if status:
+        raise SystemExit(f"Otter exited {status}; inspect {outdir / 'stderr.txt'}")
 
 objects = []
 for d in sorted(art.glob("jit-*")):

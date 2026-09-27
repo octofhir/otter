@@ -271,11 +271,12 @@ fn invariant_instructions(
                 let instruction = &sequence.instructions[index];
                 let effects =
                     effects_for_instruction(&instruction.opcode, &sequence.call_descriptors);
-                // A binding proof yields raw cell addresses; the loop's back-edge
-                // poll may run a moving collection, so they never leave their
-                // iteration.
-                if matches!(instruction.opcode, MachineOpcode::BindingGuard { .. })
-                    || effects.commoning == MachineCommoning::Never
+                // Binding and element-view proofs yield raw heap addresses.
+                // Keep them inside one iteration even in a non-reentrant loop.
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::BindingGuard { .. } | MachineOpcode::ElementView { .. }
+                ) || effects.commoning == MachineCommoning::Never
                     || effects.allocates
                     || effects.throws
                     || effects.safepoint

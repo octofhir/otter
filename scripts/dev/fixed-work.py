@@ -32,13 +32,15 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
+    parser.add_argument("--otter", type=Path, default=ROOT / "target/release/otter",
+                        help="Preserved executable for revision comparisons")
     parser.add_argument("--engines", nargs="+", choices=["otter", "node", "bun"],
                         default=["otter", "node", "bun"])
     parser.add_argument("--workloads", nargs="+", choices=list(WORKLOADS),
                         default=list(WORKLOADS))
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
-    engines = {"otter": str(ROOT / "target/release/otter"),
+    engines = {"otter": str(args.otter.resolve()),
                "node": shutil.which("node"), "bun": shutil.which("bun")}
     metadata = {
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),

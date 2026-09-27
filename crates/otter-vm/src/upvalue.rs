@@ -47,7 +47,7 @@ pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 /// (CreateMutableBinding) + §9.1.1.1.5 (InitializeBinding); the
 /// closure spine that holds these cells is built by `Op::MakeClosure`
 /// per §15.2.5 (FunctionDeclarationInstantiation).
-#[derive(Pelt)]
+#[derive(Clone, Copy, Pelt)]
 #[pelt(tag = UPVALUE_CELL_TYPE_TAG)]
 pub struct UpvalueCellBody {
     /// Captured `Value`. Stores fire the generational write barrier

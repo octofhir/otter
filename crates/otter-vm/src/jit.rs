@@ -65,7 +65,7 @@ use std::sync::Arc;
 use otter_bytecode::{Op, Operand};
 use serde::Serialize;
 
-pub use crate::property_cache::jit::JitPropertyLookupCache;
+pub use crate::property_cache::jit::{JitPropertyLookupCache, JitStoreTransitionCache};
 
 /// Opaque collector-owned nursery window carried by the compiled-entry ABI.
 pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
@@ -293,6 +293,8 @@ pub struct JitCompileSnapshot {
     /// Stable layout of this isolate's existing shared property lookup table.
     /// Generated load probes read its live entries without a runtime call.
     pub property_lookup_cache: Option<JitPropertyLookupCache>,
+    /// Fixed shared add-property transition table read by megamorphic stores.
+    pub store_transition_cache: Option<JitStoreTransitionCache>,
     /// Terminal megamorphic named accesses: source byte PC to isolate-global
     /// atom. Generated stores admit only an own writable data-slot proof;
     /// negative and unsupported table results keep the committed cold operation.
@@ -1622,6 +1624,7 @@ impl JitCompileSnapshot {
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             property_programs: rustc_hash::FxHashMap::default(),
             property_lookup_cache: None,
+            store_transition_cache: None,
             property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),

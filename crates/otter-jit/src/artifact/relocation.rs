@@ -58,6 +58,7 @@ const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
 const TARGET_STRING_CONSTANT_CELL: u8 = 12;
 const TARGET_PROPERTY_LOOKUP_CACHE_TABLE: u8 = 13;
+const TARGET_STORE_TRANSITION_CACHE_TABLE: u8 = 14;
 
 /// Whether a property source-identity cell serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -113,6 +114,8 @@ pub(crate) enum RelocationTarget {
     GcCageBase,
     /// The isolate's fixed megamorphic property table; never a cached GC value.
     PropertyLookupCacheTable,
+    /// The isolate's fixed add-property transition table.
+    StoreTransitionCacheTable,
     /// The code object's [`otter_vm::deopt::DeoptRuntime`] allocation, read by
     /// the shared deopt handler. The process address is deliberately absent;
     /// the code object owns exactly one.
@@ -1177,6 +1180,9 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         RelocationTarget::GcCageBase => output.push(TARGET_GC_CAGE_BASE),
         RelocationTarget::PropertyLookupCacheTable => {
             output.push(TARGET_PROPERTY_LOOKUP_CACHE_TABLE)
+        }
+        RelocationTarget::StoreTransitionCacheTable => {
+            output.push(TARGET_STORE_TRANSITION_CACHE_TABLE)
         }
         RelocationTarget::DeoptRuntimeData => output.push(TARGET_DEOPT_RUNTIME_DATA),
         RelocationTarget::GlobalLexicalCell {

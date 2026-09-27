@@ -826,6 +826,7 @@ impl Interpreter {
         context: &ExecutionContext,
     ) {
         view.property_lookup_cache = Some(self.property_cache.jit_layout());
+        view.store_transition_cache = Some(self.store_transition_cache.jit_layout());
         let sites: Vec<_> = view
             .instructions
             .iter()

@@ -804,7 +804,26 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
         Match,
         Rope,
     }
+    // An ASCII key (every property name in practice) has one UTF-16 unit
+    // per byte: a length mismatch rejects at once, and a Latin-1 body
+    // compares with one `memcmp`.
+    let ascii = key.is_ascii();
     let fast = heap.read_payload(string, |b| match &b.repr {
+        _ if ascii && b.len as usize != key.len() => Fast::Mismatch,
+        JsStringBodyRepr::InlineLatin1(bytes) if ascii => {
+            if &bytes[..b.len as usize] == key.as_bytes() {
+                Fast::Match
+            } else {
+                Fast::Mismatch
+            }
+        }
+        JsStringBodyRepr::SeqLatin1 if ascii => {
+            if b.seq_latin1_bytes() == key.as_bytes() {
+                Fast::Match
+            } else {
+                Fast::Mismatch
+            }
+        }
         JsStringBodyRepr::InlineLatin1(bytes) => {
             let mut units = key.encode_utf16();
             for &byte in &bytes[..b.len as usize] {

@@ -101,7 +101,8 @@ impl Interpreter {
         // a null parent shape above and stays dictionary. This keeps bulk
         // property addition O(1) instead of growing an O(n) transition
         // chain that makes lookups — and therefore bulk addition — O(n²).
-        if object::shape_property_count(parent, &self.gc_heap) >= object::MAX_FAST_PROPERTIES {
+        if object::shape_property_count(parent, &self.gc_heap) >= object::MAX_NAMED_FAST_PROPERTIES
+        {
             return Ok(None);
         }
         let roots = self.collect_allocation_roots(stack);

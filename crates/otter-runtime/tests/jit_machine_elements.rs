@@ -220,9 +220,6 @@ struct FinalRun {
     completion: String,
     optimized_entries: u64,
     optimized_deopts: u64,
-    compile_attempts: u64,
-    code_generations: u64,
-    reentrant_transitions: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -435,10 +432,6 @@ fn run_fixture(
         completion,
         optimized_entries: after.jit_optimized_entries - before.jit_optimized_entries,
         optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
-        compile_attempts: after.jit_compile_attempts - before.jit_compile_attempts,
-        code_generations: after.jit_code_generations - before.jit_code_generations,
-        reentrant_transitions: after.jit_reentrant_stub_transitions
-            - before.jit_reentrant_stub_transitions,
     }
 }
 

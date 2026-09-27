@@ -4265,9 +4265,11 @@ fn frame_state_exits(
             }
             NumericNode::ElementGuardedLoad { .. }
             | NumericNode::ElementGuardedStore { .. }
-            | NumericNode::BindingGuardedRead { .. }
-            | NumericNode::ElementUnseenExit { .. } => {
+            | NumericNode::BindingGuardedRead { .. } => {
                 &[(ExitReason::TypeMismatch, ExitAction::Recompile)]
+            }
+            NumericNode::ElementUnseenExit { .. } => {
+                &[(ExitReason::InsufficientFeedback, ExitAction::Recompile)]
             }
             NumericNode::TaggedToNumber(..)
             | NumericNode::TaggedToInt32(..)

@@ -1780,7 +1780,12 @@ impl Interpreter {
         snapshot.optimized_exit_reasons = self
             .jit_optimized_exit_profiles
             .keys()
-            .filter_map(|&(profile_fid, pc, reason)| (profile_fid == fid).then_some((pc, reason)))
+            // An insufficient-feedback exit only collected feedback; the
+            // site speculates again from what it has observed since.
+            .filter_map(|&(profile_fid, pc, reason)| {
+                (profile_fid == fid && reason != native_abi::ExitReason::InsufficientFeedback)
+                    .then_some((pc, reason))
+            })
             .fold(
                 std::collections::BTreeMap::new(),
                 |mut exits, (pc, reason)| {

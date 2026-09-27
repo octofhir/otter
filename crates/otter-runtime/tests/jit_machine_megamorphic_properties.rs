@@ -302,7 +302,13 @@ megaArguments[0] = megaGetter;
     ).expect("allocating getter probe");
     assert_eq!(getter_probe.completion_string(), "[true,1]");
     let after = runtime.execution_stats();
-    assert_no_replay(before, after);
+    // The getter's own loop may compile and leave its first generation at an
+    // unseen element site; the caller must neither replay nor recompile.
+    assert!(after.jit_optimized_entries > before.jit_optimized_entries);
+    assert_eq!(
+        after.jit_generated_call_deopts,
+        before.jit_generated_call_deopts
+    );
     // Runtime totals also include the getter's own property operations. The
     // one caller cold region and megaEffects === 1 above prove exactly-once
     // completion; nested transitions must not be attributed to that caller.

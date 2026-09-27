@@ -179,6 +179,8 @@ pub enum ScalarValueOp {
     NewBuiltinError,
     /// Bind the completed `super()` result as derived-constructor `this`.
     BindThisValue,
+    /// Create the site's closure over the activation's parent upvalue cells.
+    MakeClosure,
 }
 
 impl ScalarValueOp {
@@ -196,6 +198,7 @@ impl ScalarValueOp {
             Op::NewError => Ok(Self::NewError),
             Op::NewBuiltinError => Ok(Self::NewBuiltinError),
             Op::BindThisValue => Ok(Self::BindThisValue),
+            Op::MakeClosure => Ok(Self::MakeClosure),
             _ => Err(VmError::InvalidOperand),
         }
     }
@@ -352,7 +355,8 @@ impl Interpreter {
             ScalarValueOp::BindThisValue
             | ScalarValueOp::NewError
             | ScalarValueOp::NewBuiltinError
-            | ScalarValueOp::PrepareThrow => {
+            | ScalarValueOp::PrepareThrow
+            | ScalarValueOp::MakeClosure => {
                 // This operation consumes activation metadata and is completed
                 // by `RuntimeCall::scalar_values`.
                 return Err(VmError::InvalidOperand);
@@ -498,6 +502,9 @@ impl RuntimeCall<'_> {
             self.bind_derived_this_value(value0)?;
             return Ok(value0);
         }
+        if operation == ScalarValueOp::MakeClosure {
+            return self.make_closure_value();
+        }
         if operation == ScalarValueOp::PrepareThrow {
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
@@ -547,6 +554,48 @@ impl RuntimeCall<'_> {
             value0,
             value1,
             new_target,
+        )
+        .map_err(CommittedValueError::JavaScript)
+    }
+
+    /// Create the published `MakeClosure` site's closure over this
+    /// activation's upvalue cells, exactly as the interpreter does.
+    fn make_closure_value(&mut self) -> Result<Value, CommittedValueError> {
+        let function_index = self
+            .published_const_index(1)
+            .map_err(CommittedValueError::Fatal)?;
+        let count = self
+            .published_const_index(2)
+            .map_err(CommittedValueError::Fatal)?;
+        let parents = (0..count)
+            .map(|slot| {
+                u8::try_from(3 + slot)
+                    .map_err(|_| VmError::InvalidOperand)
+                    .and_then(|operand| self.published_imm32(operand))
+                    .and_then(|index| u32::try_from(index).map_err(|_| VmError::InvalidOperand))
+            })
+            .collect::<Result<smallvec::SmallVec<[u32; 8]>, _>>()
+            .map_err(CommittedValueError::Fatal)?;
+        let resolved = self
+            .context
+            .for_function(self.function_id())
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
+        // SAFETY: construction validated the frame and owns it exclusively.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        // §10.2.1.1 — an arrow closes over the enclosing activation's
+        // `new.target`; undefined is the unbound state.
+        let new_target = frame.new_target_value();
+        let lexical_new_target = (!new_target.is_undefined()).then_some(new_target);
+        vm.make_closure_value(
+            &resolved,
+            &mut frame,
+            function_index,
+            &parents,
+            lexical_new_target,
+            None,
         )
         .map_err(CommittedValueError::JavaScript)
     }

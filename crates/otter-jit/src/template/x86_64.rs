@@ -1626,8 +1626,11 @@ fn emit_backedge_poll(
         ; sub QWORD [r10], 1
         ; jg =>done
         ; =>slow
-        ; mov rdi, r15
     );
+    // The poll attributes the batch to this loop header for OSR tier-up, and
+    // a side exit resumes the interpreter there.
+    emit_stamp_pc(ops, target);
+    dynasm!(ops ; .arch x64 ; mov rdi, r15);
     emit_load_runtime_stub(ops, relocations, poll_entry, abi::STUB_JIT_BACKEDGE_POLL);
     dynasm!(ops
         ; .arch x64
@@ -1640,9 +1643,9 @@ fn emit_backedge_poll(
         ; je =>threw
         ; cmp eax, abi::NativeResultStatus::SideExit as i32
         ; jne =>fatal
+        ; jmp =>relink
+        ; =>done
     );
-    emit_stamp_pc(ops, target);
-    dynasm!(ops ; .arch x64 ; jmp =>relink ; =>done);
 }
 
 fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {

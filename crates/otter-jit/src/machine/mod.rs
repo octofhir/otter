@@ -81,6 +81,7 @@
 //! # See also
 //! - [`crate::optimizing`] — the production Machine compilation entry.
 
+mod block_merge;
 mod committed_probe;
 mod dce;
 mod deopt;
@@ -1756,13 +1757,14 @@ impl InstructionSequence {
         regalloc::allocate(self, target)
     }
 
-    /// Run effect-aware GVN and LICM, then reverify the rewritten graph before
-    /// register allocation.
+    /// Merge straight-line blocks, run effect-aware GVN and LICM, then
+    /// reverify the rewritten graph before register allocation.
     pub(crate) fn optimize(
         self,
         target: &TargetSpec,
     ) -> Result<(Self, gvn::MachineOptimizationStats), VerificationError> {
-        let (sequence, mut stats) = gvn::optimize(self, target)?;
+        let (sequence, _) = block_merge::optimize(self, target)?;
+        let (sequence, mut stats) = gvn::optimize(sequence, target)?;
         let (sequence, licm) = licm::optimize(sequence, target)?;
         let (sequence, exposed) = gvn::optimize(sequence, target)?;
         let (sequence, dead) = dce::optimize(sequence, target)?;

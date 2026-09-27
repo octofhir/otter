@@ -54,6 +54,9 @@ pub enum ExitReason {
     UnsupportedOperation = 10,
     /// A VM transition selected interpreter continuation without a failed speculation.
     RuntimeTransition = 11,
+    /// Generated code reached a site that had no feedback when it was
+    /// compiled. The exit collects feedback; it is not a failed speculation.
+    InsufficientFeedback = 12,
 }
 
 impl ExitReason {
@@ -70,6 +73,7 @@ impl ExitReason {
             9 => Some(Self::AllocationMiss),
             10 => Some(Self::UnsupportedOperation),
             11 => Some(Self::RuntimeTransition),
+            12 => Some(Self::InsufficientFeedback),
             _ => None,
         }
     }

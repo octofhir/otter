@@ -37,11 +37,9 @@ pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 ///
 /// # Layout
 ///
-/// One `Value` field. After task 76 the body is the only place the
-/// captured value lives — every closure handle stores a
-/// `Gc<UpvalueCellBody>` (4-byte compressed offset) instead of the
-/// previous ref-counted mutable cell (8-byte pointer + allocation
-/// overhead).
+/// One `Value` field. Closure tails and activation windows store four-byte
+/// compressed handles to these shared cells. The cell is the one authoritative
+/// location of a mutable captured binding.
 ///
 /// # Spec
 ///
@@ -72,10 +70,9 @@ pub type UpvalueCell = otter_gc::Gc<UpvalueCellBody>;
 /// Allocate a fresh [`UpvalueCell`] pre-populated with `value` on
 /// the GC heap.
 ///
-/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body is
-/// allocated directly in old-space — Phase-1 closure spines
-/// (`Rc<[UpvalueCell]>`) cannot yet be rewritten by the scavenger,
-/// and old-space objects do not move.
+/// Binding cells are allocated directly in old space. Closure tails and frame
+/// windows trace their slots in place; permanent global lexical proofs also
+/// rely on these cells retaining a stable value address.
 ///
 /// # Errors
 ///

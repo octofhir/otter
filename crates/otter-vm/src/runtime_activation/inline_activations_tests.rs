@@ -110,7 +110,7 @@ fn inline_activation_reentry_preserves_stack_and_moving_roots() {
             let closure = crate::closure::alloc_closure(
                 &mut vm.gc_heap,
                 1,
-                vec![],
+                &mut [],
                 Some(value),
                 None,
                 None,
@@ -313,7 +313,7 @@ fn inline_constructor_new_target_is_a_moving_root() {
         let receiver = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
         root.set_this_value(Value::object(receiver));
         let target =
-            crate::closure::alloc_closure(&mut vm.gc_heap, 2, vec![], None, None, None, None)
+            crate::closure::alloc_closure(&mut vm.gc_heap, 2, &mut [], None, None, None, None)
                 .unwrap();
         registers[0] = Value::closure(target);
         let mut recipes = [recipe(&context, 1, root.this_value())];

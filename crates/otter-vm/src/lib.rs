@@ -231,7 +231,6 @@ pub mod timers;
 pub mod uint8_base64;
 pub mod upvalue;
 mod upvalue_source;
-pub mod upvalue_spine;
 pub mod value;
 pub mod value_slab;
 pub mod weak_refs;

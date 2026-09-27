@@ -257,9 +257,11 @@ impl Interpreter {
             .chain(self.arguments_shape_cache.values())
     }
 
-    /// Trace cached transition shapes through live CodeBlock-owned IC slots.
+    /// Trace cached transition shapes through live CodeBlock-owned IC slots
+    /// and the shared megamorphic transition table.
     pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         self.code_space.trace_property_ic_roots(visitor);
+        self.store_transition_cache.trace_roots(visitor);
     }
 }
 

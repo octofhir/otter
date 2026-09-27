@@ -262,6 +262,18 @@ impl Interpreter {
             } else {
                 slot.record_uncached_miss();
             }
+            // A megamorphic site installs no transitions of its own; the
+            // shared table replays one another site (or this one) captured
+            // for this receiver class, under the same complete guards.
+            if slot.is_megamorphic()
+                && self
+                    .store_transition_cache
+                    .replay(obj, &mut self.gc_heap, atomized_key, &value)?
+                    .is_some()
+            {
+                path = Path::SharedTransition;
+                return Ok(());
+            }
 
             // An uncached store needs canonical `[[Set]]` resolution before a
             // new shape program can be installed. Inherited setters, non-writable data,
@@ -290,7 +302,37 @@ impl Interpreter {
                 .escape_scoped(receiver_root)
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
-            if !slot.is_megamorphic() {
+            if slot.is_megamorphic() {
+                if let Some(ic) = cache_ir::CacheStub::install_store_existing(
+                    current_obj,
+                    &self.gc_heap,
+                    atomized_key,
+                ) {
+                    if ic
+                        .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)?
+                        .is_some()
+                    {
+                        path = Path::InstallExisting;
+                        if fill_megamorphic_cache {
+                            let _ = self.resolve_property_data_slot(current_obj, atomized_key);
+                        }
+                        return Ok(());
+                    }
+                } else {
+                    path = Path::InstallTransition;
+                    if let Some(transition) = self
+                        .capture_store_property_transition_with_stack_roots(
+                            stack,
+                            current_obj,
+                            atomized_key,
+                            &value,
+                        )?
+                    {
+                        self.store_transition_cache.record(transition);
+                        return Ok(());
+                    }
+                }
+            } else {
                 if let Some(ic) = cache_ir::CacheStub::install_store_existing(
                     current_obj,
                     &self.gc_heap,

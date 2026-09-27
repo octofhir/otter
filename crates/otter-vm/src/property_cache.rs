@@ -8,6 +8,9 @@
 //!
 //! # Contents
 //! - [`PropertyLookupCache`] — the direct-mapped table.
+//! - [`StoreTransitionCache`] — the add-a-property counterpart: shared
+//!   `(receiver shape, atom)` hidden-class transitions for megamorphic stores,
+//!   V8's megamorphic stub cache holding transition handlers.
 //! - [`jit`] — the same table's owned layout description for generated loads.
 //!
 //! # Invariants
@@ -25,6 +28,9 @@
 //!   generated hits also require a nonnull cached holder shape fixing the
 //!   slot's key and descriptor kind, with no live descriptor overrides.
 //! - The table is derived data: dropping any entry is always sound.
+//! - A shared transition carries the complete replay guard of a per-site
+//!   add-transition stub (receiver shape, extensibility, and every recorded
+//!   prototype shape), so a hit commits exactly the store `[[Set]]` would.
 //! - The boxed table never resizes or is replaced during its interpreter's
 //!   lifetime. Generated probes share these exact entries and their layout;
 //!   only the owning VM thread may read or replace an entry.
@@ -206,6 +212,66 @@ impl PropertyLookupCache {
                 |resolved| resolved.hit,
             ),
         });
+    }
+}
+
+/// Direct-mapped `(receiver shape, atom)` → add-property transition table.
+///
+/// A store site that has gone megamorphic stops installing its own
+/// transitions; without this table every property-adding store at such a site
+/// would repeat the complete `[[Set]]` walk. Sites share the entries, exactly
+/// as V8's megamorphic stub cache shares transition handlers.
+#[derive(Debug)]
+pub(crate) struct StoreTransitionCache {
+    ways: Box<[Option<object::StorePropertyTransition>]>,
+}
+
+impl Default for StoreTransitionCache {
+    fn default() -> Self {
+        Self {
+            ways: (0..CAPACITY).map(|_| None).collect(),
+        }
+    }
+}
+
+impl StoreTransitionCache {
+    /// Replay the recorded transition for this receiver class and name.
+    ///
+    /// `Ok(Some(()))` committed the store; `Ok(None)` is an allocation-free
+    /// miss (nothing recorded, or a replay guard failed).
+    pub(crate) fn replay(
+        &self,
+        obj: JsObject,
+        heap: &mut otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+        value: &crate::Value,
+    ) -> Result<Option<()>, otter_gc::OutOfMemory> {
+        if object::shape(obj, heap).is_null() {
+            return Ok(None);
+        }
+        let receiver_shape = object::shape_id(obj, heap);
+        let atom = key.atom().id();
+        match &self.ways[PropertyLookupCache::index(receiver_shape, atom)] {
+            Some(transition)
+                if transition.from_shape_id == receiver_shape && transition.atom_id == atom =>
+            {
+                object::replay_store_property_transition(obj, heap, key, transition, value)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Record one captured transition, displacing whatever shared its index.
+    pub(crate) fn record(&mut self, transition: object::StorePropertyTransition) {
+        let index = PropertyLookupCache::index(transition.from_shape_id, transition.atom_id);
+        self.ways[index] = Some(transition);
+    }
+
+    /// Visit the target shapes the recorded transitions keep alive.
+    pub(crate) fn trace_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for transition in self.ways.iter().flatten() {
+            transition.trace_roots(visitor);
+        }
     }
 }
 

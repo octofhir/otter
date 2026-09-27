@@ -213,6 +213,7 @@ impl Interpreter {
             code_eviction_stats: CodeEvictionStats::default(),
             names,
             property_cache: crate::property_cache::PropertyLookupCache::default(),
+            store_transition_cache: crate::property_cache::StoreTransitionCache::default(),
             realm_context: None,
             shape_runtime,
             shape_epoch: 0,

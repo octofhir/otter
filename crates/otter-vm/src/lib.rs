@@ -995,6 +995,9 @@ pub struct Interpreter {
     /// resolving properties in one probe instead of re-entering the `[[Get]]`
     /// ladder. See [`property_cache`].
     property_cache: property_cache::PropertyLookupCache,
+    /// Shared `(receiver shape, property atom)` add-property transitions for
+    /// megamorphic store sites. See [`property_cache::StoreTransitionCache`].
+    store_transition_cache: property_cache::StoreTransitionCache,
     /// The most recent top-level [`ExecutionContext`] this interpreter ran.
     /// Every chunk links into the shared [`code_space`], so this context
     /// resolves function ids for any closure reachable in the realm — it is the

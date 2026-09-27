@@ -99,6 +99,7 @@ mod property;
 mod regalloc;
 mod safepoint;
 mod target;
+mod trivial_phi;
 mod truthiness;
 
 pub use deopt::{
@@ -1705,7 +1706,7 @@ impl InstructionSequence {
             blocks,
             instructions,
         };
-        sequence.verify_pass(target)?;
+        sequence.verify(target)?;
         Ok(sequence)
     }
 
@@ -1727,7 +1728,7 @@ impl InstructionSequence {
             blocks,
             instructions,
         };
-        sequence.verify_pass(target)?;
+        sequence.verify(target)?;
         Ok(sequence)
     }
 
@@ -1766,13 +1767,15 @@ impl InstructionSequence {
         regalloc::allocate(self, target)
     }
 
-    /// Merge straight-line blocks, run effect-aware GVN and LICM, then
-    /// reverify the rewritten graph before register allocation.
+    /// Drop trivial block parameters, merge straight-line blocks, run
+    /// effect-aware GVN and LICM, then reverify the rewritten graph before
+    /// register allocation.
     pub(crate) fn optimize(
         self,
         target: &TargetSpec,
     ) -> Result<(Self, gvn::MachineOptimizationStats), VerificationError> {
-        let (sequence, _) = block_merge::optimize(self, target)?;
+        let (sequence, _) = trivial_phi::optimize(self, target)?;
+        let (sequence, _) = block_merge::optimize(sequence, target)?;
         let (sequence, mut stats) = gvn::optimize(sequence, target)?;
         let (sequence, licm) = licm::optimize(sequence, target)?;
         let (sequence, exposed) = gvn::optimize(sequence, target)?;

@@ -1365,10 +1365,17 @@ impl MachineInstruction {
         }]);
     }
 
-    /// The sole exit id for operations with one failed proof.
+    /// The sole exit id for operations with one failed proof. A runtime
+    /// transition exit resumes an operation no proof guarded, so it is not
+    /// counted.
     #[must_use]
     pub fn deopt_id(&self) -> Option<DeoptId> {
-        (self.exits.len() == 1).then(|| self.exits[0].id)
+        let mut proofs = self
+            .exits
+            .iter()
+            .filter(|exit| exit.reason != ExitReason::RuntimeTransition);
+        let proof = proofs.next()?;
+        proofs.next().is_none().then_some(proof.id)
     }
 
     /// Exit id for one exact failed proof.

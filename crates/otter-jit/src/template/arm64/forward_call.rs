@@ -150,6 +150,7 @@ pub(super) fn emit_forward_call(
             table.entry(abi::STUB_JIT_COPY_FORWARDED_ARGUMENTS),
             code_map.as_deref_mut(),
             cold,
+            cold,
             threw,
             throw_value,
             fatal,

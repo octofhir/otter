@@ -7,6 +7,8 @@
 //!
 //! # Invariants
 //! - Callee deoptimization resumes an already-started call; no effect is replayed.
+//! - Only a failed callee identity proof takes the caller's recompiling exit;
+//!   entry and resource rejections take its resuming transition exit.
 //! - Caller publication is restored before the callee frame is discarded.
 //! - Pending-error preparation failures and pure exception values retain their
 //!   distinct caller continuations. Every private-frame rejection releases SP.
@@ -31,6 +33,7 @@ pub(super) fn emit<Store, Restore, Record>(
     derived_construct_result_entry: u64,
     mut record: Record,
     bail: DynamicLabel,
+    transition: DynamicLabel,
     finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
@@ -38,6 +41,7 @@ pub(super) fn emit<Store, Restore, Record>(
     uncommitted_rejected: DynamicLabel,
     entry_rejected: DynamicLabel,
     caller_bail: DynamicLabel,
+    caller_transition: DynamicLabel,
     construct_prepare_error: DynamicLabel,
     construct_prepare_throw: DynamicLabel,
     construct_prepare_fatal: DynamicLabel,
@@ -274,20 +278,24 @@ where
     emit_release_linkage(ops, &layout);
     dynasm!(ops
         ; .arch aarch64
-        ; b =>caller_bail
+        ; b =>caller_transition
         ; =>uncommitted_rejected
         ; ldr x25, [sp, layout.saved_x25]
     );
     emit_release_linkage(ops, &layout);
     dynasm!(ops
         ; .arch aarch64
-        ; b =>caller_bail
+        ; b =>caller_transition
     );
     record("directCallEntryReject", entry_reject_start, ops.offset().0);
 
+    // A failed callee identity proof is a failed speculation; every other
+    // pre-entry rejection resumes the call canonically.
     dynasm!(ops ; .arch aarch64 ; =>caller_bail);
     restore_roots(ops)?;
-    dynasm!(ops ; .arch aarch64 ; b =>bail);
+    dynasm!(ops ; .arch aarch64 ; b =>bail ; =>caller_transition);
+    restore_roots(ops)?;
+    dynasm!(ops ; .arch aarch64 ; b =>transition);
 
     dynasm!(ops
         ; .arch aarch64

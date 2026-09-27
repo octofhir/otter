@@ -59,6 +59,7 @@ where
     let layout = StackLayout::dynamic_prefix();
     let size_slot = layout.allocation_size.expect("dynamic prefix");
     let caller_bail = ops.new_dynamic_label();
+    let caller_transition = ops.new_dynamic_label();
     let scratch_miss = ops.new_dynamic_label();
     let uncommitted_rejected = ops.new_dynamic_label();
     let entry_rejected = ops.new_dynamic_label();
@@ -340,6 +341,7 @@ where
         0,
         &mut record,
         bail,
+        bail,
         finish_error,
         throw_value,
         fatal,
@@ -347,6 +349,7 @@ where
         uncommitted_rejected,
         entry_rejected,
         caller_bail,
+        caller_transition,
         prepare_error,
         prepare_throw,
         prepare_fatal,

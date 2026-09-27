@@ -47,15 +47,20 @@ impl Interpreter {
         frame: &ActiveFrameRef<'_>,
         materialized: Option<usize>,
     ) -> Option<u32> {
-        let cold = materialized
-            .and_then(|index| stack.get(index))
-            .and_then(|frame| self.frame_cold(frame));
+        let materialized = materialized.and_then(|index| stack.get(index));
+        let cold = materialized.and_then(|frame| self.frame_cold(frame));
         if cold.is_some_and(|cold| cold.arguments_object.is_some()) {
             return None;
         }
-        let count = frame
-            .incoming_argument_count()
-            .or_else(|| cold.map(|cold| cold.incoming_args.len()))?;
+        // A materialized frame entered without actuals never allocates its
+        // cold record: absent incoming arguments are the empty list.
+        let count = match frame.incoming_argument_count() {
+            Some(count) => count,
+            None => {
+                materialized?;
+                cold.map_or(0, |cold| cold.incoming_args.len())
+            }
+        };
         u32::try_from(count).ok()
     }
 

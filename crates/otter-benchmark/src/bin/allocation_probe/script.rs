@@ -3,6 +3,8 @@
 //! # Contents
 //! - Existing per-type GC counters bracket one unchanged source execution.
 //! - JSON records allocation traffic, collection counts and reported live bytes.
+//! - Execution counters (calls, generated/runtime transitions, IC hits) are
+//!   reported as before/after snapshots around the same execution.
 //!
 //! # Invariants
 //! - No diagnostic work executes in the measured script or allocation path.
@@ -24,10 +26,12 @@ pub(super) fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         .jit_selection(JitSelection::ProductionTiered)
         .build()?;
     let before = runtime.heap_stats().clone();
+    let execution_before = runtime.execution_stats();
     let result = runtime.run_script(
         SourceInput::from_javascript(&source),
         &path.to_string_lossy(),
     )?;
+    let execution_after = runtime.execution_stats();
     let after = runtime.heap_stats();
     let rows = after
         .by_type
@@ -59,6 +63,8 @@ pub(super) fn run(path: &Path) -> Result<(), Box<dyn Error>> {
             "fullPauseNs": after.full_pause_ns_total - before.full_pause_ns_total,
             "reportedLiveBytes": after.live_bytes,
             "byType": rows,
+            "executionBefore": execution_before,
+            "executionAfter": execution_after,
         })
     );
     Ok(())

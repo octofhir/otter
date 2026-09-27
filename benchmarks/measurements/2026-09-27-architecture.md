@@ -1,0 +1,279 @@
+# Engine architecture decision: environments first, one native contract for JIT and AOT
+
+Revision `cbb6e741` (after `894f3ffe` frame-cell batches), macOS ARM64 (Apple M1),
+Rust 1.97.1 / LLVM 22.1.6. Node v25 (V8), Bun 1.3 (JSC). All raw data lives in
+ignored `benchmarks/results/arch-2026-09-27/`; primary-source research and the
+internal subsystem maps are committed in `research-2026-09-27/`.
+
+Parity has not been reached. This document fixes the facts, the main measured
+gap, the alternatives, the chosen architecture and its success criteria.
+
+## 1. Facts
+
+### 1.1 Fixed-work baseline (HEAD code, `otter-before-young-bindings`, SHA-256 8885cc24…)
+
+Retired instructions and peak RSS from `/usr/bin/time -l`; whole process,
+startup and compilation included (`scripts/dev/fixed-work.py`).
+
+| Workload | Otter | Node/V8 | Bun/JSC | Otter/V8 | Otter/JSC | RSS Otter / V8 / JSC (MB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ts | 198.6G | 21.2G | 20.6G | 9.38× | 9.65× | 663 / 503 / 468 |
+| zlib | 273.4G | 23.1G | 23.4G | 11.82× | 11.70× | 795 / 80 / 177 |
+| crypto | 17.0G | 2.88G | 2.23G | 5.89× | 7.62× | 48 / 53 / 30 |
+| fib | 3.82G | 0.95G | 0.54G | 4.01× | 7.08× | 57 / 48 / 18 |
+| mega_method | 10.1G | 4.03G | 1.64G | 2.51× | 6.15× | 57 / 50 / 19 |
+| ast_ctor | 31.7G | 3.30G | 2.06G | 9.60× | 15.39× | 124 / 52 / 30 |
+| earley-boyer | 229.1G | 18.7G | 21.7G | 12.27× | 10.56× | 128 / 190 / 86 |
+
+Notes:
+- V8 compiles zlib's `"use asm"` module through its asm.js→Wasm validator.
+  `node --no-validate-asm` retires **35.6G** (85 MB RSS): the fair JS-JIT
+  comparison for zlib is 23–36G. JSC has no asm.js path (23.4G is its JS JIT).
+- Startup (`console.log(1)`): Otter 819M instructions / 59 MB; Node 269M / 48 MB;
+  Bun 81M / 10 MB. Startup is 21% of fib and 8% of mega_method.
+- After `894f3ffe`, Earley is 215.4G (−5.95%); other workloads unchanged.
+- zlib RSS is JIT memory: `--jitless` peaks at 224 MB (601G instructions).
+  The GC allocation census for zlib is ~0 bytes; ~610 MB is compiler/code memory.
+
+### 1.2 Execution counters (production tier, per run)
+
+From `otter-allocation-probe script` (counters added in `cbb6e741`):
+
+| Counter | ts | zlib | crypto | fib | mega | ast_ctor | earley |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| generated JS calls | 70.7M | 5.3M | 4.8M | 13.5M | 0 | 2.0M | 154.0M |
+| reentrant stub transitions | 34.7M | **44.3M** | 3.1M | 128 | 0 | 28.0M | 14.7M |
+| runtime property stubs | 22.0M | 12K | 3.0M | 0 | 0 | 24.0M | 5.6M |
+| alloc stub transitions | 2.1M | 0 | 153 | 0 | 0 | 2.0M | 10.2M |
+| JIT→Rust call transitions | 10.0M | 1.1M | 17K | 128 | 0 | 4.0M | 0.6M |
+| inline receiver allocations | 1.0M | 0 | 4.3K | 0 | 0 | 0 | 73.0M |
+| template entries | 17.9M | 13 | 266K | 0 | 0 | 134 | 4.0K |
+
+fib: (3.815G − 0.82G startup) / 13.46M calls = **222 instructions per
+invocation** vs V8's 50.5 (both include compare/sub/add of the body).
+
+### 1.3 Allocation census
+
+| Workload | GC bytes | minor/full GC | pauses | dominant objects |
+| --- | ---: | ---: | ---: | --- |
+| earley | 10.81 GB | 626 / 244 | 2.56 s + 2.74 s | objects 73.4M × 96 B; binding cells 110.9M × 16 B; closures 10.2M × 151 B |
+| ts | 1.02 GB | 38 / 5 | 0.43 s + 0.27 s | objects 3.2M × 96 B; slot slabs 2.0M × 158 B; strings 3.5M |
+| ast_ctor | 0.40 GB | 13 / 13 | 0.06 s | slot slab 2.0M × 104 B + object 2.0M × 96 B per `new` |
+| zlib, crypto, fib, mega | ~0 | ~0 | — | — |
+
+Earley GC pauses are 5.3 s of 15.7 s. An `ObjectBody` is 96 B for any object
+with ≤3 properties (V8: 12 B header + 4 B per field); ≥4 properties add an
+old-space slab. A closure is ~112 B + 4 B per capture (V8: 28–32 B).
+
+### 1.4 Where time goes (sample shares, not instruction shares)
+
+Clean native profiles (`scripts/dev/cleanprof.sh`, no artifacts/events):
+
+| Workload | Generated code | GC | closures/cells | other runtime |
+| --- | ---: | ---: | ---: | --- |
+| earley | 36% | ~27% | ~15% | `===` on non-numbers in Rust 8% |
+| ts | 39% | ~2% | — | string-compare property lookup ~9%, generic call paths ~6%, interpreter ~1% |
+| zlib | 69% | — | — | generic coercion/bitwise stubs + handle scopes ~9%, Machine compile ~8% |
+| crypto | 80% | — | — | element stubs |
+| mega_method | 78% | — | — | startup compile |
+| fib | 61% | — | — | startup compile |
+| ast_ctor | 11% | — | — | string-compare lookup 8.5%, `_super.call`/construct in Rust, runtime stores |
+
+Sampling attributes time; instruction shares differ with IPC. Machine frames
+have no frame-pointer chain, so only self samples are trustworthy.
+
+Generated-code composition (artifact runs, `scripts/dev/hotasm.py`):
+- zlib hottest function (attributed regions): typed element View/Address/Load/
+  Store/Guard 80%, captured-binding guard/hit 17%. One `HEAP16[x>>1]` costs
+  ~75 instructions: ~50 to re-derive the typed-array view on every access,
+  bounds/address ~15, load ~10, each region materializing a success boolean
+  consumed by the next region's `cbz`.
+- earley hottest functions: `instanceof` probes, receiver allocation, shape
+  proofs, store dispatch; 24.5 KB of code for 951 B of bytecode (≈250 B/op).
+- fib call site (Machine): binding guard on the captured `fib`, callee identity
+  guards, `ldar` entry cell, two stack checks, ~15 NativeFrame header stores plus
+  undefined-fill, a push onto the thread frame array, a caller-side invocation
+  counter, a root-record push, a `(value,status)` return with a 4-way status
+  dispatch, then unpublish. Three parallel structures are maintained per call.
+
+## 2. Primary-source research
+
+Eight families were researched from source at pinned revisions and every
+report's six most load-bearing citations were independently re-fetched and
+verified or corrected (`research-2026-09-27/*.md`). Load-bearing findings:
+
+| Mechanism | Primary source | What Otter spends instead |
+| --- | --- | --- |
+| One environment per scope instance; closure = {context, code} | V8 `Scope::MustAllocateInContext` (`src/ast/scopes.cc`, tag 15.5.35.10), `contexts.h`; JSC `JSLexicalEnvironment.h`, `JSCallee::m_scope`; SM `EnvironmentObject.h`; Hermes `CreateScopeInst` | one old-space cell per captured binding per activation (110.9M on Earley) and a per-binding reference array in every closure |
+| Young inline closure/context allocation, barrier-free init stores | V8 `FastNewClosure`, `JSCreateLowering::ReduceJSCreateClosure` (forced `kYoung`), Turboshaft `MemoryOptimizationReducer::SkipWriteBarrier`; JSC DFG `compileNewFunctionCommon` ("activation must be young") | Rust runtime call, old-space free-list allocation, barrier scan of every new edge |
+| Singleton scopes / context specialization fold captured constants | JSC `SymbolTable::singleton()`, `Graph::tryGetConstantClosureVar`; V8 `JSContextSpecialization::ReduceJSLoadContext`, `ContextCell::State` | a 14–20-instruction guarded load for every read of a module/IIFE-level binding (`fib`, zlib `HEAP*`, crypto helpers, TS namespaces) |
+| Allocation sinking of closures + activations | JSC `DFGObjectAllocationSinkingPhase` (`PhantomNewFunction`, `PhantomCreateActivation`); SM `ScalarReplacement.cpp` (`MNewCallObject`); LuaJIT `lj_opt_sink.c` | all closures and cells materialized |
+| Prototype in the map; validity cells | V8 `Map` `[prototype]`/`prototype_validity_cell` (`map.h`), `InvalidatePrototypeChains`; JSC Structure; SM Shape | per-hop prototype guards, shared transitions keyed by proto shape |
+| Walkable frames, one frame layout across tiers | V8 Sparkplug; SM Baseline Interpreter = Baseline JIT codegen; JSC LLInt/Baseline; HotSpot OopMaps; Go funcdata/PCDATA | three frame records, per-call publication into three structures |
+| One compiler serving JIT and AOT | .NET RyuJIT (JIT, crossgen2 ReadyToRun, NativeAOT ILCompiler); Wasmtime `.cwasm` zero-relocation code | JIT code embeds absolute addresses as movz/movk immediates; no object output |
+| Backend | Cranelift (regalloc2, stack maps, `cranelift-object`), LLVM statepoints (Falcon, WebKit FTL→B3: 4.7× compile time) | own emitter already has regalloc2 + precise safepoints; lacks portable output |
+| AOT of untyped JS | Static Hermes `SH.cpp` + tmikov discussion #1685: "not a performance improvement over a high tier JIT… predictable performance" | — |
+
+BEAM/BeamAsm contributes shared runtime fragments and grouped allocation
+checks (applied in `894f3ffe`); its isolated process heaps and immutable terms
+are not transferable to JS. HotSpot/Graal Native Image contributes the image
+heap and closed-world constraints; JS `eval`, `Function` and dynamic `import`
+keep an explicit runtime compiler path in any Otter AOT mode.
+
+## 3. The main measured gap
+
+Excess instructions over V8 (Otter − V8), approximate decomposition. Every row
+is an estimate from counters × per-event cost read from generated code, or
+from sample shares; none is a measured instruction share.
+
+| Mechanism | Estimate | Evidence |
+| --- | ---: | --- |
+| Per-operation cost of generated code (decode/guard/boolean-probe chains, element views, binding guards, property proofs) | ~45% | zlib 69%, crypto 80%, earley 36%, ts 39% of time in JIT code; element access ~75 vs ~5 instructions; property load ~38–40 vs ~4 |
+| Environments, closures and the allocations/GC they cause | ~15% | earley: cells + closures + old-space GC ≈ 40% of time; binding reads inside the JIT rows above |
+| Runtime transitions and generic runtime paths | ~12% | 44M (zlib), 35M (ts), 28M (ast) reentrant stubs at ~300 instructions of protocol each |
+| Call linkage | ~6% | 222 vs 50 instructions per fib call; 154M Earley calls |
+| Compilation time/memory | ~4% | zlib Machine compile ≈3.9 s, ~610 MB RSS |
+
+The largest *single* architectural cause that cuts across rows 1, 2 and 4 is
+the **environment model**: captured bindings are individual old-space cells,
+closures carry per-binding reference tails with an absolute base pointer
+(which pins closures in old space), frames copy spines, and every captured
+read is a guarded multi-load chain. It is the biggest measured cost on the
+largest-ratio workload (Earley), it sits on the hot path of every other
+workload through module-level captured bindings (the CLI runs scripts in a
+CommonJS wrapper, so top-level `var`/`function` are captured bindings: `fib`,
+crypto's helpers, TS namespace objects, zlib's `HEAP*` views), it forces the
+nursery bypass that makes GC expensive, and constant folding of captured
+bindings (the only way zlib's typed-array views become hoistable constants)
+needs an environment representation first.
+
+## 4. Alternatives for the environment gap
+
+| | E1: per-scope contexts (V8/JSC/SM/Hermes) | E2: flat closures + assignment conversion (Chez/OCaml/Go) | E3: keep per-binding cells, make them cheap (batches, young cells, tagged immutable slots, sinking) |
+| --- | --- | --- | --- |
+| Allocations (Earley) | ~20M contexts + 10.2M closures (measured count of scope instances with captures in the rejected grouping experiment: 20.3M) | boxes only for assigned captures; closures grow to ~12 captured Values each (≈130 B) | 110.9M cells remain; closures keep 4 B/capture tails |
+| Closure creation | O(1): two stores | O(captures) copies | O(captures) copies |
+| Captured read | ctx → depth hops → slot (2–3 loads); 0 with singleton folding | 1 load (+1 boxed) | 3–4 dependent loads + hole check |
+| Memory | 32–40 B closures; context retains all captured slots of its scope | no false retention; duplicated values per closure | many 16 B objects; 4 B/capture/closure |
+| JS semantics | exactly ES environment records: TDZ = hole, per-iteration copy, eval scope info, mapped arguments alias slots, generators keep context | needs initialization-dominance proofs for hoisting/TDZ; eval/with force boxing everywhere | unchanged |
+| Compile cost | scope analysis already exists; slot assignment is linear | whole-function assignment/dominance analysis | proof analysis for tagged slots |
+| JIT/AOT | static offsets; singleton folding in JIT only | static offsets | status quo |
+| Infrastructure removed | UpvalueCell for function/block scopes, six spine forms, frame spine copies, `upvalue_base`, `jit_initialize_generated_upvalues`, FreshUpvalue double allocation, `UpvalueSource`, per-binding capture operands | spines, most cells | little |
+| Prior evidence | rejected Otter experiment kept per-binding references *under* grouped storage (+14.8% RSS); every production engine uses E1 | Scheme compilers; Earley closures capture ~12 bindings each | measured −4…−6% steps; young-cell pilot regressed (confounded by old closures) |
+
+**Decision: E1.** E2 multiplies closure size and creation cost on the
+closure-heavy workload (≈12 captures per Earley closure) and needs whole-function
+proofs that JS hoisting/TDZ/eval make fragile. E3 is the incremental path whose
+steps measure in single-digit percents and cannot remove the per-binding
+object model. E1 replaces the model: one object per scope instance, closures
+with one context reference, young movable allocation, and a representation
+that singleton folding and allocation sinking can act on. The previous
+grouping attempt failed precisely because it kept the per-binding reference
+coordinates in closures; E1 changes compiler coordinates and closure ownership
+together.
+
+## 5. E1 contract
+
+### Final invariants
+1. A binding lives in a register unless it is captured by a nested function,
+   visible to a sloppy direct `eval`/`with`, or a mapped-arguments parameter;
+   then it is a slot of its scope's **Context**. Module environment bindings
+   (live import/export) and the global declarative environment keep their
+   existing record kinds; they are different ES environment-record kinds, not
+   an alternate storage for the same scopes.
+2. A Context is one GC object `{header, scope descriptor, parent context,
+   slots[n] (8-byte Values)}`. TDZ is the hole value in a slot. Contexts are
+   ordinary movable objects allocated young.
+3. A closure stores exactly one context reference. It has no capture tail and
+   no absolute derived address; closures are movable and allocated young.
+4. Every frame (interpreter, Template, Machine, parked generator) holds its
+   current context in one traced slot; there are no upvalue spines.
+5. Bytecode addresses captured bindings by `(depth, slot)` resolved at compile
+   time; per-iteration and block scopes push/pop/copy contexts explicitly.
+6. Direct eval resolves names through scope descriptors on the context chain;
+   no parallel name→cell tables.
+7. Every allocation of a context or closure is visible to the GC with its full
+   payload initialized before any safepoint.
+
+### Success criteria
+- Earley: binding-cell allocations 110.9M → 0 for function/block scopes;
+  closure bytes/closure ≤ 48; full GCs and GC pause share fall; instructions
+  fall by ≥20% versus `894f3ffe`.
+- No workload regresses beyond noise in instructions; RSS not worse on Earley.
+- Gates: difftest, otter-jit lib, GC stress 1..16 in all tiers on the closure,
+  eval, arguments, generator, class and loop corpora; targeted Test262
+  directories for scope, closures, eval, arguments, generators, classes, for-let
+  show no new failures (`ES_CONFORMANCE.md` before/after).
+
+### Slices after E1 (each measured before starting)
+1. Inline young allocation of contexts and closures in Template/Machine
+   (V8 `FastNewClosure`; JSC `compileNewFunctionCommon`).
+2. Singleton-context constant folding with invalidation (JSC `singleton()` +
+   watchpoints; V8 `ContextCell`), then typed-array view folding for constant
+   views — the zlib element-access path.
+3. Native call/frame contract: fp-walkable frames with the existing safepoint
+   maps, no per-call publication, callee-side tier budget, exception status
+   only on runtime transitions; pinned cage-base/thread registers; stub calls
+   through a per-isolate table (also the portable-code form).
+4. Object layout: prototype in shape, fixed in-object slots sized by slack
+   tracking, no `values_ptr`, one guard per access.
+5. AOT on the same pipeline (below).
+
+## 6. One foundation for JIT and AOT
+
+Modes assessed:
+1. **Bytecode/snapshot serialization** — startup only (Otter startup is 3×
+   Node, 10× Bun); the flat bytecode format is already address-free.
+2. **AOT native JS functions with runtime helpers** — the Template tier is
+   feedback-independent (ICs are data cells), so its code is the natural
+   AOT tier once stubs are called through a table and every heap/cell address
+   is a symbolic relocation (the relocation vocabulary already exists and is
+   captured for artifacts; a completeness check and a loader are missing).
+3. **Profile-guided (guarded) AOT** — Machine code compiled from a training
+   profile keeps deopt metadata and falls back to the interpreter/Template;
+   requires the relocation kinds for shapes, atoms and function ids.
+4. **Closed-world** — only for explicitly declared programs without `eval`,
+   `Function` or dynamic `import`; never reported as full-JS performance.
+5. **Standalone executable** — runtime binary + appended image (bytecode,
+   code, relocations, metadata), loaded at startup; the runtime compiler stays
+   present for eval/Function/dynamic import.
+
+Backend decision: keep the single compiler (HIR → Machine IR → regalloc2 →
+own emitter) and add a portable output mode that writes Mach-O/ELF objects via
+the `object` crate. Cranelift and LLVM would add a second IR and do not address
+the measured costs (environments, calls, guards, allocation), which are not
+instruction-selection problems; they remain offline code-quality yardsticks.
+AOT is not assumed faster than JIT; it is measured separately (build cost,
+executable/code/data size, startup, instructions, RSS, remaining runtime
+compilation paths).
+
+## 7. GC soundness defects found during this review
+
+1. Allocation-triggered full collections (`GcHeap::collect_full`) never ran the
+   WeakMap ephemeron fixpoint or WeakRef/FinalizationRegistry processing; only
+   the debug `force_gc` did. WeakMap values reachable only through live keys
+   were swept: all three tiers crashed on a 30-line program; `OTTER_GC_VERIFY`
+   reported 9,731 corrupt slots. Fixed: the heap runs the VM's post-mark
+   processor in every full collection.
+2. FinalizationRegistry cell targets and unregister tokens were never rewritten
+   when a scavenge moved them: `unregister` failed for every young token
+   (0/500 vs Node 500/500) and dead-target checks read stale offsets. Fixed:
+   registries are ephemeron tables with weak key walks.
+3. `new WeakRef(target)` traced the caller's `&Value` through a shared
+   reference across the body allocation and then re-read it; the compiler kept
+   the pre-allocation bits. Under GC stress every WeakRef pointed at the object
+   allocated next in the recycled nursery slot (`refs[i].deref() === held[i+1]`).
+   Fixed: the target is rooted as a mutable local and read back from it.
+Regression programs: `crates/otter-difftest/corpus/weakmap_growth_full_gc.js`
+(old binary crashes in all tiers), `finalization_young_tokens.js` (old binary:
+`unregister` 0/300, wrong `deref` identity under stress). Validation: difftest
+61/61 (interpreter oracle, Template, production, stress 1/4/16 with slot
+verification), otter-jit 283/283, VM weak/ephemeron 45/45, otter-gc 128/128.
+
+Other verified findings that shape the slices: page survival age is never
+reset and fresh objects share aged pages (premature tenuring); children of
+remembered parents are promoted immediately; old-space allocation never
+triggers growth-based major GC; `Value` cells hold full addresses yet every
+JIT decode re-adds the cage base; Template property ICs never learn after
+compilation; `TailCall` is unsupported in both JIT tiers (every strict
+`return f(x)`).

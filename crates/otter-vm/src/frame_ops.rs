@@ -52,16 +52,6 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// Load the exact running function object (SELF) into `dst`.
-    pub(crate) fn frame_load_self(
-        &self,
-        frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let value = frame.self_value();
-        frame.write(dst, value)
-    }
-
     /// Load one captured binding, rejecting an uninitialized TDZ cell.
     pub(crate) fn frame_load_upvalue(
         &self,
@@ -354,9 +344,8 @@ mod tests {
             interpreter
                 .frame_load_this(&mut active, 0)
                 .expect("materialized this");
-            interpreter
-                .frame_load_self(&mut active, 1)
-                .expect("materialized SELF");
+            let self_value = active.self_value();
+            active.write(1, self_value).expect("materialized SELF");
         }
 
         let mut native_slots = [Value::undefined(); 2];
@@ -374,9 +363,8 @@ mod tests {
             interpreter
                 .frame_load_this(&mut active, 0)
                 .expect("native this");
-            interpreter
-                .frame_load_self(&mut active, 1)
-                .expect("native SELF");
+            let self_value = active.self_value();
+            active.write(1, self_value).expect("native SELF");
         }
 
         assert_eq!(materialized_slots, native_slots);

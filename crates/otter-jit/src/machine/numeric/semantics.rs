@@ -115,6 +115,8 @@ fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<Commit
         Op::SameValue => CommittedValueOperation::Scalar(ScalarValueOp::SameValue),
         Op::BindThisValue => CommittedValueOperation::Scalar(ScalarValueOp::BindThisValue),
         Op::MakeClosure => CommittedValueOperation::Scalar(ScalarValueOp::MakeClosure),
+        Op::MakeFunction => CommittedValueOperation::Scalar(ScalarValueOp::MakeFunction),
+        Op::LoadRegExp => CommittedValueOperation::Scalar(ScalarValueOp::LoadRegExp),
         _ => CommittedValueOperation::ObjectProtocol(ObjectProtocolValueOp::Binary(
             otter_vm::native_abi::BinaryOperator::from_opcode(op)?,
         )),

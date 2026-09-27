@@ -18,9 +18,17 @@ runtime suite without a concrete reason. Stable Rust remains 1.97.1.
   −0.46% on Earley is not a robust corpus-wide memory win. TS/zlib peak RSS
   varies in both directions and remains unresolved.
 
+- Inline closure captures (next commit): one old-space closure owns its trailing
+  four-byte cell references; the separate GC capture-array type is removed.
+  The allocator takes a mutable slice and construction uses SmallVec storage.
+  Earley instructions −3.91%..−4.05% in three pairs; allocated bytes −1.49%.
+  RSS is unresolved (Earley −0.66%..+0.07%; zlib −5.43%..+1.75%).
+
 Every retained implementation was validated with the two required gates.
-Latest: difftest 59/59, JIT 283/283; final stress 1..16 in interpreter, Template
-and production (48/48, Node agreement, slot verification). Bytecode 96/96,
+Latest: difftest 59/59, JIT 283/283; closure/arguments stress 1..16 in interpreter,
+Template and production (96/96, Node agreement, slot verification). Closure
+unit tests 9/9, shared-capture snapshot and cycle reclamation pass. Previous
+arguments checks include bytecode 96/96,
 analysis 4/4, native root rewrite, intrinsic roots, generated arguments,
 Machine/cold identity, iterator snapshot and snapshot round-trip tests pass.
 x86 cross-compilation passes; x86 execution was not tested on this ARM64 host.
@@ -30,6 +38,7 @@ Reports:
 - `2026-09-27-old-free-list.md`
 - `2026-09-27-indexed-access.md`
 - `2026-09-27-arguments-reads.md` — all seven final counters and V8/JSC ratios
+- `2026-09-27-closure-captures.md` — seven counters, repetitions, GC and code size
 - `2026-09-27-null-prototype.md` — separate user-requested investigation
 
 ## Rejected experiment
@@ -45,8 +54,15 @@ The successful post-arguments Earley profile has 1739 isolate self samples:
 upvalue allocation 119, spine allocation 82, generated upvalue initialization 60,
 runtime closure construction 98, closure allocation 20. Together these disjoint
 self samples are 21.8%; additional shared GC cost is not fully attributable.
-The allocation census still counts 110,900,416 binding cells. Investigate binding
-storage and capture mutability/ownership before choosing the next replacement.
+The closure-tail change removes the separate spine allocations. A fresh profile
+is being collected in `earley-after-closure-tail-profile/`. The allocation census
+still counts 110,900,416 binding cells. Bytecode capture-graph analysis finds
+8 of 10 own `deriv_trees` bindings initialized once from simple parameters, with
+no descendant writes. Investigate a four-byte tagged capture slot that carries
+immutable values directly, while mutable bindings retain shared cells. Prove
+initialization dominance and exclude dynamic scope/mapped arguments; a store
+count alone is insufficient. `next-capture-design.md` contains the implementation
+audit checklist. No tagged capture representation is implemented yet.
 Do not repeat the rejected eight-byte owner/index design without addressing its
 reference-size and retained-memory costs. All GC roots, native frame layouts,
 spines, compiler capture consumers and snapshots must change together if their
@@ -63,6 +79,14 @@ ordinary literal. These tests are separate from the agreed seven workloads.
 ## Raw artifacts and reproducibility
 
 Everything below lives in ignored `benchmarks/results/parity-2026-09-27/`:
+- `closure-tail-reference/`, `closure-tail-final/`, `closure-tail-repeat/`:
+  complete seven-workload counters and alternating Earley/zlib repetitions.
+- `closure-tail-{earley,ts}-allocation.json`,
+  `closure-tail-{earley,zlib}-events.json`: allocation and compiler evidence.
+- `closure-tail-stress/results.json`, `closure-tail-{difftest-gate.json,jit-gate.txt}`:
+  final validation of inline captures. Other `closure-tail-*-test*.txt` are focused checks.
+- `otter-before-closure-tail`: exact arguments baseline executable, including
+  the pending-tail GC fix; final executable hash is in the closure report.
 - `arguments-reference/`, `arguments-count-final/`: seven before/final CLI runs,
   `/usr/bin/time -l`, stdout, commands and executable/source hashes.
 - `arguments-final/`: first candidate with a redundant frame-cache zero store;
@@ -82,7 +106,7 @@ Everything below lives in ignored `benchmarks/results/parity-2026-09-27/`:
   `otter-rejected-environments`, `allocation-probe-rejected-environments`,
   `environment-{reference,final}/`, `environment-{earley,ts}-{before,after}.json`.
 
-The baseline binary predates the independent pending-tail GC fix. The candidate
+The older `arguments-reference` baseline binary predates the independent pending-tail GC fix. The candidate
 includes it; the reports identify both revisions rather than pretending that the
 preserved executable was built from the immediately preceding commit.
 

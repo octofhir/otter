@@ -2143,9 +2143,9 @@ mod tests {
 
         let mut heap = GcHeap::new().expect("heap");
         let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let upvalues = vec![cell];
+        let mut upvalues = [cell];
         let closure =
-            alloc_closure(&mut heap, 99, upvalues, None, None, None, None).expect("alloc");
+            alloc_closure(&mut heap, 99, &mut upvalues, None, None, None, None).expect("alloc");
         let v = Value::closure(closure);
         assert!(v.is_callable());
         assert!(!v.is_function_id());
@@ -2188,7 +2188,7 @@ mod tests {
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
         let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let closure =
-            alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("closure");
+            alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("closure");
 
         let vobj = Value::object(obj);
         let vclo = Value::closure(closure);
@@ -2308,7 +2308,7 @@ mod tests {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("clo");
+        let closure = alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("clo");
         assert_eq!(Value::closure(closure).typeof_pure(), Some("function"));
         let body = alloc_flat_string_body_with_roots(
             &mut heap,
@@ -2357,7 +2357,7 @@ mod tests {
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
         let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("clo");
+        let closure = alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("clo");
         assert_eq!(Value::object(obj).to_boolean_pure(), Some(true));
         assert_eq!(Value::closure(closure).to_boolean_pure(), Some(true));
 
@@ -2384,7 +2384,7 @@ mod tests {
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
         let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let closure =
-            alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("closure");
+            alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("closure");
 
         let vo = Value::object(obj);
         let vc = Value::closure(closure);
@@ -2447,7 +2447,7 @@ mod tests {
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
         let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, vec![cell], None, None, None, None).expect("clo");
+        let closure = alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("clo");
         let body = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(1),

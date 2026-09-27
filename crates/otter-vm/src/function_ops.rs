@@ -4,7 +4,7 @@
 //! preserving the compact executable operand path used by dispatch.
 //!
 //! # Contents
-//! - Closure-less function value construction for `MakeFunction`.
+//! - Distinct function identities without captures for `MakeFunction`.
 //! - Captured-upvalue closure construction for variadic `MakeClosure`.
 //! - Class constructor wrapper construction for `MakeClass`.
 //! - `Function.prototype.bind` metadata and bound-function construction.
@@ -16,7 +16,8 @@
 //!   storage reads must never substitute for descriptor dispatch.
 //! - `MakeFunction` receives already-decoded executable operands.
 //! - `MakeClosure` reads the executable operand slice because its upvalue list
-//!   is variadic.
+//!   is variadic. Construction roots its temporary capture slice until the
+//!   one closure allocation owns the initialized inline tail.
 //! - Arrow closures snapshot the enclosing frame's `this` value at construction.
 //! - Function property-descriptor results remain in a handle-arena slot across
 //!   every field write; shape allocation never leaves the builder with a stale
@@ -118,7 +119,7 @@ impl Interpreter {
             let closure = crate::closure::alloc_closure(
                 &mut self.gc_heap,
                 function_id,
-                Vec::new(),
+                &mut [],
                 None,
                 None,
                 None,
@@ -148,7 +149,7 @@ impl Interpreter {
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
-            Vec::new(),
+            &mut [],
             None,
             None,
             None,
@@ -171,7 +172,7 @@ impl Interpreter {
             Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let mut parent_indices = Vec::with_capacity(count);
+        let mut parent_indices = SmallVec::<[u32; 16]>::with_capacity(count);
         for i in 0..count {
             match operands.get(3 + i) {
                 Some(Operand::Imm32(n)) if n >= 0 => parent_indices.push(n as u32),
@@ -262,11 +263,10 @@ impl Interpreter {
         if function_id == frame.function_id() {
             return Ok(frame.self_value());
         }
-        let mut cells: Vec<UpvalueCell> = Vec::with_capacity(parent_indices.len());
+        let mut cells = SmallVec::<[UpvalueCell; 16]>::with_capacity(parent_indices.len());
         for &parent_idx in parent_indices {
             cells.push(frame.upvalue(parent_idx)?);
         }
-        let upvalues = cells;
         // Arrow-closure receivers are bound lexically: every later invocation
         // ignores the call site and uses the enclosing frame's `this`.
         let bound_this = if context.function_is_arrow(function_id) {
@@ -289,7 +289,7 @@ impl Interpreter {
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
-            upvalues,
+            &mut cells,
             bound_this,
             bound_new_target,
             bound_derived_this,

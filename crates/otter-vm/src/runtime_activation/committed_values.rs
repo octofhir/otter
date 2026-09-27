@@ -618,7 +618,7 @@ impl RuntimeCall<'_> {
                     .and_then(|operand| self.published_imm32(operand))
                     .and_then(|index| u32::try_from(index).map_err(|_| VmError::InvalidOperand))
             })
-            .collect::<Result<smallvec::SmallVec<[u32; 8]>, _>>()
+            .collect::<Result<smallvec::SmallVec<[u32; 16]>, _>>()
             .map_err(CommittedValueError::Fatal)?;
         let resolved = self
             .context

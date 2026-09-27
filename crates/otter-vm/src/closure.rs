@@ -33,9 +33,9 @@
 //!   following Rust `Option` layout.
 //! - The upvalue spine is built once at closure creation
 //!   ([`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)) and never
-//!   resized. It is a [`crate::upvalue_spine::UpvalueSpineBody`] in old
-//!   space, so its address matches the `upvalue_base` / `upvalue_count`
-//!   pair for the closure's lifetime; native code must not retain that
+//!   resized. Its compressed cells occupy the closure's trailing storage in
+//!   old space, so the `upvalue_base` / `upvalue_count` pair stays valid
+//!   for the closure's lifetime; native code must not retain that
 //!   base beyond the live call. Per-cell mutation flows through
 //!   [`crate::store_upvalue`] / [`crate::read_upvalue`].
 //! - Canonical `Value` fields are always traced. Presence flags distinguish
@@ -58,12 +58,15 @@
 //! - ECMA-262 §10.2.1.1 — `[[ThisMode]]` for arrow functions.
 
 use crate::object::JsObject;
-use crate::upvalue_spine::UpvalueSpineHandle;
 use crate::{UpvalueCell, Value, upvalue_source::UpvalueSource};
 use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
+
+#[cfg(test)]
+#[path = "closure/captures_tests.rs"]
+mod captures_tests;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
@@ -86,9 +89,8 @@ pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 =
 /// Stable machine-facing closure call metadata.
 ///
 /// All addresses use fixed-width integers instead of Rust references. The
-/// `upvalue_base` points into the closure's
-/// [`crate::upvalue_spine::UpvalueSpineBody`] and is valid only while the
-/// closure remains live; it is not a movable GC-object pointer and must
+/// `upvalue_base` points into the closure's trailing capture array and is
+/// valid only while the closure remains live. It is not a movable pointer and must
 /// not be cached across calls.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,13 +184,6 @@ pub struct JsClosureBody {
     pub bound_new_target: Value,
     /// Canonical property and weak constructor state in the fixed prefix.
     pub(crate) construct: crate::closure_construct::ClosureConstructHeader,
-    /// Captured upvalue spine in declaration order, or a null handle
-    /// when the closure captures nothing. The cells live in the spine
-    /// body's own cell, so the closure owns no storage outside the heap
-    /// and a page image carries the whole of it. Per-cell mutation flows
-    /// through [`crate::store_upvalue`] / [`crate::read_upvalue`]; the
-    /// spine itself never resizes.
-    pub spine: UpvalueSpineHandle,
     /// Arrow closures created inside derived constructors capture the
     /// constructor's shared `this` cell so `super()` can bind it even
     /// when the arrow is invoked through a nested sync dispatch.
@@ -239,30 +234,26 @@ pub const CLOSURE_LOOKUP_PROTO_OVERRIDE: u8 = 1 << 2;
 impl otter_gc::SafeTraceable for JsClosureBody {
     const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
 
-    /// Walk every outgoing reference, then republish the spine's address.
-    ///
-    /// The spine handle is visited first on purpose. A restore relocates
-    /// it here, and `upvalue_base` — a raw process address compiled code
-    /// loads directly out of the call header — has to be recomputed from
-    /// the handle's post-relocation value. A scavenge never moves the
-    /// spine (it is old-space), so outside a restore the refresh writes
-    /// back what was already there.
+    /// Trace the fixed fields and exact trailing capture slots. Heap-image
+    /// restore relocates the whole closure, so recompute its derived base here.
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
-        use crate::pelt::PeltField as _;
-
-        if !self.spine.is_null() {
-            let p = &mut self.spine as *mut UpvalueSpineHandle as *mut RawGc;
-            visitor(p);
-        }
+        self.trace_fixed_fields(visitor);
         self.refresh_upvalue_base();
-        self.construct.last_instance.set(JsObject::null());
+        let base = self.captures_ptr();
+        for index in 0..self.call_header.upvalue_count as usize {
+            // SAFETY: allocated closures own exactly upvalue_count initialized
+            // compressed handles after the fixed body. Visit the actual slot.
+            let slot = unsafe { base.add(index) };
+            if unsafe { !(*slot).is_null() } {
+                visitor(slot.cast::<RawGc>());
+            }
+        }
+    }
 
-        self.bound_this.pelt_trace(visitor);
-        self.bound_new_target.pelt_trace(visitor);
-        self.bound_derived_this.pelt_trace(visitor);
-        self.call_header.eval_env.pelt_trace(visitor);
-        self.construct.own_props.pelt_trace(visitor);
-        self.proto_override.pelt_trace(visitor);
+    /// A pending stack body has no capture tail. The allocator's caller roots
+    /// the input buffer until initialization at the final heap address.
+    fn trace_pending_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.trace_fixed_fields(visitor);
     }
 }
 
@@ -367,9 +358,7 @@ impl JsClosureBody {
 
     fn new(
         function_id: u32,
-        spine: UpvalueSpineHandle,
         upvalue_count: u32,
-        upvalue_base: u64,
         bound_this: Option<Value>,
         bound_new_target: Option<Value>,
         bound_derived_this: Option<UpvalueCell>,
@@ -378,7 +367,7 @@ impl JsClosureBody {
         let call_header = ClosureCallHeader::new(
             function_id,
             upvalue_count,
-            upvalue_base,
+            0,
             bound_this.is_some(),
             bound_new_target.is_some(),
             bound_derived_this.is_some(),
@@ -388,7 +377,6 @@ impl JsClosureBody {
             call_header,
             bound_this: bound_this.unwrap_or_else(Value::undefined),
             bound_new_target: bound_new_target.unwrap_or_else(Value::undefined),
-            spine,
             bound_derived_this,
             construct: crate::closure_construct::ClosureConstructHeader::default(),
             name_deleted: false,
@@ -399,10 +387,37 @@ impl JsClosureBody {
         }
     }
 
-    /// Recompute the raw spine address compiled code reads out of the
-    /// call header. Cheap, and correct wherever the spine ended up.
+    /// Address of this allocated body's trailing compressed capture slots.
+    fn captures_ptr(&self) -> *mut UpvalueCell {
+        // SAFETY: this computes the tail address; callers only dereference it
+        // on a fully allocated body with upvalue_count initialized entries.
+        unsafe { (self as *const Self).add(1).cast_mut().cast() }
+    }
+
+    fn captures(&self) -> &[UpvalueCell] {
+        // SAFETY: published closures initialize exactly upvalue_count entries.
+        unsafe {
+            std::slice::from_raw_parts(self.captures_ptr(), self.call_header.upvalue_count as usize)
+        }
+    }
+
     fn refresh_upvalue_base(&mut self) {
-        self.call_header.upvalue_base = crate::upvalue_spine::cells_base_address(self.spine);
+        self.call_header.upvalue_base = if self.call_header.upvalue_count == 0 {
+            0
+        } else {
+            self.captures_ptr() as usize as u64
+        };
+    }
+
+    fn trace_fixed_fields(&mut self, visitor: &mut SlotVisitor<'_>) {
+        use crate::pelt::PeltField as _;
+        self.construct.last_instance.set(JsObject::null());
+        self.bound_this.pelt_trace(visitor);
+        self.bound_new_target.pelt_trace(visitor);
+        self.bound_derived_this.pelt_trace(visitor);
+        self.call_header.eval_env.pelt_trace(visitor);
+        self.construct.own_props.pelt_trace(visitor);
+        self.proto_override.pelt_trace(visitor);
     }
 
     #[inline]
@@ -544,7 +559,7 @@ impl JsClosure {
     /// Copy all dynamic call metadata without cloning the captured spine.
     ///
     /// The returned upvalue source remains valid while this exact closure is
-    /// rooted; closure creation never resizes its external vector allocation.
+    /// rooted; closure creation never resizes its inline capture array.
     #[must_use]
     pub(crate) fn call_state(self, heap: &GcHeap) -> ClosureCallState {
         heap.read_payload(self.handle, JsClosureBody::call_state)
@@ -674,11 +689,7 @@ impl JsClosure {
     where
         F: FnOnce(&[UpvalueCell]) -> R,
     {
-        let spine = heap.read_payload(self.handle, |body| body.spine);
-        if spine.is_null() {
-            return f(&[]);
-        }
-        heap.read_payload(spine, |body| f(body.cells()))
+        heap.read_payload(self.handle, |body| f(body.captures()))
     }
 
     /// Snapshot the captured upvalue spine into a fresh `Vec`.
@@ -708,72 +719,38 @@ impl JsClosure {
     }
 }
 
-/// Allocate a closure body in old-space, consistent with
-/// [`crate::alloc_upvalue`] and with the spine itself.
+/// Allocate one old-space closure containing its compressed capture array.
 ///
 /// # Errors
-///
 /// Surfaces [`OutOfMemory`] verbatim.
 pub fn alloc_closure(
     heap: &mut GcHeap,
     function_id: u32,
-    upvalues: Vec<UpvalueCell>,
-    mut bound_this: Option<Value>,
-    mut bound_new_target: Option<Value>,
-    mut bound_derived_this: Option<UpvalueCell>,
-    mut eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    upvalues: &mut [UpvalueCell],
+    bound_this: Option<Value>,
+    bound_new_target: Option<Value>,
+    bound_derived_this: Option<UpvalueCell>,
+    eval_env: Option<crate::eval_env::EvalEnvHandle>,
 ) -> Result<JsClosure, OutOfMemory> {
-    let mut upvalues = upvalues;
-    let spine = {
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            trace_pending_call_fields(
-                &mut bound_this,
-                &mut bound_new_target,
-                &mut bound_derived_this,
-                &mut eval_env,
-                visitor,
-            );
-        };
-        alloc_spine_for(heap, &mut upvalues, &mut visit)?
-    };
-    let body = JsClosureBody::new(
+    alloc_closure_with_roots(
+        heap,
         function_id,
-        spine,
-        upvalue_count_of(&upvalues),
-        crate::upvalue_spine::cells_base_address(spine),
+        upvalues,
         bound_this,
         bound_new_target,
         bound_derived_this,
         eval_env,
-    );
-    let handle = heap.alloc_old(body)?;
-    Ok(JsClosure::from_parts(handle, function_id))
-}
-
-/// Cell count as the call ABI expresses it.
-fn upvalue_count_of(upvalues: &[UpvalueCell]) -> u32 {
-    u32::try_from(upvalues.len()).expect("closure upvalue spine exceeds the u32 call ABI")
-}
-
-/// Allocate the spine a closure will own, or a null handle when it
-/// captures nothing — a closure with no upvalues costs no second cell.
-fn alloc_spine_for(
-    heap: &mut GcHeap,
-    upvalues: &mut [UpvalueCell],
-    external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<crate::upvalue_spine::UpvalueSpineHandle, OutOfMemory> {
-    if upvalues.is_empty() {
-        return Ok(crate::upvalue_spine::UpvalueSpineHandle::null());
-    }
-    crate::upvalue_spine::alloc_upvalue_spine(heap, upvalues, external_visit)
+        &mut |_| {},
+    )
 }
 
 /// Trace closure-call fields that remain in Rust locals while the captured
-/// upvalue spine is allocated.
+/// closure is allocated.
 ///
-/// The spine allocation can trigger a moving full collection before the
+/// Allocation can trigger a moving full collection before the
 /// closure body exists. These are therefore real pending-payload slots, not
 /// copies that can be reconstructed from the eventual body.
+#[cfg(test)]
 fn trace_pending_call_fields(
     bound_this: &mut Option<Value>,
     bound_new_target: &mut Option<Value>,
@@ -802,38 +779,46 @@ fn trace_pending_call_fields(
 pub fn alloc_closure_with_roots(
     heap: &mut GcHeap,
     function_id: u32,
-    upvalues: Vec<UpvalueCell>,
-    mut bound_this: Option<Value>,
-    mut bound_new_target: Option<Value>,
-    mut bound_derived_this: Option<UpvalueCell>,
-    mut eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    upvalues: &mut [UpvalueCell],
+    bound_this: Option<Value>,
+    bound_new_target: Option<Value>,
+    bound_derived_this: Option<UpvalueCell>,
+    eval_env: Option<crate::eval_env::EvalEnvHandle>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
-    let mut upvalues = upvalues;
-    let spine = {
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            trace_pending_call_fields(
-                &mut bound_this,
-                &mut bound_new_target,
-                &mut bound_derived_this,
-                &mut eval_env,
-                visitor,
-            );
-        };
-        alloc_spine_for(heap, &mut upvalues, &mut visit)?
-    };
+    let count = u32::try_from(upvalues.len()).expect("closure captures exceed the u32 call ABI");
     let body = JsClosureBody::new(
         function_id,
-        spine,
-        upvalue_count_of(&upvalues),
-        crate::upvalue_spine::cells_base_address(spine),
+        count,
         bound_this,
         bound_new_target,
         bound_derived_this,
         eval_env,
     );
-    let handle = heap.alloc_with_roots(body, external_visit)?;
+    // The external visitor may rewrite these entries before initialization.
+    // Raw pointers keep the two callbacks from retaining overlapping borrows.
+    let cells = upvalues.as_mut_ptr();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        for index in 0..count as usize {
+            // SAFETY: the caller's slice stays allocated throughout this call.
+            let slot = unsafe { cells.add(index) };
+            if unsafe { !(*slot).is_null() } {
+                visitor(slot.cast::<RawGc>());
+            }
+        }
+    };
+    let handle = heap.alloc_variable_with_roots_initialized(
+        body,
+        count as usize * std::mem::size_of::<UpvalueCell>(),
+        &mut visit,
+        |body| {
+            // SAFETY: the allocator reserved this exact tail; the rooted
+            // source is disjoint, initialized and reflects any collection.
+            unsafe { std::ptr::copy_nonoverlapping(cells, body.captures_ptr(), count as usize) };
+            body.refresh_upvalue_base();
+        },
+    )?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
 
@@ -984,7 +969,7 @@ mod tests {
             captured.offset(),
         ];
 
-        // Fill the capped heap without crossing it. The next spine allocation
+        // Fill the capped heap without crossing it. The next closure allocation
         // must overshoot, collect the unrooted filler cells, and retry while
         // rewriting every pending closure-call field in place.
         let before_filler = heap.tracked_bytes();
@@ -1042,7 +1027,7 @@ mod tests {
             alloc_closure_with_roots(
                 &mut heap,
                 71,
-                vec![captured],
+                &mut [captured],
                 bound_this,
                 bound_new_target,
                 bound_derived_this,
@@ -1054,7 +1039,7 @@ mod tests {
             alloc_closure(
                 &mut heap,
                 71,
-                vec![captured],
+                &mut [captured],
                 bound_this,
                 bound_new_target,
                 bound_derived_this,
@@ -1130,8 +1115,7 @@ mod tests {
     #[test]
     fn allocates_empty_closure() {
         let mut heap = GcHeap::new().expect("heap");
-        let closure =
-            alloc_closure(&mut heap, 7, Vec::new(), None, None, None, None).expect("alloc");
+        let closure = alloc_closure(&mut heap, 7, &mut [], None, None, None, None).expect("alloc");
         assert_eq!(closure.function_id(), 7);
         assert_eq!(closure.bound_this(&heap), None);
         assert_eq!(closure.bound_new_target(&heap), None);
@@ -1142,7 +1126,7 @@ mod tests {
             assert_eq!(body.call_header.upvalue_base, 0);
             assert_eq!(body.call_header.upvalue_count, 0);
             assert!(body.call_header.eval_env.is_null());
-            assert!(body.spine.is_null(), "no captures means no spine cell");
+            assert!(body.captures().is_empty());
             assert!(body.bound_this.is_undefined());
             assert!(body.bound_new_target.is_undefined());
         });
@@ -1153,11 +1137,11 @@ mod tests {
         let mut heap = GcHeap::new().expect("heap");
         let cell_a = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let cell_b = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
-        let upvalues = vec![cell_a, cell_b];
+        let mut upvalues = [cell_a, cell_b];
         let closure = alloc_closure(
             &mut heap,
             42,
-            upvalues,
+            &mut upvalues,
             Some(Value::null()),
             None,
             None,
@@ -1172,7 +1156,7 @@ mod tests {
         assert_eq!(call_state.upvalues.len(), 2);
         assert_eq!(call_state.upvalues.read(0), Some(cell_a));
         assert_eq!(call_state.upvalues.read(1), Some(cell_b));
-        let spine = heap.read_payload(closure.handle(), |body| {
+        let base = heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.call_header.function_id, 42);
             assert_eq!(body.call_header.upvalue_count, 2);
             assert!(body.call_header.has_flag(CLOSURE_CALL_FLAG_BOUND_THIS));
@@ -1183,20 +1167,15 @@ mod tests {
             );
             assert!(body.bound_this.is_null());
             assert!(body.bound_new_target.is_undefined());
-            body.spine
+            body.captures_ptr() as usize as u64
         });
-        // The published base is the spine's trailing array, so compiled
-        // code and the call state read the same cells.
-        let base = crate::upvalue_spine::cells_base_address(spine);
+        // Native linkage and VM call state address the closure's inline tail.
         assert_eq!(
             heap.read_payload(closure.handle(), |body| body.call_header.upvalue_base),
             base
         );
         assert_eq!(call_state.upvalues.base_ptr_or_null() as usize as u64, base);
-        assert_eq!(
-            heap.read_payload(spine, |body| body.cells().to_vec()),
-            vec![cell_a, cell_b]
-        );
+        assert_eq!(closure.upvalues_snapshot(&heap), vec![cell_a, cell_b]);
     }
 
     #[test]
@@ -1205,7 +1184,7 @@ mod tests {
         let closure = alloc_closure(
             &mut heap,
             9,
-            Vec::new(),
+            &mut [],
             Some(Value::undefined()),
             None,
             None,
@@ -1235,7 +1214,7 @@ mod tests {
         let closure = alloc_closure(
             &mut heap,
             1,
-            Vec::new(),
+            &mut [],
             None,
             Some(Value::null()),
             Some(derived_this),

@@ -4872,7 +4872,7 @@ fn is_callable_recognises_call_shapes() {
     assert!(is_callable(&Value::function(7)));
     let mut closure_heap = otter_gc::GcHeap::new().expect("closure heap");
     let closure_handle =
-        crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None, None, None, None)
+        crate::closure::alloc_closure(&mut closure_heap, 7, &mut [], None, None, None, None)
             .expect("closure");
     assert!(is_callable(&Value::closure(closure_handle)));
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
@@ -5447,7 +5447,7 @@ fn arrow_closure_overrides_call_site_this() {
     let closure_handle = crate::closure::alloc_closure(
         interp.gc_heap_mut(),
         1,
-        Vec::new(),
+        &mut [],
         Some(Value::string(bound)),
         None,
         None,

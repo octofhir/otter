@@ -1,6 +1,6 @@
-// Several bindings share one moving environment. Sibling closures, mapped
-// arguments and direct eval must retain binding identity; loop renewal replaces
-// only its own reference. Warm generated entries before observing final aliases.
+// Sibling closures, mapped arguments and direct eval retain binding identity
+// across collection; loop renewal replaces only its own binding. Warm generated
+// entries before observing final aliases.
 function make(seed) {
   let left = { n: seed };
   let right = { n: seed + 10 };
@@ -53,3 +53,25 @@ function tdz() {
   return result + ":" + read();
 }
 console.log(tdz());
+
+// More than the construction buffer's inline capacity, with aliases in a
+// second closure. Heap capture layout and generated reads must stay identical.
+function manyCaptures(seed) {
+  let a0 = seed, a1 = seed + 1, a2 = seed + 2, a3 = seed + 3;
+  let a4 = seed + 4, a5 = seed + 5, a6 = seed + 6, a7 = seed + 7;
+  let a8 = seed + 8, a9 = seed + 9, a10 = seed + 10, a11 = seed + 11;
+  let a12 = seed + 12, a13 = seed + 13, a14 = seed + 14, a15 = seed + 15;
+  let a16 = seed + 16, a17 = seed + 17, a18 = seed + 18, a19 = seed + 19;
+  return [
+    () => a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 +
+      a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19,
+    () => { a0++; a19 += 2; }
+  ];
+}
+const many = manyCaptures(3);
+let manyTotal = 0;
+for (let i = 0; i < 128; i++) {
+  manyTotal += many[0]();
+  many[1]();
+}
+console.log(manyTotal, many[0]());

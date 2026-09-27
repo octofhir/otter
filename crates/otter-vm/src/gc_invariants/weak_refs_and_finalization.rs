@@ -12,7 +12,7 @@ use crate::test_support::{
 use crate::weak_refs::{
     FINALIZATION_REGISTRY_BODY_TYPE_TAG, WEAK_REF_BODY_TYPE_TAG, finalization_registry_cell_count,
     finalization_registry_register, finalization_registry_unregister,
-    process_weak_refs_and_finalizers, weak_ref_deref,
+    post_mark_processor, take_finalization_jobs, weak_ref_deref,
 };
 use crate::{ExecutionContext, Interpreter, Value};
 use otter_bytecode::BytecodeModule;
@@ -22,16 +22,14 @@ fn full_gc_with_roots(
     heap: &mut otter_gc::GcHeap,
     roots: &mut [&mut RawGc],
 ) -> Vec<crate::weak_refs::FinalizationJob> {
+    heap.set_post_mark_processor(post_mark_processor);
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         for slot in roots.iter_mut() {
             visitor(*slot as *mut RawGc);
         }
     };
-    heap.mark_phase(&mut visit).expect("mark phase");
-    crate::collections::run_ephemeron_fixpoint(heap);
-    let jobs = process_weak_refs_and_finalizers(heap);
-    heap.sweep_phase();
-    jobs
+    heap.collect_full(&mut visit).expect("full gc");
+    take_finalization_jobs(heap)
 }
 
 fn empty_module() -> BytecodeModule {

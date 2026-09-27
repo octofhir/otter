@@ -31,8 +31,14 @@
 //!   is disabled during marking, GC stress, or a pending major collection, and
 //!   is refreshed after every rooted cold allocation transition.
 //! - Weak collection tables are registered as type-erased raw
-//!   handles; VM code runs the ephemeron fixpoint between
-//!   [`GcHeap::mark_phase`] and [`GcHeap::sweep_phase`].
+//!   handles. Every full collection runs the embedder's
+//!   [`PostMarkProcessor`] exactly once between strong marking and sweep
+//!   ([`GcHeap::collect_full`]), whatever triggered it: growth, heap cap or
+//!   an explicit request. Split-phase callers run it through
+//!   [`GcHeap::run_post_mark_processing`].
+//! - After any collection that could have killed a weak target while
+//!   finalization registries exist, [`GcHeap::take_weak_cleanup_due`]
+//!   reports once that cleanup work may be pending.
 //!
 //! # See also
 //!
@@ -63,6 +69,12 @@ use crate::store::GcStore;
 use crate::trace::{TraceTable, Traceable};
 
 mod old_batch;
+
+/// Embedder weak-semantics pass run between strong marking and sweep.
+///
+/// It may mark additional objects (ephemeron values) and clear weak slots,
+/// but must not allocate in this heap, reenter JavaScript or retain the heap.
+pub type PostMarkProcessor = fn(&mut GcHeap);
 
 /// Type alias for the higher-order visitor closure used by the
 /// GC: it receives a `&mut dyn FnMut(*mut RawGc)` slot visitor
@@ -246,6 +258,11 @@ pub struct GcHeap {
     frame_root_providers: FrameRootProviders,
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
+    /// Weak-semantics pass installed by the owning VM; see [`PostMarkProcessor`].
+    post_mark: Option<PostMarkProcessor>,
+    /// Set after a collection while finalization registries exist; the VM
+    /// consumes it at its next job checkpoint to look for emptied cells.
+    weak_cleanup_due: bool,
     shared_external: Arc<SharedExternalState>,
     /// Optional shared-ledger mirror of [`Self::reserved_bytes`] as
     /// `ExternalBytes`. Growth is admitted on the ledger before any heap
@@ -444,6 +461,8 @@ impl GcHeap {
             frame_root_providers: FrameRootProviders::new(),
             ephemerons: EphemeronRegistry::default(),
             weak_finalization: WeakFinalizationRegistry::default(),
+            post_mark: None,
+            weak_cleanup_due: false,
             shared_external: Arc::new(SharedExternalState::default()),
             external_ledger: None,
             stats: HeapStats::default(),
@@ -1859,6 +1878,7 @@ impl GcHeap {
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
         self.ephemerons.retain_non_null();
         self.weak_finalization.retain_non_null();
+        self.weak_cleanup_due |= self.weak_finalization.has_finalization_registries();
         self.stats.last_scavenge = stats;
         self.gc_stats.record_minor(&stats);
         // Per-tag counters drift between scavenges (young
@@ -1881,8 +1901,29 @@ impl GcHeap {
     ) -> Result<(), OutOfMemory> {
         let pause_start = Instant::now();
         self.mark_phase(external_visit)?;
+        self.run_post_mark_processing();
         self.sweep_phase_with_pause_start(pause_start);
         Ok(())
+    }
+
+    /// Install the embedder's weak-semantics pass. The VM installs it once
+    /// when it takes ownership of the heap.
+    pub fn set_post_mark_processor(&mut self, processor: PostMarkProcessor) {
+        self.post_mark = Some(processor);
+    }
+
+    /// Run the installed weak-semantics pass after [`Self::mark_phase`] and
+    /// before [`Self::sweep_phase`]. [`Self::collect_full`] calls it itself.
+    pub fn run_post_mark_processing(&mut self) {
+        if let Some(processor) = self.post_mark {
+            processor(self);
+        }
+    }
+
+    /// Whether a collection since the last call may have emptied a
+    /// finalization cell. Resets the flag.
+    pub fn take_weak_cleanup_due(&mut self) -> bool {
+        std::mem::take(&mut self.weak_cleanup_due)
     }
 
     /// Whether GC-stress mode is configured (env-enabled), regardless of
@@ -2230,6 +2271,7 @@ impl GcHeap {
         self.prepare_collection_observations();
         self.prune_ephemeron_registry_to_marked();
         self.prune_weak_finalization_registry_to_marked();
+        self.weak_cleanup_due |= self.weak_finalization.has_finalization_registries();
 
         // Sweep — anything still white in old / large / young
         // is dead. For old-space, walk pages; reap pages whose

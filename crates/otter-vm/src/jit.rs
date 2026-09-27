@@ -1941,6 +1941,8 @@ impl VmRuntimeActivation {
         }
         if let Some(cold) = vm.frame_cold(frame) {
             native_frame.set_new_target(cold.new_target.unwrap_or_else(crate::Value::undefined));
+            native_frame
+                .set_arguments_object(cold.arguments_object.and_then(|value| value.as_object()));
             if cold.is_derived_constructor {
                 native_frame.set_derived_constructor();
             }
@@ -1991,6 +1993,10 @@ impl VmRuntimeActivation {
             return Err(crate::VmError::InvalidOperand);
         }
         std::mem::swap(&mut frame.eval_env, &mut native.eval_env);
+        if let Some(object) = native.arguments_object() {
+            let vm = unsafe { self.vm.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
+            vm.frame_ensure_cold(frame).arguments_object = Some(crate::Value::object(object));
+        }
         Ok(result)
     }
 

@@ -696,6 +696,14 @@ pub enum Op {
     /// the unmapped variant; sloppy simple-parameter functions may
     /// expose mapped indexed properties).
     CollectArguments,
+    /// Read the activation's argument count while its implicit object is
+    /// unobserved, or the live `length` property after materialization.
+    /// Operand: `Register(dst)`.
+    LoadArgumentsLength,
+    /// Read an actual argument directly when the object remains unobserved
+    /// and the key is an in-range index. Other keys materialize the activation's
+    /// arguments object once and perform ordinary [[Get]]. Operands: dst, key.
+    LoadArgumentsElement,
 
     /// `r<dst> = globalThis[const<name>]` returning `undefined` when
     /// the binding does not exist. Operands:
@@ -1584,6 +1592,8 @@ impl Op {
             Op::NewObjectLiteral => "NEW_OBJECT_LITERAL",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
+            Op::LoadArgumentsLength => "LOAD_ARGUMENTS_LENGTH",
+            Op::LoadArgumentsElement => "LOAD_ARGUMENTS_ELEMENT",
             Op::Eval => "EVAL",
             Op::IsEvalIntrinsic => "IS_EVAL_INTRINSIC",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1632,6 +1642,7 @@ impl Op {
             | Op::IteratorCloseEnd
             | Op::CheckIteratorResult
             | Op::CollectArguments
+            | Op::LoadArgumentsLength
             | Op::FreshUpvalue
             | Op::MarkModuleEvaluated
             | Op::LoadGlobalThis => 1,
@@ -1641,6 +1652,7 @@ impl Op {
             | Op::LoadBigInt
             | Op::LoadRegExp
             | Op::LoadLength
+            | Op::LoadArgumentsElement
             | Op::Neg
             | Op::BitwiseNot
             | Op::ToNumber

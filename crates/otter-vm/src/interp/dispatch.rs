@@ -1468,6 +1468,16 @@ impl Interpreter {
                     self.run_new_function_operands(context, stack, operands)?;
                     continue;
                 }
+                Op::LoadArgumentsLength | Op::LoadArgumentsElement => {
+                    let dst = instr.reg(0);
+                    let key = (op == Op::LoadArgumentsElement)
+                        .then(|| read_register(&stack[top_idx], instr.reg(1)).copied())
+                        .transpose()?;
+                    let value = self.read_frame_arguments(context, stack, top_idx, key)?;
+                    write_register(&mut stack[top_idx], dst, value)?;
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
                 Op::CollectArguments => {
                     let dst = instr.reg(0);
                     self.run_collect_arguments_reg(context, stack, top_idx, dst)?;

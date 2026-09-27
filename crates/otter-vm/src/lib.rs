@@ -52,6 +52,7 @@ pub(crate) mod abstract_ops;
 pub mod active_frame;
 mod allocation_ops;
 mod argument_window;
+mod arguments_access;
 pub mod arguments_object;
 mod arithmetic_dispatch;
 pub mod array;

@@ -49,10 +49,15 @@ impl Interpreter {
                 if !self.is_callable_runtime(&self.iteration_anchor(base + 1)) {
                     return Err(VmError::NotCallable);
                 }
-                let existing = materialized
-                    .and_then(|index| stack.get(index))
-                    .and_then(|frame| self.frame_cold(frame))
-                    .and_then(|cold| cold.arguments_object);
+                let existing = source
+                    .native_arguments_object()
+                    .map(Value::object)
+                    .or_else(|| {
+                        materialized
+                            .and_then(|index| stack.get(index))
+                            .and_then(|frame| self.frame_cold(frame))
+                            .and_then(|cold| cold.arguments_object)
+                    });
                 let arguments = if let Some(object) = existing {
                     self.create_list_from_array_like(stack, context, object)?
                 } else {

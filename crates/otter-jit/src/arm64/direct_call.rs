@@ -791,7 +791,7 @@ where
         }
         // x8 is outside the callable/receiver proof's scratch set. The caller
         // probes intrinsic apply and the complete actual count once per site.
-        dynasm!(ops ; .arch aarch64 ; mov x8, X(count));
+        dynasm!(ops ; .arch aarch64 ; mov w8, W(count));
         if layout.allocation_size.is_some() {
             let capacity = (MAX_DIRECT_CALL_FRAME_BYTES - layout.incoming_base) / 8;
             dynasm!(ops ; .arch aarch64 ; cmp w8, capacity ; b.hi =>caller_transition);
@@ -1041,7 +1041,7 @@ where
     if matches!(site.arguments, DirectCallArguments::Forward { .. })
         && site.target.plan.needs_incoming_arguments
     {
-        dynasm!(ops ; .arch aarch64 ; str w8, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]);
+        dynasm!(ops ; .arch aarch64 ; str x8, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]);
     }
     dynasm!(ops
         ; .arch aarch64
@@ -1155,7 +1155,8 @@ where
     // The header word covers register count, tier, and flags. A target that
     // materializes `arguments` gets its actual-argument window published in
     // the same store; every frame records its argument count so the field is
-    // never read uninitialized.
+    // never read uninitialized. The 64-bit count store also clears the adjacent
+    // arguments-object root; its source is a zero-extended 32-bit count.
     if site.target.plan.needs_incoming_arguments {
         dynasm!(ops
             ; .arch aarch64
@@ -1173,7 +1174,7 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; movz w13, layout.incoming_count
-            ; str w13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+            ; str x13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         );
     } else {
         // Every actual slot is a valid root before upvalue allocation can GC.

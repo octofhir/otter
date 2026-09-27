@@ -179,6 +179,17 @@ pub(super) fn emit_scalar_value(
 ) -> Result<(), Unsupported> {
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    if matches!(
+        operation,
+        abi::ScalarValueOp::LoadArgumentsLength | abi::ScalarValueOp::LoadArgumentsElement
+    ) {
+        if let Some(src) = value0 {
+            emit_load_reg(ops, 9, src)?;
+        }
+        crate::arm64::arguments::emit(ops, 21, value0.map(|_| 9), slow);
+        emit_store_reg(ops, 16, result)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    }
     if view.cage_base != 0 {
         match (operation, value0) {
             (abi::ScalarValueOp::LoadLength, Some(src)) => {

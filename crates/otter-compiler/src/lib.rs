@@ -41,6 +41,7 @@
 //!
 
 mod annex_b;
+mod arguments_elision;
 mod assignment;
 mod builtins_call;
 mod builtins_table;

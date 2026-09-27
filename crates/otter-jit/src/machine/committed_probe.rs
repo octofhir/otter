@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`expand`] splits derived-this, loose-equality, `instanceof` and generic
-//!   binary-operator calls before allocation.
+//!   binary-operator and activation-arguments calls before allocation.
 //!
 //! # Invariants
 //! - Each probe owns its complete no-call proof and reports whether it finished.
@@ -30,6 +30,9 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeKind {
     DerivedThis,
+    Arguments {
+        element: bool,
+    },
     LooseEquality {
         equal: bool,
     },
@@ -71,7 +74,9 @@ pub(super) fn expand(
                 };
                 let kind = *sites.get(&index)?;
                 let expected = match kind {
-                    ProbeKind::DerivedThis => otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
+                    ProbeKind::DerivedThis | ProbeKind::Arguments { .. } => {
+                        otter_vm::native_abi::STUB_JIT_SCALAR_VALUE
+                    }
                     ProbeKind::LooseEquality { .. }
                     | ProbeKind::Instanceof
                     | ProbeKind::BinaryNumber { .. } => {
@@ -96,6 +101,7 @@ pub(super) fn expand(
             if inputs.len()
                 != match kind {
                     ProbeKind::DerivedThis => 1,
+                    ProbeKind::Arguments { element } => usize::from(element),
                     ProbeKind::LooseEquality { .. }
                     | ProbeKind::Instanceof
                     | ProbeKind::BinaryNumber { .. } => 2,
@@ -175,6 +181,25 @@ pub(super) fn expand(
             cold_successors.push(fatal);
             cold_arguments.push(Vec::new());
             match kind {
+                ProbeKind::Arguments { element } => {
+                    let mut operands: Vec<_> = inputs
+                        .iter()
+                        .copied()
+                        .map(MachineOperand::register_input)
+                        .collect();
+                    operands.extend([
+                        MachineOperand::register_output(fast_result),
+                        MachineOperand::register_output(condition),
+                    ]);
+                    let mut probe = MachineInstruction::plain(
+                        MachineOpcode::ArgumentsReadProbe { byte_pc, element },
+                        operands,
+                    );
+                    probe.clobbers = target_spec
+                        .clobbers(TargetClobberSet::ArgumentsProbe)
+                        .to_vec();
+                    bodies[current].push(probe);
+                }
                 ProbeKind::DerivedThis => {
                     bodies[current].push(MachineInstruction::plain(
                         MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),

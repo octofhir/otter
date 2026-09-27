@@ -97,7 +97,7 @@ where
         ; .arch aarch64
         ; blr x16
         ; tbnz x0, #63, =>scratch_miss
-        ; mov x8, x0
+        ; mov w8, w0
         ; mov x17, sp
         ; ldrh w9, [x17, PLAN_OWN]
         ; ldrh w10, [x17, PLAN_INHERITED]
@@ -121,7 +121,7 @@ where
         ; str x25, [sp, layout.saved_x25]
         // Metadata pointer is dead before this slot becomes caller code id.
         ; str x17, [sp, layout.caller_code_object_id]
-        ; str w8, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+        ; str x8, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         ; add x9, sp, x9
         ; str x9, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
         ; ldr x1, [x17, PLAN_ENTRY]

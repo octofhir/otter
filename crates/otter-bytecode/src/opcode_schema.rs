@@ -1048,6 +1048,8 @@ opcode_schema! {
     (Op::StoreElementStrict, 0xBB),
     (Op::CallForwardArguments, 0xBC),
     (Op::NewObjectLiteral, 0xBD),
+    (Op::LoadArgumentsLength, 0xBE),
+    (Op::LoadArgumentsElement, 0xBF),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1375,7 +1377,10 @@ const fn operand_shape(op: Op) -> OperandShape {
             OperandShape::Fixed(WRITE_READ_READ)
         }
         Op::MakeClass => OperandShape::Fixed(WRITE_FOUR_READS),
-        Op::CollectRest | Op::CollectArguments => OperandShape::Fixed(WRITE),
+        Op::CollectRest | Op::CollectArguments | Op::LoadArgumentsLength => {
+            OperandShape::Fixed(WRITE)
+        }
+        Op::LoadArgumentsElement => OperandShape::Fixed(WRITE_READ),
         Op::Increment => OperandShape::Fixed(WRITE_READ_IMM),
         Op::Eval => OperandShape::Fixed(WRITE_READ_IMM_IMM),
         Op::DefineGlobalVar => OperandShape::Fixed(CONST_READ),
@@ -1802,6 +1807,8 @@ const fn baseline_support(op: Op) -> TierSupport {
         | Op::LoadElement
         | Op::StoreElement
         | Op::ArrayLength
+        | Op::LoadArgumentsLength
+        | Op::LoadArgumentsElement
         | Op::Call
         | Op::CallWithThis
         | Op::CallForwardArguments

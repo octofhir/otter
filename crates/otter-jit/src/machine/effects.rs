@@ -292,6 +292,15 @@ impl MachineOpcode {
                     MachineEffects::read(MachineAliasSet::HEAP, Value)
                 }
             }
+            Self::ArgumentsReadProbe { .. } => MachineEffects {
+                reads: BINDING,
+                writes: MachineAliasSet::NONE,
+                allocates: false,
+                reentrant: false,
+                throws: false,
+                safepoint: false,
+                commoning: Never,
+            },
             Self::TruthinessProbe
             | Self::LooseEqualityProbe { .. }
             | Self::TaggedNullishEqual { .. } => MachineEffects::read(SHAPE, Guard),

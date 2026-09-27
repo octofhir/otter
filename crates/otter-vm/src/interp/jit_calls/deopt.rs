@@ -148,6 +148,9 @@ impl Interpreter {
         );
         frame.self_value = self_value;
         frame.pc = native.header.pc;
+        if let Some(object) = native.arguments_object() {
+            self.frame_ensure_cold(&mut frame).arguments_object = Some(Value::object(object));
+        }
         // The generated caller's actual-argument window dies with its stack
         // frame; the interpreter continuation reads the same list from the
         // cold record, exactly as an interpreter-entered call would.
@@ -375,7 +378,12 @@ impl Interpreter {
         // state before any handler installation or dispatch can collect.
         let outer = &mut materialized[0];
         let new_target = active.new_target_value();
-        if source_cold.is_some() || incoming.is_some() || !new_target.is_undefined() {
+        let arguments_object = native.arguments_object();
+        if source_cold.is_some()
+            || incoming.is_some()
+            || !new_target.is_undefined()
+            || arguments_object.is_some()
+        {
             let cold = self.frame_ensure_cold(outer);
             if let Some((args, rest, object, receiver)) = source_cold {
                 cold.incoming_args = args;
@@ -385,6 +393,9 @@ impl Interpreter {
             }
             if let Some(args) = incoming {
                 cold.incoming_args = args;
+            }
+            if let Some(object) = arguments_object {
+                cold.arguments_object = Some(Value::object(object));
             }
             cold.new_target = (!new_target.is_undefined()).then_some(new_target);
             cold.is_derived_constructor = native.is_derived_constructor();

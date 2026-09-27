@@ -1188,7 +1188,7 @@ fn emit_generated_value_call(
     dynasm!(ops
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r11
-        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], argument_count as i32
+        ; mov QWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], argument_count as i32
     );
     let direct_callable = ops.new_dynamic_label();
     let inherited_ready = ops.new_dynamic_label();
@@ -1695,7 +1695,7 @@ fn initialize_frame(ops: &mut Assembler, target: &otter_vm::JitDirectCallee, lay
         ; mov [rsp + 8], eax
         ; lea rax, [rsp + layout.register_base as i32]
         ; mov [rsp + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], rax
-        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32
+        ; mov QWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32
     );
     load64(ops, 11, VALUE_UNDEFINED);
     for index in 0..u32::from(target.plan.register_count) {

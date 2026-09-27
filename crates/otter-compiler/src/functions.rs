@@ -370,6 +370,24 @@ pub(crate) fn compile_function_full(
         &mut child.eval_sites,
         child.own_upvalue_count,
     );
+    // No mapped formals, eval or suspension can observe hidden identity in
+    // this first admitted family. Alias/escape proof uses lowered register
+    // flow, so local names and source spelling do not select the optimization.
+    if needs_arguments
+        && param_count == 0
+        && !has_rest
+        && !contains_direct_eval
+        && !is_async
+        && !is_generator
+        && !is_async_generator
+        && let Some(plan) = crate::arguments_elision::analyze(
+            &child.code,
+            &module.borrow().constants,
+            child.scratch_window(),
+        )
+    {
+        crate::arguments_elision::lower(&mut child.code, &plan);
+    }
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions

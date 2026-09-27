@@ -2125,6 +2125,12 @@ fn select_with_loop_entries(
                     );
                     let probe = match operation {
                         CommittedValueOperation::Scalar(
+                            otter_vm::native_abi::ScalarValueOp::LoadArgumentsLength,
+                        ) => Some(super::committed_probe::ProbeKind::Arguments { element: false }),
+                        CommittedValueOperation::Scalar(
+                            otter_vm::native_abi::ScalarValueOp::LoadArgumentsElement,
+                        ) => Some(super::committed_probe::ProbeKind::Arguments { element: true }),
+                        CommittedValueOperation::Scalar(
                             otter_vm::native_abi::ScalarValueOp::BindThisValue,
                         ) => Some(super::committed_probe::ProbeKind::DerivedThis),
                         CommittedValueOperation::ObjectProtocol(

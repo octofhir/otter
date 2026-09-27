@@ -1982,6 +1982,29 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::ArgumentsReadProbe { byte_pc, element } => {
+                let start = ops.offset().0;
+                let key = if element {
+                    Some(integer_register(locations[0])?)
+                } else {
+                    None
+                };
+                let result = integer_register(locations[usize::from(element)])?;
+                let hit = integer_register(locations[usize::from(element) + 1])?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                dynasm!(ops ; .arch aarch64 ; ldr x15, [x19, NATIVE_FRAME_OFFSET]);
+                crate::arm64::arguments::emit(&mut ops, 15, key, miss);
+                dynasm!(ops ; .arch aarch64 ; mov X(result), x16 ; movz W(hit), 1 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, result, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch aarch64 ; movz W(hit), 0 ; =>done);
+                structural_regions.push((
+                    "machineArgumentsReadProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::BinaryNumberProbe { byte_pc, operator } => {
                 let start = ops.offset().0;
                 number_probe::emit(

@@ -470,6 +470,11 @@ fn impl_char_code_at(
     if pos < 0 || pos >= len {
         return Ok(Value::number(NumberValue::Double(f64::NAN)));
     }
+    // Indexing a rope descends it per call; flatten it once, as V8's
+    // `String::Flatten` does, so a scan over a concatenated string is linear.
+    // Flattening allocates, so the receiver is re-read from its rooted slot.
+    recv.flatten_in_place(ctx.heap_mut())?;
+    let recv = receiver_string(ctx, receiver)?;
     let value = match recv.char_code_at(pos as u32, ctx.heap_mut()) {
         Some(unit) => NumberValue::from_i32(i32::from(unit)),
         None => NumberValue::Double(f64::NAN),
@@ -529,6 +534,11 @@ pub(crate) fn fast_primitive_char_code_at(
     let len = i64::from(recv.len());
     if pos < 0 || pos >= len {
         return Some(Value::number(NumberValue::Double(f64::NAN)));
+    }
+    // A rope takes the full native path, which flattens it once; this
+    // copied receiver could not be re-read after that allocation.
+    if !recv.is_contiguous(heap) {
+        return None;
     }
     let value = match recv.char_code_at(pos as u32, heap) {
         Some(unit) => NumberValue::from_i32(i32::from(unit)),

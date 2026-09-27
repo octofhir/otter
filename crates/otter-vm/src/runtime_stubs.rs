@@ -1278,7 +1278,8 @@ pub extern "C" fn string_char_code_at_leaf(
     let (Some(string), Some(index)) = (receiver.as_string(heap), index.as_i32()) else {
         return NativeResultPair::miss();
     };
-    if index < 0 {
+    // A rope must not be descended per index: the full path flattens it once.
+    if index < 0 || !string.is_contiguous(heap) {
         return NativeResultPair::miss();
     }
     let Some(unit) = string.char_code_at(index as u32, heap) else {

@@ -224,18 +224,14 @@ impl Interpreter {
 
     /// Effective activation cursor bound for one outer compiled entry.
     ///
-    /// The physical array provides the hard publication bound. The logical
-    /// bound folds the remaining synchronous re-entry budget into the current
-    /// cursor, including one slot for the outer entry itself. Generated calls
-    /// can therefore use the cursor as their sole recursion counter.
+    /// The physical array provides the hard publication bound; the JS call
+    /// depth budget provides the logical one. Generated frames live on the
+    /// native stack, which linkage bounds separately in bytes, and never
+    /// re-enter Rust, so the synchronous re-entry budget does not apply to
+    /// them. Generated calls use the cursor as their sole recursion counter;
+    /// reaching it means the call is about to exceed the JS depth budget.
     pub fn jit_generated_activation_limit(&self) -> usize {
-        let remaining = self
-            .jit_sync_reentry_limit()
-            .saturating_sub(self.sync_reentry_depth) as usize;
-        self.jit_native_activation_top
-            .saturating_add(1)
-            .saturating_add(remaining)
-            .min(self.jit_native_activations.len())
+        (self.max_stack_depth as usize).min(self.jit_native_activations.len())
     }
 
     /// Unpublish the most recently pushed native JIT activation.

@@ -11,6 +11,8 @@
 //!   retain that sibling with source-owned arguments and native parent publication. Other allocations
 //!   and residual JavaScript calls retain ordinary call linkage. Named-property cold
 //!   calls publish exact inline frames without replaying completed effects.
+//! - A site whose earlier generation failed an identity guard is not spliced
+//!   again; it keeps its generated call.
 //! - Identity guards precede allocation. Constructor parameter guards run after
 //!   successful allocation and reconstruct that same receiver and new.target.
 //!   Body exits rebuild the caller after its call and the exact callee operation.
@@ -97,6 +99,18 @@ fn splice_tree(
                 .ok_or("missing direct-call target")?;
             if exceptional_edge.is_some() {
                 return Err("protected call site".into());
+            }
+            // A spliced body whose identity proof already failed here would
+            // fail it again after every recompile. Like V8 after a wrong-target
+            // deopt, the site keeps its generated call instead.
+            if view
+                .optimized_exit_reasons
+                .get(&logical_pc)
+                .is_some_and(|reasons| {
+                    reasons.contains(&otter_vm::native_abi::ExitReason::IdentityGuard)
+                })
+            {
+                return Err("call target identity exited".into());
             }
             if target.candidates.len() != 1 {
                 return Err("requires one call target".into());
@@ -296,20 +310,27 @@ fn splice_one(
     } else {
         None
     };
+    let rejects_eval_env = callee_view.code_block.observes_eval_env;
     let guard = push(
         hir,
         if method {
-            NumericNode::InlineMethodGuard { source, target }
+            NumericNode::InlineMethodGuard {
+                source,
+                target,
+                rejects_eval_env,
+            }
         } else if construct {
             NumericNode::InlineConstructGuard {
                 source,
                 function_id: body.function_id,
+                rejects_eval_env,
             }
         } else {
             NumericNode::InlineCallGuard {
                 source,
                 function_id: body.function_id,
                 this_mode,
+                rejects_eval_env,
             }
         },
     );
@@ -757,9 +778,11 @@ fn map_body_node(
         InlineConstructGuard {
             source,
             function_id,
+            rejects_eval_env,
         } => InlineConstructGuard {
             source: map(source),
             function_id,
+            rejects_eval_env,
         },
         ConstructReceiver {
             source,
@@ -794,14 +817,21 @@ fn map_body_node(
             source,
             function_id,
             this_mode,
+            rejects_eval_env,
         } => InlineCallGuard {
             source: map(source),
             function_id,
             this_mode,
+            rejects_eval_env,
         },
-        InlineMethodGuard { source, target } => InlineMethodGuard {
+        InlineMethodGuard {
+            source,
+            target,
+            rejects_eval_env,
+        } => InlineMethodGuard {
             source: map(source),
             target,
+            rejects_eval_env,
         },
         PropertyLoad {
             receiver,

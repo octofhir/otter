@@ -563,6 +563,7 @@ impl CodeBlock {
             is_async_generator: false,
             is_derived_constructor: false,
             makes_function: false,
+            observes_eval_env: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Box::new([]),
@@ -1037,6 +1038,13 @@ pub struct CodeBlock {
     /// records the closure (and acquires a cold frame for it) only when this is
     /// set — leaf functions and most callbacks skip it entirely.
     pub(crate) makes_function: bool,
+    /// `true` when this body can observe its closure's direct-eval variable
+    /// environment: it contains a direct eval, creates a function (which
+    /// captures the environment), or resolves a name through the eval chain.
+    /// A body without such an opcode behaves identically whatever
+    /// environment its closure carries, so frameless inlining need not prove
+    /// that environment absent.
+    pub observes_eval_env: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
     /// Arguments object shape requested by the compiler.
@@ -1184,9 +1192,29 @@ impl CodeBlock {
             .code
             .iter()
             .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
+        let observes_eval_env = function.contains_direct_eval
+            || function.code.iter().any(|instr| {
+                matches!(
+                    instr.op,
+                    Op::MakeFunction
+                        | Op::MakeClosure
+                        | Op::Eval
+                        | Op::LoadDynamic
+                        | Op::StoreDynamic
+                        | Op::TypeofDynamic
+                        | Op::DeleteDynamic
+                        | Op::LoadShadowedUpvalue
+                        | Op::LoadShadowedUpvalueSnap
+                        | Op::StoreShadowedUpvalueChecked
+                        | Op::StoreShadowedUpvalueCheckedSnap
+                        | Op::DeleteShadowedUpvalue
+                        | Op::EvalRestoreBinding
+                )
+            });
         Self {
             id: function.id,
             makes_function,
+            observes_eval_env,
             param_count: function.param_count,
             register_count,
             own_upvalue_count: function.own_upvalue_count,

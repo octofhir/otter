@@ -292,8 +292,7 @@ impl NativeFrame {
         }
     }
 
-    /// Publish one nullable direct-eval environment handle in VM tests.
-    #[cfg(test)]
+    /// Publish one nullable direct-eval environment handle.
     pub(crate) fn set_eval_env(&mut self, eval_env: Option<EvalEnvHandle>) {
         self.eval_env = eval_env.unwrap_or_else(EvalEnvHandle::null);
     }

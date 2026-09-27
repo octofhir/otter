@@ -202,18 +202,23 @@ pub(super) enum NumericNode {
     TaggedToInt32(NumericValue),
     This,
     ClassSuperConstructor(NumericValue),
+    /// `rejects_eval_env` on the inline guards: the spliced body can observe
+    /// its closure's dynamic eval environment, so the guard proves it absent.
     InlineMethodGuard {
         source: NumericValue,
         target: u16,
+        rejects_eval_env: bool,
     },
     InlineConstructGuard {
         source: NumericValue,
         function_id: u32,
+        rejects_eval_env: bool,
     },
     InlineCallGuard {
         source: NumericValue,
         function_id: u32,
         this_mode: otter_vm::JitDirectCallThisMode,
+        rejects_eval_env: bool,
     },
     /// Complete nursery receiver, or undefined when no allocation was committed.
     ConstructReceiver {

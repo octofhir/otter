@@ -489,14 +489,24 @@ pub enum MachineCallGuard {
         function_id: u32,
         /// Already-profiled ordinary `this` policy to prove before entry.
         this_mode: otter_vm::JitDirectCallThisMode,
+        /// The spliced body observes its closure's dynamic eval environment,
+        /// so the guard proves that environment absent.
+        rejects_eval_env: bool,
     },
     /// Class-wrapper unwrapping followed by exact constructor identity.
     Construct {
         /// Canonical bytecode constructor identity.
         function_id: u32,
+        /// As for [`MachineCallGuard::Plain`].
+        rejects_eval_env: bool,
     },
     /// Exact receiver/prototype/slot method program.
-    Method(Box<otter_vm::jit::JitMethodGuard>),
+    Method {
+        /// Complete guarded method chain.
+        guard: Box<otter_vm::jit::JitMethodGuard>,
+        /// As for [`MachineCallGuard::Plain`].
+        rejects_eval_env: bool,
+    },
 }
 
 /// Maximum complete guarded method chain accepted by the Machine backend.
@@ -2951,7 +2961,7 @@ impl InstructionSequence {
                         let clobbers = if matches!(
                             instruction.opcode,
                             MachineOpcode::GuardCallTarget {
-                                guard: MachineCallGuard::Method(_),
+                                guard: MachineCallGuard::Method { .. },
                             }
                         ) {
                             TargetClobberSet::InlineMethodGuard

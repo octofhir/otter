@@ -663,7 +663,7 @@ fn try_emit_inline_numeric_method(
         },
         17,
         plan.has_receiver_property().then_some(16),
-        false,
+        !method.body.code_block.observes_eval_env,
         guard_miss,
     )?;
     if plan.has_receiver_property() {
@@ -787,7 +787,13 @@ fn try_emit_inline_numeric_callee(
     };
     let guard_start = ops.offset().0;
     emit_load_reg(ops, 9, callee_register)?;
-    crate::arm64::inline_guard::emit_inline_identity(ops, view, callee.function_id(), bail);
+    crate::arm64::inline_guard::emit_inline_identity(
+        ops,
+        view,
+        callee.function_id(),
+        callee.body.code_block.observes_eval_env,
+        bail,
+    );
 
     let guard_end = ops.offset().0;
     if let Some(code_map) = code_map.as_deref_mut() {

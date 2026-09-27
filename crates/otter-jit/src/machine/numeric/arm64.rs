@@ -1425,7 +1425,11 @@ fn emit_with_reach(
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
             }
             MachineOpcode::GuardCallTarget {
-                guard: MachineCallGuard::Method(ref guard),
+                guard:
+                    MachineCallGuard::Method {
+                        ref guard,
+                        rejects_eval_env,
+                    },
             } => {
                 let start = ops.offset().0;
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
@@ -1438,7 +1442,7 @@ fn emit_with_reach(
                     9,
                     9,
                     None,
-                    false,
+                    !rejects_eval_env,
                     miss,
                 )?;
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
@@ -1449,12 +1453,19 @@ fn emit_with_reach(
                     MachineCallGuard::Plain {
                         function_id,
                         this_mode,
+                        rejects_eval_env,
                     },
             } => {
                 let start = ops.offset().0;
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
+                crate::arm64::inline_guard::emit_inline_identity(
+                    &mut ops,
+                    view,
+                    function_id,
+                    rejects_eval_env,
+                    miss,
+                );
                 crate::arm64::inline_guard::emit_inline_this(
                     &mut ops,
                     view,
@@ -1467,7 +1478,11 @@ fn emit_with_reach(
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
             MachineOpcode::GuardCallTarget {
-                guard: MachineCallGuard::Construct { function_id },
+                guard:
+                    MachineCallGuard::Construct {
+                        function_id,
+                        rejects_eval_env,
+                    },
             } => {
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 let callable = ops.new_dynamic_label();
@@ -1485,7 +1500,13 @@ fn emit_with_reach(
                     ; b.ne =>callable
                     ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
                     ; =>callable);
-                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
+                crate::arm64::inline_guard::emit_inline_identity(
+                    &mut ops,
+                    view,
+                    function_id,
+                    rejects_eval_env,
+                    miss,
+                );
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
             }
             MachineOpcode::ResolveCallThis { this_mode } => {

@@ -400,12 +400,23 @@ pub(super) fn emit(
                 structural_regions.push(("machineBindingJoin", Some(byte_pc), offset, offset));
             }
             MachineOpcode::GuardCallTarget {
-                guard: MachineCallGuard::Method(ref guard),
+                guard:
+                    MachineCallGuard::Method {
+                        ref guard,
+                        rejects_eval_env,
+                    },
             } => {
                 let start = ops.offset().0;
                 let miss = deopt(instruction.deopt_id(), &deopts)?;
                 load_integer(&mut ops, frame, loc[0], 9)?;
-                emit_inline_method_guard(&mut ops, &mut relocations, view, guard, false, miss)?;
+                emit_inline_method_guard(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    guard,
+                    !rejects_eval_env,
+                    miss,
+                )?;
                 store_integer(&mut ops, frame, loc[1], 9)?;
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
@@ -414,18 +425,23 @@ pub(super) fn emit(
                     MachineCallGuard::Plain {
                         function_id,
                         this_mode,
+                        rejects_eval_env,
                     },
             } => {
                 let start = ops.offset().0;
                 let miss = deopt(instruction.deopt_id(), &deopts)?;
                 load_integer(&mut ops, frame, loc[0], 9)?;
-                emit_inline_identity(&mut ops, view, function_id, miss);
+                emit_inline_identity(&mut ops, view, function_id, rejects_eval_env, miss);
                 emit_inline_this(&mut ops, &mut relocations, view, this_mode, miss)?;
                 store_integer(&mut ops, frame, loc[1], 9)?;
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
             MachineOpcode::GuardCallTarget {
-                guard: MachineCallGuard::Construct { function_id },
+                guard:
+                    MachineCallGuard::Construct {
+                        function_id,
+                        rejects_eval_env,
+                    },
             } => {
                 let start = ops.offset().0;
                 let miss = deopt(instruction.deopt_id(), &deopts)?;
@@ -445,7 +461,7 @@ pub(super) fn emit(
                     ; mov r9, [r9 + view.class_constructor_layout.callable_byte as i32]
                     ; =>callable
                 );
-                emit_inline_identity(&mut ops, view, function_id, miss);
+                emit_inline_identity(&mut ops, view, function_id, rejects_eval_env, miss);
                 store_integer(&mut ops, frame, loc[1], 9)?;
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
@@ -4378,6 +4394,7 @@ fn emit_inline_identity(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     function_id: u32,
+    rejects_eval_env: bool,
     miss: DynamicLabel,
 ) {
     let guarded = ops.new_dynamic_label();
@@ -4412,10 +4429,15 @@ fn emit_inline_identity(
         );
         dynasm!(ops ; .arch x64 ; test r8d, r11d ; jnz =>miss);
     }
+    if rejects_eval_env {
+        dynasm!(ops
+            ; .arch x64
+            ; cmp DWORD [r9 + view.closure_call_layout.eval_env_byte as i32], 0
+            ; jne =>miss
+        );
+    }
     dynasm!(ops
         ; .arch x64
-        ; cmp DWORD [r9 + view.closure_call_layout.eval_env_byte as i32], 0
-        ; jne =>miss
         ; cmp DWORD [r9 + view.closure_call_layout.function_id_byte as i32], function_id as i32
         ; jne =>miss
         ; =>guarded

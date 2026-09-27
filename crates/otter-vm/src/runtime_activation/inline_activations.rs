@@ -11,9 +11,10 @@
 //! - Generated hits need no activation records. Only committed cold reentry uses
 //!   this scope, and the operation must normalize JS exceptions before it exits.
 //! - Every publication is removed on normal return, failure, or Rust unwinding.
-//! - Captured handles and this/SELF remain precise moving roots. Direct eval,
-//!   fresh capture cells, and incoming-arguments bodies require richer entry
-//!   recipes and are rejected before effects.
+//! - Captured handles, this/SELF and the closure's eval environment remain
+//!   precise moving roots. Direct eval, fresh capture cells, and
+//!   incoming-arguments bodies require richer entry recipes and are rejected
+//!   before effects.
 //!
 //! # See also
 //! - `crate::native_stack_snapshot` observes the same native activation chain.
@@ -120,17 +121,19 @@ impl RuntimeCall<'_> {
                 .find(|&index| function.instruction_byte_pc(index) == Some(recipe.byte_pc))
                 .and_then(|index| u32::try_from(index).ok())
                 .ok_or(VmError::InvalidOperand)?;
-            let upvalues = if let Some(closure) = entry.closure.as_closure(&vm.gc_heap) {
+            let (upvalues, eval_env) = if let Some(closure) =
+                entry.closure.as_closure(&vm.gc_heap)
+            {
                 let header = closure.call_header(&vm.gc_heap);
-                if closure.function_id() != recipe.function_id
-                    || header.requires_runtime_setup()
-                    || !header.eval_env.is_null()
-                {
+                if closure.function_id() != recipe.function_id || header.requires_runtime_setup() {
                     return Err(VmError::InvalidOperand);
                 }
-                closure.upvalues_snapshot(&vm.gc_heap).into_boxed_slice()
+                (
+                    closure.upvalues_snapshot(&vm.gc_heap).into_boxed_slice(),
+                    closure.eval_env(&vm.gc_heap),
+                )
             } else if entry.closure.as_function_id() == Some(recipe.function_id) {
-                Box::default()
+                (Box::default(), None)
             } else {
                 return Err(VmError::InvalidOperand);
             };
@@ -148,6 +151,7 @@ impl RuntimeCall<'_> {
                 entry.this,
             );
             native.set_new_target(entry.new_target);
+            native.set_eval_env(eval_env);
             if !entry.new_target.is_undefined() && function.is_derived_constructor {
                 native.set_derived_constructor();
             }

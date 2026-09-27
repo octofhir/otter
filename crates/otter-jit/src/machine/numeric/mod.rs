@@ -1084,6 +1084,7 @@ fn select_with_loop_entries(
                 source,
                 function_id,
                 this_mode,
+                rejects_eval_env,
             } = node
             {
                 let guarded = push_value(&mut representations, MachineRepresentation::Tagged);
@@ -1092,6 +1093,7 @@ fn select_with_loop_entries(
                         guard: MachineCallGuard::Plain {
                             function_id,
                             this_mode,
+                            rejects_eval_env,
                         },
                     },
                     vec![
@@ -1848,7 +1850,11 @@ fn select_with_loop_entries(
                         vec![MachineOperand::register_input(tagged), output],
                     )
                 }
-                NumericNode::InlineMethodGuard { source, target } => {
+                NumericNode::InlineMethodGuard {
+                    source,
+                    target,
+                    rejects_eval_env,
+                } => {
                     let invalid = || {
                         super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
                             instructions.len() as u32,
@@ -1869,7 +1875,10 @@ fn select_with_loop_entries(
                     }
                     let mut guard = MachineInstruction::plain(
                         MachineOpcode::GuardCallTarget {
-                            guard: MachineCallGuard::Method(Box::new(program.clone())),
+                            guard: MachineCallGuard::Method {
+                                guard: Box::new(program.clone()),
+                                rejects_eval_env,
+                            },
                         },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),
@@ -1887,10 +1896,14 @@ fn select_with_loop_entries(
                 NumericNode::InlineConstructGuard {
                     source,
                     function_id,
+                    rejects_eval_env,
                 } => {
                     let mut guard = MachineInstruction::plain(
                         MachineOpcode::GuardCallTarget {
-                            guard: MachineCallGuard::Construct { function_id },
+                            guard: MachineCallGuard::Construct {
+                                function_id,
+                                rejects_eval_env,
+                            },
                         },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),

@@ -3238,6 +3238,12 @@ fn binding_guard(
     }
     match target {
         MachineBindingTarget::Cold => dynasm!(ops ; .arch x64 ; jmp =>miss),
+        // The inliner splices closure-upvalue reads only for aarch64.
+        MachineBindingTarget::ClosureUpvalue { .. } => {
+            return Err(Unsupported::OperandShape(
+                "x86 closure upvalue binding target",
+            ));
+        }
         MachineBindingTarget::GlobalThis => {
             dynasm!(ops
                 ; .arch x64

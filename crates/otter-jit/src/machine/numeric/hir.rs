@@ -182,6 +182,10 @@ pub(super) enum NumericBindingTarget {
     GlobalThis,
     /// One stable captured cell in the current native-frame spine.
     Upvalue { index: u32 },
+    /// One captured cell of an explicit closure: an inlined callee reads its
+    /// own upvalues through the closure its call guard proved, since no
+    /// native frame of its own exists.
+    ClosureUpvalue { index: u32, closure: NumericValue },
     /// One VM-baked stable global lexical or object target.
     Global(otter_vm::jit::BindingHitProof),
 }

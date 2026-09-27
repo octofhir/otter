@@ -1207,21 +1207,31 @@ fn select_with_loop_entries(
                 byte_pc,
             } = node
             {
+                let closure = match target {
+                    NumericBindingTarget::ClosureUpvalue { closure, .. } => Some(closure),
+                    _ => None,
+                };
                 let target = machine_binding_target(target);
                 let condition = push_value(&mut representations, MachineRepresentation::Boolean);
                 let owner = push_value(&mut representations, MachineRepresentation::Int64);
                 let storage = push_value(&mut representations, MachineRepresentation::Int64);
+                let mut guard_operands = vec![
+                    MachineOperand::register_output(condition),
+                    MachineOperand::register_output(owner),
+                    MachineOperand::register_output(storage),
+                ];
+                if let Some(closure) = closure {
+                    guard_operands.push(MachineOperand::location_input(machine_value(
+                        &values, closure,
+                    )));
+                }
                 let mut guard = MachineInstruction::plain(
                     MachineOpcode::BindingGuard {
                         byte_pc,
                         semantics,
                         target,
                     },
-                    vec![
-                        MachineOperand::register_output(condition),
-                        MachineOperand::register_output(owner),
-                        MachineOperand::register_output(storage),
-                    ],
+                    guard_operands,
                 );
                 guard.clobbers = binding_guard_clobbers(target_spec);
                 instructions.push(guard);
@@ -3050,6 +3060,9 @@ fn machine_binding_target(target: NumericBindingTarget) -> MachineBindingTarget 
     match target {
         NumericBindingTarget::GlobalThis => MachineBindingTarget::GlobalThis,
         NumericBindingTarget::Upvalue { index } => MachineBindingTarget::Upvalue { index },
+        NumericBindingTarget::ClosureUpvalue { index, .. } => {
+            MachineBindingTarget::ClosureUpvalue { index }
+        }
         NumericBindingTarget::Global(proof) => MachineBindingTarget::Global(proof),
     }
 }

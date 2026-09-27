@@ -737,7 +737,12 @@ fn emit_binding_guard(
     byte_pc: u32,
     locations: &[AllocatedLocation],
 ) -> Result<(), Unsupported> {
-    if locations.len() != 3 + semantics.value_operands().into_iter().flatten().count()
+    let closure_input = usize::from(matches!(
+        target,
+        MachineBindingTarget::ClosureUpvalue { .. }
+    ));
+    if locations.len()
+        != 3 + semantics.value_operands().into_iter().flatten().count() + closure_input
         || !binding_target_matches_semantics(semantics, target)
     {
         return Err(Unsupported::OperandShape("scalar binding guard"));
@@ -786,21 +791,41 @@ fn emit_binding_guard(
                 ; mov X(storage), x14
             );
         }
-        MachineBindingTarget::Upvalue { index } => {
+        MachineBindingTarget::Upvalue { index }
+        | MachineBindingTarget::ClosureUpvalue { index } => {
             if view.cage_base == 0 || index > 4095 {
                 return Err(Unsupported::OperandShape("scalar upvalue binding target"));
             }
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
-                ; ldr w11, [x10, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-                ; cmp w11, index
-                ; b.ls =>miss
-                ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                ; cbz x9, =>miss
-                ; ldr w9, [x9, index * 4]
-                ; cbz w9, =>miss
-            );
+            if matches!(target, MachineBindingTarget::ClosureUpvalue { .. }) {
+                // The call guard proved this tagged value is the inlined
+                // callee's closure; a heap-cell Value carries its full
+                // address, and the call header holds the upvalue spine.
+                emit_load_allocated_tagged(ops, frame, locations[3], 10, 0)?;
+                let count_byte = view.closure_call_layout.upvalue_count_byte;
+                let base_byte = view.closure_call_layout.upvalue_base_byte;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr w11, [x10, count_byte]
+                    ; cmp w11, index
+                    ; b.ls =>miss
+                    ; ldr x9, [x10, base_byte]
+                    ; cbz x9, =>miss
+                    ; ldr w9, [x9, index * 4]
+                    ; cbz w9, =>miss
+                );
+            } else {
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
+                    ; ldr w11, [x10, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+                    ; cmp w11, index
+                    ; b.ls =>miss
+                    ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+                    ; cbz x9, =>miss
+                    ; ldr w9, [x9, index * 4]
+                    ; cbz w9, =>miss
+                );
+            }
             emit_load_symbolic_u64(
                 ops,
                 relocations,

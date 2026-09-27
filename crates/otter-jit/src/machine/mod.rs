@@ -624,6 +624,12 @@ pub enum MachineBindingTarget {
         /// Zero-based stable cell index.
         index: u32,
     },
+    /// One captured cell of the closure the guard's tagged input names: an
+    /// inlined callee's own upvalue.
+    ClosureUpvalue {
+        /// Zero-based cell index in the closure's upvalue spine.
+        index: u32,
+    },
     /// VM-baked global lexical/object proof.
     Global(otter_vm::jit::BindingHitProof),
 }
@@ -658,6 +664,9 @@ fn binding_target_matches_semantics(
             BindingSemantics::Read(BindingRead::Upvalue { .. })
                 | BindingSemantics::Write(BindingWrite::Upvalue { .. }),
             MachineBindingTarget::Upvalue { .. },
+        ) | (
+            BindingSemantics::Read(BindingRead::Upvalue { .. }),
+            MachineBindingTarget::ClosureUpvalue { .. },
         ) | (
             BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
                 | BindingSemantics::Write(
@@ -3032,7 +3041,11 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
                         let expected_inputs =
-                            semantics.value_operands().into_iter().flatten().count();
+                            semantics.value_operands().into_iter().flatten().count()
+                                + usize::from(matches!(
+                                    target,
+                                    MachineBindingTarget::ClosureUpvalue { .. }
+                                ));
                         let valid_outputs = outputs
                             .iter()
                             .zip([
@@ -3119,7 +3132,8 @@ impl InstructionSequence {
                             ) => *writable,
                             MachineBindingTarget::Cold
                             | MachineBindingTarget::GlobalThis
-                            | MachineBindingTarget::Upvalue { .. } => true,
+                            | MachineBindingTarget::Upvalue { .. }
+                            | MachineBindingTarget::ClosureUpvalue { .. } => true,
                         };
                         if !valid_outputs
                             || !valid_inputs

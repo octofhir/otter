@@ -338,10 +338,14 @@ impl TargetSpec {
                     .chain([float(30), float(31)])
                     .collect(),
                 (9..=16).map(integer).collect(),
-                scalar_call,
+                scalar_call.clone(),
                 (9..=16).map(integer).collect(),
-                vec![integer(9)].into_boxed_slice(),
-                [0, 1, 2, 9, 11, 12, 14, 15, 16].map(integer).into(),
+                // The hit addresses its slot through x13 and moves the value
+                // through x9.
+                [9, 13].map(integer).into(),
+                // The barrier's slow path calls the Rust remembered-set helper,
+                // which may clobber every caller-saved register.
+                scalar_call,
                 [9, 13].map(integer).into(),
                 vec![integer(16)].into_boxed_slice(),
                 (9..=15).map(integer).collect(),

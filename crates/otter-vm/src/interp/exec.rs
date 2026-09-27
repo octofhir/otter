@@ -191,11 +191,19 @@ impl Interpreter {
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.gc_heap.mark_phase(&mut noop)?;
-        crate::collections::run_ephemeron_fixpoint(&mut self.gc_heap);
-        let finalization_jobs =
-            crate::weak_refs::process_weak_refs_and_finalizers(&mut self.gc_heap);
-        for job in finalization_jobs {
+        self.gc_heap.collect_full(&mut noop)?;
+        self.enqueue_finalization_cleanup();
+        Ok(())
+    }
+
+    /// Turn finalization cells emptied by any collection since the last
+    /// checkpoint into `FinalizationCallback` microtasks.
+    ///
+    /// Runs at job checkpoints and after explicit collections. The removed
+    /// cells' callbacks and held values move straight into the traced
+    /// microtask queue with no allocation in between.
+    pub(crate) fn enqueue_finalization_cleanup(&mut self) {
+        for job in crate::weak_refs::take_finalization_jobs(&mut self.gc_heap) {
             let mut args = SmallVec::new();
             args.push(job.held_value);
             let async_context = self.async_context();
@@ -209,8 +217,6 @@ impl Interpreter {
                 async_context,
             });
         }
-        self.gc_heap.sweep_phase();
-        Ok(())
     }
 
     /// Link a freshly compiled module into this interpreter's code
@@ -406,6 +412,7 @@ impl Interpreter {
         // microtasks (and those can reject further promises), so loop until both
         // the queue and the tracker are quiescent.
         loop {
+            self.enqueue_finalization_cleanup();
             self.drain_microtask_generations_inner(default_context.clone())?;
             if !self.promise_rejections_need_checkpoint() {
                 return Ok(());

@@ -2951,6 +2951,9 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     // walked by type tag before anything has been allocated into it.
     // `every_allocated_type_tag_is_registered` fails if this list falls
     // behind the types a real build produces.
+    // Every full collection of a VM heap applies JavaScript weak semantics
+    // between strong marking and sweep, whatever triggered it.
+    heap.set_post_mark_processor(crate::weak_refs::post_mark_processor);
     heap.register_host_release::<crate::native_function::NativeFunctionBody>();
     heap.register_sever_restored::<ExoticSlots>();
     heap.register_sever_restored::<crate::array::ArrayExoticSlots>();

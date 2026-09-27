@@ -4,26 +4,31 @@
 //! stores a weak raw handle and never traces it. A
 //! `FinalizationRegistry` traces its cleanup callback and held
 //! values strongly, while targets and unregister tokens remain
-//! weak. Post-mark processing clears dead weak refs and returns
-//! cleanup work for the interpreter to enqueue on the isolate-local
-//! microtask queue.
+//! weak. Both bodies are ephemeron tables, so a scavenge rewrites
+//! moved young targets/tokens in place and nulls dead ones; every
+//! full collection runs [`post_mark_processor`] between marking and
+//! sweep. Emptied finalization cells become cleanup jobs at the
+//! interpreter's next job checkpoint.
 //!
 //! # Contents
 //!
 //! - [`JsWeakRef`] / [`WeakRefBody`] — weak target holder.
 //! - [`JsFinalizationRegistry`] / [`FinalizationRegistryBody`] —
 //!   cleanup callback plus registered cells.
-//! - [`process_weak_refs_and_finalizers`] — VM-side post-mark hook.
+//! - [`post_mark_processor`] — the heap's weak-semantics pass.
+//! - [`take_finalization_jobs`] — cleanup jobs for emptied cells.
 //!
 //! # Invariants
 //!
 //! - Weak targets and unregister tokens are never traced as strong
-//!   edges.
+//!   edges; they are visited only as weak ephemeron keys.
+//! - A null cell target is an empty `[[WeakRefTarget]]`: the cell
+//!   remains removable by `unregister` until its job is taken.
 //! - Cleanup callbacks are not invoked during GC; the interpreter
 //!   enqueues [`crate::microtask::MicrotaskKind::FinalizationCallback`]
-//!   jobs after the raw weak-processing pass.
-//! - A finalized cell is removed before the callback is enqueued, so
-//!   cleanup fires at most once per cell.
+//!   jobs at a job checkpoint.
+//! - A finalized cell is removed when its job is created, so cleanup
+//!   fires at most once per cell.
 //!
 //! # See also
 //!
@@ -59,7 +64,7 @@ pub type JsFinalizationRegistry = otter_gc::Gc<FinalizationRegistryBody>;
 /// GC-allocated payload backing every [`JsWeakRef`].
 ///
 /// The target is weak by spec and is cleared by
-/// [`process_weak_refs_and_finalizers`] after marking, so the derive
+/// [`post_mark_processor`] after marking, so the derive
 /// skips it deliberately.
 #[derive(Debug, Clone, otter_macros::Pelt)]
 #[pelt(tag = WEAK_REF_BODY_TYPE_TAG, ephemeron_via = weak_ref_ephemeron_walk)]
@@ -103,6 +108,26 @@ impl otter_gc::trace::SeverRestoredPayload for FinalizationRegistryBody {
     }
 }
 
+/// Expose every cell target and unregister token as a weak key slot.
+///
+/// Registries are registered as ephemeron tables so a scavenge rewrites a
+/// moved young target or token in place and nulls a dead one. A null target
+/// is the specification's empty `[[WeakRefTarget]]`: cleanup work is due.
+fn finalization_registry_ephemeron_walk(
+    body: &mut FinalizationRegistryBody,
+    visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
+) {
+    let mut visit_no_values = |_slot_visitor: &mut otter_gc::raw::SlotVisitor<'_>| {};
+    for cell in &mut body.cells {
+        if !cell.target.is_null() {
+            visitor(&mut cell.target as *mut RawGc, &mut visit_no_values);
+        }
+        if let Some(token) = &mut cell.unregister_token {
+            visitor(token as *mut RawGc, &mut visit_no_values);
+        }
+    }
+}
+
 fn weak_ref_ephemeron_walk(
     body: &mut WeakRefBody,
     visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
@@ -139,7 +164,10 @@ impl crate::pelt::PeltField for FinalizerCell {
 
 /// GC-allocated payload backing every [`JsFinalizationRegistry`].
 #[derive(Debug, Clone, otter_macros::Pelt)]
-#[pelt(tag = FINALIZATION_REGISTRY_BODY_TYPE_TAG)]
+#[pelt(
+    tag = FINALIZATION_REGISTRY_BODY_TYPE_TAG,
+    ephemeron_via = finalization_registry_ephemeron_walk
+)]
 pub struct FinalizationRegistryBody {
     cleanup_callback: Value,
     #[pelt(skip)]
@@ -183,10 +211,14 @@ pub(crate) fn alloc_weak_ref_with_roots(
     target: &Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsWeakRef, crate::VmError> {
-    weak_target_raw(target)?;
+    // The allocation can move a young target. Root a mutable local copy and
+    // read the target back from it: rewriting the caller's `&Value` through a
+    // shared reference would leave the compiler free to reuse the stale bits.
+    let mut target = *target;
+    weak_target_raw(&target)?;
     let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
-        target.trace_value_slots(visitor);
+        target.trace_value_slot_mut(visitor);
     };
     let weak_ref = heap.alloc_with_roots(
         WeakRefBody {
@@ -195,7 +227,7 @@ pub(crate) fn alloc_weak_ref_with_roots(
         },
         &mut allocation_roots,
     )?;
-    let target = weak_target_raw(target)?;
+    let target = weak_target_raw(&target)?;
     heap.with_payload(weak_ref, |body| {
         body.target = target;
     });
@@ -263,10 +295,10 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     if !is_callable(&cleanup_callback) {
         return Err(crate::VmError::NotCallable);
     }
-    let cleanup_callback_root = cleanup_callback;
+    // `cleanup_callback` moves into the pending payload, which the allocator
+    // traces as a moving root until the body is installed.
     let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
-        cleanup_callback_root.trace_value_slots(visitor);
     };
     let registry = heap.alloc_with_roots(
         FinalizationRegistryBody {
@@ -277,6 +309,7 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
         },
         &mut allocation_roots,
     )?;
+    heap.register_ephemeron_table(registry);
     heap.register_finalization_registry(registry);
     Ok(registry)
 }
@@ -297,6 +330,7 @@ pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
         cells: Vec::new(),
         prototype_override: None,
     })?;
+    heap.register_ephemeron_table(registry);
     heap.register_finalization_registry(registry);
     heap.record_write(registry, &barrier_cleanup_callback);
     Ok(registry)
@@ -388,14 +422,20 @@ pub fn finalization_registry_cell_count(
     heap.read_payload(registry, |body| body.cells.len())
 }
 
-/// Process weak references and finalizer cells after ordinary mark
-/// and ephemeron fixpoint, before raw heap sweep.
-#[must_use]
-pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<FinalizationJob> {
+/// Weak-semantics pass installed on every VM heap.
+///
+/// Runs after strong marking and before sweep in every full collection:
+/// the WeakMap ephemeron fixpoint, then clearing of `WeakRef` targets and of
+/// finalization-cell targets and unregister tokens that were not marked.
+/// A cleared cell target is the specification's empty `[[WeakRefTarget]]`;
+/// the cell stays in its registry (so `unregister` can still remove it) until
+/// [`take_finalization_jobs`] turns it into a cleanup job. No allocation and
+/// no JavaScript run here.
+pub fn post_mark_processor(heap: &mut otter_gc::GcHeap) {
+    crate::collections::run_ephemeron_fixpoint(heap);
     if heap.weak_finalization_registry_is_empty() {
-        return Vec::new();
+        return;
     }
-
     for raw in heap.weak_refs_snapshot() {
         if !heap.is_marked(raw) || heap.raw_type_tag(raw) != Some(WEAK_REF_BODY_TYPE_TAG) {
             continue;
@@ -410,12 +450,9 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
             });
         }
     }
-
     if !heap.has_finalization_registries() {
-        return Vec::new();
+        return;
     }
-
-    let mut jobs = Vec::new();
     for raw in heap.finalization_registries_snapshot() {
         if !heap.is_marked(raw)
             || heap.raw_type_tag(raw) != Some(FINALIZATION_REGISTRY_BODY_TYPE_TAG)
@@ -425,32 +462,74 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
         let Some(registry) = heap.cast_raw_if_type::<FinalizationRegistryBody>(raw) else {
             continue;
         };
-        let dead_targets: std::collections::HashSet<_> = heap.read_payload(registry, |body| {
-            body.cells
+        let (dead_targets, dead_tokens) = heap.read_payload(registry, |body| {
+            let targets: Vec<usize> = body
+                .cells
                 .iter()
-                .map(|cell| cell.target)
-                .filter(|target| !target.is_null() && !heap.is_marked(*target))
-                .collect()
+                .enumerate()
+                .filter(|(_, cell)| !cell.target.is_null() && !heap.is_marked(cell.target))
+                .map(|(index, _)| index)
+                .collect();
+            let tokens: Vec<usize> = body
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| cell.unregister_token.is_some_and(|t| !heap.is_marked(t)))
+                .map(|(index, _)| index)
+                .collect();
+            (targets, tokens)
         });
-        if dead_targets.is_empty() {
+        if dead_targets.is_empty() && dead_tokens.is_empty() {
+            continue;
+        }
+        heap.with_payload(registry, |body| {
+            for index in dead_targets {
+                body.cells[index].target = RawGc::NULL;
+            }
+            for index in dead_tokens {
+                body.cells[index].unregister_token = None;
+            }
+        });
+    }
+}
+
+/// Remove every finalization cell whose target was collected and return one
+/// cleanup job per cell (ECMA-262 CleanupFinalizationRegistry).
+///
+/// Cheap unless a collection ran since the last call while registries exist.
+/// The caller enqueues the jobs before any allocation, so their values stay
+/// reachable: until then they are the removed cells' own contents.
+#[must_use]
+pub fn take_finalization_jobs(heap: &mut otter_gc::GcHeap) -> Vec<FinalizationJob> {
+    if !heap.take_weak_cleanup_due() {
+        return Vec::new();
+    }
+    let mut jobs = Vec::new();
+    for raw in heap.finalization_registries_snapshot() {
+        if heap.raw_type_tag(raw) != Some(FINALIZATION_REGISTRY_BODY_TYPE_TAG) {
+            continue;
+        }
+        let Some(registry) = heap.cast_raw_if_type::<FinalizationRegistryBody>(raw) else {
+            continue;
+        };
+        if !heap.read_payload(registry, |body| body.cells.iter().any(|c| c.target.is_null())) {
             continue;
         }
         heap.with_payload(registry, |body| {
             let cleanup_callback = body.cleanup_callback;
             let cleanup_context = body.cleanup_context.clone();
-            let mut retained = Vec::with_capacity(body.cells.len());
-            for cell in body.cells.drain(..) {
-                if dead_targets.contains(&cell.target) {
+            body.cells.retain(|cell| {
+                if cell.target.is_null() {
                     jobs.push(FinalizationJob {
                         cleanup_callback,
                         context: cleanup_context.clone(),
                         held_value: cell.held_value,
                     });
+                    false
                 } else {
-                    retained.push(cell);
+                    true
                 }
-            }
-            body.cells = retained;
+            });
         });
     }
     jobs

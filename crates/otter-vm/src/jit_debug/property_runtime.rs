@@ -32,6 +32,8 @@ pub enum JitPropertyStorePath {
     InstallExisting,
     /// A new add-property recipe was captured.
     InstallTransition,
+    /// A megamorphic site replayed a shared add-property transition.
+    SharedTransition,
     /// Uncached ordinary data assignment, including saturated sites.
     UncachedData,
 }

@@ -344,6 +344,8 @@ mod tests {
             parameter_count: 1,
             register_count: 2,
             arithmetic_op_count: 1,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
             blocks: vec![NumericBlock {
                 logical_pc: 0,
                 osr_entry_allowed: false,

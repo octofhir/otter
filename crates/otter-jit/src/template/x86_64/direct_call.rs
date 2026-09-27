@@ -647,7 +647,7 @@ fn emit_construct_with_arguments(
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r14
-        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
+        ; mov QWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
     initialize_inherited_state(ops, view, target);
     if target.plan.own_upvalue_count != 0 {
@@ -999,7 +999,7 @@ fn emit_candidate(
     dynasm!(ops
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r11
-        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
+        ; mov QWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
     initialize_inherited_state(ops, view, target);
     if target.plan.own_upvalue_count != 0 {
@@ -1299,7 +1299,7 @@ fn initialize_frame(ops: &mut Assembler, target: &otter_vm::JitDirectCallee, lay
         ; mov [rsp + 8], eax
         ; lea rax, [rsp + layout.register_base as i32]
         ; mov [rsp + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], rax
-        ; mov DWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32
+        ; mov QWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32
     );
     emit_load_u64(ops, 11, VALUE_UNDEFINED);
     for index in 0..u32::from(target.plan.register_count) {

@@ -977,6 +977,13 @@ pub enum MachineOpcode {
         /// The generic operator the committed site completes.
         operator: otter_vm::native_abi::BinaryOperator,
     },
+    /// Read an unmaterialized native arguments window without a runtime call.
+    ArgumentsReadProbe {
+        /// Source bytecode position.
+        byte_pc: u32,
+        /// One tagged key input when true; no input for the length query.
+        element: bool,
+    },
     /// Invert canonical Boolean bits.
     BooleanNot,
     /// Compare one tagged value with a statically known `null` or `undefined`.
@@ -3016,9 +3023,14 @@ impl InstructionSequence {
                     MachineOpcode::TruthinessProbe
                     | MachineOpcode::LooseEqualityProbe { .. }
                     | MachineOpcode::InstanceofProbe { .. }
-                    | MachineOpcode::BinaryNumberProbe { .. } => {
+                    | MachineOpcode::BinaryNumberProbe { .. }
+                    | MachineOpcode::ArgumentsReadProbe { .. } => {
                         let (input_count, result_type) =
-                            if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {
+                            if let MachineOpcode::ArgumentsReadProbe { element, .. } =
+                                instruction.opcode
+                            {
+                                (usize::from(element), MachineRepresentation::Tagged)
+                            } else if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {
                                 (1, MachineRepresentation::Boolean)
                             } else {
                                 (2, MachineRepresentation::Tagged)
@@ -3050,6 +3062,9 @@ impl InstructionSequence {
                         if !valid
                             || instruction.clobbers
                                 != match instruction.opcode {
+                                    MachineOpcode::ArgumentsReadProbe { .. } => {
+                                        target_spec.clobbers(TargetClobberSet::ArgumentsProbe)
+                                    }
                                     MachineOpcode::BinaryNumberProbe { .. } => {
                                         target_spec.clobbers(TargetClobberSet::NumberProbe)
                                     }

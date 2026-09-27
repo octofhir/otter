@@ -171,6 +171,10 @@ pub enum ScalarValueOp {
     ArrayLength,
     /// Read one string's UTF-16 code-unit length.
     LoadLength,
+    /// Read the activation's implicit arguments length.
+    LoadArgumentsLength,
+    /// Read an actual index or materialize for observable property semantics.
+    LoadArgumentsElement,
     /// Capture an explicit throw origin before native frames unwind.
     PrepareThrow,
     /// Intrinsic Error allocation with observable message coercion.
@@ -198,6 +202,8 @@ impl ScalarValueOp {
             Op::IsArray => Ok(Self::IsArray),
             Op::ArrayLength => Ok(Self::ArrayLength),
             Op::LoadLength => Ok(Self::LoadLength),
+            Op::LoadArgumentsLength => Ok(Self::LoadArgumentsLength),
+            Op::LoadArgumentsElement => Ok(Self::LoadArgumentsElement),
             Op::Throw => Ok(Self::PrepareThrow),
             Op::NewError => Ok(Self::NewError),
             Op::NewBuiltinError => Ok(Self::NewBuiltinError),
@@ -359,6 +365,8 @@ impl Interpreter {
 
         result = match operation {
             ScalarValueOp::BindThisValue
+            | ScalarValueOp::LoadArgumentsLength
+            | ScalarValueOp::LoadArgumentsElement
             | ScalarValueOp::NewError
             | ScalarValueOp::NewBuiltinError
             | ScalarValueOp::PrepareThrow
@@ -506,6 +514,16 @@ impl RuntimeCall<'_> {
             .published_opcode()
             .map_err(CommittedValueError::Fatal)?;
         let operation = ScalarValueOp::from_opcode(opcode).map_err(CommittedValueError::Fatal)?;
+        if matches!(
+            operation,
+            ScalarValueOp::LoadArgumentsLength | ScalarValueOp::LoadArgumentsElement
+        ) {
+            return self
+                .arguments_value(
+                    (operation == ScalarValueOp::LoadArgumentsElement).then_some(value0),
+                )
+                .map_err(CommittedValueError::JavaScript);
+        }
         if operation == ScalarValueOp::BindThisValue {
             self.bind_derived_this_value(value0)?;
             return Ok(value0);

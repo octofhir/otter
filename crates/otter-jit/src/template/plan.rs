@@ -1647,7 +1647,8 @@ impl TemplatePlan {
                 | Op::TypeOf
                 | Op::IsArray
                 | Op::ArrayLength
-                | Op::LoadLength => {
+                | Op::LoadLength
+                | Op::LoadArgumentsElement => {
                     let operands = lowered.unary_operands()?;
                     let operation = match lowered.op {
                         Op::ToObject => ScalarValueOp::ToObject,
@@ -1656,6 +1657,7 @@ impl TemplatePlan {
                         Op::IsArray => ScalarValueOp::IsArray,
                         Op::ArrayLength => ScalarValueOp::ArrayLength,
                         Op::LoadLength => ScalarValueOp::LoadLength,
+                        Op::LoadArgumentsElement => ScalarValueOp::LoadArgumentsElement,
                         _ => unreachable!("scalar unary opcode group"),
                     };
                     TemplateOp::ScalarValue {
@@ -1665,10 +1667,14 @@ impl TemplatePlan {
                         value1: None,
                     }
                 }
-                Op::LoadNewTarget => {
+                Op::LoadNewTarget | Op::LoadArgumentsLength => {
                     let dst = lowered.destination_operands()?.dst;
                     TemplateOp::ScalarValue {
-                        operation: ScalarValueOp::LoadNewTarget,
+                        operation: if lowered.op == Op::LoadNewTarget {
+                            ScalarValueOp::LoadNewTarget
+                        } else {
+                            ScalarValueOp::LoadArgumentsLength
+                        },
                         result: dst,
                         value0: None,
                         value1: None,

@@ -441,6 +441,32 @@ impl Interpreter {
         materialized_frame_index: Option<usize>,
         dst: u16,
     ) -> Result<(), VmError> {
+        let value =
+            self.jit_materialize_arguments(context, stack, frame, materialized_frame_index)?;
+        frame.write(dst, value)
+    }
+
+    pub(crate) fn jit_materialize_arguments(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        frame: &mut crate::ActiveFrameMut<'_>,
+        materialized_frame_index: Option<usize>,
+    ) -> Result<Value, VmError> {
+        let existing = frame
+            .as_ref()
+            .native_arguments_object()
+            .map(Value::object)
+            .or_else(|| {
+                materialized_frame_index
+                    .and_then(|index| stack.get(index))
+                    .and_then(|frame| self.frame_cold(frame))
+                    .and_then(|cold| cold.arguments_object)
+            });
+        if let Some(value) = existing {
+            frame.set_native_arguments_object(value.as_object().ok_or(VmError::InvalidOperand)?)?;
+            return Ok(value);
+        }
         let function = context
             .exec_function(frame.function_id())
             .ok_or(VmError::InvalidOperand)?;
@@ -463,7 +489,12 @@ impl Interpreter {
         let callee = frame.self_value();
         let kind = function.arguments_object_kind;
         let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
-        frame.write(dst, value)
+        frame.set_native_arguments_object(value.as_object().ok_or(VmError::InvalidOperand)?)?;
+        if let Some(index) = materialized_frame_index {
+            self.frame_ensure_cold(stack.get_mut(index).ok_or(VmError::InvalidOperand)?)
+                .arguments_object = Some(value);
+        }
+        Ok(value)
     }
 
     /// Parameter bindings that alias the arguments object's indexed entries,
@@ -514,35 +545,7 @@ impl Interpreter {
         }
 
         let collect = |interp: &mut Self| {
-            // The typed intrinsic slot resolves `%Array.prototype%` without
-            // walking the global object; the chain below only serves embedders
-            // whose bootstrap omitted Array.
-            let iterator_method = interp
-                .realm_intrinsics
-                .array_prototype()
-                .or_else(|| {
-                    crate::object::get(interp.global_this, &interp.gc_heap, "Array")
-                        .and_then(|value| {
-                            if let Some(ctor) = value.as_object() {
-                                crate::object::get(ctor, &interp.gc_heap, "prototype")
-                            } else if let Some(native) = value.as_native_function() {
-                                native
-                                    .own_property_descriptor(&mut interp.gc_heap, "prototype")
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|descriptor| match descriptor.kind {
-                                        crate::object::DescriptorKind::Data { value } => {
-                                            Some(value)
-                                        }
-                                        _ => None,
-                                    })
-                            } else {
-                                None
-                            }
-                        })
-                        .and_then(|value| value.as_object())
-                })
-                .and_then(|prototype| crate::object::get(prototype, &interp.gc_heap, "values"));
+            let iterator_method = interp.realm_intrinsics.array_values();
             let iterator_symbol = interp
                 .well_known_symbols
                 .get(crate::symbol::WellKnown::Iterator);

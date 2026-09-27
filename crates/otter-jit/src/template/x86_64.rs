@@ -1198,20 +1198,39 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch x64 ; jmp =>committed_throw);
             }
             TemplateOp::ScalarValue {
+                operation,
                 result,
                 value0,
                 value1,
-                ..
-            } => emit_scalar_value(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                result,
-                value0,
-                value1,
-                committed_throw,
-                fatal,
-            ),
+            } => {
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if matches!(
+                    operation,
+                    abi::ScalarValueOp::LoadArgumentsLength
+                        | abi::ScalarValueOp::LoadArgumentsElement
+                ) {
+                    if let Some(src) = value0 {
+                        emit_load_reg(&mut ops, 9, src);
+                    }
+                    dynasm!(ops ; .arch x64 ; mov r11, r14);
+                    crate::x86_64::arguments::emit(&mut ops, value0.map(|_| 9), slow);
+                    emit_store_reg(&mut ops, 8, result);
+                    dynasm!(ops ; .arch x64 ; jmp =>done);
+                }
+                dynasm!(ops ; .arch x64 ; =>slow);
+                emit_scalar_value(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    result,
+                    value0,
+                    value1,
+                    committed_throw,
+                    fatal,
+                );
+                dynasm!(ops ; .arch x64 ; =>done);
+            }
             TemplateOp::TdzError { local_index } => exceptions::emit_exception_op(
                 &mut ops,
                 &mut relocations,

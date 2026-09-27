@@ -1,5 +1,8 @@
 //! Typed per-realm intrinsic slots.
 //!
+//! The original `%Array.prototype.values%` callable is also retained for
+//! arguments creation, which must never consult a mutable prototype property.
+//!
 //! Boa-style typed registry: every well-known **prototype** that the
 //! dispatch path looks up by name gets a dedicated slot. Bootstrap
 //! runs once and caches the resolved handles; runtime lookups read
@@ -240,12 +243,14 @@ impl Intrinsic {
 #[derive(Debug, Clone)]
 pub(crate) struct RealmIntrinsics {
     slots: [JsObject; Intrinsic::COUNT],
+    array_values: crate::native_function::NativeFunction,
 }
 
 impl Default for RealmIntrinsics {
     fn default() -> Self {
         Self {
             slots: [JsObject::null(); Intrinsic::COUNT],
+            array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
         }
     }
 }
@@ -279,6 +284,12 @@ intrinsic_accessors! {
 }
 
 impl RealmIntrinsics {
+    /// Original `%Array.prototype.values%`, independent of mutable properties.
+    pub(crate) fn array_values(&self) -> Option<crate::Value> {
+        (!self.array_values.raw().is_null())
+            .then(|| crate::Value::native_function(self.array_values))
+    }
+
     /// Read one slot, mapping the null handle to `None`.
     #[must_use]
     pub(crate) fn get(&self, slot: Intrinsic) -> Option<JsObject> {
@@ -294,6 +305,13 @@ impl RealmIntrinsics {
             self.slots[slot as usize] = resolve_prototype(global, heap, slot.constructor_name())
                 .unwrap_or_else(JsObject::null);
         }
+        self.array_values = self
+            .array_prototype()
+            .and_then(|prototype| object::get(prototype, heap, "values"))
+            .and_then(|value| value.as_native_function())
+            .unwrap_or_else(|| {
+                crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+            });
     }
 
     /// Visit every slot address, filled or not.
@@ -307,6 +325,7 @@ impl RealmIntrinsics {
             let p = handle as *const JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
+        self.array_values.trace_gc_roots(visitor);
     }
 
     /// Trace cached prototype handles as root slots.
@@ -316,12 +335,15 @@ impl RealmIntrinsics {
                 handle.trace_gc_roots(visitor);
             }
         }
+        if !self.array_values.raw().is_null() {
+            self.array_values.trace_gc_roots(visitor);
+        }
     }
 
     /// All slots empty?
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.iter().all(|handle| handle.is_null())
+        self.slots.iter().all(|handle| handle.is_null()) && self.array_values.raw().is_null()
     }
 }
 
@@ -370,7 +392,7 @@ mod tests {
         empty.visit_slots(&mut |_| visited += 1);
         assert_eq!(
             visited,
-            Intrinsic::COUNT,
+            Intrinsic::COUNT + 1,
             "a fixed-shape walk must not depend on which slots are filled"
         );
         let mut traced = 0usize;

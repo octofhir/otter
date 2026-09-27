@@ -112,6 +112,12 @@ fn committed_value_operation(op: Op, derived_constructor: bool) -> Option<Commit
         Op::ToPropertyKey => CommittedValueOperation::Scalar(ScalarValueOp::ToPropertyKey),
         Op::TypeOf => CommittedValueOperation::Scalar(ScalarValueOp::TypeOf),
         Op::LoadNewTarget => CommittedValueOperation::Scalar(ScalarValueOp::LoadNewTarget),
+        Op::LoadArgumentsLength => {
+            CommittedValueOperation::Scalar(ScalarValueOp::LoadArgumentsLength)
+        }
+        Op::LoadArgumentsElement => {
+            CommittedValueOperation::Scalar(ScalarValueOp::LoadArgumentsElement)
+        }
         Op::SameValue => CommittedValueOperation::Scalar(ScalarValueOp::SameValue),
         Op::BindThisValue => CommittedValueOperation::Scalar(ScalarValueOp::BindThisValue),
         Op::MakeClosure => CommittedValueOperation::Scalar(ScalarValueOp::MakeClosure),

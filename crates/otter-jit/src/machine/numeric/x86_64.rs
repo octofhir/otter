@@ -749,6 +749,25 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::ArgumentsReadProbe { byte_pc, element } => {
+                let start = ops.offset().0;
+                let key = if element { Some(ireg(loc[0])?) } else { None };
+                let result = ireg(loc[usize::from(element)])?;
+                let hit = ireg(loc[usize::from(element) + 1])?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                dynasm!(ops ; .arch x64 ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]);
+                crate::x86_64::arguments::emit(&mut ops, key, miss);
+                dynasm!(ops ; .arch x64 ; mov Rq(result), r8 ; mov Rd(hit), 1 ; jmp =>done ; =>miss);
+                load64(&mut ops, result, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; xor Rd(hit), Rd(hit) ; =>done);
+                structural_regions.push((
+                    "machineArgumentsReadProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::BinaryNumberProbe { byte_pc, operator } => {
                 let start = ops.offset().0;
                 number_probe::emit(

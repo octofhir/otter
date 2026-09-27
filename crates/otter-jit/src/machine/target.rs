@@ -81,6 +81,8 @@ pub enum TargetClobberSet {
     /// Inline ECMAScript ToInt32 of a Float64. AArch64 converts in place with
     /// intra-procedure scratch; x86-64 calls the leaf for out-of-range inputs.
     FloatToInt32,
+    /// Native arguments-window probe scratch.
+    ArgumentsProbe,
 }
 
 /// Target legalization features admitted by neutral instruction selection.
@@ -291,7 +293,7 @@ pub struct TargetSpec {
     registers: TargetRegisterFile,
     calls: TargetCallConvention,
     frame: TargetFrameSpec,
-    clobbers: [Box<[PhysicalRegister]>; 19],
+    clobbers: [Box<[PhysicalRegister]>; 20],
     capabilities: [bool; 4],
 }
 
@@ -361,6 +363,7 @@ impl TargetSpec {
                 Box::new([]),
                 scalar_call_direct,
                 vec![integer(16)].into_boxed_slice(),
+                [9, 10, 15, 16, 17].map(integer).into(),
             ],
             capabilities: [true; 4],
         }
@@ -417,6 +420,8 @@ impl TargetSpec {
                         .into_iter()
                         .chain([float(14), float(15)])
                         .collect()
+                } else if set == TargetClobberSet::ArgumentsProbe as usize {
+                    [8, 9, 10, 11].map(integer).into()
                 } else if set == TargetClobberSet::NumberProbe as usize {
                     // r11 and xmm15 are the reserved scratch pair; the probe
                     // additionally holds one decoded operand in xmm14.

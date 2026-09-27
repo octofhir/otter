@@ -369,6 +369,17 @@ impl<'a> ActiveFrameRef<'a> {
         }
     }
 
+    /// Native cache identity, when this view owns a native arguments slot.
+    pub(crate) fn native_arguments_object(&self) -> Option<crate::object::JsObject> {
+        match &self.inner {
+            ActiveFrameRefInner::Materialized { .. } => None,
+            // SAFETY: one scalar read of a published collector-traced slot.
+            ActiveFrameRefInner::Native(native) => unsafe {
+                native.frame.as_ref().arguments_object()
+            },
+        }
+    }
+
     /// Read one published actual argument.
     pub fn incoming_argument(&self, index: usize) -> Result<Value, VmError> {
         match &self.inner {
@@ -514,9 +525,13 @@ impl<'a> ActiveFrameRef<'a> {
                     let slot = unsafe { native.upvalues.base.as_ptr().add(index) };
                     visitor(slot.cast::<RawGc>());
                 }
-                // The nullable compressed eval-environment field is a real
-                // frame-owned GC slot. Visit and rewrite the field itself so
-                // generated closures never retain a pre-move handle.
+                // Both nullable compressed handles are frame-owned root slots.
+                // Rewrite the fields themselves so later generated operations
+                // observe the moved arguments object and eval environment.
+                let arguments = unsafe { std::ptr::addr_of_mut!((*frame).arguments_object) };
+                if !unsafe { (*arguments).is_null() } {
+                    visitor(arguments.cast::<RawGc>());
+                }
                 let eval_env = unsafe { std::ptr::addr_of_mut!((*frame).eval_env) };
                 if !unsafe { (*eval_env).is_null() } {
                     visitor(eval_env.cast::<RawGc>());
@@ -663,6 +678,21 @@ impl<'a> ActiveFrameMut<'a> {
     /// Read one published actual argument.
     pub fn incoming_argument(&self, index: usize) -> Result<Value, VmError> {
         self.as_ref().incoming_argument(index)
+    }
+
+    /// Publish the single arguments identity of a native activation.
+    pub(crate) fn set_native_arguments_object(
+        &mut self,
+        object: crate::object::JsObject,
+    ) -> Result<(), VmError> {
+        match &mut self.inner {
+            // SAFETY: one non-allocating write under logical mutator ownership.
+            ActiveFrameMutInner::Native(native) => unsafe {
+                native.frame.as_mut().set_arguments_object(Some(object));
+                Ok(())
+            },
+            ActiveFrameMutInner::Materialized { .. } => Err(VmError::InvalidOperand),
+        }
     }
 
     /// Write one actual-argument slot in an initialized native window.
@@ -1081,6 +1111,32 @@ mod tests {
             active.write(1, Value::undefined()),
             Err(VmError::InvalidOperand)
         ));
+    }
+
+    #[test]
+    fn native_arguments_cache_is_rewritten_in_place() {
+        let mut slots = [Value::undefined()];
+        let mut native = NativeFrame::new(
+            header(1),
+            slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        // SAFETY: synthetic offsets are only compared/rewritten, never dereferenced.
+        let before = unsafe { crate::object::JsObject::from_offset(0x1000) };
+        let after = unsafe { crate::object::JsObject::from_offset(0x2000) };
+        native.set_arguments_object(Some(before));
+        // SAFETY: the frame and initialized window remain live throughout tracing.
+        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
+        let mut rewrites = 0;
+        active.trace_non_register_slots(&mut |slot| unsafe {
+            if (*slot).0 == before.offset() {
+                slot.write(after.raw());
+                rewrites += 1;
+            }
+        });
+        assert_eq!(rewrites, 1);
+        assert_eq!(native.arguments_object(), Some(after));
     }
 
     #[test]

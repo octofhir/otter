@@ -374,6 +374,20 @@ impl RuntimeCall<'_> {
         vm.allocate_array_literal_value(elements.iter().copied())
     }
 
+    /// Read one compiler-proven activation-local arguments property.
+    pub fn arguments_value(&mut self, key: Option<Value>) -> Result<Value, VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        // SAFETY: RuntimeCall retains the validated published native descriptor.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        let materialized = match self.identity {
+            RuntimeFrameIdentity::Materialized(index) => Some(index),
+            RuntimeFrameIdentity::StackOwned => None,
+        };
+        vm.jit_read_arguments(&self.context, stack, &mut frame, materialized, key)
+    }
+
     /// Build the activation's `arguments` object and commit it to `dst`.
     ///
     /// The actual arguments come from the published incoming-argument window

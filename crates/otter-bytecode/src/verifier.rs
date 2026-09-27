@@ -317,6 +317,13 @@ fn translate_verified_function_id(
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BytecodeVerifyError {
+    /// Activation-window arguments reads require an unsuspended zero-formal function.
+    ArgumentsReadMetadata {
+        /// Owning function table index.
+        function_index: usize,
+        /// Logical instruction PC.
+        instruction_pc: usize,
+    },
     /// A module must contain `<main>` at function index zero.
     EmptyFunctionTable,
     /// Function count or its rebased end does not fit the u32 id space.
@@ -598,6 +605,13 @@ pub enum BytecodeVerifyError {
 impl std::fmt::Display for BytecodeVerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ArgumentsReadMetadata {
+                function_index,
+                instruction_pc,
+            } => write!(
+                f,
+                "function {function_index} instruction {instruction_pc} arguments read requires zero formals, arguments metadata, and no rest, eval or suspension"
+            ),
             Self::EmptyFunctionTable => write!(f, "bytecode module has no <main> function"),
             Self::FunctionRangeOverflow {
                 base,
@@ -1077,6 +1091,22 @@ fn verify_function(
     }
 
     for (instruction_pc, instruction) in function.code.iter().enumerate() {
+        if matches!(
+            instruction.op,
+            Op::LoadArgumentsLength | Op::LoadArgumentsElement
+        ) && (!function.needs_arguments
+            || function.param_count != 0
+            || function.has_rest
+            || function.contains_direct_eval
+            || function.is_async
+            || function.is_generator
+            || function.is_async_generator)
+        {
+            return Err(BytecodeVerifyError::ArgumentsReadMetadata {
+                function_index,
+                instruction_pc,
+            });
+        }
         verify_immediate_right_operands(
             function_index,
             instruction_pc,
@@ -1477,6 +1507,31 @@ mod tests {
     fn verified_carrier_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<VerifiedBytecodeModule>();
+    }
+
+    #[test]
+    fn arguments_reads_require_activation_metadata() {
+        for op in [Op::LoadArgumentsLength, Op::LoadArgumentsElement] {
+            let mut code = FunctionCodeBuilder::new();
+            let operands = [Operand::Register(0), Operand::Register(1)];
+            code.push(
+                op,
+                &operands[..if op == Op::LoadArgumentsLength { 1 } else { 2 }],
+            );
+            code.push(Op::ReturnUndefined, &[]);
+            let mut module = module_with(code.finish());
+            assert!(matches!(
+                verify_module(&module),
+                Err(BytecodeVerifyError::ArgumentsReadMetadata { .. })
+            ));
+            module.functions[0].needs_arguments = true;
+            verify_module(&module).unwrap();
+            module.functions[0].param_count = 1;
+            assert!(matches!(
+                verify_module(&module),
+                Err(BytecodeVerifyError::ArgumentsReadMetadata { .. })
+            ));
+        }
     }
 
     #[test]

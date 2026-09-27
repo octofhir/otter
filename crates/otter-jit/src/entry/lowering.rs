@@ -790,7 +790,8 @@ impl BaselinePlan {
                 | Op::LoadThis
                 | Op::LoadNewTarget
                 | Op::CollectRest
-                | Op::CollectArguments => LoweredOperands::Destination(DestinationOperands {
+                | Op::CollectArguments
+                | Op::LoadArgumentsLength => LoweredOperands::Destination(DestinationOperands {
                     dst: reg(operands, 0)?,
                 }),
                 Op::MakeFunction
@@ -856,6 +857,7 @@ impl BaselinePlan {
                 | Op::TypeOf
                 | Op::IsArray
                 | Op::ArrayLength
+                | Op::LoadArgumentsElement
                 | Op::LoadLength
                 | Op::PrivateBrandCheck
                 | Op::NewError

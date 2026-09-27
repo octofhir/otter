@@ -6,6 +6,7 @@
 //! - [`NativeFrame`] is the compact activation record shared by every tier.
 //! - [`NATIVE_FRAME_EVAL_ENV_OFFSET`] is the sole compiler-visible location of
 //!   the VM-private direct-eval root slot.
+//! - [`NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET`] locates the lazy arguments root.
 //!
 //! # Invariants
 //! - Every machine-observed field has C layout and a fixed width.
@@ -15,6 +16,8 @@
 //!   compatibility/version protocol inside the process.
 //! - Typed direct-eval root access stays inside the VM; generated code receives
 //!   only the VM-derived numeric slot offset.
+//! - The nullable arguments cache is initialized before publication and traced
+//!   in place; exact deopt preserves its identity in the interpreter frame.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
 //!   recomputed after any allocating or reentrant call.
 //!
@@ -213,6 +216,9 @@ pub struct NativeFrame {
     /// Number of actual arguments published after the register window when
     /// [`NativeFrameFlags::INCOMING_ARGUMENTS`] is set; otherwise unused.
     pub argument_count: u32,
+    /// Lazily materialized arguments identity. Null means the actual window
+    /// remains authoritative. This occupies the native record's tail padding.
+    pub(crate) arguments_object: crate::object::JsObject,
 }
 
 impl NativeFrame {
@@ -237,7 +243,18 @@ impl NativeFrame {
             upvalue_count: 0,
             eval_env: EvalEnvHandle::null(),
             argument_count: 0,
+            arguments_object: crate::object::JsObject::null(),
         }
+    }
+
+    /// The activation's arguments identity after observable materialization.
+    pub(crate) fn arguments_object(&self) -> Option<crate::object::JsObject> {
+        (!self.arguments_object.is_null()).then_some(self.arguments_object)
+    }
+
+    /// Publish the identity in the collector-traced native frame slot.
+    pub(crate) fn set_arguments_object(&mut self, object: Option<crate::object::JsObject>) {
+        self.arguments_object = object.unwrap_or_else(crate::object::JsObject::null);
     }
 
     /// Exact running function object.
@@ -422,6 +439,11 @@ pub const NATIVE_FRAME_EVAL_ENV_OFFSET: u32 = std::mem::offset_of!(NativeFrame, 
 pub const NATIVE_FRAME_ARGUMENT_COUNT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, argument_count) as u32;
 
+/// Nullable arguments object root; zero admits direct actual-window reads.
+pub const NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, arguments_object) as u32;
+const _: [(); 68] = [(); std::mem::offset_of!(NativeFrame, arguments_object)];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +531,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(NativeFrame, eval_env), 60);
         assert_eq!(std::mem::offset_of!(NativeFrame, argument_count), 64);
         assert_eq!(NATIVE_FRAME_ARGUMENT_COUNT_OFFSET, 64);
+        assert_eq!(NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET, 68);
     }
 }

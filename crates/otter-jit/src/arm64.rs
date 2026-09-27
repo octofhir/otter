@@ -41,3 +41,5 @@ pub(crate) use direct_call::{
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,
 };
+
+pub(crate) mod arguments;

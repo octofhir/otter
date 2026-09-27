@@ -238,8 +238,8 @@ where
         ; sub rsp, r9
         ; mov [rsp + ALLOCATION_SIZE as i32], r10d
         ; mov [rsp + CALLER_CODE_OBJECT_ID as i32], r11
-        ; mov rax, [r11 + SCRATCH_COUNT as i32]
-        ; mov [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], eax
+        ; mov eax, [r11 + SCRATCH_COUNT as i32]
+        ; mov [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], rax
         ; lea rax, [rsp + r8]
         ; mov [rsp + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], rax
         ; mov rsi, [r11 + PLAN_ENTRY as i32]

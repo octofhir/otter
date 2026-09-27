@@ -49,7 +49,9 @@ impl Interpreter {
     ) -> Option<u32> {
         let materialized = materialized.and_then(|index| stack.get(index));
         let cold = materialized.and_then(|frame| self.frame_cold(frame));
-        if cold.is_some_and(|cold| cold.arguments_object.is_some()) {
+        if frame.native_arguments_object().is_some()
+            || cold.is_some_and(|cold| cold.arguments_object.is_some())
+        {
             return None;
         }
         // A materialized frame entered without actuals never allocates its

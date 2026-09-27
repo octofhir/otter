@@ -359,6 +359,11 @@ pub struct OldSpace {
     /// [`OPEN_PAGE_MIN_ROOM`]; that tail joins the free list. Allocation
     /// therefore probes only pages with real room instead of every page.
     open: Vec<u32>,
+    /// Linear allocation area carved from one free-list range: allocations
+    /// bump through it, so the free list is consulted once per range rather
+    /// than split and re-inserted per object. Its unused part always starts
+    /// with a free filler header, keeping the page walkable.
+    lab: Option<FreeEntry>,
 }
 
 /// Bump room below which an old page closes: its tail becomes one free-list
@@ -374,6 +379,7 @@ impl OldSpace {
             free_list: OldFreeList::default(),
             standby: Vec::new(),
             open: Vec::new(),
+            lab: None,
         }
     }
 
@@ -386,15 +392,23 @@ impl OldSpace {
                 max_bytes: PAGE_PAYLOAD_SIZE as u64,
             });
         }
-        if let Some(entry) = self.free_list.take(size_aligned) {
+        let range = match self.lab.take() {
+            Some(lab) if lab.size as usize >= size_aligned => Some(lab),
+            // An exhausted area's rest is already a filler-capped range.
+            Some(lab) => {
+                self.free_list.push(lab.offset, lab.size as usize);
+                self.free_list.take(size_aligned)
+            }
+            None => self.free_list.take(size_aligned),
+        };
+        if let Some(entry) = range {
             let remainder = (entry.size as usize)
                 .checked_sub(size_aligned)
                 .expect("a free-list range is only handed out for a request it fits");
             debug_assert!(remainder == 0 || remainder >= CELL_SIZE);
             if remainder > 0 {
-                // Cap the tail with a fresh filler so the page's linear
-                // header walk stays intact, and hand it back to the list
-                // when it is still worth reusing.
+                // Cap the rest with a fresh filler so the page's linear
+                // header walk stays intact; it stays the linear area.
                 let tail_offset = entry.offset + size_aligned as u32;
                 let tail_ptr = crate::page::page_base_from_offset(tail_offset);
                 let in_page = tail_offset as usize & (crate::page::PAGE_SIZE - 1);
@@ -407,7 +421,10 @@ impl OldSpace {
                         crate::header::GcHeader::new_free(remainder as u32),
                     );
                 }
-                self.free_list.push(tail_offset, remainder);
+                self.lab = Some(FreeEntry {
+                    offset: tail_offset,
+                    size: remainder as u32,
+                });
             }
             // SAFETY: the entry names an in-cage old page carved by this
             // space; account the reused bytes on that page.
@@ -503,6 +520,9 @@ impl OldSpace {
     /// Drop every free-list entry; the sweep that follows rebuilds the
     /// list from the pages that survive it.
     pub(crate) fn clear_free_list(&mut self) {
+        // The linear area is a filler-capped free range the sweep finds and
+        // lists again, so it must not stay reserved beside that entry.
+        self.lab = None;
         self.free_list.clear();
     }
 
@@ -594,6 +614,7 @@ impl OldSpace {
     /// Return fully dead pages and every unused standby page to the cage.
     pub fn reap_dead_pages(&mut self) -> usize {
         let before = self.pages.len();
+        self.lab = None;
         self.pages.retain(|p| p.header().live_bytes > 0);
         self.standby.clear();
         let pages = &self.pages;

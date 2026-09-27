@@ -3734,11 +3734,19 @@ pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) 
 }
 
 /// Maximum number of own properties an object keeps in fast
-/// transition-shape storage before it normalizes to dictionary mode.
-/// Beyond this, growing the shape transition chain makes property
-/// lookup O(n) (and bulk addition O(n²)); dictionary mode keeps both
-/// O(1). Mirrors the fast-property cap used by production engines.
+/// transition-shape storage when a property arrives through a keyed or
+/// generic store, before it normalizes to dictionary mode. Objects filled
+/// with computed keys are dictionaries in all but name; bounding their
+/// transition chains keeps lookup and bulk addition O(1). V8's
+/// `JSObject::kMaxFastProperties`.
 pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
+
+/// Maximum number of own properties a *named* store (`o.x = v`) keeps in
+/// fast storage. Named stores describe an object's fixed layout, as a
+/// constructor building a large state object does, so they stay on shapes
+/// (and shape ICs) until V8's descriptor-array limit,
+/// `kMaxNumberOfDescriptors`.
+pub(crate) const MAX_NAMED_FAST_PROPERTIES: u32 = 1020;
 
 /// Append a dictionary key. The caller pushes the matching slot
 /// separately; the new offset is the pre-push length (slots and keys

@@ -64,14 +64,6 @@ impl<'a> RuntimeState<'a> {
     /// - function-user-prop bag;
     /// - pending generator / uncaught throw side-channels.
     pub fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
-        self.trace_roots_inner(visitor, true);
-    }
-
-    pub(crate) fn trace_roots_without_shape_runtime(&self, visitor: &mut GcRootVisitor<'_>) {
-        self.trace_roots_inner(visitor, false);
-    }
-
-    fn trace_roots_inner(&self, visitor: &mut GcRootVisitor<'_>, include_shape_runtime: bool) {
         let interp = self.interp;
         // 1) Shared globalThis.
         interp.global_this().trace_gc_roots(visitor);
@@ -176,9 +168,7 @@ impl<'a> RuntimeState<'a> {
         interp.trace_function_kind_roots(visitor);
         interp.trace_iterator_side_tables(visitor);
         // 7) GC-managed hidden-class root/key/transition side tables.
-        if include_shape_runtime {
-            interp.shape_runtime_for_trace().trace_roots(visitor);
-        }
+        interp.shape_runtime_for_trace().trace_roots(visitor);
         for shape in interp.simple_constructor_shapes_for_trace() {
             let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
             visitor(p);

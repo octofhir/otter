@@ -25,12 +25,8 @@ impl Interpreter {
         parent: object::ShapeHandle,
         key: &str,
     ) -> Result<object::ShapeHandle, VmError> {
-        let roots = self.collect_runtime_roots_without_shape_runtime();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _no_collection = self.gc_heap.always_allocate_scope();
+        let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
         self.shape_runtime
             .child_with_roots(
                 &mut self.gc_heap,
@@ -63,11 +59,11 @@ impl Interpreter {
         ) {
             return Ok(child);
         }
-        let roots = self.collect_runtime_roots_without_shape_runtime();
+        // A new transition allocates without collecting (a full nursery
+        // spills to old space, where long-lived shapes belong), so it never
+        // needs the whole runtime root set, which is huge in large programs.
+        let _no_collection = self.gc_heap.always_allocate_scope();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             let p = obj as *mut object::JsObject as *mut RawGc;
             visitor(p);
             value.trace_value_slot_mut(visitor);
@@ -98,11 +94,9 @@ impl Interpreter {
         {
             return Ok(child);
         }
-        let roots = self.collect_runtime_roots_without_shape_runtime();
+        // See `shape_child_rooting_object_value`.
+        let _no_collection = self.gc_heap.always_allocate_scope();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             let p = obj as *mut object::JsObject as *mut RawGc;
             visitor(p);
         };
@@ -354,13 +348,11 @@ impl Interpreter {
         ordered: &[(String, object::PropertyFlags, bool)],
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
-        let roots = self.collect_runtime_roots_without_shape_runtime();
+        // See `shape_child_rooting_object_value`.
+        let _no_collection = self.gc_heap.always_allocate_scope();
         let mut shape = self.shape_runtime.root();
         for (key, flags, is_accessor) in ordered {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
                 let p = obj as *mut object::JsObject as *mut RawGc;
                 visitor(p);
                 extra_visit(visitor);

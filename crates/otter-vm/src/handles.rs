@@ -503,12 +503,10 @@ impl Interpreter {
         ) {
             return Ok(child);
         }
-        let roots = self.collect_runtime_roots_without_shape_runtime();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        // Shape transitions allocate without collecting; see
+        // `Interpreter::shape_child_rooting_object_value`.
+        let _no_collection = self.gc_heap.always_allocate_scope();
+        let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
         self.shape_runtime
             .child_with_roots(
                 &mut self.gc_heap,

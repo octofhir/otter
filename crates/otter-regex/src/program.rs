@@ -217,7 +217,9 @@ pub(crate) struct Program {
 /// path that the leftmost search turns into a vectorizable equality scan.
 #[derive(Debug, Clone)]
 pub(crate) struct Prefilter {
-    /// Membership for code units `0..TABLE` (covers ASCII and Latin-1).
+    /// Whether each raw input code unit `0..TABLE` (ASCII and Latin-1) can
+    /// begin a match. For an `i`-flag prefilter the case fold is already
+    /// applied, so the scan never folds a low unit.
     table: [bool; Self::TABLE],
     /// Whether any member code point is `>= TABLE`; when `false`, a code unit
     /// at or above the table can never start a match.
@@ -265,6 +267,22 @@ impl Prefilter {
                 has_high = true;
             }
         }
+        // Fold the low units once here instead of once per scanned position.
+        if let Some(unicode) = canon {
+            let members = table;
+            for (unit, slot) in table.iter_mut().enumerate() {
+                let folded = if unicode {
+                    crate::casefold::fold_unicode(unit as u32)
+                } else {
+                    crate::casefold::canonicalize(unit as u32)
+                };
+                *slot = if (folded as usize) < Self::TABLE {
+                    members[folded as usize]
+                } else {
+                    set.contains(folded)
+                };
+            }
+        }
         let single = match (canon, set.ranges()) {
             (None, [r])
                 if r.start() == r.end()
@@ -296,6 +314,9 @@ impl Prefilter {
     #[inline]
     #[must_use]
     pub(crate) fn cp_may_start(&self, cp: u32) -> bool {
+        if (cp as usize) < Self::TABLE {
+            return self.table[cp as usize];
+        }
         let cp = match self.canon {
             Some(true) => crate::casefold::fold_unicode(cp),
             Some(false) => crate::casefold::canonicalize(cp),

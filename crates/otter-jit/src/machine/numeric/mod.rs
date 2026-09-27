@@ -4340,10 +4340,16 @@ fn frame_state_exits(
             | NumericNode::IntegerSubImmediate(..) => {
                 &[(ExitReason::Int32Overflow, ExitAction::Recompile)]
             }
+            // A generated call deopts only for a failed callee identity
+            // proof; recursion, stack, or target-publication limits resume
+            // the call canonically.
+            NumericNode::DirectCall { .. } => &[
+                (ExitReason::IdentityGuard, ExitAction::Recompile),
+                (ExitReason::RuntimeTransition, ExitAction::Resume),
+            ],
             NumericNode::InlineConstructGuard { .. }
             | NumericNode::InlineCallGuard { .. }
             | NumericNode::InlineMethodGuard { .. }
-            | NumericNode::DirectCall { .. }
             | NumericNode::NativeCall { .. }
             | NumericNode::ColdCallExit { .. }
             | NumericNode::NativeLeaf { .. } => {

@@ -805,13 +805,18 @@ impl Interpreter {
             self.abandon_unsupported_optimized_generation(fid);
             return;
         }
-        // Insufficient-feedback exits are soft: they gather feedback for the
-        // next generation and never count as failed speculation.
+        // Insufficient-feedback exits and resumed runtime transitions are
+        // soft: they never count as failed speculation.
         let exits = self
             .jit_optimized_exit_profiles
             .iter()
             .filter(|((profile_fid, _, reason), _)| {
-                *profile_fid == fid && *reason != native_abi::ExitReason::InsufficientFeedback
+                *profile_fid == fid
+                    && !matches!(
+                        reason,
+                        native_abi::ExitReason::InsufficientFeedback
+                            | native_abi::ExitReason::RuntimeTransition
+                    )
             })
             .map(|(_, profile)| u64::from(profile.count))
             .sum::<u64>();

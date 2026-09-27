@@ -3250,6 +3250,10 @@ fn emit_with_reach(
                     let direct_done = ops.new_dynamic_label();
                     let direct_threw = ops.new_dynamic_label();
                     let direct_bail = ops.new_dynamic_label();
+                    let transition = instruction_deopt_label(
+                        instruction.exit_id(ExitReason::RuntimeTransition),
+                        &deopt_targets,
+                    )?;
                     let final_method_guard_miss = ops.new_dynamic_label();
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
@@ -3438,6 +3442,7 @@ fn emit_with_reach(
                             } else {
                                 direct_bail
                             },
+                            transition,
                             finish_error,
                             direct_threw,
                             fatal,
@@ -3682,10 +3687,12 @@ fn emit_with_reach(
                             dynasm!(ops ; .arch aarch64 ; b =>deopt);
                         }
                     }
+                    // Inline-frame publication fails only at the activation
+                    // bound: a resource limit, not a failed proof.
                     dynasm!(ops ; .arch aarch64 ; b =>direct_bail ; =>publication_fail);
                     emit_clear_machine_roots(&mut ops);
                     emit_reload_safepoint_roots(&mut ops, frame, site)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                    dynasm!(ops ; .arch aarch64 ; b =>transition);
                     dynasm!(ops
                         ; .arch aarch64
                         ; =>direct_bail

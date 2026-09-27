@@ -631,9 +631,14 @@ pub(crate) fn direct_call_artifact(
 
 /// Emit one complete generated call.
 ///
-/// `bail` names the caller's exact pre-effect deopt exit. `finish_error`
-/// normalizes a parked runtime error, `throw_value` carries a pure JavaScript
-/// exception in `x0`, and `fatal` propagates only `ctx.error`.
+/// `bail` names the caller's exact pre-effect deopt exit for a failed callee
+/// identity proof. `transition` is the caller's pre-effect exit for every
+/// other rejection before entry — generated recursion or native stack bounds,
+/// an unpublished target generation, or a declined frame preparation — which
+/// fail no speculation, so the caller resumes the call canonically without
+/// recompiling. `finish_error` normalizes a parked runtime error,
+/// `throw_value` carries a pure JavaScript exception in `x0`, and `fatal`
+/// propagates only `ctx.error`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_direct_call(
     ops: &mut Assembler,
@@ -645,6 +650,7 @@ pub(crate) fn emit_direct_call(
     initialize_upvalues_entry: u64,
     code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
+    transition: DynamicLabel,
     finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
@@ -665,6 +671,7 @@ pub(crate) fn emit_direct_call(
         0,
         code_map,
         bail,
+        transition,
         finish_error,
         throw_value,
         fatal,
@@ -729,6 +736,7 @@ pub(crate) fn emit_direct_call_with_access<
     copy_forwarded_arguments_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
+    transition: DynamicLabel,
     finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
@@ -757,6 +765,7 @@ where
     let uncommitted_rejected = ops.new_dynamic_label();
     let entry_rejected = ops.new_dynamic_label();
     let caller_bail = ops.new_dynamic_label();
+    let caller_transition = ops.new_dynamic_label();
     let construct_prepare_error = ops.new_dynamic_label();
     let construct_prepare_throw = ops.new_dynamic_label();
     let construct_prepare_fatal = ops.new_dynamic_label();
@@ -771,7 +780,7 @@ where
         ; ldr x10, [x9]
         ; ldr x11, [X(context_register), ACTIVATION_LIMIT_OFFSET]
         ; cmp x10, x11
-        ; b.hs =>caller_bail
+        ; b.hs =>caller_transition
     );
 
     if let DirectCallArguments::Forward { count } = site.arguments {
@@ -785,7 +794,7 @@ where
         dynasm!(ops ; .arch aarch64 ; mov x8, X(count));
         if layout.allocation_size.is_some() {
             let capacity = (MAX_DIRECT_CALL_FRAME_BYTES - layout.incoming_base) / 8;
-            dynasm!(ops ; .arch aarch64 ; cmp w8, capacity ; b.hi =>caller_bail);
+            dynasm!(ops ; .arch aarch64 ; cmp w8, capacity ; b.hi =>caller_transition);
         }
     }
 
@@ -1615,6 +1624,7 @@ where
         derived_construct_result_entry,
         |kind, start, end| record_region(&mut code_map, kind, start, end, site, direct_call),
         bail,
+        transition,
         finish_error,
         throw_value,
         fatal,
@@ -1622,6 +1632,7 @@ where
         uncommitted_rejected,
         entry_rejected,
         caller_bail,
+        caller_transition,
         construct_prepare_error,
         construct_prepare_throw,
         construct_prepare_fatal,

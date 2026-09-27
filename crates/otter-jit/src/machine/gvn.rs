@@ -26,7 +26,6 @@
 //! # See also
 //! - `super::effects` is the sole opcode/effect classification table.
 
-use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
 use rustc_hash::{FxHashMap, FxHasher};
@@ -303,7 +302,7 @@ pub(super) fn optimize(
     }
 
     rebuild(&mut sequence, &eliminated, &replacements);
-    sequence.verify(target)?;
+    sequence.verify_pass(target)?;
     Ok((sequence, stats))
 }
 
@@ -493,12 +492,24 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
 /// to the same representative, the duplicate is dropped so the set stays
 /// exact.
 fn rewrite_uses(instruction: &mut MachineInstruction, replacements: &[MachineValue]) {
+    let mut metadata_changed = false;
     for operand in &mut instruction.operands {
         if operand.role == OperandRole::Use {
-            operand.value = resolve(replacements, operand.value);
+            let value = resolve(replacements, operand.value);
+            metadata_changed |= value != operand.value
+                && matches!(
+                    operand.purpose,
+                    OperandPurpose::FrameState | OperandPurpose::TaggedRoot
+                );
+            operand.value = value;
         }
     }
-    let mut seen = BTreeSet::new();
+    // Metadata operands are already distinct; only a substitution can make
+    // two of them name the same value.
+    if !metadata_changed {
+        return;
+    }
+    let mut seen = rustc_hash::FxHashSet::default();
     instruction.operands.retain(|operand| {
         !matches!(
             operand.purpose,
@@ -548,18 +559,21 @@ fn rebuild(sequence: &mut InstructionSequence, eliminated: &[bool], replacements
         }
     }
 
-    let old_instructions = std::mem::take(&mut sequence.instructions);
-    let mut instructions = Vec::with_capacity(
-        old_instructions.len() - eliminated.iter().filter(|&&removed| removed).count(),
-    );
+    let capacity =
+        sequence.instructions.len() - eliminated.iter().filter(|&&removed| removed).count();
+    let mut old_instructions = std::mem::take(&mut sequence.instructions)
+        .into_iter()
+        .zip(eliminated.iter().copied());
+    let mut instructions = Vec::with_capacity(capacity);
     for block in &mut sequence.blocks {
-        let old_range = block.first.0 as usize..block.end.0 as usize;
+        // Verified blocks own contiguous ranges in block order, so the
+        // instructions move out without a copy.
+        let len = (block.end.0 - block.first.0) as usize;
         block.first = MachineInstructionId(instructions.len() as u32);
-        for index in old_range {
-            if eliminated[index] {
+        for (mut instruction, eliminated) in old_instructions.by_ref().take(len) {
+            if eliminated {
                 continue;
             }
-            let mut instruction = old_instructions[index].clone();
             rewrite_uses(&mut instruction, replacements);
             for frame in &mut instruction.inline_frames {
                 for value in frame

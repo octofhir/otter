@@ -310,9 +310,11 @@ pub(super) fn allocate(
 ) -> Result<AllocatedSequence, AllocationError> {
     sequence.verify(target)?;
     let function = build_regalloc_function(sequence);
+    // `sequence.verify` above already proved SSA form, including every
+    // definition dominating its uses; regalloc2's own validation repeats it.
     let options = RegallocOptions {
         verbose_log: false,
-        validate_ssa: true,
+        validate_ssa: false,
         algorithm: regalloc2::Algorithm::Ion,
     };
     let output = regalloc2::run(&function, &target.registers().environment(), &options)

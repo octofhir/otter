@@ -123,21 +123,20 @@ pub fn lower_deopt_table(
         let Some(&instruction) = exits_by_state.get(&state.id) else {
             continue;
         };
+        // One lookup table per exit: frame states name hundreds of slots in
+        // large functions, so a per-slot scan of the metadata is quadratic.
+        let mut locations = rustc_hash::FxHashMap::default();
+        for metadata in allocation.metadata_for(instruction) {
+            if metadata.frame_state == Some(state.id) {
+                locations.entry(metadata.value).or_insert(metadata.location);
+            }
+        }
         let frames = state
             .frames
             .iter()
             .map(|frame| {
-                let lower = |slot| {
-                    lower_slot(
-                        sequence,
-                        allocation,
-                        layout,
-                        gpr_budget,
-                        state.id,
-                        instruction,
-                        slot,
-                    )
-                };
+                let lower =
+                    |slot| lower_slot(sequence, &locations, layout, gpr_budget, instruction, slot);
                 Ok(DeoptFrame {
                     function_id: frame.function_id,
                     byte_pc: frame.byte_pc,
@@ -173,15 +172,7 @@ pub fn lower_deopt_table(
                         .iter()
                         .copied()
                         .map(|slot| {
-                            lower_slot(
-                                sequence,
-                                allocation,
-                                layout,
-                                gpr_budget,
-                                state.id,
-                                instruction,
-                                slot,
-                            )
+                            lower_slot(sequence, &locations, layout, gpr_budget, instruction, slot)
                         })
                         .collect::<Result<_, _>>()?,
                 })
@@ -222,10 +213,9 @@ pub fn lower_deopt_table(
 
 fn lower_slot(
     sequence: &InstructionSequence,
-    allocation: &AllocatedSequence,
+    locations: &rustc_hash::FxHashMap<MachineValue, AllocatedLocation>,
     layout: MachineFrameLayout,
     gpr_budget: u16,
-    frame_state: FrameStateId,
     instruction: MachineInstructionId,
     slot: MachineFrameSlot,
 ) -> Result<DeoptSlot, MachineDeoptError> {
@@ -260,11 +250,9 @@ fn lower_slot(
             ));
         }
     };
-    let location = allocation
-        .metadata_for(instruction)
-        .iter()
-        .find(|metadata| metadata.frame_state == Some(frame_state) && metadata.value == value)
-        .map(|metadata| metadata.location)
+    let location = locations
+        .get(&value)
+        .copied()
         .ok_or(MachineDeoptError::MissingLocation(
             sequence.instructions()[instruction.0 as usize].exits[0].id,
             value,

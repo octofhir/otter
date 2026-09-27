@@ -1413,7 +1413,7 @@ pub struct InstructionSequence {
 /// Structural failure in a target-selected instruction sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationError {
-    /// Entry block does not exist.
+    /// Entry block does not exist, or an edge or parameter reaches it.
     InvalidEntry,
     /// A block owns an empty or invalid instruction range.
     InvalidBlockRange(MachineBlock),
@@ -1696,7 +1696,7 @@ impl InstructionSequence {
             blocks,
             instructions,
         };
-        sequence.verify(target)?;
+        sequence.verify_pass(target)?;
         Ok(sequence)
     }
 
@@ -1718,7 +1718,7 @@ impl InstructionSequence {
             blocks,
             instructions,
         };
-        sequence.verify(target)?;
+        sequence.verify_pass(target)?;
         Ok(sequence)
     }
 
@@ -2123,7 +2123,13 @@ impl InstructionSequence {
     }
 
     fn verify_structure(&self, target_spec: &TargetSpec) -> Result<(), VerificationError> {
-        if self.entry.0 as usize >= self.blocks.len() {
+        // The entry runs once: it has no parameters and no predecessor, so no
+        // edge can re-execute the frame's entry reads.
+        let entry = self
+            .blocks
+            .get(self.entry.0 as usize)
+            .ok_or(VerificationError::InvalidEntry)?;
+        if !entry.predecessors.is_empty() || !entry.parameters.is_empty() {
             return Err(VerificationError::InvalidEntry);
         }
         let values = ValueIndex::build(self);
@@ -2151,7 +2157,7 @@ impl InstructionSequence {
             }
         }
         let mut expected_first = 0u32;
-        let mut safepoints = std::collections::BTreeSet::new();
+        let mut safepoints = rustc_hash::FxHashSet::default();
         let mut deopts = std::collections::BTreeSet::new();
         let mut expected_predecessors = vec![Vec::new(); self.blocks.len()];
         for (predecessor, block) in self.blocks.iter().enumerate() {
@@ -3785,6 +3791,18 @@ impl InstructionSequence {
         self.verify_structure(target)?;
         inline_frames::verify(self)?;
         self.verify_gc_root_liveness()
+    }
+
+    /// Verify between optimization passes. Debug builds check every pass;
+    /// release builds rely on the unconditional verification register
+    /// allocation performs on the final sequence, as V8 keeps its graph
+    /// verifiers out of release pipelines.
+    pub(super) fn verify_pass(&self, target: &TargetSpec) -> Result<(), VerificationError> {
+        if cfg!(debug_assertions) {
+            self.verify(target)
+        } else {
+            Ok(())
+        }
     }
 }
 

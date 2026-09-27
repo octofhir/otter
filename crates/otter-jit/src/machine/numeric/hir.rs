@@ -1418,11 +1418,16 @@ fn numeric_node_blocks(function: &NumericFunction) -> Option<Vec<Option<usize>>>
 }
 
 fn innermost_reducible_natural_loops(blocks: &[NumericBlock]) -> Option<Vec<NumericNaturalLoop>> {
-    let dominators = numeric_dominators(blocks)?;
+    if blocks.is_empty() {
+        return None;
+    }
+    let dominance = super::super::dominance::Dominance::compute(blocks.len(), 0, |block| {
+        blocks[block].successors.iter().copied()
+    });
     let mut loops = Vec::<NumericNaturalLoop>::new();
     for (latch, block) in blocks.iter().enumerate() {
         for &header in &block.successors {
-            if !dominators.get(latch)?.contains(&header) {
+            if !dominance.dominates(header, latch) {
                 continue;
             }
             let mut members = BTreeSet::from([header, latch]);
@@ -1470,36 +1475,6 @@ fn innermost_reducible_natural_loops(blocks: &[NumericBlock]) -> Option<Vec<Nume
     });
     loops.sort_by_key(|natural_loop| natural_loop.header);
     Some(loops)
-}
-
-fn numeric_dominators(blocks: &[NumericBlock]) -> Option<Vec<BTreeSet<usize>>> {
-    if blocks.is_empty() {
-        return None;
-    }
-    let all = (0..blocks.len()).collect::<BTreeSet<_>>();
-    let mut dominators = vec![all; blocks.len()];
-    dominators[0] = BTreeSet::from([0]);
-    loop {
-        let mut changed = false;
-        for block_index in 1..blocks.len() {
-            let block = blocks.get(block_index)?;
-            let mut next = block
-                .predecessors
-                .iter()
-                .map(|&predecessor| dominators.get(predecessor).cloned())
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .reduce(|left, right| left.intersection(&right).copied().collect())?;
-            next.insert(block_index);
-            if next != dominators[block_index] {
-                dominators[block_index] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            return Some(dominators);
-        }
-    }
 }
 
 fn loop_is_versionable(function: &NumericFunction, natural_loop: &NumericNaturalLoop) -> bool {
@@ -2203,14 +2178,16 @@ fn merge_predecessors(
             exceptional_out_states,
         )
     };
-    let first = state(
-        *predecessors
-            .first()
-            .ok_or("predecessor state merge: no forward predecessor")?,
-    )
-    .ok_or(MISSING_EDGE)?
-    .to_vec();
-    let mut merged = first.clone();
+    if predecessors.is_empty() {
+        return Err("predecessor state merge: no forward predecessor");
+    }
+    // Each predecessor's edge state is resolved once, not once per register.
+    let edge_states = predecessors
+        .iter()
+        .map(|&predecessor| state(predecessor))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(MISSING_EDGE)?;
+    let mut merged = edge_states[0].to_vec();
     let mut parameters = Vec::new();
     let mut parameter_registers = Vec::new();
     for (register, merged_state) in merged.iter_mut().enumerate() {
@@ -2218,16 +2195,17 @@ fn merge_predecessors(
             *merged_state = RegisterState::Unset;
             continue;
         }
-        let states = predecessors
-            .iter()
-            .map(|&predecessor| state(predecessor)?.get(register).copied())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(MISSING_EDGE)?;
-        if states.iter().all(|&state| state == states[0]) {
+        let first = *merged_state;
+        let mut agree = true;
+        for states in &edge_states[1..] {
+            let state = *states.get(register).ok_or(MISSING_EDGE)?;
+            agree &= state == first;
+        }
+        if agree {
             continue;
         }
         let mut merged_type = None;
-        for state in states {
+        for state in edge_states.iter().map(|states| states[register]) {
             let RegisterState::Value(value) = state else {
                 return Err("predecessor state merge: live register unset on one path");
             };

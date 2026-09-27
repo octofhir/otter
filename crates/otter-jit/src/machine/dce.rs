@@ -122,33 +122,31 @@ pub(super) fn optimize(
     if eliminated == 0 {
         return Ok((sequence, 0));
     }
-    let old = std::mem::take(&mut sequence.instructions);
-    let mut kept = Vec::with_capacity(old.len() - eliminated as usize);
-    let mut cursor = 0usize;
+    let capacity = sequence.instructions.len() - eliminated as usize;
+    let mut old = std::mem::take(&mut sequence.instructions)
+        .into_iter()
+        .zip(removed);
+    let mut kept = Vec::with_capacity(capacity);
     for block in &mut sequence.blocks {
-        let (first, end) = (block.first.0 as usize, block.end.0 as usize);
+        // Verified blocks own contiguous ranges in block order, so the
+        // instructions move out without a copy.
+        let len = (block.end.0 - block.first.0) as usize;
         block.first = MachineInstructionId(kept.len() as u32);
-        debug_assert_eq!(cursor, first, "verified blocks own contiguous ranges");
-        kept.extend(
-            old[first..end]
-                .iter()
-                .zip(&removed[first..end])
-                .filter(|(_, removed)| !**removed)
-                .map(|(instruction, _)| {
-                    let mut instruction = instruction.clone();
-                    instruction
-                        .operands
-                        .retain(|operand| operand.purpose != OperandPurpose::TaggedRoot);
-                    instruction
-                }),
-        );
-        cursor = end;
+        for (mut instruction, removed) in old.by_ref().take(len) {
+            if removed {
+                continue;
+            }
+            instruction
+                .operands
+                .retain(|operand| operand.purpose != OperandPurpose::TaggedRoot);
+            kept.push(instruction);
+        }
         block.end = MachineInstructionId(kept.len() as u32);
     }
     sequence.instructions = kept;
     super::renumber_safepoints(&mut sequence.instructions);
     sequence.complete_gc_root_liveness();
-    sequence.verify(target)?;
+    sequence.verify_pass(target)?;
     Ok((sequence, eliminated))
 }
 

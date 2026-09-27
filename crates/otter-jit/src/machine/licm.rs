@@ -55,9 +55,10 @@ pub(super) fn optimize(
     let mut stats = LicmStats::default();
     // Innermost loops are disjoint, so splitting one never changes another
     // loop's blocks or invariants, and block indices stay stable because a
-    // split only appends the new body block. The loops are therefore found
-    // once, and the value facts only grow to cover values a split creates.
+    // split only appends the new body block. Every loop's invariants are
+    // therefore planned against the original sequence.
     let mut facts: Option<ValueFacts> = None;
+    let mut plans = Vec::new();
     for natural_loop in innermost_natural_loops(&sequence) {
         if natural_loop.header == sequence.entry.0 as usize
             || !sequence.blocks[natural_loop.header]
@@ -68,19 +69,44 @@ pub(super) fn optimize(
             continue;
         }
         let facts = facts.get_or_insert_with(|| ValueFacts::compute(&sequence));
-        facts.cover(sequence.representations.len());
         let candidates = invariant_instructions(&sequence, &natural_loop, facts);
-        if candidates.is_empty() {
-            continue;
+        if !candidates.is_empty() {
+            plans.push((natural_loop, candidates));
         }
-        split_preheader_and_hoist(&mut sequence, &natural_loop, &candidates);
+    }
+    if plans.is_empty() {
+        return Ok((sequence, stats));
+    }
+    // Every split reads its loop's original blocks and instruction indices
+    // and appends one body block, so all splits apply to one partition of
+    // the instructions and the ranges are rebuilt once.
+    let mut old_instructions = std::mem::take(&mut sequence.instructions).into_iter();
+    let mut block_instructions = sequence
+        .blocks
+        .iter()
+        .map(|block| {
+            old_instructions
+                .by_ref()
+                .take((block.end.0 - block.first.0) as usize)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (natural_loop, candidates) in &plans {
+        split_preheader_and_hoist(
+            &mut sequence,
+            &mut block_instructions,
+            natural_loop,
+            candidates,
+        );
         stats.hoisted_instructions = stats
             .hoisted_instructions
             .saturating_add(candidates.len() as u32);
         stats.versioned_loops = stats.versioned_loops.saturating_add(1);
     }
+    rebuild_predecessors(&mut sequence.blocks);
+    rebuild_instruction_ranges(&mut sequence, block_instructions);
     sequence.complete_gc_root_liveness();
-    sequence.verify(target)?;
+    sequence.verify_pass(target)?;
     Ok((sequence, stats))
 }
 
@@ -91,6 +117,8 @@ struct ValueFacts {
     edge_values: Vec<bool>,
     /// Values read by a non-input operand or by deopt reconstruction.
     reconstruction_values: Vec<bool>,
+    /// Input-operand reads of each value across the whole function.
+    input_uses: Vec<u32>,
 }
 
 impl ValueFacts {
@@ -139,20 +167,23 @@ impl ValueFacts {
         {
             reconstruction_values[value.0 as usize] = true;
         }
+        let mut input_uses = vec![0u32; count];
+        for operand in sequence
+            .instructions
+            .iter()
+            .flat_map(|instruction| instruction.operands.iter())
+            .filter(|operand| {
+                operand.role == OperandRole::Use && operand.purpose == OperandPurpose::Input
+            })
+        {
+            input_uses[operand.value.0 as usize] += 1;
+        }
         Self {
             definitions: value_definition_blocks(sequence),
             edge_values,
             reconstruction_values,
+            input_uses,
         }
-    }
-
-    /// Extend the facts to `count` values. A split creates values only for
-    /// the loop it hoists (preheader parameters and carried outputs), which
-    /// no other innermost loop reads, so they enter as undefined elsewhere.
-    fn cover(&mut self, count: usize) {
-        self.definitions.resize(count, None);
-        self.edge_values.resize(count, false);
-        self.reconstruction_values.resize(count, false);
     }
 }
 
@@ -166,19 +197,24 @@ fn invariant_instructions(
     for &block in &natural_loop.blocks {
         in_loop[block] = true;
     }
-    let mut used_outside = vec![false; sequence.representations.len()];
-    for (block_index, block) in sequence.blocks.iter().enumerate() {
-        if in_loop[block_index] {
-            continue;
-        }
-        for index in block.first.0 as usize..block.end.0 as usize {
-            for operand in &sequence.instructions[index].operands {
-                if operand.role == OperandRole::Use {
-                    used_outside[operand.value.0 as usize] = true;
-                }
-            }
+    // A value read outside the loop is read more often in the function than
+    // inside the loop; every non-input read already counts as reconstruction.
+    let mut loop_input_uses = rustc_hash::FxHashMap::<u32, u32>::default();
+    for &block in &natural_loop.blocks {
+        let data = &sequence.blocks[block];
+        for operand in sequence.instructions[data.first.0 as usize..data.end.0 as usize]
+            .iter()
+            .flat_map(|instruction| instruction.operands.iter())
+            .filter(|operand| {
+                operand.role == OperandRole::Use && operand.purpose == OperandPurpose::Input
+            })
+        {
+            *loop_input_uses.entry(operand.value.0).or_default() += 1;
         }
     }
+    let used_outside = |value: MachineValue| {
+        facts.input_uses[value.0 as usize] > loop_input_uses.get(&value.0).copied().unwrap_or(0)
+    };
     let mut writes = super::MachineAliasSet::NONE;
     let mut invalidating_boundary = false;
     for &block in &natural_loop.blocks {
@@ -206,22 +242,23 @@ fn invariant_instructions(
             invalidating_boundary |= effects.allocates || effects.safepoint || effects.reentrant;
         }
     }
-    let mut invariant_values = definitions
-        .iter()
-        .map(|block| block.is_some_and(|block| !in_loop[block]))
-        .collect::<Vec<_>>();
     let invariant_header_parameters =
         invariant_header_parameters(sequence, natural_loop, definitions);
-    for parameter in &invariant_header_parameters {
-        invariant_values[parameter.0 as usize] = true;
-    }
-    let mut variant_loop_parameters = vec![false; sequence.representations.len()];
+    let mut hoisted_outputs = rustc_hash::FxHashSet::<MachineValue>::default();
+    let mut variant_loop_parameters = rustc_hash::FxHashSet::<MachineValue>::default();
     for &block in &natural_loop.blocks {
         for parameter in &sequence.blocks[block].parameters {
-            variant_loop_parameters[parameter.0 as usize] =
-                !invariant_header_parameters.contains(parameter);
+            if !invariant_header_parameters.contains(parameter) {
+                variant_loop_parameters.insert(*parameter);
+            }
         }
     }
+    let invariant = |value: MachineValue, hoisted: &rustc_hash::FxHashSet<MachineValue>| {
+        !variant_loop_parameters.contains(&value)
+            && (definitions[value.0 as usize].is_some_and(|block| !in_loop[block])
+                || invariant_header_parameters.contains(&value)
+                || hoisted.contains(&value))
+    };
     let mut candidates = BTreeSet::new();
     loop {
         let mut changed = false;
@@ -256,8 +293,7 @@ fn invariant_instructions(
                 if !instruction.operands.iter().all(|operand| {
                     operand.role != OperandRole::Use
                         || operand.purpose != OperandPurpose::Input
-                        || (invariant_values[operand.value.0 as usize]
-                            && !variant_loop_parameters[operand.value.0 as usize])
+                        || invariant(operand.value, &hoisted_outputs)
                 }) {
                     continue;
                 }
@@ -276,7 +312,7 @@ fn invariant_instructions(
                 if outputs.iter().any(|output| {
                     facts.edge_values[output.0 as usize]
                         || facts.reconstruction_values[output.0 as usize]
-                        || used_outside[output.0 as usize]
+                        || used_outside(*output)
                 }) {
                     continue;
                 }
@@ -292,9 +328,7 @@ fn invariant_instructions(
                     continue;
                 }
                 candidates.insert(index);
-                for output in outputs {
-                    invariant_values[output.0 as usize] = true;
-                }
+                hoisted_outputs.extend(outputs);
                 changed = true;
             }
         }
@@ -407,6 +441,7 @@ fn in_dependency_order(invariants: Vec<MachineInstruction>) -> Vec<MachineInstru
 
 fn split_preheader_and_hoist(
     sequence: &mut InstructionSequence,
+    block_instructions: &mut Vec<Vec<MachineInstruction>>,
     natural_loop: &NaturalLoop,
     candidates: &BTreeSet<usize>,
 ) {
@@ -429,19 +464,6 @@ fn split_preheader_and_hoist(
         .zip(new_parameters.iter().copied())
         .collect::<BTreeMap<_, _>>();
 
-    // Verified blocks own contiguous instruction ranges in block order, so the
-    // instructions move into per-block lists without a copy.
-    let mut old_instructions = std::mem::take(&mut sequence.instructions).into_iter();
-    let mut block_instructions = sequence
-        .blocks
-        .iter()
-        .map(|block| {
-            old_instructions
-                .by_ref()
-                .take((block.end.0 - block.first.0) as usize)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
     let mut osr_entry = None;
     let mut invariants = Vec::new();
     for &block in &natural_loop.blocks {
@@ -531,8 +553,6 @@ fn split_preheader_and_hoist(
         parameters: body_parameters,
         successor_arguments: old_header.successor_arguments,
     });
-    rebuild_predecessors(&mut sequence.blocks);
-    rebuild_instruction_ranges(sequence, block_instructions);
 }
 
 fn rewrite_parameter_uses(

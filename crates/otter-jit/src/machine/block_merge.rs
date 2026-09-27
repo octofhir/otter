@@ -89,16 +89,19 @@ pub(super) fn optimize(
     let remap = |block: MachineBlock| MachineBlock(new_id[block.0 as usize]);
 
     let old_blocks = std::mem::take(&mut sequence.blocks);
-    let old_instructions = std::mem::take(&mut sequence.instructions);
     let mut new_blocks: Vec<MachineBlockData> = Vec::with_capacity(old_blocks.len());
-    let mut kept = Vec::with_capacity(old_instructions.len());
+    let mut kept = Vec::with_capacity(sequence.instructions.len());
+    let mut old_instructions = std::mem::take(&mut sequence.instructions).into_iter();
     for (index, block) in old_blocks.iter().enumerate() {
         let continues = index + 1 < old_blocks.len() && joins[index + 1];
-        let (first, end) = (block.first.0 as usize, block.end.0 as usize);
-        // A block that flows into its merged successor drops its `Jump`.
-        let body_end = if continues { end - 1 } else { end };
+        let len = (block.end.0 - block.first.0) as usize;
         let start = MachineInstructionId(kept.len() as u32);
-        kept.extend(old_instructions[first..body_end].iter().cloned());
+        // Blocks own contiguous ranges in order, so instructions move out; a
+        // block that flows into its merged successor drops its `Jump`.
+        kept.extend(old_instructions.by_ref().take(len - usize::from(continues)));
+        if continues {
+            old_instructions.next();
+        }
         let finish = MachineInstructionId(kept.len() as u32);
         if joins[index] {
             let owner = new_blocks
@@ -126,8 +129,8 @@ pub(super) fn optimize(
     sequence.entry = remap(sequence.entry);
     sequence.blocks = new_blocks;
     sequence.instructions = kept;
-    super::renumber_safepoints(&mut sequence.instructions);
-    sequence.complete_gc_root_liveness();
-    sequence.verify(target)?;
+    // Only jumps disappeared: safepoint order, and every root set, is the
+    // one the unmerged blocks already carried.
+    sequence.verify_pass(target)?;
     Ok((sequence, merged))
 }

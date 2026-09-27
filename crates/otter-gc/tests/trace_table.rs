@@ -5,7 +5,7 @@ use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{Gc, GcHeap, HandleScope};
 
-struct Leaf;
+struct Leaf(#[allow(dead_code)] u64);
 impl Traceable for Leaf {
     const TYPE_TAG: u8 = 0x90;
     unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
@@ -31,7 +31,7 @@ fn full_gc_walks_through_registered_trace_fns() {
     heap.register_traceable::<Node>();
 
     let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
-    let leaf = heap.alloc(Leaf).unwrap();
+    let leaf = heap.alloc(Leaf(0)).unwrap();
     let node = heap.alloc(Node { next: leaf }).unwrap();
     let root = scope.local(node);
     // Promote both to old gen so the full mark phase walks

@@ -19,7 +19,7 @@ use otter_gc::{
     GcHeader, OutOfMemory, PAGE_SIZE, Traceable, cage_base, cage_stats, init_cage_with_size,
 };
 
-struct Cell;
+struct Cell(#[allow(dead_code)] u64);
 
 impl Traceable for Cell {
     const TYPE_TAG: u8 = 0xE5;
@@ -41,7 +41,7 @@ unsafe fn initialize_cell(offset: u32, young: bool, aligned: usize) {
             cage_base()
                 .add(offset as usize + HEADER_SIZE)
                 .cast::<Cell>(),
-            Cell,
+            Cell(0),
         );
     }
 }

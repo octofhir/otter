@@ -12,7 +12,7 @@
 //! │  PageHeader                                │     (cage offset == cage_offset)
 //! │   - space_kind, flags, bump_cursor         │
 //! │   - allocated_bytes / live_bytes           │
-//! │   - survival_age (scavenger promotion)     │
+//! │   - age_mark (scavenger promotion)         │
 //! │   - card-table bitmap (1 bit per 512 B)    │
 //! │   - free-list head (old-space)             │
 //! ├────────────────────────────────────────────┤  ← payload_start
@@ -147,10 +147,13 @@ pub struct PageHeader {
     /// Bytes covered by live objects after the most recent mark
     /// phase. Cleared at sweep start, accumulated during mark.
     pub live_bytes: usize,
-    /// Survival counter — incremented each scavenge a young page
-    /// stays in `NewFrom`. Promotion fires when this hits the
-    /// threshold (see [`crate::scavenger::PROMOTE_AFTER_SURVIVALS`]).
-    pub survival_age: u32,
+    /// Young-generation age mark (byte offset from the page base). Objects
+    /// below it were copied here by the previous scavenge, so they have
+    /// already survived once and are promoted when they survive again.
+    /// Objects the mutator allocates afterwards sit above it and are copied
+    /// to to-space first. It equals `PAGE_HEADER_SIZE` on a page without
+    /// survivors.
+    pub age_mark: usize,
     /// Compressed offset of this page's base inside the cage. Used
     /// by [`Page::cage_offset`] without touching the cage mutex.
     pub cage_offset: u32,
@@ -175,7 +178,7 @@ impl PageHeader {
         self.bump_cursor = PAGE_HEADER_SIZE;
         self.allocated_bytes = 0;
         self.live_bytes = 0;
-        self.survival_age = 0;
+        self.age_mark = PAGE_HEADER_SIZE;
         self.cage_offset = cage_offset;
         self.card_bitmap = [0u8; CARD_BITMAP_BYTES];
     }
@@ -381,6 +384,7 @@ impl Page {
         header.bump_cursor = PAGE_HEADER_SIZE;
         header.allocated_bytes = 0;
         header.live_bytes = 0;
+        header.age_mark = PAGE_HEADER_SIZE;
         header.clear_cards();
     }
 
@@ -479,7 +483,7 @@ impl std::fmt::Debug for Page {
             .field("space", &h.space)
             .field("bump_cursor", &h.bump_cursor)
             .field("allocated_bytes", &h.allocated_bytes)
-            .field("survival_age", &h.survival_age)
+            .field("age_mark", &h.age_mark)
             .finish()
     }
 }

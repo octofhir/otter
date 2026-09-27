@@ -340,6 +340,16 @@ impl TraceTable {
     /// `trace_wrapper` casts the raw header pointer to `*mut T`
     /// (skipping the header) and forwards to `T::trace_slots`.
     pub fn register<T: Traceable>(&mut self) {
+        const {
+            // A scavenge stores the forwarding offset in the first four
+            // payload bytes. A zero-sized payload makes a header-only cell,
+            // so that write would land on the next object's header; any
+            // non-empty payload rounds the cell up to CELL_SIZE bytes of room.
+            assert!(
+                std::mem::size_of::<T>() != 0,
+                "GC payloads need room for the scavenger's forwarding offset"
+            );
+        }
         debug_assert!(
             T::TYPE_TAG != crate::header::FREE_TAG,
             "FREE_TAG is reserved for free-space fillers"
@@ -623,7 +633,7 @@ mod tests {
     use super::*;
     use crate::compressed::Gc;
 
-    struct Leaf;
+    struct Leaf(#[allow(dead_code)] u64);
 
     impl Traceable for Leaf {
         const TYPE_TAG: u8 = 0xA0;

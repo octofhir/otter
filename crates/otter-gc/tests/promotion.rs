@@ -4,7 +4,7 @@
 use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{GcHeap, HandleScope};
 
-struct Tag;
+struct Tag(#[allow(dead_code)] u64);
 impl Traceable for Tag {
     const TYPE_TAG: u8 = 0x50;
     unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
@@ -17,18 +17,16 @@ fn objects_promote_after_one_survival() {
     let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
     let mut roots = Vec::new();
     for _ in 0..10 {
-        let g = heap.alloc(Tag).unwrap();
+        let g = heap.alloc(Tag(0)).unwrap();
         // Brand-new young.
         let header = g.as_header_ptr();
         assert!(unsafe { (*header).is_young() });
         roots.push(scope.local(g));
     }
 
-    // First scavenge — copies them to to-space, bumps source page
-    // survival_age. Since survival_age starts at 0 and the
-    // scavenger increments to 1 after this scavenge, the second
-    // scavenge reads survival_age == 1 ≥ PROMOTE_AFTER_SURVIVALS
-    // and promotes.
+    // First scavenge — copies them to to-space and sets that page's age
+    // mark above them; the second scavenge finds them below the mark and
+    // promotes.
     heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
     // Second scavenge — survivors should land in old space.
     heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
@@ -43,4 +41,31 @@ fn objects_promote_after_one_survival() {
             g.offset()
         );
     }
+}
+
+#[test]
+fn fresh_objects_on_a_survivor_page_are_copied_before_promotion() {
+    let mut heap = GcHeap::new().expect("heap");
+    heap.register_traceable::<Tag>();
+    let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let survivor = scope.local(heap.alloc(Tag(0)).unwrap());
+    // The survivor is copied to to-space; after the flip its page is the
+    // mutator's from-space page again.
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+    assert!(unsafe { (*survivor.get().as_header_ptr()).is_young() });
+
+    // Allocated after the collection, on the survivor's page, above its mark.
+    let fresh = scope.local(heap.alloc(Tag(0)).unwrap());
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+    assert!(
+        unsafe { (*survivor.get().as_header_ptr()).is_old() },
+        "a second survival promotes"
+    );
+    assert!(
+        unsafe { (*fresh.get().as_header_ptr()).is_young() },
+        "a first survival copies within the nursery even on an aged page"
+    );
+
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+    assert!(unsafe { (*fresh.get().as_header_ptr()).is_old() });
 }

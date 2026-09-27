@@ -453,7 +453,8 @@ pub(crate) fn emit_html_dda_candidate_exit(
 /// The runtime half is a leaf taking those two words directly, so even the
 /// slow path publishes no frame and re-enters nothing.
 ///
-/// Clobbers `x0`, `x1`, `x2`, `x14`, `x15` and `x16`.
+/// The fast path clobbers `x14`–`x16`; the slow path is an AAPCS call and
+/// clobbers every caller-saved register (`x0`–`x18`, `d0`–`d7`, `d16`–`d31`).
 pub(crate) fn emit_write_barrier(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

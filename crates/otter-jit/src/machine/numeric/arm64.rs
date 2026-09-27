@@ -3017,8 +3017,16 @@ fn emit_with_reach(
             }
             MachineOpcode::GuardCondition => {
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
-                emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
-                dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
+                // Test the allocated status in place; a spilled status uses
+                // the declared status scratch (x16) only.
+                let status = match integer_register(locations[0]) {
+                    Ok(register) => register,
+                    Err(_) => {
+                        emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                        16
+                    }
+                };
+                dynasm!(ops ; .arch aarch64 ; cbz X(status), =>miss);
             }
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;

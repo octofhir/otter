@@ -4071,12 +4071,20 @@ pub(crate) fn store_own_data_slot_atom(
         } else {
             body_shape_id(heap, body) == hit.shape_id
         };
+        if !shape_ok || key.atom().id() != hit.atom_id {
+            return false;
+        }
+        // Store hits are installed only for a writable data slot, and a
+        // matching fast shape fixes every slot's attributes, so neither the
+        // chain walk for this slot's attributes nor the bounds need
+        // consulting. Dictionary storage and overridden descriptors still do.
+        if !body.shape.is_null() && !body.slot_attrs_overridden {
+            return true;
+        }
         let key_matches = !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
         let slot_attrs =
             (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset));
-        shape_ok
-            && key.atom().id() == hit.atom_id
-            && key_matches
+        key_matches
             && slot_attrs.is_some_and(|(flags, is_accessor)| flags.writable() && !is_accessor)
     });
     if !guard_matches {

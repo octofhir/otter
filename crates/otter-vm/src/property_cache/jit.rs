@@ -27,6 +27,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{
     CAPACITY, Entry, HASH_ATOM_MULTIPLIER, HASH_SHAPE_MULTIPLIER, HASH_SHIFT, PropertyLookupCache,
+    StoreTransitionCache, StoreTransitionJitEntry, StoreTransitionWay,
 };
 use crate::object::AtomOwnPropertyHit;
 
@@ -66,6 +67,61 @@ pub struct JitPropertyLookupCache {
     pub hash_atom_multiplier: u64,
     /// Right shift after XORing the two wrapping products.
     pub hash_shift: u8,
+}
+
+/// Native layout of the one shared add-property transition table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitStoreTransitionCache {
+    /// Process-local address of the first scalar entry.
+    pub table_addr: usize,
+    /// Byte stride between table ways.
+    pub entry_bytes: u32,
+    /// Capacity minus one for the power-of-two table.
+    pub index_mask: u32,
+    /// Receiver shape identity offset within a way.
+    pub receiver_shape_byte: u32,
+    /// Direct prototype shape identity offset within a way.
+    pub prototype_shape_byte: u32,
+    /// Property atom offset within a way.
+    pub atom_byte: u32,
+    /// Compressed child shape offset, zero when no generated handler exists.
+    pub target_shape_byte: u32,
+    /// Appended flat property slot offset within a way.
+    pub slot_byte: u32,
+    /// Number of recorded missing-key prototype links.
+    pub chain_len_byte: u32,
+    /// Offset of the fixed prototype shape identity array.
+    pub chain_byte: u32,
+    /// Header-inclusive immutable shape identity offset.
+    pub shape_id_byte: u32,
+    /// Receiver shape hash multiplier.
+    pub hash_shape_multiplier: u64,
+    /// Property atom and prototype shape hash multiplier.
+    pub hash_atom_multiplier: u64,
+    /// Shift applied before the table mask.
+    pub hash_shift: u8,
+}
+
+impl StoreTransitionCache {
+    pub(crate) fn jit_layout(&self) -> JitStoreTransitionCache {
+        JitStoreTransitionCache {
+            table_addr: self.ways[0].jit.as_ptr() as usize,
+            entry_bytes: size_of::<StoreTransitionWay>() as u32,
+            index_mask: (CAPACITY - 1) as u32,
+            receiver_shape_byte: offset_of!(StoreTransitionJitEntry, receiver_shape) as u32,
+            prototype_shape_byte: offset_of!(StoreTransitionJitEntry, prototype_shape) as u32,
+            atom_byte: offset_of!(StoreTransitionJitEntry, atom) as u32,
+            target_shape_byte: offset_of!(StoreTransitionJitEntry, target_shape) as u32,
+            slot_byte: offset_of!(StoreTransitionJitEntry, slot) as u32,
+            chain_len_byte: offset_of!(StoreTransitionJitEntry, chain_len) as u32,
+            chain_byte: offset_of!(StoreTransitionJitEntry, chain) as u32,
+            shape_id_byte: (otter_gc::header::HEADER_SIZE + crate::object::SHAPE_BODY_ID_OFFSET)
+                as u32,
+            hash_shape_multiplier: HASH_SHAPE_MULTIPLIER,
+            hash_atom_multiplier: HASH_ATOM_MULTIPLIER,
+            hash_shift: HASH_SHIFT,
+        }
+    }
 }
 
 impl PropertyLookupCache {

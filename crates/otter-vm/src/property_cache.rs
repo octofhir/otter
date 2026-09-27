@@ -228,13 +228,82 @@ impl PropertyLookupCache {
 /// layout would otherwise evict each other's prototype-chain guards.
 #[derive(Debug)]
 pub(crate) struct StoreTransitionCache {
-    ways: Box<[Option<(ShapeId, object::StorePropertyTransition)>]>,
+    ways: Box<[StoreTransitionWay]>,
+}
+
+/// Scalar prefix read by generated code. Zero `target_shape` means that the
+/// runtime record has no allocation-free generated handler.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct StoreTransitionJitEntry {
+    receiver_shape: u64,
+    prototype_shape: u64,
+    atom: u32,
+    target_shape: u32,
+    slot: u16,
+    chain_len: u8,
+    _padding: u8,
+    chain: [u64; 8],
+}
+
+impl StoreTransitionJitEntry {
+    const EMPTY: Self = Self {
+        receiver_shape: 0,
+        prototype_shape: 0,
+        atom: 0,
+        target_shape: 0,
+        slot: 0,
+        chain_len: 0,
+        _padding: 0,
+        chain: [0; 8],
+    };
+
+    fn from_transition(
+        prototype_shape: ShapeId,
+        transition: &object::StorePropertyTransition,
+    ) -> Self {
+        let mut entry = Self {
+            receiver_shape: transition.from_shape_id.raw(),
+            prototype_shape: prototype_shape.raw(),
+            atom: transition.atom_id.raw(),
+            target_shape: transition.to_shape.get().offset(),
+            slot: transition.slot,
+            ..Self::EMPTY
+        };
+        match &transition.kind {
+            object::StorePropertyTransitionKind::OwnAdd => {}
+            object::StorePropertyTransitionKind::PrototypeChainMissing { chain } => {
+                entry.chain_len = chain.len() as u8;
+                for (dst, shape) in entry.chain.iter_mut().zip(chain) {
+                    *dst = shape.raw();
+                }
+            }
+            object::StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => {
+                entry.target_shape = 0;
+            }
+        }
+        entry
+    }
+}
+
+/// One fixed table way. The native prefix and VM replay record are published
+/// together by the single mutator; generated code reads only the scalar prefix.
+#[derive(Debug)]
+#[repr(C)]
+struct StoreTransitionWay {
+    jit: Cell<StoreTransitionJitEntry>,
+    transition: Option<(ShapeId, object::StorePropertyTransition)>,
 }
 
 impl Default for StoreTransitionCache {
     fn default() -> Self {
         Self {
-            ways: (0..CAPACITY).map(|_| None).collect(),
+            ways: (0..CAPACITY)
+                .map(|_| StoreTransitionWay {
+                    jit: Cell::new(StoreTransitionJitEntry::EMPTY),
+                    transition: None,
+                })
+                .collect(),
         }
     }
 }
@@ -242,7 +311,10 @@ impl Default for StoreTransitionCache {
 impl StoreTransitionCache {
     fn index(receiver_shape: ShapeId, prototype_shape: ShapeId, atom: AtomId) -> usize {
         let mixed = receiver_shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
-            ^ prototype_shape.raw().wrapping_mul(HASH_ATOM_MULTIPLIER).rotate_left(17)
+            ^ prototype_shape
+                .raw()
+                .wrapping_mul(HASH_ATOM_MULTIPLIER)
+                .rotate_left(17)
             ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
         ((mixed >> HASH_SHIFT) as usize) & (CAPACITY - 1)
     }
@@ -265,7 +337,7 @@ impl StoreTransitionCache {
         let receiver_shape = object::shape_id(obj, heap);
         let prototype_shape = proto_shape_id(obj, heap);
         let atom = key.atom().id();
-        match &self.ways[Self::index(receiver_shape, prototype_shape, atom)] {
+        match &self.ways[Self::index(receiver_shape, prototype_shape, atom)].transition {
             Some((recorded_prototype, transition))
                 if transition.from_shape_id == receiver_shape
                     && transition.atom_id == atom
@@ -284,14 +356,23 @@ impl StoreTransitionCache {
         prototype_shape: ShapeId,
         transition: object::StorePropertyTransition,
     ) {
-        let index = Self::index(transition.from_shape_id, prototype_shape, transition.atom_id);
-        self.ways[index] = Some((prototype_shape, transition));
+        let index = Self::index(
+            transition.from_shape_id,
+            prototype_shape,
+            transition.atom_id,
+        );
+        let jit = StoreTransitionJitEntry::from_transition(prototype_shape, &transition);
+        let way = &mut self.ways[index];
+        way.transition = Some((prototype_shape, transition));
+        way.jit.set(jit);
     }
 
     /// Visit the target shapes the recorded transitions keep alive.
     pub(crate) fn trace_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        for (_, transition) in self.ways.iter().flatten() {
-            transition.trace_roots(visitor);
+        for way in &self.ways {
+            if let Some((_, transition)) = &way.transition {
+                transition.trace_roots(visitor);
+            }
         }
     }
 }

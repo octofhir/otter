@@ -107,7 +107,7 @@ use otter_bytecode::opcode_schema::{
 pub(super) mod inline_calls;
 
 use otter_vm::{
-    JitCompileSnapshot, UPVALUE_CELL_TYPE_TAG, Value,
+    JitCompileSnapshot, Value,
     deopt::DeoptRuntime,
     native_abi::{
         ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
@@ -751,7 +751,6 @@ fn emit_binding_guard(
     let owner = integer_register(locations[1])?;
     let storage = integer_register(locations[2])?;
     let upvalue_value_byte = view.upvalue_value_byte;
-    let upvalue_cell_type_tag = UPVALUE_CELL_TYPE_TAG as u32;
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
 
@@ -793,37 +792,31 @@ fn emit_binding_guard(
         }
         MachineBindingTarget::Upvalue { index }
         | MachineBindingTarget::ClosureUpvalue { index } => {
-            if view.cage_base == 0 || index > 4095 {
+            if view.cage_base == 0 || index > 1023 || upvalue_value_byte > 4095 {
                 return Err(Unsupported::OperandShape("scalar upvalue binding target"));
             }
+            // The verifier bounds `index` by the owning function's exact
+            // spine, and every activation of that function publishes a
+            // complete spine of live cells: inherited cells come from the
+            // closure, own cells are allocated before entry and replaced only
+            // by fresh cells. Only the TDZ state of the binding is dynamic.
             if matches!(target, MachineBindingTarget::ClosureUpvalue { .. }) {
                 // The call guard proved this tagged value is the inlined
                 // callee's closure; a heap-cell Value carries its full
                 // address, and the call header holds the upvalue spine.
                 emit_load_allocated_tagged(ops, frame, locations[3], 10, 0)?;
-                let count_byte = view.closure_call_layout.upvalue_count_byte;
                 let base_byte = view.closure_call_layout.upvalue_base_byte;
                 dynasm!(ops
                     ; .arch aarch64
-                    ; ldr w11, [x10, count_byte]
-                    ; cmp w11, index
-                    ; b.ls =>miss
                     ; ldr x9, [x10, base_byte]
-                    ; cbz x9, =>miss
                     ; ldr w9, [x9, index * 4]
-                    ; cbz w9, =>miss
                 );
             } else {
                 dynasm!(ops
                     ; .arch aarch64
                     ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
-                    ; ldr w11, [x10, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-                    ; cmp w11, index
-                    ; b.ls =>miss
                     ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                    ; cbz x9, =>miss
                     ; ldr w9, [x9, index * 4]
-                    ; cbz w9, =>miss
                 );
             }
             emit_load_symbolic_u64(
@@ -833,14 +826,10 @@ fn emit_binding_guard(
                 view.cage_base as u64,
                 RelocationTarget::GcCageBase,
             );
-            emit_load_u64(ops, 16, u64::from(upvalue_value_byte));
             dynasm!(ops
                 ; .arch aarch64
                 ; add X(owner), x13, x9
-                ; ldrb w10, [X(owner)]
-                ; cmp w10, upvalue_cell_type_tag
-                ; b.ne =>miss
-                ; add X(storage), X(owner), x16
+                ; add XSP(storage), XSP(owner), upvalue_value_byte
             );
             if binding_requires_live_cell(semantics) {
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [X(storage)]);
@@ -5284,7 +5273,7 @@ fn float_register(location: AllocatedLocation) -> Result<u8, Unsupported> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RelocationCapture, emit, emit_binding_guard, emit_load_u64, frame_layout};
+    use super::{RelocationCapture, emit, emit_binding_guard, frame_layout};
     use crate::{
         entry::TransitionTable,
         machine::{
@@ -5797,8 +5786,8 @@ mod tests {
         let code = assembler.finalize().expect("binding guard code");
 
         let mut expected = dynasmrt::aarch64::Assembler::new().expect("expected assembler");
-        emit_load_u64(&mut expected, 16, u64::from(view.upvalue_value_byte));
-        let expected = expected.finalize().expect("offset load code");
+        dynasmrt::dynasm!(expected ; .arch aarch64 ; add x2, x1, 0x38);
+        let expected = expected.finalize().expect("offset add code");
         assert!(
             code.as_ref()
                 .windows(expected.len())

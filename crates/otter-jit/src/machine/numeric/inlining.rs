@@ -106,6 +106,9 @@ fn splice_tree(
             if body.nodes.len() > MAX_INLINE_NODES || body.blocks.len() > 8 {
                 return Err("source body budget".into());
             }
+            if !body.entry_arguments.is_empty() {
+                return Err("callee entry is a loop header".into());
+            }
             ancestry.push(candidate.code_block.id);
             nested_diagnostics = splice_tree(&mut body, candidate, capture_events, ancestry);
             ancestry.pop();

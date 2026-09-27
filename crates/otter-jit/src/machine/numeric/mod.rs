@@ -721,6 +721,85 @@ fn select_with_loop_entries(
         let first = MachineInstructionId(instructions.len() as u32);
         let block_index = match *selected {
             SelectedBlock::Original(block_index) => block_index,
+            SelectedBlock::EntryPrologue => {
+                for (parameter, &tagged) in tagged_parameters.iter().enumerate() {
+                    let Some(tagged) = tagged else {
+                        continue;
+                    };
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::EntryValue(parameter as u16),
+                        vec![MachineOperand::register_output(tagged)],
+                    ));
+                }
+                for &node in &hir.prologue_nodes {
+                    let result = machine_value(&values, node);
+                    match hir.nodes[node.0] {
+                        NumericNode::Parameter {
+                            value_type: NumericType::Tagged,
+                            ..
+                        } => {}
+                        NumericNode::Parameter {
+                            register,
+                            value_type,
+                        } => {
+                            let tagged = tagged_parameters[usize::from(register)]
+                                .expect("live HIR parameter has an entry value");
+                            let opcode = match value_type {
+                                NumericType::Int32 => MachineOpcode::DecodeInt32,
+                                NumericType::Number => MachineOpcode::DecodeNumber,
+                                _ => unreachable!("parameter inference emits only Int32 or Number"),
+                            };
+                            instructions.push(MachineInstruction::plain(
+                                opcode,
+                                vec![
+                                    MachineOperand::register_input(tagged),
+                                    MachineOperand::register_output(result),
+                                ],
+                            ));
+                        }
+                        NumericNode::TaggedConstant(bits) => {
+                            instructions.push(MachineInstruction::plain(
+                                MachineOpcode::TaggedConstant(bits),
+                                vec![MachineOperand::register_output(result)],
+                            ));
+                        }
+                        _ => {
+                            return Err(super::VerificationError::OpcodeSignatureMismatch(
+                                MachineInstructionId(instructions.len() as u32),
+                            ));
+                        }
+                    }
+                }
+                let header = selection_cfg.originals[0];
+                let arguments = hir
+                    .entry_arguments
+                    .iter()
+                    .zip(&hir.blocks[0].parameters)
+                    .map(|(&argument, &parameter)| {
+                        select_edge_argument(
+                            hir,
+                            &values,
+                            &mut representations,
+                            &mut instructions,
+                            argument,
+                            parameter,
+                            header,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+                jump.control = ControlFlow::Branch;
+                instructions.push(jump);
+                blocks.push(MachineBlockData {
+                    first,
+                    end: MachineInstructionId(instructions.len() as u32),
+                    predecessors: Vec::new(),
+                    successors: vec![header],
+                    parameters: Vec::new(),
+                    successor_arguments: vec![arguments],
+                });
+                continue;
+            }
             SelectedBlock::NativeCallHit(block_index)
             | SelectedBlock::NativeCallCold(block_index)
             | SelectedBlock::NativeCallJoin(block_index) => {
@@ -950,7 +1029,7 @@ fn select_with_loop_entries(
             }
         };
         let block = &hir.blocks[block_index];
-        if block_index == 0 {
+        if block_index == 0 && selection_cfg.prologue.is_none() {
             for (parameter, &tagged) in tagged_parameters.iter().enumerate() {
                 let Some(tagged) = tagged else {
                     continue;
@@ -2958,7 +3037,7 @@ fn select_with_loop_entries(
     );
     InstructionSequence::new_selected(
         target_spec,
-        selection_cfg.originals[0],
+        selection_cfg.prologue.unwrap_or(selection_cfg.originals[0]),
         representations,
         call_descriptors,
         machine_frame_states(hir),
@@ -4343,6 +4422,9 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedBlock {
+    /// The function entry when HIR block 0 is also a loop header: it reads
+    /// the frame's entry values once and enters the header with them.
+    EntryPrologue,
     NativeCallHit(usize),
     NativeCallCold(usize),
     NativeCallJoin(usize),
@@ -4384,6 +4466,7 @@ struct BindingSelectedBlocks {
 
 struct SelectionCfg {
     order: Vec<SelectedBlock>,
+    prologue: Option<MachineBlock>,
     originals: Vec<MachineBlock>,
     split_edges: BTreeMap<(usize, usize), MachineBlock>,
     bindings: BTreeMap<usize, BindingSelectedBlocks>,
@@ -4401,6 +4484,10 @@ impl SelectionCfg {
         let mut properties = BTreeMap::new();
         let mut elements = BTreeMap::new();
         let mut native_calls = BTreeMap::new();
+        let prologue = (!hir.entry_arguments.is_empty()).then(|| {
+            order.push(SelectedBlock::EntryPrologue);
+            MachineBlock(0)
+        });
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
                 if is_critical_edge(hir, predecessor, successor)
@@ -4525,6 +4612,7 @@ impl SelectionCfg {
         }
         Self {
             order,
+            prologue,
             originals,
             split_edges,
             bindings,
@@ -4765,6 +4853,9 @@ fn machine_block(
                 .unwrap_or_else(|| selection_cfg.normal_exit(predecessor))
         })
         .collect::<Vec<_>>();
+    if block_index == 0 {
+        predecessors.extend(selection_cfg.prologue);
+    }
     predecessors.sort_unstable();
     MachineBlockData {
         first,
@@ -4811,6 +4902,8 @@ mod tests {
             parameter_count: 2,
             register_count: 2,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
             nodes: vec![
                 NumericNode::Parameter {
                     register: 0,
@@ -4998,6 +5091,8 @@ mod tests {
                 parameter_count: 0,
                 register_count: 1,
                 arithmetic_op_count: 0,
+                entry_arguments: Vec::new(),
+                prologue_nodes: Vec::new(),
             },
             source,
             parameter,
@@ -5068,6 +5163,8 @@ mod tests {
             parameter_count: 0,
             register_count: 1,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -5161,6 +5258,8 @@ mod tests {
             parameter_count: 1,
             register_count: 3,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -5223,6 +5322,8 @@ mod tests {
             parameter_count: 1,
             register_count: 2,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -5276,6 +5377,8 @@ mod tests {
             parameter_count: 1,
             register_count: 3,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -5401,6 +5504,8 @@ mod tests {
             parameter_count: 0,
             register_count: 2,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -5507,6 +5612,8 @@ mod tests {
             parameter_count: 3,
             register_count: 4,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -7601,6 +7708,8 @@ mod tests {
             parameter_count: 2,
             register_count: 3,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -7747,6 +7856,8 @@ mod tests {
             parameter_count: 0,
             register_count: 3,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -8058,6 +8169,8 @@ mod tests {
             parameter_count: 0,
             register_count: 1,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -8108,6 +8221,8 @@ mod tests {
             parameter_count: 1,
             register_count: 2,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         }
     }
 
@@ -12121,6 +12236,8 @@ mod tests {
             parameter_count: 0,
             register_count: 0,
             arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         };
         let sequence = select(&hir).expect("nested-loop Machine body");
         let osr_pcs = sequence

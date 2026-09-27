@@ -805,6 +805,13 @@ pub(super) struct NumericFunction {
     pub(super) parameter_count: u16,
     pub(super) register_count: u16,
     pub(super) arithmetic_op_count: usize,
+    /// Values block 0's parameters take on the implicit function-entry edge.
+    /// Non-empty only when block 0 is also a loop header: its back edges
+    /// merge with the entry, so selection enters through a separate prologue.
+    pub(super) entry_arguments: Vec<NumericValue>,
+    /// Entry reads (parameters and the fresh-activation `undefined`) the
+    /// prologue materializes when block 0 is a loop header.
+    pub(super) prologue_nodes: Vec<NumericValue>,
 }
 
 /// Natural-loop external edges that require a dedicated Machine preheader.
@@ -1023,6 +1030,8 @@ impl NumericFunction {
         let mut exceptional_out_states =
             Vec::<Option<Vec<RegisterState>>>::with_capacity(raw_blocks.len());
         let mut arithmetic_op_count = 0usize;
+        let mut entry_arguments = Vec::new();
+        let mut prologue_nodes = Vec::new();
         let mut frame_states = Vec::new();
         let mut direct_call_targets = Vec::new();
         let mut operand_values = Vec::new();
@@ -1073,6 +1082,7 @@ impl NumericFunction {
                     return None;
                 }
             };
+            let entry_state = (block_index == 0).then(|| registers.clone());
             if raw
                 .predecessors
                 .iter()
@@ -1102,7 +1112,21 @@ impl NumericFunction {
                 note_structural(decline, "exception parameter merge");
                 return None;
             }
-            let mut block_nodes = if block_index == 0 {
+            // A looping entry block receives its entry values through the
+            // prologue's edge; the reads themselves run once, in the prologue.
+            if let Some(entry_state) = entry_state.as_ref()
+                && !parameters.is_empty()
+            {
+                entry_arguments = parameter_regs
+                    .iter()
+                    .map(|&register| match entry_state.get(usize::from(register)) {
+                        Some(RegisterState::Value(value)) => Some(*value),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                prologue_nodes = entry_nodes.clone();
+            }
+            let mut block_nodes = if block_index == 0 && entry_arguments.is_empty() {
                 entry_nodes.clone()
             } else {
                 Vec::new()
@@ -1395,6 +1419,8 @@ impl NumericFunction {
                 parameter_count,
                 register_count,
                 arithmetic_op_count,
+                entry_arguments,
+                prologue_nodes,
             },
             next_phi_types,
             retry,

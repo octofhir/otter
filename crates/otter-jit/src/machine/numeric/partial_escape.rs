@@ -857,6 +857,8 @@ mod tests {
             parameter_count: 0,
             register_count: 2,
             arithmetic_op_count: 1,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
         };
 
         let stats = optimize(&mut function);

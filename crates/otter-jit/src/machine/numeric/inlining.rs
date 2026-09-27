@@ -31,8 +31,12 @@ use otter_vm::{
     deopt::{DeoptFrame, DeoptFrameEntry},
 };
 
-const MAX_INLINE_NODES: usize = 64;
-const MAX_ADDED_NODES: usize = 256;
+/// Largest callee, in bytecode bytes, that is inlined at all; TurboFan's
+/// `max_inlined_bytecode_size`.
+const MAX_INLINED_BYTECODE_BYTES: usize = 460;
+/// Bytecode bytes inlined into one optimized function across its whole
+/// inlining tree; TurboFan's `max_inlined_bytecode_size_cumulative`.
+const MAX_CUMULATIVE_INLINED_BYTECODE_BYTES: usize = 920;
 
 /// Each scalar node costs one unit; parameter boxing/decoding costs at most
 /// two, and callable/this guarding one. Diagnostics are published only after
@@ -47,6 +51,7 @@ pub(super) fn splice(
         view,
         capture_events,
         &mut vec![view.code_block.id],
+        &mut 0,
     )
 }
 
@@ -55,6 +60,7 @@ fn splice_tree(
     view: &JitCompileSnapshot,
     capture_events: bool,
     ancestry: &mut Vec<u32>,
+    inlined_bytes: &mut usize,
 ) -> Vec<otter_vm::JitCompilerDiagnostic> {
     let original_nodes = function.nodes.len();
     let mut diagnostics = Vec::new();
@@ -101,16 +107,26 @@ fn splice_tree(
             if candidate.code_block.id != target.candidates[0].callee.plan.function_id {
                 return Err("callee snapshot disagrees with target".into());
             }
+            let callee_bytes = candidate.code_block.bytecode_byte_len() as usize;
+            if callee_bytes > MAX_INLINED_BYTECODE_BYTES {
+                return Err("callee bytecode budget".into());
+            }
+            if *inlined_bytes + callee_bytes > MAX_CUMULATIVE_INLINED_BYTECODE_BYTES {
+                return Err("cumulative bytecode budget".into());
+            }
             let mut body = NumericFunction::build(candidate)
                 .map_err(|reason| format!("callee HIR: {reason:?}"))?;
-            if body.nodes.len() > MAX_INLINE_NODES || body.blocks.len() > 8 {
-                return Err("source body budget".into());
-            }
             if !body.entry_arguments.is_empty() {
                 return Err("callee entry is a loop header".into());
             }
             ancestry.push(candidate.code_block.id);
-            nested_diagnostics = splice_tree(&mut body, candidate, capture_events, ancestry);
+            nested_diagnostics = splice_tree(
+                &mut body,
+                candidate,
+                capture_events,
+                ancestry,
+                inlined_bytes,
+            );
             ancestry.pop();
             cost = body.nodes.len() + 2 * usize::from(body.parameter_count) + 1;
             if target.kind == NumericDirectCallKind::Construct {
@@ -119,9 +135,6 @@ fn splice_tree(
                     .iter()
                     .filter(|block| matches!(block.terminator, NumericTerminator::Return(_)))
                     .count();
-            }
-            if function.nodes.len() - original_nodes + cost > MAX_ADDED_NODES {
-                return Err("caller growth budget".into());
             }
             if let Some(node) = body.nodes.iter().copied().find(|&node| {
                 !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
@@ -181,10 +194,8 @@ fn splice_tree(
                 this_mode,
             )
             .ok_or("scalar splice frame or argument contract")?;
-            if proposed.nodes.len() - original_nodes > MAX_ADDED_NODES {
-                return Err("caller growth budget".into());
-            }
             *function = proposed;
+            *inlined_bytes += callee_bytes;
             Ok(())
         })();
         if capture_events {

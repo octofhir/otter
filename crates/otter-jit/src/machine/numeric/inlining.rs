@@ -126,7 +126,7 @@ fn splice_tree(
             if let Some(node) = body.nodes.iter().copied().find(|&node| {
                 !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
                     && !(target.kind == NumericDirectCallKind::Construct && is_new_target(node))
-                    && map_body_node(node, &|v| v).is_none()
+                    && map_body_node(node, &|v| v, NumericValue(0)).is_none()
             }) {
                 return Err(format!("unsupported callee operation: {node:?}"));
             }
@@ -432,7 +432,7 @@ fn splice_one(
         if !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
             && !(construct && is_new_target(node))
         {
-            let mut mapped = map_body_node(node, &map)?;
+            let mut mapped = map_body_node(node, &map, callable)?;
             match &mut mapped {
                 NumericNode::InlineMethodGuard { target, .. } => {
                     *target = target.checked_add(target_base)?
@@ -662,12 +662,46 @@ fn is_new_target(node: NumericNode) -> bool {
     )
 }
 
+/// `closure` is the callee value the call guard proved: an inlined body has
+/// no native frame of its own, so its upvalue reads address that closure.
 fn map_body_node(
     node: NumericNode,
     map: &impl Fn(NumericValue) -> NumericValue,
+    closure: NumericValue,
 ) -> Option<NumericNode> {
     use NumericNode::*;
     Some(match node {
+        BindingGuardedRead {
+            semantics:
+                semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
+                    otter_bytecode::opcode_schema::BindingRead::Upvalue { .. },
+                ),
+            target: NumericBindingTarget::Upvalue { index },
+            byte_pc,
+        } if cfg!(target_arch = "aarch64") => BindingGuardedRead {
+            semantics,
+            target: NumericBindingTarget::ClosureUpvalue { index, closure },
+            byte_pc,
+        },
+        BindingGuardedRead {
+            semantics:
+                semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
+                    otter_bytecode::opcode_schema::BindingRead::Upvalue { .. },
+                ),
+            target:
+                NumericBindingTarget::ClosureUpvalue {
+                    index,
+                    closure: nested,
+                },
+            byte_pc,
+        } => BindingGuardedRead {
+            semantics,
+            target: NumericBindingTarget::ClosureUpvalue {
+                index,
+                closure: map(nested),
+            },
+            byte_pc,
+        },
         Binding {
             semantics:
                 semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(

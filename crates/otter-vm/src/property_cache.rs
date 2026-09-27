@@ -9,7 +9,8 @@
 //! # Contents
 //! - [`PropertyLookupCache`] — the direct-mapped table.
 //! - [`StoreTransitionCache`] — the add-a-property counterpart: shared
-//!   `(receiver shape, atom)` hidden-class transitions for megamorphic stores,
+//!   `(receiver shape, prototype shape, atom)` hidden-class transitions for
+//!   megamorphic stores,
 //!   V8's megamorphic stub cache holding transition handlers.
 //! - [`jit`] — the same table's owned layout description for generated loads.
 //!
@@ -215,15 +216,19 @@ impl PropertyLookupCache {
     }
 }
 
-/// Direct-mapped `(receiver shape, atom)` → add-property transition table.
+/// Direct-mapped `(receiver shape, prototype shape, atom)` → add-property
+/// transition table.
 ///
 /// A store site that has gone megamorphic stops installing its own
 /// transitions; without this table every property-adding store at such a site
 /// would repeat the complete `[[Set]]` walk. Sites share the entries, exactly
-/// as V8's megamorphic stub cache shares transition handlers.
+/// as V8's megamorphic stub cache shares transition handlers. A hidden class
+/// here does not fix the prototype, unlike a V8 map, so the direct
+/// prototype's class joins the key: sibling subclasses sharing one receiver
+/// layout would otherwise evict each other's prototype-chain guards.
 #[derive(Debug)]
 pub(crate) struct StoreTransitionCache {
-    ways: Box<[Option<object::StorePropertyTransition>]>,
+    ways: Box<[Option<(ShapeId, object::StorePropertyTransition)>]>,
 }
 
 impl Default for StoreTransitionCache {
@@ -235,7 +240,15 @@ impl Default for StoreTransitionCache {
 }
 
 impl StoreTransitionCache {
-    /// Replay the recorded transition for this receiver class and name.
+    fn index(receiver_shape: ShapeId, prototype_shape: ShapeId, atom: AtomId) -> usize {
+        let mixed = receiver_shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
+            ^ prototype_shape.raw().wrapping_mul(HASH_ATOM_MULTIPLIER).rotate_left(17)
+            ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
+        ((mixed >> HASH_SHIFT) as usize) & (CAPACITY - 1)
+    }
+
+    /// Replay the recorded transition for this receiver class, prototype
+    /// class and name.
     ///
     /// `Ok(Some(()))` committed the store; `Ok(None)` is an allocation-free
     /// miss (nothing recorded, or a replay guard failed).
@@ -250,10 +263,13 @@ impl StoreTransitionCache {
             return Ok(None);
         }
         let receiver_shape = object::shape_id(obj, heap);
+        let prototype_shape = proto_shape_id(obj, heap);
         let atom = key.atom().id();
-        match &self.ways[PropertyLookupCache::index(receiver_shape, atom)] {
-            Some(transition)
-                if transition.from_shape_id == receiver_shape && transition.atom_id == atom =>
+        match &self.ways[Self::index(receiver_shape, prototype_shape, atom)] {
+            Some((recorded_prototype, transition))
+                if transition.from_shape_id == receiver_shape
+                    && transition.atom_id == atom
+                    && *recorded_prototype == prototype_shape =>
             {
                 object::replay_store_property_transition(obj, heap, key, transition, value)
             }
@@ -261,18 +277,29 @@ impl StoreTransitionCache {
         }
     }
 
-    /// Record one captured transition, displacing whatever shared its index.
-    pub(crate) fn record(&mut self, transition: object::StorePropertyTransition) {
-        let index = PropertyLookupCache::index(transition.from_shape_id, transition.atom_id);
-        self.ways[index] = Some(transition);
+    /// Record one transition captured on `obj` before the store, displacing
+    /// whatever shared its index.
+    pub(crate) fn record(
+        &mut self,
+        prototype_shape: ShapeId,
+        transition: object::StorePropertyTransition,
+    ) {
+        let index = Self::index(transition.from_shape_id, prototype_shape, transition.atom_id);
+        self.ways[index] = Some((prototype_shape, transition));
     }
 
     /// Visit the target shapes the recorded transitions keep alive.
     pub(crate) fn trace_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        for transition in self.ways.iter().flatten() {
+        for (_, transition) in self.ways.iter().flatten() {
             transition.trace_roots(visitor);
         }
     }
+}
+
+/// The class of `obj`'s prototype, or [`ShapeId::UNASSIGNED`] when it has none.
+#[must_use]
+pub(crate) fn prototype_shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
+    proto_shape_id(obj, heap)
 }
 
 /// The class of `obj`'s prototype, or [`ShapeId::UNASSIGNED`] when it has none.

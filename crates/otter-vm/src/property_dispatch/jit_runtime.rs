@@ -320,6 +320,8 @@ impl Interpreter {
                     }
                 } else {
                     path = Path::InstallTransition;
+                    let prototype_shape =
+                        crate::property_cache::prototype_shape_id(current_obj, &self.gc_heap);
                     if let Some(transition) = self
                         .capture_store_property_transition_with_stack_roots(
                             stack,
@@ -328,7 +330,8 @@ impl Interpreter {
                             &value,
                         )?
                     {
-                        self.store_transition_cache.record(transition);
+                        self.store_transition_cache
+                            .record(prototype_shape, transition);
                         return Ok(());
                     }
                 }

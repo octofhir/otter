@@ -1055,6 +1055,11 @@ pub struct Interpreter {
     /// count from the canonical native-activation scan. Each (native address,
     /// materialized index) also identifies the same frame during stack capture.
     jit_materialized_generated_calls: Vec<(usize, usize)>,
+    /// Activation-array indices of published frames whose registers live in
+    /// the interpreter arena (outer compiled entries). Every other published
+    /// activation is a generated frame, so the generated call depth is the
+    /// cursor minus this count.
+    jit_arena_activation_indices: Vec<usize>,
     /// Whether synchronous `Atomics.wait` may block this isolate's host thread.
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed

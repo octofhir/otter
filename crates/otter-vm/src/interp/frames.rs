@@ -190,6 +190,14 @@ impl Interpreter {
         // activation becomes visible to GC.
         unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
+        if !frame
+            .header
+            .flags
+            .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
+        {
+            self.jit_arena_activation_indices
+                .push(self.jit_native_activation_top);
+        }
         self.jit_native_activations[self.jit_native_activation_top] = jit::JitNativeActivation {
             frame: std::ptr::from_mut(frame),
         };
@@ -239,6 +247,9 @@ impl Interpreter {
     pub fn jit_pop_native_activation(&mut self) {
         debug_assert!(self.jit_native_activation_top > 0);
         self.jit_native_activation_top -= 1;
+        if self.jit_arena_activation_indices.last() == Some(&self.jit_native_activation_top) {
+            self.jit_arena_activation_indices.pop();
+        }
         self.jit_native_activations[self.jit_native_activation_top] =
             jit::JitNativeActivation::EMPTY;
     }
@@ -252,25 +263,12 @@ impl Interpreter {
     /// the transfer count removes here.
     #[inline]
     pub(crate) fn jit_generated_call_depth(&self) -> u32 {
-        // No published activation means no generated frame and no transferred
-        // one either, so the whole scan and the saturating transfer subtraction
-        // collapse to zero. Every bytecode call consults this depth.
-        if self.jit_native_activation_top == 0 {
-            return 0;
-        }
-        let published = self.jit_native_activations[..self.jit_native_activation_top]
-            .iter()
-            .filter(|activation| {
-                // SAFETY: generated publication keeps every frame and its
-                // windows live until the matching activation pop.
-                let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(activation.frame) }
-                    .expect("published native activation must remain valid");
-                frame
-                    .header()
-                    .flags
-                    .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
-            })
-            .count();
+        // Every bytecode call consults this depth, so it is O(1): generated
+        // code publishes only stack-register frames, and Rust publication
+        // records the arena-register ones it pushes.
+        let published = self
+            .jit_native_activation_top
+            .saturating_sub(self.jit_arena_activation_indices.len());
         u32::try_from(published)
             .unwrap_or(u32::MAX)
             .saturating_sub(self.jit_materialized_generated_calls.len() as u32)

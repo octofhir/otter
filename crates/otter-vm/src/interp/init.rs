@@ -228,6 +228,7 @@ impl Interpreter {
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
             jit_materialized_generated_calls: Vec::new(),
+            jit_arena_activation_indices: Vec::new(),
             allow_blocking_atomics_wait: false,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),

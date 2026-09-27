@@ -34,7 +34,10 @@ var a = {x:1.25,y:2,z:3}, b = {x:4,y:5,z:6}, mark = {before:0,after:0};
 // Two shapes of `a` keep its reads CacheIR probes with committed cold
 // siblings, so a later getter reenters and returns to this Machine body.
 var a2 = {w:0,x:1.25,y:2,z:3};
-for (var i=0;i<70000;i++) caller((i&1)?a2:a,b,mark);
+// A polymorphic warm-up site keeps `caller` out of the loop's OSR body, so
+// `caller` tiers up as its own Machine unit.
+var callers = [caller, function(){}];
+for (var i=0;i<70000;i++) callers[(i&63)===63?1:0]((i&1)?a2:a,b,mark);
 "#,
             ),
             "inline-property-warm.js",
@@ -173,7 +176,9 @@ var receiver = {x:1,y:2,z:3};
 var dot = factory.call(receiver);
 function caller(b) { return dot(b); }
 var b = {x:4,y:5,z:6};
-for(var i=0;i<70000;i++) caller(b);
+// A polymorphic warm-up site keeps `caller` out of the loop's OSR body.
+var callers = [caller, function(){}];
+for(var i=0;i<70000;i++) callers[(i&63)===63?1:0](b);
 "#,
             ),
             "inline-arrow-property-warm.js",

@@ -79,3 +79,34 @@ fn a_cap_triggered_collection_during_a_variable_allocation_is_survivable() {
     }
     assert!(allocations > 0, "at least one allocation should succeed");
 }
+
+#[test]
+fn young_trailing_allocation_uses_pending_trace_before_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static PENDING: AtomicUsize = AtomicUsize::new(0);
+    struct Tail {
+        published: bool,
+    }
+    impl otter_gc::SafeTraceable for Tail {
+        const TYPE_TAG: u8 = 0xF8;
+        fn trace_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {
+            assert!(
+                self.published,
+                "heap tracer received an unpublished stack body"
+            );
+        }
+        fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {
+            assert!(!self.published);
+            PENDING.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let mut heap = GcHeap::with_max_heap_bytes(4096).expect("heap");
+    for _ in 0..64 {
+        let handle = heap
+            .alloc_trailing_with_roots(Tail { published: false }, 1024, &mut |_| {})
+            .expect("young trailing allocation");
+        heap.with_payload(handle, |body| body.published = true);
+    }
+    assert!(heap.gc_stats().gc_cycles > 0);
+    assert!(PENDING.load(Ordering::Relaxed) > 0);
+}

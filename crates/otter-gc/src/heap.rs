@@ -1405,7 +1405,7 @@ impl GcHeap {
             // GC slots embedded in that payload before it is copied into the
             // freshly carved heap cell below.
             unsafe {
-                T::trace_slots(pending_value, visitor);
+                T::trace_pending_slots(pending_value, visitor);
             }
         };
 

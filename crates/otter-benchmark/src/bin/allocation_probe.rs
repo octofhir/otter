@@ -6,6 +6,7 @@
 //!   remembered-set work, compilation, reentry, and deoptimization.
 //! - `emit-kernel` writes the same workload as an `engineKernel` JavaScript
 //!   function for production measurement through `otter-engine-benchmark`.
+//! - `script <path>` reports per-type allocation deltas for an unchanged script.
 //!
 //! # Invariants
 //! - `OTTER_GC_STRESS` is configured by the invoking process, never mutated here.
@@ -30,6 +31,9 @@ use serde_json::json;
 mod reentrant_allocations;
 use reentrant_allocations::AllocationFixture;
 
+#[path = "allocation_probe/script.rs"]
+mod script;
+
 fn invalid_argument(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -45,6 +49,15 @@ fn fixture_named(name: &str) -> Result<AllocationFixture, io::Error> {
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "construct".to_owned());
+    if command == "script" {
+        let path = args
+            .next()
+            .ok_or_else(|| invalid_argument("script requires a path"))?;
+        if args.next().is_some() {
+            return Err(invalid_argument("usage: otter-allocation-probe script <path>").into());
+        }
+        return script::run(std::path::Path::new(&path));
+    }
     if command == "emit-kernel" {
         let fixture = fixture_named(args.next().as_deref().unwrap_or("construct"))?;
         let allocations: usize = args

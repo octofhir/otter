@@ -578,7 +578,6 @@ impl JsClosure {
     }
 
     /// Captured direct-eval variable environment, if any.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn eval_env(self, heap: &GcHeap) -> Option<crate::eval_env::EvalEnvHandle> {
         heap.read_payload(self.handle, JsClosureBody::eval_env_option)

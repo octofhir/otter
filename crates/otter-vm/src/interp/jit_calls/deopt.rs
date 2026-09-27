@@ -330,15 +330,21 @@ impl Interpreter {
             let function = context
                 .exec_function(deopt.function_id)
                 .ok_or(VmError::InvalidOperand)?;
-            let upvalues: crate::frame_state::UpvalueSpine = if index == 0 {
-                (0..active.upvalue_count())
+            let (upvalues, eval_env): (crate::frame_state::UpvalueSpine, _) = if index == 0 {
+                let upvalues = (0..active.upvalue_count())
                     .map(|index| active.upvalue(index as u32))
                     .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice()
+                    .into_boxed_slice();
+                (upvalues, None)
             } else {
+                // A spliced callee resumes with its closure's dynamic eval
+                // chain, exactly as an interpreter call would enter it.
                 match entry.closure.as_closure(&self.gc_heap) {
-                    Some(closure) => closure.upvalues_snapshot(&self.gc_heap).into_boxed_slice(),
-                    None => Vec::new().into_boxed_slice(),
+                    Some(closure) => (
+                        closure.upvalues_snapshot(&self.gc_heap).into_boxed_slice(),
+                        closure.eval_env(&self.gc_heap),
+                    ),
+                    None => (Vec::new().into_boxed_slice(), None),
                 }
             };
             let mut window = self.alloc_reg_window(deopt.slots.len())?;
@@ -352,6 +358,9 @@ impl Interpreter {
                 window,
             );
             frame.self_value = entry.closure;
+            if let Some(env) = eval_env {
+                frame.eval_env = env;
+            }
             frame.pc = resume_pcs[index];
             materialized.push(frame);
             self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {

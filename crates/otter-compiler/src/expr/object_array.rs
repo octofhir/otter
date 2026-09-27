@@ -72,6 +72,9 @@ pub(crate) fn compile_array_literal(
             span,
         );
         for el in &arr.elements {
+            // Each element's temporaries die once it is appended, so a
+            // literal of any length needs a constant number of registers.
+            let mark = cx.scratch;
             match el {
                 oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
                     let inner_span = (s.span.start, s.span.end);
@@ -100,6 +103,7 @@ pub(crate) fn compile_array_literal(
                     );
                 }
             }
+            cx.reset_scratch(mark);
         }
         Ok(dst)
     }

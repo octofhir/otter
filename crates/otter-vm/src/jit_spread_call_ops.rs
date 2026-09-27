@@ -145,6 +145,14 @@ impl Interpreter {
             // program names the exact data slot that produced this callable.
             // Accessors, proxies, exotic receivers, and deep chains therefore
             // remain unrecorded rather than weakening the generated guard.
+            // A receiver no guard can describe gets no record, so without
+            // saturation the site would repeat this capture on every call.
+            if capture_site
+                && method_site.is_none()
+                && let Some(feedback_site) = feedback_site
+            {
+                interp.saturate_method_site_feedback(feedback_site);
+            }
             if let (Some(feedback_site), Some(method_site)) = (feedback_site, method_site) {
                 let method_function = method.as_function().or_else(|| {
                     method
@@ -167,12 +175,18 @@ impl Interpreter {
                             usize::from(declaration.argument_count) == args_len
                                 && !declaration.this_operand
                         })
-                        .is_some_and(|declaration| {
+                        .map(|declaration| {
                             interp.record_method_native_leaf_feedback(
                                 feedback_site,
                                 declaration.leaf_stub_id,
                                 method_site,
                             )
+                        })
+                        .unwrap_or_else(|| {
+                            // A native no leaf entry declares is never
+                            // recorded; stop capturing the site.
+                            interp.saturate_method_site_feedback(feedback_site);
+                            false
                         })
                 };
                 interp.commit_method_call_feedback_transition(function, function_id, changed);

@@ -1637,7 +1637,16 @@ mod tests {
         native_abi::{NativeFrame, NativeFrameKind, NativeResultDomain, VmFrameHeader, VmThread},
     };
 
-    fn with_frameless_ctx(test: impl FnOnce(&mut JitCtx, &mut Option<VmError>)) {
+    /// The stubs write the error slot through `ctx.error`, so tests read it
+    /// back through that same pointer after each call; a `&mut` held across
+    /// the stub would alias the write.
+    fn ctx_error(ctx: &mut JitCtx) -> &mut Option<VmError> {
+        // SAFETY: `with_frameless_ctx` keeps the slot live for the test, and
+        // each borrow ends before the next stub call.
+        unsafe { &mut *ctx.error }
+    }
+
+    fn with_frameless_ctx(test: impl FnOnce(&mut JitCtx)) {
         let mut registers = [Value::undefined()];
         let mut frame = NativeFrame::new(
             VmFrameHeader {
@@ -1669,15 +1678,15 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
         };
-        test(&mut ctx, &mut error);
+        test(&mut ctx);
     }
 
     #[test]
     fn frameless_complex_transition_is_an_exact_pre_effect_bail() {
-        with_frameless_ctx(|ctx, error| {
+        with_frameless_ctx(|ctx| {
             let status = jit_iterator_op_stub(ctx, 0, 0, 0, 0);
             assert_eq!(status, NativeResultStatus::SideExit as u64);
-            assert!(error.is_none());
+            assert!(ctx_error(ctx).is_none());
             assert!(matches!(
                 ctx.materialized_frame_index(),
                 Err(VmError::InvalidOperand)
@@ -1687,7 +1696,7 @@ mod tests {
 
     #[test]
     fn frameless_exception_bail_preserves_the_stamped_opcode_pc() {
-        with_frameless_ctx(|ctx, error| {
+        with_frameless_ctx(|ctx| {
             // SAFETY: the fixture owns the live native frame for this call.
             unsafe {
                 (*ctx.native_frame).header.pc = 37;
@@ -1698,7 +1707,7 @@ mod tests {
                 Some(otter_vm::native_abi::NativeResultStatus::SideExit)
             );
             assert_eq!(result.logical_pc(), Some(37));
-            assert!(error.is_none());
+            assert!(ctx_error(ctx).is_none());
         });
     }
 
@@ -1709,7 +1718,7 @@ mod tests {
             DeoptTable, FrameState,
         };
 
-        with_frameless_ctx(|ctx, error| {
+        with_frameless_ctx(|ctx| {
             let value = Value::number_i32(41);
             let runtime = DeoptRuntime {
                 table: DeoptTable::from_states(vec![FrameState {
@@ -1752,26 +1761,26 @@ mod tests {
             assert_eq!(result.logical_pc(), Some(37));
             assert_eq!(unsafe { (*ctx.native_frame).header.pc }, 37);
             assert_eq!(unsafe { *(window as *const Value) }, value);
-            assert!(error.is_none());
+            assert!(ctx_error(ctx).is_none());
         });
     }
 
     #[test]
     fn frameless_final_error_boundary_preserves_structural_failure() {
-        with_frameless_ctx(|ctx, error| {
-            *error = Some(VmError::InvalidOperand);
+        with_frameless_ctx(|ctx| {
+            *ctx_error(ctx) = Some(VmError::InvalidOperand);
             let result = jit_finish_error_stub(ctx);
             assert_eq!(
                 result.validate(NativeResultDomain::Compiled),
                 Some(otter_vm::native_abi::NativeResultStatus::Fatal)
             );
-            assert!(matches!(error, Some(VmError::InvalidOperand)));
+            assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
         });
     }
 
     #[test]
     fn invalid_committed_activation_is_fatal_not_javascript_throw() {
-        with_frameless_ctx(|ctx, error| {
+        with_frameless_ctx(|ctx| {
             let result = jit_scalar_value_stub(
                 ctx,
                 Value::undefined().to_bits(),
@@ -1781,7 +1790,7 @@ mod tests {
                 result.validate(NativeResultDomain::Committed),
                 Some(otter_vm::native_abi::NativeResultStatus::Fatal)
             );
-            assert!(matches!(error, Some(VmError::InvalidOperand)));
+            assert!(matches!(ctx_error(ctx), Some(VmError::InvalidOperand)));
         });
     }
 

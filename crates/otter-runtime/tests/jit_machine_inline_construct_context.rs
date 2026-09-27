@@ -23,7 +23,9 @@ function C(){var ignored=leaf(this.probe);this.target=new.target;this.initialize
 C.prototype={probe:1.25,initialize:function(x,y){this.x=x.value;this.y=y;this.count=arguments.length;}};
 function make(x){return new C(x,19);}
 var payload={value:37};
-for(var i=0;i<70000;i++)make(payload);
+// A polymorphic warm-up site keeps `make` out of the loop's OSR body.
+var makers=[make,function(){}];
+for(var i=0;i<70000;i++)makers[(i&63)===63?1:0](payload);
 "#),"construct-context-warm.js").unwrap();
         let constructor_irs = warm
             .jit_artifacts()

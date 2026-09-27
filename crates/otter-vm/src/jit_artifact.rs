@@ -36,7 +36,7 @@ use crate::jit_debug::{JitDebugRequest, JitDebugTarget, JitDebugTier};
 pub const JIT_ARTIFACT_BUNDLE_LIMIT: usize = 1_024;
 
 /// Maximum owned payload bytes retained by one top-level capture.
-pub const JIT_ARTIFACT_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+pub const JIT_ARTIFACT_BYTE_LIMIT: usize = 2 * 1024 * 1024 * 1024;
 
 const ALL_PAYLOAD_FILES: [JitArtifactFileName; 10] = [
     JitArtifactFileName::Bytecode,

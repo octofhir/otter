@@ -218,6 +218,30 @@ impl Interpreter {
         lexical_new_target: Option<Value>,
         bound_derived_this: Option<UpvalueCell>,
     ) -> Result<(), VmError> {
+        let closure = self.make_closure_value(
+            context,
+            frame,
+            function_index,
+            parent_indices,
+            lexical_new_target,
+            bound_derived_this,
+        )?;
+        frame.write(dst, closure)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Create the closure one `MakeClosure` site denotes in `frame`, capturing
+    /// the frame's upvalue cells at `parent_indices`.
+    pub(crate) fn make_closure_value(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        function_index: u32,
+        parent_indices: &[u32],
+        lexical_new_target: Option<Value>,
+        bound_derived_this: Option<UpvalueCell>,
+    ) -> Result<Value, VmError> {
         let eval_env = frame.eval_env();
         let function_id = context
             .function_id_constant(function_index)
@@ -229,9 +253,7 @@ impl Interpreter {
         // `this instanceof Self` / `Self.prototype` would diverge from the
         // prototype the constructor installed on `this`.
         if function_id == frame.function_id() {
-            self.frame_load_self(frame, dst)?;
-            frame.advance_pc()?;
-            return Ok(());
+            return Ok(frame.self_value());
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(parent_indices.len());
         for &parent_idx in parent_indices {
@@ -268,9 +290,7 @@ impl Interpreter {
         )
         .map_err(crate::oom_to_vm)?;
         self.mark_closure_lookup(context, closure);
-        frame.write(dst, Value::closure(closure))?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(Value::closure(closure))
     }
 
     pub(crate) fn run_make_class_regs(

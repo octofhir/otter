@@ -1000,6 +1000,23 @@ impl NumericFunction {
             entry[usize::from(parameter)] = RegisterState::Value(value);
             entry_nodes.push(value);
         }
+        // Every non-parameter register of a fresh activation holds
+        // `undefined`; a read before any write (a hoisted `var`) observes it.
+        let mut entry_undefined = None;
+        for register in parameter_count..register_count {
+            if !live_in[0][usize::from(register)] {
+                continue;
+            }
+            let value = *entry_undefined.get_or_insert_with(|| {
+                let value = push(
+                    &mut nodes,
+                    NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                );
+                entry_nodes.push(value);
+                value
+            });
+            entry[usize::from(register)] = RegisterState::Value(value);
+        }
 
         let mut blocks = Vec::with_capacity(raw_blocks.len());
         let mut out_states = Vec::<Vec<RegisterState>>::with_capacity(raw_blocks.len());

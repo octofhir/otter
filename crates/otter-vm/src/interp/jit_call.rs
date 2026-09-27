@@ -223,7 +223,12 @@ impl Interpreter {
                 // callers such as the iterator fast path consume its outcome
                 // directly. Do not count the same exit again at this dispatch
                 // wrapper.
-                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, exit) {
+                // A poll that handed the loop back to the interpreter is not
+                // a miss of this body.
+                if !optimized
+                    && !Self::is_poll_handoff(exit)
+                    && !self.reoptimize_arith_overflow_bail(context, fid, exit)
+                {
                     self.note_jit_entry_bail(context, fid);
                 }
                 Ok(None)
@@ -352,6 +357,65 @@ impl Interpreter {
         outcome
     }
 
+    /// Whether a baseline exit is a back-edge poll handing its loop to the
+    /// interpreter (a relink or an OSR hand-off), not a failed operation.
+    fn is_poll_handoff(exit: SideExit) -> bool {
+        exit.reason() == native_abi::ExitReason::Interrupt
+            && exit.action() == native_abi::ExitAction::Resume
+    }
+
+    /// Credit `batch` back-edges run by a baseline (Template) body to the loop
+    /// header `header_pc` and report whether that loop now warrants optimizing
+    /// OSR. Baseline code cannot enter an optimized body mid-loop itself, so a
+    /// hot header leaves to the interpreter, whose next back-edge at that
+    /// header crosses the same threshold and enters the optimized OSR entry.
+    /// This is the baseline tier's OSR urgency check at `JumpLoop`.
+    pub(crate) fn baseline_backedges_reach_osr(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        header_pc: u32,
+        batch: u64,
+    ) -> bool {
+        let key = (fid, header_pc);
+        if self.jit_osr_disabled.contains(&key)
+            || self.jit_osr_disabled.contains(&(fid, u32::MAX))
+            || !self
+                .jit_hook
+                .as_ref()
+                .is_some_and(|hook| hook.optimizing_tier_enabled())
+            || matches!(self.jit_optimized_code.get(&fid), Some(None))
+        {
+            return false;
+        }
+        let count = {
+            let counter = self.jit_osr_counts.entry(key).or_insert(0);
+            *counter = counter.saturating_add(u32::try_from(batch).unwrap_or(u32::MAX));
+            *counter
+        };
+        let loop_span = context
+            .exec_function(fid)
+            .and_then(|function| {
+                function
+                    .loop_latch(header_pc)
+                    .map(|latch| latch - header_pc + 1)
+            })
+            .map(u64::from)
+            .unwrap_or(1);
+        self.jit_tier_cost_decision(
+            context,
+            fid,
+            crate::tier_policy::CostedTier::Optimizing,
+            crate::tier_policy::TierTrigger::LoopBackedge {
+                span_instructions: loop_span,
+            },
+            u64::from(count),
+            0,
+            self.jit_code_residency().code_bytes,
+        )
+        .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
+    }
+
     /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
     /// the threshold crossing (the top frame's `pc` is the loop header just
     /// branched to). It prefers whole-body optimizing OSR, then preserves the
@@ -464,6 +528,7 @@ impl Interpreter {
                     matches!(self.jit_code.get(&fid), Some(Some(_)))
                 };
                 if tier_still_installed
+                    && !Self::is_poll_handoff(exit)
                     && Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc)
                 {
                     self.jit_osr_disabled.insert((fid, osr_pc));
@@ -702,6 +767,23 @@ impl Interpreter {
         self.jit_runtime_stats.optimized_deopts =
             self.jit_runtime_stats.optimized_deopts.saturating_add(1);
         self.note_receiver_allocation_exit(context, site_fid, site_pc, exit);
+        // A site that still lacks feedback after one replacement is not
+        // waiting for feedback any more: its second exit is a failed
+        // speculation, so the next generation keeps the committed form.
+        let exit = if exit.reason() == native_abi::ExitReason::InsufficientFeedback
+            && self.jit_optimized_exit_profiles.contains_key(&(
+                fid,
+                resume_pc,
+                native_abi::ExitReason::InsufficientFeedback,
+            )) {
+            native_abi::SideExit::new(
+                resume_pc,
+                native_abi::ExitReason::TypeMismatch,
+                exit.action(),
+            )
+        } else {
+            exit
+        };
         let profile = self
             .jit_optimized_exit_profiles
             .entry((fid, resume_pc, exit.reason()))
@@ -723,10 +805,14 @@ impl Interpreter {
             self.abandon_unsupported_optimized_generation(fid);
             return;
         }
+        // Insufficient-feedback exits are soft: they gather feedback for the
+        // next generation and never count as failed speculation.
         let exits = self
             .jit_optimized_exit_profiles
             .iter()
-            .filter(|((profile_fid, _, _), _)| *profile_fid == fid)
+            .filter(|((profile_fid, _, reason), _)| {
+                *profile_fid == fid && *reason != native_abi::ExitReason::InsufficientFeedback
+            })
             .map(|(_, profile)| u64::from(profile.count))
             .sum::<u64>();
         let profitable = self
@@ -740,7 +826,15 @@ impl Interpreter {
                 0,
             )
             .is_some_and(crate::tier_policy::TierCostDecision::should_compile);
-        if !profitable {
+        // A soft exit only means the generation predates its feedback; the
+        // replacement is compiled from the richer profile, and the discarded
+        // generation's compile time does not raise its break-even.
+        let soft = exit.reason() == native_abi::ExitReason::InsufficientFeedback;
+        if soft {
+            self.optimizing_tier_policy
+                .forgive_last_compile(fid, crate::tier_policy::CostedTier::Optimizing);
+        }
+        if !profitable && !soft {
             self.retire_unprofitable_optimized_generation(fid);
             return;
         }
@@ -951,7 +1045,12 @@ impl Interpreter {
                 );
                 // The optimizing entry helper already recorded this exit; this
                 // synchronous wrapper only owns template-entry accounting.
-                if !optimized && !self.reoptimize_arith_overflow_bail(context, fid, exit) {
+                // A poll that handed the loop back to the interpreter is not
+                // a miss of this body.
+                if !optimized
+                    && !Self::is_poll_handoff(exit)
+                    && !self.reoptimize_arith_overflow_bail(context, fid, exit)
+                {
                     self.note_jit_entry_bail(context, fid);
                 }
                 Ok(None)

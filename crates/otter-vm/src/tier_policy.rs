@@ -345,6 +345,7 @@ impl FunctionTierState {
 pub(crate) struct TierPolicy {
     functions: FxHashMap<u32, FunctionTierState>,
     cumulative_compile_ns: FxHashMap<(u32, CostedTier), u64>,
+    last_compile_ns: FxHashMap<(u32, CostedTier), u64>,
 }
 
 impl TierPolicy {
@@ -373,6 +374,8 @@ impl TierPolicy {
             .retain(|function_id, _| !(*function_id >= start && *function_id < end));
         self.cumulative_compile_ns
             .retain(|(function_id, _), _| !(*function_id >= start && *function_id < end));
+        self.last_compile_ns
+            .retain(|(function_id, _), _| !(*function_id >= start && *function_id < end));
     }
 
     pub(crate) fn record_compile_duration(
@@ -386,6 +389,20 @@ impl TierPolicy {
             .entry((function_id, tier))
             .or_insert(0);
         *total = total.saturating_add(duration_ns);
+        self.last_compile_ns
+            .insert((function_id, tier), duration_ns);
+    }
+
+    /// Withdraw the latest generation's compile time from the break-even
+    /// ledger. A generation replaced only because it predates its feedback
+    /// did not waste that work, so it must not raise the next threshold.
+    pub(crate) fn forgive_last_compile(&mut self, function_id: u32, tier: CostedTier) {
+        let Some(last) = self.last_compile_ns.remove(&(function_id, tier)) else {
+            return;
+        };
+        if let Some(total) = self.cumulative_compile_ns.get_mut(&(function_id, tier)) {
+            *total = total.saturating_sub(last);
+        }
     }
 
     pub(crate) fn cumulative_compile_ns(&self, function_id: u32, tier: CostedTier) -> u64 {

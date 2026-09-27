@@ -14,6 +14,9 @@
 //!   guessed through a join.
 //! - Alias writes invalidate only overlapping reads. Allocation, throw,
 //!   safepoint, and reentry invalidate the whole dependency epoch.
+//! - A binding guard is reused only inside its own block, where no safepoint
+//!   separates it from the redundant guard, so its raw cell addresses never
+//!   outlive a collection.
 //! - Values carried across CFG edges keep distinct producer identities; GVN
 //!   does not extend a leader's live range through block-parameter copies.
 //! - Authoritative frame states and inline activation recipes are rewritten
@@ -65,6 +68,8 @@ struct ExpressionKey {
     outputs: Vec<MachineRepresentation>,
     dependency_epoch: u64,
     memory_versions: Vec<(MachineAliasClass, u64)>,
+    /// The block a block-local expression may be reused in.
+    block: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +257,13 @@ pub(super) fn optimize(
                     .collect::<Vec<_>>();
                 let candidate = (!outputs.iter().any(|output| edge_values[output.0 as usize]))
                     .then(|| {
-                        expression_key(instruction, &sequence.representations, effects, &state)
+                        expression_key(
+                            instruction,
+                            &sequence.representations,
+                            effects,
+                            &state,
+                            block_index,
+                        )
                     })
                     .flatten();
                 if let Some(key) = candidate {
@@ -276,6 +287,13 @@ pub(super) fn optimize(
                     available.push(AvailableExpression { key, outputs });
                 }
                 state.apply_effects(effects);
+                // Every GC safepoint ends the span in which raw addresses stay
+                // valid, whatever the opcode's effect row declares.
+                if sequence.instructions[instruction_index].safepoint.is_some()
+                    && !effects.invalidates_dependency_epoch()
+                {
+                    state.dependency_epoch = state.dependency_epoch.wrapping_add(1);
+                }
             }
 
             for &child in dominance.children(block_index).iter().rev() {
@@ -294,6 +312,7 @@ fn expression_key(
     representations: &[MachineRepresentation],
     effects: MachineEffects,
     state: &ScopeState,
+    block_index: usize,
 ) -> Option<ExpressionKey> {
     if effects.commoning == MachineCommoning::Never
         || effects.allocates
@@ -331,6 +350,11 @@ fn expression_key(
         outputs,
         dependency_epoch: state.dependency_epoch,
         memory_versions: state.memory_key(effects),
+        // A binding guard's raw cell addresses stay valid only inside its own
+        // block and safepoint-free span (the dependency epoch covers the
+        // latter), so a dominating guard in another block never replaces it.
+        block: matches!(instruction.opcode, MachineOpcode::BindingGuard { .. })
+            .then_some(block_index),
     })
 }
 

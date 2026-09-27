@@ -2071,8 +2071,11 @@ fn emit_backedge_poll(
         ; str x10, [x9]
         ; b.gt =>cont
         ; =>slow
-        ; mov x0, x20
     );
+    // The poll attributes the batch to this loop header for OSR tier-up, and
+    // a side exit resumes the interpreter there.
+    emit_stamp_pc(ops, target);
+    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
     emit_load_runtime_stub(
         ops,
         relocations,
@@ -2091,7 +2094,7 @@ fn emit_backedge_poll(
         ; b.eq =>threw
         ; cmp x0, abi::NativeResultStatus::SideExit as u32
         ; b.ne =>fatal
+        ; b =>relink
+        ; =>cont
     );
-    emit_stamp_pc(ops, target);
-    dynasm!(ops ; .arch aarch64 ; b =>relink ; =>cont);
 }

@@ -29,9 +29,10 @@ pub enum BackedgePollOutcome {
     Continue,
     /// The work budget rotated its slice; the loop still continues.
     Yield,
-    /// Resume the interpreter at the loop header. The running baseline body
-    /// was compiled before some of its call targets owned entry code; the VM
-    /// discarded it so the header recompiles with generated linkage.
+    /// Resume the interpreter at the loop header: either the running baseline
+    /// body was compiled before some of its call targets owned entry code and
+    /// the VM discarded it, or the loop became hot enough for optimizing OSR,
+    /// which the interpreter enters at the header's next back-edge.
     Relink,
 }
 
@@ -49,9 +50,11 @@ impl RuntimeCall<'_> {
         // allocate, so it must not collect while that frame is suspended here.
         let _no_collection =
             (header.kind != NativeFrameKind::Baseline).then(|| vm.gc_heap.always_allocate_scope());
+        let batch = vm.jit_backedge_fuel_window;
         let checkpoint = vm.jit_backedge_poll(context)?;
         if header.kind == NativeFrameKind::Baseline
-            && vm.take_backedge_relink(context, header.function_id)
+            && (vm.take_backedge_relink(context, header.function_id)
+                || vm.baseline_backedges_reach_osr(context, header.function_id, header.pc, batch))
         {
             return Ok(BackedgePollOutcome::Relink);
         }

@@ -148,11 +148,12 @@ fn optimized_element_stores_match_interpreter() {
         ("int", 0),
         ("float", 0),
         ("read-modify-write", 0),
-        // The out-of-bounds append completes through the committed element
-        // sibling in place.
-        ("growth", 0),
-        // A null receiver throws the canonical TypeError from the same sibling.
-        ("throw", 0),
+        // The out-of-bounds append leaves the speculative store once before
+        // any effect; the interpreter completes it and the site commits.
+        ("growth", 1),
+        // A null receiver leaves the speculative store once; the interpreter
+        // throws the canonical TypeError.
+        ("throw", 1),
     ]
     .into_iter()
     .zip(deltas)

@@ -683,6 +683,18 @@ fn map_body_node(
             byte_pc,
             exceptional_edge: None,
         },
+        BindingGuardedRead {
+            semantics:
+                semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
+                    otter_bytecode::opcode_schema::BindingRead::Global { .. },
+                ),
+            target,
+            byte_pc,
+        } => BindingGuardedRead {
+            semantics,
+            target,
+            byte_pc,
+        },
         InlineConstructGuard {
             source,
             function_id,
@@ -790,6 +802,8 @@ fn map_body_node(
         BooleanNot(value) => BooleanNot(map(value)),
         BoxTagged(value) => BoxTagged(map(value)),
         IntegerAdd(left, right) => IntegerAdd(map(left), map(right)),
+        IntegerAddWrapping(left, right) => IntegerAddWrapping(map(left), map(right)),
+        IntegerSubWrapping(left, right) => IntegerSubWrapping(map(left), map(right)),
         IntegerSub(left, right) => IntegerSub(map(left), map(right)),
         IntegerMul(left, right) => IntegerMul(map(left), map(right)),
         IntegerAnd(left, right) => IntegerAnd(map(left), map(right)),

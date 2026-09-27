@@ -314,6 +314,8 @@ impl MachineOpcode {
             // their VM declarations are non-allocating leaves.
             Self::FloatRem | Self::FloatPow => MachineEffects::NEVER,
 
+            // GVN reuses a binding guard only inside its own block: its raw
+            // cell addresses must not outlive a safepoint.
             Self::BindingGuard { .. } => {
                 MachineEffects::read(BINDING.union(SHAPE).union(PROPERTY_METADATA), Guard)
             }

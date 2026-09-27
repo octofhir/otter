@@ -12,6 +12,7 @@
 //!   collections in the VM.
 //! - Weak-reference/finalization registry bookkeeping used by VM
 //!   post-mark processing.
+//! - Old-space batch reservation with independent per-cell headers and tracing.
 //!
 //! # Invariants
 //!
@@ -60,6 +61,8 @@ use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::stats::{GcStats, TYPE_TAG_COUNT};
 use crate::store::GcStore;
 use crate::trace::{TraceTable, Traceable};
+
+mod old_batch;
 
 /// Type alias for the higher-order visitor closure used by the
 /// GC: it receives a `&mut dyn FnMut(*mut RawGc)` slot visitor

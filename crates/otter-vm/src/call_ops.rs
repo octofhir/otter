@@ -45,6 +45,9 @@
 //!   and invalidates them against the code-space publication epoch.
 //! - A freshly-started generator remains in a moving GC root through observable
 //!   `prototype` lookup and publication into the caller.
+//! - Generated entry publishes its own upvalue count only after the complete
+//!   batch is initialized; the allocation boundary roots its pending registers
+//!   and SELF before copying inherited handles from the current closure.
 //!
 //! # See also
 //! - [`crate::Frame`]
@@ -1165,31 +1168,36 @@ impl Interpreter {
         }
         unsafe { (*frame).upvalue_count = 0 };
         let roots = self.collect_allocation_roots(stack);
-        for index in 0..usize::from(own) {
+        if own != 0 {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 for &slot in &roots {
                     visitor(slot);
                 }
-                // SAFETY: the generated caller keeps the frame, register
-                // window, and initialized upvalue prefix live. The current
-                // prefix length is published in the frame before each later
-                // allocation.
+                // SAFETY: the generated caller owns this unpublished frame
+                // and register window. The empty upvalue prefix stays hidden
+                // until the entire allocation batch has completed.
                 if let Ok(active) = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) } {
                     active.trace_stack_register_slots(visitor);
                     active.trace_non_register_slots(visitor);
                 }
             };
-            let cell = crate::alloc_upvalue_with_roots(
-                &mut self.gc_heap,
-                Value::undefined(),
-                &mut external_visit,
-            )
-            .map_err(crate::oom_to_vm)?;
-            unsafe {
-                base.add(index).write(cell);
-                (*frame).upvalue_count =
-                    u32::try_from(index + 1).map_err(|_| VmError::InvalidOperand)?;
-            }
+            // SAFETY: the validated generated window reserves `own` handles.
+            // Initialize the Rust slice before exposing it to the batch writer;
+            // upvalue_count remains zero while allocation can collect.
+            let cells = unsafe {
+                std::ptr::write_bytes(base, 0, usize::from(own));
+                std::slice::from_raw_parts_mut(base, usize::from(own))
+            };
+            self.gc_heap
+                .alloc_old_batch_with_roots(
+                    crate::UpvalueCellBody {
+                        value: Value::undefined(),
+                    },
+                    cells,
+                    &mut external_visit,
+                )
+                .map_err(crate::oom_to_vm)?;
+            unsafe { (*frame).upvalue_count = u32::from(own) };
         }
 
         // Allocations may move the exact closure body and rewrite SELF in the

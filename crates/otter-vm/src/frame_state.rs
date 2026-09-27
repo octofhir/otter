@@ -15,8 +15,9 @@
 //! - Every active frame owns one attached [`RegisterWindow`].
 //! - Parked states own copied register snapshots and no arena pointers.
 //! - GC-bearing frame and parked-state fields are visited by their tracers.
-//! - Upvalue-spine construction traces both inherited and newly allocated cells
-//!   until the completed spine is attached to a published frame.
+//! - Upvalue construction roots inherited cells at the batch allocation boundary.
+//!   Fresh cells are initialized together without an intervening safepoint and
+//!   remain independently collectible after the completed frame is published.
 //!
 //! # Frame execution layout
 //!
@@ -502,20 +503,18 @@ impl Frame {
             return Ok(parent_upvalues.copy_owned());
         }
         let mut cells = Vec::with_capacity(own + parent_upvalues.len());
-        for _ in 0..own {
-            let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                external_visit(visitor);
-                for cell in &cells {
-                    visitor(cell as *const UpvalueCell as *mut RawGc);
-                }
-                parent_upvalues.trace_slots(visitor);
-            };
-            cells.push(crate::alloc_upvalue_with_roots(
-                heap,
-                Value::undefined(),
-                &mut build_roots,
-            )?);
-        }
+        cells.resize(own, UpvalueCell::null());
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            parent_upvalues.trace_slots(visitor);
+        };
+        heap.alloc_old_batch_with_roots(
+            crate::UpvalueCellBody {
+                value: Value::undefined(),
+            },
+            &mut cells,
+            &mut build_roots,
+        )?;
         for index in 0..parent_upvalues.len() {
             cells.push(
                 parent_upvalues
@@ -536,26 +535,23 @@ impl Frame {
         if own == 0 {
             return Ok(parent_upvalues);
         }
-        let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
-        for _ in 0..own {
-            // Neither collection is attached to a traced frame yet. A later
-            // allocation can move an inherited or just-created cell, so expose
-            // both live prefixes together with the caller's dynamic values.
-            let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                external_visit(visitor);
-                for cell in &cells {
-                    visitor(cell as *const UpvalueCell as *mut RawGc);
-                }
-                for cell in parent_upvalues.iter() {
-                    visitor(cell as *const UpvalueCell as *mut RawGc);
-                }
-            };
-            cells.push(crate::alloc_upvalue_with_roots(
-                heap,
-                Value::undefined(),
-                &mut build_roots,
-            )?);
-        }
+        let mut cells = Vec::with_capacity(own + parent_upvalues.len());
+        cells.resize(own, UpvalueCell::null());
+        // The batch checks its full budget before publishing any new cell.
+        // Only inherited handles and dynamic call inputs can be roots there.
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for cell in parent_upvalues.iter() {
+                visitor(cell as *const UpvalueCell as *mut RawGc);
+            }
+        };
+        heap.alloc_old_batch_with_roots(
+            crate::UpvalueCellBody {
+                value: Value::undefined(),
+            },
+            &mut cells,
+            &mut build_roots,
+        )?;
         cells.extend(parent_upvalues.iter().copied());
         Ok(cells.into_boxed_slice())
     }

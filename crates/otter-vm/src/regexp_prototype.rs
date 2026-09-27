@@ -206,8 +206,13 @@ fn slice_subject_string<'scope>(
     let input = input_value
         .as_string(scope.context().heap())
         .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input root is not a string"))?;
-    let units = input.with_utf16(scope.context().heap(), |units| units[range].to_vec());
-    let string = JsString::from_utf16_units(&units, scope.context().heap_mut())?;
+    // A substring view over the subject's own storage: widening the whole
+    // subject per match and capture made a global scan quadratic.
+    let start = u32::try_from(range.start)
+        .map_err(|_| native_type_error(REGEXP_EXEC_NAME, "match offset out of range"))?;
+    let length = u32::try_from(range.len())
+        .map_err(|_| native_type_error(REGEXP_EXEC_NAME, "match length out of range"))?;
+    let string = input.slice(start, length, scope.context().heap_mut())?;
     Ok(scope.value(Value::string(string)))
 }
 

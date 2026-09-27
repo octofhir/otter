@@ -27,7 +27,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{
     CAPACITY, Entry, HASH_ATOM_MULTIPLIER, HASH_SHAPE_MULTIPLIER, HASH_SHIFT, PropertyLookupCache,
-    StoreTransitionCache, StoreTransitionJitEntry, StoreTransitionWay,
+    StoreTransitionCache, StoreTransitionJitEntry,
 };
 use crate::object::AtomOwnPropertyHit;
 
@@ -74,7 +74,7 @@ pub struct JitPropertyLookupCache {
 pub struct JitStoreTransitionCache {
     /// Process-local address of the first scalar entry.
     pub table_addr: usize,
-    /// Byte stride between table ways.
+    /// Byte stride between scalar table entries.
     pub entry_bytes: u32,
     /// Capacity minus one for the power-of-two table.
     pub index_mask: u32,
@@ -105,8 +105,8 @@ pub struct JitStoreTransitionCache {
 impl StoreTransitionCache {
     pub(crate) fn jit_layout(&self) -> JitStoreTransitionCache {
         JitStoreTransitionCache {
-            table_addr: self.ways[0].jit.as_ptr() as usize,
-            entry_bytes: size_of::<StoreTransitionWay>() as u32,
+            table_addr: self.jit_ways[0].as_ptr() as usize,
+            entry_bytes: size_of::<StoreTransitionJitEntry>() as u32,
             index_mask: (CAPACITY - 1) as u32,
             receiver_shape_byte: offset_of!(StoreTransitionJitEntry, receiver_shape) as u32,
             prototype_shape_byte: offset_of!(StoreTransitionJitEntry, prototype_shape) as u32,

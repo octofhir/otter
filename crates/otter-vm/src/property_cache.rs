@@ -10,9 +10,8 @@
 //! - [`PropertyLookupCache`] — the direct-mapped table.
 //! - [`StoreTransitionCache`] — the add-a-property counterpart: shared
 //!   `(receiver shape, prototype shape, atom)` hidden-class transitions for
-//!   megamorphic stores,
-//!   V8's megamorphic stub cache holding transition handlers.
-//! - [`jit`] — the same table's owned layout description for generated loads.
+//!   megamorphic stores.
+//! - [`jit`] — owned scalar table layouts for generated probes.
 //!
 //! # Invariants
 //! - A shape's own-key set never changes, so an entry keyed by receiver shape
@@ -32,9 +31,9 @@
 //! - A shared transition carries the complete replay guard of a per-site
 //!   add-transition stub (receiver shape, extensibility, and every recorded
 //!   prototype shape), so a hit commits exactly the store `[[Set]]` would.
-//! - The boxed table never resizes or is replaced during its interpreter's
-//!   lifetime. Generated probes share these exact entries and their layout;
-//!   only the owning VM thread may read or replace an entry.
+//! - Boxed tables never resize or move during their interpreter's lifetime.
+//!   The compact JIT transition entry and its rooted replay record use the
+//!   same index and are replaced together by the owning VM thread.
 //!
 //! # See also
 //! - [`crate::cache_ir`]
@@ -228,10 +227,11 @@ impl PropertyLookupCache {
 /// layout would otherwise evict each other's prototype-chain guards.
 #[derive(Debug)]
 pub(crate) struct StoreTransitionCache {
-    ways: Box<[StoreTransitionWay]>,
+    ways: Box<[Option<(ShapeId, object::StorePropertyTransition)>]>,
+    jit_ways: Box<[Cell<StoreTransitionJitEntry>]>,
 }
 
-/// Scalar prefix read by generated code. Zero `target_shape` means that the
+/// Compact scalar entry read by generated code. Zero `target_shape` means that the
 /// runtime record has no allocation-free generated handler.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -286,23 +286,12 @@ impl StoreTransitionJitEntry {
     }
 }
 
-/// One fixed table way. The native prefix and VM replay record are published
-/// together by the single mutator; generated code reads only the scalar prefix.
-#[derive(Debug)]
-#[repr(C)]
-struct StoreTransitionWay {
-    jit: Cell<StoreTransitionJitEntry>,
-    transition: Option<(ShapeId, object::StorePropertyTransition)>,
-}
-
 impl Default for StoreTransitionCache {
     fn default() -> Self {
         Self {
-            ways: (0..CAPACITY)
-                .map(|_| StoreTransitionWay {
-                    jit: Cell::new(StoreTransitionJitEntry::EMPTY),
-                    transition: None,
-                })
+            ways: (0..CAPACITY).map(|_| None).collect(),
+            jit_ways: (0..CAPACITY)
+                .map(|_| Cell::new(StoreTransitionJitEntry::EMPTY))
                 .collect(),
         }
     }
@@ -337,7 +326,7 @@ impl StoreTransitionCache {
         let receiver_shape = object::shape_id(obj, heap);
         let prototype_shape = proto_shape_id(obj, heap);
         let atom = key.atom().id();
-        match &self.ways[Self::index(receiver_shape, prototype_shape, atom)].transition {
+        match &self.ways[Self::index(receiver_shape, prototype_shape, atom)] {
             Some((recorded_prototype, transition))
                 if transition.from_shape_id == receiver_shape
                     && transition.atom_id == atom
@@ -362,17 +351,14 @@ impl StoreTransitionCache {
             transition.atom_id,
         );
         let jit = StoreTransitionJitEntry::from_transition(prototype_shape, &transition);
-        let way = &mut self.ways[index];
-        way.transition = Some((prototype_shape, transition));
-        way.jit.set(jit);
+        self.ways[index] = Some((prototype_shape, transition));
+        self.jit_ways[index].set(jit);
     }
 
     /// Visit the target shapes the recorded transitions keep alive.
     pub(crate) fn trace_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        for way in &self.ways {
-            if let Some((_, transition)) = &way.transition {
-                transition.trace_roots(visitor);
-            }
+        for (_, transition) in self.ways.iter().flatten() {
+            transition.trace_roots(visitor);
         }
     }
 }

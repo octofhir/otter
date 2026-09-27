@@ -152,6 +152,19 @@ impl MethodFeedbackDirectory {
             )
     }
 
+    /// Stop capturing a site whose targets no guard chain can name. Baked
+    /// chains stay valid: their guards still prove exactly the targets they
+    /// recorded, and every other receiver already takes the generic call.
+    fn saturate_method_targets(&mut self, site: usize) {
+        if self
+            .address(site)
+            .is_some_and(FeedbackSlotAddress::is_method)
+            && let Some(slot) = self.method_targets.get_mut(site)
+        {
+            *slot = Some(MethodCallFeedback::Megamorphic);
+        }
+    }
+
     fn record_method_native_leaf(
         &mut self,
         site: usize,
@@ -342,6 +355,14 @@ impl Interpreter {
     ) -> bool {
         self.method_feedback
             .record_method_native_leaf(site, stub_id, method_site)
+    }
+
+    /// Mark one `Op::CallMethodValue` site megamorphic after a receiver or
+    /// callee that no generated guard can describe, so later calls skip the
+    /// per-call feedback capture, as a V8 IC goes megamorphic once it fails
+    /// to cache.
+    pub(crate) fn saturate_method_site_feedback(&mut self, site: usize) {
+        self.method_feedback.saturate_method_targets(site);
     }
 
     pub(crate) fn record_method_target_feedback(

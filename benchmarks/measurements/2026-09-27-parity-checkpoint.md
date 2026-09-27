@@ -24,41 +24,54 @@ focused `jit_machine_elements` 7/7; x86 cross-check passes. Cross-target
 execution itself was not tested on this ARM64 host. Do not rerun full Test262
 or the full runtime suite without a concrete reason.
 
+## Rejected captured-environment experiment
+
+The full owner/index implementation passed differential 58/58, JIT 283/283,
+GC stress 1..16, focused rooting/snapshot/reclamation tests, x86 compilation and
+VM/runtime compile-fail boundaries. It failed the resource objective:
+Earley instructions -2.27%, RSS +14.83%; TS +0.94% / +1.32%; zlib +1.59% / +5.59%.
+Every workload completed. Exact counters and allocation attribution are in
+`2026-09-27-captured-environments.md`.
+
+All experimental VM/JIT code, fixtures and layout documentation were restored
+together. No old/new flag exists. The independent pending-tail GC tracing fix
+and its regression test remain, together with the new alias differential corpus.
+Both mandatory gates pass again on the retained state: differential 58/58,
+JIT 283/283; pending-tail GC tests 4/4. The next compiler analysis is in
+`arguments_elision.rs` and is not yet wired into emission.
+
+Preserved artifacts under the ignored parity result directory:
+- `rejected-captured-environments.patch`
+- `otter-rejected-environments`, `allocation-probe-rejected-environments`
+- `environment-reference/`, `environment-final/`: all seven adjacent counters
+- `environment-{earley,ts}-{before,after}.json`: allocation attribution
+- `environment-zlib-events.json`: successful untruncated diagnostic capture
+- `otter-before-environments`: restored production engine baseline
+- `allocation-probe-before-environments`, `otter-before-element`
+
 ## Next executable architectural slice
 
-The captured-environments report records primary V8/JSC/SpiderMonkey source
-mechanisms, a fresh uninstrumented Earley profile, allocation census and required
-invariants. The census accepts this candidate: Earley creates 110,900,416
-upvalue cells and 10,172,901 spines, with 606 full GCs. No environment
-implementation has been started yet.
+Investigate arguments object materialization. Earley allocates 14.6 million
+exotic/symbol sidecars totaling 5,022,525,056 bytes; `collect_arguments_value`,
+sidecar allocation and symbol installation are visible in its native profile.
+Determine the hot creating functions from a successful JIT-attributed profile.
+The source includes read-only local aliases (`sc_list`) and direct indexed reads
+(`sc_consStar`), but do not infer execution frequency from source alone.
 
-Start at `crates/otter-vm/src/upvalue.rs`, `upvalue_spine.rs`,
-`frame_state.rs` (own-capture allocation loops), and
-`call_ops.rs::jit_initialize_generated_upvalues`.
+Primary sources being studied: JSC `DFGArgumentsEliminationPhase.cpp`,
+V8 `js-create-lowering.cc`, SpiderMonkey `ScalarReplacement.cpp`. Otter already
+avoids materialization for `apply`-only arguments use via AST proof and
+`CallForwardArguments`; inspect that mechanism before introducing a new one.
+Potential replacement: explicit activation argument operations for proven local
+non-escaping uses, with precise alias/mapped/prototype/eval semantics and one
+canonical materialization when observable. Alternatively dedicated arguments
+storage may remove sidecars when escape is frequent. Select using measured
+sites, not a generic promise of escape analysis.
 
-Replace individual cell bodies with grouped environment slots and one current
-typed owner/index binding reference. Keep compiler binding semantics, including
-individual loop renewal, shared aliases, eval, mapped arguments and derived-this.
-Update all root tracing, native frame/spine layout, both JIT emitters, binding
-proofs/barriers, image restore and code liveness; no old-cell adapter.
-
-Audit `GcHeap::alloc_trailing_with_roots`: its pending-root closure currently
-calls `T::trace_slots` rather than `trace_pending_slots`. A traced variable-sized
-environment must not walk nonexistent stack trailing storage. Also account for
-old pinned spines retaining young environments through the remembered set.
-Grouping can retain sibling values and larger references grow spines; measure
-those costs instead of assuming a memory win.
-
-Before implementation binaries are preserved in the ignored result directory:
-- `otter-before-environments` (same engine as indexed-access final measurements)
-- `allocation-probe-before-environments`
-- `otter-before-element` (preceding GC slice)
-
-The new `otter-allocation-probe script <path>` diagnostic has built in release
-and successfully run unchanged Earley and TS scripts. Its per-tag allocation
-counts bracket execution and exclude bootstrap. Raw reports:
-`environment-earley-before.json`, `environment-ts-before.json`.
-These are attribution, not a substitute for CLI instruction/RSS measurements.
+Start at `crates/otter-compiler/src/functions.rs`, `hoist.rs`, `calls.rs`,
+`crates/otter-vm/src/jit_spread_call_ops.rs`, `arguments_object.rs`, and
+`object.rs::arguments_direct_snapshot`. Preserve the existing generated forward
+call path; do not reintroduce Rust-side argument forwarding.
 
 ## Measurement and operational details
 

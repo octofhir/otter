@@ -1,100 +1,94 @@
-# Active parity investigation checkpoint
+# Fixed-work parity checkpoint
 
-Goal remains active. No parity claim and no external blocker.
-Work stays on main; no stash or compatibility engine. User-owned untracked
-`PROMPT_OCTANE_GAP.md` must remain untouched.
+Main, macOS ARM64. Goal remains active; parity has not been reached.
+Do not switch the repository toolchain, rerun full Test262 or run the full
+runtime suite without a concrete reason. Stable Rust remains 1.97.1.
 
-## Completed engine slices
+## Retained architectural changes
 
-1. `bd9285bf2836cdf4f26231d16bef36a8b25b1fa3` — signed G:
-   intrusive old-space free lists replace BinaryHeap/Vec hole storage.
-   Earley–Boyer instructions -15.45%, nearly unchanged RSS.
-2. `cd3aa798d0c7e0c2bc0e4ca9c9ca8a59768899c3` — signed G:
-   source-owned indexed layouts, scalar loads/indices/stores, semantic GVN,
-   guarded-element inlining, both backend/allocator contracts updated.
-   Zlib instructions -31.25%, RSS -12.54%; controlled seeded crypto -17.09%.
-   TS RSS +1.30% on the adjacent repeat is an unresolved regression.
+- `bd9285bf`: linked old-space free lists. Earley instructions −15.45%.
+- `cd3aa798`: source-owned indexed layouts and scalar Machine indexed access.
+  Zlib instructions −31.25%; seeded crypto −17.09%.
+- `2f3cf313`: whole-script allocation census using existing per-tag counters.
+- `866b7be5`: trace pending allocation tails before publishing their payload.
+- `d9e81603`: arguments replacement: compiler alias/escape proof, explicit activation
+  length/index operations, both Template/Machine backends, one canonical cold
+  materialization, traced native cache and saved iterator intrinsic. Earley
+  instructions −27.59%; allocated bytes −38.15%; full GC 606 → 257. Final RSS
+  −0.46% on Earley is not a robust corpus-wide memory win. TS/zlib peak RSS
+  varies in both directions and remains unresolved.
 
-Reports: `2026-09-27-engine-research.md`, `2026-09-27-old-free-list.md`,
-`2026-09-27-indexed-access.md`. All seven workload counters and V8/JSC ratios
-are there. Remaining ratios: 2.51–17.76× V8, 6.21–15.85× embedded JSC.
+Every retained implementation was validated with the two required gates.
+Latest: difftest 59/59, JIT 283/283; final stress 1..16 in interpreter, Template
+and production (48/48, Node agreement, slot verification). Bytecode 96/96,
+analysis 4/4, native root rewrite, intrinsic roots, generated arguments,
+Machine/cold identity, iterator snapshot and snapshot round-trip tests pass.
+x86 cross-compilation passes; x86 execution was not tested on this ARM64 host.
 
-Latest engine validation: differential 57/57 (GC stress 1/4/16), JIT 283/283,
-focused `jit_machine_elements` 7/7; x86 cross-check passes. Cross-target
-execution itself was not tested on this ARM64 host. Do not rerun full Test262
-or the full runtime suite without a concrete reason.
+Reports:
+- `2026-09-27-engine-research.md`
+- `2026-09-27-old-free-list.md`
+- `2026-09-27-indexed-access.md`
+- `2026-09-27-arguments-reads.md` — all seven final counters and V8/JSC ratios
+- `2026-09-27-null-prototype.md` — separate user-requested investigation
 
-## Rejected captured-environment experiment
+## Rejected experiment
 
-The full owner/index implementation passed differential 58/58, JIT 283/283,
-GC stress 1..16, focused rooting/snapshot/reclamation tests, x86 compilation and
-VM/runtime compile-fail boundaries. It failed the resource objective:
-Earley instructions -2.27%, RSS +14.83%; TS +0.94% / +1.32%; zlib +1.59% / +5.59%.
-Every workload completed. Exact counters and allocation attribution are in
-`2026-09-27-captured-environments.md`.
+The grouped owner/index captured-environment representation passed correctness
+checks but regressed RSS: Earley +14.83%, TS +1.32%, zlib +5.59%. It was completely
+removed. See `2026-09-27-captured-environments.md`. The independent pending-tail
+GC fix and alias regression corpus remain. No old/new runtime flag exists.
 
-All experimental VM/JIT code, fixtures and layout documentation were restored
-together. No old/new flag exists. The independent pending-tail GC tracing fix
-and its regression test remain, together with the new alias differential corpus.
-Both mandatory gates pass again on the retained state: differential 58/58,
-JIT 283/283; pending-tail GC tests 4/4. The next compiler analysis is in
-`arguments_elision.rs` and is not yet wired into emission.
+## Next measured mechanism
 
-Preserved artifacts under the ignored parity result directory:
-- `rejected-captured-environments.patch`
-- `otter-rejected-environments`, `allocation-probe-rejected-environments`
-- `environment-reference/`, `environment-final/`: all seven adjacent counters
-- `environment-{earley,ts}-{before,after}.json`: allocation attribution
-- `environment-zlib-events.json`: successful untruncated diagnostic capture
-- `otter-before-environments`: restored production engine baseline
-- `allocation-probe-before-environments`, `otter-before-element`
+The successful post-arguments Earley profile has 1739 isolate self samples:
+upvalue allocation 119, spine allocation 82, generated upvalue initialization 60,
+runtime closure construction 98, closure allocation 20. Together these disjoint
+self samples are 21.8%; additional shared GC cost is not fully attributable.
+The allocation census still counts 110,900,416 binding cells. Investigate binding
+storage and capture mutability/ownership before choosing the next replacement.
+Do not repeat the rejected eight-byte owner/index design without addressing its
+reference-size and retained-memory costs. All GC roots, native frame layouts,
+spines, compiler capture consumers and snapshots must change together if their
+representation changes.
 
-## Next executable architectural slice
+The user's null-prototype lead is also measured. V8 forces dictionary mode for
+null-prototype literals but has dictionary-index IC handlers, so “every read
+hashes” is inaccurate. Otter already produces shape-proven direct property loads
+for both null literals and Object.create(null). Creation is the gap: the null
+literal falls out of Machine on DefineDataProperty. In the exploratory retained
+100k-object workload it retires 51.7% more whole-process instructions than an
+ordinary literal. These tests are separate from the agreed seven workloads.
 
-Investigate arguments object materialization. Earley allocates 14.6 million
-exotic/symbol sidecars totaling 5,022,525,056 bytes; `collect_arguments_value`,
-sidecar allocation and symbol installation are visible in its native profile.
-Determine the hot creating functions from a successful JIT-attributed profile.
-The source includes read-only local aliases (`sc_list`) and direct indexed reads
-(`sc_consStar`), but do not infer execution frequency from source alone.
+## Raw artifacts and reproducibility
 
-Primary sources being studied: JSC `DFGArgumentsEliminationPhase.cpp`,
-V8 `js-create-lowering.cc`, SpiderMonkey `ScalarReplacement.cpp`. Otter already
-avoids materialization for `apply`-only arguments use via AST proof and
-`CallForwardArguments`; inspect that mechanism before introducing a new one.
-Potential replacement: explicit activation argument operations for proven local
-non-escaping uses, with precise alias/mapped/prototype/eval semantics and one
-canonical materialization when observable. Alternatively dedicated arguments
-storage may remove sidecars when escape is frequent. Select using measured
-sites, not a generic promise of escape analysis.
+Everything below lives in ignored `benchmarks/results/parity-2026-09-27/`:
+- `arguments-reference/`, `arguments-count-final/`: seven before/final CLI runs,
+  `/usr/bin/time -l`, stdout, commands and executable/source hashes.
+- `arguments-final/`: first candidate with a redundant frame-cache zero store;
+  `arguments-ts-{reference2,repeat2}/`: its TS repeat.
+- `arguments-{earley,ts}-allocation.json`: allocation census.
+- `arguments-count-{earley,zlib}-events.json`,
+  `arguments-reference-earley-events.json`: compiler time and generated size.
+- `earley-after-arguments-profile/`: successful native/JIT attribution;
+  `earley-arguments-profile/`: pre-change attributed profile.
+- `arguments-count-{jit-gate.txt,difftest-gate.json,stress.json,x86-check.txt}`:
+  final gates and stress evidence. Other `arguments-*-tests.txt` hold focused checks.
+- `null-prototype-final-counters/`, `null-prototype-artifacts/`,
+  `null-prototype-events.json`:
+  independent construction/read investigation.
+- `otter-before-environments`: preserved indexed-access baseline executable.
+- Rejected experiment: `rejected-captured-environments.patch`,
+  `otter-rejected-environments`, `allocation-probe-rejected-environments`,
+  `environment-{reference,final}/`, `environment-{earley,ts}-{before,after}.json`.
 
-Start at `crates/otter-compiler/src/functions.rs`, `hoist.rs`, `calls.rs`,
-`crates/otter-vm/src/jit_spread_call_ops.rs`, `arguments_object.rs`, and
-`object.rs::arguments_direct_snapshot`. Preserve the existing generated forward
-call path; do not reintroduce Rust-side argument forwarding.
-
-## Measurement and operational details
-
-All raw artifacts live under `benchmarks/results/parity-2026-09-27/`.
-`element-final/` has latest full production measurements; `element-ts-reference/`
-and `element-ts-repeat/` record the repeated memory regression. Seeded crypto
-is separate and does not alter the agreed original script.
-
-Event-only zlib: 57 compile completions both revisions, 4.174609 → 3.872612 s,
-16,268,012 → 15,257,860 generated code bytes. Full artifact captures hit their
-2 GiB retention budget and cannot supply total code size. The corrected
-`hotasm.py` preserves stdout/stderr, checks exit status, and disables CLI timeout.
-`profile-zlib-element-complete/` has a successful, but artifact-truncated, run;
-`plain-earley-element/` is the latest uninstrumented profile.
-
-Use fff for indexed repository searches. Stable Rust remains 1.97.1. Separately
-installed nightly-2026-09-27 (1.101.0-nightly) accepts Allocator/Vec::new_in/
-Box::new_in without feature gates. No toolchain switch has been made. Allocator
-API may support compiler arenas; it does not provide moving-GC pointer semantics.
+The baseline binary predates the independent pending-tail GC fix. The candidate
+includes it; the reports identify both revisions rather than pretending that the
+preserved executable was built from the immediately preceding commit.
 
 Mandatory gates after the next coherent engine change:
 `cargo run --release -q -p otter-difftest`
 `cargo test --release -q -p otter-jit --lib`
-Then all seven fixed-work runs through `/usr/bin/time -l`, RSS, relevant JIT
-code size/compiler time, signed logical commit with signature status G, and
-continue to the next measured gap. Do not stop at this checkpoint.
+Then measure all seven fixed-work workloads, RSS and affected JIT code size/time,
+make a signed logical commit in main, and continue from the next measured gap.
+Leave the user's untracked `PROMPT_OCTANE_GAP.md` untouched.

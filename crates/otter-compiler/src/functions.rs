@@ -50,13 +50,17 @@ pub(crate) fn compile_function_full(
         .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b));
     // §B.3.6.2 — `fn.arguments` yields a snapshot of a sloppy ordinary
     // function's running activation, which the body itself never names.
-    // When the unit reads the property anywhere, the activation keeps its
-    // incoming argument list; the snapshot object is built by the reader.
+    // A body that reads the property itself keeps its incoming argument list;
+    // the snapshot object is built by the reader, which rebuilds any other
+    // activation from its parameter registers.
     let legacy_arguments_observable = parent.dot_arguments_observed
         && !function_is_strict
         && !is_method
         && !is_async
-        && !is_generator;
+        && !is_generator
+        && body
+            .as_ref()
+            .is_some_and(|b| capture::function_body_reads_dot_arguments(params, b));
     // Only the body (or a direct eval in it) observes the arguments object
     // itself, so only then does the prologue materialize it.
     let body_needs_arguments_object =

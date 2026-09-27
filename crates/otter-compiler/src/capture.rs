@@ -260,12 +260,54 @@ pub fn program_reads_dot_arguments(stmts: &[Statement<'_>]) -> bool {
     finder.found
 }
 
+/// `true` when the body of one function, including its arrow functions but
+/// not its other nested functions, reads a `.arguments` property.
+///
+/// Like SpiderMonkey, only such a function captures its actual arguments at
+/// call time: `fn.arguments` is almost always read inside `fn` itself. Any
+/// other running activation answers the accessor from its live parameter
+/// registers, so an unrelated `node.arguments` elsewhere in the unit does
+/// not pessimize every function.
+#[must_use]
+pub fn function_body_reads_dot_arguments(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &oxc_ast::ast::FunctionBody<'_>,
+) -> bool {
+    let mut finder = DotArgumentsFinder {
+        found: false,
+        skip_nested_functions: true,
+    };
+    finder.visit_formal_parameters(params);
+    if !finder.found {
+        finder.visit_function_body(body);
+    }
+    finder.found
+}
+
 #[derive(Default)]
 struct DotArgumentsFinder {
     found: bool,
+    /// Stop at nested non-arrow functions, which own their activations.
+    skip_nested_functions: bool,
 }
 
 impl<'a> Visit<'a> for DotArgumentsFinder {
+    fn visit_function(
+        &mut self,
+        it: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        if !self.skip_nested_functions {
+            walk::walk_function(self, it, flags);
+        }
+    }
+
+    fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
+        if !self.skip_nested_functions {
+            walk::walk_class(self, it);
+        }
+    }
+
     fn visit_static_member_expression(&mut self, it: &oxc_ast::ast::StaticMemberExpression<'a>) {
         if it.property.name.as_str() == "arguments" {
             self.found = true;

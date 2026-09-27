@@ -698,6 +698,17 @@ fn map_body_node(
             target,
             byte_pc,
         },
+        TaggedNullishEqual {
+            value,
+            equal,
+            byte_pc,
+        } => TaggedNullishEqual {
+            value: map(value),
+            equal,
+            byte_pc,
+        },
+        TaggedStrictEqual(left, right) => TaggedStrictEqual(map(left), map(right)),
+        TaggedToBoolean(value) => TaggedToBoolean(map(value)),
         InlineConstructGuard {
             source,
             function_id,

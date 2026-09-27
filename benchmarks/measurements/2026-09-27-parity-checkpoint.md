@@ -18,7 +18,7 @@ runtime suite without a concrete reason. Stable Rust remains 1.97.1.
   −0.46% on Earley is not a robust corpus-wide memory win. TS/zlib peak RSS
   varies in both directions and remains unresolved.
 
-- Inline closure captures (next commit): one old-space closure owns its trailing
+- `76aa818d`: inline closure captures; one old-space closure owns its trailing
   four-byte cell references; the separate GC capture-array type is removed.
   The allocator takes a mutable slice and construction uses SmallVec storage.
   Earley instructions −3.91%..−4.05% in three pairs; allocated bytes −1.49%.
@@ -38,6 +38,7 @@ Reports:
 - `2026-09-27-old-free-list.md`
 - `2026-09-27-indexed-access.md`
 - `2026-09-27-arguments-reads.md` — all seven final counters and V8/JSC ratios
+- `2026-09-27-young-bindings.md` — rejected nursery allocation policy
 - `2026-09-27-closure-captures.md` — seven counters, repetitions, GC and code size
 - `2026-09-27-null-prototype.md` — separate user-requested investigation
 
@@ -48,14 +49,22 @@ checks but regressed RSS: Earley +14.83%, TS +1.32%, zlib +5.59%. It was complet
 removed. See `2026-09-27-captured-environments.md`. The independent pending-tail
 GC fix and alias regression corpus remain. No old/new runtime flag exists.
 
+A second experiment moved local binding cells to the nursery while preserving
+pinned globals. It regressed Earley instructions by 6.273% in a fresh pair and
+was removed before full validation. See `2026-09-27-young-bindings.md`; do not
+repeat a policy-only nursery change. Its root-audit findings remain relevant
+when directly captured values become moving references.
+
 ## Next measured mechanism
 
 The successful post-arguments Earley profile has 1739 isolate self samples:
 upvalue allocation 119, spine allocation 82, generated upvalue initialization 60,
 runtime closure construction 98, closure allocation 20. Together these disjoint
 self samples are 21.8%; additional shared GC cost is not fully attributable.
-The closure-tail change removes the separate spine allocations. A fresh profile
-is being collected in `earley-after-closure-tail-profile/`. The allocation census
+The closure-tail change removes the separate spine allocations. The fresh profile
+in `earley-after-closure-tail-profile/` records 1790 isolate self samples: local
+cell allocation 94, generated initialization 54, closure construction 127 + 36,
+closure allocation 27. The allocation census
 still counts 110,900,416 binding cells. Bytecode capture-graph analysis finds
 8 of 10 own `deriv_trees` bindings initialized once from simple parameters, with
 no descendant writes. Investigate a four-byte tagged capture slot that carries

@@ -5,7 +5,7 @@
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
-//! - Scalar, global-read and named-property bodies, including bounded fully spliced helper
+//! - Scalar, guarded-element, global-read and named-property bodies, including bounded fully spliced helper
 //!   chains, are admitted. Base construction probes the shared nursery allocator;
 //!   misses retain full construct linkage in an explicit sibling. Enclosing helpers
 //!   retain that sibling with source-owned arguments and native parent publication. Other allocations
@@ -485,6 +485,9 @@ fn splice_one(
     for (node, site) in &body.property_sites {
         hir.property_sites.insert(map(*node), site.clone());
     }
+    for (node, layout) in &body.element_sites {
+        hir.element_sites.insert(map(*node), *layout);
+    }
     for (node, site) in &body.constructor_field_sites {
         hir.constructor_field_sites.insert(map(*node), site.clone());
     }
@@ -832,6 +835,32 @@ fn map_body_node(
             source: map(source),
             target,
             rejects_eval_env,
+        },
+        ElementGuardedLoad {
+            receiver,
+            index,
+            byte_pc,
+            access,
+            result_type,
+        } => ElementGuardedLoad {
+            receiver: map(receiver),
+            index: map(index),
+            byte_pc,
+            access,
+            result_type,
+        },
+        ElementGuardedStore {
+            receiver,
+            index,
+            value,
+            byte_pc,
+            access,
+        } => ElementGuardedStore {
+            receiver: map(receiver),
+            index: map(index),
+            value: map(value),
+            byte_pc,
+            access,
         },
         PropertyLoad {
             receiver,

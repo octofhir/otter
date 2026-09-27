@@ -28,21 +28,12 @@
 //!   before the Boolean result is defined, preserving the canonical decision.
 //! - Checked integer overflow uses the allocator-driven VM [`DeoptRuntime`];
 //!   the emitter owns no parallel reconstruction recipe.
-//! - Settled tagged dense and typed element accesses keep receiver, fast index,
-//!   and store value in allocator-owned late locations while one shared guard
-//!   program proves the VM-baked layout. A miss branches before effects to one
-//!   cold sibling that publishes the canonical roots, boxes a raw Int32/Uint32
-//!   index from its late home, preserves the caller bank around that cold call,
-//!   and completes through the fixed boxed-value VM boundary; it never
-//!   deoptimizes and replays the operation. The generated hit cannot allocate,
-//!   reenter, or pay a call-clobber allocation boundary.
-//!   Packed-double accesses retain their exact pre-effect deopt boundary.
-//!   Every access derives its current base/length after the explicit loop
-//!   preheader; no untraced interior pointer survives a backedge or safepoint.
-//!   An unsupported or unprepared element access publishes exact moving roots
-//!   and calls the fixed boxed-value VM boundary.
-//!   The operation either completes once or propagates its parked exception;
-//!   no post-call status may deopt and replay it.
+//! - Indexed accesses consume source-owned layouts and allocator locations.
+//!   Scalar loads retain signedness and floating bits; stores directly consume
+//!   compatible integer/double operands, narrowing Float32 at the memory effect.
+//!   All miss-capable proofs precede a store. A speculative miss exact-deopts;
+//!   a committed miss boxes operands inside its rooted cold CFG and completes
+//!   once. No interior pointer survives a backedge, safepoint or reentry.
 //! - Settled ordinary named properties consume the VM's complete monomorphic
 //!   or polymorphic shape/slot chain directly. Loads remain tagged; stores
 //!   guard the whole chain before one commit. Tagged values use the `x19`
@@ -153,11 +144,10 @@ use crate::{
         VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
-        DenseIndexForm, element_access_for, emit_check_shape_identity,
-        emit_element_address_from_dense_view, emit_element_read, emit_element_view,
-        emit_element_write_guard, emit_element_write_proven, emit_exotic_length_fast,
-        emit_load_header, emit_load_object_header, emit_ordinary_lookup_state_guard,
-        emit_shape_state_guard,
+        DenseIndexForm, emit_check_shape_identity, emit_element_address_from_dense_view,
+        emit_element_read, emit_element_view, emit_element_write_guard, emit_element_write_proven,
+        emit_exotic_length_fast, emit_load_header, emit_load_object_header,
+        emit_ordinary_lookup_state_guard, emit_shape_state_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_initialize_inline_values_ptr,
@@ -2892,10 +2882,7 @@ fn emit_with_reach(
                     emit_store_allocated_integer(&mut ops, frame, locations[3], 17, 0)?;
                 }
             }
-            MachineOpcode::ElementView { byte_pc } => {
-                let access = element_access_for(view, byte_pc)
-                    .copied()
-                    .ok_or(Unsupported::OperandShape("scalar element view access"))?;
+            MachineOpcode::ElementView { byte_pc, access } => {
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
@@ -2922,10 +2909,7 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::ElementAddress { byte_pc } => {
-                let access = element_access_for(view, byte_pc)
-                    .copied()
-                    .ok_or(Unsupported::OperandShape("scalar element address access"))?;
+            MachineOpcode::ElementAddress { byte_pc, access } => {
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
@@ -2936,8 +2920,30 @@ fn emit_with_reach(
                 emit_element_address_from_dense_view(
                     &mut ops,
                     &access,
-                    |ops, target| emit_load_allocated_integer(ops, frame, locations[2], target, 0),
-                    DenseIndexForm::Tagged,
+                    |ops, target| {
+                        if sequence.representations()[instruction.operands[2].value.0 as usize]
+                            == MachineRepresentation::Float64
+                        {
+                            let source = float_register(locations[2])?;
+                            dynasm!(ops ; .arch aarch64
+                                ; fcvtzu W(target), D(source)
+                                ; ucvtf d31, W(target)
+                                ; fcmp d31, D(source)
+                                ; b.ne =>miss
+                            );
+                            Ok(())
+                        } else {
+                            emit_load_allocated_integer(ops, frame, locations[2], target, 0)
+                        }
+                    },
+                    match sequence.representations()[instruction.operands[2].value.0 as usize] {
+                        MachineRepresentation::Tagged => DenseIndexForm::Tagged,
+                        MachineRepresentation::Int32 => DenseIndexForm::Int32,
+                        MachineRepresentation::Uint32 | MachineRepresentation::Float64 => {
+                            DenseIndexForm::Uint32
+                        }
+                        _ => return Err(Unsupported::OperandShape("element index representation")),
+                    },
                     miss,
                 )?;
                 emit_store_allocated_integer(&mut ops, frame, locations[4], 16, 0)?;
@@ -2953,21 +2959,41 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::ElementValueLoad { byte_pc } => {
-                let access =
-                    element_access_for(view, byte_pc)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar element value load access",
-                        ))?;
+            MachineOpcode::ElementValueLoad { byte_pc, access } => {
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
                 emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
-                emit_element_read(&mut ops, access.element, miss);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
+                let representation =
+                    sequence.representations()[instruction.operands[2].value.0 as usize];
+                if representation == MachineRepresentation::Tagged {
+                    emit_element_read(&mut ops, access.element, miss);
+                    emit_store_allocated_tagged(&mut ops, frame, locations[2], 9, 0)?;
+                } else if representation == MachineRepresentation::Float64 {
+                    let destination = float_register(locations[2])?;
+                    if access.element == otter_vm::JitElementRepr::Float32 {
+                        dynasm!(ops ; .arch aarch64 ; ldr S(destination), [x16] ; fcvt D(destination), S(destination));
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; ldr D(destination), [x16]);
+                    }
+                } else {
+                    use otter_vm::JitElementRepr as E;
+                    match access.element {
+                        E::Int8 => dynasm!(ops ; .arch aarch64 ; ldrsb w9, [x16]),
+                        E::Uint8 | E::Uint8Clamped => dynasm!(ops ; .arch aarch64 ; ldrb w9, [x16]),
+                        E::Int16 => dynasm!(ops ; .arch aarch64 ; ldrsh w9, [x16]),
+                        E::Uint16 => dynasm!(ops ; .arch aarch64 ; ldrh w9, [x16]),
+                        E::Int32 | E::Uint32 => dynasm!(ops ; .arch aarch64 ; ldr w9, [x16]),
+                        _ => {
+                            return Err(Unsupported::OperandShape(
+                                "scalar element load representation",
+                            ));
+                        }
+                    }
+                    emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                }
                 emit_load_u64(&mut ops, 10, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                 emit_load_u64(&mut ops, 10, 0);
@@ -2980,32 +3006,20 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::ElementValueGuard { byte_pc } => {
-                let access =
-                    element_access_for(view, byte_pc)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar element value guard access",
-                        ))?;
+            MachineOpcode::ElementValueGuard { byte_pc, access } => {
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let start = ops.offset().0;
-                // A raw double operand is selected only for packed-double
-                // Array stores and needs no guard; every other store value is
-                // tagged and proves it is storable in the view's representation.
-                let value_is_float = sequence.representations()
-                    [instruction.operands[1].value.0 as usize]
-                    == MachineRepresentation::Float64;
-                if value_is_float && access.element != otter_vm::JitElementRepr::Float64 {
-                    return Err(Unsupported::OperandShape("scalar raw double element store"));
-                }
+                // Scalar operands already satisfy the verified storage contract.
                 emit_load_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz x9, =>miss);
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
                 if access.element == otter_vm::JitElementRepr::Boxed {
                     emit_element_read(&mut ops, access.element, miss);
                 }
-                if !value_is_float {
+                if sequence.representations()[instruction.operands[1].value.0 as usize]
+                    == MachineRepresentation::Tagged
+                {
                     emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                     emit_element_write_guard(&mut ops, access.element, miss);
                 }
@@ -3021,24 +3035,27 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::ElementValueStore { byte_pc } => {
-                let access =
-                    element_access_for(view, byte_pc)
-                        .copied()
-                        .ok_or(Unsupported::OperandShape(
-                            "scalar element value store access",
-                        ))?;
+            MachineOpcode::ElementValueStore { byte_pc, access } => {
                 let start = ops.offset().0;
                 let value_is_float = sequence.representations()
                     [instruction.operands[1].value.0 as usize]
                     == MachineRepresentation::Float64;
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
                 if value_is_float {
-                    if access.element != otter_vm::JitElementRepr::Float64 {
-                        return Err(Unsupported::OperandShape("scalar raw double element store"));
+                    match locations[1] {
+                        AllocatedLocation::Register(source) if source.is_float() => {
+                            dynasm!(ops ; .arch aarch64 ; fmov d31, D(source.encoding()));
+                        }
+                        AllocatedLocation::Stack(slot) => {
+                            emit_frame_ldr_d(&mut ops, 31, spill_offset(frame, slot)?);
+                        }
+                        _ => return Err(Unsupported::OperandShape("scalar floating store")),
                     }
-                    let source = float_register(locations[1])?;
-                    dynasm!(ops ; .arch aarch64 ; str D(source), [x16]);
+                    if access.element == otter_vm::JitElementRepr::Float32 {
+                        dynasm!(ops ; .arch aarch64 ; fcvt s31, d31 ; str s31, [x16]);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; str d31, [x16]);
+                    }
                 } else {
                     emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                     emit_element_write_proven(&mut ops, access.element);

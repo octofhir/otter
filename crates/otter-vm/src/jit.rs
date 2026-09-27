@@ -1343,7 +1343,7 @@ impl JitElementRepr {
 /// carries, what instance state invalidates the layout, where its live element
 /// count lives, where its element base lives, and how one element is stored —
 /// so the address program is written once and the family is data.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitElementAccess {
     /// Expected receiver `GcHeader::type_tag`.
     pub type_tag: u8,

@@ -444,10 +444,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   and writes use the `machineBinding*` family, while prepared literals use
     `machineStringConstantLoad`. Ordinary packed-double Array operations prove
     receiver/view identity, exact index/bounds, and element representation in
-    separate SSA nodes. A generated load publishes a normal tagged value;
-    numeric consumers decode it independently. Fractions, negatives, NaN,
-    values beyond Uint32, holes, detached/resized views, and unprepared sites
-    enter the one committed boxed-value `[[Get]]` / `[[Set]]` sibling. That
+  separate SSA nodes. Speculative numeric loads produce Int32, Uint32 or
+  Float64 directly; committed fast/cold joins remain tagged. Every Machine
+  element operation owns its complete immutable layout, independent of source
+  byte PC. Equivalent view proofs may be commoned inside one block and memory
+  epoch. Scalar indices stay unboxed, with an exact Float64-to-Uint32 check;
+  cold calls alone box numeric arguments. Fractions, negatives, NaN,
+    values beyond Uint32, holes and detached/resized views fail before an
+    effect. Speculative sites exact-deopt at the access; previously exited,
+    protected and unprepared sites enter the one committed boxed-value
+    `[[Get]]` / `[[Set]]` sibling. That
     sibling publishes precise moving roots and exposes
     Success/Throw/Fatal control before register allocation. A store occurs only
     after every miss-capable proof and is never replayed. Local catches consume
@@ -457,7 +463,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `licm-hoisted=<N> versioned-loops=<N>` and starts its normalized graph with
     `machine-ir explicit-loop-preheaders`. Hoisted scalar values are explicit
     loop-header SSA arguments. Packed element base/length addresses are derived
-    per access and never retained across a generated backedge, collection, or
+    inside the iteration and never retained across a generated backedge, collection, or
     JavaScript reentry.
     Named-property regions transpile immutable CacheIR snapshots into explicit
     `machineCacheIr*` guards, prototype loads, field accesses, publication, and

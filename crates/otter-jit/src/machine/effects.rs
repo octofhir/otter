@@ -534,7 +534,10 @@ mod tests {
                 byte_pc: 0,
                 value_is_non_cell: false,
             },
-            MachineOpcode::ElementValueStore { byte_pc: 0 },
+            MachineOpcode::ElementValueStore {
+                byte_pc: 0,
+                access: otter_vm::JitElementAccess::default(),
+            },
         ] {
             let effects = opcode.effects();
             assert!(!effects.writes.is_empty(), "{opcode:?}");

@@ -827,6 +827,7 @@ mod tests {
                 NumericNode::IntegerAddImmediate(value(2), 1),
             ],
             property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
             constructor_field_sites: BTreeMap::new(),
             blocks: vec![NumericBlock {
                 logical_pc: 0,

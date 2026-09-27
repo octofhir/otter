@@ -88,6 +88,7 @@ mod deopt;
 mod derived_this;
 mod dominance;
 mod effects;
+mod element;
 mod frame;
 mod gvn;
 mod inline_frames;
@@ -1049,31 +1050,41 @@ pub enum MachineOpcode {
     /// Prove receiver identity and representation and materialize its live raw
     /// base/length pair. A miss only clears the Boolean result.
     ElementView {
-        /// Source bytecode offset selecting immutable layout metadata.
+        /// Source bytecode offset used only for diagnostics.
         byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
     },
     /// Prove an exact integer index is in bounds and derive one raw address
     /// from a prior view. This operation has no heap effect.
     ElementAddress {
-        /// Source bytecode offset selecting element stride and length width.
+        /// Source bytecode offset used only for diagnostics.
         byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
     },
     /// Read one addressed element and independently prove slot presence.
     ElementValueLoad {
-        /// Source bytecode offset selecting the physical representation.
+        /// Source bytecode offset used only for diagnostics.
         byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
     },
     /// Prove that a value can be written directly to one addressed element.
     /// No store is performed by this guard.
     ElementValueGuard {
-        /// Source bytecode offset selecting the physical representation.
+        /// Source bytecode offset used only for diagnostics.
         byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
     },
     /// Commit one already-proven element store. This no-fail effect has no
     /// guard, exit, call, or hidden control transfer.
     ElementValueStore {
-        /// Source bytecode offset selecting the physical representation.
+        /// Source bytecode offset used only for diagnostics.
         byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
     },
     /// Require a composed Boolean proof. Failure is an exact pre-effect exit.
     GuardCondition,
@@ -3358,7 +3369,8 @@ impl InstructionSequence {
                     else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let valid = [base, length, index]
+                    let index_representation = self.representations[index.value.0 as usize];
+                    let valid = [base, length]
                         .into_iter()
                         .all(|operand| *operand == MachineOperand::location_input(operand.value))
                         && *active == MachineOperand::register_input(active.value)
@@ -3368,8 +3380,19 @@ impl InstructionSequence {
                             == MachineRepresentation::Int64
                         && self.representations[length.value.0 as usize]
                             == MachineRepresentation::Int64
-                        && self.representations[index.value.0 as usize]
-                            == MachineRepresentation::Tagged
+                        && matches!(
+                            index_representation,
+                            MachineRepresentation::Tagged
+                                | MachineRepresentation::Int32
+                                | MachineRepresentation::Uint32
+                                | MachineRepresentation::Float64
+                        )
+                        && *index
+                            == if index_representation == MachineRepresentation::Float64 {
+                                MachineOperand::register_input(index.value)
+                            } else {
+                                MachineOperand::location_input(index.value)
+                            }
                         && self.representations[active.value.0 as usize]
                             == MachineRepresentation::Boolean
                         && self.representations[address.value.0 as usize]
@@ -3380,7 +3403,7 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
-                if matches!(instruction.opcode, MachineOpcode::ElementValueLoad { .. }) {
+                if let MachineOpcode::ElementValueLoad { access, .. } = instruction.opcode {
                     let [address, active, value, hit] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
@@ -3392,15 +3415,17 @@ impl InstructionSequence {
                             == MachineRepresentation::Int64
                         && self.representations[active.value.0 as usize]
                             == MachineRepresentation::Boolean
-                        && self.representations[value.value.0 as usize]
-                            == MachineRepresentation::Tagged
+                        && element::valid_load(
+                            access.element,
+                            self.representations[value.value.0 as usize],
+                        )
                         && self.representations[hit.value.0 as usize]
                             == MachineRepresentation::Boolean;
                     if !valid {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
-                if matches!(instruction.opcode, MachineOpcode::ElementValueGuard { .. }) {
+                if let MachineOpcode::ElementValueGuard { access, .. } = instruction.opcode {
                     let [address, value, active, hit] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
@@ -3411,10 +3436,7 @@ impl InstructionSequence {
                         && *hit == MachineOperand::register_output(hit.value)
                         && self.representations[address.value.0 as usize]
                             == MachineRepresentation::Int64
-                        && matches!(
-                            value_representation,
-                            MachineRepresentation::Tagged | MachineRepresentation::Float64
-                        )
+                        && element::valid_store(access.element, value_representation)
                         && self.representations[active.value.0 as usize]
                             == MachineRepresentation::Boolean
                         && self.representations[hit.value.0 as usize]
@@ -3423,7 +3445,7 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
-                if matches!(instruction.opcode, MachineOpcode::ElementValueStore { .. }) {
+                if let MachineOpcode::ElementValueStore { access, .. } = instruction.opcode {
                     let [address, value] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
@@ -3431,9 +3453,9 @@ impl InstructionSequence {
                         && *value == MachineOperand::location_input(value.value)
                         && self.representations[address.value.0 as usize]
                             == MachineRepresentation::Int64
-                        && matches!(
+                        && element::valid_store(
+                            access.element,
                             self.representations[value.value.0 as usize],
-                            MachineRepresentation::Tagged | MachineRepresentation::Float64
                         );
                     if !valid {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));

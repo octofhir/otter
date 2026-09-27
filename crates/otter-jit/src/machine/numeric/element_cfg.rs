@@ -1,13 +1,14 @@
 //! Explicit indexed-element guards, effects, committed cold call and CFG.
 //!
 //! # Contents
-//! - Receiver-view, bounds/address, slot and value guards as separate SSA nodes.
+//! - Source-owned layout programs and typed receiver/address/value SSA nodes.
 //! - Direct no-fail element loads/stores and committed runtime completion.
 //! - Success, Throw, Fatal and ordinary join blocks.
 //!
 //! # Invariants
 //! - No raw element address crosses a call, allocation, or reentrant edge.
 //! - Every miss-capable proof dominates the generated store.
+//! - Emitters consume complete layout programs; source PCs carry no semantics.
 //! - Only the cold call owns a safepoint; its status is explicit control flow.
 //! - A committed cold operation is never deoptimized and replayed.
 
@@ -57,7 +58,48 @@ pub(super) struct Inputs {
     pub receiver: MachineValue,
     pub index: MachineValue,
     pub stored_fast: Option<MachineValue>,
-    pub stored_tagged: Option<MachineValue>,
+}
+
+/// Select the storage representation once for guarded and committed stores.
+pub(super) fn stored_value(
+    hir: &NumericFunction,
+    site: hir::NumericValue,
+    value: hir::NumericValue,
+    values: &[MachineValue],
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) -> MachineValue {
+    use otter_vm::JitElementRepr as E;
+    let Some(layout) = hir.element_sites.get(&site) else {
+        return machine_value(values, value);
+    };
+    let ty = hir.nodes[value.0].value_type();
+    if layout.element.stores_int32()
+        && (ty == NumericType::Int32
+            || (ty == NumericType::Uint32 && layout.element != E::Uint8Clamped))
+    {
+        return machine_value(values, value);
+    }
+    if matches!(layout.element, E::Float32 | E::Float64) {
+        let widen = match ty {
+            NumericType::Number => return machine_value(values, value),
+            NumericType::Int32 => Some(MachineOpcode::Int32ToFloat64),
+            NumericType::Uint32 => Some(MachineOpcode::Uint32ToFloat64),
+            _ => None,
+        };
+        if let Some(widen) = widen {
+            let result = push_value(representations, MachineRepresentation::Float64);
+            instructions.push(MachineInstruction::plain(
+                widen,
+                vec![
+                    MachineOperand::register_input(machine_value(values, value)),
+                    MachineOperand::register_output(result),
+                ],
+            ));
+            return result;
+        }
+    }
+    tagged_call_argument(hir, values, representations, instructions, value)
 }
 
 pub(super) fn site(hir: &NumericFunction, block: usize) -> Option<hir::NumericValue> {
@@ -85,13 +127,13 @@ pub(super) fn exceptional(hir: &NumericFunction, block: usize) -> Option<usize> 
 pub(super) fn select_probe(
     target_spec: &TargetSpec,
     byte_pc: u32,
-    access: Option<NumericElementAccess>,
+    access: Option<otter_vm::JitElementAccess>,
     inputs: Inputs,
     values: Values,
-    _representations: &mut Vec<MachineRepresentation>,
+    representations: &mut Vec<MachineRepresentation>,
     instructions: &mut Vec<MachineInstruction>,
 ) -> Result<(), super::super::VerificationError> {
-    let Some(_access) = access else {
+    let Some(access) = access else {
         instructions.push(MachineInstruction::plain(
             MachineOpcode::IntegerConstant(0),
             vec![MachineOperand::register_output(values.address)],
@@ -107,7 +149,7 @@ pub(super) fn select_probe(
         return Ok(());
     };
     let mut view = MachineInstruction::plain(
-        MachineOpcode::ElementView { byte_pc },
+        MachineOpcode::ElementView { byte_pc, access },
         vec![
             MachineOperand::location_input(inputs.receiver),
             MachineOperand::register_output(values.base),
@@ -118,11 +160,15 @@ pub(super) fn select_probe(
     view.clobbers = element_clobbers(target_spec);
     instructions.push(view);
     let mut address = MachineInstruction::plain(
-        MachineOpcode::ElementAddress { byte_pc },
+        MachineOpcode::ElementAddress { byte_pc, access },
         vec![
             MachineOperand::location_input(values.base),
             MachineOperand::location_input(values.length),
-            MachineOperand::location_input(inputs.index),
+            if representations[inputs.index.0 as usize] == MachineRepresentation::Float64 {
+                MachineOperand::register_input(inputs.index)
+            } else {
+                MachineOperand::location_input(inputs.index)
+            },
             MachineOperand::register_input(values.view_hit),
             MachineOperand::register_output(values.address),
             MachineOperand::register_output(values.address_hit),
@@ -132,7 +178,7 @@ pub(super) fn select_probe(
     instructions.push(address);
     let mut terminal = if let Some(stored) = inputs.stored_fast {
         MachineInstruction::plain(
-            MachineOpcode::ElementValueGuard { byte_pc },
+            MachineOpcode::ElementValueGuard { byte_pc, access },
             vec![
                 MachineOperand::location_input(values.address),
                 MachineOperand::location_input(stored),
@@ -142,7 +188,7 @@ pub(super) fn select_probe(
         )
     } else {
         MachineInstruction::plain(
-            MachineOpcode::ElementValueLoad { byte_pc },
+            MachineOpcode::ElementValueLoad { byte_pc, access },
             vec![
                 MachineOperand::location_input(values.address),
                 MachineOperand::register_input(values.address_hit),
@@ -166,7 +212,7 @@ pub(super) fn select_guarded(
     target_spec: &TargetSpec,
     hir: &NumericFunction,
     byte_pc: u32,
-    access: NumericElementAccess,
+    access: otter_vm::JitElementAccess,
     inputs: Inputs,
     result: Option<MachineValue>,
     state_index: usize,
@@ -199,7 +245,7 @@ pub(super) fn select_guarded(
     instructions.push(require);
     if let Some(stored) = inputs.stored_fast {
         let mut effect = MachineInstruction::plain(
-            MachineOpcode::ElementValueStore { byte_pc },
+            MachineOpcode::ElementValueStore { byte_pc, access },
             vec![
                 MachineOperand::location_input(values.address),
                 MachineOperand::location_input(stored),
@@ -250,8 +296,11 @@ pub(super) fn select_block(
                     _ => unreachable!(),
                 };
                 if access.is_some() {
+                    let access = *hir.element_sites.get(&node).ok_or(
+                        super::super::VerificationError::OpcodeSignatureMismatch(first),
+                    )?;
                     let mut effect = MachineInstruction::plain(
-                        MachineOpcode::ElementValueStore { byte_pc },
+                        MachineOpcode::ElementValueStore { byte_pc, access },
                         vec![
                             MachineOperand::location_input(values.address),
                             MachineOperand::location_input(stored),
@@ -295,11 +344,20 @@ pub(super) fn select_block(
             }
             descriptor.arguments = vec![MachineRepresentation::Tagged; if store { 3 } else { 2 }];
             let descriptor_index = intern_call_descriptor(call_descriptors, descriptor);
+            let (index, stored) = match hir.nodes[node.0] {
+                NumericNode::ElementLoad { index, .. } => (index, None),
+                NumericNode::ElementStore { index, value, .. } => (index, Some(value)),
+                _ => unreachable!(),
+            };
+            let index =
+                tagged_call_argument(hir, machine_values, representations, instructions, index);
             let mut operands = vec![
                 MachineOperand::location_input(inputs.receiver),
-                MachineOperand::location_input(inputs.index),
+                MachineOperand::location_input(index),
             ];
-            if let Some(value) = inputs.stored_tagged {
+            if let Some(value) = stored {
+                let value =
+                    tagged_call_argument(hir, machine_values, representations, instructions, value);
                 operands.push(MachineOperand::location_input(value));
             }
             operands.extend([

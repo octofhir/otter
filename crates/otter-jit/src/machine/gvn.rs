@@ -14,9 +14,8 @@
 //!   guessed through a join.
 //! - Alias writes invalidate only overlapping reads. Allocation, throw,
 //!   safepoint, and reentry invalidate the whole dependency epoch.
-//! - A binding guard is reused only inside its own block, where no safepoint
-//!   separates it from the redundant guard, so its raw cell addresses never
-//!   outlive a collection.
+//! - Binding and element-view proofs are reused only inside their own block
+//!   and safepoint-free span, so their raw addresses never outlive a collection.
 //! - Values carried across CFG edges keep distinct producer identities; GVN
 //!   does not extend a leader's live range through block-parameter copies.
 //! - Authoritative frame states and inline activation recipes are rewritten
@@ -349,16 +348,39 @@ fn expression_key(
         outputs,
         dependency_epoch: state.dependency_epoch,
         memory_versions: state.memory_key(effects),
-        // A binding guard's raw cell addresses stay valid only inside its own
+        // A binding or element-view proof's raw addresses stay inside its own
         // block and safepoint-free span (the dependency epoch covers the
         // latter), so a dominating guard in another block never replaces it.
-        block: matches!(instruction.opcode, MachineOpcode::BindingGuard { .. })
-            .then_some(block_index),
+        block: matches!(
+            instruction.opcode,
+            MachineOpcode::BindingGuard { .. } | MachineOpcode::ElementView { .. }
+        )
+        .then_some(block_index),
     })
 }
 
 fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
     match opcode {
+        MachineOpcode::ElementView { access, .. } => MachineOpcode::ElementView {
+            byte_pc: 0,
+            access: *access,
+        },
+        MachineOpcode::ElementAddress { access, .. } => MachineOpcode::ElementAddress {
+            byte_pc: 0,
+            access: *access,
+        },
+        MachineOpcode::ElementValueLoad { access, .. } => MachineOpcode::ElementValueLoad {
+            byte_pc: 0,
+            access: *access,
+        },
+        MachineOpcode::ElementValueGuard { access, .. } => MachineOpcode::ElementValueGuard {
+            byte_pc: 0,
+            access: *access,
+        },
+        MachineOpcode::ElementValueStore { access, .. } => MachineOpcode::ElementValueStore {
+            byte_pc: 0,
+            access: *access,
+        },
         MachineOpcode::NativeLeafIdentity {
             builtin_native_ref, ..
         } => MachineOpcode::NativeLeafIdentity {

@@ -437,8 +437,20 @@ roots are rewritten and verified before register allocation.
 Scalar Machine bundles express indexed access through `machineElementView`,
 `machineElementAddress`, `machineElementValueLoad`,
 `machineElementValueGuard`, and `machineElementValueStore`. Each region carries
-the source `bytePc`. Misses use `machineCommittedValueEffect` plus explicit
-Success/Throw/Fatal successors; a committed indexed operation is never replayed.
+the source `bytePc` for diagnostics and owns its complete immutable layout
+program. Emitters do not recover layout through a caller's byte PC. GVN can
+reuse equivalent view proofs at different source positions within one block
+and memory epoch; width, signedness and buffer guards remain part of identity.
+Raw view bases remain inside their iteration.
+
+Speculative loads produce Int32, Uint32 or Float64 directly from numeric
+storage. Indices retain their scalar representation; a Float64 index must
+round-trip exactly through Uint32 before the bounds check. Misses exit before
+any store effect and reconstruct the original operation from typed deopt
+recipes. Sites that require committed completion use `machineCommittedValueEffect`
+plus explicit Success/Throw/Fatal successors. Their join remains tagged, and
+numeric arguments are boxed and rooted only in the cold block. A committed
+indexed operation is never replayed.
 Property regions transpile immutable CacheIR programs into
 `machineCacheIrGuardShape`, `machineCacheIrGuardAtomSlot`,
 `machineCacheIrLoadPrototype`, `machineCacheIrGuardPrototypeNull`,

@@ -30,9 +30,9 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::{
-    ControlFlow, DeoptId, InstructionSequence, MachineAliasClass, MachineCommoning, MachineEffects,
-    MachineFrameSlot, MachineInstruction, MachineInstructionId, MachineOpcode,
-    MachineRepresentation, MachineValue, OperandPurpose, OperandRole, TargetSpec,
+    ControlFlow, DeoptId, InstructionSequence, MachineAliasClass, MachineAliasSet,
+    MachineCommoning, MachineEffects, MachineFrameSlot, MachineInstruction, MachineInstructionId,
+    MachineOpcode, MachineRepresentation, MachineValue, OperandPurpose, OperandRole, TargetSpec,
     VerificationError, dominance::Dominance, effects::effects_for_instruction,
 };
 
@@ -83,6 +83,10 @@ struct AvailableExpression {
 struct ScopeState {
     dependency_epoch: u64,
     memory_versions: [u64; MachineAliasClass::COUNT],
+    /// Advances only when JavaScript may run or a receiver's shape or element
+    /// metadata is written: the whole validity span of a typed-array view,
+    /// whose off-heap base survives collection and allocation.
+    reentry_epoch: u64,
 }
 
 impl ScopeState {
@@ -90,6 +94,7 @@ impl ScopeState {
         Self {
             dependency_epoch: 0,
             memory_versions: [0; MachineAliasClass::COUNT],
+            reentry_epoch: 0,
         }
     }
 
@@ -100,6 +105,7 @@ impl ScopeState {
         let epoch = ((block as u64) + 1) << 32;
         self.dependency_epoch = epoch;
         self.memory_versions.fill(epoch);
+        self.reentry_epoch = epoch;
     }
 
     fn memory_key(&self, effects: MachineEffects) -> Vec<(MachineAliasClass, u64)> {
@@ -111,6 +117,14 @@ impl ScopeState {
     }
 
     fn apply_effects(&mut self, effects: MachineEffects) {
+        if effects.reentrant
+            || effects.writes.intersects(
+                MachineAliasSet::one(MachineAliasClass::Shape)
+                    .union(MachineAliasSet::one(MachineAliasClass::ElementMetadata)),
+            )
+        {
+            self.reentry_epoch = self.reentry_epoch.wrapping_add(1);
+        }
         for alias in ALIASES {
             if effects.writes.contains(alias) {
                 self.memory_versions[alias as usize] =
@@ -343,15 +357,28 @@ fn expression_key(
         })
         .map(|operand| operand.value)
         .collect();
+    if instruction.opcode.is_off_heap_element_view() {
+        // A typed-array view's base is off-heap storage, so a dominating view
+        // of the same receiver stands for this one until JavaScript may run.
+        return Some(ExpressionKey {
+            opcode: canonical_opcode(&instruction.opcode),
+            inputs,
+            outputs,
+            dependency_epoch: state.reentry_epoch,
+            memory_versions: Vec::new(),
+            block: None,
+        });
+    }
     Some(ExpressionKey {
         opcode: canonical_opcode(&instruction.opcode),
         inputs,
         outputs,
         dependency_epoch: state.dependency_epoch,
         memory_versions: state.memory_key(effects),
-        // A binding or element-view proof's raw addresses stay inside its own
-        // block and safepoint-free span (the dependency epoch covers the
-        // latter), so a dominating guard in another block never replaces it.
+        // A binding or in-heap element-view proof's raw addresses stay inside
+        // its own block and safepoint-free span (the dependency epoch covers
+        // the latter), so a dominating guard in another block never replaces
+        // it.
         block: matches!(
             instruction.opcode,
             MachineOpcode::BindingGuard { .. } | MachineOpcode::ElementView { .. }

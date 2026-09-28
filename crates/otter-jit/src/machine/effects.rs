@@ -200,6 +200,20 @@ const ALLOCATION: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::Allo
 const GC_BARRIER: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::GcBarrier);
 
 impl MachineOpcode {
+    /// Whether this is an element view whose base is a typed array's off-heap
+    /// storage. A moving collection never changes such a base or its length;
+    /// only JavaScript reentry (detach, resize, transfer) or a write of the
+    /// receiver's shape or element metadata can, so the view's proof outlives
+    /// safepoints and allocations that end every in-heap address.
+    #[must_use]
+    pub fn is_off_heap_element_view(&self) -> bool {
+        matches!(
+            self,
+            Self::ElementView { access, .. }
+                if matches!(access.base, otter_vm::JitElementBase::ThroughLocalBuffer { .. })
+        )
+    }
+
     /// Return the opcode-local effect row. Descriptor-backed call effects are
     /// completed by [`effects_for_instruction`].
     #[must_use]

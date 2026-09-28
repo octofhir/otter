@@ -218,6 +218,7 @@ fn invariant_instructions(
     };
     let mut writes = super::MachineAliasSet::NONE;
     let mut invalidating_boundary = false;
+    let mut reentrant_boundary = false;
     for &block in &natural_loop.blocks {
         let data = &sequence.blocks[block];
         for index in data.first.0 as usize..data.end.0 as usize {
@@ -230,6 +231,7 @@ fn invariant_instructions(
             // successful continuation. Allocation, collection, or JavaScript
             // reentry can, and therefore blocks memory-proof motion.
             invalidating_boundary |= effects.allocates || effects.safepoint || effects.reentrant;
+            reentrant_boundary |= effects.reentrant;
         }
     }
     let invariant_header_parameters =
@@ -261,19 +263,30 @@ fn invariant_instructions(
                 let instruction = &sequence.instructions[index];
                 let effects =
                     effects_for_instruction(&instruction.opcode, &sequence.call_descriptors);
-                // Binding and element-view proofs yield raw heap addresses.
-                // Keep them inside one iteration even in a non-reentrant loop.
-                if matches!(
+                // Binding and in-heap element-view proofs yield raw heap
+                // addresses: keep them inside one iteration even in a
+                // non-reentrant loop. A typed-array view's base is off-heap
+                // storage that a collection never moves; only JavaScript
+                // reentry (detach, resize, transfer) can change its proof, so
+                // it moves out of any loop that cannot reenter.
+                let off_heap_view = instruction.opcode.is_off_heap_element_view();
+                if (matches!(
                     instruction.opcode,
                     MachineOpcode::BindingGuard { .. } | MachineOpcode::ElementView { .. }
-                ) || effects.commoning == MachineCommoning::Never
+                ) && !off_heap_view)
+                    || effects.commoning == MachineCommoning::Never
                     || effects.allocates
                     || effects.throws
                     || effects.safepoint
                     || effects.reentrant
                     || !effects.writes.is_empty()
                     || effects.reads.intersects(writes)
-                    || (!effects.reads.is_empty() && invalidating_boundary)
+                    || (!effects.reads.is_empty()
+                        && if off_heap_view {
+                            reentrant_boundary
+                        } else {
+                            invalidating_boundary
+                        })
                     || instruction.control != ControlFlow::None
                     || instruction.safepoint.is_some()
                     || instruction.frame_state.is_some()

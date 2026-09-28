@@ -886,15 +886,32 @@ mod tests {
         expect(Op::Equal, t, f, f);
         expect(Op::Equal, VALUE_NULL, VALUE_UNDEFINED, f);
         expect(Op::Equal, box_i32(1), VALUE_TRUE, f);
+        // Cells are read only for their header type tag (byte 0).
+        let string_tag = u64::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG);
+        let object_tag = u64::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG) + 1;
+        let cells = [
+            Box::new([string_tag; 2]),
+            Box::new([string_tag; 2]),
+            Box::new([object_tag; 2]),
+            Box::new([object_tag; 2]),
+        ];
+        let [string_a, string_b, object_a, object_b] = cells
+            .each_ref()
+            .map(|cell| std::ptr::from_ref(cell.as_ref()) as u64);
         // Identical heap-cell bits are the same cell — strict equality
         // decides inline without a probe.
-        expect(Op::Equal, 0x1234, 0x1234, t);
-        expect(Op::NotEqual, 0x1234, 0x1234, f);
-        // Distinct cells ask the leaf content-equality probe; without a live
-        // isolate heap (this harness) the probe misses and the site takes
-        // the exact side exit.
+        expect(Op::Equal, object_a, object_a, t);
+        expect(Op::NotEqual, object_a, object_a, f);
+        // Distinct cells of a kind compared by identity, or of different
+        // kinds, differ without a probe.
+        expect(Op::Equal, object_a, object_b, f);
+        expect(Op::Equal, string_a, object_a, f);
+        expect(Op::Equal, string_a, VALUE_NULL, f);
+        // Two distinct strings ask the leaf content-equality probe; without
+        // a live isolate heap (this harness) the probe misses and the site
+        // takes the exact side exit.
         assert!(matches!(
-            run_binary(Op::Equal, 0x1234, 0x5678),
+            run_binary(Op::Equal, string_a, string_b),
             Exit::Bailed(_)
         ));
     }

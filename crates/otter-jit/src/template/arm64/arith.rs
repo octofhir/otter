@@ -418,6 +418,7 @@ pub(super) fn emit_compare(
         // cells decide reference identity inline; distinct cells complete
         // content equality (strings, BigInts) through the leaf probe.
         let cell_path = ops.new_dynamic_label();
+        let distinct_cells = ops.new_dynamic_label();
         let leaf_call = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
@@ -442,16 +443,32 @@ pub(super) fn emit_compare(
             ; .arch aarch64
             ; b =>have_bool
             // Identical bits are the same cell — strictly equal without a
-            // probe; distinct cells ask the leaf `(heap, lhs, rhs)` probe,
-            // whose only miss is a null heap (isolate-less test harness).
+            // probe. A cell differs from an immediate, and two cells of
+            // different kinds, or of a kind compared by identity, differ.
+            // Only two strings or two BigInts ask the leaf `(heap, lhs, rhs)`
+            // probe, whose only miss is a null heap (isolate-less test
+            // harness).
             ; =>cell_path
             ; cmp x9, x10
-            ; b.ne =>leaf_call
+            ; b.ne =>distinct_cells
         );
         emit_cset(ops, kind, IntCondition);
         dynasm!(ops
             ; .arch aarch64
             ; b =>have_bool
+            ; =>distinct_cells
+            ; tst x9, x11
+            ; b.ne =>strict_false
+            ; tst x10, x11
+            ; b.ne =>strict_false
+            ; ldrb w16, [x9]
+            ; ldrb w17, [x10]
+            ; cmp w16, w17
+            ; b.ne =>strict_false
+            ; cmp w16, u32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
+            ; b.eq =>leaf_call
+            ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
+            ; b.ne =>strict_false
             ; =>leaf_call
             ; ldr x0, [x20, THREAD_OFFSET]
             ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]

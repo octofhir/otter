@@ -2711,6 +2711,12 @@ pub(super) fn emit(
                     return Err(Unsupported::OperandShape("x86-64 scalar leaf ABI"));
                 }
                 let exit = deopt(instruction.deopt_id(), &deopts)?;
+                let strict_equal_done =
+                    (target == otter_vm::native_abi::STUB_STRICT_EQ_LEAF).then(|| {
+                        let done = ops.new_dynamic_label();
+                        strict_equal_fast_path(&mut ops, done);
+                        done
+                    });
                 dynasm!(ops
                     ; .arch x64
                     ; mov rdi, [r15 + THREAD_OFFSET as i32]
@@ -2721,6 +2727,9 @@ pub(super) fn emit(
                 load64(&mut ops, 11, Value::boolean(true).to_bits());
                 dynasm!(ops ; .arch x64 ; cmp rax, r11);
                 bool_from_flags(&mut ops, 0, Cond::Eq);
+                if let Some(done) = strict_equal_done {
+                    dynasm!(ops ; .arch x64 ; =>done);
+                }
             }
             MachineOpcode::Fatal => dynasm!(ops ; .arch x64 ; jmp =>fatal),
         }
@@ -3047,6 +3056,103 @@ enum Cond {
     Le,
     Gt,
     Ge,
+}
+
+/// Decide `rsi === rdx` inline, leaving the Boolean in `eax` and jumping to
+/// `done`, whenever the answer needs no heap body: identical bits (true
+/// unless NaN), two numbers (compared as doubles, so `1 === 1.0` and
+/// `+0 === -0`), a number or an immediate against anything else, and two
+/// cells of different kinds or of a kind compared by identity. Only two
+/// strings or two BigInts fall through to the strict-equality leaf call that
+/// follows. Uses the call's clobbers: rax, rcx, r11, xmm0 and xmm1.
+fn strict_equal_fast_path(ops: &mut Assembler, done: DynamicLabel) {
+    use otter_vm::value::tag;
+    let differ = ops.new_dynamic_label();
+    let numbers = ops.new_dynamic_label();
+    let not_equal = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let left_double = ops.new_dynamic_label();
+    let right_decoded = ops.new_dynamic_label();
+    let right_double = ops.new_dynamic_label();
+    let compare = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; cmp rsi, rdx ; jne =>differ);
+    // Identical bits: every value equals itself except NaN, whose one
+    // canonical encoding this is.
+    load64(ops, 11, tag::box_double(tag::CANONICAL_NAN));
+    dynasm!(ops ; .arch x64 ; cmp rsi, r11);
+    bool_from_flags(ops, 0, Cond::Ne);
+    dynasm!(ops
+        ; .arch x64
+        ; jmp =>done
+        ; =>differ
+        ; mov r11, rsi
+        ; or r11, rdx
+    );
+    load64(ops, 1, tag::NUMBER_TAG);
+    dynasm!(ops
+        ; .arch x64
+        ; test r11, rcx
+        ; jnz =>numbers
+        // Neither is a number. An immediate (bit 1) differs from everything
+        // with other bits.
+        ; test r11, tag::OTHER_TAG as i32
+        ; jnz =>not_equal
+        ; movzx ecx, BYTE [rsi]
+        ; movzx r11d, BYTE [rdx]
+        ; cmp ecx, r11d
+        ; jne =>not_equal
+        ; cmp ecx, i32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
+        ; je =>slow
+        ; cmp ecx, i32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
+        ; je =>slow
+        ; =>not_equal
+        ; xor eax, eax
+        ; jmp =>done
+        ; =>numbers
+        // At least one is a number; both must be.
+        ; test rsi, rcx
+        ; jz =>not_equal
+        ; test rdx, rcx
+        ; jz =>not_equal
+        ; mov r11, rsi
+        ; and r11, rcx
+        ; cmp r11, rcx
+        ; jne =>left_double
+        ; cvtsi2sd xmm0, esi
+        ; jmp =>right_decoded
+        ; =>left_double
+    );
+    load64(ops, 11, tag::DOUBLE_ENCODE_OFFSET);
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, rsi
+        ; sub rax, r11
+        ; movq xmm0, rax
+        ; =>right_decoded
+        ; mov r11, rdx
+        ; and r11, rcx
+        ; cmp r11, rcx
+        ; jne =>right_double
+        ; cvtsi2sd xmm1, edx
+        ; jmp =>compare
+        ; =>right_double
+    );
+    load64(ops, 11, tag::DOUBLE_ENCODE_OFFSET);
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, rdx
+        ; sub rax, r11
+        ; movq xmm1, rax
+        ; =>compare
+        // Equal only when ordered (PF clear) and ZF set.
+        ; xor eax, eax
+        ; ucomisd xmm0, xmm1
+        ; setnp al
+        ; sete cl
+        ; and al, cl
+        ; jmp =>done
+        ; =>slow
+    );
 }
 
 fn bool_from_flags(ops: &mut Assembler, dst: u8, condition: Cond) {

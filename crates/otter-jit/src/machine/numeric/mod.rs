@@ -11419,10 +11419,15 @@ mod tests {
             Value::boolean(true).to_bits()
         );
 
+        // Two distinct string cells are the one pair the inline path cannot
+        // decide: it reads only their header type tags, and the leaf, given
+        // no heap, misses before touching their bodies.
+        let left_cell = Box::new([u64::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG); 2]);
+        let right_cell = Box::new([u64::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG); 2]);
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let frame = vec![
-            tag::box_int32(3),
-            tag::box_int32(4),
+            std::ptr::from_ref(left_cell.as_ref()) as u64,
+            std::ptr::from_ref(right_cell.as_ref()) as u64,
             Value::undefined().to_bits(),
         ];
         let interrupt = 0_u8;

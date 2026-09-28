@@ -4192,6 +4192,11 @@ fn emit_with_reach(
                         return Err(Unsupported::OperandShape("scalar runtime call result"));
                     }
                     let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
+                    let strict_equal_done = (target == STUB_STRICT_EQ_LEAF).then(|| {
+                        let done = ops.new_dynamic_label();
+                        emit_strict_equal_fast_path(&mut ops, done);
+                        done
+                    });
                     let array_construct_region = if target == STUB_ARRAY_CONSTRUCT_ALLOC {
                         let byte_pc = instruction
                             .deopt_id()
@@ -4245,6 +4250,9 @@ fn emit_with_reach(
                             ; cmp x0, x16
                             ; cset w0, eq
                         );
+                    }
+                    if let Some(done) = strict_equal_done {
+                        dynasm!(ops ; .arch aarch64 ; =>done);
                     }
                     if let Some((byte_pc, start)) = array_construct_region {
                         structural_regions.push((
@@ -5369,6 +5377,99 @@ fn emit_frame_str_d(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset
     } else {
         dynasm!(ops ; .arch aarch64 ; str D(register), [sp, offset]);
     }
+}
+
+/// Decide `x1 === x2` inline, leaving the Boolean in `w0` and branching to
+/// `done`, whenever the answer needs no heap body: identical bits (true
+/// unless NaN), two numbers (compared as doubles, so `1 === 1.0` and
+/// `+0 === -0`), a number or an immediate against anything else, and two
+/// cells of different kinds or of a kind compared by identity. Only two
+/// strings or two BigInts fall through to the strict-equality leaf call that
+/// follows, which compares their contents. Uses the call's clobbers: x16,
+/// x17, d0 and d1.
+fn emit_strict_equal_fast_path(ops: &mut dynasmrt::aarch64::Assembler, done: DynamicLabel) {
+    use otter_vm::value::tag;
+    let differ = ops.new_dynamic_label();
+    let numbers = ops.new_dynamic_label();
+    let not_equal = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let left_double = ops.new_dynamic_label();
+    let right_decoded = ops.new_dynamic_label();
+    let right_double = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x1, x2
+        ; b.ne =>differ
+    );
+    // Identical bits: every value equals itself except NaN, whose one
+    // canonical encoding this is.
+    emit_load_u64(ops, 16, tag::box_double(tag::CANONICAL_NAN));
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x1, x16
+        ; cset w0, ne
+        ; b =>done
+        ; =>differ
+        ; orr x16, x1, x2
+        ; tst x16, tag::NUMBER_TAG
+        ; b.ne =>numbers
+        // Neither is a number. An immediate (bit 1) differs from everything
+        // with other bits.
+        ; tst x16, tag::OTHER_TAG
+        ; b.ne =>not_equal
+        ; ldrb w16, [x1]
+        ; ldrb w17, [x2]
+        ; cmp w16, w17
+        ; b.ne =>not_equal
+        ; cmp w16, u32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
+        ; b.eq =>slow
+        ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
+        ; b.eq =>slow
+        ; =>not_equal
+        ; mov w0, wzr
+        ; b =>done
+        ; =>numbers
+        // At least one is a number; both must be.
+        ; tst x1, tag::NUMBER_TAG
+        ; b.eq =>not_equal
+        ; tst x2, tag::NUMBER_TAG
+        ; b.eq =>not_equal
+    );
+    emit_load_u64(ops, 16, tag::NUMBER_TAG);
+    dynasm!(ops
+        ; .arch aarch64
+        ; and x17, x1, x16
+        ; cmp x17, x16
+        ; b.ne =>left_double
+        ; scvtf d0, w1
+        ; b =>right_decoded
+        ; =>left_double
+    );
+    emit_load_u64(ops, 17, tag::DOUBLE_ENCODE_OFFSET);
+    dynasm!(ops
+        ; .arch aarch64
+        ; sub x17, x1, x17
+        ; fmov d0, x17
+        ; =>right_decoded
+        ; and x17, x2, x16
+        ; cmp x17, x16
+        ; b.ne =>right_double
+        ; scvtf d1, w2
+        ; fcmp d0, d1
+        ; cset w0, eq
+        ; b =>done
+        ; =>right_double
+    );
+    emit_load_u64(ops, 17, tag::DOUBLE_ENCODE_OFFSET);
+    dynasm!(ops
+        ; .arch aarch64
+        ; sub x17, x2, x17
+        ; fmov d1, x17
+        ; fcmp d0, d1
+        ; cset w0, eq
+        ; b =>done
+        ; =>slow
+    );
 }
 
 fn emit_load_u64(ops: &mut dynasmrt::aarch64::Assembler, register: u8, value: u64) {

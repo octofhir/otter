@@ -5352,8 +5352,17 @@ impl Runtime {
         // drain so any `queueMicrotask` registered during script
         // execution gets a chance to run before we report success.
         let script_outcome = self.interp.run(&context);
+        // The checkpoint and the import pump both allocate in the moving young
+        // generation, so the completion cannot wait in a plain local.
+        let completion_root = script_outcome
+            .as_ref()
+            .ok()
+            .map(|value| self.interp.persistent_root_insert(*value));
         let drain_outcome = self.drain_microtasks_dispatching_uncaught(&context);
-        let value = match (script_outcome, drain_outcome) {
+        let release_root = |interp: &mut otter_vm::Interpreter| {
+            completion_root.and_then(|root| interp.persistent_root_remove(root))
+        };
+        match (script_outcome, drain_outcome) {
             (
                 Err(otter_vm::RunError {
                     error: otter_vm::VmError::Exit { code },
@@ -5368,6 +5377,7 @@ impl Runtime {
                     ..
                 }),
             ) => {
+                release_root(&mut self.interp);
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
                 return Ok((self.attach_execution_stats(result), context));
             }
@@ -5378,14 +5388,20 @@ impl Runtime {
                 ));
             }
             (Ok(_), Err(drain_err)) => {
+                release_root(&mut self.interp);
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
                     map_vm_error(drain_err),
                 ));
             }
-            (Ok(v), Ok(())) => v,
-        };
-        self.pump_layer_a_dynamic_imports(&context)?;
+            (Ok(_), Ok(())) => {}
+        }
+        if let Err(error) = self.pump_layer_a_dynamic_imports(&context) {
+            release_root(&mut self.interp);
+            return Err(error);
+        }
+        let value =
+            release_root(&mut self.interp).expect("the completion root outlives the checkpoint");
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp));

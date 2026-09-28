@@ -12,7 +12,7 @@
 //! - The audit is diagnostic only and adds no dispatch/allocation hot-path work.
 //!
 //! # See also
-//! - [`crate::opcode_schema`] for the authoritative Phase 2 metadata slice.
+//! - [`crate::opcode_schema`] for the authoritative metadata.
 
 use serde::Serialize;
 
@@ -102,6 +102,10 @@ pub struct OpcodeAudit {
     pub may_trigger_gc: bool,
     /// Whether execution may invoke JavaScript.
     pub may_reenter_javascript: bool,
+    /// Whether execution may read mutable managed-heap state.
+    pub may_read_heap: bool,
+    /// Whether execution may store into an existing managed-heap object.
+    pub may_write_heap: bool,
     /// Current feedback family.
     pub feedback: FeedbackKind,
     /// Whether compiled execution needs a safepoint.
@@ -201,6 +205,8 @@ pub fn opcode_inventory() -> Vec<OpcodeAudit> {
                 may_allocate: schema.effects.may_allocate,
                 may_trigger_gc: schema.effects.may_trigger_gc,
                 may_reenter_javascript: schema.effects.may_reenter_javascript,
+                may_read_heap: schema.effects.may_read_heap,
+                may_write_heap: schema.effects.may_write_heap,
                 feedback: schema.feedback,
                 safepoint_required: schema.effects.safepoint_required,
                 interpreter: "crates/otter-vm/src/interp/dispatch.rs",
@@ -287,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn property_upvalue_and_iterator_rows_are_exact() {
+    fn property_context_and_iterator_rows_are_exact() {
         let inventory = opcode_inventory();
         let store_property = row(&inventory, "STORE_PROPERTY");
         assert_eq!(
@@ -300,9 +306,29 @@ mod tests {
         );
         assert_eq!(store_property.register_writes_exact[0].operand_index, 3);
 
-        let load_upvalue = row(&inventory, "LOAD_UPVALUE");
-        assert!(load_upvalue.register_reads_exact.is_empty());
-        assert_eq!(load_upvalue.register_writes_exact[0].operand_index, 0);
+        let load_context_slot = row(&inventory, "LOAD_CONTEXT_SLOT");
+        assert_eq!(
+            load_context_slot.register_reads_exact,
+            vec![RegisterReference {
+                operand_index: 1,
+                source: RegisterSource::RegisterOperand,
+            }]
+        );
+        assert_eq!(load_context_slot.register_writes_exact[0].operand_index, 0);
+        assert!(load_context_slot.may_read_heap && !load_context_slot.may_write_heap);
+        assert!(!load_context_slot.may_throw);
+
+        let store_context_slot = row(&inventory, "STORE_CONTEXT_SLOT");
+        assert_eq!(
+            store_context_slot
+                .register_reads_exact
+                .iter()
+                .map(|reference| reference.operand_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(store_context_slot.register_writes_exact.is_empty());
+        assert!(store_context_slot.may_write_heap && !store_context_slot.may_throw);
 
         let iterator_next = row(&inventory, "ITERATOR_NEXT");
         assert_eq!(

@@ -1,7 +1,8 @@
 //! Interpreter-owned class-construction helpers.
 //!
 //! # Contents
-//! - Bind-only and register-dispatch helpers for `BindThisValue`.
+//! - Bind-only and register-dispatch helpers for `BindThisValue` over a
+//!   derived constructor's frame-held `this`.
 //! - Interpreter class checks and function-name installation.
 //!
 //! # Invariants
@@ -18,8 +19,8 @@ use crate::{
 };
 
 impl Interpreter {
-    /// §13.3.7.2 BindThisValue — bind `super()`'s result into the nearest
-    /// derived-constructor `this`, rejecting a double binding.
+    /// §9.1.1.3.1 BindThisValue — bind `super()`'s result as the running
+    /// derived constructor's frame-held `this`, rejecting a double binding.
     pub(crate) fn run_bind_this_value_reg(
         &mut self,
         stack: &mut ActivationStack,
@@ -33,52 +34,32 @@ impl Interpreter {
 
     /// Bind-only value kernel shared with committed generated callers.
     ///
-    /// The caller owns logical-PC advancement. This kernel either publishes
-    /// the derived `this` value once or returns the semantic double-bind /
-    /// missing-derived-binding error without changing the PC.
+    /// The caller owns logical-PC advancement. `BindThisValue` runs only in
+    /// the derived constructor whose `this` it binds: a `this` reached from
+    /// an arrow or a direct eval lives in a context slot and binds through
+    /// `BindThisContextSlot` instead.
     pub(crate) fn bind_this_value(
         &mut self,
         stack: &mut ActivationStack,
         top_idx: usize,
         value: crate::Value,
     ) -> Result<crate::Value, VmError> {
-        let target = (0..=top_idx).rev().find(|&i| {
-            self.frame_cold(&stack[i])
-                .is_some_and(|c| c.is_derived_constructor)
-        });
-        if let Some(ti) = target {
-            if !stack[ti].this_value.is_hole() {
-                return Err(self.err_this_uninit(
-                    ("super constructor may only be called once".to_string()).into(),
-                ));
-            }
-            stack[ti].this_value = value;
-            let frame = &mut stack[ti];
-            let derived_this_cell = self
-                .frame_cold(frame)
-                .and_then(|cold| cold.derived_this_cell);
-            if let Some(cell) = derived_this_cell {
-                crate::store_upvalue(&mut self.gc_heap, cell, value);
-            }
-            if let Some(obj) = value.as_object() {
-                let cold = self.frame_ensure_cold(frame);
-                cold.construct_target = Some(obj);
-            }
-        } else {
-            let derived_this_cell = self
-                .frame_cold(&stack[top_idx])
-                .and_then(|cold| cold.derived_this_cell);
-            let Some(cell) = derived_this_cell else {
-                return Err(self.err_this_uninit(
-                    ("super called outside a derived constructor".to_string()).into(),
-                ));
-            };
-            if !crate::read_upvalue(&self.gc_heap, cell).is_hole() {
-                return Err(self.err_this_uninit(
-                    ("super constructor may only be called once".to_string()).into(),
-                ));
-            }
-            crate::store_upvalue(&mut self.gc_heap, cell, value);
+        let frame = &mut stack[top_idx];
+        if !self
+            .frame_cold(frame)
+            .is_some_and(|cold| cold.is_derived_constructor)
+        {
+            return Err(self.err_this_uninit(
+                ("super called outside a derived constructor".to_string()).into(),
+            ));
+        }
+        if !frame.this_value.is_hole() {
+            return Err(self.err_this_uninit(crate::context_ops::SUPER_CALLED_TWICE.into()));
+        }
+        frame.this_value = value;
+        if let Some(obj) = value.as_object() {
+            let cold = self.frame_ensure_cold(frame);
+            cold.construct_target = Some(obj);
         }
         Ok(value)
     }

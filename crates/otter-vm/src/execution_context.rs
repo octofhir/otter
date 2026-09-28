@@ -323,20 +323,7 @@ impl ExecutionContext {
     pub fn jit_compile_snapshot(&self, function_id: u32) -> Option<crate::jit::JitCompileSnapshot> {
         let mut view = self.code_block_arc(function_id)?.jit_compile_snapshot();
         let code_block = Arc::clone(&view.code_block);
-        // Mark each self-binding maker whose constant resolves to the function
-        // being compiled: it materializes the named-function SELF binding, which
-        // the emitter can read straight from the frame's own closure instead of
-        // a Rust round-trip. Operand 1 is the function-id constant index.
         for instr in &mut view.instructions {
-            if matches!(
-                instr.op(&code_block),
-                otter_bytecode::Op::MakeFunction | otter_bytecode::Op::MakeClosure
-            ) && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
-                instr.operand(&code_block, 1)
-                && self.function_id_constant(idx) == Some(function_id)
-            {
-                instr.make_self = true;
-            }
             if instr.op(&code_block) == otter_bytecode::Op::LoadProperty
                 && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
                     instr.operand(&code_block, 2)
@@ -725,8 +712,7 @@ mod tests {
                 scratch,
                 param_count: 0,
                 length: 0,
-                own_upvalue_count: 0,
-                inherited_upvalue_count: 0,
+                scopes: Vec::new(),
                 is_strict: false,
                 is_arrow: false,
                 is_method: false,
@@ -743,8 +729,6 @@ mod tests {
                 source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
-                direct_eval_bindings: Vec::new(),
-                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: code.into(),
                 spans: Vec::new(),

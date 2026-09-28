@@ -15,9 +15,11 @@
 //! - Every active frame owns one attached [`RegisterWindow`].
 //! - Parked states own copied register snapshots and no arena pointers.
 //! - GC-bearing frame and parked-state fields are visited by their tracers.
-//! - Upvalue construction roots inherited cells at the batch allocation boundary.
-//!   Fresh cells are initialized together without an intervening safepoint and
-//!   remain independently collectible after the completed frame is published.
+//! - Every frame is constructed with its exact SELF: the closure (or bare
+//!   function value) being executed. There is no default; context-reading
+//!   bytecode (`LoadClosureContext`, `LoadSelf`) reads it directly.
+//! - Frames hold no binding storage: captured and eval-visible bindings live
+//!   in contexts, which reach the frame only through its registers and SELF.
 //!
 //! # Frame execution layout
 //!
@@ -40,8 +42,7 @@
 //!   window slot for them. `new.target` remains optional cold call state.
 //! - **Header.** [`Frame::function_id`] + [`Frame::pc`] identify the resume
 //!   point; [`Frame::return_register`] names the caller register that receives
-//!   the completion value (`None` for `<main>`); [`Frame::upvalues`] is the
-//!   captured-cell spine indexed by the upvalue opcodes.
+//!   the completion value (`None` for `<main>`).
 //!
 //! # See also
 //! - [crate::frame_ops]
@@ -50,15 +51,12 @@
 use smallvec::SmallVec;
 
 use otter_bytecode::Function;
-use otter_gc::raw::{RawGc, SlotVisitor};
+use otter_gc::raw::SlotVisitor;
 
 use crate::{
-    CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, abstract_ops,
-    cold_frame::ColdFrameIdx, eval_env::EvalEnvHandle, native_abi::VmFrameHeader,
-    upvalue_source::UpvalueSource,
+    CodeBlock, JsPromiseHandle, RegisterWindow, Value, VmError, abstract_ops,
+    cold_frame::ColdFrameIdx, native_abi::VmFrameHeader,
 };
-
-pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
 
 /// Byte stride between adjacent registers in a frame window. Register `r` sits
 /// at `window_base + r * REGISTER_SLOT_BYTES`. Frozen: the optimizing tier
@@ -67,10 +65,10 @@ pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
 pub(crate) const REGISTER_SLOT_BYTES: usize = std::mem::size_of::<Value>();
 const _: () = assert!(REGISTER_SLOT_BYTES == 8);
 
-// One current 72-byte materialized activation. Async/generator ownership and
+// One current 56-byte materialized activation. Async/generator ownership and
 // all other uncommon protocol state live in `cold_frame::ColdFramePool` and are
 // reached lazily through `frame.cold`.
-const _: [(); 72] = [(); std::mem::size_of::<Frame>()];
+const _: [(); 56] = [(); std::mem::size_of::<Frame>()];
 
 /// Owned register values of a suspended frame. This type deliberately cannot
 /// expose a [`RegisterWindow`]: parked state is independent of the active arena.
@@ -112,24 +110,14 @@ impl OwnedRegisterSnapshot {
 pub struct Frame {
     /// Common interpreter/baseline machine-visible frame prefix.
     pub header: VmFrameHeader,
-    /// Nullable direct-eval environment owned by this materialized activation.
-    ///
-    /// The handle occupies the common header's existing tail padding, so the
-    /// register window retains its machine-observed offset. Ownership moves to
-    /// a published native frame only for that frame's generated-code dynamic
-    /// extent.
-    pub(crate) eval_env: EvalEnvHandle,
     /// Register window for this frame.
     pub registers: RegisterWindow,
-    /// Captured upvalues for this call. Empty for non-closure
-    /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
-    /// operands.
-    pub upvalues: UpvalueSpine,
-    /// Exact function object executing this frame. Named-function SELF and
-    /// `arguments.callee` read this hot field so materialized and native frames
-    /// share one representation-neutral binding. Bare functions use the
-    /// canonical interned function value; closure calls store that exact
-    /// closure instance.
+    /// Exact function object executing this frame (SELF).
+    /// `LoadClosureContext`, `LoadSelf`, and `arguments.callee` read this
+    /// hot field so materialized and native frames share one
+    /// representation-neutral binding. Closure calls store that exact closure
+    /// instance; a bare function value appears only for functions whose code
+    /// never reads its closure context.
     pub self_value: Value,
     /// `this` value visible inside the body. `<main>` and free
     /// `Op::Call` invocations both bind `Value::Undefined`
@@ -157,16 +145,13 @@ pub struct Frame {
 #[derive(Debug)]
 pub struct ParkedFrameState {
     pub header: VmFrameHeader,
-    eval_env: EvalEnvHandle,
     registers: OwnedRegisterSnapshot,
-    pub upvalues: UpvalueSpine,
     pub self_value: Value,
     pub this_value: Value,
     pub return_register: Option<u16>,
 }
 
 const _: [(); 0] = [(); std::mem::offset_of!(Frame, header)];
-const _: [(); 12] = [(); std::mem::offset_of!(Frame, eval_env)];
 const _: [(); 16] = [(); std::mem::offset_of!(Frame, registers)];
 
 impl std::ops::Deref for Frame {
@@ -353,220 +338,15 @@ impl Frame {
         self.pc = self.pc.wrapping_add(1);
     }
 
-    /// Shared empty upvalue slice for plain functions without captured
-    /// parent cells.
-    pub(crate) fn empty_upvalues() -> UpvalueSpine {
-        Vec::<UpvalueCell>::new().into_boxed_slice()
-    }
-
-    /// Allocate a frame for `function`. Registers are pre-filled
-    /// with `Value::Undefined`. Used for test-side construction
-    /// of trivial functions.
-    ///
-    /// **Precondition:** `function.own_upvalue_count == 0`. Functions with own
-    /// upvalues route through
-    /// [`Self::for_function_with_heap`] (production path) or
-    /// [`Self::build_upvalues`] + [`Self::with_return_upvalues_and_this`].
+    /// Frame for a bytecode [`Function`] record with an explicit SELF and
+    /// receiver. Hosts and tests that hold only the compiler DTO use this;
+    /// dispatch builds frames from verified [`CodeBlock`]s through
+    /// [`Self::for_code_block`].
     #[must_use]
-    pub fn for_function(function: &Function, window: RegisterWindow) -> Self {
-        debug_assert_eq!(
-            function.own_upvalue_count, 0,
-            "Frame::for_function requires zero own upvalues — use for_function_with_heap or build_upvalues + with_return_upvalues_and_this"
-        );
-        Self::with_return(function, None, window)
-    }
-
-    /// Allocate a frame for `function`, allocating
-    /// `function.own_upvalue_count` cells on the GC heap.
-    /// The production entry path uses this for the `<main>`
-    /// frame so any top-level `let n = 0; () => n` style upvalue
-    /// has a backing cell from the moment dispatch starts.
-    ///
-    /// # Errors
-    ///
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn for_function_with_heap(
-        function: &Function,
-        heap: &mut otter_gc::GcHeap,
-        window: RegisterWindow,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        let upvalues = Self::build_upvalues(heap, function, Self::empty_upvalues())?;
-        Ok(Self::with_return_upvalues_and_this(
-            function,
-            None,
-            upvalues,
-            Value::undefined(),
-            window,
-        ))
-    }
-
-    /// Allocate a frame whose return value should land in the
-    /// caller's register `return_register`. Same precondition as
-    /// [`Self::for_function`] — zero own upvalues.
-    #[must_use]
-    pub fn with_return(
+    pub fn for_function(
         function: &Function,
         return_register: Option<u16>,
-        window: RegisterWindow,
-    ) -> Self {
-        Self::with_return_upvalues_and_this(
-            function,
-            return_register,
-            Self::empty_upvalues(),
-            Value::undefined(),
-            window,
-        )
-    }
-
-    /// Build the captured-upvalue spine for `function`, allocating
-    /// `function.own_upvalue_count` fresh
-    /// [`UpvalueCellBody`] cells on the GC heap and prepending them
-    /// to `parent_upvalues` (per the §15.2.5 capture layout).
-    ///
-    /// # Errors
-    ///
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn build_upvalues(
-        heap: &mut otter_gc::GcHeap,
-        function: &Function,
-        parent_upvalues: UpvalueSpine,
-    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        let mut empty = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-        Self::build_upvalues_for_count(
-            heap,
-            function.own_upvalue_count,
-            parent_upvalues,
-            &mut empty,
-        )
-    }
-
-    /// A callee that captures nothing of its own inherits the caller's spine
-    /// unchanged and allocates no cell, so the common bytecode call keeps the
-    /// whole cell-building path out of line.
-    #[inline]
-    pub(crate) fn build_upvalues_for_exec(
-        heap: &mut otter_gc::GcHeap,
-        function: &CodeBlock,
-        parent_upvalues: UpvalueSpine,
-    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        if function.own_upvalue_count == 0 {
-            return Ok(parent_upvalues);
-        }
-        let mut empty = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-        Self::build_upvalues_for_count(
-            heap,
-            function.own_upvalue_count,
-            parent_upvalues,
-            &mut empty,
-        )
-    }
-
-    /// [`Self::build_upvalues_for_exec`] with caller-owned roots exposed to
-    /// any collection the cell allocations trigger. Frame builders hold the
-    /// callee / receiver / `new.target` in plain Rust locals while the frame
-    /// is not yet on a traced stack; those locals must ride through here.
-    pub(crate) fn build_upvalues_for_exec_with_roots(
-        heap: &mut otter_gc::GcHeap,
-        function: &CodeBlock,
-        parent_upvalues: UpvalueSpine,
-        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        Self::build_upvalues_for_count(
-            heap,
-            function.own_upvalue_count,
-            parent_upvalues,
-            external_visit,
-        )
-    }
-
-    /// Build an owned interpreter/native spine from an allocation-neutral
-    /// inherited source.
-    ///
-    /// This is the direct-call counterpart of
-    /// [`Self::build_upvalues_for_exec_with_roots`]. It never creates an
-    /// intermediate clone of inherited cells: callees with fresh own cells make
-    /// one final allocation, while inherited-only callers copy only when an
-    /// owned/materialized frame explicitly requests one.
-    ///
-    /// `external_visit` must trace the owner of `parent_upvalues` (the exact
-    /// closure for a closure-backed source) in addition to any scalar call
-    /// values. The source visits its cell slots directly during each collection
-    /// so no shared Rust slice spans a relocation.
-    pub(crate) fn build_upvalues_for_exec_from_source_with_roots(
-        heap: &mut otter_gc::GcHeap,
-        function: &CodeBlock,
-        parent_upvalues: UpvalueSource,
-        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        let own = function.own_upvalue_count as usize;
-        if own == 0 {
-            return Ok(parent_upvalues.copy_owned());
-        }
-        let mut cells = Vec::with_capacity(own + parent_upvalues.len());
-        cells.resize(own, UpvalueCell::null());
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            parent_upvalues.trace_slots(visitor);
-        };
-        heap.alloc_old_batch_with_roots(
-            crate::UpvalueCellBody {
-                value: Value::undefined(),
-            },
-            &mut cells,
-            &mut build_roots,
-        )?;
-        for index in 0..parent_upvalues.len() {
-            cells.push(
-                parent_upvalues
-                    .read(index)
-                    .expect("upvalue source index in bounds"),
-            );
-        }
-        Ok(cells.into_boxed_slice())
-    }
-
-    fn build_upvalues_for_count(
-        heap: &mut otter_gc::GcHeap,
-        own_upvalue_count: u16,
-        parent_upvalues: UpvalueSpine,
-        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        let own = own_upvalue_count as usize;
-        if own == 0 {
-            return Ok(parent_upvalues);
-        }
-        let mut cells = Vec::with_capacity(own + parent_upvalues.len());
-        cells.resize(own, UpvalueCell::null());
-        // The batch checks its full budget before publishing any new cell.
-        // Only inherited handles and dynamic call inputs can be roots there.
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            for cell in parent_upvalues.iter() {
-                visitor(cell as *const UpvalueCell as *mut RawGc);
-            }
-        };
-        heap.alloc_old_batch_with_roots(
-            crate::UpvalueCellBody {
-                value: Value::undefined(),
-            },
-            &mut cells,
-            &mut build_roots,
-        )?;
-        cells.extend(parent_upvalues.iter().copied());
-        Ok(cells.into_boxed_slice())
-    }
-
-    /// Full constructor used by call sites that need to bind a
-    /// non-default `this`. The caller is responsible for
-    /// pre-building `upvalues` via [`Self::build_upvalues`] (or
-    /// passing [`Self::empty_upvalues`] when the function has none).
-    /// See [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)
-    /// for the layout.
-    #[must_use]
-    pub fn with_return_upvalues_and_this(
-        function: &Function,
-        return_register: Option<u16>,
-        upvalues: UpvalueSpine,
+        self_value: Value,
         this_value: Value,
         window: RegisterWindow,
     ) -> Self {
@@ -575,27 +355,22 @@ impl Frame {
             .saturating_add(function.locals)
             .saturating_add(function.scratch) as usize;
         debug_assert_eq!(window.len(), total);
-        debug_assert!(
-            upvalues.len() >= function.own_upvalue_count as usize,
-            "frame upvalues must include the function's own cells"
-        );
         Self {
             header: VmFrameHeader::interpreter(function.id, total as u16),
-            eval_env: EvalEnvHandle::null(),
             registers: window,
             return_register,
-            upvalues,
-            self_value: Value::function(function.id),
+            self_value,
             this_value,
             cold: None,
         }
     }
 
+    /// Frame for a verified [`CodeBlock`] with an explicit SELF and receiver.
     #[must_use]
-    pub(crate) fn with_exec_return_upvalues_and_this(
+    pub(crate) fn for_code_block(
         function: &CodeBlock,
         return_register: Option<u16>,
-        upvalues: UpvalueSpine,
+        self_value: Value,
         this_value: Value,
         window: RegisterWindow,
     ) -> Self {
@@ -604,41 +379,24 @@ impl Frame {
             function.register_count as usize,
             "register window must match the function's register_count"
         );
-        debug_assert!(
-            upvalues.len() >= function.own_upvalue_count as usize,
-            "frame upvalues must include the function's own cells"
-        );
         Self {
             header: VmFrameHeader::interpreter(function.id, function.register_count),
-            eval_env: EvalEnvHandle::null(),
             registers: window,
             return_register,
-            upvalues,
-            self_value: Value::function(function.id),
+            self_value,
             this_value,
             cold: None,
         }
     }
 
-    /// Trace hot upvalues, SELF, and receiver state. Active register windows are
-    /// traced once by RegisterStack; async/generator ownership is traced through
-    /// the attached cold record.
+    /// Trace SELF and receiver state. Active register windows are traced once
+    /// by RegisterStack; async/generator ownership is traced through the
+    /// attached cold record.
     pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {
         // Active register windows are traced once through RegisterStack's
         // precisely published prefix. The frame walker owns scalar/header state.
-        for slot in self.upvalues.iter() {
-            let p = slot as *const UpvalueCell as *mut RawGc;
-            visitor(p);
-        }
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
-        if !self.eval_env.is_null() {
-            visitor(
-                std::ptr::from_ref(&self.eval_env)
-                    .cast_mut()
-                    .cast::<RawGc>(),
-            );
-        }
         // Cold-record GC slots (pending_to_primitive / pending_bind_function /
         // pending_iterator_next) are traced separately by the caller through
         // [`crate::cold_frame::ColdFrame::trace_cold_slots`] when
@@ -656,9 +414,7 @@ impl ParkedFrameState {
         (
             Self {
                 header: frame.header,
-                eval_env: frame.eval_env,
                 registers,
-                upvalues: frame.upvalues,
                 self_value: frame.self_value,
                 this_value: frame.this_value,
                 return_register: frame.return_register,
@@ -674,18 +430,14 @@ impl ParkedFrameState {
         window.copy_from_slice(&self.registers.0);
         let Self {
             header,
-            eval_env,
             registers: _,
-            upvalues,
             self_value,
             this_value,
             return_register,
         } = self;
         Frame {
             header,
-            eval_env,
             registers: window,
-            upvalues,
             self_value,
             this_value,
             return_register,
@@ -700,19 +452,8 @@ impl ParkedFrameState {
 
     pub(crate) fn trace_slots(&self, visitor: &mut SlotVisitor<'_>) {
         self.registers.trace_slots(visitor);
-        for slot in self.upvalues.iter() {
-            let p = slot as *const UpvalueCell as *mut RawGc;
-            visitor(p);
-        }
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
-        if !self.eval_env.is_null() {
-            visitor(
-                std::ptr::from_ref(&self.eval_env)
-                    .cast_mut()
-                    .cast::<RawGc>(),
-            );
-        }
     }
 
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {

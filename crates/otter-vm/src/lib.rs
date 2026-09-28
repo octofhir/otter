@@ -3,6 +3,9 @@
 //! # Contents
 //! - [`Value`] — opaque NaN-boxed runtime value.
 //! - [`Frame`] — compact call frame.
+//! - [`context`] — per-scope binding contexts: every captured or
+//!   eval-visible binding is a context slot reached from a register and a
+//!   packed coordinate; a closure keeps the one context it was created over.
 //! - [`Interpreter`] — match-based dispatch loop over the frozen
 //!   executable view inside [`ExecutionContext`].
 //! - [`tier_policy::OptimizingDecision`] — additive optimizing-tier promotion
@@ -80,6 +83,8 @@ pub mod console;
 mod constant_ops;
 mod constructor_fast_path;
 mod constructor_profile;
+pub mod context;
+mod context_ops;
 mod conversion;
 mod cpu_profile;
 pub mod date;
@@ -137,7 +142,6 @@ pub mod jit;
 pub mod jit_artifact;
 mod jit_class_value_ops;
 mod jit_construct_ops;
-mod jit_control_ops;
 pub mod jit_debug;
 mod jit_delete_ops;
 mod jit_deopt_handlers;
@@ -230,7 +234,6 @@ pub mod tier_policy;
 pub mod timers;
 pub mod uint8_base64;
 pub mod upvalue;
-mod upvalue_source;
 pub mod value;
 pub mod value_slab;
 pub mod weak_refs;
@@ -375,8 +378,7 @@ pub(crate) struct RealmState {
     pub(crate) realm_context: Option<ExecutionContext>,
     pub(crate) module_environments: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
     pub(crate) host_module_env_cache: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
-    pub(crate) module_init_upvalues:
-        std::collections::HashMap<std::sync::Arc<str>, Box<[crate::UpvalueCell]>>,
+    pub(crate) module_init_closures: std::collections::HashMap<std::sync::Arc<str>, Value>,
     pub(crate) global_lexicals: rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, bool)>,
     pub(crate) global_lexical_epoch: u64,
     pub(crate) global_lexical_load_ic: rustc_hash::FxHashMap<(u32, u32), crate::UpvalueCell>,
@@ -438,11 +440,8 @@ impl RealmState {
         {
             object.trace_gc_roots(visitor);
         }
-        for spine in self.module_init_upvalues.values() {
-            for slot in spine.iter() {
-                let pointer = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
-                visitor(pointer);
-            }
+        for closure in self.module_init_closures.values() {
+            closure.trace_value_slots(visitor);
         }
         for (slot, _) in self.global_lexicals.values() {
             let pointer = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
@@ -620,7 +619,7 @@ pub struct JitRuntimeStats {
     pub feedback_refreshes: u64,
     /// Loop-OSR compile/entry attempts at threshold crossings.
     pub osr_attempts: u64,
-    /// JIT property/method/element/global/upvalue runtime stub calls.
+    /// JIT property/method/element/global/context runtime stub calls.
     pub runtime_property_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub runtime_stub_transitions: u64,
@@ -898,8 +897,8 @@ pub struct Interpreter {
     /// Prepared bytecode callback metadata for native loops that repeatedly
     /// call the same JS function. Entries are a strict stack: acquisition
     /// pushes the exact callable and scalar closure state, release pops it.
-    /// Runtime root tracing reaches inherited cells through the callable itself;
-    /// no second upvalue spine is cloned into this stack.
+    /// Runtime root tracing reaches the callback's context through the
+    /// callable itself.
     lean_callback_roots: Vec<call_ops::LeanCallbackRoot>,
     /// Owned dynamic payload for the most recently raised [`VmError`]. The
     /// error itself is `Copy` (no drop glue on the hot `Result` chain); its
@@ -967,8 +966,8 @@ pub struct Interpreter {
     /// the window to request an early poll.
     jit_backedge_fuel_window: u64,
     /// Per-isolate GC heap. Owned here so allocator-bearing
-    /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since
-    /// task 76) reach it through `&mut self`. The `Runtime`
+    /// opcodes (e.g. `Op::CreateContext`) reach it through
+    /// `&mut self`. The `Runtime`
     /// layer delegates `gc_heap` / `heap_stats` /
     /// `heap_snapshot` / `force_gc` accessors here.
     gc_heap: otter_gc::GcHeap,
@@ -1092,12 +1091,12 @@ pub struct Interpreter {
     /// specifier, regardless of import style or how many programs run on
     /// the isolate. Traced as GC roots.
     host_module_env_cache: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
-    /// Per-module persistent `<module-init>` own-upvalue cells — the
-    /// engine's module environment record. The link-phase (hoist) and
-    /// evaluation-phase invocations of one module's init share these
-    /// cells so closures instantiated at link time observe the
-    /// bindings the body later initialises.
-    module_init_upvalues: std::collections::HashMap<std::sync::Arc<str>, Box<[crate::UpvalueCell]>>,
+    /// Per-module persistent `<module-init>` SELF closure, created over the
+    /// module-scope context (the module Environment Record's context-held
+    /// bindings). The link-phase (hoist) and evaluation-phase invocations of
+    /// one module's init run the same closure, so closures instantiated at
+    /// link time observe the bindings the body later initialises.
+    module_init_closures: std::collections::HashMap<std::sync::Arc<str>, Value>,
     /// §9.1.1.4 GlobalEnvironmentRecord declarative record — script
     /// top-level `let` / `const` / `class` bindings, shared across
     /// every script and eval chunk in the realm and *not* reflected
@@ -1462,11 +1461,6 @@ pub struct Interpreter {
     /// [`Interpreter::poll_async_atomic_waits`] settles notified or
     /// timed-out entries.
     pending_atomic_waits: Vec<atomics::PendingAtomicWait>,
-    /// Monotonic creation sequence for eval-introduced bindings. Snapshot
-    /// opcodes compare against it to see the pre-RHS environment
-    /// (§13.15.2 reference resolution order). Starts at 1 so sequence 0
-    /// reads as "created before any snapshot".
-    eval_binding_seq: u64,
     /// Lazily-created `%FallbackSymbol%` for the legacy Intl-constructed
     /// compatibility path (`Intl.DateTimeFormat.call(obj)` /
     /// `Intl.NumberFormat.call(obj)` on an instance-shaped receiver).
@@ -1910,21 +1904,14 @@ pub struct EvalCompileOptions {
     /// they bind the name themselves). §19.2.1.3 then makes a sloppy
     /// body var-declaring `arguments` an early SyntaxError.
     pub forbid_var_arguments: bool,
-    /// §19.2.1.3 EvalDeclarationInstantiation — the caller variable
-    /// environment of a direct eval running inside a function. Entry
-    /// `i` corresponds to the upvalue cell the runtime splices into
-    /// slot `i` of the compiled `<main>`'s frame; the compiler binds
-    /// each name to that slot. `None` for indirect eval and for
-    /// direct eval at script top level (global environment).
-    pub caller_scope: Option<Vec<EvalCallerBinding>>,
-    /// §19.2.1.3 step 16.a — `true` for a direct eval whose caller
-    /// variable environment is the GLOBAL environment (a script-
-    /// top-level call site). `caller_scope` then carries only the
-    /// block-scope refinements lexically between the global
-    /// environment and the eval site: the body resolves those names
-    /// through the spliced cells, while its var-scoped declarations
-    /// still land on the global object as deletable bindings.
-    pub global_var_env: bool,
+    /// §19.2.1.3 EvalDeclarationInstantiation — the context chain of a
+    /// direct eval's call site, innermost first, with each context's scope
+    /// descriptor and current eval-extension names; its `var_depth` names
+    /// the VariableEnvironment context (`None`: the global environment).
+    /// The compiled `<main>` runs as a closure over the chain's innermost
+    /// context, so every caller binding is a static hop from it. `None`
+    /// for indirect eval, host scripts, and `Function`.
+    pub caller_chain: Option<otter_bytecode::EvalCallerChain>,
     /// `true` to compile the source as *script global code*
     /// (§16.1.7 GlobalDeclarationInstantiation — non-configurable
     /// global var bindings) instead of eval code. Used by host hooks
@@ -2008,45 +1995,6 @@ pub struct CallSiteInfo {
     /// relevant expression lives inside the callback body.
     #[serde(rename = "sourceLinesAfter", skip_serializing_if = "Vec::is_empty")]
     pub source_lines_after: Vec<String>,
-}
-
-/// One caller-environment binding visible to a direct eval body.
-#[derive(Debug, Clone)]
-pub struct EvalCallerBinding {
-    /// Source-level binding name.
-    pub name: String,
-    /// `true` for `let` / `const` / `class` caller bindings — a
-    /// sloppy eval body var-declaring the same name is a runtime
-    /// `SyntaxError` (§19.2.1.3 step 5).
-    pub lexical: bool,
-    /// Passthrough capture from a function enclosing the caller —
-    /// readable, but a `var` of the same name in the eval body
-    /// declares a fresh caller binding (§19.2.1.3).
-    pub captured: bool,
-    /// `true` for a `const` / `class` caller binding — an eval-body
-    /// assignment throws `TypeError` in every mode (§13.3.1).
-    pub is_const: bool,
-    /// `true` for a named function expression's self-name binding —
-    /// an eval-body assignment throws `TypeError` in strict mode only
-    /// (§10.2.11, §9.1.1.1.5).
-    pub fn_self_name: bool,
-    /// `true` for a binding declared in a block or catch clause
-    /// lexically between the caller's variable environment and the
-    /// eval site: the body resolves the name here, but a body `var`
-    /// of the same name declares a fresh variable-environment binding
-    /// underneath (§19.2.1.3, §B.3.5).
-    pub inner: bool,
-    /// `true` for a binding a previous sloppy eval introduced into the
-    /// caller's variable environment (§19.2.1.3 CreateMutableBinding
-    /// with deletable = true): the eval body keeps routing the name
-    /// through the dynamic eval-environment ops so a `delete` stays
-    /// observable.
-    pub deletable: bool,
-    /// 1-based lexical scope depth of the binding inside the caller
-    /// function — the function scope is `1`, each enclosing block or
-    /// catch clause adds one. Orders the binding against the caller's
-    /// `with` object environments (§9.1.1.2.1).
-    pub scope_depth: u16,
 }
 
 /// Embedder-supplied parse + compile callback used by

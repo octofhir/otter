@@ -10,7 +10,13 @@
 //!   indexed elements, arithmetic, comparison, typed array construction, and
 //!   typed plain/method/forwarded calls and frameless scalar/property-inline guards.
 //! - Forwarding carries method, callee, receiver and mapped register values as
-//!   explicit SSA operands; captured aliases remain live activation cells.
+//!   explicit SSA operands; a function whose mapped formals live in context
+//!   slots declines Machine forwarding.
+//! - Per-scope contexts: SELF ([`NumericNode::Callee`]), the closure's
+//!   context word, one pure node per parent hop, slot loads and
+//!   write-barriered slot stores, and context allocation at an exact
+//!   safepoint. `ReturnDerived` and every eval-extension lookup keep the
+//!   Template baseline or their committed binding sibling.
 //! - [`NumericLoopEntryPlan`] — explicit external-entry splits for reducible
 //!   natural loops, including OSR entry.
 //!
@@ -50,12 +56,21 @@
 //!   `PropertyShapeLoad` node with an exact pre-operation state; it does not
 //!   end its block.
 //! - Every schema-owned binding read, write, and delete remains one typed HIR
-//!   family. Structurally proven global-this, upvalue, global lexical, and
-//!   global-object targets retain a generated sibling; dynamic/shadowed sites
-//!   and missing proofs use only the committed cold sibling. Guard miss, TDZ,
+//!   family. Structurally proven global-this, global lexical, global-object
+//!   and checked context-slot targets retain a generated sibling; lookup and
+//!   eval-extension sites and missing proofs use only the committed cold
+//!   sibling, with the context register as a boxed input. Guard miss, TDZ,
 //!   const/accessor/Proxy failure, and unresolved lookup never deopt or replay.
 //!   The pre-operation frame state exists solely to publish complete tagged
 //!   roots at the committed cold safepoint.
+//! - A checked context-slot access outside a local handler whose hole exit
+//!   never fired speculates an initialized binding instead: straight-line hops,
+//!   a slot load and a [`NumericNode::ContextHoleGuard`] with an exact
+//!   pre-operation state, before any store. Such a site does not end its
+//!   block. After the exit fires, the next generation keeps the committed CFG.
+//! - Context values are ordinary tagged SSA values. Parent and closure-context
+//!   words are immutable after creation; only slots are mutable. No derived
+//!   context address exists in HIR.
 //! - Loose numeric equality reuses the guarded numeric path. A tagged value may
 //!   compare directly with a static nullish literal, but the node retains an
 //!   exact pre-operation state so a native-function cell can deopt for HTMLDDA
@@ -175,14 +190,21 @@ pub(super) enum NumericElementAccess {
 pub(super) enum NumericBindingTarget {
     /// The realm-global object through the snapshot's stable global-this cell.
     GlobalThis,
-    /// One stable captured cell in the current native-frame spine.
-    Upvalue { index: u32 },
-    /// One captured cell of an explicit closure: an inlined callee reads its
-    /// own upvalues through the closure its call guard proved, since no
-    /// native frame of its own exists.
-    ClosureUpvalue { index: u32, closure: NumericValue },
     /// One VM-baked stable global lexical or object target.
     Global(otter_vm::jit::BindingHitProof),
+    /// A checked context slot `depth` parent links above the context input.
+    /// The generated guard misses to the committed sibling on the TDZ hole.
+    ContextSlot { depth: u16, slot: u16 },
+}
+
+/// Which context one [`NumericNode::ContextAllocation`] creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericContextAllocation {
+    /// `CreateContext`: a fresh context of `function_id`'s scope `scope`
+    /// under the input parent (a context or `undefined`).
+    Create { function_id: u32, scope: u32 },
+    /// `CopyContext`: a per-iteration copy of the input context.
+    Copy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -197,23 +219,21 @@ pub(super) enum NumericNode {
     TaggedToInt32(NumericValue),
     This,
     ClassSuperConstructor(NumericValue),
-    /// `rejects_eval_env` on the inline guards: the spliced body can observe
-    /// its closure's dynamic eval environment, so the guard proves it absent.
+    /// Inline guards prove the callable's function identity. A spliced body
+    /// that reads its SELF reads the guarded callable value itself, so two
+    /// closures of one function each see their own context.
     InlineMethodGuard {
         source: NumericValue,
         target: u16,
-        rejects_eval_env: bool,
     },
     InlineConstructGuard {
         source: NumericValue,
         function_id: u32,
-        rejects_eval_env: bool,
     },
     InlineCallGuard {
         source: NumericValue,
         function_id: u32,
         this_mode: otter_vm::JitDirectCallThisMode,
-        rejects_eval_env: bool,
     },
     /// Complete nursery receiver, or undefined when no allocation was committed.
     ConstructReceiver {
@@ -227,6 +247,38 @@ pub(super) enum NumericNode {
         receiver: NumericValue,
     },
     BoxTagged(NumericValue),
+    /// The running closure (SELF). A spliced body maps it to the guarded
+    /// callable of its inline site.
+    Callee,
+    /// A closure's immutable context word; `undefined` for a non-closure.
+    ClosureContext(NumericValue),
+    /// A context's immutable parent word.
+    ContextParent(NumericValue),
+    /// Unchecked read of one context slot.
+    ContextSlotLoad {
+        context: NumericValue,
+        slot: u16,
+    },
+    /// Exact pre-effect exit when `value` is the TDZ hole. A checked access
+    /// that never exited here speculates its binding is initialized; the
+    /// interpreter raises the `ReferenceError` after the exit.
+    ContextHoleGuard {
+        value: NumericValue,
+        byte_pc: u32,
+    },
+    /// Unchecked write-barriered store of one context slot.
+    ContextSlotStore {
+        context: NumericValue,
+        slot: u16,
+        value: NumericValue,
+    },
+    /// Non-reentrant context allocation at an exact safepoint. A refused
+    /// allocation exits before any effect at the original opcode.
+    ContextAllocation {
+        kind: NumericContextAllocation,
+        input: NumericValue,
+        byte_pc: u32,
+    },
     Binding {
         semantics: BindingSemantics,
         inputs: [Option<NumericValue>; 2],
@@ -637,6 +689,13 @@ impl NumericNode {
             | Self::InlineMethodGuard { .. }
             | Self::BoxTagged(..)
             | Self::This
+            | Self::Callee
+            | Self::ClosureContext(..)
+            | Self::ContextParent(..)
+            | Self::ContextSlotLoad { .. }
+            | Self::ContextHoleGuard { .. }
+            | Self::ContextSlotStore { .. }
+            | Self::ContextAllocation { .. }
             | Self::ClassSuperConstructor(..)
             | Self::Binding { .. }
             | Self::StringConstantCell { .. }
@@ -745,6 +804,8 @@ impl NumericNode {
             | Self::BindingGuardedRead { .. }
             | Self::ElementUnseenExit { .. }
             | Self::ArrayConstruct { .. }
+            | Self::ContextHoleGuard { .. }
+            | Self::ContextAllocation { .. }
             | Self::DirectCall { .. }
             | Self::NativeCall { .. }
             | Self::NativeLeaf { .. }
@@ -784,7 +845,7 @@ pub(super) enum NumericTerminator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericBlock {
     pub(super) logical_pc: u32,
-    /// Whether selection may publish an OSR trampoline at this block.
+    /// Whether selection may give this loop header an OSR block.
     pub(super) osr_entry_allowed: bool,
     pub(super) predecessors: Vec<usize>,
     pub(super) successors: Vec<usize>,
@@ -1550,6 +1611,7 @@ fn loop_is_versionable(function: &NumericFunction, natural_loop: &NumericNatural
                             | NumericNode::ColdCallExit { .. }
                             | NumericNode::ArrayConstruct { .. }
                             | NumericNode::LiteralAllocation { .. }
+                            | NumericNode::ContextAllocation { .. }
                             | NumericNode::TaggedStringConcat(..)
                             | NumericNode::CommittedValue { .. }
                             | NumericNode::ClassSuperConstructor(..)
@@ -1875,6 +1937,9 @@ fn build_raw_blocks(
                 .is_some();
         let speculated_load = op == Op::LoadProperty
             && super::property_speculation::speculated_load(view, pc).is_some();
+        // Only a site lowering to the binding CFG ends its block; a
+        // speculated checked context access stays straight-line.
+        let binding = binding && !speculates_context_binding(view, pc, op, protected_throw);
         if (binding
             || native_call
             || (matches!(
@@ -2182,7 +2247,8 @@ fn instruction_accesses(
     }
     // Elided arguments are an implicit operand span. Preserve the current
     // mapped register bindings even when the call's destination overwrites one
-    // of them; captured bindings stay in the traced upvalue spine instead.
+    // of them; a context-held binding is read through the explicit context
+    // register operand instead.
     if op == Op::CallForwardArguments {
         for (_, storage) in code.forwarded_argument_bindings() {
             if let otter_bytecode::ArgumentBindingStorage::Register { reg } = storage
@@ -2524,18 +2590,80 @@ fn lower_binding(
         *input = Some(read_value(registers, register)?);
     }
 
+    // A checked context slot that speculates an initialized binding reads
+    // and writes the slot through straight-line context nodes. The hole
+    // exits before any effect; the interpreter then raises the
+    // `ReferenceError`, and the next generation keeps the committed CFG.
+    if speculate && exceptional_edge.is_none() {
+        let checked = match semantics {
+            BindingSemantics::Read(BindingRead::ContextSlot { context, coord, .. }) => {
+                Some((None, context, coord))
+            }
+            BindingSemantics::Write(BindingWrite::ContextSlot {
+                value,
+                context,
+                coord,
+            }) => Some((Some(value), context, coord)),
+            _ => None,
+        };
+        if let Some((stored, context, coord)) = checked {
+            let context = read_context(
+                registers,
+                register(instruction, code, usize::from(context))?,
+                nodes,
+            )?;
+            let coord = context_coord(instruction, code, usize::from(coord))?;
+            let target = context_hops(nodes, block_nodes, context, coord.depth);
+            let current = push(
+                nodes,
+                NumericNode::ContextSlotLoad {
+                    context: target,
+                    slot: coord.slot,
+                },
+            );
+            block_nodes.push(current);
+            let guard = push(
+                nodes,
+                NumericNode::ContextHoleGuard {
+                    value: current,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(guard);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(guard),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            if let Some(stored) = stored {
+                let value =
+                    read_value(registers, register(instruction, code, usize::from(stored))?)?;
+                let store = push(
+                    nodes,
+                    NumericNode::ContextSlotStore {
+                        context: target,
+                        slot: coord.slot,
+                        value,
+                    },
+                );
+                block_nodes.push(store);
+            } else if let Some(destination) = semantics.result_operand() {
+                write(
+                    registers,
+                    register(instruction, code, usize::from(destination))?,
+                    RegisterState::Value(current),
+                )?;
+            }
+            return Some(());
+        }
+    }
+
     let target = match semantics {
         BindingSemantics::Read(BindingRead::GlobalThis { .. }) if cage_available => {
             Some(NumericBindingTarget::GlobalThis)
-        }
-        BindingSemantics::Read(BindingRead::Upvalue { index, .. })
-        | BindingSemantics::Write(BindingWrite::Upvalue { index, .. })
-            if cage_available =>
-        {
-            u32::try_from(instruction.imm32(code, usize::from(index))?)
-                .ok()
-                .filter(|index| *index <= 4095)
-                .map(|index| NumericBindingTarget::Upvalue { index })
         }
         BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
             if cage_available =>
@@ -2555,23 +2683,40 @@ fn lower_binding(
                 | otter_vm::jit::BindingHitProof::GlobalObject { writable, .. } => *writable,
             })
             .map(NumericBindingTarget::Global),
+        // A committed checked context slot keeps a generated sibling: the
+        // guard walks the chain and misses to the cold call on the hole.
+        BindingSemantics::Read(BindingRead::ContextSlot { coord, .. })
+        | BindingSemantics::Write(BindingWrite::ContextSlot { coord, .. }) => {
+            let coord = context_coord(instruction, code, usize::from(coord))?;
+            Some(NumericBindingTarget::ContextSlot {
+                depth: coord.depth,
+                slot: coord.slot,
+            })
+        }
+        // A derived-this bind, eval-extension lookups, and resolved
+        // references complete through the committed sibling; the context or
+        // reference register is one of its boxed inputs.
         BindingSemantics::Read(
-            BindingRead::Dynamic { .. }
-            | BindingRead::ShadowedUpvalue { .. }
-            | BindingRead::EvalBindingSeq { .. },
+            BindingRead::LookupSlot { .. }
+            | BindingRead::LookupGlobal { .. }
+            | BindingRead::ResolveRef { .. },
         )
         | BindingSemantics::Write(
-            BindingWrite::Dynamic { .. }
-            | BindingWrite::ShadowedUpvalue { .. }
-            | BindingWrite::ShadowedRestore { .. },
+            BindingWrite::BindThis { .. }
+            | BindingWrite::LookupSlot { .. }
+            | BindingWrite::LookupGlobal { .. }
+            | BindingWrite::StoreRef { .. }
+            | BindingWrite::DeclareEvalVar { .. }
+            | BindingWrite::VarScope { .. },
         )
         | BindingSemantics::Delete(_) => None,
-        BindingSemantics::Read(BindingRead::GlobalThis { .. } | BindingRead::Upvalue { .. })
-        | BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
+        BindingSemantics::Read(
+            BindingRead::GlobalThis { .. }
+            | BindingRead::Global { .. }
+            | BindingRead::Exists { .. },
+        )
         | BindingSemantics::Write(
-            BindingWrite::Global { .. }
-            | BindingWrite::GlobalChecked { .. }
-            | BindingWrite::Upvalue { .. },
+            BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. },
         ) => None,
     };
 
@@ -2773,6 +2918,105 @@ fn lower_instruction(
         Op::LoadHole => NumericNode::TaggedConstant(otter_vm::Value::hole().to_bits()),
         Op::LoadNull => NumericNode::TaggedConstant(otter_vm::Value::null().to_bits()),
         Op::LoadThis => NumericNode::This,
+        Op::LoadClosureContext | Op::LoadSelf => {
+            let callee = push(nodes, NumericNode::Callee);
+            block_nodes.push(callee);
+            let value = if op == Op::LoadClosureContext {
+                let context = push(nodes, NumericNode::ClosureContext(callee));
+                block_nodes.push(context);
+                context
+            } else {
+                callee
+            };
+            return write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            );
+        }
+        Op::LoadContextSlot => {
+            let context = read_context(registers, register(instruction, code, 1)?, nodes)?;
+            let Some(coord) = context_coord(instruction, code, 2) else {
+                note_decline(
+                    decline,
+                    op,
+                    logical_pc,
+                    "context chain beyond the hop bound",
+                );
+                return None;
+            };
+            let target = context_hops(nodes, block_nodes, context, coord.depth);
+            let value = push(
+                nodes,
+                NumericNode::ContextSlotLoad {
+                    context: target,
+                    slot: coord.slot,
+                },
+            );
+            block_nodes.push(value);
+            return write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            );
+        }
+        Op::StoreContextSlot => {
+            let value = read_value(registers, register(instruction, code, 0)?)?;
+            let context = read_context(registers, register(instruction, code, 1)?, nodes)?;
+            let Some(coord) = context_coord(instruction, code, 2) else {
+                note_decline(
+                    decline,
+                    op,
+                    logical_pc,
+                    "context chain beyond the hop bound",
+                );
+                return None;
+            };
+            let target = context_hops(nodes, block_nodes, context, coord.depth);
+            let store = push(
+                nodes,
+                NumericNode::ContextSlotStore {
+                    context: target,
+                    slot: coord.slot,
+                    value,
+                },
+            );
+            block_nodes.push(store);
+            return Some(());
+        }
+        Op::CreateContext | Op::CopyContext => {
+            let input = read_context(registers, register(instruction, code, 1)?, nodes)?;
+            let kind = if op == Op::CreateContext {
+                NumericContextAllocation::Create {
+                    function_id,
+                    scope: u32::try_from(instruction.imm32(code, 2)?).ok()?,
+                }
+            } else {
+                NumericContextAllocation::Copy
+            };
+            let value = push(
+                nodes,
+                NumericNode::ContextAllocation {
+                    kind,
+                    input,
+                    byte_pc: instruction.byte_pc,
+                },
+            );
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
+            return write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            );
+        }
         Op::LoadString => {
             let _ = instruction.const_index(code, 1)?;
             NumericNode::StringConstantCell {
@@ -3259,6 +3503,12 @@ fn lower_instruction(
                 if let otter_bytecode::ArgumentBindingStorage::Register { reg } = storage {
                     arguments.push(read_value(registers, reg)?);
                 }
+            }
+            // Context-held mapped formals travel as the trailing formals
+            // context; the emitter also publishes it into its frame register,
+            // which the native leaf copy and arguments materialization read.
+            if let Some(context) = code.forwarded_formals_context() {
+                arguments.push(read_value(registers, context)?);
             }
             let (start, count) = append_operand_values(operand_values, arguments)?;
             let target = intern_direct_call_target(
@@ -4301,6 +4551,65 @@ fn push(nodes: &mut Vec<NumericNode>, node: NumericNode) -> NumericValue {
     value
 }
 
+/// Deepest context chain one access expands into explicit parent hops.
+/// Compilers emit a hop per enclosing scope that owns a context, so real
+/// chains stay in single digits; a deeper chain keeps the Template baseline.
+const MAX_CONTEXT_HOPS: u16 = 64;
+
+/// A context register's value. Contexts are tagged heap values; any other
+/// representation is an invalid operand the lowering refuses.
+fn read_context(
+    registers: &[RegisterState],
+    register: u16,
+    nodes: &[NumericNode],
+) -> Option<NumericValue> {
+    let value = read_value(registers, register)?;
+    (nodes.get(value.0)?.value_type() == NumericType::Tagged).then_some(value)
+}
+
+/// The packed `depth << 16 | slot` coordinate at `operand`, within the hop
+/// bound.
+fn context_coord(
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    operand: usize,
+) -> Option<otter_bytecode::ContextCoord> {
+    otter_bytecode::ContextCoord::from_imm32(instruction.imm32(code, operand)?)
+        .filter(|coord| coord.depth <= MAX_CONTEXT_HOPS)
+}
+
+/// Follow `depth` immutable parent words from `context`, one pure node per
+/// hop so value numbering shares common chain prefixes.
+fn context_hops(
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    context: NumericValue,
+    depth: u16,
+) -> NumericValue {
+    let mut current = context;
+    for _ in 0..depth {
+        current = push(nodes, NumericNode::ContextParent(current));
+        block_nodes.push(current);
+    }
+    current
+}
+
+/// Whether a checked context-slot access speculates an initialized binding:
+/// it lowers to straight-line context nodes with an exact pre-effect hole
+/// exit instead of the committed binding CFG. A protected site, or one whose
+/// hole exit already fired in an earlier generation, keeps the committed CFG
+/// whose cold sibling raises the `ReferenceError` without replay.
+fn speculates_context_binding(
+    view: &JitCompileSnapshot,
+    logical_pc: u32,
+    op: Op,
+    protected: bool,
+) -> bool {
+    matches!(op, Op::LoadContextSlotChecked | Op::StoreContextSlotChecked)
+        && !protected
+        && !view.optimized_exit_reasons.contains_key(&logical_pc)
+}
+
 fn register(
     instruction: &JitInstructionMetadata,
     code: &otter_vm::CodeBlock,
@@ -4502,6 +4811,7 @@ mod tests {
 
     use super::*;
     use crate::machine::TargetSpec;
+    use std::sync::Arc;
 
     fn parameter_origins(masks: &[u16]) -> Vec<BTreeSet<u16>> {
         masks
@@ -4570,8 +4880,6 @@ mod tests {
                 generated_stack_frame_bytes: Some(0),
                 param_count: 1,
                 register_count: 2,
-                own_upvalue_count: 0,
-                inherited_upvalue_count: 0,
                 needs_incoming_arguments: false,
             },
             receiver_allocation: None,
@@ -4691,6 +4999,7 @@ mod tests {
                     &TargetSpec::aarch64(),
                     &hir,
                     &hir.plan_loop_entries(),
+                    None,
                 )
                 .expect("verified native leaf Machine IR");
                 sequence
@@ -5096,8 +5405,6 @@ mod tests {
                     generated_stack_frame_bytes: Some(0),
                     param_count: 0,
                     register_count: 1,
-                    own_upvalue_count: 0,
-                    inherited_upvalue_count: 0,
                     needs_incoming_arguments: false,
                 },
                 receiver_allocation: None,
@@ -5258,8 +5565,6 @@ mod tests {
                     generated_stack_frame_bytes: Some(0),
                     param_count: 0,
                     register_count: 1,
-                    own_upvalue_count: 0,
-                    inherited_upvalue_count: 0,
                     needs_incoming_arguments: false,
                 },
                 receiver_allocation: None,
@@ -5791,6 +6096,365 @@ mod tests {
         assert!(!live[2], "the catch supplies its exception register");
     }
 
+    fn coord(depth: u16, slot: u16) -> Operand {
+        Operand::Imm32(
+            otter_bytecode::ContextCoord::new(depth, slot)
+                .expect("addressable slot")
+                .to_imm32(),
+        )
+    }
+
+    fn context_view(function_id: u32, instructions: Vec<(Op, Vec<Operand>)>) -> JitCompileSnapshot {
+        JitCompileSnapshot::without_feedback(
+            function_id,
+            1,
+            6,
+            instructions
+                .into_iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn context_operations_lower_to_explicit_context_nodes() {
+        let view = context_view(
+            123,
+            vec![
+                (Op::LoadClosureContext, vec![Operand::Register(1)]),
+                (
+                    Op::LoadContextSlot,
+                    vec![Operand::Register(2), Operand::Register(1), coord(2, 3)],
+                ),
+                (
+                    Op::StoreContextSlot,
+                    vec![Operand::Register(2), Operand::Register(1), coord(0, 1)],
+                ),
+                (
+                    Op::CreateContext,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::Imm32(4),
+                    ],
+                ),
+                (
+                    Op::CopyContext,
+                    vec![Operand::Register(3), Operand::Register(3)],
+                ),
+                (Op::LoadSelf, vec![Operand::Register(4)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let function = NumericFunction::build(&view).expect("context operations lower");
+        // Unchecked accesses and allocations do not split the block.
+        assert_eq!(function.blocks.len(), 1);
+        let nodes = &function.nodes;
+        let find = |predicate: &dyn Fn(&NumericNode) -> bool| {
+            nodes
+                .iter()
+                .position(predicate)
+                .map(NumericValue)
+                .expect("expected context node")
+        };
+        let callee = find(&|node| matches!(node, NumericNode::Callee));
+        let closure_context = find(&|node| *node == NumericNode::ClosureContext(callee));
+        let first_hop = find(&|node| *node == NumericNode::ContextParent(closure_context));
+        let second_hop = find(&|node| *node == NumericNode::ContextParent(first_hop));
+        let load = find(&|node| {
+            *node
+                == NumericNode::ContextSlotLoad {
+                    context: second_hop,
+                    slot: 3,
+                }
+        });
+        assert!(nodes.contains(&NumericNode::ContextSlotStore {
+            context: closure_context,
+            slot: 1,
+            value: load,
+        }));
+        let create = find(&|node| {
+            matches!(
+                node,
+                NumericNode::ContextAllocation {
+                    kind: NumericContextAllocation::Create {
+                        function_id: 123,
+                        scope: 4,
+                    },
+                    input,
+                    byte_pc: 24,
+                } if *input == closure_context
+            )
+        });
+        let copy = find(&|node| {
+            matches!(
+                node,
+                NumericNode::ContextAllocation {
+                    kind: NumericContextAllocation::Copy,
+                    input,
+                    byte_pc: 32,
+                } if *input == create
+            )
+        });
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, NumericNode::Callee))
+                .count(),
+            2,
+            "LoadSelf reads SELF directly"
+        );
+        for allocation in [create, copy] {
+            assert_eq!(
+                nodes[allocation.0].frame_state_purpose(),
+                Some(NumericFrameStatePurpose::ExactDeopt)
+            );
+            assert!(
+                function
+                    .frame_states
+                    .iter()
+                    .any(|state| state.point == NumericFramePoint::Node(allocation))
+            );
+        }
+        assert_eq!(
+            function.blocks[0].terminator,
+            NumericTerminator::Return(load)
+        );
+    }
+
+    #[test]
+    fn derived_returns_and_deep_context_chains_keep_the_template_baseline() {
+        let derived = context_view(
+            124,
+            vec![
+                (
+                    Op::ReturnDerived,
+                    vec![Operand::Register(1), Operand::Register(0), coord(0, 0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        assert!(NumericFunction::build(&derived).is_err());
+        let deep = context_view(
+            125,
+            vec![
+                (
+                    Op::LoadContextSlot,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        coord(MAX_CONTEXT_HOPS + 1, 0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        assert!(NumericFunction::build(&deep).is_err());
+    }
+
+    #[test]
+    fn checked_context_slots_speculate_until_their_hole_exit_fires() {
+        let instructions = vec![
+            (
+                Op::LoadContextSlotChecked,
+                vec![Operand::Register(1), Operand::Register(0), coord(1, 0)],
+            ),
+            (
+                Op::StoreContextSlotChecked,
+                vec![Operand::Register(1), Operand::Register(0), coord(0, 2)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ];
+        let speculated = NumericFunction::build(&context_view(126, instructions.clone()))
+            .expect("speculated checked context accesses");
+        assert_eq!(
+            speculated.blocks.len(),
+            1,
+            "speculated accesses stay straight-line"
+        );
+        assert!(
+            !speculated
+                .nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::Binding { .. }))
+        );
+        let guards = speculated
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| matches!(node, NumericNode::ContextHoleGuard { .. }))
+            .map(|(index, _)| NumericValue(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            guards.len(),
+            2,
+            "the load and the store each prove the slot"
+        );
+        for guard in &guards {
+            let state = speculated
+                .frame_states
+                .iter()
+                .find(|state| state.point == NumericFramePoint::Node(*guard))
+                .expect("hole guard owns an exact pre-operation state");
+            let NumericNode::ContextHoleGuard { byte_pc, .. } = speculated.nodes[guard.0] else {
+                unreachable!()
+            };
+            assert_eq!(state.frames[0].byte_pc, byte_pc);
+        }
+        // The store's guard precedes the store itself.
+        let store = speculated
+            .nodes
+            .iter()
+            .position(|node| matches!(node, NumericNode::ContextSlotStore { slot: 2, .. }))
+            .expect("guarded store");
+        assert!(guards[1].0 < store);
+
+        let mut exited = context_view(127, instructions);
+        for pc in [0, 1] {
+            exited.optimized_exit_reasons.insert(
+                pc,
+                BTreeSet::from([otter_vm::native_abi::ExitReason::TypeMismatch]),
+            );
+        }
+        let committed = NumericFunction::build(&exited).expect("committed checked accesses");
+        let targets = committed
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                NumericNode::Binding { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                Some(NumericBindingTarget::ContextSlot { depth: 1, slot: 0 }),
+                Some(NumericBindingTarget::ContextSlot { depth: 0, slot: 2 }),
+            ]
+        );
+        assert!(
+            !committed
+                .nodes
+                .iter()
+                .any(|node| matches!(node, NumericNode::ContextHoleGuard { .. }))
+        );
+    }
+
+    #[test]
+    fn inlined_closure_context_reads_the_guarded_callee() {
+        // A checked read keeps an exact hole exit inside the spliced body, so
+        // the callee activation recipe is observable.
+        let callee = Arc::new(context_view(
+            41,
+            vec![
+                (Op::LoadClosureContext, vec![Operand::Register(1)]),
+                (
+                    Op::LoadContextSlotChecked,
+                    vec![Operand::Register(2), Operand::Register(1), coord(1, 0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        ));
+        let mut root = JitCompileSnapshot::without_feedback(
+            40,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(
+                    Op::Call,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(2)]),
+            ],
+        );
+        root.direct_callees.insert(
+            0,
+            vec![JitDirectCallee {
+                plan: JitDirectCallPlan {
+                    function_id: 41,
+                    code_object_id: 42,
+                    entry_cell: 43,
+                    tier: NativeFrameKind::Baseline,
+                    this_mode: JitDirectCallThisMode::StrictOrLexical,
+                    is_derived_constructor: false,
+                    generated_stack_frame_bytes: Some(0),
+                    param_count: 1,
+                    register_count: 6,
+                    needs_incoming_arguments: false,
+                },
+                receiver_allocation: None,
+            }],
+        );
+        root.inline_callees
+            .insert(0, otter_vm::jit::JitInlineCallee { body: callee });
+        let mut function = NumericFunction::build(&root).expect("root with a direct call");
+        let NumericNode::DirectCall { source, .. } = function
+            .nodes
+            .iter()
+            .copied()
+            .find(|node| matches!(node, NumericNode::DirectCall { .. }))
+            .expect("direct call site")
+        else {
+            unreachable!()
+        };
+        let diagnostics = super::super::inlining::splice(&mut function, &root, true);
+        assert!(
+            diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic,
+                otter_vm::JitCompilerDiagnostic::InlineLowered {
+                    outcome: otter_vm::JitInlineLoweringOutcome::Inlined,
+                    ..
+                }
+            )),
+            "{diagnostics:?}"
+        );
+        let reachable = function
+            .blocks
+            .iter()
+            .flat_map(|block| block.nodes.iter().copied())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !reachable
+                .iter()
+                .any(|node| matches!(function.nodes[node.0], NumericNode::Callee)),
+            "a spliced body has no frame SELF"
+        );
+        let context = reachable
+            .iter()
+            .copied()
+            .find(|node| function.nodes[node.0] == NumericNode::ClosureContext(source))
+            .expect("the callee context is the guarded callable's context word");
+        let hop = reachable
+            .iter()
+            .copied()
+            .find(|node| function.nodes[node.0] == NumericNode::ContextParent(context))
+            .expect("captured reads hop from the callable's context");
+        assert!(reachable.iter().any(|node| {
+            function.nodes[node.0]
+                == NumericNode::ContextSlotLoad {
+                    context: hop,
+                    slot: 0,
+                }
+        }));
+        let entry = function
+            .frame_states
+            .iter()
+            .flat_map(|state| state.frames.iter())
+            .find_map(|frame| (frame.function_id == 41).then_some(frame.entry?))
+            .expect("inline activation recipe");
+        assert_eq!(entry.closure, NumericFrameSlot::Value(source));
+    }
+
     #[test]
     fn schema_only_value_ops_use_the_generic_admission_transfer() {
         let view = JitCompileSnapshot::without_feedback(
@@ -5825,10 +6489,14 @@ mod tests {
                     ],
                 ),
                 JitTestInstruction::new(
-                    Op::StoreUpvalueChecked,
+                    Op::StoreContextSlotChecked,
                     3,
                     24,
-                    vec![Operand::Register(0), Operand::Imm32(0)],
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::Imm32(0),
+                    ],
                 ),
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
             ],
@@ -5848,7 +6516,7 @@ mod tests {
         );
         assert_eq!(
             instruction_accesses(&view.instructions[3], code),
-            Some((vec![0], Vec::new()))
+            Some((vec![0, 1], Vec::new()))
         );
 
         let mut origins = parameter_origins(&[1, 2, 4, 8]);
@@ -6857,12 +7525,7 @@ mod tests {
                 0,
                 5,
                 vec![
-                    JitTestInstruction::new(
-                        Op::LoadUpvalue,
-                        0,
-                        0,
-                        vec![Operand::Register(0), Operand::Imm32(0)],
-                    ),
+                    JitTestInstruction::new(Op::LoadGlobalThis, 0, 0, vec![Operand::Register(0)]),
                     JitTestInstruction::new(
                         Op::ToPrimitive,
                         1,
@@ -7217,7 +7880,7 @@ mod tests {
         let mut view = JitCompileSnapshot::without_feedback(
             104,
             6,
-            6,
+            7,
             vec![
                 JitTestInstruction::new(
                     Op::CallForwardArguments,
@@ -7228,29 +7891,32 @@ mod tests {
                         Operand::Register(3),
                         Operand::Register(4),
                         Operand::Register(5),
+                        Operand::Register(6),
                     ],
                 ),
                 JitTestInstruction::new(Op::ReturnValue, 1, 16, vec![Operand::Register(0)]),
             ],
         );
+        // The context-held formal is reached through the explicit context
+        // register operand (r6), which is live whatever the arguments kind.
         let bindings = [
             (0, ArgumentBindingStorage::Register { reg: 1 }),
-            (1, ArgumentBindingStorage::Upvalue { idx: 0 }),
+            (1, ArgumentBindingStorage::Context { reg: 6, slot: 0 }),
             (2, ArgumentBindingStorage::Register { reg: 0 }),
         ];
         for (kind, expected) in [
             (
                 ArgumentsObjectKind::Mapped,
-                vec![true, true, false, true, true, true],
+                vec![true, true, false, true, true, true, true],
             ),
             (
                 ArgumentsObjectKind::Unmapped,
-                vec![false, false, false, true, true, true],
+                vec![false, false, false, true, true, true, true],
             ),
         ] {
             view.seed_argument_bindings_for_test(kind, &bindings);
             let semantics = classify_snapshot(&view).expect("forwarding semantics");
-            let mut live = vec![true, false, false, false, false, false];
+            let mut live = vec![true, false, false, false, false, false, false];
             transfer_instruction_liveness(
                 &view.instructions[0],
                 &view.code_block,

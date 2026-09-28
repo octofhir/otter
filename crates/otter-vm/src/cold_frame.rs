@@ -33,7 +33,7 @@ use crate::frame_state::{
     AsyncFrameState, PendingBindFunction, PendingGetIterator, PendingIteratorNext,
     PendingToPrimitive, TryHandler,
 };
-use crate::{JsObject, UpvalueCell, Value};
+use crate::{JsObject, Value};
 use smallvec::SmallVec;
 
 /// A non-throw abrupt completion (`return` / `break` / `continue`)
@@ -180,19 +180,21 @@ pub struct ColdFrame {
     pub active_iterator_closers: SmallVec<[(Value, u32); 2]>,
     /// `true` when this frame runs a *derived* class constructor.
     /// Its `this` starts in the TDZ (a `Value::hole()` in
-    /// `Frame::this_value`) until `super(...)` runs
-    /// [`otter_bytecode::Op::BindThisValue`]. The return path
-    /// (`pop_frame`) consults this to apply §10.2.2 derived
-    /// constructor return semantics: an object return is honoured
-    /// verbatim, an undefined return yields the bound `this`, and an
-    /// undefined return with `this` still in the TDZ is a
+    /// `Frame::this_value`) until `super(...)` binds it — through
+    /// [`otter_bytecode::Op::BindThisValue`] for a frame-held `this`, or
+    /// into the `DerivedThis` context slot that
+    /// [`Self::derived_this_slot`] names. The return path (`pop_frame`)
+    /// consults this to apply
+    /// §10.2.2 derived constructor return semantics: an object return is
+    /// honoured verbatim, an undefined return yields the bound `this`, and
+    /// an undefined return with `this` still in the TDZ is a
     /// `ReferenceError`.
     pub is_derived_constructor: bool,
-    /// Shared `this` binding cell for derived constructors. Arrow
-    /// closures created in the constructor capture this cell so
-    /// `super()` can bind the original constructor environment even
-    /// when the arrow runs through a nested sync dispatch.
-    pub derived_this_cell: Option<UpvalueCell>,
+    /// The `DerivedThis` context slot a [`otter_bytecode::Op::ReturnDerived`]
+    /// completion named: the context value and the slot coordinate relative
+    /// to it. The frame reads the slot when it actually pops, after crossed
+    /// `finally` blocks, which may still call `super()`.
+    pub derived_this_slot: Option<(Value, otter_bytecode::ContextCoord)>,
 }
 
 impl ColdFrame {
@@ -237,6 +239,9 @@ impl ColdFrame {
         for (value, _) in &self.active_iterator_closers {
             crate::code_liveness::visit_value(value, visitor);
         }
+        if let Some((context, _)) = &self.derived_this_slot {
+            crate::code_liveness::visit_value(context, visitor);
+        }
     }
 
     /// Whether this slot is logically empty (no cold state worth
@@ -258,7 +263,7 @@ impl ColdFrame {
             && self.handlers.is_empty()
             && self.active_iterator_closers.is_empty()
             && !self.is_derived_constructor
-            && self.derived_this_cell.is_none()
+            && self.derived_this_slot.is_none()
     }
 
     /// Whether exact deoptimization may replace only this record's static
@@ -292,7 +297,7 @@ impl ColdFrame {
             handlers,
             active_iterator_closers,
             is_derived_constructor,
-            derived_this_cell,
+            derived_this_slot,
         } = self;
         let _preserved = (
             acquired,
@@ -302,7 +307,6 @@ impl ColdFrame {
             incoming_args,
             arguments_object,
             is_derived_constructor,
-            derived_this_cell,
         );
 
         async_state.is_none()
@@ -313,6 +317,7 @@ impl ColdFrame {
             && pending_iterator_next.is_none()
             && parked_finally.is_empty()
             && active_iterator_closers.is_empty()
+            && derived_this_slot.is_none()
             && handlers
                 .iter()
                 .all(|handler| handler.catch_pc.is_some() && handler.finally_pc.is_none())
@@ -362,10 +367,6 @@ impl ColdFrame {
         if let Some(v) = &self.new_target {
             v.trace_value_slots(visitor);
         }
-        if let Some(cell) = &self.derived_this_cell {
-            let p = cell as *const UpvalueCell as *mut otter_gc::raw::RawGc;
-            visitor(p);
-        }
         for v in &self.rest_args {
             v.trace_value_slots(visitor);
         }
@@ -377,6 +378,9 @@ impl ColdFrame {
         }
         for (v, _) in &self.active_iterator_closers {
             v.trace_value_slots(visitor);
+        }
+        if let Some((context, _)) = &self.derived_this_slot {
+            context.trace_value_slots(visitor);
         }
     }
 }

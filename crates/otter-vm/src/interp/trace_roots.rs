@@ -75,13 +75,11 @@ impl Interpreter {
         self.extra_realms.iter()
     }
 
-    /// Borrow the persistent module-init upvalue spines for GC root
-    /// tracing. The cells back module-scope bindings shared between
-    /// the link-phase and evaluation-phase init invocations.
-    pub(crate) fn module_init_upvalues_for_trace(
-        &self,
-    ) -> impl Iterator<Item = &Box<[crate::UpvalueCell]>> {
-        self.module_init_upvalues.values()
+    /// Borrow the persistent module-init SELF closures for GC root tracing.
+    /// Their contexts back module-scope bindings shared between the
+    /// link-phase and evaluation-phase init invocations.
+    pub(crate) fn module_init_closures_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.module_init_closures.values()
     }
 
     /// Global declarative-record cells for the GC root walk.

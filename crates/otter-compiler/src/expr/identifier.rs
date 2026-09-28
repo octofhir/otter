@@ -87,8 +87,8 @@ fn compile_identifier_with_envs(
 /// directly instead, making the copy dead.
 ///
 /// Returns `None` for every shape that needs real lowering: a `with` scope in
-/// effect, the `NaN` / `Infinity` pseudo-globals, a module import, a captured
-/// upvalue, a global, or a binding still in its temporal dead zone. Callers
+/// effect, the `NaN` / `Infinity` pseudo-globals, a module import, a context
+/// slot, a global, or a binding still in its temporal dead zone. Callers
 /// must additionally ensure no user code can run between this read and the
 /// operator, or the slot could be reassigned before the operator reads it.
 pub(crate) fn borrowed_local_register(cx: &Compiler, name: &str) -> Option<u16> {
@@ -107,7 +107,7 @@ pub(crate) fn borrowed_local_register(cx: &Compiler, name: &str) -> Option<u16> 
     }
     match info.storage {
         BindingStorage::Register { reg } => Some(reg),
-        BindingStorage::Upvalue { .. } => None,
+        BindingStorage::Slot { .. } => None,
     }
 }
 
@@ -128,12 +128,9 @@ pub(crate) fn compile_identifier_without_with(
     // can shadow the global if it really needs to.
     //
     // <https://tc39.es/ecma262/#sec-error-objects>
-    if cx.lookup_binding(name).is_none()
-        && cx.captured_binding_owner(name).is_none()
-        && !cx.any_enclosing_leaking_direct_eval()
-        && cx.active_with_envs.is_empty()
-        && find_module_import_binding(cx, name).is_none()
+    if find_module_import_binding(cx, name).is_none()
         && is_builtin_error_class_name(name)
+        && cx.resolves_to_plain_global(name)
     {
         let dst = cx.alloc_scratch();
         let kind_idx = cx.intern_string_constant(name);
@@ -145,25 +142,14 @@ pub(crate) fn compile_identifier_without_with(
         return Ok(dst);
     }
     // Module-mode identifier resolution: imported aliases
-    // resolve to a `LoadProperty` against the source
-    // module's import-record (live binding — every read
-    // observes the current export value).
-    //
-    // Inner functions that reference an imported alias
-    // walk up the function-context stack to find the
-    // matching record-upvalue, then capture it via the
-    // standard `resolve_capture` cascade so the cell is
-    // available in the inner frame's upvalues array.
+    // resolve to a live read of the source module's binding.
     //
     // Spec: <https://tc39.es/ecma262/#sec-getidentifierreference>
     //       <https://tc39.es/ecma262/#sec-module-environment-records-getbindingvalue-n-s>
-    if let Some((binding, synthetic)) = find_module_import_binding(cx, name) {
+    if let Some(binding) = find_module_import_binding(cx, name) {
         // `import * as ns` binds to the Module Namespace Exotic Object
-        // (§10.4.6), resolved from the specifier — distinct from the
-        // raw env record used for named-import indirection. A `import
-        // defer * as ns` binding instead reads its dedicated deferred
-        // namespace cell (lazy evaluation), handled by the generic
-        // record path below.
+        // (§10.4.6), resolved from the specifier. A `import defer * as ns`
+        // binding instead reads its dedicated deferred namespace slot.
         if binding.is_namespace && !binding.is_deferred {
             let dst = cx.alloc_scratch();
             let target = import_target_constant(cx, &binding.request);
@@ -175,32 +161,13 @@ pub(crate) fn compile_identifier_without_with(
             );
             return Ok(dst);
         }
-        // `import defer * as ns` — the deferred cell already holds the
-        // deferred namespace object; read it directly.
         if binding.is_namespace {
-            let resolved_uv = if cx.module_state.is_some() {
-                binding.record_uv_idx
-            } else {
-                cx.resolve_capture(&synthetic)
-                    .expect("synthetic import-record binding must resolve")
-            };
-            let record_dst = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUpvalue,
-                vec![
-                    Operand::Register(record_dst),
-                    Operand::Imm32(resolved_uv as i32),
-                ],
-                span,
-            );
-            return Ok(record_dst);
+            return crate::statements::load_import_record(cx, binding.record, span);
         }
         // §9.1.1.5 GetBindingValue — read the named import through the
         // source module's §16.2.1.6 ResolveExport table so a re-exported
         // / star-exported name observes the *defining* module's live
         // binding (raising ReferenceError if it is still in its TDZ).
-        // The source URL is statically known from the host resolution
-        // table, so the read needs no per-import record cell.
         let source_url = import_target_constant(cx, &binding.request);
         let url_const = cx.intern_string_constant(&source_url);
         let name_const = cx.intern_string_constant(&binding.source_name);
@@ -216,67 +183,10 @@ pub(crate) fn compile_identifier_without_with(
         );
         return Ok(dst);
     }
-    // §19.2.1.3 — this eval chunk's own deletable var binding: read
-    // through the eval-environment record so a `delete` of the name
-    // (from this body or a nested eval) makes later reads throw
-    // instead of serving the orphaned static cell.
-    if cx.eval_var_dynamic_reference(name) {
-        let dst = cx.alloc_scratch();
-        let name_idx = cx.intern_string_constant(name);
-        cx.emit(
-            Op::LoadDynamic,
-            [Operand::Register(dst), Operand::ConstIndex(name_idx)],
-            span,
-        );
-        return Ok(dst);
-    }
-    if let Some(info) = cx.lookup_binding(name) {
-        let dst = cx.alloc_scratch();
-        if info.initialized {
-            cx.emit_load_storage(dst, info.storage, span);
-        } else {
-            // Reading a `let` / `const` binding before its
-            // initializer ran — runtime raises
-            // `ReferenceError` via `Op::TdzError`.
-            let diag_idx = match info.storage {
-                BindingStorage::Register { reg } => reg,
-                BindingStorage::Upvalue { idx } => idx,
-            };
-            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
-        }
-        return Ok(dst);
-    }
-    // Walk the parent chain for a closure capture.
-    if let Some((uv_idx, _, eval_depth)) = cx.resolve_capture_with_info(name) {
-        let dst = cx.alloc_scratch();
-        cx.emit_captured_binding_load(dst, name, uv_idx, eval_depth, span);
-        return Ok(dst);
-    }
-    // §10.2.4.1 ResolveBinding + §10.2.4.5 GetValue
-    // fallback — an unbound free identifier resolves
-    // against the global environment record (foundation:
-    // `globalThis`). When the global has no own property
-    // under that name, the runtime throws a
-    // `ReferenceError` per the spec.
-    //
-    // Inside a function whose body contains a direct eval,
-    // the name may instead resolve to a binding the eval
-    // introduced into this frame's variable environment at
-    // runtime — `Op::LoadDynamic` checks that map first.
-    //
-    // <https://tc39.es/ecma262/#sec-resolvebinding>
-    // <https://tc39.es/ecma262/#sec-getvalue>
+    // §9.1.2.1 GetIdentifierReference: a register, a context slot (probing
+    // eval extensions that may shadow it), or the global environment.
+    let reference = cx.resolve_ref(name);
     let dst = cx.alloc_scratch();
-    let name_idx = cx.intern_string_constant(name);
-    let op = if cx.any_enclosing_leaking_direct_eval() {
-        Op::LoadDynamic
-    } else {
-        Op::LoadGlobalOrThrow
-    };
-    cx.emit(
-        op,
-        [Operand::Register(dst), Operand::ConstIndex(name_idx)],
-        span,
-    );
+    cx.emit_name_load(dst, name, &reference, false, span);
     Ok(dst)
 }

@@ -89,7 +89,7 @@ pub(crate) fn match_simple_constructor_init(
         || function.is_generator
         || function.is_async_generator
         || function.contains_direct_eval
-        || function.own_upvalue_count != 0
+        || !function.scopes.is_empty()
         || function.code.len() < 2
     {
         return None;
@@ -312,8 +312,7 @@ mod tests {
                 scratch: 11,
                 param_count: 2,
                 length: 2,
-                own_upvalue_count: 0,
-                inherited_upvalue_count: 0,
+                scopes: Vec::new(),
                 is_strict: true,
                 is_arrow: false,
                 is_method: false,
@@ -330,8 +329,6 @@ mod tests {
                 source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
-                direct_eval_bindings: Vec::new(),
-                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: code.into(),
                 spans: Vec::new(),

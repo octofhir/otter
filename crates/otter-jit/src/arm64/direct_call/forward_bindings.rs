@@ -1,21 +1,22 @@
 //! Generated register-alias stores for live argument forwarding.
 //!
 //! # Contents
-//! - Patching mapped parameters after the incoming/captured window copy.
+//! - Patching mapped parameters after the incoming-window copy.
 //! - Stable caller-base recovery across dynamic private-frame reservations.
 //!
 //! # Invariants
-//! - All capture allocation and moving GC precede these stores. The loader reads
-//!   current rooted homes, never stale copies from before that allocation.
+//! - Every moving GC precedes these stores. The loader reads current rooted
+//!   homes, never stale copies from before an allocation.
 //! - Missing actuals remain absent; only declared formals and existing actual
-//!   slots are patched. Captured bindings were read by the shared leaf copy.
+//!   slots are patched. Context-held formals were read from their current
+//!   context slot by the shared leaf copy.
 //! - No call, collection or stack-pointer change occurs in this program.
 //! - Entry: x0 actual count, w2 callee parameter count, w3 full register count.
 //!   The loader writes x14, may clobber x15/x16/x17, and preserves x2/x3/x8.
 //!
 //! # See also
 //! - [`super::layout`] — the sole owner of linkage size and control offsets.
-//! - `otter_vm::forward_arguments` — incoming/captured copy and binding metadata.
+//! - `otter_vm::forward_arguments` — incoming/context copy and binding metadata.
 
 use super::*;
 
@@ -73,6 +74,13 @@ mod tests {
             ArgumentsObjectKind::Mapped,
             &[(1, ArgumentBindingStorage::Register { reg: 0 })],
         );
+        let size_slot = StackLayout::dynamic_prefix()
+            .allocation_size
+            .expect("dynamic prefix records its reservation");
+        assert!(
+            size_slot + 4 <= 128,
+            "size slot stays below the fixture window"
+        );
         for dynamic in [false, true] {
             let mut ops = Assembler::new().unwrap();
             let mut layout = StackLayout::dynamic_prefix();
@@ -89,7 +97,7 @@ mod tests {
                 ; str x0, [sp]
                 ; sub sp, sp, #256
                 ; mov w9, #256
-                ; str w9, [sp, 120]
+                ; str w9, [sp, size_slot]
                 ; add x9, sp, #128
                 ; str x9, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
                 ; str w1, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]

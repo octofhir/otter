@@ -1,20 +1,85 @@
-//! Function, arrow, and callable object lowering.
+//! Function, arrow, and callable lowering.
+//!
+//! One lowering serves ordinary functions, methods, class constructors, and
+//! arrows. A function's scopes follow FunctionDeclarationInstantiation
+//! (§10.2.11), outermost first:
+//!
+//! - `FunctionName` — a named function expression's immutable self binding,
+//!   initialized from `LoadSelf`;
+//! - `Callee` — only for a sloppy function whose parameter list has
+//!   expressions and a direct eval: the extension anchor for that eval's
+//!   `var`s, outside the parameters;
+//! - `Params` — formals and `arguments` when the parameter list has
+//!   expressions (their slots start in the TDZ);
+//! - `Body` — the VariableEnvironment: `var`s, functions, and top-level
+//!   lexicals; with a simple parameter list the formals live here too. A
+//!   sloppy function whose own code calls eval anchors the extension here.
+//!
+//! Each scope gets a context only when it owns a slot or anchors an
+//! extension. A derived constructor whose `this` an arrow, an arrow
+//! `super()`, or a direct eval observes keeps `this` in a `DerivedThis` slot
+//! of its first own scope.
 //!
 //! # Contents
-//! - full function compilation
-//! - arrow function compilation
-//! - callable emission
+//! - [`compile_function_full`] / [`compile_arrow_function`] — lower one
+//!   function into the module's function table.
+//! - [`compile_function_impl`] — the shared lowering, with optional class
+//!   instance-field injection for constructors.
+//! - [`ClosureRecord`] / [`emit_make_callable`] — materialize the callable
+//!   over the creator's innermost context.
+//! - [`finish_function`] — write a finished frame into its record.
 //!
 //! # Invariants
 //! - Nested functions are registered in the shared module builder.
+//! - Every `CreateContext` of the prologue precedes `GeneratorStart`.
+//! - A closure captures exactly the context that was innermost when its
+//!   body was compiled, which is the chain its static depths assume.
 //! - An implicit undefined return is omitted when the final source statement
 //!   already returns, so the authoritative CFG contains no dead tail block.
 //!
 //! # See also
 //! - `params` and `function_context`
 
+use crate::function_context::DerivedThisSlot;
+use crate::scope::CtxReg;
 use crate::*;
+use otter_bytecode::{ScopeFlags, ScopeKind, SlotKind};
 
+/// A compiled function plus the context its closure must capture.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClosureRecord {
+    pub(crate) function_id: u32,
+    /// The creator's innermost context when the body was compiled.
+    pub(crate) ctx: CtxReg,
+    /// The body reads its closure context.
+    pub(crate) needs_context: bool,
+    pub(crate) is_arrow: bool,
+}
+
+/// Class instance fields a constructor initializes inline.
+pub(crate) struct FieldInjection<'r, 'a> {
+    pub(crate) fields: &'r [&'r oxc_ast::ast::PropertyDefinition<'a>],
+    pub(crate) is_derived: bool,
+}
+
+/// Everything [`compile_function_impl`] needs about one function.
+pub(crate) struct FunctionSpec<'r, 'a> {
+    pub(crate) name: &'r str,
+    pub(crate) params: &'r oxc_ast::ast::FormalParameters<'a>,
+    pub(crate) body: Option<&'r oxc_ast::ast::FunctionBody<'a>>,
+    pub(crate) span: (u32, u32),
+    pub(crate) is_async: bool,
+    pub(crate) is_generator: bool,
+    pub(crate) force_strict: bool,
+    pub(crate) is_arrow: bool,
+    /// Arrow with a concise expression body.
+    pub(crate) arrow_expression: bool,
+    /// Named function expression: bind the self name (§15.2.5 funcEnv).
+    pub(crate) nfe_self: bool,
+    pub(crate) fields: Option<FieldInjection<'r, 'a>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_function_full(
     parent: &mut Compiler,
     name: &str,
@@ -24,148 +89,247 @@ pub(crate) fn compile_function_full(
     is_async: bool,
     is_generator: bool,
     force_strict: bool,
-) -> Result<(u32, Vec<u32>), CompileError> {
+) -> Result<ClosureRecord, CompileError> {
+    compile_function_impl(
+        parent,
+        FunctionSpec {
+            name,
+            params,
+            body: body.as_deref(),
+            span,
+            is_async,
+            is_generator,
+            force_strict,
+            is_arrow: false,
+            arrow_expression: false,
+            nfe_self: false,
+            fields: None,
+        },
+    )
+}
+
+/// Compile a named function expression, binding its self name.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_named_function_expression(
+    parent: &mut Compiler,
+    name: &str,
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
+    span: (u32, u32),
+    is_async: bool,
+    is_generator: bool,
+) -> Result<ClosureRecord, CompileError> {
+    compile_function_impl(
+        parent,
+        FunctionSpec {
+            name,
+            params,
+            body: body.as_deref(),
+            span,
+            is_async,
+            is_generator,
+            force_strict: false,
+            is_arrow: false,
+            arrow_expression: false,
+            nfe_self: true,
+            fields: None,
+        },
+    )
+}
+
+/// Compile an arrow function. `() => expr` lowers to one
+/// `ReturnValue(expr)`; a block body lowers like any function body.
+pub(crate) fn compile_arrow_function(
+    parent: &mut Compiler,
+    arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
+    span: (u32, u32),
+) -> Result<ClosureRecord, CompileError> {
+    compile_function_impl(
+        parent,
+        FunctionSpec {
+            name: "<arrow>",
+            params: &arrow.params,
+            body: Some(&arrow.body),
+            span,
+            is_async: arrow.r#async,
+            is_generator: false,
+            force_strict: false,
+            is_arrow: true,
+            arrow_expression: arrow.expression,
+            nfe_self: false,
+            fields: None,
+        },
+    )
+}
+
+/// `true` when an `arguments` binding already exists in an arrow's
+/// variable environment *during parameter instantiation* — i.e. a
+/// formal parameter (or rest pattern) declares the name.
+fn arrow_binds_arguments(params: &oxc_ast::ast::FormalParameters<'_>) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    for param in &params.items {
+        collect_pattern_var_names(&param.pattern, &mut names);
+    }
+    if let Some(rest) = &params.rest {
+        collect_pattern_var_names(&rest.rest.argument, &mut names);
+    }
+    names.iter().any(|name| name == "arguments")
+}
+
+pub(crate) fn compile_function_impl(
+    parent: &mut Compiler,
+    spec: FunctionSpec<'_, '_>,
+) -> Result<ClosureRecord, CompileError> {
+    let FunctionSpec {
+        name,
+        params,
+        body,
+        span,
+        is_async,
+        is_generator,
+        force_strict,
+        is_arrow,
+        arrow_expression,
+        nfe_self,
+        fields,
+    } = spec;
     let is_async_generator = is_async && is_generator;
     let is_method = std::mem::take(&mut parent.next_fn_is_method);
     let hinted_home = std::mem::take(&mut parent.next_fn_has_home);
     let hinted_derived_ctor = std::mem::take(&mut parent.next_fn_derived_ctor);
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
-    let no_self_name = std::mem::take(&mut parent.next_fn_no_self_name);
     let source_text_span = std::mem::take(&mut parent.next_fn_source_text_span);
     let module = Rc::clone(&parent.top_mut().module);
-    let body_has_strict_directive = match body {
-        Some(b) => b.has_use_strict_directive(),
-        None => false,
-    };
+    let body_has_strict_directive = body.is_some_and(|b| b.has_use_strict_directive());
     let function_is_strict = force_strict || parent.is_strict || body_has_strict_directive;
     let simple_params = formal_parameters_are_simple(params);
+    let has_param_expressions = formal_parameters_contain_expression(params);
     // §15.4.1 — MethodDefinition uses UniqueFormalParameters even in
-    // sloppy code.
-    let allow_duplicate_formals = !function_is_strict && simple_params && !is_method;
-    // A direct eval body may reference `arguments` dynamically, so
-    // its presence forces the arguments object to materialize even
-    // when the enclosing body never names it (§19.2.1.3).
+    // sloppy code; arrows never allow duplicates.
+    let allow_duplicate_formals = !function_is_strict && simple_params && !is_method && !is_arrow;
+    let fields_contain_eval = fields.as_ref().is_some_and(|injection| {
+        injection.fields.iter().any(|field| {
+            field
+                .value
+                .as_ref()
+                .is_some_and(capture::expression_contains_direct_eval)
+        })
+    });
+    // Any direct eval inside (nested functions included) can read every
+    // binding it can see, so every own binding becomes a slot.
     let contains_direct_eval = body
-        .as_ref()
-        .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b));
-    // §B.3.6.2 — `fn.arguments` yields a snapshot of a sloppy ordinary
-    // function's running activation, which the body itself never names.
-    // A body that reads the property itself keeps its incoming argument list;
-    // the snapshot object is built by the reader, which rebuilds any other
-    // activation from its parameter registers.
-    let legacy_arguments_observable = parent.dot_arguments_observed
+        .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b))
+        || fields_contain_eval;
+    // A sloppy direct eval in the function's OWN code creates `var`s in the
+    // variable environment: that scope anchors the eval extension.
+    let params_eval =
+        has_param_expressions && !function_is_strict && capture::params_contain_direct_eval(params);
+    let body_eval = !function_is_strict
+        && body.is_some_and(|b| capture::own_code_contains_direct_eval(None, Some(b)));
+    let legacy_arguments_observable = !is_arrow
+        && parent.dot_arguments_observed
         && !function_is_strict
         && !is_method
         && !is_async
         && !is_generator
-        && body
-            .as_ref()
-            .is_some_and(|b| capture::function_body_reads_dot_arguments(params, b));
-    // Only the body (or a direct eval in it) observes the arguments object
-    // itself, so only then does the prologue materialize it.
-    let body_needs_arguments_object =
-        body_references_arguments(params, body.as_deref()) || contains_direct_eval;
+        && body.is_some_and(|b| capture::function_body_reads_dot_arguments(params, b));
+    // §10.2.11 step 18 — a top-level lexical `arguments` (simple
+    // parameter list) replaces the arguments object.
+    let lexical_arguments = !has_param_expressions
+        && body.is_some_and(|b| {
+            let mut names: Vec<(String, bool)> = Vec::new();
+            hoist_lexical_names(&b.statements, &mut names);
+            names.iter().any(|(name, _)| name == "arguments")
+        });
+    let body_needs_arguments_object = !is_arrow
+        && !lexical_arguments
+        && (body_references_arguments(params, body) || contains_direct_eval);
     let needs_arguments = body_needs_arguments_object || legacy_arguments_observable;
     let uses_mapped_arguments = body_needs_arguments_object && !function_is_strict && simple_params;
-    // A body that only ever forwards `arguments` through `apply` keeps the
-    // incoming argument list but never needs the object on its fast path.
-    // A direct eval may still observe the object, and an own binding named
-    // `arguments` shadows it entirely.
     let arguments_forward_only = body_needs_arguments_object
         && !contains_direct_eval
-        && !crate::hoist::function_declares_name(params, body.as_deref(), "arguments")
-        && crate::hoist::arguments_uses_are_forwarded(params, body.as_deref());
+        && !crate::hoist::function_declares_name(params, body, "arguments")
+        && crate::hoist::arguments_uses_are_forwarded(params, body);
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
+    let derived_this = hinted_derived_ctor && capture::derived_this_observed(params, body);
+
     let active_with_envs = parent.active_with_envs.clone();
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(function_is_strict)
         .with_module_url(parent.module_url.clone());
+    if is_arrow {
+        child = child.with_arrow();
+        // Arrows resolve `super` lexically.
+        child.super_home_static = parent.super_home_static;
+        child.binds_arguments = arrow_binds_arguments(params);
+    } else {
+        child.super_home_static = static_home;
+        child.has_home_object = is_method || hinted_home;
+        child.is_derived_ctor = hinted_derived_ctor;
+        // §10.2.11 — every non-arrow function's variable environment
+        // binds `arguments`.
+        child.binds_arguments = true;
+    }
     child.dot_arguments_observed = parent.dot_arguments_observed;
-    child.super_home_static = static_home;
-    child.has_home_object = is_method || hinted_home;
-    child.is_derived_ctor = hinted_derived_ctor;
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
-    // §10.2.11 — every non-arrow function's variable environment
-    // binds `arguments` (as the arguments object, a parameter, or a
-    // body declaration), which arms the §19.2.1.3 direct-eval check
-    // during parameter initialization.
-    child.binds_arguments = true;
-    // Whether the function's own name is actually observable inside its body —
-    // by a direct identifier reference (here or in a nested closure) or a direct
-    // eval that could name it through a string literal. A named function
-    // expression whose body never names itself has an unobservable self-binding
-    // (§15.2.5 NamedEvaluation only sets the `name` *property*; it creates no
-    // self-reference binding), so emitting the self-binding `MakeFunction` would
-    // be dead code that also allocates a throwaway closure on every call and
-    // marks the function `makes_function`, defeating method inlining.
+    let formal_names: Vec<String> = formal_parameter_bound_names(params);
     let mut self_name_referenced = false;
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
-        // Cell promotion only needs the *nested* reference test: a
-        // direct depth-0 self-call resolves as a plain local and needs
-        // no upvalue cell, but a nested closure naming the self-name
-        // (or a direct eval) does. The self-binding liveness test below
-        // is broader — see `self_name_referenced`.
+        if is_arrow {
+            child.captured_names.remove("arguments");
+        }
         let self_name_in_inner =
             contains_direct_eval || capture::inner_references_name(Some(params), b, name);
-        // Self-binding liveness: the §10.2.11 self-binding `MakeFunction`
-        // is dead code unless the name is observable *somewhere* in the
-        // body — including a direct self-recursive call at the function's
-        // own depth (`return f(n - 1)`), which the nested-only test
-        // misses. A direct eval can name it through a string literal.
         self_name_referenced =
             contains_direct_eval || capture::body_references_name(Some(params), b, name);
-        // §10.2.11 — the function expression's self-name is a funcEnv
-        // binding; nested closures referencing it need an upvalue cell.
-        // A direct eval in the body can also reference the self-name
-        // through a string literal, so it must reach a cell too.
-        if !is_method && !no_self_name && !name.is_empty() && self_name_in_inner {
+        if nfe_self && self_name_in_inner {
             child.captured_names.insert(name.to_string());
         }
-        // A nested closure (arrow in a parameter default or in the body)
-        // that references `arguments` captures the arguments object
-        // through an upvalue cell, so the binding must be cell-promoted.
-        // The body-side reference is covered by `analyze_function`; the
-        // parameter-default side (`function f(h = () => arguments) {}`)
-        // is only visible through the params-aware nested-reference scan.
+        // A nested closure referencing `arguments` (in a parameter default
+        // or the body) reads the object through a slot.
         if body_needs_arguments_object
             && capture::inner_references_name(Some(params), b, "arguments")
         {
             child.captured_names.insert("arguments".to_string());
         }
-        // §19.2.1.3 — a direct eval body reads and writes caller
-        // bindings through upvalue cells, so promote every
-        // function-scope binding (not just statically captured ones).
         if contains_direct_eval {
             child
                 .captured_names
                 .extend(capture::all_own_names(Some(params), b));
+            if is_arrow {
+                child.captured_names.remove("arguments");
+                if child.binds_arguments {
+                    child.captured_names.insert("arguments".to_string());
+                }
+            }
         }
+    }
+    if fields_contain_eval {
+        child.captured_names.insert("arguments".to_string());
     }
     child.contains_direct_eval = contains_direct_eval;
     child.arguments_forward_only = arguments_forward_only;
     if uses_mapped_arguments {
         child.mapped_argument_names = simple_formal_names(params).into_iter().collect();
     }
-    child.reserve_known_own_upvalues();
-    parent.push(child);
-    parent.enter_scope();
-    // A non-arrow function owns its `new.target` — the
-    // field-initializer signal does not propagate into its body.
-    let saved_field_init = parent.in_field_initializer;
-    parent.in_field_initializer = false;
 
-    // Reserve raw argv slots up front so destructuring / defaults
-    // can address them by ordinal. The compiler's scratch counter
-    // tracks them so subsequent register allocations don't collide.
+    let parent_ctx = parent.innermost_ctx();
+    child.closure_context_empty = parent_ctx == CtxReg::Closure && parent.closure_context_empty;
+    parent.push(child);
+    // A non-arrow function owns its `new.target` — the field-initializer
+    // signal does not propagate into its body.
+    let saved_field_init = parent.in_field_initializer;
+    if !is_arrow {
+        parent.in_field_initializer = false;
+    }
+
     let param_count = u16::try_from(params.items.len()).expect("too many parameters");
     let length = formal_parameter_length(params);
     parent.scratch = param_count;
     let has_rest = params.rest.is_some();
 
-    // Reserve the function's id ahead of compilation so the body
-    // can reference its own name (recursion).
     let function_id = module.borrow().functions.len() as u32;
     module.borrow_mut().functions.push(Function {
         id: function_id,
@@ -177,202 +341,44 @@ pub(crate) fn compile_function_full(
         ..Default::default()
     });
 
-    predeclare_formal_parameters(parent, params, allow_duplicate_formals, span)?;
-    // Bind self-name for recursion — §10.2.11 funcEnv: the function
-    // expression's name is visible to parameter default expressions
-    // and the body alike, so it binds BEFORE parameter
-    // initialization. A same-named formal shadows it (skip).
-    // Capture operands are finalized after body lowering because
-    // parent captures are discovered lazily.
-    // MethodDefinition bodies get NO self-name binding: a method's
-    // property name is not a binding inside it (§15.4), and a class
-    // constructor's name must resolve to the §15.7.14 class-scope
-    // binding, not to a re-made closure of itself.
-    let fn_self_immutable = std::mem::take(&mut parent.fn_self_immutable_hint);
-    let self_make_idx = if is_method
-        || no_self_name
-        || !self_name_referenced
-        || parent.lookup_in_current_scope(name).is_some()
-    {
-        None
-    } else {
-        let self_storage = parent.declare_binding(name, false, span)?;
-        if fn_self_immutable {
-            parent.top_mut().mark_fn_self_name(name);
-        }
-        let const_idx = parent.intern_function_id(function_id);
-        let tmp = parent.alloc_scratch();
-        let idx = parent.code.len();
-        parent.emit(
-            Op::MakeFunction,
-            [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+    let result = compile_function_scopes(
+        parent,
+        FunctionScopes {
+            name,
+            params,
+            body,
             span,
-        );
-        parent.emit_store_storage(tmp, self_storage, span);
-        parent.mark_initialized(name);
-        Some((idx, tmp, const_idx))
-    };
-    // §10.2.11 step 22 — bind `arguments` BEFORE
-    // IteratorBindingInitialization (step 24), so a parameter
-    // default expression like `x = arguments[0]` resolves the
-    // arguments object. Skip if a formal named `arguments` exists.
-    if body_needs_arguments_object
-        && !arguments_forward_only
-        && parent.lookup_binding("arguments").is_none()
-    {
-        let storage = parent.declare_binding("arguments", false, span)?;
-        parent.mark_param("arguments");
-        let tmp = parent.alloc_scratch();
-        parent.emit(Op::CollectArguments, [Operand::Register(tmp)], span);
-        parent.emit_store_storage(tmp, storage, span);
-        parent.mark_initialized("arguments");
-    }
-    // Bind every formal parameter, in source order. Side-effects
-    // (default-value evaluation, iterator-protocol calls for array
-    // patterns) follow the spec's per-call ordering.
-    parent.in_param_init = true;
-    for (ordinal, param) in params.items.iter().enumerate() {
-        compile_formal_parameter(
-            parent,
-            ordinal as u16,
-            &param.pattern,
-            param.initializer.as_deref(),
-            span,
+            is_generator,
+            is_arrow,
+            arrow_expression,
+            function_is_strict,
+            has_param_expressions,
             allow_duplicate_formals,
-        )?;
-    }
-    if let Some(rest) = &params.rest {
-        compile_rest_parameter(parent, &rest.rest.argument, span)?;
-    }
-    parent.in_param_init = false;
-    crate::type_hints::annotate_formal_parameters(parent, params);
-    let mapped_argument_bindings = if uses_mapped_arguments {
-        mapped_formal_parameter_bindings(parent, params)
-    } else {
-        Vec::new()
-    };
-
-    // §10.2.11 FunctionDeclarationInstantiation step 28 — hoist
-    // every `var`-declared name in the body to the function scope
-    // and pre-bind it to `undefined`. Reads before the source-level
-    // declaration site observe the hoisted `undefined` (no TDZ).
-    let mut direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
-    if let Some(body) = body {
-        let mut var_names: Vec<String> = Vec::new();
-        hoist_var_names(&body.statements, &mut var_names);
-        // §B.3.3.1 — parameter names (and "arguments" itself) block
-        // the sloppy block-level function var-scope extension;
-        // everything bound so far is a parameter or the function
-        // self-name.
-        let mut annex_blocked: std::collections::HashSet<String> = parent
-            .scopes
-            .iter()
-            .flat_map(|scope| scope.bindings.keys().cloned())
-            .collect();
-        annex_blocked.insert("arguments".to_string());
-        pre_declare_annex_b_functions(parent, &body.statements, &annex_blocked, span)?;
-        // §10.2.11 step 28 — with parameter expressions the body owns
-        // a separate variable environment: a body `var` whose name is
-        // already a parameter-environment binding (a formal, the
-        // implicit `arguments`, the self-name) declares a FRESH
-        // binding initialized from that binding's current value.
-        // Closures made in parameter defaults keep the parameter
-        // cell; body code and body closures resolve the shadow.
-        let param_shadowed: Vec<String> = if formal_parameters_contain_expression(params) {
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            var_names
-                .iter()
-                .filter(|name| seen.insert(name.as_str()))
-                .filter(|name| parent.lookup_binding(name).is_some())
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        pre_declare_var_bindings(parent, &var_names, span)?;
-        // Pre-declare lexical bindings (TDZ) so hoisted nested
-        // functions can capture forward references.
-        let mut lex_names: Vec<(String, bool)> = Vec::new();
-        hoist_lexical_names(&body.statements, &mut lex_names);
-        validate_no_param_lexical_conflict(params, &lex_names, span)?;
-        pre_declare_lexical_bindings(parent, &lex_names, span)?;
-        // §10.2.11 step 30 — function declarations hoist to the
-        // function scope. Pre-emitting their closure stores here
-        // means calls placed textually above the declaration
-        // resolve correctly.
-        hoist_function_declarations(parent, &body.statements)?;
-        if !param_shadowed.is_empty() {
-            parent.enter_scope();
-            for name in &param_shadowed {
-                let Some(info) = parent.lookup_binding(name) else {
-                    continue;
-                };
-                let tmp = parent.alloc_scratch();
-                parent.emit_load_storage(tmp, info.storage, span);
-                let storage = parent.declare_binding(name, false, span)?;
-                parent.emit_store_storage(tmp, storage, span);
-                parent.mark_initialized(name);
-            }
-        }
-        if is_generator {
-            parent.emit(Op::GeneratorStart, vec![], span);
-        }
-        for stmt in &body.statements {
-            compile_discarded_statement(parent, stmt)?;
-        }
-        if !param_shadowed.is_empty() {
-            parent.exit_scope();
-        }
-        if contains_direct_eval {
-            capture_lexical_environment_for_eval(parent);
-            capture_private_environment_for_eval(parent);
-            capture_super_bindings_for_eval(parent);
-            direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
-        }
-    }
+            self_binding: nfe_self
+                && self_name_referenced
+                && !name.is_empty()
+                && !formal_names.iter().any(|formal| formal == name),
+            params_eval,
+            body_eval,
+            derived_this,
+            body_needs_arguments_object,
+            arguments_forward_only,
+            uses_mapped_arguments,
+            fields,
+        },
+    );
     parent.in_field_initializer = saved_field_init;
-    parent.exit_scope();
-    // Implicit `return undefined;` at the function tail. Do not manufacture an
-    // unreachable block after a final explicit return: the return already
-    // completes every path reaching the end of the source statement list.
-    let ends_with_return = body
-        .as_ref()
-        .is_some_and(|body| matches!(body.statements.last(), Some(Statement::ReturnStatement(_))));
-    if !ends_with_return {
-        parent.emit(Op::ReturnUndefined, vec![], span);
-    }
+    let mapped_argument_bindings = match result {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            parent.pop();
+            return Err(error);
+        }
+    };
 
     let mut child = parent.pop();
-    if child.register_overflow {
-        return Err(CompileError::Unsupported {
-            node: "function body exhausts the 65535-register window".to_string(),
-            span,
-        });
-    }
-
-    let captures = child.parent_captures.clone();
-    if !captures.is_empty()
-        && let Some((self_make_idx, tmp, const_idx)) = self_make_idx
-    {
-        let self_captures: Vec<u32> = (0..captures.len())
-            .map(|idx| child.own_upvalue_count as u32 + idx as u32)
-            .collect();
-        let operands = make_closure_operands(tmp, const_idx, &self_captures, span)?;
-        assert!(
-            child
-                .code
-                .replace(self_make_idx as u32, Op::MakeClosure, &operands)
-        );
-    }
-    crate::function_context::finalize_virtual_capture_indices(
-        &mut child.code,
-        &mut direct_eval_meta,
-        &mut child.eval_sites,
-        child.own_upvalue_count,
-    );
     // No mapped formals, eval or suspension can observe hidden identity in
-    // this first admitted family. Alias/escape proof uses lowered register
-    // flow, so local names and source spelling do not select the optimization.
+    // this admitted family. Alias/escape proof uses lowered register flow.
     if needs_arguments
         && param_count == 0
         && !has_rest
@@ -384,305 +390,210 @@ pub(crate) fn compile_function_full(
             &child.code,
             &module.borrow().constants,
             child.scratch_window(),
+            &child.closure_ctx_patches,
         )
     {
         crate::arguments_elision::lower(&mut child.code, &plan);
     }
-    let mut module_mut = module.borrow_mut();
-    let slot = module_mut
-        .functions
-        .get_mut(function_id as usize)
-        .expect("reserved function slot");
-    slot.locals = 0;
-    slot.scratch = child.scratch_window();
-    slot.param_count = param_count;
-    slot.length = length;
-    slot.has_rest = has_rest;
-    slot.is_async = is_async;
-    slot.is_generator = is_generator;
-    slot.is_async_generator = is_async_generator;
-    slot.is_method = is_method;
-    slot.needs_arguments = needs_arguments;
-    slot.uses_arguments_callee = body_needs_arguments_object
-        && crate::hoist::body_uses_arguments_callee(params, body.as_deref());
-    slot.arguments_object_kind = if uses_mapped_arguments {
-        ArgumentsObjectKind::Mapped
-    } else {
-        ArgumentsObjectKind::Unmapped
-    };
-    slot.mapped_argument_bindings = mapped_argument_bindings;
-    slot.own_upvalue_count = child.own_upvalue_count;
-    slot.inherited_upvalue_count = captures.len() as u16;
-    slot.direct_eval_bindings = direct_eval_meta;
-    slot.eval_sites = std::mem::take(&mut child.eval_sites);
-    slot.contains_direct_eval = contains_direct_eval;
-    slot.number_hint_sites = child.number_hint_sites;
-    let class_hint_sites = child.class_hint_sites;
-    slot.code = child.code.finish();
-    slot.spans = child.spans;
-    drop(module_mut);
-    parent.take_class_hint_sites(function_id, class_hint_sites);
-    Ok((function_id, captures))
+    let record = finish_function(parent, &mut child, function_id, span, |slot| {
+        slot.param_count = param_count;
+        slot.length = length;
+        slot.has_rest = has_rest;
+        slot.is_async = is_async;
+        slot.is_generator = is_generator;
+        slot.is_async_generator = is_async_generator;
+        slot.is_method = is_method;
+        slot.is_arrow = is_arrow;
+        slot.is_derived_constructor = hinted_derived_ctor;
+        slot.needs_arguments = needs_arguments;
+        slot.uses_arguments_callee =
+            body_needs_arguments_object && crate::hoist::body_uses_arguments_callee(params, body);
+        slot.arguments_object_kind = if uses_mapped_arguments {
+            ArgumentsObjectKind::Mapped
+        } else {
+            ArgumentsObjectKind::Unmapped
+        };
+        slot.mapped_argument_bindings = mapped_argument_bindings;
+        slot.contains_direct_eval = contains_direct_eval;
+    })?;
+    Ok(ClosureRecord {
+        function_id,
+        ctx: parent_ctx,
+        needs_context: record,
+        is_arrow,
+    })
 }
 
-/// Snapshot the function-scope bindings that live in upvalue cells as
-/// a [`DirectEvalBinding`] table for `Op::Eval`. Called after the body
-/// is compiled (every hoisted declaration has settled) and before the
-/// function scope is exited.
-/// Record one direct-eval call site: snapshot the block-scope
-/// bindings (everything below the function scope) visible at the
-/// current compile point into the function's `eval_sites` table and
-/// return the site index for the `Op::Eval` operand. Innermost
-/// binding wins per name; simple catch parameters carry
-/// `lexical: false` (§B.3.5 exempts them from the eval-`var`
-/// collision SyntaxError).
-pub(crate) fn record_eval_site(cx: &mut Compiler) -> u32 {
-    let mut entries: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (index, scope) in cx.scopes.iter().enumerate().skip(1).rev() {
-        for (name, info) in &scope.bindings {
-            if name.starts_with("__") && !name.starts_with(crate::with_statement::WITH_ENV_PREFIX) {
-                continue;
-            }
-            let BindingStorage::Upvalue { idx } = info.storage else {
-                continue;
-            };
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            entries.push(otter_bytecode::DirectEvalBinding {
-                captured: false,
-                name: name.clone(),
-                upvalue: idx,
-                lexical: !info.catch_param,
-                is_const: info.is_const,
-                fn_self_name: info.fn_self_name,
-                inner: true,
-                param: false,
-                deletable: false,
-                scope_depth: u16::try_from(index + 1).unwrap_or(u16::MAX),
-            });
-        }
-    }
-    // Scope-map iteration is hash-ordered; sort for deterministic
-    // bytecode. Shadowing was already resolved by the innermost-first
-    // `seen` guard.
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let site = cx.eval_sites.len() as u32;
-    cx.eval_sites.push(entries);
-    site
-}
-
-pub(crate) fn collect_direct_eval_bindings(
-    cx: &Compiler,
-    lexical_names: &[(String, bool)],
-) -> Vec<otter_bytecode::DirectEvalBinding> {
-    let lexical: std::collections::HashSet<&str> = lexical_names
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
-    let Some(scope) = cx.scopes.first() else {
-        return Vec::new();
-    };
-    let mut entries: Vec<otter_bytecode::DirectEvalBinding> = scope
-        .bindings
-        .iter()
-        .filter_map(|(name, info)| match info.storage {
-            BindingStorage::Upvalue { idx } => Some(otter_bytecode::DirectEvalBinding {
-                captured: false,
-                name: name.clone(),
-                upvalue: idx,
-                lexical: lexical.contains(name.as_str()),
-                is_const: info.is_const,
-                fn_self_name: info.fn_self_name,
-                inner: false,
-                param: info.param,
-                deletable: cx.eval_var_dynamic_reference(name),
-                scope_depth: 1,
-            }),
-            BindingStorage::Register { .. } => None,
-        })
-        .collect();
-    // An own function-scope binding shadows any same-named
-    // passthrough capture for the eval body — emitting both would let
-    // hash-ordered table consumers resolve the name to the OUTER cell
-    // and break §19.2.1.3 caller-var re-binding.
-    let own_names: std::collections::HashSet<String> =
-        entries.iter().map(|entry| entry.name.clone()).collect();
-    // Captured private-name / brand cells (class scope) ride along
-    // so a direct eval can resolve `obj.#name` (§19.2.1.1
-    // PrivateEnvironment inheritance).
-    for (name, idx) in cx.captured_uv.iter() {
-        if own_names.contains(name) {
-            continue;
-        }
-        let synthetic = name.starts_with("__privsym_")
-            || name.starts_with("__privbrand_")
-            || name == crate::class::SUPER_HOME_NAME
-            || name == crate::class::SUPER_STATIC_HOME_NAME
-            || name == crate::class::SUPER_CTOR_NAME;
-        if synthetic {
-            entries.push(otter_bytecode::DirectEvalBinding {
-                captured: false,
-                name: name.clone(),
-                upvalue: *idx,
-                lexical: true,
-                is_const: false,
-                fn_self_name: false,
-                inner: false,
-                param: true,
-                deletable: false,
-                scope_depth: 1,
-            });
-            continue;
-        }
-        if name.starts_with("__") {
-            continue;
-        }
-        // §19.2.1.3 — expose an ENCLOSING function's cell as a
-        // passthrough capture so the eval body can read it. The
-        // `captured` bit prevents an unrelated eval declaration from
-        // adopting this alias into its current record; a body `var` of
-        // the same name instead gets a fresh shadow. Carry the source
-        // binding's immutability flags so reads and writes through the
-        // passthrough preserve `const` and named-function self semantics.
-        let (is_const, fn_self_name) = cx
-            .captured_binding_owner(name)
-            .map(|(_, info)| (info.is_const, info.fn_self_name))
-            .unwrap_or((false, false));
-        entries.push(otter_bytecode::DirectEvalBinding {
-            captured: true,
-            name: name.clone(),
-            upvalue: *idx,
-            lexical: false,
-            is_const,
-            fn_self_name,
-            inner: false,
-            param: false,
-            deletable: cx.eval_var_dynamic_reference(name),
-            scope_depth: 1,
-        });
-    }
-    // `bindings` is hash-ordered; sort for deterministic bytecode.
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries
-}
-
-/// `true` when an `arguments` binding already exists in an arrow's
-/// variable environment *during parameter instantiation* — i.e. a
-/// formal parameter (or rest pattern) declares the name. Body
-/// declarations don't count: their bindings are created only after
-/// the parameters finish, so a direct eval in a parameter default
-/// may legally var-declare `arguments` (§19.2.1.3). Arrows never
-/// synthesize an arguments object of their own (§10.2.11).
-fn arrow_binds_arguments(arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>) -> bool {
-    let mut names: Vec<String> = Vec::new();
-    for param in &arrow.params.items {
-        collect_pattern_var_names(&param.pattern, &mut names);
-    }
-    if let Some(rest) = &arrow.params.rest {
-        collect_pattern_var_names(&rest.rest.argument, &mut names);
-    }
-    names.iter().any(|name| name == "arguments")
-}
-
-/// Compile an arrow function. Two body shapes share the same
-/// lowering:
-///
-/// - `() => expr` (expression body): one synthetic
-///   `ReturnValue(expr)`.
-/// - `() => { ... }` (block body): existing function-body
-///   compilation, with an implicit `ReturnUndefined` tail.
-///
-/// Captures from the enclosing scope flow through the same
-/// upvalue mechanism as nested function declarations — see
-/// [`capture`]. The arrow has no `this` of its own (foundation
-/// slice doesn't model `this` yet — task 23).
-pub(crate) fn compile_arrow_function(
-    parent: &mut Compiler,
-    arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
+struct FunctionScopes<'r, 'a> {
+    name: &'r str,
+    params: &'r oxc_ast::ast::FormalParameters<'a>,
+    body: Option<&'r oxc_ast::ast::FunctionBody<'a>>,
     span: (u32, u32),
-) -> Result<(u32, Vec<u32>), CompileError> {
-    let module = Rc::clone(&parent.top_mut().module);
-    let function_is_strict = parent.is_strict || arrow.body.has_use_strict_directive();
-    validate_formal_parameter_names(&arrow.params, function_is_strict, false, span)?;
-    let active_with_envs = parent.active_with_envs.clone();
-    let mut child = FunctionContext::new(Rc::clone(&module))
-        .with_strict(function_is_strict)
-        .with_arrow()
-        .with_module_url(parent.module_url.clone());
-    // Arrows resolve `super` lexically — inherit the statics-side
-    // home flag from the enclosing context.
-    child.dot_arguments_observed = parent.dot_arguments_observed;
-    child.super_home_static = parent.super_home_static;
-    child.active_with_envs = active_with_envs;
-    // Arrows have no implicit `arguments` object; the binding exists
-    // only when a parameter or a body var / lexical / function
-    // declaration introduces the name (drives the §19.2.1.3
-    // direct-eval-in-parameter-defaults check).
-    child.binds_arguments = arrow_binds_arguments(arrow);
-    child.captured_names = capture::analyze_arrow(arrow);
-    // §19.2.1.3 — a direct eval inside the arrow body uses the
-    // arrow's own variable scope as its caller environment, so every
-    // arrow-scope binding must live in a cell.
-    let contains_direct_eval = capture::body_contains_direct_eval(Some(&arrow.params), &arrow.body);
-    if contains_direct_eval {
-        child
-            .captured_names
-            .extend(capture::all_own_names(Some(&arrow.params), &arrow.body));
+    is_generator: bool,
+    is_arrow: bool,
+    arrow_expression: bool,
+    function_is_strict: bool,
+    has_param_expressions: bool,
+    allow_duplicate_formals: bool,
+    self_binding: bool,
+    params_eval: bool,
+    body_eval: bool,
+    derived_this: bool,
+    body_needs_arguments_object: bool,
+    arguments_forward_only: bool,
+    uses_mapped_arguments: bool,
+    fields: Option<FieldInjection<'r, 'a>>,
+}
+
+/// Lower the function's scopes and body into the frame on top of the
+/// stack. Returns the mapped-arguments table.
+fn compile_function_scopes(
+    parent: &mut Compiler,
+    f: FunctionScopes<'_, '_>,
+) -> Result<Vec<MappedArgumentBinding>, CompileError> {
+    let span = f.span;
+    let strict = f.function_is_strict;
+    // §15.2.5 — a named function expression's funcEnv holds its own name,
+    // outside every other scope of the function.
+    if f.self_binding {
+        parent.enter_scope_with_flags(
+            ScopeKind::FunctionName,
+            ScopeFlags {
+                strict,
+                var_scope: false,
+                has_extension: false,
+            },
+        );
+        let storage = parent.declare_binding(f.name, SlotKind::FnSelfName, span)?;
+        parent.mark_fn_self_name(f.name);
+        match storage {
+            BindingStorage::Register { reg } => {
+                parent.emit(Op::LoadSelf, [Operand::Register(reg)], span);
+            }
+            BindingStorage::Slot { .. } => {
+                let tmp = parent.alloc_scratch();
+                parent.emit(Op::LoadSelf, [Operand::Register(tmp)], span);
+                parent.emit_store_storage(tmp, storage, span);
+            }
+        }
+        parent.mark_initialized(f.name);
     }
-    child.contains_direct_eval = contains_direct_eval;
-    child.reserve_known_own_upvalues();
-    parent.push(child);
-    parent.enter_scope();
+    // §10.2.11 step 20 — a sloppy parameter list with expressions keeps a
+    // separate callee environment that receives a parameter eval's `var`s.
+    if f.params_eval {
+        parent.enter_scope_with_flags(
+            ScopeKind::Callee,
+            ScopeFlags {
+                strict: false,
+                var_scope: true,
+                has_extension: true,
+            },
+        );
+        parent.ensure_innermost_context(span)?;
+    }
+    let param_scope_kind = if f.has_param_expressions {
+        ScopeKind::Params
+    } else {
+        ScopeKind::Body
+    };
+    let simple_body_extension = !f.has_param_expressions && f.body_eval;
+    parent.enter_scope_with_flags(
+        param_scope_kind,
+        ScopeFlags {
+            strict,
+            var_scope: !f.has_param_expressions,
+            has_extension: simple_body_extension,
+        },
+    );
+    let param_scope = parent.scopes.len() - 1;
+    parent.top_mut().var_scope = param_scope;
+    if simple_body_extension {
+        parent.ensure_innermost_context(span)?;
+    }
+    if f.derived_this {
+        let storage = parent.declare_forced_slot("this", SlotKind::DerivedThis, span)?;
+        let BindingStorage::Slot {
+            ctx: CtxReg::Reg(ctx),
+            slot,
+        } = storage
+        else {
+            unreachable!("a function's own scope context is a register");
+        };
+        parent.mark_initialized("this");
+        parent.top_mut().derived_this = Some(DerivedThisSlot { ctx, slot });
+    }
+    // §15.7.10 — a base class runs field initializers from [[Construct]]
+    // before the constructor binds its parameters: they never observe the
+    // constructor's parameter bindings.
+    if let Some(injection) = &f.fields
+        && !injection.is_derived
+    {
+        crate::class::emit_instance_field_inits(parent, injection.fields)?;
+    }
 
-    let param_count = u16::try_from(arrow.params.items.len()).expect("too many parameters");
-    let length = formal_parameter_length(&arrow.params);
-    parent.scratch = param_count;
-    let has_rest = arrow.params.rest.is_some();
-
-    // Reserve the function record up front so we can emit
-    // `MakeFunction` / `MakeClosure` for the result later.
-    let function_id = module.borrow().functions.len() as u32;
-    module.borrow_mut().functions.push(Function {
-        id: function_id,
-        name: "<arrow>".to_string(),
+    predeclare_formal_parameters(
+        parent,
+        f.params,
+        f.allow_duplicate_formals,
+        f.has_param_expressions,
         span,
-        is_strict: function_is_strict,
-        module_url: parent.module_url.clone(),
-        ..Default::default()
-    });
-
-    predeclare_formal_parameters(parent, &arrow.params, false, span)?;
+    )?;
+    // §10.2.11 step 22 — bind `arguments` BEFORE the formals are
+    // initialized, so a parameter default can read it.
+    if f.body_needs_arguments_object
+        && !f.arguments_forward_only
+        && parent.lookup_in_current_scope("arguments").is_none()
+    {
+        let storage = parent.declare_binding("arguments", SlotKind::Arguments, span)?;
+        let tmp = parent.alloc_scratch();
+        let ctx_operand = match parent.scopes[param_scope].context.map(|ctx| ctx.reg) {
+            Some(CtxReg::Reg(reg)) if f.uses_mapped_arguments => reg,
+            _ => tmp,
+        };
+        parent.emit(
+            Op::CollectArguments,
+            [Operand::Register(tmp), Operand::Register(ctx_operand)],
+            span,
+        );
+        parent.emit_store_storage(tmp, storage, span);
+        parent.mark_initialized("arguments");
+    }
     parent.in_param_init = true;
-    for (ordinal, param) in arrow.params.items.iter().enumerate() {
+    for (ordinal, param) in f.params.items.iter().enumerate() {
         compile_formal_parameter(
             parent,
             ordinal as u16,
             &param.pattern,
             param.initializer.as_deref(),
             span,
-            false,
+            f.allow_duplicate_formals,
         )?;
     }
-    if let Some(rest) = &arrow.params.rest {
+    if let Some(rest) = &f.params.rest {
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
     parent.in_param_init = false;
-    crate::type_hints::annotate_formal_parameters(parent, &arrow.params);
+    crate::type_hints::annotate_formal_parameters(parent, f.params);
+    let mapped_argument_bindings = if f.uses_mapped_arguments {
+        mapped_formal_parameter_bindings(parent, f.params)
+    } else {
+        Vec::new()
+    };
+    // `CallForwardArguments` names the mapped formals' context register.
+    parent.top_mut().mapped_arguments_ctx =
+        mapped_argument_bindings
+            .iter()
+            .find_map(|binding| match binding.storage {
+                ArgumentBindingStorage::Context { reg, .. } => Some(reg),
+                ArgumentBindingStorage::Register { .. } => None,
+            });
 
-    let mut direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
-    if arrow.expression {
-        // `() => expr` — body is a single ExpressionStatement
-        // whose expression is the implicit return value.
-        let stmt = arrow
-            .body
-            .statements
-            .first()
-            .ok_or(CompileError::Unsupported {
-                node: "ArrowFunction: empty expression body".to_string(),
-                span,
-            })?;
+    if f.is_arrow && f.arrow_expression {
+        let body = f.body.expect("arrow body");
+        let stmt = body.statements.first().ok_or(CompileError::Unsupported {
+            node: "ArrowFunction: empty expression body".to_string(),
+            span,
+        })?;
         let Statement::ExpressionStatement(es) = stmt else {
             return Err(CompileError::Unsupported {
                 node: "ArrowFunction: malformed expression body".to_string(),
@@ -691,247 +602,198 @@ pub(crate) fn compile_arrow_function(
         };
         let inner_span = (es.span.start, es.span.end);
         let reg = compile_expr(parent, &es.expression, inner_span)?;
-        if contains_direct_eval {
-            capture_lexical_environment_for_eval(parent);
-            capture_private_environment_for_eval(parent);
-            capture_super_bindings_for_eval(parent);
-            direct_eval_meta = collect_direct_eval_bindings(parent, &[]);
-        }
         parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
-    } else {
-        // §10.2.11 FunctionDeclarationInstantiation — block-body
-        // arrow functions own a regular function scope and must
-        // pre-hoist `var` / lexical / function-declaration bindings
-        // before walking the body, exactly like the regular
-        // `compile_function_declaration_body` pass above. Without
-        // this, nested `var x = …` inside the arrow body fails the
-        // `var \`x\` not pre-hoisted` invariant check at the
-        // `Statement::VariableDeclaration` arm.
+        return Ok(mapped_argument_bindings);
+    }
+
+    // §10.2.11 step 28 — with parameter expressions the body owns a
+    // separate variable environment.
+    if f.has_param_expressions {
+        parent.enter_scope_with_flags(
+            ScopeKind::Body,
+            ScopeFlags {
+                strict,
+                var_scope: true,
+                has_extension: f.body_eval,
+            },
+        );
+        let body_scope = parent.scopes.len() - 1;
+        parent.top_mut().var_scope = body_scope;
+        if f.body_eval {
+            parent.ensure_innermost_context(span)?;
+        }
+    }
+    let mut ends_with_return = false;
+    if let Some(body) = f.body {
         let mut var_names: Vec<String> = Vec::new();
-        hoist_var_names(&arrow.body.statements, &mut var_names);
-        let mut annex_blocked: std::collections::HashSet<String> = parent
-            .scopes
-            .iter()
-            .flat_map(|scope| scope.bindings.keys().cloned())
-            .collect();
+        hoist_var_names(&body.statements, &mut var_names);
+        // §B.3.3.1 — parameter names and "arguments" block the sloppy
+        // block-level function var-scope extension.
+        let mut annex_blocked: std::collections::HashSet<String> =
+            formal_parameter_bound_names(f.params).into_iter().collect();
         annex_blocked.insert("arguments".to_string());
-        pre_declare_annex_b_functions(parent, &arrow.body.statements, &annex_blocked, span)?;
+        pre_declare_annex_b_functions(parent, &body.statements, &annex_blocked, span)?;
         pre_declare_var_bindings(parent, &var_names, span)?;
+        // §10.2.11 step 28.f — with parameter expressions, a body `var`
+        // naming a parameter-environment binding starts with that
+        // binding's current value.
+        if f.has_param_expressions {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for name in &var_names {
+                if !seen.insert(name.as_str()) {
+                    continue;
+                }
+                let Some(param_info) = parent.scopes[param_scope].bindings.get(name).copied()
+                else {
+                    continue;
+                };
+                let Some(body_info) = parent.lookup_in_current_scope(name) else {
+                    continue;
+                };
+                let tmp = parent.alloc_scratch();
+                parent.emit_load_storage(tmp, param_info.storage, span);
+                parent.emit_store_storage(tmp, body_info.storage, span);
+            }
+        }
         let mut lex_names: Vec<(String, bool)> = Vec::new();
-        hoist_lexical_names(&arrow.body.statements, &mut lex_names);
+        hoist_lexical_names(&body.statements, &mut lex_names);
+        validate_no_param_lexical_conflict(f.params, &lex_names, span)?;
         pre_declare_lexical_bindings(parent, &lex_names, span)?;
-        hoist_function_declarations(parent, &arrow.body.statements)?;
-        for stmt in &arrow.body.statements {
+        hoist_function_declarations(parent, &body.statements)?;
+        if f.is_generator {
+            parent.emit(Op::GeneratorStart, vec![], span);
+        }
+        let derived_fields = f.fields.as_ref().filter(|injection| injection.is_derived);
+        let mut fields_emitted = derived_fields.is_none();
+        for stmt in &body.statements {
             compile_discarded_statement(parent, stmt)?;
+            // Derived classes initialize fields once the constructor's
+            // statement-level `super(...)` returns.
+            if !fields_emitted && crate::class::is_top_level_super_call(stmt) {
+                crate::class::emit_instance_field_inits(
+                    parent,
+                    derived_fields.expect("derived field injection").fields,
+                )?;
+                fields_emitted = true;
+            }
         }
-        if contains_direct_eval {
-            capture_lexical_environment_for_eval(parent);
-            capture_private_environment_for_eval(parent);
-            capture_super_bindings_for_eval(parent);
-            direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
+        if !fields_emitted {
+            crate::class::emit_instance_field_inits(
+                parent,
+                derived_fields.expect("derived field injection").fields,
+            )?;
         }
+        ends_with_return = matches!(body.statements.last(), Some(Statement::ReturnStatement(_)));
+    } else if let Some(injection) = &f.fields
+        && injection.is_derived
+    {
+        crate::class::emit_instance_field_inits(parent, injection.fields)?;
+    }
+    if !ends_with_return {
         parent.emit(Op::ReturnUndefined, vec![], span);
     }
-    parent.exit_scope();
+    Ok(mapped_argument_bindings)
+}
 
-    let child = parent.pop();
+/// Finalize a popped frame into its reserved function record. `fill` sets
+/// the shape fields the caller owns. Returns whether the body reads its
+/// closure context.
+pub(crate) fn finish_function(
+    parent: &mut Compiler,
+    child: &mut FunctionContext,
+    function_id: u32,
+    span: (u32, u32),
+    fill: impl FnOnce(&mut Function),
+) -> Result<bool, CompileError> {
+    let finished = child.finish_code(span);
     if child.register_overflow {
         return Err(CompileError::Unsupported {
             node: "function body exhausts the 65535-register window".to_string(),
             span,
         });
     }
-
-    let captures = child.parent_captures.clone();
-    let mut child = child;
-    crate::function_context::finalize_virtual_capture_indices(
-        &mut child.code,
-        &mut direct_eval_meta,
-        &mut child.eval_sites,
-        child.own_upvalue_count,
-    );
+    let module = Rc::clone(&parent.top_mut().module);
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions
         .get_mut(function_id as usize)
         .expect("reserved function slot");
     slot.locals = 0;
-    slot.scratch = child.scratch_window();
-    slot.param_count = param_count;
-    slot.length = length;
-    slot.has_rest = has_rest;
-    slot.is_async = arrow.r#async;
-    slot.own_upvalue_count = child.own_upvalue_count;
-    slot.inherited_upvalue_count = captures.len() as u16;
-    slot.is_arrow = true;
-    slot.direct_eval_bindings = direct_eval_meta;
-    slot.eval_sites = std::mem::take(&mut child.eval_sites);
-    slot.contains_direct_eval = contains_direct_eval;
-    slot.number_hint_sites = child.number_hint_sites;
-    let class_hint_sites = child.class_hint_sites;
-    slot.code = child.code.finish();
-    slot.spans = child.spans;
+    slot.scratch = finished.scratch;
+    slot.scopes = finished.scopes;
+    slot.number_hint_sites = finished.number_hint_sites;
+    slot.code = finished.code;
+    slot.spans = finished.spans;
+    fill(slot);
     drop(module_mut);
-    parent.take_class_hint_sites(function_id, class_hint_sites);
-    Ok((function_id, captures))
+    parent.take_class_hint_sites(function_id, finished.class_hint_sites);
+    Ok(finished.uses_closure_context)
 }
 
-/// Emit the right "make a callable into `dst`" instruction:
-/// [`Op::MakeFunction`] when the inner function captures nothing,
-/// [`Op::MakeClosure`] otherwise.
-///
-/// Arrow functions always go through [`Op::MakeClosure`] (even with
-/// zero non-`this` captures) so the runtime can snapshot the
-/// enclosing frame's `this` into the closure value at construction
-/// time. Regular function declarations / expressions take `this`
-/// from the call site and use the lighter `MakeFunction` form when
-/// they have no captures.
+/// Materialize a callable for `record` into `dst`: a closure over the
+/// creator's context when the body reads it, a context-free function
+/// otherwise. Arrows always go through `MakeClosure` so the VM snapshots
+/// the creator's `this` / `new.target`.
 pub(crate) fn emit_make_callable(
     cx: &mut Compiler,
     dst: u16,
-    function_const: u32,
-    captures: &[u32],
-    is_arrow: bool,
+    record: &ClosureRecord,
     span: (u32, u32),
-) -> Result<(), CompileError> {
-    if captures.is_empty() && !is_arrow {
+) {
+    emit_make_callable_as(cx, dst, record, record.is_arrow, span);
+}
+
+/// [`emit_make_callable`] that always yields a closure object (methods).
+pub(crate) fn emit_make_callable_object(
+    cx: &mut Compiler,
+    dst: u16,
+    record: &ClosureRecord,
+    span: (u32, u32),
+) {
+    emit_make_callable_as(cx, dst, record, true, span);
+}
+
+fn emit_make_callable_as(
+    cx: &mut Compiler,
+    dst: u16,
+    record: &ClosureRecord,
+    closure_object: bool,
+    span: (u32, u32),
+) {
+    let function_const = cx.intern_function_id(record.function_id);
+    // A closure context that is statically `undefined` needs no operand.
+    let context_empty = record.ctx == CtxReg::Closure && cx.closure_context_empty;
+    if record.needs_context && !context_empty {
+        cx.emit_ctx(
+            Op::MakeClosure,
+            vec![
+                Operand::Register(dst),
+                Operand::ConstIndex(function_const),
+                Operand::Register(0),
+            ],
+            2,
+            record.ctx,
+            span,
+        );
+    } else if closure_object {
+        // No context to capture: close over `undefined`.
+        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+        cx.emit(
+            Op::MakeClosure,
+            [
+                Operand::Register(dst),
+                Operand::ConstIndex(function_const),
+                Operand::Register(dst),
+            ],
+            span,
+        );
+    } else {
         cx.emit(
             Op::MakeFunction,
             [Operand::Register(dst), Operand::ConstIndex(function_const)],
             span,
         );
-        return Ok(());
     }
-    let operands = make_closure_operands(dst, function_const, captures, span)?;
-    cx.emit(Op::MakeClosure, operands, span);
-    Ok(())
-}
-
-pub(crate) fn emit_make_callable_object(
-    cx: &mut Compiler,
-    dst: u16,
-    function_const: u32,
-    captures: &[u32],
-    span: (u32, u32),
-) -> Result<(), CompileError> {
-    let operands = make_closure_operands(dst, function_const, captures, span)?;
-    cx.emit(Op::MakeClosure, operands, span);
-    Ok(())
-}
-
-fn make_closure_operands(
-    dst: u16,
-    function_const: u32,
-    captures: &[u32],
-    span: (u32, u32),
-) -> Result<Vec<Operand>, CompileError> {
-    // `MakeClosure` operand layout is `[dst, fn_const, count,
-    // capture0, …, captureN-1]`; the wire encoder caps the total
-    // operand count at `u8::MAX` (255), so the capture-count payload
-    // tops out at 252. Beyond that we surface a `CompileError`
-    // instead of panicking inside the bytecode writer.
-    const MAX_CAPTURES: usize = u8::MAX as usize - 3;
-    if captures.len() > MAX_CAPTURES {
-        return Err(CompileError::Unsupported {
-            node: format!(
-                "closure capturing {} upvalues exceeds the {} limit of `Op::MakeClosure`",
-                captures.len(),
-                MAX_CAPTURES
-            ),
-            span,
-        });
-    }
-    let mut operands: Vec<Operand> = Vec::with_capacity(3 + captures.len());
-    operands.push(Operand::Register(dst));
-    operands.push(Operand::ConstIndex(function_const));
-    operands.push(Operand::ConstIndex(captures.len() as u32));
-    for &parent_idx in captures {
-        operands.push(Operand::Imm32(parent_idx as i32));
-    }
-    Ok(operands)
-}
-
-/// §19.2.1.1 step ~6 — a direct eval inherits the caller's
-/// PrivateEnvironment. Force a capture of every enclosing class's
-/// private-name (and brand) cells so they ride the direct-eval
-/// binding table into the eval frame. Called by every
-/// function-finalization path that collects direct-eval bindings
-/// (ordinary functions, synthetic and user class constructors).
-/// A direct eval can name ANY lexically visible binding, not just the
-/// ones the surrounding function references statically (`class C {
-/// field = eval("C"); }`). Force a passthrough capture of every
-/// cell-backed binding in the enclosing frames so
-/// [`collect_direct_eval_bindings`] can expose them to the eval chunk.
-/// Ancestor bindings are already cell-promoted: the any-depth
-/// direct-eval scan (`body_contains_direct_eval`) marks every enclosing
-/// function `contains_direct_eval`, which promotes its own names.
-pub(crate) fn capture_lexical_environment_for_eval(cx: &mut Compiler) {
-    let top = cx.stack.len();
-    if top < 2 {
-        return;
-    }
-    let mut names: Vec<String> = Vec::new();
-    for frame in &cx.stack[..top - 1] {
-        for scope in &frame.scopes {
-            for (name, info) in &scope.bindings {
-                // Synthetic bindings (private symbols, super homes,
-                // class internals) ride through their dedicated
-                // capture helpers below.
-                if name.starts_with("__") {
-                    continue;
-                }
-                if matches!(info.storage, BindingStorage::Upvalue { .. }) {
-                    names.push(name.clone());
-                }
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    // `Op::MakeClosure` carries at most 252 captures. A pathological
-    // enclosing scope (a bundled script's module wrapper with hundreds of
-    // top-level bindings) would blow that limit, so stop short of it and
-    // leave the remaining names to the pre-fix behaviour (resolvable only
-    // when referenced statically). Names are sorted, so the exposed
-    // subset is deterministic.
-    const CAPTURE_BUDGET: usize = 200;
-    for name in names {
-        if cx.top_mut().parent_captures.len() >= CAPTURE_BUDGET {
-            break;
-        }
-        let _ = cx.resolve_capture(&name);
-    }
-}
-
-pub(crate) fn capture_private_environment_for_eval(cx: &mut Compiler) {
-    if cx.private_namespaces.is_empty() {
-        return;
-    }
-    let pairs: Vec<(u32, Vec<String>)> = cx
-        .private_namespaces
-        .iter()
-        .copied()
-        .zip(cx.class_private_names.iter().cloned())
-        .map(|(ns, names)| (ns, names.into_iter().collect()))
-        .collect();
-    for (ns, names) in pairs {
-        for name in names {
-            let binding = format!("__privsym_{ns}_{name}");
-            let _ = cx.resolve_capture(&binding);
-        }
-        let brand = format!("__privbrand_{ns}");
-        let _ = cx.resolve_capture(&brand);
-    }
-}
-
-/// Companion to [`capture_private_environment_for_eval`] — a direct
-/// eval whose call site has a [[HomeObject]] also needs the
-/// synthetic super bindings spliced into its frame.
-pub(crate) fn capture_super_bindings_for_eval(cx: &mut Compiler) {
-    let _ = cx.resolve_capture(crate::class::SUPER_HOME_NAME);
-    let _ = cx.resolve_capture(crate::class::SUPER_STATIC_HOME_NAME);
-    let _ = cx.resolve_capture(crate::class::SUPER_CTOR_NAME);
-    let _ = cx.resolve_capture(crate::class::CLASS_SELF_NAME);
 }
 
 /// §10.2.11 / §15.2.1 — it is a Syntax Error if any element of the

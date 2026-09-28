@@ -13,6 +13,14 @@
 //!   calls publish exact inline frames without replaying completed effects.
 //! - A site whose earlier generation failed an identity guard is not spliced
 //!   again; it keeps its generated call.
+//! - A spliced body has no native frame: its SELF is the guarded callable of
+//!   the site, so `LoadSelf` is that value and `LoadClosureContext` reads that
+//!   closure's context word. Captured reads, hole-checked reads and slot
+//!   stores then walk the callable's own chain; every exit rebuilds the callee
+//!   frame with the same callable as its SELF.
+//! - A callee that creates a context or a closure keeps its generated call:
+//!   context allocation, `MakeClosure` and `MakeFunction` have no spliced form,
+//!   and a committed checked context slot's cold sibling is not admitted.
 //! - Identity guards precede allocation. Constructor parameter guards run after
 //!   successful allocation and reconstruct that same receiver and new.target.
 //!   Body exits rebuild the caller after its call and the exact callee operation.
@@ -151,9 +159,9 @@ fn splice_tree(
                     .count();
             }
             if let Some(node) = body.nodes.iter().copied().find(|&node| {
-                !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
+                !is_activation_input(node)
                     && !(target.kind == NumericDirectCallKind::Construct && is_new_target(node))
-                    && map_body_node(node, &|v| v, NumericValue(0)).is_none()
+                    && map_body_node(node, &|v| v).is_none()
             }) {
                 return Err(format!("unsupported callee operation: {node:?}"));
             }
@@ -176,7 +184,7 @@ fn splice_tree(
                 return Err("callee requires loop or throw CFG".into());
             }
             let plan = &target.candidates[0].callee.plan;
-            if plan.own_upvalue_count != 0 || plan.needs_incoming_arguments {
+            if plan.needs_incoming_arguments {
                 return Err("callee requires activation entry setup".into());
             }
             if target.kind == NumericDirectCallKind::Method
@@ -310,27 +318,20 @@ fn splice_one(
     } else {
         None
     };
-    let rejects_eval_env = callee_view.code_block.observes_eval_env;
     let guard = push(
         hir,
         if method {
-            NumericNode::InlineMethodGuard {
-                source,
-                target,
-                rejects_eval_env,
-            }
+            NumericNode::InlineMethodGuard { source, target }
         } else if construct {
             NumericNode::InlineConstructGuard {
                 source,
                 function_id: body.function_id,
-                rejects_eval_env,
             }
         } else {
             NumericNode::InlineCallGuard {
                 source,
                 function_id: body.function_id,
                 this_mode,
-                rejects_eval_env,
             }
         },
     );
@@ -432,6 +433,9 @@ fn splice_one(
                 };
             }
             NumericNode::This => mapping[index] = this,
+            // The spliced body has no frame: its SELF is the guarded callable,
+            // so a captured read walks that closure's own context chain.
+            NumericNode::Callee => mapping[index] = callable,
             node if construct && is_new_target(node) => mapping[index] = source,
             _ => {
                 mapping[index] = push(
@@ -461,10 +465,8 @@ fn splice_one(
     hir.operand_values
         .extend(body.operand_values.iter().copied().map(map));
     for (index, &node) in body.nodes.iter().enumerate() {
-        if !matches!(node, NumericNode::Parameter { .. } | NumericNode::This)
-            && !(construct && is_new_target(node))
-        {
-            let mut mapped = map_body_node(node, &map, callable)?;
+        if !is_activation_input(node) && !(construct && is_new_target(node)) {
+            let mut mapped = map_body_node(node, &map)?;
             match &mut mapped {
                 NumericNode::InlineMethodGuard { target, .. } => {
                     *target = target.checked_add(target_base)?
@@ -495,10 +497,8 @@ fn splice_one(
         let NumericFramePoint::Node(node) = state.point else {
             return None;
         };
-        if matches!(
-            body.nodes[node.0],
-            NumericNode::Parameter { .. } | NumericNode::This
-        ) || (construct && is_new_target(body.nodes[node.0]))
+        if is_activation_input(body.nodes[node.0])
+            || (construct && is_new_target(body.nodes[node.0]))
         {
             continue;
         }
@@ -587,10 +587,8 @@ fn splice_one(
                 .iter()
                 .copied()
                 .filter(|n| {
-                    !matches!(
-                        body.nodes[n.0],
-                        NumericNode::Parameter { .. } | NumericNode::This
-                    ) && !(construct && is_new_target(body.nodes[n.0]))
+                    !is_activation_input(body.nodes[n.0])
+                        && !(construct && is_new_target(body.nodes[n.0]))
                 })
                 .map(map)
                 .collect();
@@ -683,6 +681,15 @@ fn splice_one(
     Some(())
 }
 
+/// Body nodes that name the callee activation's inputs rather than compute:
+/// the splice maps them to the call site's arguments, receiver and callable.
+fn is_activation_input(node: NumericNode) -> bool {
+    matches!(
+        node,
+        NumericNode::Parameter { .. } | NumericNode::This | NumericNode::Callee
+    )
+}
+
 fn is_new_target(node: NumericNode) -> bool {
     matches!(
         node,
@@ -697,46 +704,12 @@ fn is_new_target(node: NumericNode) -> bool {
     )
 }
 
-/// `closure` is the callee value the call guard proved: an inlined body has
-/// no native frame of its own, so its upvalue reads address that closure.
 fn map_body_node(
     node: NumericNode,
     map: &impl Fn(NumericValue) -> NumericValue,
-    closure: NumericValue,
 ) -> Option<NumericNode> {
     use NumericNode::*;
     Some(match node {
-        BindingGuardedRead {
-            semantics:
-                semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
-                    otter_bytecode::opcode_schema::BindingRead::Upvalue { .. },
-                ),
-            target: NumericBindingTarget::Upvalue { index },
-            byte_pc,
-        } if cfg!(target_arch = "aarch64") => BindingGuardedRead {
-            semantics,
-            target: NumericBindingTarget::ClosureUpvalue { index, closure },
-            byte_pc,
-        },
-        BindingGuardedRead {
-            semantics:
-                semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
-                    otter_bytecode::opcode_schema::BindingRead::Upvalue { .. },
-                ),
-            target:
-                NumericBindingTarget::ClosureUpvalue {
-                    index,
-                    closure: nested,
-                },
-            byte_pc,
-        } => BindingGuardedRead {
-            semantics,
-            target: NumericBindingTarget::ClosureUpvalue {
-                index,
-                closure: map(nested),
-            },
-            byte_pc,
-        },
         Binding {
             semantics:
                 semantics @ otter_bytecode::opcode_schema::BindingSemantics::Read(
@@ -776,16 +749,33 @@ fn map_body_node(
             equal,
             byte_pc,
         },
+        ClosureContext(closure) => ClosureContext(map(closure)),
+        ContextParent(context) => ContextParent(map(context)),
+        ContextSlotLoad { context, slot } => ContextSlotLoad {
+            context: map(context),
+            slot,
+        },
+        ContextHoleGuard { value, byte_pc } => ContextHoleGuard {
+            value: map(value),
+            byte_pc,
+        },
+        ContextSlotStore {
+            context,
+            slot,
+            value,
+        } => ContextSlotStore {
+            context: map(context),
+            slot,
+            value: map(value),
+        },
         TaggedStrictEqual(left, right) => TaggedStrictEqual(map(left), map(right)),
         TaggedToBoolean(value) => TaggedToBoolean(map(value)),
         InlineConstructGuard {
             source,
             function_id,
-            rejects_eval_env,
         } => InlineConstructGuard {
             source: map(source),
             function_id,
-            rejects_eval_env,
         },
         ConstructReceiver {
             source,
@@ -820,21 +810,14 @@ fn map_body_node(
             source,
             function_id,
             this_mode,
-            rejects_eval_env,
         } => InlineCallGuard {
             source: map(source),
             function_id,
             this_mode,
-            rejects_eval_env,
         },
-        InlineMethodGuard {
-            source,
-            target,
-            rejects_eval_env,
-        } => InlineMethodGuard {
+        InlineMethodGuard { source, target } => InlineMethodGuard {
             source: map(source),
             target,
-            rejects_eval_env,
         },
         ElementGuardedLoad {
             receiver,

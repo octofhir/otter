@@ -20,7 +20,8 @@
 //! - Resolved explicit-receiver and forwarded targets use the same bounded
 //!   CodeBlock feedback and invalidate stale caller generations on target growth.
 //! - Spread validation order matches interpreter dispatch.
-//! - Elided mapped arguments read live parameter cells; after materialization,
+//! - Elided mapped arguments read live parameter-context slots; after
+//!   materialization,
 //!   forwarding reads the actual arguments object through CreateListFromArrayLike.
 //!
 //! # See also
@@ -369,13 +370,30 @@ impl Interpreter {
     }
 
     /// §10.4.4 Arguments exotic object construction for an interpreter frame.
+    /// `CollectArguments dst, ctx`. A mapped object aliases the slots of the
+    /// parameter-scope context in `ctx`, the register every context-held
+    /// mapped formal names.
     pub(crate) fn run_collect_arguments_reg(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
+        ctx: u16,
     ) -> Result<(), VmError> {
+        debug_assert!(
+            context
+                .exec_function(stack[frame_index].function_id)
+                .is_none_or(
+                    |function| function.mapped_argument_bindings.iter().all(
+                        |binding| match binding.storage {
+                            ArgumentBindingStorage::Context { reg, .. } => reg == ctx,
+                            ArgumentBindingStorage::Register { .. } => true,
+                        }
+                    )
+                ),
+            "CollectArguments names the mapped formals' context register"
+        );
         let value = self.materialize_frame_arguments_object(context, stack, frame_index)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, value)?;
@@ -411,8 +429,8 @@ impl Interpreter {
                 .frame_cold_mut(frame)
                 .map(|cold| cold.incoming_args.clone())
                 .unwrap_or_default();
-            let mapped_entries = Self::mapped_argument_entries(function, elements.len(), |idx| {
-                frame.upvalues.get(idx as usize).copied()
+            let mapped_entries = Self::mapped_arguments(function, elements.len(), |reg| {
+                frame.registers.get(usize::from(reg)).copied()
             });
             (
                 elements,
@@ -431,8 +449,8 @@ impl Interpreter {
     ///
     /// A stack-owned frame reads the actual arguments its generated caller
     /// published after the register window; a materialized activation reads
-    /// the same list from its cold record. Mapped parameters alias through the
-    /// activation's capture cells either way.
+    /// the same list from its cold record. Mapped parameters alias slots of
+    /// the activation's parameter context either way.
     pub(crate) fn jit_runtime_collect_arguments(
         &mut self,
         context: &ExecutionContext,
@@ -483,9 +501,8 @@ impl Interpreter {
                 }
                 (None, None) => return Err(VmError::InvalidOperand),
             };
-        let mapped_entries = Self::mapped_argument_entries(function, elements.len(), |idx| {
-            frame.upvalue(u32::from(idx)).ok()
-        });
+        let mapped_entries =
+            Self::mapped_arguments(function, elements.len(), |reg| frame.read(reg).ok());
         let callee = frame.self_value();
         let kind = function.arguments_object_kind;
         let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
@@ -497,33 +514,37 @@ impl Interpreter {
         Ok(value)
     }
 
-    /// Parameter bindings that alias the arguments object's indexed entries,
-    /// resolved against the activation's capture cells.
-    fn mapped_argument_entries(
+    /// Parameter bindings that alias the arguments object's indexed entries:
+    /// slots of the parameter-scope context held in the register the
+    /// context-held mapped formals name.
+    fn mapped_arguments(
         function: &crate::executable::CodeBlock,
         argument_count: usize,
-        mut upvalue: impl FnMut(u16) -> Option<crate::UpvalueCell>,
-    ) -> Vec<crate::object::MappedArgumentEntry> {
+        mut read_register: impl FnMut(u16) -> Option<Value>,
+    ) -> Option<crate::object::MappedArguments> {
         if function.arguments_object_kind != ArgumentsObjectKind::Mapped {
-            return Vec::new();
+            return None;
         }
-        function
+        let mut context_register = None;
+        let entries: Vec<_> = function
             .mapped_argument_bindings
             .iter()
             .filter_map(|binding| {
                 if binding.argument_index as usize >= argument_count {
                     return None;
                 }
-                let ArgumentBindingStorage::Upvalue { idx } = binding.storage else {
+                let ArgumentBindingStorage::Context { reg, slot } = binding.storage else {
                     return None;
                 };
-                let cell = upvalue(idx)?;
+                context_register = Some(reg);
                 Some(crate::object::MappedArgumentEntry {
                     key: binding.argument_index.to_string(),
-                    cell,
+                    slot,
                 })
             })
-            .collect()
+            .collect();
+        let context = read_register(context_register?)?.as_context()?;
+        Some(crate::object::MappedArguments { context, entries })
     }
 
     /// Allocate and initialize one arguments exotic object from already
@@ -533,7 +554,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         elements: SmallVec<[Value; 4]>,
         kind: ArgumentsObjectKind,
-        mapped_entries: Vec<crate::object::MappedArgumentEntry>,
+        mapped: Option<crate::object::MappedArguments>,
         callee: Value,
     ) -> Result<Value, VmError> {
         let elements_len = elements.len();
@@ -543,6 +564,12 @@ impl Interpreter {
         for value in elements {
             self.push_iteration_anchor(value);
         }
+        // The parameter-scope context is young: it rides as an anchor through
+        // every allocation below and is re-read before the map is installed.
+        let mapped = mapped.map(|mapped| {
+            let anchor = self.push_iteration_anchor(Value::context(mapped.context)) - 1;
+            (anchor, mapped.entries)
+        });
 
         let collect = |interp: &mut Self| {
             let iterator_method = interp.realm_intrinsics.array_values();
@@ -568,12 +595,22 @@ impl Interpreter {
                 if let Some(proto) = interp.object_prototype_object_opt() {
                     object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
                 }
+                let mapped = match &mapped {
+                    Some((anchor, entries)) => Some(crate::object::MappedArguments {
+                        context: interp
+                            .iteration_anchor(*anchor)
+                            .as_context()
+                            .ok_or(VmError::InvalidOperand)?,
+                        entries: entries.clone(),
+                    }),
+                    None => None,
+                };
                 crate::arguments_object::initialize_mapped(
                     obj,
                     &mut interp.gc_heap,
                     elements,
                     callee,
-                    mapped_entries,
+                    mapped,
                     iterator_descriptor,
                     shape,
                 )

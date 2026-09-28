@@ -12,7 +12,13 @@
 //!
 //! # Invariants
 //! - Private names are validated before bytecode emission for the class body.
-//! - Class lowering installs synthetic captures before compiling methods that can reference `super`.
+//! - Every class evaluation creates one `Class` scope context holding the
+//!   class-scope bindings its methods, constructor, initializers, and static
+//!   blocks reach: private names (`#name`), the private brand, the home
+//!   objects, the parent constructor, the inner class name, and pre-evaluated
+//!   computed field keys. Their names are not identifiers, so no source
+//!   binding collides with them, and resolution by name follows the
+//!   PrivateEnvironment / HomeObject nesting.
 //!
 //! # See also
 //! - `functions` and `scope`
@@ -46,11 +52,9 @@ use crate::*;
 /// 4. A [`Op::MakeClass`] that fuses constructor / prototype /
 ///    statics into a single `Value::ClassConstructor`.
 ///
-/// Method bodies that reference `super` resolve through two
-/// synthetic upvalues installed in the class scope:
-/// `__class_home` (the prototype object methods belong to) and
-/// `__class_super` (the parent class value, only present when the
-/// class has an `extends` clause).
+/// Method bodies that reference `super` resolve through class-scope
+/// slots: `%home` (the prototype object methods belong to) and `%super`
+/// (the parent class value, only present with an `extends` clause).
 pub(crate) fn compile_class(
     cx: &mut Compiler,
     class: &oxc_ast::ast::Class<'_>,
@@ -100,13 +104,12 @@ pub(crate) fn compile_class(
         validate_class_private_names_inner(class, &mut scopes)?;
     }
 
-    cx.enter_scope();
-
     // §15.7.1 — ALL parts of a class definition are strict mode
     // code: the heritage expression, computed keys, and the inline
     // static-element evaluation lowered into this frame.
     let saved_strict = cx.is_strict;
     cx.is_strict = true;
+    cx.enter_scope(otter_bytecode::ScopeKind::Class);
     // §15.7.1 — while heritage / computed keys lower inline into a
     // sloppy frame, property stores must carry strict PutValue
     // failure semantics (the frame's own function stays sloppy).
@@ -118,23 +121,16 @@ pub(crate) fn compile_class(
     result
 }
 
-/// Declare one class-evaluation-scoped captured cell and re-mint it
-/// (`Op::FreshUpvalue`) so each evaluation of the same class source —
-/// e.g. a class expression in a loop body — gets a distinct cell.
-/// Without the re-mint, a later evaluation's store lands in the cell
-/// the earlier evaluation's methods captured (a `super()` chain built
-/// in a loop then collapses into self-recursion).
-fn declare_fresh_class_cell(
+/// Declare one class-scope slot. Each class evaluation creates the scope's
+/// context afresh, so a class expression evaluated in a loop gets distinct
+/// bindings per evaluation.
+fn declare_class_slot(
     cx: &mut Compiler,
     name: &str,
-    is_const: bool,
+    kind: otter_bytecode::SlotKind,
     span: (u32, u32),
 ) -> Result<crate::scope::BindingStorage, CompileError> {
-    let storage = cx.declare_captured_binding(name, is_const, span)?;
-    if let crate::scope::BindingStorage::Upvalue { idx } = storage {
-        cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
-    }
-    Ok(storage)
+    cx.declare_forced_slot(name, kind, span)
 }
 
 fn compile_class_strict(
@@ -143,9 +139,9 @@ fn compile_class_strict(
     class_name: Option<&str>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    // Allocate a fresh private-field namespace and push it on the
-    // compiler's class-context stack so every `#name` reference
-    // inside the class body mangles into this class's slot.
+    // Push this class on the compiler's class-context stack: its private
+    // names, instance methods, and scope location drive `#name`
+    // validation and brand checks inside the body.
     let private_namespace = {
         let module = Rc::clone(&cx.top_mut().module);
         let mut m = module.borrow_mut();
@@ -155,63 +151,24 @@ fn compile_class_strict(
     };
     cx.private_namespaces.push(private_namespace);
 
+    cx.class_scope_locations.push(cx.innermost_location());
+
     // Allocate one runtime-unique symbol per private name for this
-    // class evaluation. Methods capture these bindings, so repeated
+    // class evaluation. Methods reach these slots by name, so repeated
     // evaluation of the same class body gets distinct private keys.
     let private_bound = collect_class_private_bound(&class.body);
     cx.class_private_names
         .push(private_bound.iter().cloned().collect());
     for name in &private_bound {
         let scratch_mark = cx.scratch;
-        let binding = cx
-            .private_key_binding_name(name)
-            .ok_or(CompileError::Unsupported {
-                node: "ClassDeclaration: private name outside class".to_string(),
-                span,
-            })?;
-        let storage = declare_fresh_class_cell(cx, &binding, true, span)?;
+        let binding = private_name_binding(name);
+        let storage =
+            declare_class_slot(cx, &binding, otter_bytecode::SlotKind::PrivateName, span)?;
         let key_reg = emit_private_symbol_key(cx, name, span)?;
         cx.emit_store_storage(key_reg, storage, span);
         cx.mark_initialized(&binding);
-        cx.scratch = scratch_mark;
+        cx.reset_scratch(scratch_mark);
     }
-    // Pack every private-name symbol into ONE captured array
-    // (`__privarr_{ns}`) so the constructor's field initializers
-    // index it instead of capturing thousands of individual
-    // `__privsym_*` cells (Op::MakeClosure tops out at 252
-    // captures; see language/identifiers/start-unicode-*-class).
-    if !private_bound.is_empty() {
-        let scratch_mark = cx.scratch;
-        let arr_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::NewArray,
-            [Operand::Register(arr_reg), Operand::ConstIndex(0)],
-            span,
-        );
-        for (i, name) in private_bound.iter().enumerate() {
-            let item_mark = cx.scratch;
-            let binding = cx
-                .private_key_binding_name(name)
-                .expect("namespace pushed above");
-            let info = cx.lookup_binding(&binding).expect("declared above");
-            let sym_reg = cx.alloc_scratch();
-            cx.emit_load_storage(sym_reg, info.storage, span);
-            let idx_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadInt32,
-                [Operand::Register(idx_reg), Operand::Imm32(i as i32)],
-                span,
-            );
-            cx.emit_store_element(arr_reg, idx_reg, sym_reg, span);
-            cx.scratch = item_mark;
-        }
-        let arr_binding = format!("__privarr_{private_namespace}");
-        let storage = declare_fresh_class_cell(cx, &arr_binding, true, span)?;
-        cx.emit_store_storage(arr_reg, storage, span);
-        cx.mark_initialized(&arr_binding);
-        cx.scratch = scratch_mark;
-    }
-    cx.class_private_ordered.push(private_bound.clone());
     cx.class_private_instance_methods
         .push(collect_class_private_instance_methods(&class.body));
 
@@ -231,18 +188,26 @@ fn compile_class_strict(
         )
     });
     let privproto_storage = if has_instance_private_methods {
-        let binding = format!("__privbrand_{private_namespace}");
-        let storage = declare_fresh_class_cell(cx, &binding, true, span)?;
+        let storage = declare_class_slot(
+            cx,
+            PRIVATE_BRAND_BINDING,
+            otter_bytecode::SlotKind::PrivateBrand,
+            span,
+        )?;
         let key_reg = emit_private_symbol_key(cx, "brand", span)?;
         cx.emit_store_storage(key_reg, storage, span);
-        cx.mark_initialized(&binding);
+        cx.mark_initialized(PRIVATE_BRAND_BINDING);
         // The brand's stored VALUE is the class prototype object, so
         // a branded receiver whose [[Prototype]] chain misses the
         // method holder (proxy / plain constructor-return override)
         // can still resolve private methods through the brand entry.
-        let proto_binding = format!("__privproto_{private_namespace}");
-        let proto_storage = declare_fresh_class_cell(cx, &proto_binding, true, span)?;
-        Some((proto_binding, proto_storage))
+        let proto_storage = declare_class_slot(
+            cx,
+            PRIVATE_PROTO_BINDING,
+            otter_bytecode::SlotKind::Synthetic,
+            span,
+        )?;
+        Some((PRIVATE_PROTO_BINDING, proto_storage))
     } else {
         None
     };
@@ -259,39 +224,51 @@ fn compile_class_strict(
     if let Some(name) = class_name
         && class.id.is_some()
     {
-        let storage = declare_fresh_class_cell(cx, name, false, span)?;
-        let hole = cx.alloc_scratch();
-        cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
-        cx.emit_store_storage(hole, storage, span);
+        // The slot starts as the TDZ hole (SlotKind::Class).
+        declare_class_slot(cx, name, otter_bytecode::SlotKind::Class, span)?;
         cx.mark_fn_self_name(name);
     }
 
-    // Reserve the synthetic `__class_home` / `__class_super`
-    // captured cells BEFORE any expression in the class body
-    // compiles. `resolve_capture` assigns parent-capture indices
-    // relative to the frame's own-upvalue count at resolution time,
-    // so every own captured cell this class adds must be declared
-    // ahead of the first arbitrary `compile_expr` (the heritage) —
-    // otherwise a capture resolved there would collide with these
-    // cells. Values are stored once the prototype / parent exist.
-    let home_storage = declare_fresh_class_cell(cx, SUPER_HOME_NAME, true, span)?;
-    let static_home_storage = declare_fresh_class_cell(cx, SUPER_STATIC_HOME_NAME, true, span)?;
+    // Declare the home / parent slots before any expression in the class
+    // body compiles; values are stored once the prototype / parent exist.
+    let home_storage = declare_class_slot(
+        cx,
+        SUPER_HOME_NAME,
+        otter_bytecode::SlotKind::SuperHome,
+        span,
+    )?;
+    let static_home_storage = declare_class_slot(
+        cx,
+        SUPER_STATIC_HOME_NAME,
+        otter_bytecode::SlotKind::SuperStaticHome,
+        span,
+    )?;
     let super_storage = if class.super_class.is_some() {
-        Some(declare_fresh_class_cell(cx, SUPER_CTOR_NAME, true, span)?)
+        Some(declare_class_slot(
+            cx,
+            SUPER_CTOR_NAME,
+            otter_bytecode::SlotKind::SuperCtor,
+            span,
+        )?)
     } else {
         None
     };
     // §13.3.7.1 SuperCall resolves the parent DYNAMICALLY via the
     // active class's [[GetPrototypeOf]] (observable through
-    // Object.setPrototypeOf between definition and `new`). The cell
+    // Object.setPrototypeOf between definition and `new`). The slot
     // carries the class value; super() reads its live prototype.
     let class_self_storage = if class.super_class.is_some() {
-        Some(declare_fresh_class_cell(cx, CLASS_SELF_NAME, true, span)?)
+        Some(declare_class_slot(
+            cx,
+            CLASS_SELF_NAME,
+            otter_bytecode::SlotKind::ClassSelf,
+            span,
+        )?)
     } else {
         None
     };
 
-    // Collect instance fields now so their computed-key cells can be
+    // Collect instance fields now so their computed-key slots can be
     // reserved alongside the other synthetics (the keys themselves
     // evaluate later, in source order).
     let instance_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
@@ -311,7 +288,7 @@ fn compile_class_strict(
         }
         let pspan = (p.span.start, p.span.end);
         let binding = field_key_binding_name(idx);
-        declare_fresh_class_cell(cx, &binding, true, pspan)?;
+        declare_class_slot(cx, &binding, otter_bytecode::SlotKind::Synthetic, pspan)?;
     }
     let static_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
         .body
@@ -330,7 +307,7 @@ fn compile_class_strict(
         }
         let pspan = (p.span.start, p.span.end);
         let binding = static_field_key_binding_name(idx);
-        declare_fresh_class_cell(cx, &binding, true, pspan)?;
+        declare_class_slot(cx, &binding, otter_bytecode::SlotKind::Synthetic, pspan)?;
     }
 
     // Evaluate the parent class first so observable side-effects
@@ -409,9 +386,8 @@ fn compile_class_strict(
         cx.patch_branch_to_here(done);
     }
 
-    // Fill the synthetic `__class_home` / `__class_super` cells
-    // (declared above, before the heritage) so method bodies can
-    // resolve `super` through the standard upvalue walker.
+    // Fill the home / parent slots (declared above, before the heritage)
+    // so method bodies can resolve `super` by name.
     cx.emit_store_storage(prototype_reg, home_storage, span);
     cx.mark_initialized(SUPER_HOME_NAME);
     if let Some((proto_binding, proto_storage)) = &privproto_storage {
@@ -489,12 +465,12 @@ fn compile_class_strict(
     // and side effects like `[counter++]` behave per spec), and
     // canonicalized through §7.1.19 ToPropertyKey (user
     // `@@toPrimitive` / `valueOf` / `toString` fire HERE, not per
-    // instance). The key lands in the synthetic captured cell
-    // reserved before the heritage; the constructor's field-init
-    // code resolves it through the standard upvalue walker.
+    // instance). The key lands in the class-scope slot reserved
+    // before the heritage; the constructor's field-init code reads
+    // it by name.
     // §15.7.14 step 28 — instance and static computed keys evaluate
     // in ONE source-order walk (intercalated), each landing in its
-    // reserved cell; only the VALUE initializers are deferred.
+    // reserved slot; only the VALUE initializers are deferred.
     {
         let mut inst_idx = 0usize;
         let mut static_idx = 0usize;
@@ -546,7 +522,7 @@ fn compile_class_strict(
             };
             let info = cx
                 .lookup_binding(&binding)
-                .expect("field-key cell reserved before the heritage");
+                .expect("field-key slot reserved before the heritage");
             cx.emit_store_storage(key_canon, info.storage, pspan);
             cx.mark_initialized(&binding);
         }
@@ -557,7 +533,7 @@ fn compile_class_strict(
     // a derived class gets `constructor(...args) { super(...args); }`.
     let display_name = class_name.unwrap_or("<class>").to_string();
     let is_derived = super_reg.is_some();
-    let (ctor_id, ctor_captures) = match ctor_method {
+    let ctor_record = match ctor_method {
         Some(m) => compile_class_constructor(
             cx,
             &display_name,
@@ -576,6 +552,7 @@ fn compile_class_strict(
     // Give the class name a runtime identity that a `p: C` annotation can be
     // resolved against. A second class of the same name makes the name
     // ambiguous and drops every site that referenced it.
+    let ctor_id = ctor_record.function_id;
     if let Some(class_name) = class_name {
         cx.declare_class(class_name, ctor_id);
     }
@@ -594,9 +571,8 @@ fn compile_class_strict(
             .source_text_span = Some(span);
     }
 
-    let ctor_const = cx.intern_function_id(ctor_id);
     let ctor_reg = cx.alloc_scratch();
-    emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span)?;
+    emit_make_callable(cx, ctor_reg, &ctor_record, span);
 
     // §15.7.14 step 17 — `proto.constructor` is created BEFORE the
     // class elements run, so among the prototype's string keys it
@@ -710,7 +686,7 @@ fn compile_class_strict(
         if !m.r#static {
             cx.next_fn_source_text_span = Some(method_span);
         }
-        let (m_id, m_captures) = compile_function_full(
+        let m_record = compile_function_full(
             cx,
             &body_name,
             &m.value.params,
@@ -720,9 +696,8 @@ fn compile_class_strict(
             m.value.generator,
             true,
         )?;
-        let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
-        emit_make_callable_object(cx, m_reg, m_const, &m_captures, method_span)?;
+        emit_make_callable_object(cx, m_reg, &m_record, method_span);
         let is_accessor = matches!(
             m.kind,
             oxc_ast::ast::MethodDefinitionKind::Get | oxc_ast::ast::MethodDefinitionKind::Set
@@ -1026,7 +1001,7 @@ fn compile_class_strict(
                 static_field_ordinal += 1;
                 // §15.7.10 — the field NAME evaluated earlier, in the
                 // intercalated source-order key pass; computed keys
-                // load from their reserved cell here.
+                // load from their reserved slot here.
                 let mut inferred_name: Option<String> = None;
                 let key_reg = if p.computed {
                     let binding = static_field_key_binding_name(field_idx);
@@ -1079,16 +1054,15 @@ fn compile_class_strict(
                 };
                 // §15.7.10 — the initializer is its own function-like
                 // unit called with `this` = the class value.
-                let (init_id, init_captures) = compile_static_field_initializer(
+                let init_record = compile_static_field_initializer(
                     cx,
                     &display_name,
                     p.value.as_ref(),
                     inferred_name.as_deref(),
                     pspan,
                 )?;
-                let init_const = cx.intern_function_id(init_id);
                 let init_reg = cx.alloc_scratch();
-                emit_make_callable(cx, init_reg, init_const, &init_captures, false, pspan)?;
+                emit_make_callable(cx, init_reg, &init_record, pspan);
                 let value_reg = cx.alloc_scratch();
                 cx.emit(
                     Op::CallWithThis,
@@ -1154,17 +1128,10 @@ fn compile_class_strict(
             oxc_ast::ast::ClassElement::StaticBlock(s) => {
                 // §15.7.4 StaticBlock — a synthesised function with
                 // no params; `this` bound to the statics object.
-                // Compile through the standard MakeClosure path so
-                // identifier references to outer locals capture as
-                // upvalues (the previous `MakeFunction`-only emit
-                // dropped captures and left `Op::LoadUpvalue` /
-                // `Op::StoreUpvalue` indices dangling).
                 let bspan = (s.span.start, s.span.end);
-                let (function_id, captures) =
-                    compile_static_block(cx, &display_name, &s.body, bspan)?;
-                let const_idx = cx.intern_function_id(function_id);
+                let record = compile_static_block(cx, &display_name, &s.body, bspan)?;
                 let fn_reg = cx.alloc_scratch();
-                emit_make_callable(cx, fn_reg, const_idx, &captures, false, bspan)?;
+                emit_make_callable(cx, fn_reg, &record, bspan);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::CallWithThis,
@@ -1183,8 +1150,8 @@ fn compile_class_strict(
 
     cx.private_namespaces.pop();
     cx.class_private_names.pop();
-    cx.class_private_ordered.pop();
     cx.class_private_instance_methods.pop();
+    cx.class_scope_locations.pop();
     cx.exit_scope();
     Ok(class_reg)
 }
@@ -1224,31 +1191,38 @@ pub(crate) fn is_top_level_super_call(stmt: &Statement<'_>) -> bool {
     matches!(call.callee, Expression::Super(_))
 }
 
-/// Synthetic name for the per-method "home object" upvalue that
-/// the class lowering installs in the enclosing class scope. The
-/// value is the prototype object that the method belongs to —
-/// `super.x` walks one hop up its `[[Prototype]]` chain to find the
-/// parent's binding.
-pub(crate) const SUPER_HOME_NAME: &str = "__class_home";
+/// Class-scope slot holding the prototype object instance methods belong
+/// to — their [[HomeObject]]; `super.x` walks one hop up its
+/// `[[Prototype]]` chain.
+pub(crate) const SUPER_HOME_NAME: &str = "%home";
 
-/// Synthetic name for the per-derived-constructor "super
-/// constructor" upvalue. Holds the parent class value so
-/// `super(args)` knows what to invoke with the current receiver.
-pub(crate) const SUPER_CTOR_NAME: &str = "__class_super";
+/// Class-scope slot holding the parent class value `super(args)`
+/// constructs.
+pub(crate) const SUPER_CTOR_NAME: &str = "%super";
 
-/// Synthetic captured cell holding the STATICS object — the
-/// [[HomeObject]] for `super.x` inside static methods, static
-/// blocks, and static field initializers (§15.7.14: their home is
-/// the class, whose property lookups chain through the parent
-/// class's statics).
-pub(crate) const SUPER_STATIC_HOME_NAME: &str = "__class_static_home";
+/// Class-scope slot holding the STATICS object — the [[HomeObject]] for
+/// `super.x` inside static methods, static blocks, and static field
+/// initializers.
+pub(crate) const SUPER_STATIC_HOME_NAME: &str = "%static_home";
 
-/// Synthetic captured binding carrying the class value itself, so a
-/// derived constructor's `super()` can resolve the parent through the
-/// class's LIVE [[GetPrototypeOf]] (§13.3.7.1 GetSuperConstructor).
-pub(crate) const CLASS_SELF_NAME: &str = "__class_self";
+/// Class-scope slot carrying the class value itself, so a derived
+/// constructor's `super()` can resolve the parent through the class's LIVE
+/// [[GetPrototypeOf]] (§13.3.7.1 GetSuperConstructor).
+pub(crate) const CLASS_SELF_NAME: &str = "%class";
 
-/// Which home-object cell `super.x` resolves through in the current
+/// Class-scope slot holding the private-methods brand symbol.
+pub(crate) const PRIVATE_BRAND_BINDING: &str = "%brand";
+
+/// Class-scope slot holding the prototype object branded receivers
+/// resolve private methods through.
+pub(crate) const PRIVATE_PROTO_BINDING: &str = "%privproto";
+
+/// Class-scope slot name of private name `#name`.
+pub(crate) fn private_name_binding(name: &str) -> String {
+    format!("#{name}")
+}
+
+/// Which home-object slot `super.x` resolves through in the current
 /// context (statics side for static elements, prototype side
 /// otherwise).
 pub(crate) fn super_home_binding_name(cx: &Compiler) -> &'static str {
@@ -1259,49 +1233,31 @@ pub(crate) fn super_home_binding_name(cx: &Compiler) -> &'static str {
     }
 }
 
-/// Synthetic captured-binding name for the `idx`-th instance field's
-/// computed property key, evaluated once at class-definition time
-/// per §15.7.14 ClassFieldDefinitionEvaluation. The constructor's
-/// field-init code resolves it through the standard upvalue walker.
+/// Class-scope slot of the `idx`-th instance field's computed property
+/// key, evaluated once at class-definition time per §15.7.14.
 pub(crate) fn field_key_binding_name(idx: usize) -> String {
-    format!("__class_fieldkey_{idx}")
+    format!("%fieldkey_{idx}")
 }
 
-/// Synthetic captured-binding name for the `idx`-th STATIC field's
-/// pre-evaluated computed key (source-order intercalated with the
-/// instance keys per §15.7.14 step 28).
+/// Class-scope slot of the `idx`-th STATIC field's pre-evaluated computed
+/// key (source-order intercalated with the instance keys, §15.7.14 step 28).
 pub(crate) fn static_field_key_binding_name(idx: usize) -> String {
-    format!("__class_staticfieldkey_{idx}")
+    format!("%staticfieldkey_{idx}")
 }
 
-/// Resolve a synthetic captured name (`__class_home` / `__class_super`)
-/// into a register holding its current value. Returns
-/// [`CompileError::Unsupported`] when the surrounding function has
-/// no class context, which is what the user sees on stray `super`
-/// usages outside a class body.
+/// Load a class-scope binding (`%home`, `%super`, …) resolved by name.
+/// Returns [`CompileError::Unsupported`] when no enclosing class declares
+/// it, which is what the user sees on stray `super` usages.
 pub(crate) fn load_synthetic_capture(
     cx: &mut Compiler,
     name: &str,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    if let Some(info) = cx.lookup_binding(name) {
-        let dst = cx.alloc_scratch();
-        cx.emit_load_storage(dst, info.storage, span);
-        return Ok(dst);
-    }
-    if let Some(uv_idx) = cx.resolve_capture(name) {
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+    cx.load_internal(name, span)
+        .ok_or_else(|| CompileError::Unsupported {
+            node: format!("super used outside a class method (`{name}` not in scope)"),
             span,
-        );
-        return Ok(dst);
-    }
-    Err(CompileError::Unsupported {
-        node: format!("super used outside a class method (`{name}` not in scope)"),
-        span,
-    })
+        })
 }
 
 /// §7.3.31 PrivateElementFind own-only step — when `#name` resolves
@@ -1329,9 +1285,13 @@ pub(crate) fn emit_private_method_brand_check(
         {
             return Ok(());
         }
-        let ns = cx.private_namespaces[i];
-        let binding = format!("__privbrand_{ns}");
-        let brand_reg = load_synthetic_capture(cx, &binding, span)?;
+        // The brand of the class that declares `#name`.
+        let Some(resolved) = cx.resolve_name(&private_name_binding(name)) else {
+            return Ok(());
+        };
+        let Some(brand_reg) = cx.load_at(resolved.location, PRIVATE_BRAND_BINDING, span) else {
+            return Ok(());
+        };
         cx.emit(
             Op::PrivateBrandCheck,
             [Operand::Register(obj_reg), Operand::Register(brand_reg)],
@@ -1342,6 +1302,8 @@ pub(crate) fn emit_private_method_brand_check(
     Ok(())
 }
 
+/// Load the runtime key of private name `#name`: the innermost enclosing
+/// class that declares it (§9.2 PrivateEnvironment chain).
 pub(crate) fn load_private_key(
     cx: &mut Compiler,
     name: &str,
@@ -1353,31 +1315,11 @@ pub(crate) fn load_private_key(
             span,
         });
     }
-    // §9.2 PrivateEnvironment chain — resolve through enclosing class
-    // scopes, innermost first, so an inner class reads an outer
-    // class's `#name` while its own declarations shadow.
-    let namespaces: Vec<u32> = cx.private_namespaces.iter().rev().copied().collect();
-    for ns in namespaces {
-        let binding = format!("__privsym_{ns}_{name}");
-        if let Some(info) = cx.lookup_binding(&binding) {
-            let dst = cx.alloc_scratch();
-            cx.emit_load_storage(dst, info.storage, span);
-            return Ok(dst);
-        }
-        if let Some(uv_idx) = cx.resolve_capture(&binding) {
-            let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUpvalue,
-                [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
-                span,
-            );
-            return Ok(dst);
-        }
-    }
-    Err(CompileError::Unsupported {
-        node: format!("private name `#{name}` missing runtime key binding"),
-        span,
-    })
+    cx.load_internal(&private_name_binding(name), span)
+        .ok_or_else(|| CompileError::Unsupported {
+            node: format!("private name `#{name}` missing runtime key binding"),
+            span,
+        })
 }
 
 fn emit_private_symbol_key(

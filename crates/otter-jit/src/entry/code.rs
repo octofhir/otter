@@ -32,8 +32,11 @@ use otter_vm::{
 ///
 /// Shared across entry kinds: the function-entry and loop-header OSR paths use
 /// the identical [`JitEntry`] ABI (`extern "C" fn(*mut JitCtx) -> NativeResultPair`) and
-/// the same `JitCtx` construction, differing only in which instruction the
-/// prologue branches to. Lives free (it uses no compiled-code state) so any
+/// the same `JitCtx` construction. A baseline OSR entry names its own
+/// prologue trampoline; an optimizing OSR entry (`osr_pc`) enters at the
+/// function's start with the header's PC in the frame and the
+/// [`NativeFrameFlags::OSR_ENTRY`] bit set, which the generated entry dispatch
+/// reads. Lives free (it uses no compiled-code state) so any
 /// [`JitFunctionCode`](otter_vm::JitFunctionCode) implementation can reuse it.
 ///
 /// # Safety
@@ -48,6 +51,7 @@ pub(crate) unsafe fn enter_compiled(
     register_count: u16,
     kind: NativeFrameKind,
     has_safepoints: bool,
+    osr_pc: Option<u32>,
 ) -> JitExecOutcome {
     {
         let stack = activation.stack_ptr().cast::<ActivationStack>();
@@ -55,25 +59,14 @@ pub(crate) unsafe fn enter_compiled(
         // This interpreter-to-native entry boundary reads
         // the materialized activation once through the tier-neutral API; the
         // resulting NativeFrame is the sole machine-visible state thereafter.
-        let (regs, self_value, this_value, upvalue_base, upvalue_count) = {
+        let (regs, self_value, this_value) = {
             // SAFETY: `activation.stack_ptr()` names the exclusively frozen
             // interpreter stack for this compiled-entry transaction.
             let stack_ref = unsafe { &mut *stack };
             let frame = &mut stack_ref[activation.frame_index()];
             let active = ActiveFrameMut::materialized(frame);
             let regs = active.register_base_ptr().cast::<u64>();
-            let upvalue_base = if active.upvalue_count() == 0 {
-                0
-            } else {
-                active.upvalue_base_ptr() as u64
-            };
-            (
-                regs,
-                active.self_value(),
-                active.this_value(),
-                upvalue_base,
-                active.upvalue_count() as u32,
-            )
+            (regs, active.self_value(), active.this_value())
         };
         // SAFETY: same contract; the activation array is isolate-owned, never
         // resized, and outlives every compiled activation.
@@ -97,15 +90,18 @@ pub(crate) unsafe fn enter_compiled(
         let native_stack_limit = unsafe {
             (*vm).jit_native_stack_limit(std::ptr::from_ref(&native_stack_marker).addr())
         };
-        let flags = if has_safepoints {
-            NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS)
-        } else {
-            NativeFrameFlags::empty()
-        };
+        let mut flag_bits = 0;
+        if has_safepoints {
+            flag_bits |= NativeFrameFlags::HAS_SAFEPOINTS;
+        }
+        if osr_pc.is_some() {
+            flag_bits |= NativeFrameFlags::OSR_ENTRY;
+        }
+        let flags = NativeFrameFlags::from_bits(flag_bits);
         let mut native_frame = NativeFrame::new(
             VmFrameHeader {
                 function_id,
-                pc: 0,
+                pc: osr_pc.unwrap_or(0),
                 register_count,
                 kind,
                 flags,
@@ -114,7 +110,6 @@ pub(crate) unsafe fn enter_compiled(
             self_value,
             this_value,
         );
-        native_frame.set_upvalue_window(upvalue_base, upvalue_count);
         if let Err(error) = activation.initialize_native_frame_state(&mut native_frame) {
             return JitExecOutcome::Fatal(error);
         }
@@ -157,7 +152,7 @@ pub(crate) unsafe fn enter_compiled(
             return JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand));
         }
         let ret =
-            unsafe { activation.with_native_eval_env_owner(ctx.native_frame, || entry(&mut ctx)) };
+            unsafe { activation.with_native_frame_extent(ctx.native_frame, || entry(&mut ctx)) };
         let pop_status = jit_pop_native_activation_stub(&mut ctx);
         if pop_status != NativeResultStatus::Success as u64 {
             return JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand));

@@ -270,6 +270,23 @@ impl Interpreter {
                     }
                     continue;
                 }
+                // §10.2.2 [[Construct]] steps 10–12 for a derived constructor:
+                // both registers are read now, but the `DerivedThis` slot is
+                // read when the frame pops, after any crossed `finally`
+                // (which may still call `super()`).
+                Op::ReturnDerived => {
+                    let (value_reg, ctx_reg) = (instr.reg(0), instr.reg(1));
+                    let coord = otter_bytecode::ContextCoord::from_imm32(instr.imm(2))
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let value = *read_register(frame, value_reg)?;
+                    let ctx = *read_register(frame, ctx_reg)?;
+                    self.frame_ensure_cold(frame).derived_this_slot = Some((ctx, coord));
+                    if let Some(popped) = self.return_running_finally_above(stack, floor, value)? {
+                        return Ok(popped);
+                    }
+                    continue;
+                }
                 Op::Call | Op::CallWithThis => {
                     // Both forms already own the loaded callable. Record its
                     // exact native identity before execution can collect;
@@ -1479,8 +1496,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::CollectArguments => {
-                    let dst = instr.reg(0);
-                    self.run_collect_arguments_reg(context, stack, top_idx, dst)?;
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    self.run_collect_arguments_reg(context, stack, top_idx, dst, ctx)?;
                     continue;
                 }
                 Op::Nop => {
@@ -1611,13 +1628,7 @@ impl Interpreter {
                 }
                 Op::LoadThis => {
                     let dst = instr.reg(0);
-                    // Legacy arrows created before a derived constructor binds
-                    // `this` carry the hole snapshot. Resolve that sidecar-only
-                    // inheritance once, then enter the same kernel native
-                    // activations use.
-                    let this_value = self.materialized_this_binding(&*stack, top_idx)?;
                     let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
-                    frame.set_this_value(this_value);
                     self.frame_load_this(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
@@ -1670,35 +1681,73 @@ impl Interpreter {
                     self.run_load_bigint_reg(context, frame, dst, idx)?;
                     continue;
                 }
-                Op::LoadUpvalue => {
+                Op::LoadClosureContext => {
                     let dst = instr.reg(0);
-                    let idx = instr.imm(1);
                     let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
-                    self.frame_load_upvalue(&mut frame, dst, idx)?;
+                    self.frame_load_closure_context(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
-                Op::FreshUpvalue => {
-                    let idx = instr.imm(0);
+                Op::LoadSelf => {
+                    let dst = instr.reg(0);
                     let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
-                    self.frame_fresh_upvalue(&mut frame, idx)?;
+                    self.frame_load_self(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
-                Op::StoreUpvalue => {
-                    let src = instr.reg(0);
-                    let idx = instr.imm(1);
+                Op::CreateContext => {
+                    let (dst, parent) = (instr.reg(0), instr.reg(1));
+                    let scope = instr.imm(2) as u32;
                     let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
-                    self.frame_store_upvalue(&mut frame, src, idx)?;
+                    self.frame_create_context(context, &mut frame, dst, parent, scope)?;
                     frame.advance_pc()?;
                     continue;
                 }
-                Op::StoreUpvalueChecked => {
-                    let src = instr.reg(0);
-                    let idx = instr.imm(1);
+                Op::CopyContext => {
+                    let (dst, src) = (instr.reg(0), instr.reg(1));
                     let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
-                    self.frame_store_upvalue_checked(&mut frame, src, idx)?;
+                    self.frame_copy_context(&mut frame, dst, src)?;
                     frame.advance_pc()?;
+                    continue;
+                }
+                Op::LoadContextSlot | Op::LoadContextSlotChecked => {
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    let coord = instr.imm(2);
+                    let frame = &mut stack[top_idx];
+                    let value = self.load_context_slot_value(
+                        context,
+                        *read_register(frame, ctx)?,
+                        coord,
+                        op == Op::LoadContextSlotChecked,
+                    )?;
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc()?;
+                    continue;
+                }
+                Op::StoreContextSlot | Op::StoreContextSlotChecked => {
+                    let (src, ctx) = (instr.reg(0), instr.reg(1));
+                    let coord = instr.imm(2);
+                    let frame = &mut stack[top_idx];
+                    let (value, target) =
+                        (*read_register(frame, src)?, *read_register(frame, ctx)?);
+                    self.store_context_slot_value(
+                        context,
+                        target,
+                        coord,
+                        value,
+                        op == Op::StoreContextSlotChecked,
+                    )?;
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
+                Op::BindThisContextSlot => {
+                    let (src, ctx) = (instr.reg(0), instr.reg(1));
+                    let coord = instr.imm(2);
+                    let frame = &mut stack[top_idx];
+                    let (value, target) =
+                        (*read_register(frame, src)?, *read_register(frame, ctx)?);
+                    self.bind_this_context_slot_value(target, coord, value)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::CollectRest => {
@@ -1793,137 +1842,189 @@ impl Interpreter {
                     self.run_get_template_object_reg(context, stack, top_idx, dst, site_idx)?;
                     continue;
                 }
-                // §9.1 — captured-binding read in a frame whose
-                // function contains a direct eval: an
-                // eval-introduced var of the same name shadows the
-                // capture.
-                Op::LoadShadowedUpvalue => {
-                    let dst = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
-                    let eval_depth = function.imm32(instr, 3).unwrap_or(i32::MAX) as u32;
+                // §9.1.2.1 GetIdentifierReference through contexts a sloppy
+                // direct eval may have extended: extensions at hops
+                // `[0, depth)` first, then the static slot or the global
+                // Environment Record.
+                Op::LoadLookupSlot => {
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, coord) = (instr.const_word(2), instr.imm(3));
                     let frame = &mut stack[top_idx];
-                    self.run_load_shadowed_upvalue_reg(
-                        context, frame, dst, name_idx, uv_idx, eval_depth,
-                    )?;
-                    continue;
-                }
-                // §9.1 — the write/delete halves of the same shadowed-capture
-                // family: the eval chain is resolved at the operation point
-                // within the compiler's bounded physical depth.
-                Op::StoreShadowedUpvalueChecked => {
-                    let value_reg = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
-                    let policy = function.imm32(instr, 3).unwrap_or(0);
-                    let frame = &mut stack[top_idx];
-                    self.run_store_shadowed_upvalue_checked_reg(
-                        context, frame, value_reg, name_idx, uv_idx, policy, None,
-                    )?;
-                    continue;
-                }
-                // §9.1.1.1.5 — the Annex B.3.3.3 sync re-creates a
-                // deleted sloppy-eval `var` binding in the current
-                // eval-environment record.
-                Op::EvalRestoreBinding => {
-                    let name_idx = instr.const_word(0);
-                    let index = u32::try_from(function.imm32(instr, 1).unwrap_or(0))
-                        .map_err(|_| VmError::InvalidOperand)?;
-                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
-                    self.eval_restore_binding(context, &mut frame, name_idx, index)?;
-                    frame.advance_pc()?;
-                    continue;
-                }
-                // §13.15.2 — snapshot the eval-binding sequence so the
-                // assignment target's reference resolves before the RHS.
-                Op::EvalBindingSeq => {
-                    let dst = instr.reg(0);
-                    let seq = self.current_eval_binding_seq();
-                    let frame = &mut stack[top_idx];
-                    crate::write_register(frame, dst, Value::number_f64(seq as f64))?;
-                    frame.advance_pc()?;
-                    continue;
-                }
-                Op::LoadShadowedUpvalueSnap => {
-                    let dst = function.reg(instr, 0);
-                    let name_idx = function
-                        .const_index(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
-                    let eval_depth = function.imm32(instr, 3).unwrap_or(i32::MAX) as u32;
-                    let snapshot = crate::jit_control_ops::read_snapshot_register(
-                        &stack[top_idx],
-                        function.reg(instr, 4),
-                    )?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_shadowed_upvalue_snap_reg(
+                    let value = self.load_lookup_slot_value(
                         context,
-                        frame,
-                        dst,
+                        function_id,
+                        *read_register(frame, ctx)?,
                         name_idx,
-                        uv_idx,
-                        eval_depth,
-                        Some(snapshot),
+                        coord,
                     )?;
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc()?;
                     continue;
                 }
-                Op::StoreShadowedUpvalueCheckedSnap => {
+                Op::StoreLookupSlot => {
                     let value_reg = function.reg(instr, 0);
+                    let ctx = function.reg(instr, 1);
                     let name_idx = function
-                        .const_index(instr, 1)
+                        .const_index(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
-                    let policy = function.imm32(instr, 3).unwrap_or(0);
-                    let snapshot = crate::jit_control_ops::read_snapshot_register(
-                        &stack[top_idx],
-                        function.reg(instr, 4),
-                    )?;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_shadowed_upvalue_checked_reg(
+                    let coord = function.imm32(instr, 3).ok_or(VmError::InvalidOperand)?;
+                    let fallback = function.imm32(instr, 4).ok_or(VmError::InvalidOperand)?;
+                    let frame = &stack[top_idx];
+                    let (value, target) = (
+                        *read_register(frame, value_reg)?,
+                        *read_register(frame, ctx)?,
+                    );
+                    self.store_lookup_slot_value(
                         context,
-                        frame,
-                        value_reg,
+                        function_id,
+                        target,
                         name_idx,
-                        uv_idx,
-                        policy,
-                        Some(snapshot),
+                        coord,
+                        fallback,
+                        value,
                     )?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
-                Op::DeleteShadowedUpvalue => {
-                    let dst = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    let uv_idx = function.imm32(instr, 2).unwrap_or(0) as usize;
-                    let eval_depth = function.imm32(instr, 3).unwrap_or(0) as u32;
-                    let frame = &mut stack[top_idx];
-                    self.run_delete_shadowed_upvalue_reg(
-                        context, frame, dst, name_idx, uv_idx, eval_depth,
+                Op::DeleteLookupSlot => {
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
+                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let value = self.delete_lookup_slot_value(
+                        context,
+                        function_id,
+                        target,
+                        name_idx,
+                        depth,
                     )?;
-                    continue;
-                }
-                Op::LoadDynamic => {
-                    let dst = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    self.run_load_dynamic_reg(context, stack, top_idx, dst, name_idx)?;
-                    continue;
-                }
-                Op::StoreDynamic => {
-                    let value_reg = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    self.run_store_dynamic_reg(context, stack, top_idx, value_reg, name_idx)?;
-                    continue;
-                }
-                Op::TypeofDynamic => {
-                    let dst = instr.reg(0);
-                    let name_idx = instr.const_word(1);
-                    self.run_typeof_dynamic_reg(context, stack, top_idx, dst, name_idx)?;
-                    continue;
-                }
-                Op::DeleteDynamic => {
-                    let dst = instr.reg(0);
-                    let name_idx = instr.const_word(1);
                     let frame = &mut stack[top_idx];
-                    self.run_delete_dynamic_reg(context, frame, dst, name_idx)?;
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc()?;
+                    continue;
+                }
+                Op::LoadLookupGlobal | Op::TypeofLookupGlobal => {
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
+                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let missing = if op == Op::LoadLookupGlobal {
+                        otter_bytecode::opcode_schema::BindingMissing::Throw
+                    } else {
+                        otter_bytecode::opcode_schema::BindingMissing::Undefined
+                    };
+                    let value = self.load_lookup_global_value(
+                        context,
+                        stack,
+                        function_id,
+                        target,
+                        name_idx,
+                        depth,
+                        missing,
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc()?;
+                    continue;
+                }
+                Op::StoreLookupGlobal => {
+                    let (value_reg, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, mode) = (instr.const_word(2), instr.imm(3));
+                    let frame = &stack[top_idx];
+                    let (value, target) = (
+                        *read_register(frame, value_reg)?,
+                        *read_register(frame, ctx)?,
+                    );
+                    self.store_lookup_global_value(
+                        context,
+                        stack,
+                        function_id,
+                        target,
+                        name_idx,
+                        mode,
+                        value,
+                    )?;
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
+                Op::DeleteLookupGlobal => {
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
+                    let target = *read_register(&stack[top_idx], ctx)?;
+                    let value = self.delete_lookup_global_value(
+                        context,
+                        function_id,
+                        target,
+                        name_idx,
+                        depth,
+                    )?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, value)?;
+                    frame.advance_pc()?;
+                    continue;
+                }
+                // §13.15.2 — the assignment target's reference base resolves
+                // before the right-hand side; `StoreRef` writes through it.
+                Op::ResolveLookupRef => {
+                    let (dst, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, target_imm) = (instr.const_word(2), instr.imm(3));
+                    let frame = &mut stack[top_idx];
+                    let reference = self.resolve_lookup_ref_value(
+                        context,
+                        function_id,
+                        *read_register(frame, ctx)?,
+                        name_idx,
+                        target_imm,
+                    )?;
+                    write_register(frame, dst, reference)?;
+                    frame.advance_pc()?;
+                    continue;
+                }
+                Op::StoreRef => {
+                    let (value_reg, reference_reg) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, mode) = (instr.const_word(2), instr.imm(3));
+                    let frame = &stack[top_idx];
+                    let (value, reference) = (
+                        *read_register(frame, value_reg)?,
+                        *read_register(frame, reference_reg)?,
+                    );
+                    self.store_ref_value(
+                        context,
+                        stack,
+                        function_id,
+                        reference,
+                        name_idx,
+                        mode,
+                        value,
+                    )?;
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
+                // §19.2.1.3 step 16 — a sloppy eval's `var` with no static
+                // slot becomes a deletable binding of the var scope.
+                Op::DeclareEvalVar => {
+                    let ctx = instr.reg(0);
+                    let (name_idx, var_depth) = (instr.const_word(1), instr.imm(2));
+                    let target = *read_register(&stack[top_idx], ctx)?;
+                    self.declare_eval_var_value(context, function_id, target, name_idx, var_depth)?;
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
+                Op::StoreVarScope => {
+                    let (value_reg, ctx) = (instr.reg(0), instr.reg(1));
+                    let (name_idx, var_depth) = (instr.const_word(2), instr.imm(3));
+                    let frame = &stack[top_idx];
+                    let (value, target) = (
+                        *read_register(frame, value_reg)?,
+                        *read_register(frame, ctx)?,
+                    );
+                    self.store_var_scope_value(
+                        context,
+                        function_id,
+                        target,
+                        name_idx,
+                        var_depth,
+                        value,
+                    )?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 // §6.2.12 — mint a Private Name carrier; the marker
@@ -2684,9 +2785,11 @@ impl Interpreter {
                     continue;
                 }
                 Op::MakeClosure => {
-                    let operands = function.operand_view(instr);
+                    let dst = instr.reg(0);
+                    let function_index = instr.const_word(1);
+                    let ctx = instr.reg(2);
                     let frame = &mut stack[top_idx];
-                    self.run_make_closure_operands(context, frame, operands)?;
+                    self.run_make_closure_regs(context, frame, dst, function_index, ctx)?;
                     continue;
                 }
                 Op::ArrayBufferCall => {

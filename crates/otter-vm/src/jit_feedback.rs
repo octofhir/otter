@@ -33,7 +33,7 @@
 //! - The isolate's VM thread is the sole property-program writer and hot-path
 //!   reader. Structural mutation, immutable snapshots, and GC root tracing are
 //!   serialized by the slot; probes never borrow interpreter-global state.
-//! - Property slots may retain traced transition shapes. No `Value`, upvalue,
+//! - Property slots may retain traced transition shapes. No `Value`, context,
 //!   closure, or `this` crosses the CodeBlock boundary. Method distributions remain isolate-owned behind
 //!   [`crate::interp::MethodFeedbackDirectory`].
 //!

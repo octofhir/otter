@@ -214,9 +214,10 @@ pub(crate) extern "C" fn jit_acknowledge_caught_throw_stub(ctx: *mut JitCtx) -> 
 /// function was entered, which is what lets a unit with spliced frames be a
 /// generated direct-call target like any other.
 ///
-/// Each spliced frame restores the exact callable from its entry recipe; the
-/// VM derives its captured-cell spine from that live closure. Caller and callee
-/// bindings must never be substituted merely because their function ids match.
+/// Each spliced frame restores the exact callable from its entry recipe as
+/// its SELF; the rebuilt frame reaches its captured bindings through that live
+/// closure's context. Caller and callee bindings must never be substituted
+/// merely because their function ids match.
 pub(crate) extern "C" fn jit_deopt_writeback_stub(
     ctx: *mut JitCtx,
     exit_index: u64,
@@ -686,7 +687,7 @@ pub(crate) extern "C" fn jit_class_value_op_stub(
         }
         let result = ctx
             .runtime_call()
-            .and_then(|mut call| call.eval_op(arg0, arg1, arg2));
+            .and_then(|mut call| call.eval_op(arg0, arg1));
         return match result {
             Ok(()) => NativeResultStatus::Success as u64,
             Err(err) => {
@@ -1406,35 +1407,6 @@ pub(crate) extern "C" fn jit_copy_spread_arguments_stub(
             parameter_count,
         )
     })
-}
-
-/// Build a generated callee's stack-owned upvalue spine before publication.
-/// Returns `Success`, pre-publication `SideExit`, or pending `Throw`.
-pub(crate) extern "C" fn jit_initialize_upvalues_stub(
-    ctx: *mut JitCtx,
-    frame: u64,
-    own: u64,
-    inherited: u64,
-) -> NativeResultPair {
-    let ctx = unsafe { &mut *ctx };
-    let Some(activation) = ctx.checked_activation() else {
-        return NativeResultPair::miss();
-    };
-    let (Ok(own), Ok(inherited)) = (u16::try_from(own), u16::try_from(inherited)) else {
-        return NativeResultPair::miss();
-    };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let stack = unsafe { &*activation.stack_ptr() };
-    let context = unsafe { &*activation.context_ptr() };
-    let frame = frame as *mut otter_vm::native_abi::NativeFrame;
-    match unsafe { vm.jit_initialize_generated_upvalues(stack, context, frame, own, inherited) } {
-        Ok(true) => NativeResultPair::success_bits(0),
-        Ok(false) => NativeResultPair::miss(),
-        Err(error) => {
-            park_jit_error(ctx, error);
-            NativeResultPair::throw_pending()
-        }
-    }
 }
 
 /// Complete one full loose-equality opcode in the VM. Returns `Success`,

@@ -26,10 +26,10 @@
 //!   materialized-only cold operations reject non-materialized frames before
 //!   mutating state; total value-level operations never side-exit for
 //!   representation.
-//! - Register/upvalue windows stay published across allocating operations;
+//! - Register windows stay published across allocating operations;
 //!   slot access remains checked and scoped through [`ActiveFrameMut`].
 //! - Binding allocates no wrapper, lock, side table, or thread-local state.
-//!   Scoped inline reentry owns temporary native records and captured spines;
+//!   Scoped inline reentry owns temporary native records;
 //!   every such record is removed before its storage is released.
 //!
 //! # See also
@@ -119,7 +119,7 @@ impl<'a> RuntimeCall<'a> {
         // copied frame would create a second, stale-looking carrier for its GC
         // slots even though no allocation occurs during this bind.
         // SAFETY: the validated frame remains initialized for `'a`.
-        let (flags, function_id, register_count, register_base, upvalue_base, upvalue_count) = {
+        let (flags, function_id, register_count, register_base) = {
             // SAFETY: one operation-scoped shared view; every retained value is
             // scalar and the view ends before any semantic VM entry.
             let frame = unsafe { frame.as_ref() };
@@ -128,8 +128,6 @@ impl<'a> RuntimeCall<'a> {
                 frame.header.function_id,
                 frame.header.register_count,
                 frame.register_base,
-                frame.upvalue_base,
-                frame.upvalue_count,
             )
         };
         let identity = if flags.contains(NativeFrameFlags::STACK_REGISTERS) {
@@ -141,16 +139,9 @@ impl<'a> RuntimeCall<'a> {
             let materialized = unsafe { stack.as_ref() }
                 .get(frame_index)
                 .ok_or(VmError::InvalidOperand)?;
-            let expected_upvalue_base = if materialized.upvalues.is_empty() {
-                0
-            } else {
-                materialized.upvalues.as_ptr() as u64
-            };
             if materialized.function_id != function_id
                 || materialized.registers.len() != usize::from(register_count)
                 || materialized.registers.as_ptr() as u64 != register_base
-                || expected_upvalue_base != upvalue_base
-                || materialized.upvalues.len() != upvalue_count as usize
             {
                 return Err(VmError::InvalidOperand);
             }
@@ -210,25 +201,8 @@ impl<'a> RuntimeCall<'a> {
         unsafe { self.frame.as_mut().header.pc = pc };
     }
 
-    /// Complete one decoded control-family operation against the published
-    /// native activation.
-    pub fn control_op(
-        &mut self,
-        opcode: u8,
-        arg0: u64,
-        arg1: u64,
-        arg2: u64,
-    ) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = self.context.clone();
-        self.with_frame(|frame| {
-            vm.jit_runtime_control_op(&context, frame, opcode, arg0, arg1, arg2)
-        })
-    }
-
-    /// Complete one materialized global-access transition while the native
-    /// descriptor remains the sole owner of representation-neutral frame
-    /// state such as the direct-eval environment.
+    /// Complete one materialized global-access transition against the
+    /// published native activation.
     pub fn global_op(
         &mut self,
         opcode: u8,
@@ -257,9 +231,8 @@ impl<'a> RuntimeCall<'a> {
     }
 
     /// Complete one materialized `delete` transition against the published
-    /// native activation. Dynamic-name resolution reads the native frame's
-    /// sole eval-environment root; property/element drivers retain the
-    /// canonical materialized stack path.
+    /// native activation; property/element drivers retain the canonical
+    /// materialized stack path.
     pub fn delete_op(
         &mut self,
         opcode: u8,
@@ -287,45 +260,17 @@ impl<'a> RuntimeCall<'a> {
         })
     }
 
-    /// Run one synchronous direct eval with the materialized frame as the sole
-    /// eval-environment root for the duration of interpreter reentry, then
-    /// return ownership to the published native descriptor on every outcome.
-    pub fn eval_op(&mut self, packed_registers: u64, flags: u64, site: u64) -> Result<(), VmError> {
+    /// Run one synchronous direct eval from the materialized caller frame.
+    /// `packed_registers` carries the `dst`, `src`, and `ctx` registers in
+    /// 16-bit lanes; `flags` is the instruction's flags immediate.
+    pub fn eval_op(&mut self, packed_registers: u64, flags: u64) -> Result<(), VmError> {
         let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
             return Err(VmError::InvalidOperand);
         };
-        let native = self.frame.as_ptr();
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        {
-            let materialized = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
-            // SAFETY: RuntimeCall exclusively owns the published native
-            // descriptor. The short reference ends before VM reentry.
-            let native_frame = unsafe { &mut *native };
-            if materialized.function_id != native_frame.header.function_id
-                || !materialized.eval_env.is_null()
-            {
-                return Err(VmError::InvalidOperand);
-            }
-            std::mem::swap(&mut materialized.eval_env, &mut native_frame.eval_env);
-        }
-
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = &self.context;
-        let result =
-            vm.jit_runtime_eval_op(context, stack, frame_index, packed_registers, flags, site);
-
-        let materialized = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
-        // SAFETY: the native descriptor stayed published and exclusively
-        // owned. Direct eval may move or replace the materialized slot, so it
-        // is deliberately re-fetched only after the VM call completes.
-        let native_frame = unsafe { &mut *native };
-        let invalid_owner = materialized.function_id != native_frame.header.function_id
-            || !native_frame.eval_env.is_null();
-        std::mem::swap(&mut materialized.eval_env, &mut native_frame.eval_env);
-        if invalid_owner {
-            return Err(VmError::InvalidOperand);
-        }
-        result
+        vm.jit_runtime_eval_op(context, stack, frame_index, packed_registers, flags)
     }
 
     pub(super) fn with_frame<T>(
@@ -448,15 +393,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_activation_moves_one_eval_env_owner_for_every_native_outcome() {
+    fn runtime_activation_mirrors_call_state_and_writes_back_arguments_identity() {
         let (context, function) = bind_this_fixture();
         let mut vm = Interpreter::new();
-        let before = crate::eval_env::alloc_eval_env(&mut vm.gc_heap, None).expect("eval env");
-        let after = crate::eval_env::alloc_eval_env(&mut vm.gc_heap, None).expect("moved eval env");
+        let arguments = vm
+            .alloc_host_object_with_roots(&[], &[])
+            .expect("arguments identity");
         let mut materialized = vm
             .test_frame_for_function(&function)
             .expect("materialized frame");
-        materialized.eval_env = before;
         let cold = vm.frame_ensure_cold(&mut materialized);
         cold.new_target = Some(Value::function(99));
         cold.is_derived_constructor = true;
@@ -481,24 +426,18 @@ mod tests {
             .initialize_native_frame_state(&mut native)
             .expect("non-lexical state mirror");
 
-        assert!(native.eval_env().is_none());
         assert_eq!(native.new_target(), Value::function(99));
         assert!(native.is_derived_constructor());
-        for outcome in [0_u8, 1, 2, 3] {
-            stack[0].eval_env = before;
-            let returned = unsafe {
-                activation.with_native_eval_env_owner(std::ptr::addr_of_mut!(native), || {
-                    assert!(stack[0].eval_env.is_null());
-                    assert_eq!(native.eval_env(), Some(before));
-                    native.set_eval_env(Some(after));
-                    outcome
-                })
-            }
-            .expect("eval env ownership transaction");
-            assert_eq!(returned, outcome);
-            assert_eq!(stack[0].eval_env, after);
-            assert!(native.eval_env().is_none());
+        let returned = unsafe {
+            activation.with_native_frame_extent(std::ptr::addr_of_mut!(native), || {
+                native.set_arguments_object(Some(arguments));
+                7_u8
+            })
         }
+        .expect("native frame extent");
+        assert_eq!(returned, 7);
+        let cold = vm.frame_cold(&stack[0]).expect("cold record");
+        assert_eq!(cold.arguments_object, Some(Value::object(arguments)));
         assert_eq!(std::mem::size_of_val(&activation), 32);
     }
 
@@ -666,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_materialized_lexical_bind_targets_the_outer_derived_frame() {
+    fn committed_materialized_bind_never_reaches_an_enclosing_derived_frame() {
         let (base_context, outer_function) = bind_this_fixture();
         let inner_function = Function {
             id: 1,
@@ -735,22 +674,18 @@ mod tests {
         }
         .expect("nested runtime call");
         assert_eq!(call.identity(), RuntimeFrameIdentity::Materialized(1));
-        assert_eq!(
-            call.scalar_values(bound, Value::undefined())
-                .expect("lexical committed bind"),
-            bound
-        );
-        assert_eq!(native.header.pc, 0);
-        assert_eq!(stack[0].this_value, bound);
-        assert!(stack[1].this_value.is_hole());
-        assert_eq!(native.this_value(), bound);
-
+        // A frame-held `this` binds only in its own derived constructor: an
+        // arrow's `super()` binds a context slot instead, so a nested
+        // non-derived frame is a catchable error and the outer binding stays
+        // in its TDZ.
         assert!(matches!(
-            call.scalar_values(Value::number_i32(72), Value::undefined()),
+            call.scalar_values(bound, Value::undefined()),
             Err(CommittedValueError::JavaScript(VmError::ThisUninitialized))
         ));
-        assert_eq!(stack[0].this_value, bound);
-        assert_eq!(native.this_value(), bound);
+        assert_eq!(native.header.pc, 0);
+        assert!(stack[0].this_value.is_hole());
+        assert!(stack[1].this_value.is_hole());
+        assert!(native.this_value().is_hole());
     }
 
     #[test]

@@ -72,7 +72,7 @@ fn layout_equivalence_replaces_source_pc_identity() {
         let hir = NumericFunction::build(&view(JitElementRepr::Int32, second)).unwrap();
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
             let sequence =
-                select_with_loop_entries(&target, &hir, &hir.plan_loop_entries()).unwrap();
+                select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None).unwrap();
             let (sequence, _) = sequence.optimize(&target).unwrap();
             assert_eq!(
                 sequence
@@ -106,7 +106,7 @@ fn element_payload_signedness_survives_selection_and_allocation() {
         let hir = NumericFunction::build(&view(element, element)).unwrap();
         for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
             let sequence =
-                select_with_loop_entries(&target, &hir, &hir.plan_loop_entries()).unwrap();
+                select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None).unwrap();
             for instruction in sequence.instructions() {
                 if let MachineOpcode::ElementValueLoad { access, .. } = instruction.opcode {
                     assert_eq!(access.element, element);

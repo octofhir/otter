@@ -10,7 +10,8 @@
 //!
 //! | Root | Invariant |
 //! | --- | --- |
-//! | upvalue cell | unrooted cells are reclaimed |
+//! | global-lexical cell | unrooted cells are reclaimed |
+//! | context | a rooted chain keeps its slots, parent, and extension alive; an unrooted one is reclaimed |
 //! | global object | global properties keep values alive |
 //! | array element | element slots trace values |
 //! | map entry | key/value slots trace values |
@@ -109,6 +110,78 @@ fn upvalue_cell_root_survives_force_gc() {
         "upvalue cell should be reclaimed once unrooted (UpvalueCellBody TYPE_TAG = {})",
         <UpvalueCellBody as Traceable>::TYPE_TAG
     );
+}
+
+/// A context chain reached from a root keeps its slot values, parent, and eval
+/// extension alive across a full collection; once unrooted it is reclaimed.
+#[test]
+fn context_root_survives_force_gc() {
+    use crate::context::{self, CONTEXT_BODY_TYPE_TAG, ContextShape};
+    use crate::{Value, eval_env};
+
+    let mut interp = Interpreter::new();
+    interp.force_gc().expect("settle bootstrap garbage");
+    let baseline =
+        interp.gc_heap_mut().gc_stats().by_type[CONTEXT_BODY_TYPE_TAG as usize].live_bytes;
+    let shape = |slot_count| ContextShape {
+        scope_function_id: 0,
+        scope_index: 0,
+        slot_count,
+    };
+    let outer = context::alloc_context_with_roots(
+        interp.gc_heap_mut(),
+        shape(1),
+        Value::undefined(),
+        |_| false,
+        &mut |_| {},
+    )
+    .expect("outer context");
+    let payload = interp
+        .alloc_host_object_with_roots(&[], &[])
+        .expect("slot payload");
+    assert!(context::write_slot(
+        interp.gc_heap_mut(),
+        outer,
+        0,
+        Value::object(payload)
+    ));
+    let extension =
+        eval_env::alloc_extension_with_roots(interp.gc_heap_mut(), &mut |_| {}).expect("extension");
+    eval_env::extension_set_or_insert(interp.gc_heap_mut(), extension, "e", Value::number_i32(3));
+    context::set_extension(interp.gc_heap_mut(), outer, extension);
+    let inner = context::alloc_context_with_roots(
+        interp.gc_heap_mut(),
+        shape(0),
+        Value::context(outer),
+        |_| false,
+        &mut |_| {},
+    )
+    .expect("inner context");
+    let root = interp.persistent_root_insert(Value::context(inner));
+
+    interp.force_gc().expect("force GC");
+    let inner = interp
+        .persistent_root_get(root)
+        .and_then(Value::as_context)
+        .expect("rooted inner context");
+    let outer = context::parent(interp.gc_heap(), inner).expect("parent survives");
+    let held = context::read_slot(interp.gc_heap(), outer, 0)
+        .and_then(Value::as_object)
+        .expect("slot value survives");
+    assert_eq!(
+        interp.gc_heap().debug_header_tag(held),
+        Some(crate::object::OBJECT_BODY_TYPE_TAG)
+    );
+    let extension = context::extension(interp.gc_heap(), outer).expect("extension survives");
+    assert_eq!(
+        eval_env::extension_get(interp.gc_heap(), extension, "e"),
+        Some(Value::number_i32(3))
+    );
+
+    interp.persistent_root_remove(root);
+    interp.force_gc().expect("force GC");
+    let after = interp.gc_heap_mut().gc_stats().by_type[CONTEXT_BODY_TYPE_TAG as usize].live_bytes;
+    assert_eq!(after, baseline, "an unrooted context chain is reclaimed");
 }
 
 /// Globals act as a strong root: an object stamped onto
@@ -494,9 +567,7 @@ fn parked_frame_keeps_alive() {
         scratch: 1,
         ..Function::default()
     };
-    let mut frame = interp
-        .test_frame_for_function_with_heap(&function)
-        .expect("frame");
+    let mut frame = interp.test_frame_for_function(&function).expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::object(object);
 

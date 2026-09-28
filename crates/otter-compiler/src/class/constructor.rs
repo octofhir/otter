@@ -8,11 +8,14 @@
 //! # Invariants
 //! - Instance fields are initialized at the class-constructor points required by class evaluation.
 //! - Derived constructors initialize fields after the top-level `super(...)` call when present.
+//! - Constructors compile through the shared function lowering, so their
+//!   scopes, contexts, and a `DerivedThis` slot follow the same rules as any
+//!   function.
 //!
 //! # See also
 //! - [`super`]
 
-use super::{SUPER_CTOR_NAME, is_top_level_super_call, load_synthetic_capture};
+use super::{SUPER_CTOR_NAME, load_synthetic_capture};
 use crate::*;
 
 fn emit_public_field_define(
@@ -66,21 +69,22 @@ fn emit_public_field_define(
     );
 }
 
-///   capture as user-written constructors.
+/// Synthesize the default constructor: an empty base-class body, or
+/// `constructor(...args) { super(...args); }` for a derived class, with the
+/// instance-field initializers inline.
 pub(crate) fn compile_synthetic_constructor(
     parent: &mut Compiler,
     name: &str,
     is_derived: bool,
     span: (u32, u32),
     instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
-) -> Result<(u32, Vec<u32>), CompileError> {
+) -> Result<ClosureRecord, CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(true)
         .with_module_url(parent.module_url.clone());
-    // No body to pre-pass; only the synthesised super call needs
-    // outer captures. A direct eval inside a field initializer still
-    // runs with this constructor frame as its caller (§19.2.1.3).
+    // A direct eval inside a field initializer runs with this constructor
+    // frame as its caller (§19.2.1.3).
     let contains_direct_eval = instance_fields.iter().any(|field| {
         field
             .value
@@ -93,11 +97,19 @@ pub(crate) fn compile_synthetic_constructor(
     child.contains_direct_eval = contains_direct_eval;
     child.has_home_object = true;
     child.is_derived_ctor = is_derived;
+    let parent_ctx = parent.innermost_ctx();
+    child.closure_context_empty =
+        parent_ctx == crate::scope::CtxReg::Closure && parent.closure_context_empty;
     parent.push(child);
-    parent.enter_scope();
+    parent.enter_scope_with_flags(
+        otter_bytecode::ScopeKind::Body,
+        otter_bytecode::ScopeFlags {
+            strict: true,
+            var_scope: true,
+            has_extension: false,
+        },
+    );
 
-    // Reserve the function record up-front so the slot id is
-    // stable across recursive compile cycles.
     let function_id = module.borrow().functions.len() as u32;
     module.borrow_mut().functions.push(Function {
         id: function_id,
@@ -108,108 +120,70 @@ pub(crate) fn compile_synthetic_constructor(
         ..Default::default()
     });
 
-    if is_derived {
-        // Default derived ctor is `constructor(...args) {
-        // super(...args); }`: materialise the incoming argument
-        // list and construct the superclass. §13.3.7.1
-        // GetSuperConstructor resolves through the class's LIVE
-        // [[GetPrototypeOf]] (a setPrototypeOf between definition and
-        // `new` is observable), so the captured class value's current
-        // prototype is read at call time — same as an explicit
-        // `super()`.
-        //
-        // # See also
-        // - <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
-        let super_ctor = if parent
-            .lookup_binding(crate::class::CLASS_SELF_NAME)
-            .is_some()
-            || parent
-                .resolve_capture(crate::class::CLASS_SELF_NAME)
-                .is_some()
-        {
-            let class_reg = load_synthetic_capture(parent, crate::class::CLASS_SELF_NAME, span)?;
-            let proto_reg = parent.alloc_scratch();
+    let body: Result<(), CompileError> = (|| {
+        if is_derived {
+            // Default derived ctor is `constructor(...args) {
+            // super(...args); }`. §13.3.7.1 GetSuperConstructor resolves
+            // through the class's LIVE [[GetPrototypeOf]].
+            let super_ctor = if parent.resolve_name(crate::class::CLASS_SELF_NAME).is_some() {
+                let class_reg =
+                    load_synthetic_capture(parent, crate::class::CLASS_SELF_NAME, span)?;
+                let proto_reg = parent.alloc_scratch();
+                parent.emit(
+                    Op::GetPrototype,
+                    [Operand::Register(proto_reg), Operand::Register(class_reg)],
+                    span,
+                );
+                proto_reg
+            } else {
+                load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?
+            };
+            let args_reg = parent.alloc_scratch();
+            parent.emit(Op::CollectRest, [Operand::Register(args_reg)], span);
+            let dst = parent.alloc_scratch();
             parent.emit(
-                Op::GetPrototype,
-                [Operand::Register(proto_reg), Operand::Register(class_reg)],
+                Op::SuperConstructSpread,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(super_ctor),
+                    Operand::Register(args_reg),
+                ],
                 span,
             );
-            proto_reg
+            // §13.3.7.3 steps 7–9 — bind `this` so the field initializers
+            // below (and the implicit return) see the constructed value.
+            parent.emit(Op::BindThisValue, [Operand::Register(dst)], span);
+            emit_instance_field_inits(parent, instance_fields)?;
+            parent.emit(Op::Return, [Operand::Register(dst)], span);
         } else {
-            load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?
-        };
-        let args_reg = parent.alloc_scratch();
-        parent.emit(Op::CollectRest, [Operand::Register(args_reg)], span);
-        let dst = parent.alloc_scratch();
-        parent.emit(
-            Op::SuperConstructSpread,
-            vec![
-                Operand::Register(dst),
-                Operand::Register(super_ctor),
-                Operand::Register(args_reg),
-            ],
-            span,
-        );
-        // §13.3.7.3 steps 7–9 — bind `this` so the field initializers
-        // below (and the implicit return) see the constructed value.
-        parent.emit(Op::BindThisValue, [Operand::Register(dst)], span);
-        // §15.7.10 InitializeInstanceElements — brand + field
-        // initialisers run against the bound `this` BEFORE the
-        // implicit return (a private-method brand applies even with
-        // no fields).
-        emit_instance_field_inits(parent, instance_fields)?;
-        parent.emit(Op::Return, [Operand::Register(dst)], span);
-    } else {
-        emit_instance_field_inits(parent, instance_fields)?;
-        parent.emit(Op::ReturnUndefined, vec![], span);
-    }
-
-    let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
-        capture_lexical_environment_for_eval(parent);
-        capture_private_environment_for_eval(parent);
-        capture_super_bindings_for_eval(parent);
-        collect_direct_eval_bindings(parent, &[])
-    } else {
-        Vec::new()
-    };
+            emit_instance_field_inits(parent, instance_fields)?;
+            parent.emit(Op::ReturnUndefined, vec![], span);
+        }
+        Ok(())
+    })();
     parent.exit_scope();
     let mut child = parent.pop();
-    if child.register_overflow {
-        return Err(CompileError::Unsupported {
-            node: "function body exhausts the 65535-register window".to_string(),
-            span,
-        });
-    }
-
-    let captures = child.parent_captures.clone();
-    let mut direct_eval_meta = direct_eval_meta;
-    crate::function_context::finalize_virtual_capture_indices(
-        &mut child.code,
-        &mut direct_eval_meta,
-        &mut child.eval_sites,
-        child.own_upvalue_count,
-    );
-    let mut module_mut = module.borrow_mut();
-    let slot = module_mut
-        .functions
-        .get_mut(function_id as usize)
-        .expect("reserved synthetic ctor slot");
-    slot.locals = 0;
-    slot.scratch = child.scratch_window();
-    slot.param_count = 0;
-    slot.length = 0;
-    slot.has_rest = is_derived;
-    slot.is_derived_constructor = is_derived;
-    slot.own_upvalue_count = child.own_upvalue_count;
-    slot.inherited_upvalue_count = captures.len() as u16;
-    slot.direct_eval_bindings = direct_eval_meta;
-    slot.eval_sites = std::mem::take(&mut child.eval_sites);
-    slot.contains_direct_eval = contains_direct_eval;
-    slot.code = child.code.finish();
-    slot.spans = child.spans;
-    Ok((function_id, captures))
+    body?;
+    let needs_context = finish_function(parent, &mut child, function_id, span, |slot| {
+        slot.param_count = 0;
+        slot.length = 0;
+        slot.has_rest = is_derived;
+        slot.is_derived_constructor = is_derived;
+        slot.contains_direct_eval = contains_direct_eval;
+    })?;
+    Ok(ClosureRecord {
+        function_id,
+        ctx: parent_ctx,
+        needs_context,
+        is_arrow: false,
+    })
 }
 
+/// Compile a user-written class constructor; instance fields initialize
+/// inline — before parameter binding for a base class, after the
+/// statement-level `super(...)` for a derived class.
+///
+/// # See also
 /// - <https://tc39.es/ecma262/#sec-initializeinstanceelements>
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_class_constructor(
@@ -221,200 +195,41 @@ pub(crate) fn compile_class_constructor(
     is_async: bool,
     instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
     is_derived: bool,
-) -> Result<(u32, Vec<u32>), CompileError> {
+) -> Result<ClosureRecord, CompileError> {
     // §7.3.30 — a class with instance private METHODS brands every
     // instance (the brand store lives in the field-init prologue),
-    // so such constructors take the field-init compilation path even
-    // with zero fields.
+    // so such constructors take the field-init path even with zero
+    // fields.
     let needs_brand = parent
         .class_private_instance_methods
         .last()
         .is_some_and(|methods| !methods.is_empty());
-    if instance_fields.is_empty() && !needs_brand {
-        let module = Rc::clone(&parent.top_mut().module);
-        // Constructors get no self-name binding (the class name
-        // resolves through the class scope) but keep their
-        // [[Construct]] slot — they are NOT flagged is_method.
-        parent.next_fn_no_self_name = true;
-        parent.next_fn_has_home = true;
-        parent.next_fn_derived_ctor = is_derived;
-        let (function_id, captures) =
-            compile_function_full(parent, name, params, body, span, is_async, false, true)?;
-        if is_derived {
-            module
-                .borrow_mut()
-                .functions
-                .get_mut(function_id as usize)
-                .expect("compiled constructor slot")
-                .is_derived_constructor = true;
-        }
-        return Ok((function_id, captures));
-    }
-    // Compile the function with field-init injection. We mirror
-    // `compile_function` but inject the field stores after the
-    // self-name binding and before the user body. The compiler
-    // doesn't have a public hook for this, so we duplicate the
-    // setup here.
-    let module = Rc::clone(&parent.top_mut().module);
-    validate_formal_parameter_names(params, true, false, span)?;
-    let mut child = FunctionContext::new(Rc::clone(&module))
-        .with_strict(true)
-        .with_module_url(parent.module_url.clone());
-    if let Some(b) = body {
-        child.captured_names = capture::analyze_function(Some(params), b);
-    }
-    // §19.2.1.3 — field initializers compile into this constructor
-    // frame; a direct eval in either the body or any initializer
-    // receives the constructor's variable environment (and its
-    // new.target / this).
-    let contains_direct_eval = body
-        .as_ref()
-        .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b))
-        || instance_fields.iter().any(|field| {
-            field
-                .value
-                .as_ref()
-                .is_some_and(capture::expression_contains_direct_eval)
-        });
-    if contains_direct_eval {
-        if let Some(b) = body {
-            child
-                .captured_names
-                .extend(capture::all_own_names(Some(params), b));
-        }
-        child.captured_names.insert("arguments".to_string());
-    }
-    child.contains_direct_eval = contains_direct_eval;
-    child.has_home_object = true;
-    child.is_derived_ctor = is_derived;
-    parent.push(child);
-    parent.enter_scope();
-
-    let param_count = u16::try_from(params.items.len()).expect("too many parameters");
-    let length = formal_parameter_length(params);
-    parent.scratch = param_count;
-    let has_rest = params.rest.is_some();
-
-    let function_id = module.borrow().functions.len() as u32;
-    module.borrow_mut().functions.push(Function {
-        id: function_id,
-        name: name.to_string(),
-        span,
-        is_strict: true,
-        module_url: parent.module_url.clone(),
-        ..Default::default()
+    parent.next_fn_has_home = true;
+    parent.next_fn_derived_ctor = is_derived;
+    let fields = (!instance_fields.is_empty() || needs_brand).then_some(FieldInjection {
+        fields: instance_fields,
+        is_derived,
     });
-
-    // §15.7.10 InitializeInstanceElements — a base class runs field
-    // initialisers from [[Construct]] BEFORE the constructor body's
-    // FunctionDeclarationInstantiation binds the parameters: a
-    // throwing initialiser wins over a throwing parameter default,
-    // and initialisers never observe the constructor's own parameter
-    // bindings. Derived classes run them right after the top-level
-    // `super(...)` call returns, so `this` is already allocated.
-    if !is_derived {
-        emit_instance_field_inits(parent, instance_fields)?;
-    }
-
-    predeclare_formal_parameters(parent, params, false, span)?;
-    for (ordinal, param) in params.items.iter().enumerate() {
-        compile_formal_parameter(
-            parent,
-            ordinal as u16,
-            &param.pattern,
-            param.initializer.as_deref(),
+    compile_function_impl(
+        parent,
+        FunctionSpec {
+            name,
+            params,
+            body: body.as_deref(),
             span,
-            false,
-        )?;
-    }
-    if let Some(rest) = &params.rest {
-        compile_rest_parameter(parent, &rest.rest.argument, span)?;
-    }
-
-    // No self-name binding here: the class name resolves through
-    // the §15.7.14 class-scope binding (an upvalue capture), so the
-    // constructor body observes the full class value rather than a
-    // bare re-made closure of itself.
-
-    if let Some(body) = body {
-        let mut var_names: Vec<String> = Vec::new();
-        hoist_var_names(&body.statements, &mut var_names);
-        pre_declare_var_bindings(parent, &var_names, span)?;
-        let mut lex_names: Vec<(String, bool)> = Vec::new();
-        hoist_lexical_names(&body.statements, &mut lex_names);
-        pre_declare_lexical_bindings(parent, &lex_names, span)?;
-        hoist_function_declarations(parent, &body.statements)?;
-        let mut fields_emitted = !is_derived;
-        for stmt in &body.statements {
-            compile_discarded_statement(parent, stmt)?;
-            // Inject the field initialisers as soon as the user's
-            // first statement-level `super(...)` call has run. This
-            // mirrors the spec's "after the super call returns" rule
-            // for derived constructors. If the user doesn't write a
-            // top-level super-call (defensive shape) we fall through
-            // to the post-body emission below.
-            if !fields_emitted && is_top_level_super_call(stmt) {
-                emit_instance_field_inits(parent, instance_fields)?;
-                fields_emitted = true;
-            }
-        }
-        if !fields_emitted {
-            emit_instance_field_inits(parent, instance_fields)?;
-        }
-    } else if is_derived {
-        // No body at all (degenerate shape) — emit field inits.
-        emit_instance_field_inits(parent, instance_fields)?;
-    }
-    let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
-        capture_lexical_environment_for_eval(parent);
-        capture_private_environment_for_eval(parent);
-        capture_super_bindings_for_eval(parent);
-        collect_direct_eval_bindings(parent, &[])
-    } else {
-        Vec::new()
-    };
-    parent.exit_scope();
-    parent.emit(Op::ReturnUndefined, vec![], span);
-
-    let mut child = parent.pop();
-    if child.register_overflow {
-        return Err(CompileError::Unsupported {
-            node: "function body exhausts the 65535-register window".to_string(),
-            span,
-        });
-    }
-
-    let captures = child.parent_captures.clone();
-    let mut direct_eval_meta = direct_eval_meta;
-    crate::function_context::finalize_virtual_capture_indices(
-        &mut child.code,
-        &mut direct_eval_meta,
-        &mut child.eval_sites,
-        child.own_upvalue_count,
-    );
-    let mut module_mut = module.borrow_mut();
-    let slot = module_mut
-        .functions
-        .get_mut(function_id as usize)
-        .expect("reserved function slot");
-    slot.locals = 0;
-    slot.scratch = child.scratch_window();
-    slot.param_count = param_count;
-    slot.length = length;
-    slot.has_rest = has_rest;
-    slot.is_async = is_async;
-    slot.is_derived_constructor = is_derived;
-    slot.own_upvalue_count = child.own_upvalue_count;
-    slot.inherited_upvalue_count = captures.len() as u16;
-    slot.direct_eval_bindings = direct_eval_meta;
-    slot.eval_sites = std::mem::take(&mut child.eval_sites);
-    slot.contains_direct_eval = contains_direct_eval;
-    slot.code = child.code.finish();
-    slot.spans = child.spans;
-    Ok((function_id, captures))
+            is_async,
+            is_generator: false,
+            force_strict: true,
+            is_arrow: false,
+            arrow_expression: false,
+            nfe_self: false,
+            fields,
+        },
+    )
 }
 
-/// upvalues) per §15.7.10 InitializeFieldsForReceiver.
+/// Emit the instance brand and every field initializer against `this`
+/// per §15.7.10 InitializeFieldsForReceiver.
 pub(crate) fn emit_instance_field_inits(
     cx: &mut Compiler,
     fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
@@ -435,41 +250,42 @@ fn emit_instance_field_inits_inner(
 ) -> Result<(), CompileError> {
     // §7.3.29 — brand the instance when the class declares private
     // methods; a second branding of the same object throws.
-    if let Some(ns) = cx.private_namespaces.last().copied() {
-        let binding = format!("__privbrand_{ns}");
-        if cx.lookup_binding(&binding).is_some() || cx.resolve_capture(&binding).is_some() {
-            let span = (0, 0);
-            let key_reg = crate::class::load_synthetic_capture(cx, &binding, span)?;
-            let this_reg = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
-            let present = cx.alloc_scratch();
-            cx.emit(
-                Op::HasProperty,
-                [
-                    Operand::Register(present),
-                    Operand::Register(key_reg),
-                    Operand::Register(this_reg),
-                ],
-                span,
-            );
-            let fresh = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
-            emit_field_add_type_error(cx, span);
-            cx.patch_branch_to_here(fresh);
-            // Brand value = the class prototype object (see
-            // `__privproto_*` in class/mod.rs) so branded receivers
-            // off the prototype chain still resolve private methods.
-            let proto_binding = format!("__privproto_{ns}");
-            let brand_value = if cx.lookup_binding(&proto_binding).is_some()
-                || cx.resolve_capture(&proto_binding).is_some()
-            {
-                crate::class::load_synthetic_capture(cx, &proto_binding, span)?
-            } else {
+    if let Some(location) = cx.class_scope_locations.last().copied()
+        && cx
+            .resolve_at(location, crate::class::PRIVATE_BRAND_BINDING)
+            .is_some()
+    {
+        let span = (0, 0);
+        let key_reg = cx
+            .load_at(location, crate::class::PRIVATE_BRAND_BINDING, span)
+            .expect("brand slot resolved above");
+        let this_reg = cx.alloc_scratch();
+        cx.emit_load_this(this_reg, span);
+        let present = cx.alloc_scratch();
+        cx.emit(
+            Op::HasProperty,
+            [
+                Operand::Register(present),
+                Operand::Register(key_reg),
+                Operand::Register(this_reg),
+            ],
+            span,
+        );
+        let fresh = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
+        emit_field_add_type_error(cx, span);
+        cx.patch_branch_to_here(fresh);
+        // Brand value = the class prototype object (see
+        // `PRIVATE_PROTO_BINDING`) so branded receivers off the
+        // prototype chain still resolve private methods.
+        let brand_value = match cx.load_at(location, crate::class::PRIVATE_PROTO_BINDING, span) {
+            Some(reg) => reg,
+            None => {
                 let true_reg = cx.alloc_scratch();
                 cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], span);
                 true_reg
-            };
-            cx.emit_store_element(this_reg, key_reg, brand_value, span);
-        }
+            }
+        };
+        cx.emit_store_element(this_reg, key_reg, brand_value, span);
     }
     for (idx, p) in fields.iter().enumerate() {
         // Register recycling: nothing emitted for one field-init
@@ -514,7 +330,7 @@ fn emit_instance_field_inits_inner(
             }
         };
         let this_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadThis, [Operand::Register(this_reg)], pspan);
+        cx.emit_load_this(this_reg, pspan);
         if p.computed {
             // §15.7.10 — computed-key field. The key was evaluated
             // exactly once at class-definition time (§15.7.14) into
@@ -540,7 +356,7 @@ fn emit_instance_field_inits_inner(
                 );
             }
             emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
-            cx.scratch = scratch_mark;
+            cx.reset_scratch(scratch_mark);
             continue;
         }
         let key_str = match &p.key {
@@ -563,7 +379,7 @@ fn emit_instance_field_inits_inner(
                 }
             }
             oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
-                let key_reg = load_private_key_for_field(cx, pid.name.as_str(), pspan)?;
+                let key_reg = crate::class::load_private_key(cx, pid.name.as_str(), pspan)?;
                 // §7.3.28 PrivateFieldAdd — re-initializing the same
                 // private field on one object (constructor-return
                 // override + second `new`) is a TypeError. Fields
@@ -583,7 +399,7 @@ fn emit_instance_field_inits_inner(
                 emit_field_add_type_error(cx, pspan);
                 cx.patch_branch_to_here(fresh);
                 emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
-                cx.scratch = scratch_mark;
+                cx.reset_scratch(scratch_mark);
                 continue;
             }
             _ => {
@@ -601,7 +417,7 @@ fn emit_instance_field_inits_inner(
             pspan,
         );
         emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
-        cx.scratch = scratch_mark;
+        cx.reset_scratch(scratch_mark);
     }
     Ok(())
 }
@@ -631,43 +447,4 @@ fn emit_field_add_type_error(cx: &mut Compiler, span: (u32, u32)) {
         span,
     );
     cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
-}
-
-/// Resolve a private FIELD's symbol inside the constructor via the
-/// per-class `__privarr_{ns}` array (one capture for the whole
-/// class) instead of one `__privsym_*` capture per name —
-/// `Op::MakeClosure` tops out at 252 captures.
-fn load_private_key_for_field(
-    cx: &mut Compiler,
-    name: &str,
-    span: (u32, u32),
-) -> Result<u16, CompileError> {
-    if let (Some(ns), Some(ordered)) = (
-        cx.private_namespaces.last().copied(),
-        cx.class_private_ordered.last(),
-    ) && let Some(idx) = ordered.iter().position(|n| n == name)
-    {
-        let binding = format!("__privarr_{ns}");
-        if cx.lookup_binding(&binding).is_some() || cx.resolve_capture(&binding).is_some() {
-            let arr_reg = load_synthetic_capture(cx, &binding, span)?;
-            let idx_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadInt32,
-                [Operand::Register(idx_reg), Operand::Imm32(idx as i32)],
-                span,
-            );
-            let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadElement,
-                vec![
-                    Operand::Register(dst),
-                    Operand::Register(arr_reg),
-                    Operand::Register(idx_reg),
-                ],
-                span,
-            );
-            return Ok(dst);
-        }
-    }
-    crate::class::load_private_key(cx, name, span)
 }

@@ -28,9 +28,9 @@ use otter_vm::{
 /// Machine-visible context shared by every compiled tier.
 ///
 /// The context contains execution services, not duplicated JavaScript frame
-/// state. Registers, SELF, `this`, upvalues, PC, and tier state live only in
+/// state. Registers, SELF, `this`, PC, and tier state live only in
 /// [`NativeFrame`]; every compiled tier resolves them through that canonical
-/// activation. Nested calls reuse this context and swap only its active-frame
+/// activation, and captured bindings through the contexts its registers hold. Nested calls reuse this context and swap only its active-frame
 /// pointer for the dynamic extent of the callee. Machine IR safepoints link
 /// allocator-owned tagged homes through the VM-owned root-chain head.
 #[repr(C)]
@@ -306,19 +306,12 @@ pub(crate) const CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET: u32 =
 /// 16-aligned machine-stack reservation for a nested callee's compact frame.
 pub(crate) const NATIVE_FRAME_STACK_SIZE: u32 =
     ((std::mem::size_of::<NativeFrame>() + 15) & !15) as u32;
-/// Byte offsets of the callee-frame fields emitted nested-call sequences fill.
-pub(crate) const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, register_base) as u32;
-pub(crate) const NATIVE_FRAME_THIS_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, this_value_bits) as u32;
-pub(crate) const NATIVE_FRAME_SELF_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, self_value_bits) as u32;
-pub(crate) const NATIVE_FRAME_UPVALUE_BASE_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, upvalue_base) as u32;
-pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
-pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
+/// Byte offsets of the callee-frame fields emitted nested-call sequences fill,
+/// re-exported from the VM-owned [`NativeFrame`] layout.
+pub(crate) use otter_vm::native_abi::{
+    NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+    NATIVE_FRAME_THIS_OFFSET,
+};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags))

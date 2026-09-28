@@ -234,7 +234,7 @@ impl Interpreter {
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             host_module_env_cache: std::collections::HashMap::new(),
-            module_init_upvalues: std::collections::HashMap::new(),
+            module_init_closures: std::collections::HashMap::new(),
             global_lexicals: rustc_hash::FxHashMap::default(),
             global_lexical_epoch: 0,
             global_lexical_load_ic: rustc_hash::FxHashMap::default(),
@@ -312,7 +312,6 @@ impl Interpreter {
             iterator_user_props: None,
             persistent_roots: persistent_roots::PersistentRoots::new(),
             pending_atomic_waits: Vec::new(),
-            eval_binding_seq: 1,
             intl_fallback_symbol: None,
             console_sink: console::default_console_sink(),
             timer_scheduler: None,
@@ -451,8 +450,8 @@ impl Interpreter {
             &mut state.host_module_env_cache,
         );
         std::mem::swap(
-            &mut self.module_init_upvalues,
-            &mut state.module_init_upvalues,
+            &mut self.module_init_closures,
+            &mut state.module_init_closures,
         );
         std::mem::swap(&mut self.global_lexicals, &mut state.global_lexicals);
         std::mem::swap(
@@ -561,7 +560,7 @@ impl Interpreter {
             realm_context: None,
             module_environments: std::collections::HashMap::new(),
             host_module_env_cache: std::collections::HashMap::new(),
-            module_init_upvalues: std::collections::HashMap::new(),
+            module_init_closures: std::collections::HashMap::new(),
             global_lexicals: rustc_hash::FxHashMap::default(),
             global_lexical_epoch: 0,
             global_lexical_load_ic: rustc_hash::FxHashMap::default(),

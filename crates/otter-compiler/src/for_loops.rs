@@ -7,6 +7,12 @@
 //!
 //! # Invariants
 //! - Loop frames own their break and continue patch sites.
+//! - A `let` / `const` head binds in a fresh `ForHead` scope per iteration
+//!   (§14.7.5.6): the scope's context, when one is needed, is created after
+//!   `IteratorNext` and before the head binds, with the enclosing context as
+//!   its parent. The right-hand side runs in a separate TDZ scope holding the
+//!   head names (§14.7.5.12); it owns a context only when a closure or eval
+//!   in the right-hand side can observe them.
 //!
 //! # See also
 //! - `statements` for general statement dispatch
@@ -41,17 +47,10 @@ pub(crate) fn compile_for_of_statement(
     cx.emit_completion_reset(span);
     let is_for_await = s.r#await;
 
-    // §14.7.5 — a `for (let … of RHS)` / `for (const … of RHS)` head
-    // binds each name (single identifier or destructuring leaf) in an
-    // own-upvalue cell that `Op::FreshUpvalue` re-installs as a hole.
-    // This gives both the head Temporal Dead Zone during RHS
-    // evaluation (§14.7.5.12) and a fresh binding per iteration for
-    // any capturing closure (§14.7.5.6 CreatePerIterationEnvironment).
-    // `var` and assignment-target heads keep the register path in
-    // `bind_for_in_of_head`.
-    let per_iter_upvalues = declare_per_iteration_head(cx, &s.left, span)?;
-
-    let iterable_reg = compile_expr(cx, &s.right, span)?;
+    // §14.7.5.12 ForIn/OfHeadEvaluation — the right-hand side runs with
+    // the head's `let` / `const` names in their TDZ.
+    let head_names = per_iteration_head_names(&s.left);
+    let iterable_reg = compile_head_rhs(cx, &head_names, &s.right, span)?;
     let iter_reg = cx.alloc_scratch();
     if is_for_await {
         cx.emit(
@@ -103,12 +102,6 @@ pub(crate) fn compile_for_of_statement(
         cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
     }
     let loop_top = cx.next_pc();
-    // §14.7.5.6 — materialise fresh per-iteration cells for a captured
-    // `let`/`const` head before the next value binds, so each
-    // iteration's closures capture distinct bindings.
-    for &idx in &per_iter_upvalues {
-        cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
-    }
     if is_for_await {
         let result_reg = cx.alloc_scratch();
         let awaited_reg = cx.alloc_scratch();
@@ -162,7 +155,7 @@ pub(crate) fn compile_for_of_statement(
         cx.active_handlers += 1;
         handler
     });
-    cx.enter_scope();
+    enter_iteration_scope(cx, &head_names, span)?;
     bind_for_in_of_head(cx, &s.left, bind_source, span)?;
     if let Some(body_reg) = compile_statement(cx, &s.body)? {
         // Record this iteration's non-empty completion as `V`. A
@@ -229,12 +222,6 @@ pub(crate) fn compile_for_of_statement(
     if !is_for_await {
         cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
     }
-    // Close the head-binding scope opened for the per-iteration
-    // `let`/`const` cell — leaving it pushed would leak the head name
-    // into the enclosing scope's redeclaration checks.
-    if !per_iter_upvalues.is_empty() {
-        cx.exit_scope();
-    }
     Ok(completion_reg)
 }
 
@@ -278,11 +265,9 @@ fn emit_async_iterator_close(
     cx.patch_branch_to_here(skip);
 }
 
-/// If `head` is a `for (let x of …)` / `for (const x of …)` single
-/// identifier binding, return `(name, is_const)`. Such heads route
-/// through a per-iteration upvalue cell (§14.7.5.6) that also provides
-/// the head Temporal Dead Zone (§14.7.5.12). `var`, destructuring, and
-/// AssignmentTarget heads return `None` and keep the register path.
+/// The `(name, is_const)` leaves of a `for (let … of …)` /
+/// `for (const … in …)` head. `var` and AssignmentTarget heads bind no
+/// per-iteration names and return nothing.
 fn per_iteration_head_names(head: &oxc_ast::ast::ForStatementLeft<'_>) -> Vec<(String, bool)> {
     use oxc_ast::ast::{ForStatementLeft, VariableDeclarationKind};
     let ForStatementLeft::VariableDeclaration(decl) = head else {
@@ -336,20 +321,7 @@ pub(crate) fn compile_for_in_statement(
     {
         let name = id.name.as_str().to_string();
         let init_reg = crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?;
-        if let Some(info) = cx.lookup_binding(&name) {
-            cx.emit_store_storage(init_reg, info.storage, span);
-        } else {
-            let name_idx = cx.intern_string_constant(&name);
-            cx.emit(
-                Op::StoreGlobalBinding,
-                [
-                    Operand::Register(init_reg),
-                    Operand::ConstIndex(name_idx),
-                    Operand::Imm32(0),
-                ],
-                span,
-            );
-        }
+        store_identifier(cx, &name, init_reg, span)?;
     }
 
     // Lower through the VM's internal for-in enumerable-key snapshot
@@ -368,12 +340,9 @@ pub(crate) fn compile_for_in_statement(
     //     <body>
     //     Jump loop_top
     //   exit:
-    // §14.7.5 — a single-identifier `let`/`const` head binds in an
-    // own-upvalue cell holed during RHS evaluation (head TDZ) and
-    // re-installed fresh per iteration, mirroring the for-of path.
-    let per_iter_upvalues = declare_per_iteration_head(cx, &s.left, span)?;
-
-    let obj_reg = compile_expr(cx, &s.right, span)?;
+    // §14.7.5.12 — the right-hand side runs with the head names in TDZ.
+    let head_names = per_iteration_head_names(&s.left);
+    let obj_reg = compile_head_rhs(cx, &head_names, &s.right, span)?;
     let keys_reg = cx.alloc_scratch();
     cx.emit(
         Op::ForInKeys,
@@ -416,11 +385,6 @@ pub(crate) fn compile_for_in_statement(
 
     cx.push_loop_frame(LoopFrame::iteration());
     let loop_top = cx.next_pc();
-    // §14.7.5.6 CreatePerIterationEnvironment — fresh cell before the
-    // next key binds so closures capture a distinct binding.
-    for &idx in &per_iter_upvalues {
-        cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
-    }
     cx.emit(
         Op::IteratorNext,
         vec![
@@ -450,7 +414,7 @@ pub(crate) fn compile_for_in_statement(
     // §14.7.5.6 — `let`/`const` rebinds per iteration; `var`
     // re-uses the function-scope binding. Assignment-target heads
     // reassign in place.
-    cx.enter_scope();
+    enter_iteration_scope(cx, &head_names, span)?;
     bind_for_in_of_head(cx, &s.left, value_reg, span)?;
     compile_discarded_statement(cx, &s.body)?;
     cx.exit_scope();
@@ -466,40 +430,53 @@ pub(crate) fn compile_for_in_statement(
     for pc in frame.break_patches {
         cx.patch_branch_to_here(pc);
     }
-    if !per_iter_upvalues.is_empty() {
-        cx.exit_scope();
-    }
     Ok(None)
 }
 
-/// Open the head-binding scope and declare each `let`/`const` head
-/// name (single identifier or destructuring leaf) in a holed
-/// own-upvalue cell — §14.7.5.12 head TDZ during RHS evaluation plus
-/// per-iteration freshness. Returns the cell indices (empty for `var`
-/// / assignment-target heads, which keep the register path).
-fn declare_per_iteration_head(
+/// Evaluate a `for-in` / `for-of` right-hand side. With `let` / `const`
+/// head names, it runs inside a TDZ scope declaring them uninitialized
+/// (§14.7.5.12); a name a closure or direct eval in the right-hand side can
+/// observe takes a slot of that scope's hole-initialized context.
+fn compile_head_rhs(
     cx: &mut Compiler,
-    head: &oxc_ast::ast::ForStatementLeft<'_>,
+    names: &[(String, bool)],
+    rhs: &Expression<'_>,
     span: (u32, u32),
-) -> Result<Vec<u16>, CompileError> {
-    let names = per_iteration_head_names(head);
+) -> Result<u16, CompileError> {
     if names.is_empty() {
-        return Ok(Vec::new());
+        return compile_expr(cx, rhs, span);
     }
-    cx.enter_scope();
-    let mut cells = Vec::with_capacity(names.len());
-    for (name, is_const) in &names {
-        let idx = match cx.declare_captured_binding(name, *is_const, span)? {
-            crate::scope::BindingStorage::Upvalue { idx } => idx,
-            crate::scope::BindingStorage::Register { .. } => {
-                unreachable!("declare_captured_binding always yields an upvalue")
+    let (rhs_refs, rhs_eval) = crate::capture::expression_nested_refs(rhs);
+    cx.enter_scope(otter_bytecode::ScopeKind::ForHead);
+    let result = (|| {
+        for (name, is_const) in names {
+            if cx.lookup_in_current_scope(name).is_some() {
+                continue;
             }
-        };
-        // Hole the cell so closures inside the RHS observe the TDZ.
-        cx.emit(Op::FreshUpvalue, [Operand::Imm32(idx as i32)], span);
-        cells.push(idx);
+            let observed = rhs_eval || rhs_refs.contains(name);
+            cx.declare_binding_with_capture(name, lexical_kind(*is_const), span, observed)?;
+        }
+        compile_expr(cx, rhs, span)
+    })();
+    cx.exit_scope();
+    result
+}
+
+/// Enter one iteration's head scope and declare its `let` / `const`
+/// names uninitialized, so the head binding and closures in destructuring
+/// defaults resolve them (§14.7.5.6 steps h–j).
+fn enter_iteration_scope(
+    cx: &mut Compiler,
+    names: &[(String, bool)],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    cx.enter_scope(otter_bytecode::ScopeKind::ForHead);
+    for (name, is_const) in names {
+        if cx.lookup_in_current_scope(name).is_none() {
+            cx.declare_binding(name, lexical_kind(*is_const), span)?;
+        }
     }
-    Ok(cells)
+    Ok(())
 }
 
 /// Bind the per-iteration value of a `for-in` / `for-of` head to the
@@ -550,26 +527,14 @@ pub(crate) fn bind_for_in_of_head(
                         );
                         return Ok(());
                     }
-                    let storage = if is_var {
-                        cx.lookup_binding(&name)
-                            .ok_or(CompileError::Unsupported {
-                                node: format!("for-of var `{name}` not pre-hoisted"),
-                                span,
-                            })?
-                            .storage
-                    } else if let Some(info) = cx.lookup_binding(&name).filter(|info| {
-                        !info.initialized
-                            && matches!(info.storage, crate::scope::BindingStorage::Upvalue { .. })
-                    }) {
-                        // §14.7.5.6 — the single-identifier head's
-                        // per-iteration cell was pre-declared (holed)
-                        // by the loop prologue; bind THROUGH it so
-                        // Op::FreshUpvalue re-installs the binding
-                        // every iteration and closures capture a
-                        // distinct copy.
-                        info.storage
-                    } else {
-                        cx.declare_binding(&name, is_const, span)?
+                    if is_var {
+                        // `var` heads assign the variable-scope binding.
+                        return store_identifier(cx, &name, src_reg, span);
+                    }
+                    // The iteration scope pre-declared the head binding.
+                    let storage = match cx.lookup_in_current_scope(&name) {
+                        Some(info) => info.storage,
+                        None => cx.declare_binding(&name, lexical_kind(is_const), span)?,
                     };
                     cx.emit_store_storage(src_reg, storage, span);
                     cx.mark_initialized(&name);
@@ -614,7 +579,7 @@ pub(crate) fn bind_for_in_of_head(
             // §13.3.5.3 + §6.2.5.5 step 6.b, like `super.X = V`.
             if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 cx.emit(
@@ -647,7 +612,7 @@ pub(crate) fn bind_for_in_of_head(
         ForStatementLeft::ComputedMemberExpression(member) => {
             if matches!(member.object, oxc_ast::ast::Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let key_reg = compile_expr(cx, &member.expression, span)?;
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 cx.emit(

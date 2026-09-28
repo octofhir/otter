@@ -1042,7 +1042,7 @@ pub struct RuntimeExecutionStats {
     pub jit_feedback_refreshes: u64,
     /// Loop-OSR threshold attempts.
     pub jit_osr_attempts: u64,
-    /// JIT property/method/element/global/upvalue runtime stub calls.
+    /// JIT property/method/element/global/context runtime stub calls.
     pub jit_runtime_property_stubs: u64,
     /// ABI-classified runtime stub transitions from compiled code.
     pub jit_runtime_stub_transitions: u64,
@@ -1794,32 +1794,15 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
             )
             .map_err(compile_error_message);
         }
-        // §19.2.1.3 — a direct eval inside a function carries
-        // its caller variable environment binding list.
-        let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
-            options.caller_scope.map(|bindings| {
-                bindings
-                    .into_iter()
-                    .map(|binding| otter_compiler::EvalCallerBinding {
-                        name: binding.name,
-                        lexical: binding.lexical,
-                        captured: binding.captured,
-                        is_const: binding.is_const,
-                        fn_self_name: binding.fn_self_name,
-                        inner: binding.inner,
-                        deletable: binding.deletable,
-                        scope_depth: binding.scope_depth,
-                    })
-                    .collect()
-            });
+        // §19.2.1.3 — a direct eval compiles against its call site's
+        // context chain; indirect eval and `Function` carry none.
         otter_compiler::compile_eval_source(
             source,
             SourceKind::JavaScript,
             "<eval>",
             options.force_strict,
             options.forbid_var_arguments,
-            caller_scope.as_deref(),
-            options.global_var_env,
+            options.caller_chain.as_ref(),
             options.new_target_allowed,
             options.in_class_field_initializer,
             options.super_property_allowed,

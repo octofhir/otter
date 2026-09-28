@@ -15,7 +15,8 @@
 //!   predecessor, and the merged block has no parameters.
 //! - Landing pads, loop preheaders, and OSR/entry blocks are never merged into
 //!   a predecessor; they keep their identity for exception, LICM and entry
-//!   metadata.
+//!   metadata. A landing pad also never absorbs its successor: it stays the
+//!   one-successor acknowledgement block the caught-throw contract names.
 //! - Only the removed `Jump` instructions disappear; every other instruction
 //!   keeps its order. Block ids are renumbered densely and every block
 //!   reference (edges, entry, call landing pads) is remapped.
@@ -35,7 +36,9 @@ pub(super) fn optimize(
     mut sequence: InstructionSequence,
     target: &TargetSpec,
 ) -> Result<(InstructionSequence, u32), VerificationError> {
-    let landing_pads = sequence
+    // A call's landing pad, and the throw successor of a committed status
+    // branch, both begin with the caught-throw acknowledgement.
+    let mut landing_pads = sequence
         .call_descriptors
         .iter()
         .filter_map(|descriptor| match descriptor.exceptional {
@@ -43,6 +46,24 @@ pub(super) fn optimize(
             ExceptionalEdge::None | ExceptionalEdge::Propagate => None,
         })
         .collect::<FxHashSet<_>>();
+    landing_pads.extend(
+        sequence
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                let MachineOpcode::Call(descriptor) =
+                    sequence.instructions[block.first.0 as usize].opcode
+                else {
+                    return false;
+                };
+                sequence
+                    .call_descriptors
+                    .get(descriptor as usize)
+                    .is_some_and(super::is_caught_throw_acknowledgement_target)
+            })
+            .map(|(index, _)| index),
+    );
     let blocks = &sequence.blocks;
     let instructions = &sequence.instructions;
     // `joins[b]`: block `b` continues block `b - 1`.
@@ -56,7 +77,8 @@ pub(super) fn optimize(
                 matches!(
                     instruction.opcode,
                     MachineOpcode::LoopPreheader
-                        | MachineOpcode::OsrEntry { .. }
+                        | MachineOpcode::OsrValue { .. }
+                        | MachineOpcode::OsrDispatch { .. }
                         | MachineOpcode::EntryValue(_)
                         | MachineOpcode::EntryThis
                 )
@@ -71,6 +93,7 @@ pub(super) fn optimize(
             && block.parameters.is_empty()
             && index != sequence.entry.0 as usize
             && !landing_pads.contains(&index)
+            && !landing_pads.contains(&(index - 1))
             && !marker;
     }
     let merged = joins.iter().filter(|join| **join).count() as u32;

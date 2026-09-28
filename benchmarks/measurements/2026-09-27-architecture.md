@@ -277,3 +277,108 @@ triggers growth-based major GC; `Value` cells hold full addresses yet every
 JIT decode re-adds the cage base; Template property ICs never learn after
 compilation; `TailCall` is unsupported in both JIT tiers (every strict
 `return f(x)`).
+
+## 8. E1a result: per-scope contexts replace upvalue cells
+
+E1a lands the environment contract of
+`2026-09-27-environments-contract.md` in every tier: per-scope context objects
+in ordinary registers, one context word per closure, `Lookup*` operations over
+an eval-extension chain, `DerivedThis` as a context slot. Upvalue cells, the
+upvalue spine, `FreshUpvalue`, the `Shadowed*`/`EvalBinding*`/`*Dynamic`
+families, the old-space cell batch allocator and the generated-upvalue
+initializer are deleted, not bridged.
+
+Fixed-work instructions (`scripts/dev/fixed-work.py`, release CLI, one
+sequential run each; the whole process, JIT compile threads included):
+
+| Workload | HEAD `ceb3ca18` | E1a | Δ | RSS HEAD → E1a |
+|---|---:|---:|---:|---|
+| ts-fixed | 198.6G | 184.7G | −7.0% | 695 → 535 MB |
+| zlib-fixed | 273.4G | 243.1G | −11.1% | 834 → 722 MB |
+| crypto-fixed | 16.98G | 16.82G | −0.9% | 51 → 52 MB |
+| fib | 3.82G | 3.65G | −4.4% | 59 → 59 MB |
+| mega_method | 10.12G | 10.01G | −1.1% | 59 → 59 MB |
+| ast_ctor | 31.73G | 27.63G | −12.9% | 130 → 130 MB |
+| earley-boyer | 229.1G | 184.5G | −19.4% | 134 → 154 MB |
+
+(`benchmarks/results/arch-2026-09-27/e1a-final3` against `baseline-head`;
+every stdout matches.)
+
+Earley's RSS grows 15%: a context is a 32-byte body plus 8 bytes per slot
+where a cell was 16 bytes, and contexts captured by old closures are promoted.
+That is the first E1b target (below), not an accepted cost.
+
+Defects surfaced while closing the E1a regressions; each has a regression
+program in the difftest corpus:
+1. Template routed every checked (TDZ) context access through the committed
+   binding call: `mega_method` doubled (20.9G). The hit path is now inline on
+   both targets (load, `hole` compare, barriered store); only a TDZ `hole`
+   takes the committed call that throws.
+2. Arguments elision treated the closure-context placeholder operand (`r0`
+   until `finish_code` routes it) as a use of the `arguments` object whenever
+   `arguments` lived in `r0`. Every CommonJS-wrapped function that reads a
+   captured binding kept a materialized `arguments` object: earley spent 12%
+   in `collect_arguments`. The analysis now skips placeholder operands.
+3. Machine OSR entry (pre-existing, exposed by 2) is rebuilt on the Maglev /
+   Warp model. The old design wrote each header value into its allocated
+   location from a trampoline and landed on a marker instruction; with a
+   versioned preheader the marker's parallel moves conflated two header
+   values, and a spilled value's live register copy went stale
+   (`osr_preheader_parameters.js`, `osr_entry_live_values.js`). Now the entry
+   block is an `OsrDispatch` that reads the native frame's `OSR_ENTRY` bit and
+   PC once, and the header gets an OSR block: an extra predecessor whose
+   `OsrValue`s read and type-check every header parameter from the
+   interpreter frame, so regalloc2 places every value and LICM's shared
+   preheader needs no OSR special case. Like V8 (code per OSR offset) and
+   SpiderMonkey (`osrPc`), a compile carries at most the one header whose
+   back-edge requested it: an OSR block for every eligible header doubled the
+   regalloc time of zlib's largest function (0.52 → 1.05 s per compile, +17%
+   instructions), and an entry compile now has no dispatch at all. When the
+   current code cannot enter a newly hot header, the VM recompiles for it
+   (SpiderMonkey's `osrPc` mismatch recompile).
+4. Forwarded calls (`f.apply(this, arguments)`) of a function whose mapped
+   formals live in its context declined the Machine tier. The forward packet
+   now ends with the formals context (Template and Machine publish it into
+   the frame window, and the runtime reads context-held formals from it), so
+   the mapped `arguments` aliasing stays exact
+   (`forward_context_formals.js`).
+5. An exceptional edge out of a call skipped the edits regalloc2 placed after
+   the call and around the block terminator, so a catch received the SELF
+   closure instead of the thrown value. Landing pads now run the same edit
+   run as the normal path (`machine_catch_result_split.js`).
+6. GC safepoints rooted only the location a root operand names. regalloc2
+   assumes values are immutable: inside a block its redundant-move eliminator
+   skips a move whose destination already holds a copy, so a context lived in
+   both a callee-saved register (rooted, rewritten by the scavenger) and its
+   spill slot (not rooted), and the edge into a loop preheader read the stale
+   slot. Safepoint lowering now roots every location holding the same bits at
+   the call (Ion's `populateSafepoints` rule), derived from a block-local walk
+   of the allocator's edits, definitions and clobbers
+   (`gc_root_register_spill_copy.js`; GC stress stride 4 used to crash the
+   scavenger on a garbage header).
+
+Two GC-stress defects older than E1a were fixed on the way: Map/Set natives
+read their receiver before flattening a rope key (stale receiver after the
+flattening allocation: Set iteration order diverged under stress), and the
+`-p` completion value was unrooted across the event-loop drain.
+
+## Checkpoint
+
+Series E1 (environments), state at the time of writing (2026-09-29):
+- Committed before E1a: `894f3ffe` frame-cell batches, `cbb6e741` tooling,
+  `3c51767c` weak-semantics GC fixes, `ceb3ca18` nursery age mark,
+  `a892e658` this document, `6a09147d` environment corpus + contract
+  (`2026-09-27-environments-contract.md`).
+- E1a (section 8) is committed with its defect fixes. Gates on the final
+  tree: otter-jit lib 302/302; difftest 84/84 (interpreter oracle, Template,
+  production, GC stress 1/4/16); Test262 `language/` 24,077/24,077; the seven
+  fixed-work workloads above; the `otter-runtime` JIT tests were updated to
+  the context model and checked one binary at a time.
+- Open: 12 of 15 environment corpora match Node (remaining: Annex B
+  `function arguments`, derived-class field initialization timing); `-e`/`-p`
+  source runs in the CommonJS eval scope, where every loop scope is a context
+  (a `CopyContext` allocation per iteration of a plain counting loop).
+- Next: E1b — context size (drop the per-context `extension` word for scopes
+  without sloppy eval, V8-style), young closures and inline context/closure
+  allocation in both JIT tiers, singleton-context folding; then earley RSS
+  and census re-measured.

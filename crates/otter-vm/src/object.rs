@@ -78,13 +78,13 @@ use std::any::Any;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::Value;
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use crate::proxy::JsProxy;
 use crate::string::{JsString, to_utf16_vec};
 use crate::symbol::JsSymbol;
-use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -317,15 +317,37 @@ impl HostData {
     }
 }
 
+/// One mapped arguments index aliased to a slot of the parameter-scope
+/// context (§10.4.4.7 CreateMappedArgumentsObject ParameterMap).
 #[derive(Debug, Clone)]
 pub(crate) struct MappedArgumentEntry {
     pub(crate) key: String,
-    pub(crate) cell: UpvalueCell,
+    pub(crate) slot: u16,
+}
+
+/// The ParameterMap of a mapped arguments object: every entry aliases a slot
+/// of the one parameter-scope context.
+#[derive(Debug, Clone)]
+pub(crate) struct MappedArguments {
+    pub(crate) context: crate::context::ContextHandle,
+    pub(crate) entries: Vec<MappedArgumentEntry>,
 }
 
 #[derive(Debug)]
 struct MappedArgumentsData {
+    context: crate::context::ContextHandle,
     entries: Box<[MappedArgumentEntry]>,
+}
+
+/// A mapped argument's aliased binding: the parameter-scope context and slot.
+type MappedCell = (crate::context::ContextHandle, u16);
+
+fn mapped_read(heap: &otter_gc::GcHeap, (context, slot): MappedCell) -> Value {
+    crate::context::read_slot(heap, context, slot).unwrap_or_else(Value::undefined)
+}
+
+fn mapped_write(heap: &mut otter_gc::GcHeap, (context, slot): MappedCell, value: Value) {
+    crate::context::write_slot(heap, context, slot, value);
 }
 
 /// Host object access failure.
@@ -384,7 +406,7 @@ struct AccessorPair {
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`AccessorCellBody`].
 ///
-/// Next free tag after `EVAL_ENV_BODY_TYPE_TAG = 0x2E`; distinct from every
+/// Next free tag after `EVAL_EXTENSION_BODY_TYPE_TAG = 0x2E`; distinct from every
 /// other GC body so the `type_tag → trace` table dispatch stays unambiguous.
 pub const ACCESSOR_CELL_TYPE_TAG: u8 = 0x2F;
 
@@ -1025,10 +1047,8 @@ impl otter_gc::SafeTraceable for ExoticSlots {
             .as_mut()
             .and_then(|data| data.downcast_mut::<MappedArgumentsData>())
         {
-            for entry in data.entries.iter_mut() {
-                let p = &mut entry.cell as *mut UpvalueCell as *mut RawGc;
-                v(p);
-            }
+            let p = &mut data.context as *mut crate::context::ContextHandle as *mut RawGc;
+            v(p);
         }
         if let Some(data) = self.host_data.as_mut() {
             data.trace_gc_slots(v);
@@ -2980,7 +3000,8 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::collections::WeakSetBody,
         crate::collections::weak_table::WeakTableBody<crate::collections::weak_table::MapKind>,
         crate::collections::weak_table::WeakTableBody<crate::collections::weak_table::SetKind>,
-        crate::eval_env::EvalEnvBody,
+        crate::context::ContextBody,
+        crate::eval_env::EvalExtensionBody,
         crate::generator::GeneratorBody,
         crate::generator::ParkedFrameBody,
         crate::intl::payload::IntlBody,
@@ -3490,43 +3511,58 @@ pub(crate) fn arguments_direct_snapshot(
     })
 }
 
+/// Install the ParameterMap. The caller passes the current context handle:
+/// `mapped.context` must be rooted across every allocation that preceded
+/// this call (the arguments object and its shape).
 pub(crate) fn install_mapped_arguments(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
-    entries: Vec<MappedArgumentEntry>,
+    mapped: MappedArguments,
 ) {
+    let MappedArguments {
+        mut context,
+        entries,
+    } = mapped;
     // The sidecar allocates, so it is reserved here, outside the payload
-    // borrow below. This may move `obj`, which is why the local is `mut`.
+    // borrow below. This may move `obj` and the young context, so both ride
+    // through the allocation as roots.
     let mut obj = obj;
-    ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    {
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: `context` is a local declared before the scope and outlives it.
+        unsafe {
+            scope
+                .add_raw_slot((&mut context as *mut crate::context::ContextHandle).cast::<RawGc>());
+        }
+        ensure_exotic(&mut obj, heap).expect("exotic sidecar");
+    }
     if entries.is_empty() {
         return;
     }
-    let cells: Vec<UpvalueCell> = entries.iter().map(|entry| entry.cell).collect();
     heap.with_payload(obj, |body| {
         body.chain_link_opaque = true;
         body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
+            context,
             entries: entries.into_boxed_slice(),
         })));
     });
-    // The parameter cells are held by the sidecar, which is its own old-space
-    // body, so the edge a scavenge has to re-trace starts there and not at the
-    // object: re-tracing the object finds one edge to an old child and stops
-    // before it ever reaches the cells. Recording the object instead leaves a
-    // young cell unevacuated and the sidecar holding its pre-move offset.
+    // The context is held by the sidecar, which is its own body, so the edge
+    // a scavenge has to re-trace starts there and not at the object:
+    // re-tracing the object finds one edge to the sidecar and stops before it
+    // ever reaches the context. Recording the object instead leaves a young
+    // context unevacuated and the sidecar holding its pre-move offset.
     let sidecar = heap.read_payload(obj, |body| body.exotic.get());
-    for cell in cells {
-        heap.record_write(sidecar, &cell);
-    }
+    heap.record_write(sidecar, &context);
 }
 
-fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<UpvalueCell> {
-    body.host_data_ref()?
-        .downcast_ref::<MappedArgumentsData>()?
-        .entries
+fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<MappedCell> {
+    let data = body
+        .host_data_ref()?
+        .downcast_ref::<MappedArgumentsData>()?;
+    data.entries
         .iter()
         .find(|entry| entry.key == key)
-        .map(|entry| entry.cell)
+        .map(|entry| (data.context, entry.slot))
 }
 
 fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
@@ -3547,6 +3583,7 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
             if !retained.is_empty() {
                 body.exotic_mut().host_data =
                     Some(HostData::Untraced(Box::new(MappedArgumentsData {
+                        context: mapped.context,
                         entries: retained.into_boxed_slice(),
                     })));
             }
@@ -3580,12 +3617,12 @@ fn apply_mapped_arguments_partial_define(
     }
 
     if let Some(value) = descriptor.value {
-        store_upvalue(heap, cell, value);
+        mapped_write(heap, cell, value);
     }
 
     if descriptor.writable == Some(false) {
         if descriptor.value.is_none() {
-            let current = read_upvalue(heap, cell);
+            let current = mapped_read(heap, cell);
             let stored = current;
             if let Some(offset) = existing_offset {
                 let is_data_slot = heap.read_payload(obj, |body| {
@@ -3813,7 +3850,7 @@ pub(crate) fn supports_fast_property_ic(obj: JsObject, heap: &otter_gc::GcHeap) 
 pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
     heap.read_payload(obj, |body| {
         if let Some(cell) = mapped_argument_cell(body, key) {
-            return Some(read_upvalue(heap, cell));
+            return Some(mapped_read(heap, cell));
         }
         body_offset_of(heap, body, key).map(|offset| {
             let i = offset as usize;
@@ -3858,7 +3895,7 @@ pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Property
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
-                *value = read_upvalue(heap, cell);
+                *value = mapped_read(heap, cell);
             }
             lookup
         }
@@ -3879,7 +3916,7 @@ pub(crate) fn lookup_own_slot(
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
-                *value = read_upvalue(heap, cell);
+                *value = mapped_read(heap, cell);
             }
             (
                 Some(OwnPropertySlotHit {
@@ -3927,7 +3964,7 @@ pub(crate) fn lookup_own_atom(
             if let Some(cell) = mapped_argument_cell(body, key.name())
                 && let PropertyLookup::Data { value, .. } = &mut lookup
             {
-                *value = read_upvalue(heap, cell);
+                *value = mapped_read(heap, cell);
             }
             AtomPropertyLookup {
                 hit: Some(AtomOwnPropertyHit {
@@ -4003,7 +4040,7 @@ pub(crate) fn load_own_data_slot_atom(
             return Some(body.data_value(heap, offset));
         }
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
-            return Some(read_upvalue(heap, cell));
+            return Some(mapped_read(heap, cell));
         }
         if offset >= body_property_count(heap, body) {
             return None;
@@ -4109,7 +4146,7 @@ pub(crate) fn store_own_data_slot_atom(
         body.set_data_value(offset, stored);
     });
     if let Some(cell) = mapped_cell {
-        store_upvalue(heap, cell, *value);
+        mapped_write(heap, cell, *value);
     }
     record_slot_write(heap, obj, stored);
     Some(())
@@ -4184,7 +4221,7 @@ pub fn get_own_descriptor(
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let DescriptorKind::Data { value } = &mut descriptor.kind
             {
-                *value = read_upvalue(heap, cell);
+                *value = mapped_read(heap, cell);
             }
             descriptor
         })
@@ -5171,7 +5208,7 @@ pub fn ordinary_set_data_property(
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
     let success = descriptor_core::ordinary_set_data_property(obj, heap, key, value);
     if success && let Some(cell) = mapped_cell {
-        store_upvalue(heap, cell, value);
+        mapped_write(heap, cell, value);
     }
     success
 }
@@ -5195,7 +5232,7 @@ pub(crate) fn ordinary_set_data_property_with_shape(
         append_index,
     );
     if success && let Some(cell) = mapped_cell {
-        store_upvalue(heap, cell, value);
+        mapped_write(heap, cell, value);
     }
     #[cfg(debug_assertions)]
     if success {
@@ -5935,7 +5972,7 @@ pub fn define_own_property_in_place(
         let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
         if let Some(cell) = mapped_cell {
             if map_is_data {
-                store_upvalue(heap, cell, stored);
+                mapped_write(heap, cell, stored);
                 if !map_writable {
                     heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                 }
@@ -6078,7 +6115,7 @@ fn resolve_set_inner(
                     if let Some(cell) = mapped_argument_cell(body, key)
                         && let PropertyLookup::Data { value, .. } = &mut found
                     {
-                        *value = read_upvalue(heap, cell);
+                        *value = mapped_read(heap, cell);
                     }
                     found
                 }

@@ -7,6 +7,10 @@
 //!
 //! # Invariants
 //! - Every entered try region is paired with explicit leave or finalizer handling.
+//! - The try, catch, and finally blocks each run BlockDeclarationInstantiation
+//!   (§14.2.3): lexical declarations and hoisted functions of the block bind
+//!   in its own scope, whose context each entry creates afresh. The catch
+//!   parameter shares the catch block's scope (a clash is an early error).
 //!
 //! # See also
 //! - `statements` for dispatch
@@ -70,11 +74,7 @@ pub(crate) fn compile_try_statement(
         let inner = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
         cx.active_handlers += 1;
 
-        cx.enter_scope();
-        for inner_stmt in &s.block.body {
-            compile_discarded_statement(cx, inner_stmt)?;
-        }
-        cx.exit_scope();
+        compile_try_block(cx, &s.block)?;
         cx.emit(Op::LeaveTry, vec![], span);
         cx.active_handlers -= 1; // inner catch handler left
         let success_jump = cx.emit_branch_placeholder(Op::Jump, None, span);
@@ -96,11 +96,7 @@ pub(crate) fn compile_try_statement(
     if has_catch {
         let handler_pc = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
         cx.active_handlers += 1;
-        cx.enter_scope();
-        for inner_stmt in &s.block.body {
-            compile_discarded_statement(cx, inner_stmt)?;
-        }
-        cx.exit_scope();
+        compile_try_block(cx, &s.block)?;
         cx.emit(Op::LeaveTry, vec![], span);
         cx.active_handlers -= 1;
         let skip_catch = cx.emit_branch_placeholder(Op::Jump, None, span);
@@ -116,11 +112,7 @@ pub(crate) fn compile_try_statement(
     let handler_pc = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
     cx.active_handlers += 1;
     cx.active_finally += 1;
-    cx.enter_scope();
-    for inner_stmt in &s.block.body {
-        compile_discarded_statement(cx, inner_stmt)?;
-    }
-    cx.exit_scope();
+    compile_try_block(cx, &s.block)?;
     cx.emit(Op::LeaveTry, vec![], span);
     cx.active_handlers -= 1;
     cx.active_finally -= 1;
@@ -128,6 +120,21 @@ pub(crate) fn compile_try_statement(
     compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
     cx.emit(Op::EndFinally, vec![], span);
     Ok(None)
+}
+
+/// Lower the `try` block as a Block (§14.2.3).
+fn compile_try_block(
+    cx: &mut Compiler,
+    block: &oxc_ast::ast::BlockStatement<'_>,
+) -> Result<(), CompileError> {
+    let span = (block.span.start, block.span.end);
+    let mark = cx.scratch;
+    compile_block_body(cx, &block.body, otter_bytecode::ScopeKind::Block, span)?;
+    let floor = mark.max(cx.context_register_floor());
+    if floor < cx.scratch {
+        cx.reset_scratch(floor);
+    }
+    Ok(())
 }
 
 pub(crate) fn compile_catch_clause(
@@ -139,55 +146,50 @@ pub(crate) fn compile_catch_clause(
     // §14.15.3 — a throw discards the try block's completion value;
     // the catch clause threads its own `V` from `undefined`.
     cx.emit_completion_reset(span);
-    cx.enter_scope();
-    if let Some(param) = &handler.param {
-        match &param.pattern {
-            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
-                let pname = id.name.as_str().to_string();
-                // Catch parameters are fresh declarative bindings.
-                // When an outer `var` with the same name is captured,
-                // the generic name-keyed capture allocator would reuse
-                // that upvalue cell. Force a new cell for the catch
-                // binding so it shadows instead of aliasing.
-                let storage = cx.declare_captured_binding(&pname, false, span)?;
-                cx.emit_store_storage(exc_reg, storage, span);
-                cx.mark_initialized(&pname);
-                // §B.3.5 — a direct eval below may var-declare this
-                // name without a SyntaxError; the site snapshot reads
-                // the flag off the binding.
-                if let Some(info) = cx
-                    .scopes
-                    .last_mut()
-                    .and_then(|scope| scope.bindings.get_mut(&pname))
-                {
-                    info.catch_param = true;
+    // §14.15.2 CatchClauseEvaluation — a fresh catch environment per
+    // entry: its context (when the parameter or a block binding lives in
+    // a slot) is created here, after the unwinder filled `exc_reg`.
+    cx.enter_scope(otter_bytecode::ScopeKind::Catch);
+    let result = (|| {
+        if let Some(param) = &handler.param {
+            match &param.pattern {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
+                    let pname = id.name.as_str().to_string();
+                    let storage = cx.declare_binding(
+                        &pname,
+                        otter_bytecode::SlotKind::CatchParam { simple: true },
+                        span,
+                    )?;
+                    cx.emit_store_storage(exc_reg, storage, span);
+                    cx.mark_initialized(&pname);
+                }
+                // §14.15 Catch — `catch (pattern) { … }` destructures the
+                // exception value into fresh bindings of the catch scope.
+                // <https://tc39.es/ecma262/#sec-runtime-semantics-catchclauseevaluation>
+                pattern => {
+                    let mut names = Vec::new();
+                    collect_pattern_var_names(pattern, &mut names);
+                    for name in &names {
+                        if cx.lookup_in_current_scope(name).is_none() {
+                            cx.declare_binding(
+                                name,
+                                otter_bytecode::SlotKind::CatchParam { simple: false },
+                                span,
+                            )?;
+                        }
+                    }
+                    destructure_into(cx, exc_reg, pattern, span)?;
                 }
             }
-            // §14.15 Catch — `catch (pattern) { … }` accepts a
-            // BindingPattern. Destructure the exception value into
-            // freshly-declared lexical bindings.
-            // <https://tc39.es/ecma262/#sec-runtime-semantics-catchclauseevaluation>
-            _ => destructure_into(cx, exc_reg, &param.pattern, span)?,
         }
-    }
-    // §14.2.3 BlockDeclarationInstantiation — the catch Block's
-    // lexical names pre-declare (TDZ) at entry so closures made
-    // before the declaration bind the block binding. A clash with
-    // the catch parameter is an early error, so sharing the scope
-    // is safe.
-    let mut block_lex: Vec<(String, bool)> = Vec::new();
-    crate::hoist::hoist_lexical_names(&handler.body.body, &mut block_lex);
-    let (mut block_captured, nested_eval) =
-        crate::capture::nested_function_refs_in_statements(&handler.body.body);
-    if nested_eval {
-        block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
-    }
-    crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
-    for inner in &handler.body.body {
-        compile_discarded_statement(cx, inner)?;
-    }
+        // §14.2.3 BlockDeclarationInstantiation of the catch Block — its
+        // lexical names and functions bind in the same scope as the
+        // parameter.
+        compile_block_statements(cx, &handler.body.body, span)?;
+        Ok(())
+    })();
     cx.exit_scope();
-    Ok(())
+    result
 }
 
 pub(crate) fn compile_finalizer(
@@ -219,24 +221,11 @@ pub(crate) fn compile_finalizer(
     };
     let saved = cx.completion_suppressed;
     cx.top_mut().finally_body_depth += 1;
-    cx.enter_scope();
-    let result: Result<(), CompileError> = (|| {
-        // §14.2.3 — the finally Block's lexical names pre-declare
-        // (TDZ) at entry, same as any other block.
-        let fspan = (finalizer.span.start, finalizer.span.end);
-        let mut block_lex: Vec<(String, bool)> = Vec::new();
-        crate::hoist::hoist_lexical_names(&finalizer.body, &mut block_lex);
-        let (mut block_captured, nested_eval) =
-            crate::capture::nested_function_refs_in_statements(&finalizer.body);
-        if nested_eval {
-            block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
-        }
-        crate::hoist::pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, fspan)?;
-        for inner in &finalizer.body {
-            compile_discarded_statement(cx, inner)?;
-        }
-        Ok(())
-    })();
+    // §14.2.3 — the finally Block instantiates its declarations like any
+    // other block.
+    let fspan = (finalizer.span.start, finalizer.span.end);
+    cx.enter_scope(otter_bytecode::ScopeKind::Block);
+    let result = compile_block_statements(cx, &finalizer.body, fspan).map(drop);
     cx.exit_scope();
     cx.top_mut().finally_body_depth -= 1;
     cx.top_mut().completion_suppressed = saved;

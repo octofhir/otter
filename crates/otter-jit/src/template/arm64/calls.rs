@@ -663,7 +663,6 @@ fn try_emit_inline_numeric_method(
         },
         17,
         plan.has_receiver_property().then_some(16),
-        !method.body.code_block.observes_eval_env,
         guard_miss,
     )?;
     if plan.has_receiver_property() {
@@ -787,13 +786,7 @@ fn try_emit_inline_numeric_callee(
     };
     let guard_start = ops.offset().0;
     emit_load_reg(ops, 9, callee_register)?;
-    crate::arm64::inline_guard::emit_inline_identity(
-        ops,
-        view,
-        callee.function_id(),
-        callee.body.code_block.observes_eval_env,
-        bail,
-    );
+    crate::arm64::inline_guard::emit_inline_identity(ops, view, callee.function_id(), bail);
 
     let guard_end = ops.offset().0;
     if let Some(code_map) = code_map.as_deref_mut() {
@@ -1155,7 +1148,6 @@ pub(super) fn emit_call_with_receiver(
             },
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
-            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             code_map,
             bail,
             transition,
@@ -1371,7 +1363,6 @@ pub(super) fn emit_construct(
             table.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
             table.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
             0,
-            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             0,
             code_map,
             bail,
@@ -1655,7 +1646,6 @@ pub(super) fn emit_method_call(
             },
             17,
             None,
-            true,
             next_target,
         )?;
         if let Some(code_map) = code_map.as_deref_mut() {
@@ -1678,7 +1668,6 @@ pub(super) fn emit_method_call(
             direct_site,
             table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
             table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
-            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             code_map.as_deref_mut(),
             bail,
             transition,

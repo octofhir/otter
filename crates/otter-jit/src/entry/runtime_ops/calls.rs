@@ -56,27 +56,6 @@ pub(crate) extern "C" fn jit_pop_native_activation_stub(ctx: *mut JitCtx) -> u64
     NativeResultStatus::Success as u64
 }
 
-/// Validate a closure callee for scratch-frame inlining and return its captured
-/// upvalue-spine base, or `0` when the site must take the normal call path.
-pub(crate) extern "C" fn jit_inline_closure_upvalues_stub(
-    ctx: *mut JitCtx,
-    callee_reg: u64,
-    expected_fid: u64,
-) -> usize {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let callee = match ctx
-        .active_frame_mut()
-        .and_then(|frame| frame.read(callee_reg as u16))
-    {
-        Ok(callee) => callee,
-        Err(_) => return 0,
-    };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    vm.jit_inline_closure_upvalues(callee, expected_fid as u32)
-        .unwrap_or(0)
-}
-
 /// Cold deoptimization for one already-started generated stack call.
 ///
 /// The native frame stays published for this entire transition. The VM copies

@@ -84,7 +84,7 @@ pub(crate) fn compile_expr(
         Expression::ThisExpression(t) => {
             let span = (t.span.start, t.span.end);
             let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(dst)], span);
+            cx.emit_load_this(dst, span);
             Ok(dst)
         }
 
@@ -203,32 +203,24 @@ pub(crate) fn compile_expr(
                 f.id.as_ref()
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-            // §10.2.11 / §15.2.5 NamedEvaluation — a NAMED function
-            // expression whose body observes its own name binds that name
-            // in a funcEnv between the enclosing scope and the function
-            // scope, holding the closure itself, immutably. Model the
-            // funcEnv as a synthetic compiler scope with an own-upvalue
-            // cell: the closure captures the cell, and the cell is filled
-            // with the closure right after `MakeClosure`, so the self-name
-            // resolves to the *same* object every call (identity and
-            // expando properties survive; no per-call re-make).
+            // §15.2.5 — a NAMED function expression binds its own name in
+            // a funcEnv the function itself owns (`LoadSelf`), so the name
+            // resolves to the very closure every call. §20.2.1.1
+            // CreateDynamicFunction's `function anonymous(...)` binds
+            // nothing.
             let dynamic_fn_no_self = std::mem::take(&mut cx.next_fn_expr_no_self_binding);
-            if dynamic_fn_no_self {
-                // §20.2.1.1 — suppress the in-child self binding too.
-                cx.next_fn_no_self_name = true;
-            }
-            let self_observed = !dynamic_fn_no_self
-                && f.id.is_some()
-                && f.body.as_ref().is_some_and(|body| {
-                    capture::body_references_name(Some(&f.params), body, &name)
-                        || capture::body_contains_direct_eval(Some(&f.params), body)
-                });
-            if self_observed {
-                cx.enter_scope();
-                let storage = cx.declare_captured_binding(&name, true, span)?;
-                cx.mark_fn_self_name(&name);
-                cx.next_fn_no_self_name = true;
-                let result = compile_function_full(
+            let record = if f.id.is_some() && !dynamic_fn_no_self {
+                compile_named_function_expression(
+                    cx,
+                    &name,
+                    &f.params,
+                    &f.body,
+                    span,
+                    f.r#async,
+                    f.generator,
+                )?
+            } else {
+                compile_function_full(
                     cx,
                     &name,
                     &f.params,
@@ -237,44 +229,18 @@ pub(crate) fn compile_expr(
                     f.r#async,
                     f.generator,
                     false,
-                );
-                let (function_id, captures) = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        cx.exit_scope();
-                        return Err(e);
-                    }
-                };
-                let dst = cx.alloc_scratch();
-                let const_idx = cx.intern_function_id(function_id);
-                emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
-                cx.emit_store_storage(dst, storage, span);
-                cx.mark_initialized(&name);
-                cx.exit_scope();
-                return Ok(dst);
-            }
-            let (function_id, captures) = compile_function_full(
-                cx,
-                &name,
-                &f.params,
-                &f.body,
-                span,
-                f.r#async,
-                f.generator,
-                false,
-            )?;
+                )?
+            };
             let dst = cx.alloc_scratch();
-            let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
+            emit_make_callable(cx, dst, &record, span);
             Ok(dst)
         }
 
         Expression::ArrowFunctionExpression(a) => {
             let span = (a.span.start, a.span.end);
-            let (function_id, captures) = compile_arrow_function(cx, a, span)?;
+            let record = compile_arrow_function(cx, a, span)?;
             let dst = cx.alloc_scratch();
-            let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, true, span)?;
+            emit_make_callable(cx, dst, &record, span);
             Ok(dst)
         }
 
@@ -329,8 +295,7 @@ pub(crate) fn compile_expr_with_inferred_name(
         ),
         Expression::FunctionExpression(f) if f.id.is_none() => {
             let span = (f.span.start, f.span.end);
-            cx.next_fn_no_self_name = true;
-            let (function_id, captures) = compile_function_full(
+            let record = compile_function_full(
                 cx,
                 inferred_name,
                 &f.params,
@@ -341,21 +306,19 @@ pub(crate) fn compile_expr_with_inferred_name(
                 false,
             )?;
             let dst = cx.alloc_scratch();
-            let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
+            emit_make_callable(cx, dst, &record, span);
             Ok(dst)
         }
         Expression::ArrowFunctionExpression(a) => {
             let span = (a.span.start, a.span.end);
-            let (function_id, captures) = compile_arrow_function(cx, a, span)?;
+            let record = compile_arrow_function(cx, a, span)?;
             {
                 let module = Rc::clone(&cx.top_mut().module);
-                module.borrow_mut().functions[function_id as usize].name =
+                module.borrow_mut().functions[record.function_id as usize].name =
                     inferred_name.to_string();
             }
             let dst = cx.alloc_scratch();
-            let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, true, span)?;
+            emit_make_callable(cx, dst, &record, span);
             Ok(dst)
         }
         Expression::ClassExpression(class) if class.id.is_none() => {
@@ -412,11 +375,7 @@ pub(crate) fn compile_expr_into_with_inferred_name(
             Ok(destination)
         }
         Expression::ThisExpression(this) => {
-            cx.emit(
-                Op::LoadThis,
-                [Operand::Register(destination)],
-                (this.span.start, this.span.end),
-            );
+            cx.emit_load_this(destination, (this.span.start, this.span.end));
             Ok(destination)
         }
         Expression::ParenthesizedExpression(parenthesized) => compile_expr_into_with_inferred_name(

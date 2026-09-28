@@ -8,7 +8,6 @@
 //! - Ordinary call entry and shared callable invocation.
 //! - Constructor call entry, receiver/prototype setup and learned slot capacity.
 //! - Spread and explicit-`this` call forms.
-//! - Stack-owned generated-call upvalue-spine initialization.
 //! - Same-stack synchronous re-entry and reusable lean callback frames.
 //! - Dispatch-local owner resolution for cross-chunk callees.
 //!
@@ -45,9 +44,10 @@
 //!   and invalidates them against the code-space publication epoch.
 //! - A freshly-started generator remains in a moving GC root through observable
 //!   `prototype` lookup and publication into the caller.
-//! - Generated entry publishes its own upvalue count only after the complete
-//!   batch is initialized; the allocation boundary roots its pending registers
-//!   and SELF before copying inherited handles from the current closure.
+//! - Every bytecode frame is built with its exact SELF; building a frame
+//!   allocates no GC memory, so call-site locals stay current until the frame
+//!   is published. The callee reaches its outer bindings through SELF's
+//!   context and creates its own contexts in its prologue.
 //!
 //! # See also
 //! - [`crate::Frame`]
@@ -66,7 +66,6 @@ use crate::{
     NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     argument_window::{ArgumentOperands, BytecodeArgumentWindow},
     executable::OperandView,
-    frame_state::UpvalueSpine,
     is_constructor_runtime, native_to_vm_error_with_stack,
     operand_decode::register_operand,
     promise_dispatch, read_register,
@@ -119,10 +118,10 @@ mod tests {
             .alloc_host_object_with_roots(&[], &[])
             .expect("construct receiver");
         let window = interp.alloc_reg_window(1).expect("register window");
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
+        let mut frame = Frame::for_code_block(
             &function,
             None,
-            Frame::empty_upvalues(),
+            Value::function(0),
             Value::object(receiver),
             window,
         );
@@ -134,7 +133,6 @@ mod tests {
                 &mut frame,
                 smallvec::smallvec![Value::number_i32(1), Value::number_i32(2)],
                 false,
-                None,
                 Some(receiver),
                 Value::function(0),
             )
@@ -308,17 +306,11 @@ fn invoke_native_call_with_roots(
     }
 }
 
-/// `(function_id, upvalues, this, new_target, derived_this_cell,
-/// eval_env, closure)` resolved from a callable value for a bytecode call.
-pub(crate) type BytecodeCallTargetParts = (
-    u32,
-    crate::frame_state::UpvalueSpine,
-    Value,
-    Option<Value>,
-    Option<crate::UpvalueCell>,
-    Option<crate::eval_env::EvalEnvHandle>,
-    Option<crate::closure::JsClosure>,
-);
+/// `(function_id, this, new_target, closure)` resolved from a callable value
+/// for a bytecode call. `closure` is the exact SELF when the target is a
+/// closure; the callee reaches its context through it.
+pub(crate) type BytecodeCallTargetParts =
+    (u32, Value, Option<Value>, Option<crate::closure::JsClosure>);
 
 #[derive(Clone)]
 pub(crate) struct LeanCallbackRoot {
@@ -326,8 +318,6 @@ pub(crate) struct LeanCallbackRoot {
     function_id: u32,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
-    bound_derived_this: Option<crate::UpvalueCell>,
-    eval_env: Option<crate::eval_env::EvalEnvHandle>,
 }
 
 impl LeanCallbackRoot {
@@ -349,8 +339,6 @@ impl LeanCallbackRoot {
                 function_id,
                 bound_this: None,
                 bound_new_target: None,
-                bound_derived_this: None,
-                eval_env: None,
             });
         }
         let closure = callback.as_closure(heap)?;
@@ -361,29 +349,7 @@ impl LeanCallbackRoot {
             function_id,
             bound_this: state.bound_this,
             bound_new_target: state.bound_new_target,
-            bound_derived_this: state.bound_derived_this,
-            eval_env: state.eval_env,
         })
-    }
-
-    /// Re-read the allocation-neutral captured spine from the currently traced
-    /// callback value. The callback root keeps the closure allocation alive and
-    /// is relocation-refreshed between builtin elements.
-    fn upvalue_source(
-        &self,
-        heap: &otter_gc::GcHeap,
-    ) -> Result<crate::upvalue_source::UpvalueSource, VmError> {
-        if self.callback.as_function().is_some() {
-            return Ok(crate::upvalue_source::UpvalueSource::empty());
-        }
-        let closure = self
-            .callback
-            .as_closure(heap)
-            .ok_or(VmError::InvalidOperand)?;
-        if closure.function_id() != self.function_id {
-            return Err(VmError::InvalidOperand);
-        }
-        Ok(closure.call_state(heap).upvalues)
     }
 
     pub(crate) fn trace_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
@@ -393,14 +359,6 @@ impl LeanCallbackRoot {
         }
         if let Some(value) = &self.bound_new_target {
             value.trace_value_slots(visitor);
-        }
-        if let Some(cell) = &self.bound_derived_this {
-            let p = cell as *const crate::UpvalueCell as *mut RawGc;
-            visitor(p);
-        }
-        if let Some(env) = &self.eval_env {
-            let p = env as *const crate::eval_env::EvalEnvHandle as *mut RawGc;
-            visitor(p);
         }
     }
 }
@@ -475,12 +433,8 @@ pub(crate) struct LeanCallbackState {
     param_count: usize,
     /// Strict and arrow callbacks use the incoming receiver directly.
     this_passthrough: bool,
-    /// Whether the callback has captured upvalues that must be refreshed from
-    /// the traced root before each off-stack recycled-frame entry.
-    has_parent_upvalues: bool,
-    /// True when the callback carries no bound `new.target`, derived-`this`
-    /// cell, or captured eval environment — i.e. the per-element frame needs no
-    /// pooled cold record. The hot Array/Map/Set/TypedArray callbacks (plain
+    /// True when the callback carries no bound `new.target` — i.e. the
+    /// per-element frame needs no pooled cold record. The hot Array/Map/Set/TypedArray callbacks (plain
     /// functions and arrows) all qualify, so they take the prepared-frame fast
     /// path; anything else falls to the general per-element build.
     fast_reuse: bool,
@@ -489,8 +443,8 @@ pub(crate) struct LeanCallbackState {
     /// state lives only for a single builtin invocation, so no mid-loop
     /// recompilation can stale this handle.
     compiled: Option<std::sync::Arc<dyn crate::jit::JitFunctionCode>>,
-    /// Recycled callee frame for the prepared fast path: its register window,
-    /// upvalue spine box, and frame shell are reused across elements instead of
+    /// Recycled callee frame for the prepared fast path: its register window
+    /// and frame shell are reused across elements instead of
     /// being drawn, built, and dropped per element. `None` until the first
     /// fast-path call builds it, and whenever a bail consumes it mid-loop.
     reuse_frame: Option<Frame>,
@@ -1131,163 +1085,6 @@ impl Interpreter {
         })
     }
 
-    /// Initialize the exact upvalue spine of an unpublished stack-owned
-    /// generated callee. Fresh cells occupy the prefix and closure captures
-    /// follow without allocating a Rust-owned frame container.
-    ///
-    /// # Safety
-    ///
-    /// `frame` must name an exclusively owned native frame whose initialized
-    /// register window and `upvalue_base` storage stay live for the call. The
-    /// storage must contain at least `own + inherited` handles.
-    pub unsafe fn jit_initialize_generated_upvalues(
-        &mut self,
-        stack: &ActivationStack,
-        context: &ExecutionContext,
-        frame: *mut crate::native_abi::NativeFrame,
-        own: u16,
-        inherited: u16,
-    ) -> Result<bool, VmError> {
-        let function_id = unsafe { (*frame).header.function_id };
-        let Ok(owner) = context.for_function(function_id) else {
-            return Ok(false);
-        };
-        let context = &*owner;
-        let Some(function) = context.exec_function(function_id) else {
-            return Ok(false);
-        };
-        if function.own_upvalue_count != own || function.inherited_upvalue_count != inherited {
-            return Ok(false);
-        }
-        let total = usize::from(own)
-            .checked_add(usize::from(inherited))
-            .ok_or(VmError::InvalidOperand)?;
-        let base = unsafe { (*frame).upvalue_base as *mut crate::UpvalueCell };
-        if total != 0 && base.is_null() {
-            return Ok(false);
-        }
-        unsafe { (*frame).upvalue_count = 0 };
-        let roots = self.collect_allocation_roots(stack);
-        if own != 0 {
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-                // SAFETY: the generated caller owns this unpublished frame
-                // and register window. The empty upvalue prefix stays hidden
-                // until the entire allocation batch has completed.
-                if let Ok(active) = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) } {
-                    active.trace_stack_register_slots(visitor);
-                    active.trace_non_register_slots(visitor);
-                }
-            };
-            // SAFETY: the validated generated window reserves `own` handles.
-            // Initialize the Rust slice before exposing it to the batch writer;
-            // upvalue_count remains zero while allocation can collect.
-            let cells = unsafe {
-                std::ptr::write_bytes(base, 0, usize::from(own));
-                std::slice::from_raw_parts_mut(base, usize::from(own))
-            };
-            self.gc_heap
-                .alloc_old_batch_with_roots(
-                    crate::UpvalueCellBody {
-                        value: Value::undefined(),
-                    },
-                    cells,
-                    &mut external_visit,
-                )
-                .map_err(crate::oom_to_vm)?;
-            unsafe { (*frame).upvalue_count = u32::from(own) };
-        }
-
-        // Allocations may move the exact closure body and rewrite SELF in the
-        // unpublished frame. Re-read it only after the final collection, then
-        // copy its stable old-space spine handles into the stack suffix.
-        let self_value = Value::from_abi_bits(unsafe { (*frame).self_value_bits });
-        if inherited != 0 {
-            let Some(closure) = self_value.as_closure(&self.gc_heap) else {
-                return Ok(false);
-            };
-            if closure.function_id() != function_id {
-                return Ok(false);
-            }
-            let source = closure.call_state(&self.gc_heap).upvalues;
-            if source.len() != usize::from(inherited) {
-                return Ok(false);
-            }
-            for index in 0..usize::from(inherited) {
-                let cell = source.read(index).ok_or(VmError::InvalidOperand)?;
-                unsafe { base.add(usize::from(own) + index).write(cell) };
-            }
-        } else if let Some(closure) = self_value.as_closure(&self.gc_heap)
-            && closure.function_id() == function_id
-            && !closure.call_state(&self.gc_heap).upvalues.is_empty()
-        {
-            return Ok(false);
-        }
-        unsafe {
-            (*frame).upvalue_count = u32::try_from(total).map_err(|_| VmError::InvalidOperand)?;
-        }
-        Ok(true)
-    }
-
-    pub(crate) fn lean_callback_parent_upvalue(
-        &self,
-        state: &LeanCallbackState,
-        idx: usize,
-    ) -> Option<crate::UpvalueCell> {
-        self.lean_callback_roots
-            .get(state.root_index)?
-            .upvalue_source(&self.gc_heap)
-            .ok()?
-            .read(idx)
-    }
-
-    /// §9.1 — install the frame's direct-eval variable environment:
-    /// a `contains_direct_eval` function gets a FRESH record chained
-    /// to the closure's captured one (so probe closures created
-    /// before the eval observe later bindings); other closures just
-    /// re-expose the captured record for the dynamic walkers.
-    #[inline]
-    pub(crate) fn stash_frame_eval_env(
-        &mut self,
-        function: &crate::executable::CodeBlock,
-        frame: &mut Frame,
-        inherited: Option<crate::eval_env::EvalEnvHandle>,
-    ) -> Result<(), VmError> {
-        // A body with no direct `eval` and no inherited record installs
-        // nothing, which is every ordinary call; keep the record allocation
-        // itself out of line.
-        if !function.contains_direct_eval && inherited.is_none() {
-            return Ok(());
-        }
-        self.stash_frame_eval_env_slow(function, frame, inherited)
-    }
-
-    #[cold]
-    fn stash_frame_eval_env_slow(
-        &mut self,
-        function: &crate::executable::CodeBlock,
-        frame: &mut Frame,
-        inherited: Option<crate::eval_env::EvalEnvHandle>,
-    ) -> Result<(), VmError> {
-        if function.contains_direct_eval {
-            let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                frame.trace_frame_slots(visitor);
-            };
-            let env = crate::eval_env::alloc_eval_env_with_roots(
-                &mut self.gc_heap,
-                inherited,
-                &mut frame_roots,
-            )
-            .map_err(crate::oom_to_vm)?;
-            frame.eval_env = env;
-        } else if inherited.is_some() {
-            frame.eval_env = inherited.expect("checked inherited eval env");
-        }
-        Ok(())
-    }
-
     pub(crate) fn bind_bytecode_call_arguments(
         &mut self,
         function: &CodeBlock,
@@ -1332,7 +1129,6 @@ impl Interpreter {
         frame: &mut Frame,
         args: SmallVec<[Value; 8]>,
         is_derived: bool,
-        derived_this_cell: Option<crate::UpvalueCell>,
         receiver: Option<JsObject>,
         new_target: Value,
     ) -> Result<(), VmError> {
@@ -1344,7 +1140,6 @@ impl Interpreter {
         let cold = self.frame_ensure_cold(frame);
         if is_derived {
             cold.is_derived_constructor = true;
-            cold.derived_this_cell = derived_this_cell;
         } else {
             cold.construct_target = receiver;
         }
@@ -1387,72 +1182,49 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Resolve a bytecode call target: its function id, the `this` the
+    /// callee binds (an arrow's lexical copy wins over the call site), an
+    /// arrow's lexical `new.target`, and the exact closure (SELF) when the
+    /// target is one.
     pub(crate) fn bytecode_call_target_parts(
         current: Value,
         effective_this: Value,
         heap: &otter_gc::GcHeap,
     ) -> Result<BytecodeCallTargetParts, VmError> {
         if let Some(function_id) = current.as_function() {
-            return Ok((
-                function_id,
-                Frame::empty_upvalues(),
-                effective_this,
-                None,
-                None,
-                None,
-                None,
-            ));
+            return Ok((function_id, effective_this, None, None));
         }
         if let Some(handle) = current
             .as_raw_gc()
             .and_then(|raw| raw.checked_cast::<crate::closure::JsClosureBody>())
         {
-            let (function_id, bound_this, bound_new_target, bound_derived_this, eval_env) = heap
-                .read_payload(handle, |body| {
-                    (
-                        body.call_header.function_id,
-                        body.bound_this_option(),
-                        body.bound_new_target_option(),
-                        body.bound_derived_this_option(),
-                        body.eval_env_option(),
-                    )
-                });
-            let c = crate::closure::JsClosure::from_parts(handle, function_id);
-            let upvalues: crate::frame_state::UpvalueSpine =
-                c.upvalues_snapshot(heap).into_boxed_slice();
-            let mut this_value = bound_this.unwrap_or(effective_this);
-            // An arrow closed over a derived constructor's pre-super()
-            // `this` snapshot carries the hole; the live value arrives
-            // through the shared derived-this cell once super() runs.
-            if this_value.is_hole()
-                && let Some(cell) = bound_derived_this
-            {
-                this_value = crate::read_upvalue(heap, cell);
-            }
+            let (function_id, bound_this, bound_new_target) = heap.read_payload(handle, |body| {
+                (
+                    body.call_header.function_id,
+                    body.bound_this_option(),
+                    body.bound_new_target_option(),
+                )
+            });
+            let closure = crate::closure::JsClosure::from_parts(handle, function_id);
             return Ok((
                 function_id,
-                upvalues,
-                this_value,
+                bound_this.unwrap_or(effective_this),
                 bound_new_target,
-                bound_derived_this,
-                eval_env,
-                Some(c),
+                Some(closure),
             ));
         }
         Err(VmError::NotCallable)
     }
 
-    fn bytecode_construct_target_parts(
+    fn bytecode_construct_target_function_id(
         current: Value,
         heap: &otter_gc::GcHeap,
-    ) -> Result<(u32, crate::frame_state::UpvalueSpine), VmError> {
+    ) -> Result<u32, VmError> {
         if let Some(function_id) = current.as_function() {
-            return Ok((function_id, Frame::empty_upvalues()));
+            return Ok(function_id);
         }
-        if let Some(c) = current.as_closure(heap) {
-            let function_id = c.function_id();
-            let upvalues = c.upvalues_snapshot(heap).into_boxed_slice();
-            return Ok((function_id, upvalues));
+        if let Some(closure) = current.as_closure(heap) {
+            return Ok(closure.function_id());
         }
         Err(VmError::NotCallable)
     }
@@ -1460,14 +1232,13 @@ impl Interpreter {
     fn build_construct_bytecode_frame(
         &mut self,
         context: &ExecutionContext,
-        mut current: Value,
-        mut receiver: Option<JsObject>,
-        mut new_target: Value,
-        mut args: SmallVec<[Value; 8]>,
+        current: Value,
+        receiver: Option<JsObject>,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
-        let (function_id, parent_upvalues) =
-            Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
+        let function_id = Self::bytecode_construct_target_function_id(current, &self.gc_heap)?;
         let owner = context
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)?;
@@ -1481,29 +1252,9 @@ impl Interpreter {
         if function.is_async || function.is_generator || function.is_method {
             return Err(self.err_type(("function is not a constructor".to_string()).into()));
         }
-        // Everything read below lives in plain Rust locals while this frame
-        // is not yet on any traced stack: a collection triggered by the cell
-        // allocations must rewrite them in place or they go stale.
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            current.trace_value_slot_mut(visitor);
-            new_target.trace_value_slot_mut(visitor);
-            if let Some(receiver) = &mut receiver {
-                visitor(receiver as *mut JsObject as *mut RawGc);
-            }
-            for value in &mut args {
-                value.trace_value_slot_mut(visitor);
-            }
-        };
-        let upvalues = Frame::build_upvalues_for_exec_with_roots(
-            &mut self.gc_heap,
-            function,
-            parent_upvalues,
-            &mut build_roots,
-        )?;
         // §10.2.2 — a derived constructor enters with `this` in the
-        // TDZ; `super(...)` binds it via `Op::BindThisValue`. A base
-        // constructor receives the freshly-allocated receiver as
-        // `this` immediately.
+        // TDZ; `super(...)` binds it. A base constructor receives the
+        // freshly-allocated receiver as `this` immediately.
         let is_derived = function.is_derived_constructor;
         debug_assert!(
             !is_derived || receiver.is_none(),
@@ -1514,44 +1265,13 @@ impl Interpreter {
         } else {
             Value::object(receiver.ok_or(VmError::InvalidOperand)?)
         };
+        // Frame construction allocates no GC memory: the locals stay current.
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            return_register,
-            upvalues,
-            this_value,
-            window,
-        );
-        frame.self_value = current;
-        let derived_this_cell = if is_derived {
-            let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                frame.trace_frame_slots(visitor);
-                current.trace_value_slot_mut(visitor);
-                new_target.trace_value_slot_mut(visitor);
-                if let Some(receiver) = &mut receiver {
-                    visitor(receiver as *mut JsObject as *mut RawGc);
-                }
-                for value in &mut args {
-                    value.trace_value_slot_mut(visitor);
-                }
-            };
-            Some(crate::alloc_upvalue_with_roots(
-                &mut self.gc_heap,
-                Value::hole(),
-                &mut frame_roots,
-            )?)
-        } else {
-            None
-        };
+        let mut frame =
+            Frame::for_code_block(function, return_register, current, this_value, window);
         self.bind_construct_arguments_and_publish_cold(
-            function,
-            &mut frame,
-            args,
-            is_derived,
-            derived_this_cell,
-            receiver,
-            new_target,
+            function, &mut frame, args, is_derived, receiver, new_target,
         )?;
         window_rollback.commit();
         Ok(frame)
@@ -1560,14 +1280,13 @@ impl Interpreter {
     fn build_construct_bytecode_frame_from_window(
         &mut self,
         context: &ExecutionContext,
-        mut current: Value,
-        mut receiver: Option<JsObject>,
-        mut new_target: Value,
+        current: Value,
+        receiver: Option<JsObject>,
+        new_target: Value,
         args: &BytecodeArgumentWindow<'_, '_>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
-        let (function_id, parent_upvalues) =
-            Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
+        let function_id = Self::bytecode_construct_target_function_id(current, &self.gc_heap)?;
         let owner = context
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)?;
@@ -1580,21 +1299,6 @@ impl Interpreter {
         if function.is_async || function.is_generator || function.is_method {
             return Err(self.err_type(("function is not a constructor".to_string()).into()));
         }
-        // See `build_construct_bytecode_frame`: the frame is not yet on a
-        // traced stack, so every local must ride through the allocations.
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            current.trace_value_slot_mut(visitor);
-            new_target.trace_value_slot_mut(visitor);
-            if let Some(receiver) = &mut receiver {
-                visitor(receiver as *mut JsObject as *mut RawGc);
-            }
-        };
-        let upvalues = Frame::build_upvalues_for_exec_with_roots(
-            &mut self.gc_heap,
-            function,
-            parent_upvalues,
-            &mut build_roots,
-        )?;
         let is_derived = function.is_derived_constructor;
         debug_assert!(
             !is_derived || receiver.is_none(),
@@ -1607,43 +1311,13 @@ impl Interpreter {
         };
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            return_register,
-            upvalues,
-            this_value,
-            window,
-        );
-        frame.self_value = current;
-        let mut extras = args.bind_into(function, &mut frame)?;
-        let derived_this_cell = if is_derived {
-            let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                frame.trace_frame_slots(visitor);
-                current.trace_value_slot_mut(visitor);
-                new_target.trace_value_slot_mut(visitor);
-                if let Some(receiver) = &mut receiver {
-                    visitor(receiver as *mut JsObject as *mut RawGc);
-                }
-                for value in &mut extras.rest_args {
-                    value.trace_value_slot_mut(visitor);
-                }
-                for value in &mut extras.incoming_args {
-                    value.trace_value_slot_mut(visitor);
-                }
-            };
-            Some(crate::alloc_upvalue_with_roots(
-                &mut self.gc_heap,
-                Value::hole(),
-                &mut frame_roots,
-            )?)
-        } else {
-            None
-        };
+        let mut frame =
+            Frame::for_code_block(function, return_register, current, this_value, window);
+        let extras = args.bind_into(function, &mut frame)?;
         {
             let cold = self.frame_ensure_cold(&mut frame);
             if is_derived {
                 cold.is_derived_constructor = true;
-                cold.derived_this_cell = derived_this_cell;
             } else {
                 cold.construct_target = receiver;
             }
@@ -1727,12 +1401,9 @@ impl Interpreter {
         context: &ExecutionContext,
         callee_closure: Option<crate::closure::JsClosure>,
         function_id: u32,
-        parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
-        derived_this_cell: Option<crate::UpvalueCell>,
-        callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
-        mut effective_args: SmallVec<[Value; 8]>,
+        effective_args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
         self.record_runtime_bytecode_call();
@@ -1769,50 +1440,26 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
-        let mut this_for_callee = self.this_for_bytecode_call_stack_rooted(
+        let this_for_callee = self.this_for_bytecode_call_stack_rooted(
             function,
             stack,
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let mut self_value = callee_closure
+        // SELF is the exact closure (old space, stable) or the bare function.
+        let self_value = callee_closure
             .map(Value::closure)
             .unwrap_or_else(|| Value::function(function_id));
-        let mut new_target_for_callee = new_target_for_callee;
-        let mut derived_this_cell = derived_this_cell;
-        let mut callee_eval_env = callee_eval_env;
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self_value.trace_value_slot_mut(visitor);
-            this_for_callee.trace_value_slot_mut(visitor);
-            if let Some(value) = &mut new_target_for_callee {
-                value.trace_value_slot_mut(visitor);
-            }
-            if let Some(cell) = &mut derived_this_cell {
-                visitor(cell as *mut crate::UpvalueCell as *mut RawGc);
-            }
-            if let Some(env) = &mut callee_eval_env {
-                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
-            }
-            for value in &mut effective_args {
-                value.trace_value_slot_mut(visitor);
-            }
-        };
-        let upvalues = Frame::build_upvalues_for_exec_with_roots(
-            &mut self.gc_heap,
-            function,
-            parent_upvalues,
-            &mut build_roots,
-        )?;
+        // Frame construction allocates no GC memory: the locals stay current.
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+        let mut new_frame = Frame::for_code_block(
             function,
             return_register,
-            upvalues,
+            self_value,
             this_for_callee,
             window,
         );
-        new_frame.self_value = self_value;
         if let Some(async_state) = async_state {
             self.frame_set_async_state(&mut new_frame, async_state);
         }
@@ -1820,11 +1467,6 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
         }
-        if let Some(cell) = derived_this_cell {
-            let cold = self.frame_ensure_cold(&mut new_frame);
-            cold.derived_this_cell = Some(cell);
-        }
-        self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5 Generator-call entry: instead of pushing the frame
         // onto the dispatch stack, hand the caller a paused
@@ -1888,44 +1530,22 @@ impl Interpreter {
         &mut self,
         stack: &ActivationStack,
         function: &CodeBlock,
-        parent_upvalues: UpvalueSpine,
+        self_value: Value,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
-        derived_this_cell: Option<crate::UpvalueCell>,
-        callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
         args: &BytecodeArgumentWindow<'_, '_>,
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
     ) -> Result<Frame, VmError> {
-        let mut this_for_callee =
+        let this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
-        let mut new_target_for_callee = new_target_for_callee;
-        let mut derived_this_cell = derived_this_cell;
-        let mut callee_eval_env = callee_eval_env;
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            this_for_callee.trace_value_slot_mut(visitor);
-            if let Some(value) = &mut new_target_for_callee {
-                value.trace_value_slot_mut(visitor);
-            }
-            if let Some(cell) = &mut derived_this_cell {
-                visitor(cell as *mut crate::UpvalueCell as *mut RawGc);
-            }
-            if let Some(env) = &mut callee_eval_env {
-                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
-            }
-        };
-        let upvalues = Frame::build_upvalues_for_exec_with_roots(
-            &mut self.gc_heap,
-            function,
-            parent_upvalues,
-            &mut build_roots,
-        )?;
+        // Frame construction allocates no GC memory: the locals stay current.
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
+        let mut frame = Frame::for_code_block(
             function,
             return_register,
-            upvalues,
+            self_value,
             this_for_callee,
             window,
         );
@@ -1942,11 +1562,6 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut frame);
             cold.new_target = Some(new_target);
         }
-        if let Some(cell) = derived_this_cell {
-            let cold = self.frame_ensure_cold(&mut frame);
-            cold.derived_this_cell = Some(cell);
-        }
-        self.stash_frame_eval_env(function, &mut frame, callee_eval_env)?;
         window_rollback.commit();
         Ok(frame)
     }
@@ -2058,25 +1673,18 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let current = *callee;
         let effective_this = this_value;
-        let (
-            function_id,
-            parent_upvalues,
-            this_for_callee,
-            new_target_for_callee,
-            derived_this_cell,
-            callee_eval_env,
-            callee_closure,
-        ) = match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
-            Ok(parts) => parts,
-            Err(_) if current.as_class_constructor().is_some() => {
-                // §10.3.1 — a class constructor's [[Call]] always throws;
-                // only [[Construct]] may enter it.
-                return Err(self.err_type(
-                    ("Class constructor cannot be invoked without 'new'".to_string()).into(),
-                ));
-            }
-            Err(_) => return Ok(false),
-        };
+        let (function_id, this_for_callee, new_target_for_callee, callee_closure) =
+            match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
+                Ok(parts) => parts,
+                Err(_) if current.as_class_constructor().is_some() => {
+                    // §10.3.1 — a class constructor's [[Call]] always throws;
+                    // only [[Construct]] may enter it.
+                    return Err(self.err_type(
+                        ("Class constructor cannot be invoked without 'new'".to_string()).into(),
+                    ));
+                }
+                Err(_) => return Ok(false),
+            };
         let context = owner_cache
             .resolve(context, function_id)
             .map_err(|_| VmError::InvalidOperand)?;
@@ -2099,27 +1707,24 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
-        let mut frame = {
+        // SELF is canonical hot frame state for both interpreter and native
+        // activations: the exact invoked closure, whose context the body
+        // reaches through `LoadClosureContext`.
+        let frame = {
             let caller = &stack[top_idx];
             let args =
                 BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
             self.prepare_bytecode_call_frame_from_window(
                 stack,
                 function,
-                parent_upvalues,
+                current,
                 this_for_callee,
                 new_target_for_callee,
-                derived_this_cell,
-                callee_eval_env,
                 &args,
                 return_register,
                 async_state,
             )?
         };
-        // SELF is canonical hot frame state for both interpreter and native
-        // activations. It records the exact invoked closure even when this
-        // particular body never executes a named-SELF opcode.
-        frame.self_value = current;
         if function.is_generator {
             self.push_generator_bytecode_call_frame(
                 stack,
@@ -2430,25 +2035,15 @@ impl Interpreter {
             break;
         }
         if current.is_function() || current.is_closure() {
-            let (
-                function_id,
-                parent_upvalues,
-                this_for_callee,
-                new_target_for_callee,
-                derived_this_cell,
-                callee_eval_env,
-                callee_closure,
-            ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+            let (function_id, this_for_callee, new_target_for_callee, callee_closure) =
+                Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
                 stack,
                 context,
                 callee_closure,
                 function_id,
-                parent_upvalues,
                 this_for_callee,
                 new_target_for_callee,
-                derived_this_cell,
-                callee_eval_env,
                 effective_args,
                 dst,
             );
@@ -2545,25 +2140,15 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
-        let (
-            function_id,
-            parent_upvalues,
-            this_for_callee,
-            new_target_for_callee,
-            derived_this_cell,
-            callee_eval_env,
-            callee_closure,
-        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        let (function_id, this_for_callee, new_target_for_callee, callee_closure) =
+            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         self.push_bytecode_call_frame(
             stack,
             context,
             callee_closure,
             function_id,
-            parent_upvalues,
             this_for_callee,
             new_target_for_callee,
-            derived_this_cell,
-            callee_eval_env,
             effective_args,
             dst,
         )
@@ -3177,8 +2762,8 @@ impl Interpreter {
         } else {
             roots.target()
         };
-        if let Ok((function_id, _)) =
-            Self::bytecode_construct_target_parts(bytecode_callee, &self.gc_heap)
+        if let Ok(function_id) =
+            Self::bytecode_construct_target_function_id(bytecode_callee, &self.gc_heap)
             && context
                 .exec_function(function_id)
                 .is_some_and(|function| function.is_derived_constructor)
@@ -3883,18 +3468,12 @@ impl Interpreter {
         let register_count = function.register_count as usize;
         let param_count = function.param_count as usize;
         let this_passthrough = function.is_strict || function.is_arrow;
-        let has_parent_upvalues = !root.upvalue_source(&self.gc_heap).ok()?.is_empty();
-        // A callback with no bound `new.target` / derived-`this` cell / captured
-        // eval environment needs no pooled cold record, so its per-element frame
-        // is a flat register window the prepared fast path can recycle in place.
-        // A body with OWN upvalue cells (a captured local, a catch parameter)
-        // is excluded: the recycled frame splices only the closure's parent
-        // captures, so the own leading cells would be missing and every
-        // compiled upvalue access would resolve one slot off.
-        let fast_reuse = root.bound_new_target.is_none()
-            && root.bound_derived_this.is_none()
-            && root.eval_env.is_none()
-            && function.own_upvalue_count == 0;
+        // A callback with no bound `new.target` needs no pooled cold record, so
+        // its per-element frame is a flat register window the prepared fast
+        // path can recycle in place. Its contexts are no obstacle: the body's
+        // own `CreateContext` prologue allocates fresh ones on every reuse,
+        // and its incoming context is SELF's, which reuse keeps.
+        let fast_reuse = root.bound_new_target.is_none();
         if self.enter_sync_reentry().is_ok() {
             let root_index = self.lean_callback_roots.len();
             let function_id = root.function_id;
@@ -3906,7 +3485,6 @@ impl Interpreter {
                 register_count,
                 param_count,
                 this_passthrough,
-                has_parent_upvalues,
                 fast_reuse,
                 compiled: None,
                 reuse_frame: None,
@@ -3944,7 +3522,7 @@ impl Interpreter {
         context: &ExecutionContext,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
-        let (function_id, _, this_for_callee, _, _, _, _) = Self::bytecode_call_target_parts(
+        let (function_id, this_for_callee, _, _) = Self::bytecode_call_target_parts(
             roots.target(),
             roots.receiver_value(),
             &self.gc_heap,
@@ -3964,9 +3542,9 @@ impl Interpreter {
         // `async_state` so its completion settles that promise. Without this
         // an async callee runs as a plain frame and its first `Op::Await`
         // finds a frame with no `async_state`, which `do_await` reports as
-        // `VmError::InvalidOperand`. The promise is allocated before the
-        // upvalue spine and receiver coercion (which also allocate), rooting
-        // the raw receiver and arguments exactly as the opcode path does.
+        // `VmError::InvalidOperand`. The promise is allocated before receiver
+        // coercion (which also allocates), rooting the raw receiver and
+        // arguments exactly as the opcode path does.
         let is_plain_async = function.is_async && !function.is_generator;
         let async_result_promise = if is_plain_async {
             Some(
@@ -3976,10 +3554,10 @@ impl Interpreter {
         } else {
             None
         };
-        // The promise allocation above can relocate closure-owned cells. Read
-        // the target parts again from the registered target instead of using a
-        // detached pre-allocation snapshot.
-        let (_, _, this_for_callee, _, _, _, _) = Self::bytecode_call_target_parts(
+        // The promise allocation above can collect. Read the target parts
+        // again from the registered target instead of using a detached
+        // pre-allocation snapshot.
+        let (_, this_for_callee, _, _) = Self::bytecode_call_target_parts(
             roots.target(),
             roots.receiver_value(),
             &self.gc_heap,
@@ -3988,31 +3566,20 @@ impl Interpreter {
         let this_for_callee =
             self.this_for_bytecode_call_runtime_rooted(function, roots.receiver_value(), &[])?;
         roots.set_receiver(this_for_callee);
-        let (_, parent_upvalues, _, _, _, _, _) = Self::bytecode_call_target_parts(
+        let (_, _, new_target_for_callee, _) = Self::bytecode_call_target_parts(
             roots.target(),
             roots.receiver_value(),
             &self.gc_heap,
         )?;
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        // Building own upvalue cells can collect as well; refresh every
-        // closure-owned optional handle before installing it on the frame.
-        let (_, _, _, new_target_for_callee, derived_this_cell, callee_eval_env, _) =
-            Self::bytecode_call_target_parts(
-                roots.target(),
-                roots.receiver_value(),
-                &self.gc_heap,
-            )?;
         let _window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+        let mut new_frame = Frame::for_code_block(
             function,
             None,
-            upvalues,
+            roots.target(),
             roots.receiver_value(),
             window,
         );
-        new_frame.self_value = roots.target();
         if let Some(result_promise) = async_result_promise {
             self.frame_set_async_state(
                 &mut new_frame,
@@ -4023,11 +3590,6 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
         }
-        if let Some(cell) = derived_this_cell {
-            let cold = self.frame_ensure_cold(&mut new_frame);
-            cold.derived_this_cell = Some(cell);
-        }
-        self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         self.bind_bytecode_call_arguments(function, &mut new_frame, roots.take_args())?;
         // §27.5.1 GeneratorFunction call evaluation returns a
         // generator object without executing the body. `invoke`
@@ -4146,7 +3708,7 @@ impl Interpreter {
         // Prepared fast path: a callback that needs no pooled cold record
         // resolves its compiled body once and then re-enters that body with a
         // recycled frame, so per element only the receiver coercion (cached),
-        // the upvalue refresh, the register reset, and the argument bind run —
+        // the SELF refresh, the register reset, and the argument bind run —
         // no per-element frame allocation, register draw, tier probe, or
         // dispatch envelope.
         if state.fast_reuse {
@@ -4179,8 +3741,8 @@ impl Interpreter {
                 false,
             );
         }
-        // Callback carries a bound `new.target` / derived-`this` cell / captured
-        // eval environment: build a fresh frame per element and tier up through
+        // Callback carries a bound `new.target`: build a fresh frame per
+        // element and tier up through
         // the synchronous-entry path as before.
         self.invoke_cold_lean(stack, state, &context, effective_this, effective_args, true)
     }
@@ -4199,9 +3761,9 @@ impl Interpreter {
         let window_rollback = self.register_window_rollback();
         // Refresh the GC-live inputs from the traced root every element: the
         // recycled frame is held off-stack between calls and is not itself
-        // traced, so its captured upvalues / receiver could be relocated by a
-        // moving collection the builtin triggers between elements. Reading them
-        // back from `lean_callback_roots` (which IS traced) keeps them current.
+        // traced, so its SELF / receiver could be relocated by a moving
+        // collection the builtin triggers between elements. Reading them back
+        // from `lean_callback_roots` (which IS traced) keeps them current.
         let bound_this = {
             let root = self
                 .lean_callback_roots
@@ -4222,16 +3784,13 @@ impl Interpreter {
             self.this_for_bytecode_call_runtime_rooted(function, bound_this, &[effective_args])?
         };
         let register_count = state.register_count;
-        // Receiver coercion may collect. Re-read both exact SELF and the stable
-        // source from the traced root afterwards; no cloned spine is parked in
-        // the root stack.
-        let (self_value, parent_upvalues) = {
-            let root = self
-                .lean_callback_roots
-                .get(state.root_index)
-                .ok_or(VmError::InvalidOperand)?;
-            (root.callback, root.upvalue_source(&self.gc_heap)?)
-        };
+        // Receiver coercion may collect. Re-read the exact SELF from the
+        // traced root afterwards; the callee reaches its context through it.
+        let self_value = self
+            .lean_callback_roots
+            .get(state.root_index)
+            .ok_or(VmError::InvalidOperand)?
+            .callback;
         let mut frame = match state.reuse_frame.take() {
             Some(mut frame) => {
                 debug_assert_eq!(frame.registers.len(), register_count);
@@ -4239,30 +3798,14 @@ impl Interpreter {
                 frame.return_register = None;
                 frame.self_value = self_value;
                 frame.this_value = this_for_callee;
-                if state.has_parent_upvalues
-                    && let Err(error) = parent_upvalues.copy_into(frame.upvalues.as_mut())
-                {
-                    self.frame_release_cold(&mut frame);
-                    self.reclaim_registers(&mut frame);
-                    return Err(error);
-                }
                 frame
             }
             None => {
                 let function = context
                     .exec_function(state.function_id)
                     .ok_or(VmError::InvalidOperand)?;
-                debug_assert_eq!(function.own_upvalue_count, 0);
                 let window = self.alloc_reg_window(register_count)?;
-                let mut frame = Frame::with_exec_return_upvalues_and_this(
-                    function,
-                    None,
-                    parent_upvalues.copy_owned(),
-                    this_for_callee,
-                    window,
-                );
-                frame.self_value = self_value;
-                frame
+                Frame::for_code_block(function, None, self_value, this_for_callee, window)
             }
         };
         if let Err(error) = Self::reset_and_bind_lean_bytecode_call_arguments(
@@ -4359,84 +3902,27 @@ impl Interpreter {
             this_for_callee,
             &[effective_args],
         )?;
-        // Coercion may collect; reload every closure-derived value and source
-        // from the traced root before allocating fresh cells/materializing.
-        let (
-            mut self_value,
-            parent_upvalues,
-            new_target_for_callee,
-            mut derived_this_cell,
-            mut callee_eval_env,
-        ) = {
+        // Coercion may collect; reload SELF and the lexical `new.target` from
+        // the traced root.
+        let (self_value, new_target_for_callee) = {
             let root = self
                 .lean_callback_roots
                 .get(state.root_index)
                 .ok_or(VmError::InvalidOperand)?;
-            (
-                root.callback,
-                root.upvalue_source(&self.gc_heap)?,
-                root.bound_new_target,
-                root.bound_derived_this,
-                root.eval_env,
-            )
+            (root.callback, root.bound_new_target)
         };
-        let mut rooted_this = this_for_callee;
-        let mut rooted_new_target = new_target_for_callee;
-        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self_value.trace_value_slot_mut(visitor);
-            rooted_this.trace_value_slot_mut(visitor);
-            if let Some(value) = &mut rooted_new_target {
-                value.trace_value_slot_mut(visitor);
-            }
-            if let Some(cell) = &mut derived_this_cell {
-                visitor(cell as *mut crate::UpvalueCell as *mut RawGc);
-            }
-            if let Some(env) = &mut callee_eval_env {
-                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
-            }
-            // Keep the caller-owned argument window as the one authoritative
-            // set of slots. Upvalue-cell allocation may move young values, so
-            // the collector must rewrite the exact slice that the binder reads
-            // below instead of a detached snapshot.
-            for value in effective_args {
-                value.trace_value_slots(visitor);
-            }
-        };
-        let upvalues = Frame::build_upvalues_for_exec_from_source_with_roots(
-            &mut self.gc_heap,
-            function,
-            parent_upvalues,
-            &mut build_roots,
-        )?;
-        let this_for_callee = rooted_this;
-        let new_target_for_callee = rooted_new_target;
+        // Frame construction allocates no GC memory: the locals stay current.
         let _window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            None,
-            upvalues,
-            this_for_callee,
-            window,
-        );
-        new_frame.self_value = self_value;
+        let mut new_frame =
+            Frame::for_code_block(function, None, self_value, this_for_callee, window);
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
         }
-        if let Some(cell) = derived_this_cell {
-            let cold = self.frame_ensure_cold(&mut new_frame);
-            cold.derived_this_cell = Some(cell);
-        }
-        let setup = self
-            .stash_frame_eval_env(function, &mut new_frame, callee_eval_env)
-            .and_then(|()| {
-                // `effective_args` is the same collector-rewritten window
-                // traced by `build_roots`; read it only after the allocating
-                // upvalue build has completed.
-                Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)
-            });
-        if let Err(error) = setup {
+        if let Err(error) =
+            Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)
+        {
             self.frame_release_cold(&mut new_frame);
             self.reclaim_registers(&mut new_frame);
             return Err(error);
@@ -4650,8 +4136,8 @@ impl Interpreter {
         } else {
             roots.current.get()
         };
-        if let Ok((function_id, _)) =
-            Self::bytecode_construct_target_parts(bytecode_callee, &self.gc_heap)
+        if let Ok(function_id) =
+            Self::bytecode_construct_target_function_id(bytecode_callee, &self.gc_heap)
             && context
                 .exec_function(function_id)
                 .is_some_and(|function| function.is_derived_constructor)

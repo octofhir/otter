@@ -9,6 +9,8 @@
 //! - [`values`] — tagged encode/decode primitives.
 //! - [`arith`] — numeric, comparison, and bitwise emitters.
 //! - [`binding`] — typed binding/declaration family emission.
+//! - [`context`] — SELF context reads, unchecked context-slot access, and
+//!   context allocation.
 //!
 //! # Invariants
 //! - Every instruction that can side-exit, transition, or poll stamps its
@@ -53,6 +55,7 @@ mod calls;
 mod class_ops;
 mod class_value;
 mod construct;
+mod context;
 mod delete;
 mod exceptions;
 mod forward_call;
@@ -569,6 +572,64 @@ fn compile_with_reach(
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_SELF_OFFSET]);
                 emit_store_reg(&mut ops, 9, dst)?;
             }
+            TemplateOp::LoadClosureContext { dst } => {
+                context::emit_load_closure_context(&mut ops, view, dst)?;
+            }
+            TemplateOp::LoadContextSlot {
+                dst,
+                context,
+                depth,
+                slot,
+            } => {
+                context::emit_load_context_slot(&mut ops, view, dst, context, depth, slot)?;
+            }
+            TemplateOp::StoreContextSlot {
+                src,
+                context,
+                depth,
+                slot,
+            } => {
+                context::emit_store_context_slot(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    src,
+                    context,
+                    depth,
+                    slot,
+                )?;
+            }
+            TemplateOp::CreateContext {
+                dst,
+                parent,
+                scope,
+                safepoint,
+            } => {
+                context::emit_context_allocation(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    dst,
+                    context::ContextAllocation::Create { parent, scope },
+                    safepoint,
+                    allocation_miss_exit,
+                )?;
+            }
+            TemplateOp::CopyContext {
+                dst,
+                src,
+                safepoint,
+            } => {
+                context::emit_context_allocation(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    dst,
+                    context::ContextAllocation::Copy { source: src },
+                    safepoint,
+                    allocation_miss_exit,
+                )?;
+            }
             TemplateOp::ClassSuperConstructor { dst, class } => {
                 emit_load_reg(&mut ops, 1, class)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
@@ -598,7 +659,7 @@ fn compile_with_reach(
             TemplateOp::MakeClosure {
                 dst,
                 function,
-                parents,
+                context,
             } => {
                 transitions::emit_make_closure(
                     &mut ops,
@@ -607,8 +668,7 @@ fn compile_with_reach(
                     code_block_id,
                     dst,
                     function,
-                    plan.index_tail(parents),
-                    parents,
+                    context,
                     threw,
                     fatal,
                 );
@@ -629,6 +689,7 @@ fn compile_with_reach(
                 result,
                 value0,
                 value1,
+                context_coord,
             } => {
                 binding::emit_binding_value(
                     &mut ops,
@@ -639,6 +700,7 @@ fn compile_with_reach(
                     result,
                     value0,
                     value1,
+                    context_coord,
                     instr.byte_pc,
                     code_map.as_mut(),
                     committed_throw,
@@ -736,16 +798,6 @@ fn compile_with_reach(
                     committed_throw,
                     fatal,
                 )?;
-            }
-            TemplateOp::FreshUpvalue { index } => {
-                transitions::emit_fresh_upvalue(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    index,
-                    threw,
-                    fatal,
-                );
             }
             TemplateOp::DefineDataProperty { object, key, value } => {
                 transitions::emit_define_data_property(
@@ -1541,6 +1593,29 @@ fn compile_with_reach(
                 emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
                 dynasm!(ops ; .arch aarch64 ; b =>returned);
             }
+            TemplateOp::ReturnDerived {
+                value,
+                context,
+                depth,
+                slot,
+            } => {
+                // Only `undefined` over a bound receiver completes here; the
+                // receiver is the construct result. Every other shape re-runs
+                // `ReturnDerived` in the interpreter before any effect. Template
+                // never compiles a return that crosses a `finally`, so reading
+                // the `DerivedThis` slot now equals reading it at frame pop.
+                emit_load_reg(&mut ops, 9, value)?;
+                emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>runtime_transition_exit);
+                context::emit_read_context_slot(&mut ops, view, 0, context, depth, slot)?;
+                emit_load_u64(&mut ops, 10, VALUE_HOLE);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp x0, x10
+                    ; b.eq =>runtime_transition_exit
+                    ; b =>returned
+                );
+            }
             TemplateOp::UnsupportedBail => {
                 dynasm!(ops ; .arch aarch64 ; b =>unsupported_exit);
             }
@@ -1797,7 +1872,6 @@ fn compile_with_reach(
     let TemplatePlan {
         register_count,
         register_operands,
-        index_operands,
         mut safepoint_records,
         osr_only,
         ..
@@ -1825,7 +1899,6 @@ fn compile_with_reach(
         register_count,
         Box::new([]),
         register_operands,
-        index_operands,
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
@@ -1849,6 +1922,11 @@ fn operation_requires_pc_stamp(op: TemplateOp, canonical_boolean_branch: bool) -
         TemplateOp::LoadImmediate { .. }
         | TemplateOp::Move { .. }
         | TemplateOp::LoadSelfClosure { .. }
+        // Unchecked context accesses have no exit; the store's write-barrier
+        // slow path is a frame-free leaf.
+        | TemplateOp::LoadClosureContext { .. }
+        | TemplateOp::LoadContextSlot { .. }
+        | TemplateOp::StoreContextSlot { .. }
         // The fused chain performs no observable effect on its fast path — only
         // register-window stores and a branch — and its per-operation fallback
         // stamps each PC itself; the success target stamps its own on arrival.

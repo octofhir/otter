@@ -38,6 +38,21 @@ impl CodeBlock {
             .filter(|_| self.arguments_object_kind == ArgumentsObjectKind::Mapped)
             .map(|binding| (binding.argument_index, binding.storage))
     }
+
+    /// Frame register holding the context of the context-held mapped formals,
+    /// when a forwarded argument list reads any. Every such formal names the
+    /// same parameter-scope context register.
+    ///
+    /// A committed forward packet carries this context as its trailing word:
+    /// `[method, callee, receiver, register bindings…, formals context]`.
+    #[must_use]
+    pub fn forwarded_formals_context(&self) -> Option<u16> {
+        self.forwarded_argument_bindings()
+            .find_map(|(_, storage)| match storage {
+                ArgumentBindingStorage::Context { reg, .. } => Some(reg),
+                ArgumentBindingStorage::Register { .. } => None,
+            })
+    }
 }
 
 impl Interpreter {
@@ -116,7 +131,7 @@ impl Interpreter {
         for (argument_index, storage) in function.forwarded_argument_bindings() {
             let index = usize::from(argument_index);
             if index < count
-                && let ArgumentBindingStorage::Upvalue { .. } = storage
+                && let ArgumentBindingStorage::Context { .. } = storage
             {
                 write(index, self.live_argument_binding(source, storage)?)?;
             }
@@ -134,8 +149,13 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         Ok(match storage {
             ArgumentBindingStorage::Register { reg } => frame.read(reg)?,
-            ArgumentBindingStorage::Upvalue { idx } => {
-                crate::upvalue::read_upvalue(&self.gc_heap, frame.upvalue(u32::from(idx))?)
+            ArgumentBindingStorage::Context { reg, slot } => {
+                let context = frame
+                    .read(reg)?
+                    .as_context()
+                    .ok_or(VmError::InvalidOperand)?;
+                crate::context::read_slot(&self.gc_heap, context, slot)
+                    .ok_or(VmError::InvalidOperand)?
             }
         })
     }

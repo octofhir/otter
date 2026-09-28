@@ -3,22 +3,18 @@
 //! A closure carries:
 //!
 //! - the bytecode function id it executes,
-//! - the captured upvalue spine (one [`crate::UpvalueCell`] per
-//!   binding, in declaration order),
+//! - the one context it was created over ([`crate::context`]), from which
+//!   every outer binding its body reaches is a fixed hop,
 //! - an optional bound `this` (arrow closures capture their receiver
 //!   lexically; non-arrow closures take `this` from the call site),
-//! - an optional bound `new.target` for arrow closures,
-//! - an optional derived-constructor `this` cell for arrow
-//!   `super()` calls that run after the original frame is off-stack,
-//! - one nullable compressed direct-eval environment handle in the stable
-//!   call header.
+//! - an optional bound `new.target` for arrow closures.
 //!
 //! # Contents
 //!
 //! - [`ClosureCallHeader`] — stable machine-facing call ABI prefix.
 //! - [`ClosureCallState`] — allocation-neutral VM call metadata.
 //! - [`JsClosureBody`] — GC body holding the ABI prefix, canonical
-//!   bound values, and the traced tail.
+//!   bound values, and per-instance property state.
 //! - [`JsClosure`] — 8-byte handle plus cached function id.
 //! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocators.
 //! - [`JS_CLOSURE_BODY_TYPE_TAG`] — reserved
@@ -27,46 +23,36 @@
 //! # Invariants
 //!
 //! - The machine-facing prefix is `#[repr(C)]`: native linkage may read
-//!   [`ClosureCallHeader`], bound values and the constructor header only. The
-//!   nullable direct-eval handle has one representation and one traced owner:
-//!   [`ClosureCallHeader::eval_env`]. Native linkage must never interpret the
-//!   following Rust `Option` layout.
-//! - The upvalue spine is built once at closure creation
-//!   ([`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)) and never
-//!   resized. Its compressed cells occupy the closure's trailing storage in
-//!   old space, so the `upvalue_base` / `upvalue_count` pair stays valid
-//!   for the closure's lifetime; native code must not retain that
-//!   base beyond the live call. Per-cell mutation flows through
-//!   [`crate::store_upvalue`] / [`crate::read_upvalue`].
-//! - Canonical `Value` fields are always traced. Presence flags distinguish
-//!   `None` from `Some(undefined)` while [`JsClosure`] keeps the ergonomic
+//!   [`ClosureCallHeader`], bound values and the constructor header only.
+//! - [`ClosureCallHeader::context`] is a full 8-byte `Value` word holding a
+//!   context or `undefined`, fixed at creation. Generated code loads it with
+//!   one instruction and follows it without cage-base arithmetic.
+//! - Canonical `Value` fields are always traced, in the pending body too, so
+//!   an allocation-triggered collection rewrites the context and bound values
+//!   before they are copied into the cell. Presence flags distinguish `None`
+//!   from `Some(undefined)` while [`JsClosure`] keeps the ergonomic
 //!   `Option<Value>` API.
-//! - Bound `new.target` and derived-constructor `this` require the call-setup
-//!   runtime stub. A direct-eval environment is copied directly into the
-//!   callee's traced native frame and does not route through that stub.
+//! - Closures are allocated in old space and never move; a bound
+//!   `new.target` requires the call-setup runtime stub.
 //!
 //! # See also
 //!
 //! - [`crate::native_abi::NativeFrame`] — fixed-width native activation ABI.
-//! - [`crate::jit::JitCompileSnapshot`] — publishes the nested function-id
-//!   byte offset to native backends.
+//! - [`crate::jit::JitCompileSnapshot`] — publishes the closure byte offsets
+//!   to native backends.
 //!
 //! # Spec
 //!
-//! - ECMA-262 §15.2.5 — closure environment construction.
+//! - ECMA-262 §10.2.3 OrdinaryFunctionCreate — `[[Environment]]`.
 //! - ECMA-262 §13.3.6 — `[[Call]]` for ordinary functions / closures.
 //! - ECMA-262 §10.2.1.1 — `[[ThisMode]]` for arrow functions.
 
+use crate::Value;
 use crate::object::JsObject;
-use crate::{UpvalueCell, Value, upvalue_source::UpvalueSource};
 use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
-
-#[cfg(test)]
-#[path = "closure/captures_tests.rs"]
-mod captures_tests;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
@@ -75,23 +61,14 @@ pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
 pub const CLOSURE_CALL_FLAG_BOUND_THIS: u32 = 1 << 0;
 /// [`ClosureCallHeader::flags`] bit: `bound_new_target` is semantically present.
 pub const CLOSURE_CALL_FLAG_BOUND_NEW_TARGET: u32 = 1 << 1;
-/// [`ClosureCallHeader::flags`] bit: the Rust tail carries a derived-`this` cell.
-pub const CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS: u32 = 1 << 2;
 /// Flags whose semantics require the call-setup runtime stub.
 ///
-/// Native linkage handles lexical `this` inline. Lexical `new.target`, shared
-/// derived-constructor state route through setup before control returns to the
-/// compiled callee in the same native activation. The direct-eval environment
-/// has its own fixed header slot and is copied inline.
-pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 =
-    CLOSURE_CALL_FLAG_BOUND_NEW_TARGET | CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS;
+/// Native linkage handles lexical `this` and the context inline. A lexical
+/// `new.target` routes through setup before control returns to the compiled
+/// callee in the same native activation.
+pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 = CLOSURE_CALL_FLAG_BOUND_NEW_TARGET;
 
 /// Stable machine-facing closure call metadata.
-///
-/// All addresses use fixed-width integers instead of Rust references. The
-/// `upvalue_base` points into the closure's trailing capture array and is
-/// valid only while the closure remains live. It is not a movable pointer and must
-/// not be cached across calls.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosureCallHeader {
@@ -99,38 +76,19 @@ pub struct ClosureCallHeader {
     pub function_id: u32,
     /// Presence and call-setup routing flags.
     pub flags: u32,
-    /// Process address of the first captured [`UpvalueCell`], or zero when empty.
-    pub upvalue_base: u64,
-    /// Number of captured [`UpvalueCell`] entries at `upvalue_base`.
-    pub upvalue_count: u32,
-    /// Nullable compressed direct-eval environment handle.
-    pub(crate) eval_env: crate::eval_env::EvalEnvHandle,
+    /// The context this closure was created over, or `undefined`.
+    pub context: Value,
 }
 
 /// Allocation-neutral closure state consumed by call preparation.
-///
-/// `upvalues` borrows the closure's spine without constructing a
-/// `Vec`/`Box`. The exact closure value must remain rooted for every use
-/// of this record that can cross a collection.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClosureCallState {
-    pub(crate) upvalues: UpvalueSource,
     pub(crate) bound_this: Option<Value>,
     pub(crate) bound_new_target: Option<Value>,
-    pub(crate) bound_derived_this: Option<UpvalueCell>,
-    pub(crate) eval_env: Option<crate::eval_env::EvalEnvHandle>,
 }
 
 impl ClosureCallHeader {
-    fn new(
-        function_id: u32,
-        upvalue_count: u32,
-        upvalue_base: u64,
-        bound_this: bool,
-        bound_new_target: bool,
-        bound_derived_this: bool,
-        eval_env: Option<crate::eval_env::EvalEnvHandle>,
-    ) -> Self {
+    fn new(function_id: u32, context: Value, bound_this: bool, bound_new_target: bool) -> Self {
         let mut flags = 0;
         if bound_this {
             flags |= CLOSURE_CALL_FLAG_BOUND_THIS;
@@ -138,15 +96,10 @@ impl ClosureCallHeader {
         if bound_new_target {
             flags |= CLOSURE_CALL_FLAG_BOUND_NEW_TARGET;
         }
-        if bound_derived_this {
-            flags |= CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS;
-        }
         Self {
             function_id,
             flags,
-            upvalue_base,
-            upvalue_count,
-            eval_env: eval_env.unwrap_or_else(crate::eval_env::EvalEnvHandle::null),
+            context,
         }
     }
 
@@ -184,10 +137,6 @@ pub struct JsClosureBody {
     pub bound_new_target: Value,
     /// Canonical property and weak constructor state in the fixed prefix.
     pub(crate) construct: crate::closure_construct::ClosureConstructHeader,
-    /// Arrow closures created inside derived constructors capture the
-    /// constructor's shared `this` cell so `super()` can bind it even
-    /// when the arrow is invoked through a nested sync dispatch.
-    pub bound_derived_this: Option<UpvalueCell>,
     /// Per-instance deletion of the intrinsic `name` metadata property
     /// (`delete f.name`). Sibling closures of the same template keep
     /// their own copies, so the marker cannot live in a table keyed by
@@ -234,25 +183,7 @@ pub const CLOSURE_LOOKUP_PROTO_OVERRIDE: u8 = 1 << 2;
 impl otter_gc::SafeTraceable for JsClosureBody {
     const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
 
-    /// Trace the fixed fields and exact trailing capture slots. Heap-image
-    /// restore relocates the whole closure, so recompute its derived base here.
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
-        self.trace_fixed_fields(visitor);
-        self.refresh_upvalue_base();
-        let base = self.captures_ptr();
-        for index in 0..self.call_header.upvalue_count as usize {
-            // SAFETY: allocated closures own exactly upvalue_count initialized
-            // compressed handles after the fixed body. Visit the actual slot.
-            let slot = unsafe { base.add(index) };
-            if unsafe { !(*slot).is_null() } {
-                visitor(slot.cast::<RawGc>());
-            }
-        }
-    }
-
-    /// A pending stack body has no capture tail. The allocator's caller roots
-    /// the input buffer until initialization at the final heap address.
-    fn trace_pending_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.trace_fixed_fields(visitor);
     }
 }
@@ -262,15 +193,9 @@ pub const CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET: usize =
     std::mem::offset_of!(ClosureCallHeader, function_id);
 /// Byte offset of `flags` inside [`ClosureCallHeader`].
 pub const CLOSURE_CALL_HEADER_FLAGS_OFFSET: usize = std::mem::offset_of!(ClosureCallHeader, flags);
-/// Byte offset of `upvalue_base` inside [`ClosureCallHeader`].
-pub const CLOSURE_CALL_HEADER_UPVALUE_BASE_OFFSET: usize =
-    std::mem::offset_of!(ClosureCallHeader, upvalue_base);
-/// Byte offset of `upvalue_count` inside [`ClosureCallHeader`].
-pub const CLOSURE_CALL_HEADER_UPVALUE_COUNT_OFFSET: usize =
-    std::mem::offset_of!(ClosureCallHeader, upvalue_count);
-/// Byte offset of `eval_env` inside [`ClosureCallHeader`].
-pub const CLOSURE_CALL_HEADER_EVAL_ENV_OFFSET: usize =
-    std::mem::offset_of!(ClosureCallHeader, eval_env);
+/// Byte offset of `context` inside [`ClosureCallHeader`].
+pub const CLOSURE_CALL_HEADER_CONTEXT_OFFSET: usize =
+    std::mem::offset_of!(ClosureCallHeader, context);
 
 /// Byte offset of the nested call header in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_CALL_HEADER_OFFSET: usize = std::mem::offset_of!(JsClosureBody, call_header);
@@ -280,16 +205,9 @@ pub const CLOSURE_BODY_FUNCTION_ID_OFFSET: usize =
 /// Byte offset of the nested call flags in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_CALL_FLAGS_OFFSET: usize =
     CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_FLAGS_OFFSET;
-/// Byte offset of the nested upvalue base in [`JsClosureBody`]'s payload.
-pub const CLOSURE_BODY_UPVALUE_BASE_OFFSET: usize =
-    CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_UPVALUE_BASE_OFFSET;
-/// Byte offset of the nested upvalue count in [`JsClosureBody`]'s payload.
-pub const CLOSURE_BODY_UPVALUE_COUNT_OFFSET: usize =
-    CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_UPVALUE_COUNT_OFFSET;
-/// Byte offset of the nested nullable eval-environment handle in
-/// [`JsClosureBody`]'s payload.
-pub const CLOSURE_BODY_EVAL_ENV_OFFSET: usize =
-    CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_EVAL_ENV_OFFSET;
+/// Byte offset of the nested context word in [`JsClosureBody`]'s payload.
+pub const CLOSURE_BODY_CONTEXT_OFFSET: usize =
+    CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_CONTEXT_OFFSET;
 /// Byte offset of canonical `bound_this` in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, bound_this);
 /// Byte offset of canonical `bound_new_target` in [`JsClosureBody`]'s payload.
@@ -335,20 +253,20 @@ pub const CLOSURE_BODY_LAST_INSTANCE_OFFSET: usize = std::mem::offset_of!(JsClos
         last_instance
     );
 
-const _: [(); 24] = [(); std::mem::size_of::<ClosureCallHeader>()];
+const _: [(); 16] = [(); std::mem::size_of::<ClosureCallHeader>()];
 const _: [(); 8] = [(); std::mem::align_of::<ClosureCallHeader>()];
 const _: [(); 0] = [(); CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET];
 const _: [(); 4] = [(); CLOSURE_CALL_HEADER_FLAGS_OFFSET];
-const _: [(); 8] = [(); CLOSURE_CALL_HEADER_UPVALUE_BASE_OFFSET];
-const _: [(); 16] = [(); CLOSURE_CALL_HEADER_UPVALUE_COUNT_OFFSET];
-const _: [(); 20] = [(); CLOSURE_CALL_HEADER_EVAL_ENV_OFFSET];
+const _: [(); 8] = [(); CLOSURE_CALL_HEADER_CONTEXT_OFFSET];
 const _: [(); 0] = [(); CLOSURE_BODY_CALL_HEADER_OFFSET];
-const _: [(); 24] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
-const _: [(); 32] = [(); CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET];
+const _: [(); 16] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
+const _: [(); 24] = [(); CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET];
+const _: [(); 32] = [(); CLOSURE_BODY_OWN_PROPS_OFFSET];
 
 impl JsClosureBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         visitor(self.call_header.function_id);
+        crate::code_liveness::visit_value(&self.call_header.context, visitor);
         crate::code_liveness::visit_value(&self.bound_this, visitor);
         crate::code_liveness::visit_value(&self.bound_new_target, visitor);
         if let Some(value) = &self.proto_override {
@@ -358,26 +276,21 @@ impl JsClosureBody {
 
     fn new(
         function_id: u32,
-        upvalue_count: u32,
+        context: Value,
         bound_this: Option<Value>,
         bound_new_target: Option<Value>,
-        bound_derived_this: Option<UpvalueCell>,
-        eval_env: Option<crate::eval_env::EvalEnvHandle>,
     ) -> Self {
+        debug_assert!(context.is_undefined() || context.as_context().is_some());
         let call_header = ClosureCallHeader::new(
             function_id,
-            upvalue_count,
-            0,
+            context,
             bound_this.is_some(),
             bound_new_target.is_some(),
-            bound_derived_this.is_some(),
-            eval_env,
         );
         Self {
             call_header,
             bound_this: bound_this.unwrap_or_else(Value::undefined),
             bound_new_target: bound_new_target.unwrap_or_else(Value::undefined),
-            bound_derived_this,
             construct: crate::closure_construct::ClosureConstructHeader::default(),
             name_deleted: false,
             length_deleted: false,
@@ -387,35 +300,12 @@ impl JsClosureBody {
         }
     }
 
-    /// Address of this allocated body's trailing compressed capture slots.
-    fn captures_ptr(&self) -> *mut UpvalueCell {
-        // SAFETY: this computes the tail address; callers only dereference it
-        // on a fully allocated body with upvalue_count initialized entries.
-        unsafe { (self as *const Self).add(1).cast_mut().cast() }
-    }
-
-    fn captures(&self) -> &[UpvalueCell] {
-        // SAFETY: published closures initialize exactly upvalue_count entries.
-        unsafe {
-            std::slice::from_raw_parts(self.captures_ptr(), self.call_header.upvalue_count as usize)
-        }
-    }
-
-    fn refresh_upvalue_base(&mut self) {
-        self.call_header.upvalue_base = if self.call_header.upvalue_count == 0 {
-            0
-        } else {
-            self.captures_ptr() as usize as u64
-        };
-    }
-
     fn trace_fixed_fields(&mut self, visitor: &mut SlotVisitor<'_>) {
         use crate::pelt::PeltField as _;
         self.construct.last_instance.set(JsObject::null());
+        self.call_header.context.pelt_trace(visitor);
         self.bound_this.pelt_trace(visitor);
         self.bound_new_target.pelt_trace(visitor);
-        self.bound_derived_this.pelt_trace(visitor);
-        self.call_header.eval_env.pelt_trace(visitor);
         self.construct.own_props.pelt_trace(visitor);
         self.proto_override.pelt_trace(visitor);
     }
@@ -434,41 +324,10 @@ impl JsClosureBody {
             .then_some(self.bound_new_target)
     }
 
-    #[inline]
-    pub(crate) fn bound_derived_this_option(&self) -> Option<UpvalueCell> {
-        debug_assert_eq!(
-            self.call_header
-                .has_flag(CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS),
-            self.bound_derived_this.is_some()
-        );
-        self.bound_derived_this
-    }
-
-    #[inline]
-    pub(crate) fn eval_env_option(&self) -> Option<crate::eval_env::EvalEnvHandle> {
-        (!self.call_header.eval_env.is_null()).then_some(self.call_header.eval_env)
-    }
-
-    /// Copy call metadata while borrowing the immutable upvalue allocation.
     fn call_state(&self) -> ClosureCallState {
-        // SAFETY: the spine is built once, never resized, and lives in
-        // old space, so the published base stays valid while the closure
-        // is reachable. A consumer of ClosureCallState must root the
-        // exact closure value for the record's live extent, as documented
-        // on the record itself.
-        let upvalues = unsafe {
-            UpvalueSource::from_raw_parts(
-                self.call_header.upvalue_base as usize as *mut UpvalueCell,
-                self.call_header.upvalue_count,
-            )
-        }
-        .expect("closure upvalue spine must fit the u32 call ABI");
         ClosureCallState {
-            upvalues,
             bound_this: self.bound_this_option(),
             bound_new_target: self.bound_new_target_option(),
-            bound_derived_this: self.bound_derived_this_option(),
-            eval_env: self.eval_env_option(),
         }
     }
 }
@@ -556,10 +415,7 @@ impl JsClosure {
         heap.read_payload(self.handle, |body| body.call_header)
     }
 
-    /// Copy all dynamic call metadata without cloning the captured spine.
-    ///
-    /// The returned upvalue source remains valid while this exact closure is
-    /// rooted; closure creation never resizes its inline capture array.
+    /// Copy the bound values in one payload read.
     #[must_use]
     pub(crate) fn call_state(self, heap: &GcHeap) -> ClosureCallState {
         heap.read_payload(self.handle, JsClosureBody::call_state)
@@ -585,17 +441,10 @@ impl JsClosure {
         heap.read_payload(self.handle, JsClosureBody::bound_new_target_option)
     }
 
-    /// Shared derived-constructor `this` cell captured by arrow
-    /// closures that may run `super()`.
+    /// The context this closure was created over, or `undefined`.
     #[must_use]
-    pub fn bound_derived_this(self, heap: &GcHeap) -> Option<UpvalueCell> {
-        heap.read_payload(self.handle, JsClosureBody::bound_derived_this_option)
-    }
-
-    /// Captured direct-eval variable environment, if any.
-    #[must_use]
-    pub(crate) fn eval_env(self, heap: &GcHeap) -> Option<crate::eval_env::EvalEnvHandle> {
-        heap.read_payload(self.handle, JsClosureBody::eval_env_option)
+    pub fn context(self, heap: &GcHeap) -> Value {
+        heap.read_payload(self.handle, |body| body.call_header.context)
     }
 
     /// Record that this closure's function kind defaults its
@@ -675,31 +524,6 @@ impl JsClosure {
         child.pelt_trace(&mut visit);
     }
 
-    /// Number of captured upvalue cells. Reads the body once.
-    #[must_use]
-    pub fn upvalue_count(self, heap: &GcHeap) -> usize {
-        self.call_header(heap).upvalue_count as usize
-    }
-
-    /// Run `f` with the captured upvalue spine. The slice borrow
-    /// never escapes the closure; callers that need to retain a
-    /// cell beyond `f` should snapshot the `UpvalueCell` handle
-    /// (it is itself a `Copy` GC handle).
-    pub fn with_upvalues<F, R>(self, heap: &GcHeap, f: F) -> R
-    where
-        F: FnOnce(&[UpvalueCell]) -> R,
-    {
-        heap.read_payload(self.handle, |body| f(body.captures()))
-    }
-
-    /// Snapshot the captured upvalue spine into a fresh `Vec`.
-    /// Use when the caller needs to return cells across a borrow
-    /// boundary; otherwise prefer [`Self::with_upvalues`].
-    #[must_use]
-    pub fn upvalues_snapshot(self, heap: &GcHeap) -> Vec<UpvalueCell> {
-        self.with_upvalues(heap, <[UpvalueCell]>::to_vec)
-    }
-
     /// Identity comparison via GC handle offset.
     #[must_use]
     pub fn ptr_eq(self, other: Self) -> bool {
@@ -719,59 +543,36 @@ impl JsClosure {
     }
 }
 
-/// Allocate one old-space closure containing its compressed capture array.
+/// Allocate one old-space closure over `context` (a context value or
+/// `undefined`).
 ///
 /// # Errors
 /// Surfaces [`OutOfMemory`] verbatim.
 pub fn alloc_closure(
     heap: &mut GcHeap,
     function_id: u32,
-    upvalues: &mut [UpvalueCell],
+    context: Value,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
-    bound_derived_this: Option<UpvalueCell>,
-    eval_env: Option<crate::eval_env::EvalEnvHandle>,
 ) -> Result<JsClosure, OutOfMemory> {
     alloc_closure_with_roots(
         heap,
         function_id,
-        upvalues,
+        context,
         bound_this,
         bound_new_target,
-        bound_derived_this,
-        eval_env,
         &mut |_| {},
     )
-}
-
-/// Trace closure-call fields that remain in Rust locals while the captured
-/// closure is allocated.
-///
-/// Allocation can trigger a moving full collection before the
-/// closure body exists. These are therefore real pending-payload slots, not
-/// copies that can be reconstructed from the eventual body.
-#[cfg(test)]
-fn trace_pending_call_fields(
-    bound_this: &mut Option<Value>,
-    bound_new_target: &mut Option<Value>,
-    bound_derived_this: &mut Option<UpvalueCell>,
-    eval_env: &mut Option<crate::eval_env::EvalEnvHandle>,
-    visitor: &mut SlotVisitor<'_>,
-) {
-    use crate::pelt::PeltField as _;
-
-    bound_this.pelt_trace(visitor);
-    bound_new_target.pelt_trace(visitor);
-    bound_derived_this.pelt_trace(visitor);
-    eval_env.pelt_trace(visitor);
 }
 
 /// Allocate a closure body while exposing caller-owned roots across
 /// any allocation-triggered collection.
 ///
-/// Use this from interpreter call sites where the surrounding
-/// `Value`s on the Rust stack must be preserved (per the
-/// [`GcHeap::alloc_with_roots`] contract).
+/// The context and bound values ride in the pending body, which the
+/// allocator traces, so a collection rewrites them before the copy into the
+/// cell. `external_visit` covers any other young value the caller holds in a
+/// Rust local across this call (per the [`GcHeap::alloc_with_roots`]
+/// contract).
 ///
 /// # Errors
 ///
@@ -779,325 +580,159 @@ fn trace_pending_call_fields(
 pub fn alloc_closure_with_roots(
     heap: &mut GcHeap,
     function_id: u32,
-    upvalues: &mut [UpvalueCell],
+    context: Value,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
-    bound_derived_this: Option<UpvalueCell>,
-    eval_env: Option<crate::eval_env::EvalEnvHandle>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
-    let count = u32::try_from(upvalues.len()).expect("closure captures exceed the u32 call ABI");
-    let body = JsClosureBody::new(
-        function_id,
-        count,
-        bound_this,
-        bound_new_target,
-        bound_derived_this,
-        eval_env,
-    );
-    // The external visitor may rewrite these entries before initialization.
-    // Raw pointers keep the two callbacks from retaining overlapping borrows.
-    let cells = upvalues.as_mut_ptr();
-    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        external_visit(visitor);
-        for index in 0..count as usize {
-            // SAFETY: the caller's slice stays allocated throughout this call.
-            let slot = unsafe { cells.add(index) };
-            if unsafe { !(*slot).is_null() } {
-                visitor(slot.cast::<RawGc>());
-            }
-        }
-    };
-    let handle = heap.alloc_variable_with_roots_initialized(
-        body,
-        count as usize * std::mem::size_of::<UpvalueCell>(),
-        &mut visit,
-        |body| {
-            // SAFETY: the allocator reserved this exact tail; the rooted
-            // source is disjoint, initialized and reflects any collection.
-            unsafe { std::ptr::copy_nonoverlapping(cells, body.captures_ptr(), count as usize) };
-            body.refresh_upvalue_base();
-        },
-    )?;
+    let body = JsClosureBody::new(function_id, context, bound_this, bound_new_target);
+    let handle = heap.alloc_old_with_roots(body, external_visit)?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pelt::PeltField as _;
-    use crate::{Value, alloc_upvalue, eval_env::EvalEnvBody, upvalue::UpvalueCellBody};
 
+    /// Allocate a closure while a capped heap forces a full collection, with
+    /// its context and bound values young: the pending body must carry them.
     fn alloc_closure_across_forced_full_gc(with_external_roots: bool) {
         const HEAP_CAP: u64 = 4 * 1024;
 
         let mut heap = GcHeap::with_max_heap_bytes(HEAP_CAP).expect("heap");
-        let mut bound_new_target = None;
-        let mut bound_derived_this = None;
-        let mut eval_env = None;
-
         let this_object = crate::object::alloc_object_with_roots(&mut heap, &mut |_| {})
             .expect("young bound this");
-        let mut bound_this = Some(Value::object(this_object));
-
-        let target_object = {
+        let mut bound_this = Value::object(this_object);
+        let context = {
+            let slot: *mut Value = &mut bound_this;
             let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                trace_pending_call_fields(
-                    &mut bound_this,
-                    &mut bound_new_target,
-                    &mut bound_derived_this,
-                    &mut eval_env,
-                    visitor,
-                );
+                // SAFETY: the local outlives the allocation.
+                unsafe { (*slot).trace_value_slot_mut(visitor) };
             };
-            crate::object::alloc_object_with_roots(&mut heap, &mut roots)
-                .expect("young bound new.target")
-        };
-        bound_new_target = Some(Value::object(target_object));
-
-        let derived_cell = {
-            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                trace_pending_call_fields(
-                    &mut bound_this,
-                    &mut bound_new_target,
-                    &mut bound_derived_this,
-                    &mut eval_env,
-                    visitor,
-                );
-            };
-            heap.alloc_with_roots(
-                UpvalueCellBody {
-                    value: Value::number_i32(303),
+            crate::context::alloc_context_with_roots(
+                &mut heap,
+                crate::context::ContextShape {
+                    scope_function_id: 71,
+                    scope_index: 0,
+                    slot_count: 1,
                 },
+                Value::undefined(),
+                |_| false,
                 &mut roots,
             )
-            .expect("young derived-this cell")
+            .expect("young context")
         };
-        bound_derived_this = Some(derived_cell);
-
-        let env = {
-            let derived_cell = bound_derived_this.expect("derived cell");
-            let body = EvalEnvBody {
-                names: vec!["evalSentinel".to_string()],
-                cells: vec![derived_cell],
-                seqs: Vec::new(),
-                parent: None,
-            };
-            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                trace_pending_call_fields(
-                    &mut bound_this,
-                    &mut bound_new_target,
-                    &mut bound_derived_this,
-                    &mut eval_env,
-                    visitor,
-                );
-            };
-            heap.alloc_with_roots(body, &mut roots)
-                .expect("young eval env")
-        };
-        eval_env = Some(env);
-
-        let mut captured = {
-            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                trace_pending_call_fields(
-                    &mut bound_this,
-                    &mut bound_new_target,
-                    &mut bound_derived_this,
-                    &mut eval_env,
-                    visitor,
-                );
-            };
-            heap.alloc_with_roots(
-                UpvalueCellBody {
-                    value: Value::number_i32(404),
-                },
-                &mut roots,
-            )
-            .expect("young captured cell")
-        };
-
+        assert!(crate::context::write_slot(
+            &mut heap,
+            context,
+            0,
+            Value::number_i32(404)
+        ));
+        let mut context_value = Value::context(context);
         let mut external = if with_external_roots {
-            let object = {
-                let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    trace_pending_call_fields(
-                        &mut bound_this,
-                        &mut bound_new_target,
-                        &mut bound_derived_this,
-                        &mut eval_env,
-                        visitor,
-                    );
-                    visitor(std::ptr::addr_of_mut!(captured).cast::<RawGc>());
-                };
-                crate::object::alloc_object_with_roots(&mut heap, &mut roots)
-                    .expect("young external root")
+            let this_slot: *mut Value = &mut bound_this;
+            let context_slot: *mut Value = &mut context_value;
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                // SAFETY: the locals outlive the allocation.
+                unsafe {
+                    (*this_slot).trace_value_slot_mut(visitor);
+                    (*context_slot).trace_value_slot_mut(visitor);
+                }
             };
-            Some(Value::object(object))
+            Some(Value::object(
+                crate::object::alloc_object_with_roots(&mut heap, &mut roots)
+                    .expect("young external root"),
+            ))
         } else {
             None
         };
+        let original = [bound_this.to_bits(), context_value.to_bits()];
 
-        let this_shape = crate::object::shape_id(
-            bound_this
-                .expect("bound this")
-                .as_object()
-                .expect("bound this object"),
-            &heap,
-        );
-        let target_shape = crate::object::shape_id(
-            bound_new_target
-                .expect("bound new.target")
-                .as_object()
-                .expect("bound new.target object"),
-            &heap,
-        );
-        let external_shape = external.map(|value| {
-            crate::object::shape_id(value.as_object().expect("external object"), &heap)
-        });
-        let original_offsets = [
-            bound_this
-                .expect("bound this")
-                .as_object()
-                .expect("bound this object")
-                .offset(),
-            bound_new_target
-                .expect("bound new.target")
-                .as_object()
-                .expect("bound new.target object")
-                .offset(),
-            bound_derived_this.expect("derived cell").offset(),
-            eval_env.expect("eval env").offset(),
-            captured.offset(),
-        ];
-
-        // Fill the capped heap without crossing it. The next closure allocation
-        // must overshoot, collect the unrooted filler cells, and retry while
-        // rewriting every pending closure-call field in place.
+        // Fill the capped heap without crossing it; the closure allocation
+        // must overshoot, collect, and retry with rewritten pending fields.
+        let fill_roots = |heap: &mut GcHeap,
+                          bound_this: &mut Value,
+                          context_value: &mut Value,
+                          external: &mut Option<Value>| {
+            let this_slot: *mut Value = bound_this;
+            let context_slot: *mut Value = context_value;
+            let external_slot: *mut Option<Value> = external;
+            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                use crate::pelt::PeltField as _;
+                // SAFETY: the locals outlive the allocation.
+                unsafe {
+                    (*this_slot).trace_value_slot_mut(visitor);
+                    (*context_slot).trace_value_slot_mut(visitor);
+                    (*external_slot).pelt_trace(visitor);
+                }
+            };
+            heap.alloc_old_with_roots(
+                crate::upvalue::UpvalueCellBody {
+                    value: Value::undefined(),
+                },
+                &mut roots,
+            )
+            .expect("filler");
+        };
         let before_filler = heap.tracked_bytes();
-        {
-            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                trace_pending_call_fields(
-                    &mut bound_this,
-                    &mut bound_new_target,
-                    &mut bound_derived_this,
-                    &mut eval_env,
-                    visitor,
-                );
-                visitor(std::ptr::addr_of_mut!(captured).cast::<RawGc>());
-                external.pelt_trace(visitor);
-            };
-            let _ = heap
-                .alloc_old_with_roots(
-                    UpvalueCellBody {
-                        value: Value::undefined(),
-                    },
-                    &mut roots,
-                )
-                .expect("first filler");
-        }
+        fill_roots(
+            &mut heap,
+            &mut bound_this,
+            &mut context_value,
+            &mut external,
+        );
         let filler_bytes = heap.tracked_bytes() - before_filler;
-        assert!(filler_bytes > 0);
         while heap.tracked_bytes().saturating_add(filler_bytes) <= HEAP_CAP {
-            let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                trace_pending_call_fields(
-                    &mut bound_this,
-                    &mut bound_new_target,
-                    &mut bound_derived_this,
-                    &mut eval_env,
-                    visitor,
-                );
-                visitor(std::ptr::addr_of_mut!(captured).cast::<RawGc>());
-                external.pelt_trace(visitor);
-            };
-            let _ = heap
-                .alloc_old_with_roots(
-                    UpvalueCellBody {
-                        value: Value::undefined(),
-                    },
-                    &mut roots,
-                )
-                .expect("filler");
+            fill_roots(
+                &mut heap,
+                &mut bound_this,
+                &mut context_value,
+                &mut external,
+            );
         }
-        assert!(HEAP_CAP - heap.tracked_bytes() < filler_bytes);
         let collections_before = heap.gc_stats().gc_cycles;
 
         let closure = if with_external_roots {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                use crate::pelt::PeltField as _;
                 external.pelt_trace(visitor);
             };
             alloc_closure_with_roots(
                 &mut heap,
                 71,
-                &mut [captured],
-                bound_this,
-                bound_new_target,
-                bound_derived_this,
-                eval_env,
+                context_value,
+                Some(bound_this),
+                None,
                 &mut external_visit,
             )
             .expect("closure after forced collection")
         } else {
-            alloc_closure(
-                &mut heap,
-                71,
-                &mut [captured],
-                bound_this,
-                bound_new_target,
-                bound_derived_this,
-                eval_env,
-            )
-            .expect("closure after forced collection")
+            alloc_closure(&mut heap, 71, context_value, Some(bound_this), None)
+                .expect("closure after forced collection")
         };
-
         assert!(heap.gc_stats().gc_cycles > collections_before);
-        let stored_this = closure
-            .bound_this(&heap)
-            .expect("stored this")
-            .as_object()
-            .expect("stored this object");
-        let stored_target = closure
-            .bound_new_target(&heap)
-            .expect("stored new.target")
-            .as_object()
-            .expect("stored new.target object");
-        let stored_derived = closure
-            .bound_derived_this(&heap)
-            .expect("stored derived-this cell");
-        let stored_env = closure.eval_env(&heap).expect("stored eval env");
-        let stored_capture = closure.upvalues_snapshot(&heap)[0];
-
-        assert_eq!(crate::object::shape_id(stored_this, &heap), this_shape);
-        assert_eq!(crate::object::shape_id(stored_target, &heap), target_shape);
-        assert_eq!(
-            crate::read_upvalue(&heap, stored_derived),
-            Value::number_i32(303)
-        );
-        assert_eq!(
-            crate::read_upvalue(&heap, stored_capture),
-            Value::number_i32(404)
-        );
-        heap.read_payload(stored_env, |body| {
-            assert_eq!(body.names.len(), 1);
-            assert_eq!(body.names[0], "evalSentinel");
-            assert_eq!(body.cells.as_slice(), &[stored_derived]);
-        });
+        let stored_this = closure.bound_this(&heap).expect("stored this");
+        let stored_context = closure.context(&heap);
         assert!(
-            [
-                stored_this.offset(),
-                stored_target.offset(),
-                stored_derived.offset(),
-                stored_env.offset(),
-                stored_capture.offset(),
-            ]
-            .iter()
-            .zip(original_offsets)
-            .any(|(after, before)| *after != before),
-            "forced full GC must relocate at least one young capture"
+            [stored_this.to_bits(), stored_context.to_bits()]
+                .iter()
+                .zip(original)
+                .any(|(after, before)| *after != before),
+            "forced full GC must relocate at least one young field"
         );
-
-        if let (Some(value), Some(shape)) = (external, external_shape) {
+        let context = stored_context.as_context().expect("context survives");
+        assert_eq!(
+            crate::context::read_slot(&heap, context, 0),
+            Some(Value::number_i32(404))
+        );
+        assert_eq!(
+            heap.debug_header_tag(stored_this.as_object().expect("this object")),
+            Some(crate::object::OBJECT_BODY_TYPE_TAG)
+        );
+        if let Some(value) = external {
             assert_eq!(
-                crate::object::shape_id(value.as_object().expect("external object"), &heap),
-                shape
+                heap.debug_header_tag(value.as_object().expect("external object")),
+                Some(crate::object::OBJECT_BODY_TYPE_TAG)
             );
         }
     }
@@ -1113,69 +748,20 @@ mod tests {
     }
 
     #[test]
-    fn allocates_empty_closure() {
+    fn allocates_closure_without_a_context() {
         let mut heap = GcHeap::new().expect("heap");
-        let closure = alloc_closure(&mut heap, 7, &mut [], None, None, None, None).expect("alloc");
+        let closure = alloc_closure(&mut heap, 7, Value::undefined(), None, None).expect("alloc");
         assert_eq!(closure.function_id(), 7);
         assert_eq!(closure.bound_this(&heap), None);
         assert_eq!(closure.bound_new_target(&heap), None);
+        assert!(closure.context(&heap).is_undefined());
         assert!(!closure.requires_runtime_setup(&heap));
         heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.call_header.function_id, 7);
             assert_eq!(body.call_header.flags, 0);
-            assert_eq!(body.call_header.upvalue_base, 0);
-            assert_eq!(body.call_header.upvalue_count, 0);
-            assert!(body.call_header.eval_env.is_null());
-            assert!(body.captures().is_empty());
             assert!(body.bound_this.is_undefined());
             assert!(body.bound_new_target.is_undefined());
         });
-    }
-
-    #[test]
-    fn allocates_closure_with_upvalues_and_bound_this() {
-        let mut heap = GcHeap::new().expect("heap");
-        let cell_a = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
-        let cell_b = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
-        let mut upvalues = [cell_a, cell_b];
-        let closure = alloc_closure(
-            &mut heap,
-            42,
-            &mut upvalues,
-            Some(Value::null()),
-            None,
-            None,
-            None,
-        )
-        .expect("alloc");
-        assert_eq!(closure.function_id(), 42);
-        assert_eq!(closure.upvalue_count(&heap), 2);
-        assert_eq!(closure.bound_this(&heap), Some(Value::null()));
-        assert_eq!(closure.bound_new_target(&heap), None);
-        let call_state = closure.call_state(&heap);
-        assert_eq!(call_state.upvalues.len(), 2);
-        assert_eq!(call_state.upvalues.read(0), Some(cell_a));
-        assert_eq!(call_state.upvalues.read(1), Some(cell_b));
-        let base = heap.read_payload(closure.handle(), |body| {
-            assert_eq!(body.call_header.function_id, 42);
-            assert_eq!(body.call_header.upvalue_count, 2);
-            assert!(body.call_header.has_flag(CLOSURE_CALL_FLAG_BOUND_THIS));
-            assert!(
-                !body
-                    .call_header
-                    .has_flag(CLOSURE_CALL_FLAG_BOUND_NEW_TARGET)
-            );
-            assert!(body.bound_this.is_null());
-            assert!(body.bound_new_target.is_undefined());
-            body.captures_ptr() as usize as u64
-        });
-        // Native linkage and VM call state address the closure's inline tail.
-        assert_eq!(
-            heap.read_payload(closure.handle(), |body| body.call_header.upvalue_base),
-            base
-        );
-        assert_eq!(call_state.upvalues.base_ptr_or_null() as usize as u64, base);
-        assert_eq!(closure.upvalues_snapshot(&heap), vec![cell_a, cell_b]);
     }
 
     #[test]
@@ -1184,74 +770,54 @@ mod tests {
         let closure = alloc_closure(
             &mut heap,
             9,
-            &mut [],
+            Value::undefined(),
             Some(Value::undefined()),
-            None,
-            None,
             None,
         )
         .expect("alloc");
-
         assert_eq!(closure.bound_this(&heap), Some(Value::undefined()));
         assert_eq!(closure.bound_new_target(&heap), None);
-        heap.read_payload(closure.handle(), |body| {
-            assert!(body.bound_this.is_undefined());
-            assert!(body.bound_new_target.is_undefined());
-            assert!(body.call_header.has_flag(CLOSURE_CALL_FLAG_BOUND_THIS));
-            assert!(
-                !body
-                    .call_header
-                    .has_flag(CLOSURE_CALL_FLAG_BOUND_NEW_TARGET)
-            );
-        });
+        let state = closure.call_state(&heap);
+        assert_eq!(state.bound_this, Some(Value::undefined()));
+        assert!(closure.context(&heap).is_undefined());
     }
 
     #[test]
-    fn semantic_tail_flags_and_eval_env_use_distinct_call_paths() {
+    fn only_a_bound_new_target_needs_runtime_setup() {
         let mut heap = GcHeap::new().expect("heap");
-        let derived_this = alloc_upvalue(&mut heap, Value::hole()).expect("derived this");
-        let eval_env = crate::eval_env::alloc_eval_env(&mut heap, None).expect("eval env");
-        let closure = alloc_closure(
-            &mut heap,
-            1,
-            &mut [],
-            None,
-            Some(Value::null()),
-            Some(derived_this),
-            Some(eval_env),
-        )
-        .expect("closure");
-        let header = closure.call_header(&heap);
+        let lexical_this =
+            alloc_closure(&mut heap, 1, Value::undefined(), Some(Value::null()), None)
+                .expect("closure");
+        assert!(!lexical_this.requires_runtime_setup(&heap));
+        let lexical_new_target =
+            alloc_closure(&mut heap, 1, Value::undefined(), None, Some(Value::null()))
+                .expect("closure");
+        let header = lexical_new_target.call_header(&heap);
         assert!(header.has_flag(CLOSURE_CALL_FLAG_BOUND_NEW_TARGET));
-        assert!(header.has_flag(CLOSURE_CALL_FLAG_BOUND_DERIVED_THIS));
         assert!(header.requires_runtime_setup());
-        assert_eq!(header.eval_env, eval_env);
-        assert_eq!(closure.bound_new_target(&heap), Some(Value::null()));
-        assert_eq!(closure.bound_derived_this(&heap), Some(derived_this));
-        assert_eq!(closure.eval_env(&heap), Some(eval_env));
-
-        let lexical_this_only = ClosureCallHeader {
-            function_id: 1,
-            flags: CLOSURE_CALL_FLAG_BOUND_THIS,
-            upvalue_base: 0,
-            upvalue_count: 0,
-            eval_env,
-        };
-        assert!(!lexical_this_only.requires_runtime_setup());
-        assert_eq!(lexical_this_only.eval_env, eval_env);
     }
 
     #[test]
     fn closure_call_abi_layout_is_stable() {
-        assert_eq!(std::mem::size_of::<ClosureCallHeader>(), 24);
+        assert_eq!(std::mem::size_of::<ClosureCallHeader>(), 16);
         assert_eq!(std::mem::align_of::<ClosureCallHeader>(), 8);
         assert_eq!(CLOSURE_BODY_FUNCTION_ID_OFFSET, 0);
         assert_eq!(CLOSURE_BODY_CALL_FLAGS_OFFSET, 4);
-        assert_eq!(CLOSURE_BODY_UPVALUE_BASE_OFFSET, 8);
-        assert_eq!(CLOSURE_BODY_UPVALUE_COUNT_OFFSET, 16);
-        assert_eq!(CLOSURE_BODY_EVAL_ENV_OFFSET, 20);
-        assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 24);
-        assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 32);
+        assert_eq!(CLOSURE_BODY_CONTEXT_OFFSET, 8);
+        assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 16);
+        assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 24);
+        assert_eq!(CLOSURE_BODY_OWN_PROPS_OFFSET, 32);
+    }
+
+    #[test]
+    fn closure_body_carries_no_capture_tail() {
+        // Fixed-size body: the context word replaced the capture tail, the
+        // absolute spine base, and the eval-environment handle.
+        assert_eq!(std::mem::size_of::<JsClosureBody>(), 80);
+        let mut heap = GcHeap::new().expect("heap");
+        let closure = alloc_closure(&mut heap, 3, Value::undefined(), None, None).expect("alloc");
+        let tag = heap.debug_header_tag(closure.handle());
+        assert_eq!(tag, Some(JS_CLOSURE_BODY_TYPE_TAG));
     }
 
     #[test]

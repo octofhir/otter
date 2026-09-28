@@ -23,6 +23,8 @@
 //!   the code-space payload `Arc`; timers, realm contexts, parked dynamic
 //!   imports, and other queued work therefore block physical reclamation even
 //!   when they carry no bare id visible to this visitor.
+//! - A live context reports its descriptor-owning function id, so the scope
+//!   table that names its slots outlives every context of the chunk.
 //! - JIT entries, feedback, function-keyed caches, and diagnostic frame ids are
 //!   non-owning metadata. Eviction invalidates or purges the executable tables
 //!   before tombstoning; diagnostics retain copied names and spans rather than
@@ -161,6 +163,13 @@ pub(crate) fn census_candidate_ids(
             body.visit_function_ids(&mut visit);
         });
         heap.for_each_live_payload::<crate::closure::JsClosureBody, _>(|_, body| {
+            body.visit_function_ids(&mut visit);
+        });
+        // A live context pins the chunk whose scope table describes it.
+        heap.for_each_live_payload::<crate::context::ContextBody, _>(|_, body| {
+            body.visit_function_ids(&mut visit);
+        });
+        heap.for_each_live_payload::<crate::eval_env::EvalExtensionBody, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });
         heap.for_each_live_payload::<crate::bound_function::BoundFunctionBody, _>(|_, body| {

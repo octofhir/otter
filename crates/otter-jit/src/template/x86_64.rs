@@ -7,8 +7,11 @@
 //!   concat packet and coercive runtime delegate.
 //! - Monomorphic plain and bounded polymorphic method generated calls through
 //!   the shared entry-cell, frame, deopt, and feedback contracts.
-//! - Generated base/super constructor linkage with fixed or spread arguments,
-//!   closure-capture refresh, and receiver-allocation fast paths.
+//! - Generated base/super constructor linkage with fixed or spread arguments
+//!   and receiver-allocation fast paths.
+//! - SELF context reads, unchecked context-slot access, and context
+//!   allocation ([`context`]); checked and lookup binding accesses through
+//!   the committed binding boundary.
 //! - Iterator lifecycle, descriptor definitions, and class-value transitions
 //!   through shared VM descriptors.
 //! - Actual-argument collection and intrinsic-apply forwarding through the
@@ -50,6 +53,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "x86_64/context.rs"]
+mod context;
 #[path = "x86_64/direct_call.rs"]
 mod direct_call;
 #[path = "x86_64/exceptions.rs"]
@@ -58,6 +63,7 @@ mod exceptions;
 pub(crate) mod intrinsic_prototype;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
+use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
 use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition};
 use otter_vm::{JitCompileSnapshot, native_abi as abi, runtime_stubs::alloc_value_stub_by_id};
 
@@ -323,6 +329,56 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch x64 ; mov rax, [r14 + NATIVE_FRAME_SELF_OFFSET as i32]);
                 emit_store_reg(&mut ops, 0, dst);
             }
+            TemplateOp::LoadClosureContext { dst } => {
+                context::emit_load_closure_context(&mut ops, view, dst)?;
+            }
+            TemplateOp::LoadContextSlot {
+                dst,
+                context,
+                depth,
+                slot,
+            } => context::emit_load_context_slot(&mut ops, view, dst, context, depth, slot)?,
+            TemplateOp::StoreContextSlot {
+                src,
+                context,
+                depth,
+                slot,
+            } => context::emit_store_context_slot(
+                &mut ops,
+                &mut relocations,
+                view,
+                src,
+                context,
+                depth,
+                slot,
+            )?,
+            TemplateOp::CreateContext {
+                dst,
+                parent,
+                scope,
+                safepoint,
+            } => context::emit_context_allocation(
+                &mut ops,
+                &mut relocations,
+                view,
+                dst,
+                context::ContextAllocation::Create { parent, scope },
+                safepoint,
+                allocation_miss,
+            )?,
+            TemplateOp::CopyContext {
+                dst,
+                src,
+                safepoint,
+            } => context::emit_context_allocation(
+                &mut ops,
+                &mut relocations,
+                view,
+                dst,
+                context::ContextAllocation::Copy { source: src },
+                safepoint,
+                allocation_miss,
+            )?,
             TemplateOp::ClassSuperConstructor { dst, class } => {
                 emit_load_reg(&mut ops, 6, class);
                 dynasm!(ops ; .arch x64 ; mov rdi, r15);
@@ -416,9 +472,6 @@ pub(super) fn compile(
                     fatal,
                 )?;
             }
-            TemplateOp::FreshUpvalue { index } => {
-                emit_fresh_upvalue(&mut ops, &mut relocations, transitions, index, threw, fatal)
-            }
             TemplateOp::DefineDataProperty { object, key, value } => {
                 dynasm!(ops
                     ; .arch x64
@@ -508,7 +561,6 @@ pub(super) fn compile(
                         lane(3),
                         instruction.pc,
                         instruction.byte_pc,
-                        threw,
                         committed_throw,
                         fatal,
                         direct_done,
@@ -529,7 +581,6 @@ pub(super) fn compile(
                         instruction.pc,
                         instruction.byte_pc,
                         opcode == otter_bytecode::Op::SuperConstructSpread as u8,
-                        threw,
                         committed_throw,
                         fatal,
                         direct_done,
@@ -774,7 +825,7 @@ pub(super) fn compile(
             TemplateOp::MakeClosure {
                 dst,
                 function,
-                parents,
+                context,
             } => emit_make_closure(
                 &mut ops,
                 &mut relocations,
@@ -782,27 +833,56 @@ pub(super) fn compile(
                 view.code_block.id,
                 dst,
                 function,
-                plan.index_tail(parents),
-                parents,
+                context,
                 threw,
                 fatal,
-            )?,
-            TemplateOp::BindingValue {
-                result,
-                value0,
-                value1,
-                ..
-            } => emit_committed_value2(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                abi::STUB_JIT_BINDING_VALUE,
-                result,
-                value0,
-                value1,
-                committed_throw,
-                fatal,
             ),
+            TemplateOp::BindingValue {
+                semantics,
+                result,
+                value0,
+                value1,
+                context_coord,
+            } => {
+                let checked = match (semantics, context_coord) {
+                    (BindingSemantics::Read(BindingRead::ContextSlot { .. }), Some(coord)) => {
+                        let dst = result.ok_or(Unsupported::OperandShape("context read result"))?;
+                        Some((context::CheckedContextAccess::Load { dst }, value0, coord))
+                    }
+                    (BindingSemantics::Write(BindingWrite::ContextSlot { .. }), Some(coord)) => {
+                        let src = value0.ok_or(Unsupported::OperandShape("context write value"))?;
+                        Some((context::CheckedContextAccess::Store { src }, value1, coord))
+                    }
+                    _ => None,
+                };
+                let done = ops.new_dynamic_label();
+                if let Some((access, register, coord)) = checked {
+                    let miss = ops.new_dynamic_label();
+                    context::emit_checked_context_slot(
+                        &mut ops,
+                        &mut relocations,
+                        view,
+                        access,
+                        register.ok_or(Unsupported::OperandShape("checked context register"))?,
+                        coord.depth,
+                        coord.slot,
+                        miss,
+                    )?;
+                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
+                }
+                emit_committed_value2(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    abi::STUB_JIT_BINDING_VALUE,
+                    result,
+                    value0,
+                    value1,
+                    committed_throw,
+                    fatal,
+                );
+                dynasm!(ops ; .arch x64 ; =>done);
+            }
             TemplateOp::GlobalDeclarationValue { value0, value1, .. } => {
                 emit_committed_value2(
                     &mut ops,
@@ -1023,7 +1103,6 @@ pub(super) fn compile(
                     &arguments,
                     instruction.pc,
                     byte_pc,
-                    threw,
                     committed_throw,
                     fatal,
                     direct_done,
@@ -1087,7 +1166,6 @@ pub(super) fn compile(
                     instruction.pc,
                     byte_pc,
                     super_construct,
-                    threw,
                     committed_throw,
                     fatal,
                     direct_done,
@@ -1131,7 +1209,6 @@ pub(super) fn compile(
                     argument_registers,
                     instruction.pc,
                     byte_pc,
-                    threw,
                     committed_throw,
                     fatal,
                     direct_done,
@@ -1374,6 +1451,29 @@ pub(super) fn compile(
                 emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
                 dynasm!(ops ; .arch x64 ; jmp =>returned);
             }
+            TemplateOp::ReturnDerived {
+                value,
+                context,
+                depth,
+                slot,
+            } => {
+                // Only `undefined` over a bound receiver completes here; the
+                // receiver is the construct result. Every other shape re-runs
+                // `ReturnDerived` in the interpreter before any effect. Template
+                // never compiles a return that crosses a `finally`, so reading
+                // the `DerivedThis` slot now equals reading it at frame pop.
+                emit_load_reg(&mut ops, 0, value);
+                emit_load_u64(&mut ops, 11, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; cmp rax, r11 ; jne =>runtime_transition);
+                context::emit_read_context_slot_rax(&mut ops, view, context, depth, slot)?;
+                emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                dynasm!(ops
+                    ; .arch x64
+                    ; cmp rax, r11
+                    ; je =>runtime_transition
+                    ; jmp =>returned
+                );
+            }
             TemplateOp::UnsupportedBail => dynasm!(ops ; .arch x64 ; jmp =>unsupported),
         }
         if let Some(code_map) = code_map.as_mut() {
@@ -1500,7 +1600,6 @@ pub(super) fn compile(
     let TemplatePlan {
         register_count,
         register_operands,
-        index_operands,
         mut safepoint_records,
         osr_only,
         instructions,
@@ -1536,7 +1635,6 @@ pub(super) fn compile(
         register_count,
         Box::new([]),
         register_operands,
-        index_operands,
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
@@ -1559,6 +1657,11 @@ fn requires_pc_stamp(op: TemplateOp) -> bool {
         TemplateOp::LoadImmediate { .. }
             | TemplateOp::Move { .. }
             | TemplateOp::LoadSelfClosure { .. }
+            // Unchecked context accesses have no exit; the store's barrier
+            // is a frame-free leaf.
+            | TemplateOp::LoadClosureContext { .. }
+            | TemplateOp::LoadContextSlot { .. }
+            | TemplateOp::StoreContextSlot { .. }
             | TemplateOp::FusedNumericChain { .. }
             | TemplateOp::Return { .. }
             | TemplateOp::ReturnUndefined
@@ -2296,29 +2399,6 @@ fn emit_make_function(
     emit_status_word_result(ops, threw, fatal);
 }
 
-fn emit_fresh_upvalue(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    index: i32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, index
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_FRESH_UPVALUE),
-        abi::STUB_JIT_FRESH_UPVALUE,
-    );
-    dynasm!(ops ; .arch x64 ; call r11);
-    emit_status_word_result(ops, threw, fatal);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_define_own_property(
     ops: &mut Assembler,
@@ -2469,6 +2549,9 @@ fn emit_array_construct_alloc_call(
     Ok(())
 }
 
+/// `MakeClosure dst, fn, ctx`: `esi` the compiling function id, `edx` the
+/// destination, `ecx` the function constant, `r8d` the context register.
+#[allow(clippy::too_many_arguments)]
 fn emit_make_closure(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -2476,33 +2559,18 @@ fn emit_make_closure(
     code_block_id: u32,
     dst: u16,
     function: u32,
-    parents: &[u32],
-    parents_tail: super::TemplateTail,
+    context: u16,
     threw: DynamicLabel,
     fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
+) {
     dynasm!(ops
         ; .arch x64
         ; mov rdi, r15
         ; mov esi, code_block_id as i32
         ; mov edx, i32::from(dst)
         ; mov ecx, function as i32
+        ; mov r8d, i32::from(context)
     );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        8,
-        parents.as_ptr() as u64,
-        RelocationTarget::TemplateOperandSlice {
-            arena: TemplateOperandArena::Indices,
-            role: TemplateOperandRole::ClosureParents,
-            start: u32::try_from(parents_tail.start)
-                .map_err(|_| Unsupported::OperandShape("x86-64 closure parent start"))?,
-            len: u32::try_from(parents_tail.len)
-                .map_err(|_| Unsupported::OperandShape("x86-64 closure parent count"))?,
-        },
-    );
-    emit_load_u64(ops, 9, parents.len() as u64);
     emit_load_runtime_stub(
         ops,
         relocations,
@@ -2511,7 +2579,6 @@ fn emit_make_closure(
     );
     dynasm!(ops ; .arch x64 ; call r11);
     emit_status_word_result(ops, threw, fatal);
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3291,8 +3358,13 @@ fn emit_forward_call(
                 otter_bytecode::ArgumentBindingStorage::Register { reg } => {
                     Some(PacketWord::Register(reg))
                 }
-                otter_bytecode::ArgumentBindingStorage::Upvalue { .. } => None,
+                otter_bytecode::ArgumentBindingStorage::Context { .. } => None,
             }),
+    );
+    words.extend(
+        view.code_block
+            .forwarded_formals_context()
+            .map(PacketWord::Register),
     );
     if words.len() > 510 {
         dynasm!(ops ; .arch x64 ; jmp =>identity_guard);

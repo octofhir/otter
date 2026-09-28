@@ -290,7 +290,7 @@ mod tests {
                     },
                 ]),
             }]);
-            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
                 .expect("intrinsic property selection");
             let probe = sequence
                 .instructions()
@@ -346,7 +346,10 @@ mod tests {
                     result: 1,
                     target: invalid,
                 };
-                assert!(select_with_loop_entries(&target, &hir, &hir.plan_loop_entries()).is_err());
+                assert!(
+                    select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
+                        .is_err()
+                );
             }
         }
     }
@@ -358,7 +361,7 @@ mod tests {
             let site = hir.property_sites.get_mut(&hir::NumericValue(2)).unwrap();
             site.program = Box::default();
             site.megamorphic_atom = Some(17);
-            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
                 .expect("megamorphic property selection");
             let probes = sequence
                 .instructions()
@@ -433,7 +436,7 @@ mod tests {
             let site = hir.property_sites.get_mut(&hir::NumericValue(2)).unwrap();
             site.program =
                 vec![own(7, 8, false), own(9, 16, true), own(11, 24, false)].into_boxed_slice();
-            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
                 .expect("polymorphic property selection");
             let loads = sequence
                 .instructions()
@@ -535,7 +538,7 @@ mod tests {
             let mut hir = super::super::tests::property_selection_hir();
             let site = hir.property_sites.get_mut(&hir::NumericValue(3)).unwrap();
             site.program = vec![existing.clone(), transition.clone()].into_boxed_slice();
-            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
                 .expect("store dispatch selection");
             let dispatches = sequence
                 .instructions()
@@ -594,7 +597,7 @@ mod tests {
             let site = hir.property_sites.get_mut(&hir::NumericValue(3)).unwrap();
             site.program = Box::default();
             site.megamorphic_atom = Some(17);
-            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries())
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
                 .expect("megamorphic property selection");
             let stores = sequence
                 .instructions()

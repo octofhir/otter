@@ -10,13 +10,23 @@
 //! - PC is always rendered as 6 zero-padded decimal digits.
 //! - Functions are emitted in `id` order; spans table is sorted by
 //!   `pc`.
+//! - Every operand renders as one whitespace-free token. Packed binding
+//!   immediates render through their schema domain — a context coordinate as
+//!   `d<depth>:s<slot>`, a scope index as `scope:<n>` — and fall back to
+//!   `i32:<value>` when the word does not decode, so unverified input still
+//!   disassembles.
 //!
 //! # See also
 //! - [`crate::dump`] for the machine-readable form.
+//! - [`crate::opcode_schema::ImmediateDomain`] for the immediate alphabets.
 
 use std::fmt::Write;
 
-use crate::{BytecodeModule, Function, Operand, SourceKind};
+use crate::opcode_schema::{ImmediateDomain, operand_spec_at};
+use crate::{
+    BindingStoreFallback, BytecodeModule, ContextCoord, Function, LookupGlobalMode,
+    LookupRefTarget, Op, Operand, ScopeDescriptor, ScopeKind, SlotKind, SourceKind, StoreRefMode,
+};
 
 /// Disassemble `module` into the canonical text form.
 #[must_use]
@@ -41,7 +51,10 @@ fn write_function(out: &mut String, f: &Function) {
     let _ = writeln!(out);
     let _ = writeln!(out, "function {} @ span={}-{}", f.name, f.span.0, f.span.1);
     let _ = writeln!(out, "  registers:  {}+{}", f.locals, f.scratch);
-    let _ = writeln!(out, "  upvalues:   0");
+    let _ = writeln!(out, "  scopes:     {}", f.scopes.len());
+    for (index, scope) in f.scopes.iter().enumerate() {
+        write_scope(out, index, scope);
+    }
     let _ = writeln!(out, "  feedback:   0");
     let _ = writeln!(out, "  bytecode:");
     for (pc, instr) in f.code.iter().enumerate() {
@@ -49,23 +62,11 @@ fn write_function(out: &mut String, f: &Function) {
         let mut line = format!("    {pc:06}:  {}", instr.op.mnemonic());
         if !operands.is_empty() {
             line.push_str("  ");
-            let mut first = true;
-            for operand in operands.iter() {
-                if !first {
+            for (index, operand) in operands.iter().enumerate() {
+                if index != 0 {
                     line.push(' ');
                 }
-                first = false;
-                match operand {
-                    Operand::Register(r) => {
-                        let _ = write!(line, "r{r}");
-                    }
-                    Operand::ConstIndex(k) => {
-                        let _ = write!(line, "k[{k}]");
-                    }
-                    Operand::Imm32(v) => {
-                        let _ = write!(line, "i32:{v}");
-                    }
-                }
+                write_operand(&mut line, instr.op, index, operand);
             }
         }
         let _ = writeln!(out, "{line}");
@@ -76,10 +77,155 @@ fn write_function(out: &mut String, f: &Function) {
     }
 }
 
+fn write_scope(out: &mut String, index: usize, scope: &ScopeDescriptor) {
+    let mut line = format!("    scope {index}: {}", scope_kind_name(scope.kind));
+    for (set, flag) in [
+        (scope.flags.strict, "strict"),
+        (scope.flags.var_scope, "var_scope"),
+        (scope.flags.has_extension, "extension"),
+    ] {
+        if set {
+            line.push(' ');
+            line.push_str(flag);
+        }
+    }
+    let _ = writeln!(out, "{line}");
+    for (slot_index, slot) in scope.slots.iter().enumerate() {
+        let exported = if slot.exported { " exported" } else { "" };
+        let _ = writeln!(
+            out,
+            "      slot {slot_index}: {} {}{exported}",
+            slot.name,
+            slot_kind_name(slot.kind)
+        );
+    }
+}
+
+fn write_operand(line: &mut String, op: Op, index: usize, operand: Operand) {
+    match operand {
+        Operand::Register(r) => {
+            let _ = write!(line, "r{r}");
+        }
+        Operand::ConstIndex(k) => {
+            let _ = write!(line, "k[{k}]");
+        }
+        Operand::Imm32(value) => {
+            let domain = operand_spec_at(op, index).and_then(|spec| spec.imm_domain);
+            if !domain.is_some_and(|domain| write_immediate(line, domain, value)) {
+                let _ = write!(line, "i32:{value}");
+            }
+        }
+    }
+}
+
+/// Render one packed immediate; `false` when the word does not decode.
+fn write_immediate(line: &mut String, domain: ImmediateDomain, value: i32) -> bool {
+    if !domain.admits(value) {
+        return false;
+    }
+    let _ = match domain {
+        ImmediateDomain::ScopeIndex => write!(line, "scope:{value}"),
+        ImmediateDomain::ContextDepth => write!(line, "d{value}"),
+        ImmediateDomain::ContextCoord => match ContextCoord::from_imm32(value) {
+            Some(coord) => write!(line, "d{}:s{}", coord.depth, coord.slot),
+            None => return false,
+        },
+        ImmediateDomain::LookupRefTarget => match LookupRefTarget::from_imm32(value) {
+            LookupRefTarget::Slot(coord) => write!(line, "d{}:s{}", coord.depth, coord.slot),
+            LookupRefTarget::Global { depth } => write!(line, "d{depth}:global"),
+        },
+        ImmediateDomain::LookupGlobalMode => match LookupGlobalMode::from_imm32(value) {
+            Some(mode) => write!(line, "d{}:{}", mode.depth, strictness(mode.strict)),
+            None => return false,
+        },
+        ImmediateDomain::StoreFallback => match BindingStoreFallback::from_imm32(value) {
+            Some(fallback) => write!(line, "{}", fallback_name(fallback)),
+            None => return false,
+        },
+        ImmediateDomain::StoreRefMode => match StoreRefMode::from_imm32(value) {
+            Some(mode) => {
+                match mode.slot {
+                    Some(slot) => {
+                        let _ = write!(line, "s{slot}:");
+                    }
+                    None => line.push_str("global:"),
+                }
+                write!(
+                    line,
+                    "{}:{}",
+                    fallback_name(mode.fallback),
+                    strictness(mode.strict)
+                )
+            }
+            None => return false,
+        },
+    };
+    true
+}
+
+const fn strictness(strict: bool) -> &'static str {
+    if strict { "strict" } else { "sloppy" }
+}
+
+const fn fallback_name(fallback: BindingStoreFallback) -> &'static str {
+    match fallback {
+        BindingStoreFallback::Mutable => "mutable",
+        BindingStoreFallback::ImmutableThrow => "immutable-throw",
+        BindingStoreFallback::ImmutableIgnore => "immutable-ignore",
+    }
+}
+
+const fn scope_kind_name(kind: ScopeKind) -> &'static str {
+    match kind {
+        ScopeKind::FunctionName => "function_name",
+        ScopeKind::Callee => "callee",
+        ScopeKind::Params => "params",
+        ScopeKind::Body => "body",
+        ScopeKind::Lexical => "lexical",
+        ScopeKind::Block => "block",
+        ScopeKind::Catch => "catch",
+        ScopeKind::ForHead => "for_head",
+        ScopeKind::Switch => "switch",
+        ScopeKind::With => "with",
+        ScopeKind::Class => "class",
+        ScopeKind::ObjectHome => "object_home",
+        ScopeKind::EvalVar => "eval_var",
+        ScopeKind::EvalLexical => "eval_lexical",
+        ScopeKind::Module => "module",
+    }
+}
+
+const fn slot_kind_name(kind: SlotKind) -> &'static str {
+    match kind {
+        SlotKind::Var => "var",
+        SlotKind::FunctionDecl => "function_decl",
+        SlotKind::Arguments => "arguments",
+        SlotKind::Param { checked: false } => "param",
+        SlotKind::Param { checked: true } => "param(checked)",
+        SlotKind::Let => "let",
+        SlotKind::Const => "const",
+        SlotKind::Class => "class",
+        SlotKind::DerivedThis => "derived_this",
+        SlotKind::FnSelfName => "fn_self_name",
+        SlotKind::CatchParam { simple: false } => "catch_param",
+        SlotKind::CatchParam { simple: true } => "catch_param(simple)",
+        SlotKind::WithObject => "with_object",
+        SlotKind::PrivateName => "private_name",
+        SlotKind::PrivateBrand => "private_brand",
+        SlotKind::SuperHome => "super_home",
+        SlotKind::SuperStaticHome => "super_static_home",
+        SlotKind::SuperCtor => "super_ctor",
+        SlotKind::ClassSelf => "class_self",
+        SlotKind::ModuleEnv => "module_env",
+        SlotKind::ImportMeta => "import_meta",
+        SlotKind::Synthetic => "synthetic",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Function, Instruction, Op, Operand, SpanEntry};
+    use crate::{Instruction, ScopeFlags, SlotDescriptor, SpanEntry};
 
     #[test]
     fn empty_module_renders_banner_only() {
@@ -110,6 +256,146 @@ mod tests {
         let text = disassemble(&module);
         assert!(text.contains("; otter bytecode dump —"));
         assert!(text.contains("RETURN  r0"));
+    }
+
+    #[test]
+    fn scopes_and_binding_immediates_render_through_their_domains() {
+        let instruction =
+            |pc: u32, op: Op, operands: Vec<Operand>| Instruction { pc, op, operands };
+        let coord = |depth, slot| ContextCoord::new(depth, slot).unwrap().to_imm32();
+        let code = vec![
+            instruction(
+                0,
+                Op::CreateContext,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Imm32(0),
+                ],
+            ),
+            instruction(
+                1,
+                Op::LoadContextSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Imm32(coord(1, 2)),
+                ],
+            ),
+            instruction(
+                2,
+                Op::ResolveLookupRef,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(LookupRefTarget::Global { depth: 3 }.to_imm32()),
+                ],
+            ),
+            instruction(
+                3,
+                Op::StoreRef,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(
+                        StoreRefMode {
+                            slot: Some(4),
+                            fallback: BindingStoreFallback::ImmutableThrow,
+                            strict: true,
+                        }
+                        .to_imm32(),
+                    ),
+                ],
+            ),
+            instruction(
+                4,
+                Op::StoreLookupGlobal,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(
+                        LookupGlobalMode {
+                            depth: 2,
+                            strict: false,
+                        }
+                        .to_imm32(),
+                    ),
+                ],
+            ),
+            instruction(
+                5,
+                Op::StoreLookupSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(coord(0, 1)),
+                    Operand::Imm32(BindingStoreFallback::ImmutableIgnore.to_imm32()),
+                ],
+            ),
+            instruction(
+                6,
+                Op::LoadContextSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Imm32(i32::from(u16::MAX)),
+                ],
+            ),
+            instruction(7, Op::ReturnUndefined, vec![]),
+        ];
+        let module = BytecodeModule {
+            module: "scopes.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "f".to_string(),
+                scopes: vec![ScopeDescriptor {
+                    kind: ScopeKind::Body,
+                    flags: ScopeFlags {
+                        strict: false,
+                        var_scope: true,
+                        has_extension: true,
+                    },
+                    slots: vec![
+                        SlotDescriptor {
+                            name: "x".to_string(),
+                            kind: SlotKind::Var,
+                            exported: false,
+                        },
+                        SlotDescriptor {
+                            name: "y".to_string(),
+                            kind: SlotKind::Param { checked: true },
+                            exported: true,
+                        },
+                    ],
+                }],
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        };
+        let text = disassemble(&module);
+        for expected in [
+            "  scopes:     1\n    scope 0: body var_scope extension\n",
+            "      slot 0: x var\n      slot 1: y param(checked) exported\n",
+            "CREATE_CONTEXT  r0 r1 scope:0",
+            "LOAD_CONTEXT_SLOT  r2 r0 d1:s2",
+            "RESOLVE_LOOKUP_REF  r3 r0 k[0] d3:global",
+            "STORE_REF  r2 r3 k[0] s4:immutable-throw:strict",
+            "STORE_LOOKUP_GLOBAL  r2 r0 k[0] d2:sloppy",
+            "STORE_LOOKUP_SLOT  r2 r0 k[0] d0:s1 immutable-ignore",
+            "LOAD_CONTEXT_SLOT  r2 r0 i32:65535",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
     }
 
     #[test]
@@ -210,10 +496,15 @@ mod tests {
             Op::TdzError,
             Op::MakeFunction,
             Op::MakeClosure,
-            Op::LoadUpvalue,
-            Op::StoreUpvalue,
-            Op::StoreUpvalueChecked,
-            Op::FreshUpvalue,
+            Op::LoadClosureContext,
+            Op::LoadSelf,
+            Op::CreateContext,
+            Op::CopyContext,
+            Op::LoadContextSlot,
+            Op::LoadContextSlotChecked,
+            Op::StoreContextSlot,
+            Op::StoreContextSlotChecked,
+            Op::BindThisContextSlot,
             Op::Call,
             Op::CallWithThis,
             Op::CallForwardArguments,
@@ -251,6 +542,7 @@ mod tests {
             Op::CollectRest,
             Op::ReturnValue,
             Op::ReturnUndefined,
+            Op::ReturnDerived,
             Op::NewObject,
             Op::LoadProperty,
             Op::StoreProperty,
@@ -308,6 +600,17 @@ mod tests {
             Op::CopyDataProperties,
             Op::DefineOwnProperty,
             Op::NewObjectLiteral,
+            Op::LoadLookupSlot,
+            Op::StoreLookupSlot,
+            Op::DeleteLookupSlot,
+            Op::LoadLookupGlobal,
+            Op::TypeofLookupGlobal,
+            Op::StoreLookupGlobal,
+            Op::DeleteLookupGlobal,
+            Op::ResolveLookupRef,
+            Op::StoreRef,
+            Op::DeclareEvalVar,
+            Op::StoreVarScope,
         ]
     }
 
@@ -407,103 +710,120 @@ mod tests {
 000047 TDZ_ERROR\n\
 000048 MAKE_FUNCTION\n\
 000049 MAKE_CLOSURE\n\
-000050 LOAD_UPVALUE\n\
-000051 STORE_UPVALUE\n\
-000052 STORE_UPVALUE_CHECKED\n\
-000053 FRESH_UPVALUE\n\
-000054 CALL\n\
-000055 CALL_WITH_THIS\n\
-000056 CALL_FORWARD_ARGUMENTS\n\
-000057 BIND_FUNCTION\n\
-000058 LOAD_THIS\n\
-000059 LOAD_NEW_TARGET\n\
-000060 THROW\n\
-000061 ENTER_TRY\n\
-000062 LEAVE_TRY\n\
-000063 END_FINALLY\n\
-000064 NEW_ERROR\n\
-000065 GENERATOR_START\n\
-000066 GET_ITERATOR\n\
-000067 GET_ASYNC_ITERATOR\n\
-000068 ITERATOR_NEXT\n\
-000069 ITERATOR_CLOSE\n\
-000070 ITERATOR_CLOSE_START\n\
-000071 ITERATOR_CLOSE_END\n\
-000072 ARRAY_PUSH\n\
-000073 CALL_SPREAD\n\
-000074 NEW\n\
-000075 NEW_SPREAD\n\
-000076 SUPER_CONSTRUCT_SPREAD\n\
-000077 BIND_THIS_VALUE\n\
-000078 LOAD_SUPER_PROPERTY\n\
-000079 LOAD_SUPER_ELEMENT\n\
-000080 SET_SUPER_PROPERTY\n\
-000081 SET_SUPER_ELEMENT\n\
-000082 JUMP_VIA_FINALLY\n\
-000083 POP_PARKED_FINALLY\n\
-000084 GLOBAL_BINDING_EXISTS\n\
-000085 STORE_GLOBAL_CHECKED\n\
-000086 MAKE_CLASS\n\
-000087 MATH_LOAD\n\
-000088 COLLECT_REST\n\
-000089 RETURN_VALUE\n\
-000090 RETURN_UNDEFINED\n\
-000091 NEW_OBJECT\n\
-000092 LOAD_PROPERTY\n\
-000093 STORE_PROPERTY\n\
-000094 DELETE_PROPERTY\n\
-000095 GET_PROTOTYPE\n\
-000096 SET_PROTOTYPE\n\
-000097 NEW_ARRAY\n\
-000098 LOAD_ELEMENT\n\
-000099 STORE_ELEMENT\n\
-000100 ARRAY_LENGTH\n\
-000101 HAS_PROPERTY\n\
-000102 INSTANCEOF\n\
-000103 EVAL\n\
-000104 IS_EVAL_INTRINSIC\n\
-000105 NEW_FUNCTION\n\
-000106 LOAD_GLOBAL_THIS\n\
-000107 LOAD_GLOBAL_OR_THROW\n\
-000108 COLLECT_ARGUMENTS\n\
-000109 LOAD_GLOBAL_OR_UNDEFINED\n\
-000110 DEFINE_GLOBAL_VAR\n\
-000111 IMPORT_META_RESOLVE\n\
-000112 IMPORT_NAMESPACE_DYNAMIC\n\
-000113 IMPORT_NAMESPACE\n\
-000114 IMPORT_NAMESPACE_DEFERRED\n\
-000115 EVALUATE_MODULE\n\
-000116 MARK_MODULE_EVALUATED\n\
-000117 STAR_REEXPORT\n\
-000118 MODULE_NAMESPACE_OBJECT\n\
-000119 LOAD_IMPORT_BINDING\n\
-000120 PROMISE_FULFILLED_OF\n\
-000121 TEMPORAL_LOAD\n\
-000122 NEW_COLLECTION\n\
-000123 NEW_WEAK_REF\n\
-000124 NEW_FINALIZATION_REGISTRY\n\
-000125 SYMBOL_LOAD\n\
-000126 TYPEOF\n\
-000127 DELETE_ELEMENT\n\
-000128 AWAIT\n\
-000129 SAME_VALUE\n\
-000130 IS_ARRAY\n\
-000131 LOOSE_EQ\n\
-000132 LOOSE_NEQ\n\
-000133 NEW_BUILTIN_ERROR\n\
-000134 LOAD_BUILTIN_ERROR\n\
-000135 BIGINT_CALL\n\
-000136 ARRAY_CONSTRUCT\n\
-000137 ARRAY_FROM\n\
-000138 ARRAY_OF\n\
-000139 ARRAY_BUFFER_CALL\n\
-000140 DATA_VIEW_CALL\n\
-000141 YIELD\n\
-000142 SHARED_ARRAY_BUFFER_CALL\n\
-000143 TO_PRIMITIVE\n\
-000144 FOR_IN_KEYS\n\
-000145 COPY_DATA_PROPERTIES\n\
-000146 DEFINE_OWN_PROPERTY\n\
-000147 NEW_OBJECT_LITERAL\n\
+000050 LOAD_CLOSURE_CONTEXT\n\
+000051 LOAD_SELF\n\
+000052 CREATE_CONTEXT\n\
+000053 COPY_CONTEXT\n\
+000054 LOAD_CONTEXT_SLOT\n\
+000055 LOAD_CONTEXT_SLOT_CHECKED\n\
+000056 STORE_CONTEXT_SLOT\n\
+000057 STORE_CONTEXT_SLOT_CHECKED\n\
+000058 BIND_THIS_CONTEXT_SLOT\n\
+000059 CALL\n\
+000060 CALL_WITH_THIS\n\
+000061 CALL_FORWARD_ARGUMENTS\n\
+000062 BIND_FUNCTION\n\
+000063 LOAD_THIS\n\
+000064 LOAD_NEW_TARGET\n\
+000065 THROW\n\
+000066 ENTER_TRY\n\
+000067 LEAVE_TRY\n\
+000068 END_FINALLY\n\
+000069 NEW_ERROR\n\
+000070 GENERATOR_START\n\
+000071 GET_ITERATOR\n\
+000072 GET_ASYNC_ITERATOR\n\
+000073 ITERATOR_NEXT\n\
+000074 ITERATOR_CLOSE\n\
+000075 ITERATOR_CLOSE_START\n\
+000076 ITERATOR_CLOSE_END\n\
+000077 ARRAY_PUSH\n\
+000078 CALL_SPREAD\n\
+000079 NEW\n\
+000080 NEW_SPREAD\n\
+000081 SUPER_CONSTRUCT_SPREAD\n\
+000082 BIND_THIS_VALUE\n\
+000083 LOAD_SUPER_PROPERTY\n\
+000084 LOAD_SUPER_ELEMENT\n\
+000085 SET_SUPER_PROPERTY\n\
+000086 SET_SUPER_ELEMENT\n\
+000087 JUMP_VIA_FINALLY\n\
+000088 POP_PARKED_FINALLY\n\
+000089 GLOBAL_BINDING_EXISTS\n\
+000090 STORE_GLOBAL_CHECKED\n\
+000091 MAKE_CLASS\n\
+000092 MATH_LOAD\n\
+000093 COLLECT_REST\n\
+000094 RETURN_VALUE\n\
+000095 RETURN_UNDEFINED\n\
+000096 RETURN_DERIVED\n\
+000097 NEW_OBJECT\n\
+000098 LOAD_PROPERTY\n\
+000099 STORE_PROPERTY\n\
+000100 DELETE_PROPERTY\n\
+000101 GET_PROTOTYPE\n\
+000102 SET_PROTOTYPE\n\
+000103 NEW_ARRAY\n\
+000104 LOAD_ELEMENT\n\
+000105 STORE_ELEMENT\n\
+000106 ARRAY_LENGTH\n\
+000107 HAS_PROPERTY\n\
+000108 INSTANCEOF\n\
+000109 EVAL\n\
+000110 IS_EVAL_INTRINSIC\n\
+000111 NEW_FUNCTION\n\
+000112 LOAD_GLOBAL_THIS\n\
+000113 LOAD_GLOBAL_OR_THROW\n\
+000114 COLLECT_ARGUMENTS\n\
+000115 LOAD_GLOBAL_OR_UNDEFINED\n\
+000116 DEFINE_GLOBAL_VAR\n\
+000117 IMPORT_META_RESOLVE\n\
+000118 IMPORT_NAMESPACE_DYNAMIC\n\
+000119 IMPORT_NAMESPACE\n\
+000120 IMPORT_NAMESPACE_DEFERRED\n\
+000121 EVALUATE_MODULE\n\
+000122 MARK_MODULE_EVALUATED\n\
+000123 STAR_REEXPORT\n\
+000124 MODULE_NAMESPACE_OBJECT\n\
+000125 LOAD_IMPORT_BINDING\n\
+000126 PROMISE_FULFILLED_OF\n\
+000127 TEMPORAL_LOAD\n\
+000128 NEW_COLLECTION\n\
+000129 NEW_WEAK_REF\n\
+000130 NEW_FINALIZATION_REGISTRY\n\
+000131 SYMBOL_LOAD\n\
+000132 TYPEOF\n\
+000133 DELETE_ELEMENT\n\
+000134 AWAIT\n\
+000135 SAME_VALUE\n\
+000136 IS_ARRAY\n\
+000137 LOOSE_EQ\n\
+000138 LOOSE_NEQ\n\
+000139 NEW_BUILTIN_ERROR\n\
+000140 LOAD_BUILTIN_ERROR\n\
+000141 BIGINT_CALL\n\
+000142 ARRAY_CONSTRUCT\n\
+000143 ARRAY_FROM\n\
+000144 ARRAY_OF\n\
+000145 ARRAY_BUFFER_CALL\n\
+000146 DATA_VIEW_CALL\n\
+000147 YIELD\n\
+000148 SHARED_ARRAY_BUFFER_CALL\n\
+000149 TO_PRIMITIVE\n\
+000150 FOR_IN_KEYS\n\
+000151 COPY_DATA_PROPERTIES\n\
+000152 DEFINE_OWN_PROPERTY\n\
+000153 NEW_OBJECT_LITERAL\n\
+000154 LOAD_LOOKUP_SLOT\n\
+000155 STORE_LOOKUP_SLOT\n\
+000156 DELETE_LOOKUP_SLOT\n\
+000157 LOAD_LOOKUP_GLOBAL\n\
+000158 TYPEOF_LOOKUP_GLOBAL\n\
+000159 STORE_LOOKUP_GLOBAL\n\
+000160 DELETE_LOOKUP_GLOBAL\n\
+000161 RESOLVE_LOOKUP_REF\n\
+000162 STORE_REF\n\
+000163 DECLARE_EVAL_VAR\n\
+000164 STORE_VAR_SCOPE\n\
 ";
 }

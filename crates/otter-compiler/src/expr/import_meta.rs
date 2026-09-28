@@ -24,9 +24,8 @@ pub(crate) fn compile_meta_property(
     }
     // The only legal MetaProperty inside a module is
     // `import.meta`. The runtime materialises it as a
-    // JsObject the linker passes in as param 1; we hoist
-    // it into `import_meta_uv` at function entry so
-    // closures capture it.
+    // JsObject the linker passes in as param 1; the module
+    // prologue stores it into a module-scope slot.
     //
     // Spec: <https://tc39.es/ecma262/#prod-ImportMeta>
     //       <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
@@ -39,25 +38,10 @@ pub(crate) fn compile_meta_property(
             span,
         });
     }
-    if let Some(import_meta_uv) = cx.module_state.as_ref().map(|s| s.import_meta_uv) {
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadUpvalue,
-            vec![
-                Operand::Register(dst),
-                Operand::Imm32(import_meta_uv as i32),
-            ],
-            span,
-        );
+    // The module's `import.meta` object lives in a module-scope slot, so
+    // nested functions reach it through their context chain.
+    if let Some(dst) = cx.load_internal(crate::compiler::IMPORT_META_BINDING, span) {
         return Ok(dst);
-    }
-    // Nested function inside a module: `module_state` lives on the
-    // module-init frame only, but the init scope registers a
-    // synthetic `__otter_import_meta` binding, so inner functions
-    // reach the same object through the regular capture cascade.
-    let name = crate::synthetic::import_meta_synthetic_name();
-    if cx.resolve_capture(&name).is_some() || cx.lookup_binding(&name).is_some() {
-        return crate::class::load_synthetic_capture(cx, &name, span);
     }
     Err(CompileError::Unsupported {
         node: "`import.meta` outside an ES-module fragment".to_string(),
@@ -93,7 +77,7 @@ pub(crate) fn compile_import(
             // Literal import.defer in module code: linker resolves
             // it during fragment merge, opcode reads the deferred
             // namespace and wraps it in a fulfilled promise. In
-            // script code there is no module graph/upvalue state, so
+            // script code there is no module graph state, so
             // it uses the same host dynamic-import promise path as
             // import().
             let specifier = lit.value.as_str().to_string();

@@ -146,7 +146,6 @@ pub(super) fn emit_forward_call(
             0,
             0,
             0,
-            table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             table.entry(abi::STUB_JIT_COPY_FORWARDED_ARGUMENTS),
             code_map.as_deref_mut(),
             cold,
@@ -226,9 +225,10 @@ pub(super) fn emit_forward_call(
             .forwarded_argument_bindings()
             .filter_map(|(_, storage)| match storage {
                 otter_bytecode::ArgumentBindingStorage::Register { reg } => Some(reg),
-                otter_bytecode::ArgumentBindingStorage::Upvalue { .. } => None,
+                otter_bytecode::ArgumentBindingStorage::Context { .. } => None,
             }),
     );
+    words.extend(view.code_block.forwarded_formals_context());
     if words.len() > 510 {
         // The canonical frame is reconstructed before the call has effects.
         dynasm!(ops ; .arch aarch64 ; b =>bail);

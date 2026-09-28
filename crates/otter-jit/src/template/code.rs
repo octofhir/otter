@@ -39,10 +39,6 @@ pub struct TemplateCode {
     /// transitions, so the allocation must live exactly as long as the code.
     #[allow(dead_code)]
     register_operands: Box<[u16]>,
-    /// Stable decoded parent-upvalue index buffer for closure sites; same
-    /// ownership contract as [`Self::register_operands`].
-    #[allow(dead_code)]
-    index_operands: Box<[u32]>,
     /// Stable backing store for the self-patching `LoadProperty` IC cells;
     /// emitted code holds raw addresses into this slice.
     #[allow(dead_code)]
@@ -68,7 +64,6 @@ impl TemplateCode {
         register_count: u16,
         dependencies: Box<[CodeDependency]>,
         register_operands: Box<[u16]>,
-        index_operands: Box<[u32]>,
         load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         safepoint_records: Box<[SafepointRecord]>,
@@ -93,7 +88,6 @@ impl TemplateCode {
             register_count,
             dependencies,
             register_operands,
-            index_operands,
             load_ic_cells,
             store_ic_cells,
             safepoint_records,
@@ -142,7 +136,6 @@ impl JitFunctionCode for TemplateCode {
             self.code.len(),
             &[
                 std::mem::size_of_val::<[u16]>(&self.register_operands),
-                std::mem::size_of_val::<[u32]>(&self.index_operands),
                 std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self.load_ic_cells),
                 std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self.store_ic_cells),
                 std::mem::size_of_val::<[SafepointRecord]>(&self.safepoint_records),
@@ -212,6 +205,7 @@ impl JitFunctionCode for TemplateCode {
                 self.register_count,
                 otter_vm::native_abi::NativeFrameKind::Baseline,
                 !self.safepoint_records.is_empty(),
+                None,
             )
         })
     }
@@ -231,6 +225,7 @@ impl JitFunctionCode for TemplateCode {
                 self.register_count,
                 otter_vm::native_abi::NativeFrameKind::Baseline,
                 !self.safepoint_records.is_empty(),
+                None,
             )
         }
     }

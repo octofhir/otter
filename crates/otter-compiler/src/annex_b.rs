@@ -29,18 +29,10 @@ use oxc_ast::ast::Statement;
 use crate::hoist::collect_lexical_var_names;
 
 /// Collect Annex B.3.3 var-extension candidates from a function /
-/// script / eval body. `blocked` carries the names that can never
+/// script / eval body, with the source span starts of every *eligible*
+/// declaration site. `blocked` carries the names that can never
 /// receive the extension: top-level lexical names, parameter names,
-/// and (when the arguments object is materialised) `"arguments"`.
-pub(crate) fn collect_annex_b_candidates(
-    stmts: &[Statement<'_>],
-    blocked: &HashSet<String>,
-) -> Vec<String> {
-    collect_annex_b_candidates_spanned(stmts, blocked).0
-}
-
-/// Like [`collect_annex_b_candidates`], but also returns the source
-/// span starts of every *eligible* declaration site. A later
+/// and (when the arguments object is materialised) `"arguments"`. A later
 /// same-name declaration whose own path is blocked (a `let` in an
 /// enclosing block, for example) shares the candidate name but must
 /// not sync the var-scope binding at its source position.

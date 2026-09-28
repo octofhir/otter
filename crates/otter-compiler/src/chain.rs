@@ -112,7 +112,7 @@ pub(crate) fn compile_chain_into(
                     span,
                 )?;
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let key_reg = compile_expr(cx, &m.expression, span)?;
                 cx.emit(
                     Op::LoadSuperElement,
@@ -214,7 +214,7 @@ fn compile_chain_call_into(
                                 mspan,
                             )?;
                             let this_reg = cx.alloc_scratch();
-                            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], mspan);
+                            cx.emit_load_this(this_reg, mspan);
                             (callee, Some(this_reg))
                         } else {
                             let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
@@ -249,7 +249,7 @@ fn compile_chain_call_into(
                                 mspan,
                             )?;
                             let this_reg = cx.alloc_scratch();
-                            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], mspan);
+                            cx.emit_load_this(this_reg, mspan);
                             let key_reg = compile_expr(cx, &m.expression, mspan)?;
                             let callee = cx.alloc_scratch();
                             cx.emit(
@@ -467,7 +467,7 @@ pub(crate) fn compile_chain_into_chain_object(
                     span,
                 )?;
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let key_reg = compile_expr(cx, &m.expression, span)?;
                 cx.emit(
                     Op::LoadSuperElement,

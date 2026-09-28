@@ -87,14 +87,13 @@ fn inline_activation_reentry_preserves_stack_and_moving_roots() {
         if !stack_owned {
             let mut window = vm.alloc_reg_window(1).unwrap();
             window[0] = root_registers[0];
-            let mut frame = Frame::with_exec_return_upvalues_and_this(
+            let frame = Frame::for_code_block(
                 context.exec_function(0).unwrap(),
                 None,
-                Box::default(),
+                Value::function(0),
                 Value::undefined(),
                 window,
             );
-            frame.self_value = Value::function(0);
             root.header.flags = Default::default();
             root.register_base = window.as_mut_ptr() as u64;
             stack.push(frame);
@@ -110,10 +109,8 @@ fn inline_activation_reentry_preserves_stack_and_moving_roots() {
             let closure = crate::closure::alloc_closure(
                 &mut vm.gc_heap,
                 1,
-                &mut [],
+                Value::undefined(),
                 Some(value),
-                None,
-                None,
                 None,
             )
             .unwrap();
@@ -137,14 +134,13 @@ fn inline_activation_reentry_preserves_stack_and_moving_roots() {
                     let stack = unsafe { &mut *stack_ptr };
                     assert_eq!(vm.logical_call_depth(stack), 2);
                     let window = vm.alloc_reg_window(1).unwrap();
-                    let mut getter = Frame::with_exec_return_upvalues_and_this(
+                    let getter = Frame::for_code_block(
                         context.exec_function(2).unwrap(),
                         None,
-                        Box::default(),
+                        Value::function(2),
                         Value::undefined(),
                         window,
                     );
-                    getter.self_value = Value::function(2);
                     stack.push(getter);
                     let names: Vec<_> = vm
                         .snapshot_active_frames(&context, stack, 10)
@@ -313,7 +309,7 @@ fn inline_constructor_new_target_is_a_moving_root() {
         let receiver = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
         root.set_this_value(Value::object(receiver));
         let target =
-            crate::closure::alloc_closure(&mut vm.gc_heap, 2, &mut [], None, None, None, None)
+            crate::closure::alloc_closure(&mut vm.gc_heap, 2, Value::undefined(), None, None)
                 .unwrap();
         registers[0] = Value::closure(target);
         let mut recipes = [recipe(&context, 1, root.this_value())];

@@ -14,14 +14,14 @@
 //! - These APIs are cold side-exit operations, never normal call entry or a
 //!   native-to-interpreter tier transition.
 //! - Register values are attached/copied exactly once after the side exit.
-//! - The direct-eval environment is moved exactly once from the published
-//!   native frame into the fully published outer materialized frame.
+//! - Contexts travel as ordinary register values; every rebuilt frame gets
+//!   its exact SELF, through which it reaches its incoming context.
 //! - Inline chains return a complete result for materialized and stack-owned
 //!   native entries alike; their published outer frame retains its GC lifetime.
 //! - Every rebuilt frame receives the exact static catch-only handler stack for
 //!   its resume PC before interpreter dispatch can observe it.
 //! - The outer inline continuation retains the live activation's actuals,
-//!   captured cells, arguments object and constructor bindings. Descendants
+//!   SELF, arguments object and constructor bindings. Descendants
 //!   use the same decoded frame schema, including their own or lexical new.target.
 //!   A lexical arrow binding never enables constructor result substitution.
 //! - Every temporary materialized frame and register window is removed before
@@ -116,22 +116,16 @@ impl Interpreter {
             native.header.pc,
         )?;
         let register_count = active.register_count();
-        if register_count != usize::from(function.register_count)
-            || active.upvalue_count() < usize::from(function.own_upvalue_count)
-        {
+        if register_count != usize::from(function.register_count) {
             return Err(VmError::InvalidOperand);
         }
 
         // Copy all scalar and tagged inputs before building the materialized
         // frame. Host Vec/register-arena growth cannot collect; once pushed,
         // ordinary runtime-turn tracing owns the new interpreter storage.
+        // Contexts travel as ordinary register values and through SELF.
         let self_value = active.self_value();
         let this_value = active.this_value();
-        let mut upvalues = Vec::with_capacity(active.upvalue_count());
-        for index in 0..active.upvalue_count() {
-            let index = u32::try_from(index).map_err(|_| VmError::InvalidOperand)?;
-            upvalues.push(active.upvalue(index)?);
-        }
 
         let _window_rollback = self.register_window_rollback();
         let mut window = self.alloc_reg_window(register_count)?;
@@ -139,14 +133,7 @@ impl Interpreter {
             let register = u16::try_from(index).map_err(|_| VmError::InvalidOperand)?;
             window[index] = active.read(register)?;
         }
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            None,
-            upvalues.into_boxed_slice(),
-            this_value,
-            window,
-        );
-        frame.self_value = self_value;
+        let mut frame = Frame::for_code_block(function, None, self_value, this_value, window);
         frame.pc = native.header.pc;
         if let Some(object) = native.arguments_object() {
             self.frame_ensure_cold(&mut frame).arguments_object = Some(Value::object(object));
@@ -187,11 +174,6 @@ impl Interpreter {
             |interp| {
                 let floor = stack.floor();
                 stack.push(frame);
-                let materialized = stack
-                    .last_mut()
-                    .expect("generated deopt frame was just published");
-                debug_assert!(materialized.eval_env.is_null());
-                std::mem::swap(&mut materialized.eval_env, &mut native.eval_env);
                 let result = interp.dispatch_loop_above_rooted(context, stack, floor);
                 interp.release_frames_above(stack, floor);
                 result
@@ -333,37 +315,13 @@ impl Interpreter {
             let function = context
                 .exec_function(deopt.function_id)
                 .ok_or(VmError::InvalidOperand)?;
-            let (upvalues, eval_env): (crate::frame_state::UpvalueSpine, _) = if index == 0 {
-                let upvalues = (0..active.upvalue_count())
-                    .map(|index| active.upvalue(index as u32))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice();
-                (upvalues, None)
-            } else {
-                // A spliced callee resumes with its closure's dynamic eval
-                // chain, exactly as an interpreter call would enter it.
-                match entry.closure.as_closure(&self.gc_heap) {
-                    Some(closure) => (
-                        closure.upvalues_snapshot(&self.gc_heap).into_boxed_slice(),
-                        closure.eval_env(&self.gc_heap),
-                    ),
-                    None => (Vec::new().into_boxed_slice(), None),
-                }
-            };
+            // Contexts are ordinary tagged slots of the recipe; each frame's
+            // incoming context is its exact SELF closure's.
             let mut window = self.alloc_reg_window(deopt.slots.len())?;
             window.copy_from_slice(&deopt.slots);
             let return_register = (index != 0).then_some(entry.return_register);
-            let mut frame = Frame::with_exec_return_upvalues_and_this(
-                function,
-                return_register,
-                upvalues,
-                entry.this,
-                window,
-            );
-            frame.self_value = entry.closure;
-            if let Some(env) = eval_env {
-                frame.eval_env = env;
-            }
+            let mut frame =
+                Frame::for_code_block(function, return_register, entry.closure, entry.this, window);
             frame.pc = resume_pcs[index];
             materialized.push(frame);
             self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
@@ -446,11 +404,6 @@ impl Interpreter {
         for frame in materialized {
             stack.push(frame);
         }
-        let outer = stack
-            .get_mut(floor.depth())
-            .expect("inline deopt outer frame was just published");
-        debug_assert!(outer.eval_env.is_null());
-        std::mem::swap(&mut outer.eval_env, &mut native.eval_env);
         let result = self.dispatch_loop_above_rooted(context, stack, floor);
         self.leave_sync_reentry();
         self.release_frames_above(stack, floor);
@@ -531,8 +484,6 @@ mod tests {
             let mut interpreter = Interpreter::new();
             let mut stack = ActivationStack::new();
             let thrown = Value::number_i32(73);
-            let eval_env = crate::eval_env::alloc_eval_env(&mut interpreter.gc_heap, None)
-                .expect("inline eval env");
             let mut native = NativeFrame::new(
                 crate::native_abi::VmFrameHeader {
                     function_id: 0,
@@ -551,7 +502,6 @@ mod tests {
                 native.header.register_count = 2;
                 native.set_stack_registers();
             }
-            native.set_eval_env(Some(eval_env));
             let frames = [
                 crate::deopt::DeoptFrame {
                     function_id: 0,
@@ -598,7 +548,6 @@ mod tests {
                 })
                 .expect("both nested catches resume");
             assert_eq!(result, thrown);
-            assert!(native.eval_env().is_none());
             assert!(stack.is_empty());
         }
     }
@@ -711,8 +660,6 @@ mod tests {
         let mut interpreter = Interpreter::new();
         let mut stack = ActivationStack::new();
         let thrown = Value::number_i32(91);
-        let eval_env = crate::eval_env::alloc_eval_env(&mut interpreter.gc_heap, None)
-            .expect("generated eval env");
         let mut registers = [thrown, Value::undefined()];
         let mut native = NativeFrame::new(
             crate::native_abi::VmFrameHeader {
@@ -727,7 +674,6 @@ mod tests {
             Value::undefined(),
         );
         native.set_stack_registers();
-        native.set_eval_env(Some(eval_env));
         // SAFETY: this fixture keeps `native` and its register window live and
         // stationary through the complete rooted deopt transaction below.
         unsafe {
@@ -749,7 +695,6 @@ mod tests {
             .expect("stack-call catch resumes");
         interpreter.jit_pop_native_activation();
         assert_eq!(result, thrown);
-        assert!(native.eval_env().is_none());
         assert!(stack.is_empty());
     }
 }

@@ -1,35 +1,14 @@
-//! Synthetic names and literal-key helpers shared by module and object lowering.
+//! Literal decoding and key-formatting helpers shared by expression lowering.
 //!
 //! # Contents
-//! - module/import synthetic name builders
 //! - UTF-16 string decoding
 //! - numeric literal property-key formatting
 //!
 //! # Invariants
-//! - Generated names must stay outside user binding syntax.
+//! - Decoding is lossless for every oxc lone-surrogate encoding.
 //!
 //! # See also
 //! - `module_state` and `expr`
-
-/// Synthetic binding name used to capture the `module_env`
-/// JsObject through inner-function `resolve_capture` cascades.
-/// Inner functions that mutate a module-level export reach the
-/// outer module-init's `module_env` cell via this name.
-pub(crate) fn module_env_synthetic_name() -> String {
-    "__otter_module_env".to_string()
-}
-
-/// Synthetic binding name for the `import_meta` JsObject.
-pub(crate) fn import_meta_synthetic_name() -> String {
-    "__otter_import_meta".to_string()
-}
-
-/// Synthetic binding name for an import-record at the given
-/// outer-frame upvalue index. Distinct names per-record let inner
-/// functions cascade each independently.
-pub(crate) fn import_record_synthetic_name(record_uv: u16) -> String {
-    format!("__otter_import_record_{record_uv}")
-}
 
 /// Decode oxc's lossy lone-surrogate encoding back into raw WTF-16
 /// code units. When `StringLiteral::lone_surrogates` is set, oxc

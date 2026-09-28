@@ -316,7 +316,7 @@ fn render_region_annotation(
     if let Some(direct_call) = region.direct_call {
         write!(
             output,
-            " call-kind={} call-argument-mode={} call-target-function={} call-target-index={} call-target-count={} call-target-code-object-id={} call-target-tier={} call-this-mode={} call-callee-native-frame-bytes={} call-linkage-bytes={} call-reserved-stack-bytes={} call-callee-register-count={} call-own-upvalue-count={} call-inherited-upvalue-count={}",
+            " call-kind={} call-argument-mode={} call-target-function={} call-target-index={} call-target-count={} call-target-code-object-id={} call-target-tier={} call-this-mode={} call-callee-native-frame-bytes={} call-linkage-bytes={} call-reserved-stack-bytes={} call-callee-register-count={}",
             direct_call.call_kind.name(),
             direct_call.argument_mode.name(),
             direct_call.target_function_id,
@@ -329,8 +329,6 @@ fn render_region_annotation(
             direct_call.linkage_bytes.map_or_else(|| "dynamic".to_owned(), |bytes| bytes.to_string()),
             direct_call.reserved_stack_bytes.map_or_else(|| "dynamic".to_owned(), |bytes| bytes.to_string()),
             direct_call.callee_register_count,
-            direct_call.own_upvalue_count,
-            direct_call.inherited_upvalue_count,
         )
         .expect("writing to String cannot fail");
     }
@@ -535,7 +533,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             byte_pc,
             direct_call,
         } => format!(
-            "directCallEntryCell(callerBytePc={byte_pc},callKind={},argumentMode={},targetFunction={},targetIndex={},targetCount={},targetCodeObjectId={},targetTier={},thisMode={},calleeNativeFrameBytes={},linkageBytes={},reservedStackBytes={},calleeRegisterCount={},ownUpvalueCount={},inheritedUpvalueCount={})",
+            "directCallEntryCell(callerBytePc={byte_pc},callKind={},argumentMode={},targetFunction={},targetIndex={},targetCount={},targetCodeObjectId={},targetTier={},thisMode={},calleeNativeFrameBytes={},linkageBytes={},reservedStackBytes={},calleeRegisterCount={})",
             direct_call.call_kind.name(),
             direct_call.argument_mode.name(),
             direct_call.target_function_id,
@@ -552,8 +550,6 @@ fn symbolic_target(target: &RelocationTarget) -> String {
                 .reserved_stack_bytes
                 .map_or_else(|| "dynamic".to_owned(), |bytes| bytes.to_string()),
             direct_call.callee_register_count,
-            direct_call.own_upvalue_count,
-            direct_call.inherited_upvalue_count,
         ),
     }
 }
@@ -561,13 +557,11 @@ fn symbolic_target(target: &RelocationTarget) -> String {
 fn operand_arena_name(arena: TemplateOperandArena) -> &'static str {
     match arena {
         TemplateOperandArena::Registers => "registers",
-        TemplateOperandArena::Indices => "indices",
     }
 }
 
 fn operand_role_name(role: TemplateOperandRole) -> &'static str {
     match role {
-        TemplateOperandRole::ClosureParents => "closureParents",
         TemplateOperandRole::ConstructArguments => "constructArguments",
     }
 }
@@ -821,15 +815,13 @@ mod tests {
                     linkage_bytes: Some(112),
                     reserved_stack_bytes: Some(272),
                     callee_register_count: 6,
-                    own_upvalue_count: 2,
-                    inherited_upvalue_count: 1,
                 },
             ),
             None,
         );
         assert_eq!(
             output,
-            "  ; region kind=directCallGuard range=+0x00000004..+0x0000000c function=7 call-kind=plain call-argument-mode=fixed call-target-function=11 call-target-index=0 call-target-count=1 call-target-code-object-id=29 call-target-tier=optimizing call-this-mode=sloppyGlobal call-callee-native-frame-bytes=160 call-linkage-bytes=112 call-reserved-stack-bytes=272 call-callee-register-count=6 call-own-upvalue-count=2 call-inherited-upvalue-count=1 pc=2 byte-pc=19\n"
+            "  ; region kind=directCallGuard range=+0x00000004..+0x0000000c function=7 call-kind=plain call-argument-mode=fixed call-target-function=11 call-target-index=0 call-target-count=1 call-target-code-object-id=29 call-target-tier=optimizing call-this-mode=sloppyGlobal call-callee-native-frame-bytes=160 call-linkage-bytes=112 call-reserved-stack-bytes=272 call-callee-register-count=6 pc=2 byte-pc=19\n"
         );
     }
 
@@ -894,8 +886,6 @@ mod tests {
                     linkage_bytes: Some(112),
                     reserved_stack_bytes: Some(272),
                     callee_register_count: 6,
-                    own_upvalue_count: 2,
-                    inherited_upvalue_count: 1,
                 },
             },
         );
@@ -911,7 +901,7 @@ mod tests {
         );
         assert!(assembly.starts_with("; otter jit aarch64 assembly\n"));
         assert!(assembly.contains(
-            "directCallEntryCell(callerBytePc=19,callKind=plain,argumentMode=fixed,targetFunction=11,targetIndex=0,targetCount=1,targetCodeObjectId=29,targetTier=optimizing,thisMode=sloppyGlobal,calleeNativeFrameBytes=160,linkageBytes=112,reservedStackBytes=272,calleeRegisterCount=6,ownUpvalueCount=2,inheritedUpvalueCount=1)"
+            "directCallEntryCell(callerBytePc=19,callKind=plain,argumentMode=fixed,targetFunction=11,targetIndex=0,targetCount=1,targetCodeObjectId=29,targetTier=optimizing,thisMode=sloppyGlobal,calleeNativeFrameBytes=160,linkageBytes=112,reservedStackBytes=272,calleeRegisterCount=6)"
         ));
     }
 

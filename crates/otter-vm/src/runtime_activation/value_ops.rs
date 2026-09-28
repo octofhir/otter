@@ -246,13 +246,14 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_define_own_property(stack, context, &mut frame, target, key, descriptor)
     }
 
-    /// Allocate a closure from the current published activation.
+    /// Allocate a closure over the context in `context_reg` from the current
+    /// published activation.
     pub fn make_closure(
         &mut self,
         function_id: u32,
         dst: u16,
         function_index: u32,
-        parent_indices: &[u32],
+        context_reg: u16,
     ) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = &self.context;
@@ -267,7 +268,7 @@ impl RuntimeCall<'_> {
             function_id,
             dst,
             function_index,
-            parent_indices,
+            context_reg,
         )
     }
 
@@ -467,61 +468,30 @@ impl RuntimeCall<'_> {
         vm.materialize_virtual_objects(recipes)
     }
 
-    /// Store a captured binding with its TDZ check.
-    pub fn store_upvalue_checked(&mut self, src: u16, index: i32) -> Result<(), VmError> {
+    /// `CreateContext dst, parent, scope` over the current activation.
+    pub fn create_context(
+        &mut self,
+        dst: u16,
+        parent: u16,
+        scope_index: u32,
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = &self.context;
+        let frame = self.frame.as_ptr();
+        // SAFETY: as [`Self::add`].
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_create_context(context, &mut frame, dst, parent, scope_index)
+    }
+
+    /// `CopyContext dst, src` over the current activation.
+    pub fn copy_context(&mut self, dst: u16, src: u16) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_store_upvalue_checked(&mut frame, src, index)
-    }
-
-    /// Replace a loop-captured upvalue with a fresh cell.
-    pub fn fresh_upvalue(&mut self, index: i32) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_fresh_upvalue(&mut frame, index)
-    }
-
-    /// Read a captured binding.
-    pub fn load_upvalue(&mut self, dst: u16, index: i32) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_load_upvalue(&mut frame, dst, index)
-    }
-
-    /// Read a captured binding as an SSA value without assigning a bytecode
-    /// destination register.
-    pub fn load_upvalue_value(&self, index: i32) -> Result<Value, VmError> {
-        let index = u32::try_from(index).map_err(|_| VmError::InvalidOperand)?;
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall owns the validated published descriptor.
-        let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        let value =
-            crate::read_upvalue(unsafe { &self.vm.as_ref().gc_heap }, frame.upvalue(index)?);
-        if value.is_hole() {
-            Err(VmError::TemporalDeadZone { local_index: index })
-        } else {
-            Ok(value)
-        }
-    }
-
-    /// Write a captured binding.
-    pub fn store_upvalue(&mut self, src: u16, index: i32) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_store_upvalue(&mut frame, src, index)
+        vm.jit_runtime_copy_context(&mut frame, dst, src)
     }
 
     /// Complete one computed `[[Get]]` over boxed SSA values.

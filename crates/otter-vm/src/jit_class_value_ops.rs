@@ -166,8 +166,9 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Complete one direct `Eval` while its materialized caller frame owns the
-    /// eval-environment slot for the complete synchronous VM reentry.
+    /// Complete one direct `Eval dst, src, ctx, flags` from its materialized
+    /// caller frame. `packed_registers` carries `dst`, `src`, and `ctx` in
+    /// 16-bit lanes.
     pub(crate) fn jit_runtime_eval_op(
         &mut self,
         context: &ExecutionContext,
@@ -175,7 +176,6 @@ impl Interpreter {
         frame_index: usize,
         packed_registers: u64,
         flags: u64,
-        site: u64,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
@@ -186,8 +186,8 @@ impl Interpreter {
         let operands = [
             Operand::Register(lane(packed_registers, 0)),
             Operand::Register(lane(packed_registers, 1)),
+            Operand::Register(lane(packed_registers, 2)),
             Operand::Imm32(flags as u32 as i32),
-            Operand::Imm32(site as u32 as i32),
         ];
         self.run_eval_operands(context, stack, operands.as_slice())?;
         stack[frame_index].pc = saved_pc;

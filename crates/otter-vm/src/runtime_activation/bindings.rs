@@ -7,13 +7,15 @@
 //!
 //! # Invariants
 //! - Published function/PC and `OpcodeSchema` are the sole semantic authority;
-//!   the native ABI carries only two boxed SSA values.
-//! - Shadowed captures decode one schema-owned bounded eval prefix; a lookup or
-//!   delete cannot cross the captured declaration owner.
-//! - Structural site, constant, immediate, and upvalue failures are fatal.
+//!   the native ABI carries only two boxed SSA values, in
+//!   `BindingSemantics::value_operands` order: the stored value first, then
+//!   the context or reference register (or the pre-RHS existence Boolean).
+//! - `Lookup*` operations decode one schema-owned static hop bound; an
+//!   extension probe cannot cross the declaring context.
+//! - Structural site, constant, immediate, and context failures are fatal.
 //!   Entered JavaScript semantics return only success or a catchable error.
 //! - Both boxed inputs and the result are rooted for the complete allocating or
-//!   reentrant operation. Eval-environment ownership stays in the native frame.
+//!   reentrant operation; allocating kernels re-read contexts from those roots.
 //! - No operation advances the PC or writes a destination register.
 //!
 //! # See also
@@ -22,7 +24,7 @@
 
 use otter_bytecode::opcode_schema::{
     BindingDelete, BindingMissing, BindingRead, BindingSemantics, BindingWrite,
-    GlobalDeclarationSemantics, ShadowedUpvalueStorePolicy, opcode_schema,
+    GlobalDeclarationSemantics, opcode_schema,
 };
 
 use crate::{Value, VmError, rooting::RootScopeExt};
@@ -104,67 +106,51 @@ impl RuntimeCall<'_> {
                     .map_err(CommittedValueError::Fatal)?;
                 vm.global_binding_exists_value(stack, context, function_id, name_idx)
             }
-            BindingSemantics::Read(BindingRead::Upvalue { index, .. }) => {
-                let index = self
-                    .published_imm32(index)
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                self.with_frame(|frame| vm.frame_load_upvalue_value(frame, index))
+            BindingSemantics::Read(BindingRead::ContextSlot { coord, .. }) => {
+                let coord = self
+                    .published_imm32(coord)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.load_context_slot_value(context, value0, coord, true)
             }
-            BindingSemantics::Read(BindingRead::Dynamic { name, missing, .. }) => {
+            BindingSemantics::Read(BindingRead::LookupSlot { name, coord, .. }) => {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                let eval_env = self
-                    .with_frame(|frame| Ok(frame.eval_env()))
+                let coord = self
+                    .published_imm32(coord)
                     .map_err(CommittedValueError::Fatal)?;
-                match missing {
-                    BindingMissing::Throw => {
-                        vm.load_dynamic_value(context, stack, function_id, eval_env, name_idx)
-                    }
-                    BindingMissing::Undefined => {
-                        vm.typeof_dynamic_value(context, stack, function_id, eval_env, name_idx)
-                    }
-                }
+                vm.load_lookup_slot_value(context, function_id, value0, name_idx, coord)
             }
-            BindingSemantics::Read(BindingRead::ShadowedUpvalue {
+            BindingSemantics::Read(BindingRead::LookupGlobal {
                 name,
-                index,
-                eval_depth,
-                snapshot,
+                depth,
+                missing,
                 ..
             }) => {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                let index = self
-                    .published_imm32(index)
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                let eval_depth = self
-                    .published_imm32(eval_depth)
-                    .ok()
-                    .and_then(|depth| u32::try_from(depth).ok())
-                    .filter(|depth| *depth != 0)
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                // The snapshot rides as the first boxed input when the
-                // opcode carries one.
-                let snapshot = snapshot
-                    .map(|_| {
-                        crate::jit_control_ops::snapshot_from_value(value0)
-                            .map_err(CommittedValueError::Fatal)
-                    })
-                    .transpose()?;
-                self.with_frame(|frame| {
-                    vm.load_shadowed_upvalue_value(
-                        context, frame, name_idx, index, eval_depth, snapshot,
-                    )
-                })
+                let depth = self
+                    .published_imm32(depth)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.load_lookup_global_value(
+                    context,
+                    stack,
+                    function_id,
+                    value0,
+                    name_idx,
+                    depth,
+                    missing,
+                )
             }
-            BindingSemantics::Read(BindingRead::EvalBindingSeq { .. }) => {
-                Ok(Value::number_f64(vm.current_eval_binding_seq() as f64))
+            BindingSemantics::Read(BindingRead::ResolveRef { name, target, .. }) => {
+                let name_idx = self
+                    .published_const_index(name)
+                    .map_err(CommittedValueError::Fatal)?;
+                let target = self
+                    .published_imm32(target)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.resolve_lookup_ref_value(context, function_id, value0, name_idx, target)
             }
             BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
                 let name_idx = self
@@ -194,125 +180,115 @@ impl RuntimeCall<'_> {
                 )
                 .map(|()| Value::undefined())
             }
-            BindingSemantics::Write(BindingWrite::Upvalue { index, check, .. }) => {
-                let index = self
-                    .published_imm32(index)
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                self.with_frame(|frame| vm.frame_store_upvalue_value(frame, index, value0, check))
+            BindingSemantics::Write(BindingWrite::ContextSlot { coord, .. }) => {
+                let coord = self
+                    .published_imm32(coord)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.store_context_slot_value(context, value1, coord, value0, true)
                     .map(|()| Value::undefined())
             }
-            BindingSemantics::Write(BindingWrite::Dynamic { name, strict, .. }) => {
+            BindingSemantics::Write(BindingWrite::BindThis { coord, .. }) => {
+                let coord = self
+                    .published_imm32(coord)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.bind_this_context_slot_value(value1, coord, value0)
+                    .map(|()| Value::undefined())
+            }
+            BindingSemantics::Write(BindingWrite::LookupSlot {
+                name,
+                coord,
+                fallback,
+                ..
+            }) => {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                let strict = flag(
-                    self.published_imm32(strict)
-                        .map_err(CommittedValueError::Fatal)?,
-                )?;
-                let eval_env = self
-                    .with_frame(|frame| Ok(frame.eval_env()))
+                let coord = self
+                    .published_imm32(coord)
                     .map_err(CommittedValueError::Fatal)?;
-                vm.store_dynamic_value(
+                let fallback = self
+                    .published_imm32(fallback)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.store_lookup_slot_value(
                     context,
-                    stack,
                     function_id,
-                    eval_env,
-                    value0,
+                    value1,
                     name_idx,
-                    strict,
+                    coord,
+                    fallback,
+                    value0,
                 )
                 .map(|()| Value::undefined())
             }
-            BindingSemantics::Write(BindingWrite::ShadowedRestore { name, index }) => {
+            BindingSemantics::Write(BindingWrite::LookupGlobal { name, mode, .. }) => {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                let index = self
-                    .published_imm32(index)
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                self.with_frame(|frame| vm.eval_restore_binding(context, frame, name_idx, index))
-                    .map(|()| Value::undefined())
-            }
-            BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
-                name,
-                index,
-                policy,
-                snapshot,
-                ..
-            }) => {
-                let name_idx = self
-                    .published_const_index(name)
+                let mode = self
+                    .published_imm32(mode)
                     .map_err(CommittedValueError::Fatal)?;
-                let index = self
-                    .published_imm32(index)
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                let policy = self
-                    .published_imm32(policy)
-                    .map_err(CommittedValueError::Fatal)
-                    .and_then(|encoded| {
-                        ShadowedUpvalueStorePolicy::from_imm32(encoded)
-                            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
-                    })?;
-                // The snapshot rides as the second boxed input when the
-                // opcode carries one.
-                let snapshot = snapshot
-                    .map(|_| {
-                        crate::jit_control_ops::snapshot_from_value(value1)
-                            .map_err(CommittedValueError::Fatal)
-                    })
-                    .transpose()?;
-                self.with_frame(|frame| {
-                    vm.store_shadowed_upvalue_value(
-                        context,
-                        frame,
-                        name_idx,
-                        index,
-                        policy.eval_depth,
-                        policy.fallback,
-                        value0,
-                        snapshot,
-                    )
-                })
+                vm.store_lookup_global_value(
+                    context,
+                    stack,
+                    function_id,
+                    value1,
+                    name_idx,
+                    mode,
+                    value0,
+                )
                 .map(|()| Value::undefined())
             }
-            BindingSemantics::Delete(BindingDelete::Dynamic { name, .. }) => {
+            BindingSemantics::Write(BindingWrite::StoreRef { name, mode, .. }) => {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                let eval_env = self
-                    .with_frame(|frame| Ok(frame.eval_env()))
+                let mode = self
+                    .published_imm32(mode)
                     .map_err(CommittedValueError::Fatal)?;
-                vm.delete_dynamic_value(context, function_id, eval_env, name_idx)
+                vm.store_ref_value(context, stack, function_id, value1, name_idx, mode, value0)
+                    .map(|()| Value::undefined())
             }
-            BindingSemantics::Delete(BindingDelete::ShadowedUpvalue {
-                name,
-                index,
-                eval_depth,
-                ..
+            BindingSemantics::Write(BindingWrite::DeclareEvalVar {
+                name, var_depth, ..
             }) => {
                 let name_idx = self
                     .published_const_index(name)
                     .map_err(CommittedValueError::Fatal)?;
-                let index = self
-                    .published_imm32(index)
-                    .ok()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                let eval_depth = self
-                    .published_imm32(eval_depth)
-                    .ok()
-                    .and_then(|depth| u32::try_from(depth).ok())
-                    .filter(|depth| *depth != 0)
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-                self.with_frame(|frame| {
-                    vm.delete_shadowed_upvalue_value(context, frame, name_idx, index, eval_depth)
-                })
+                let var_depth = self
+                    .published_imm32(var_depth)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.declare_eval_var_value(context, function_id, value0, name_idx, var_depth)
+                    .map(|()| Value::undefined())
+            }
+            BindingSemantics::Write(BindingWrite::VarScope {
+                name, var_depth, ..
+            }) => {
+                let name_idx = self
+                    .published_const_index(name)
+                    .map_err(CommittedValueError::Fatal)?;
+                let var_depth = self
+                    .published_imm32(var_depth)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.store_var_scope_value(context, function_id, value1, name_idx, var_depth, value0)
+                    .map(|()| Value::undefined())
+            }
+            BindingSemantics::Delete(BindingDelete::LookupSlot { name, depth, .. }) => {
+                let name_idx = self
+                    .published_const_index(name)
+                    .map_err(CommittedValueError::Fatal)?;
+                let depth = self
+                    .published_imm32(depth)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.delete_lookup_slot_value(context, function_id, value0, name_idx, depth)
+            }
+            BindingSemantics::Delete(BindingDelete::LookupGlobal { name, depth, .. }) => {
+                let name_idx = self
+                    .published_const_index(name)
+                    .map_err(CommittedValueError::Fatal)?;
+                let depth = self
+                    .published_imm32(depth)
+                    .map_err(CommittedValueError::Fatal)?;
+                vm.delete_lookup_global_value(context, function_id, value0, name_idx, depth)
             }
         }
         .map_err(semantic_error)?;

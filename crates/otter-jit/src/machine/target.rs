@@ -83,6 +83,9 @@ pub enum TargetClobberSet {
     FloatToInt32,
     /// Native arguments-window probe scratch.
     ArgumentsProbe,
+    /// Context word loads and stores, SELF reads and hole tests: at most one
+    /// immediate or frame-pointer scratch outside the allocation file.
+    ContextAccess,
 }
 
 /// Target legalization features admitted by neutral instruction selection.
@@ -293,7 +296,7 @@ pub struct TargetSpec {
     registers: TargetRegisterFile,
     calls: TargetCallConvention,
     frame: TargetFrameSpec,
-    clobbers: [Box<[PhysicalRegister]>; 20],
+    clobbers: [Box<[PhysicalRegister]>; 21],
     capabilities: [bool; 4],
 }
 
@@ -364,6 +367,7 @@ impl TargetSpec {
                 scalar_call_direct,
                 vec![integer(16)].into_boxed_slice(),
                 [9, 10, 15, 16, 17].map(integer).into(),
+                vec![integer(16)].into_boxed_slice(),
             ],
             capabilities: [true; 4],
         }
@@ -422,6 +426,10 @@ impl TargetSpec {
                         .collect()
                 } else if set == TargetClobberSet::ArgumentsProbe as usize {
                     [8, 9, 10, 11].map(integer).into()
+                } else if set == TargetClobberSet::ContextAccess as usize {
+                    // r11 is the reserved move scratch; context words are
+                    // addressed with 32-bit displacements.
+                    Box::new([integer(11)]) as Box<[PhysicalRegister]>
                 } else if set == TargetClobberSet::NumberProbe as usize {
                     // r11 and xmm15 are the reserved scratch pair; the probe
                     // additionally holds one decoded operand in xmm14.

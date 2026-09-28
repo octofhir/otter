@@ -18,6 +18,10 @@
 //!   published through the shared native-frame flag/count contract.
 //! - Every started generated call is removed from the activation stack before
 //!   its success, throw, or fatal result leaves this linkage.
+//! - The callee frame carries no binding storage: SELF is the exact callee
+//!   (a class wrapper publishes its inner callable), and the callee reads its
+//!   captured bindings through `LoadClosureContext`. The function-id guard
+//!   fixes the closure's context-chain shape.
 //!
 //! # See also
 //! - `crate::arm64::direct_call` — peer target implementation.
@@ -36,8 +40,7 @@ use crate::{
         CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
         CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET, FUNCTION_ENTRY_GENERATION_CELL_OFFSET,
         GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET,
-        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET,
+        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_STACK_LIMIT_OFFSET,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
     },
     template::DirectCallEvents,
@@ -51,7 +54,6 @@ const INCOMING_ARGUMENTS_HEADER_WORD: u32 = (abi::NativeFrameFlags::INCOMING_ARG
 
 #[derive(Debug, Clone, Copy)]
 struct StackLayout {
-    upvalue_base: u32,
     register_base: u32,
     incoming_base: u32,
     incoming_count: u32,
@@ -70,13 +72,7 @@ impl StackLayout {
             .generated_stack_frame_bytes
             .filter(|bytes| *bytes != 0)?;
         let control = NATIVE_FRAME_STACK_SIZE;
-        let upvalue_base = control.checked_add(40)?;
-        let upvalue_count = u32::from(target.plan.own_upvalue_count)
-            .checked_add(u32::from(target.plan.inherited_upvalue_count))?;
-        let register_base = upvalue_base
-            .checked_add(upvalue_count.checked_mul(4)?)?
-            .checked_add(7)?
-            & !7;
+        let register_base = control.checked_add(40)?;
         let incoming_count = if target.plan.needs_incoming_arguments {
             u32::try_from(argument_count).ok()?
         } else {
@@ -89,7 +85,6 @@ impl StackLayout {
             .checked_add(15)?
             & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
-            upvalue_base,
             register_base,
             incoming_base,
             incoming_count,
@@ -153,7 +148,6 @@ pub(super) fn emit_plain(
     arguments: &[u16],
     logical_pc: u32,
     byte_pc: u32,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -179,7 +173,6 @@ pub(super) fn emit_plain(
         0,
         1,
         CallForm::Plain { callee },
-        finish_error,
         throw_value,
         fatal,
         done,
@@ -199,7 +192,6 @@ pub(super) fn emit_method(
     arguments: &[u16],
     logical_pc: u32,
     byte_pc: u32,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -227,7 +219,6 @@ pub(super) fn emit_method(
                 receiver,
                 guard: &method.guard,
             },
-            finish_error,
             throw_value,
             fatal,
             done,
@@ -250,7 +241,6 @@ pub(super) fn emit_spread_plain(
     arguments: u16,
     logical_pc: u32,
     byte_pc: u32,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -276,7 +266,6 @@ pub(super) fn emit_spread_plain(
         0,
         1,
         CallForm::CallWithThis { callee, receiver },
-        finish_error,
         throw_value,
         fatal,
         done,
@@ -297,7 +286,6 @@ pub(super) fn emit_construct(
     logical_pc: u32,
     byte_pc: u32,
     super_construct: bool,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -315,7 +303,6 @@ pub(super) fn emit_construct(
         logical_pc,
         byte_pc,
         super_construct,
-        finish_error,
         throw_value,
         fatal,
         done,
@@ -336,7 +323,6 @@ pub(super) fn emit_spread_construct(
     logical_pc: u32,
     byte_pc: u32,
     super_construct: bool,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -354,7 +340,6 @@ pub(super) fn emit_spread_construct(
         logical_pc,
         byte_pc,
         super_construct,
-        finish_error,
         throw_value,
         fatal,
         done,
@@ -375,7 +360,6 @@ fn emit_construct_with_arguments(
     logical_pc: u32,
     byte_pc: u32,
     super_construct: bool,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -421,7 +405,6 @@ fn emit_construct_with_arguments(
     let started_fatal = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
     let fallback = ops.new_dynamic_label();
-    let prepare_pending = ops.new_dynamic_label();
 
     dynasm!(ops
         ; .arch x64
@@ -649,15 +632,6 @@ fn emit_construct_with_arguments(
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r14
         ; mov QWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
-    initialize_inherited_state(ops, view, target);
-    if target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; lea r10, [rsp + layout.upvalue_base as i32]
-            ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-            ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-        );
-    }
     match arguments {
         CallArguments::Fixed(arguments) => {
             for (index, &argument) in arguments.iter().enumerate() {
@@ -690,34 +664,6 @@ fn emit_construct_with_arguments(
             );
             dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
         }
-    }
-    if target.plan.own_upvalue_count != 0 {
-        // The receiver is already prepared, which may have run observable
-        // prototype lookup; no exact exit remains. The stub only side-exits
-        // without an activation, which receiver preparation already proved.
-        dynasm!(ops
-            ; .arch x64
-            ; mov rdi, r15
-            ; mov rsi, rsp
-            ; mov edx, target.plan.own_upvalue_count as i32
-            ; mov ecx, target.plan.inherited_upvalue_count as i32
-        );
-        emit_load_runtime_stub(
-            ops,
-            relocations,
-            transitions.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
-            abi::STUB_JIT_INITIALIZE_UPVALUES,
-        );
-        dynasm!(ops
-            ; .arch x64
-            ; call r11
-            ; test rdx, rdx
-            ; je >captures_ready
-            ; cmp edx, abi::NativeResultStatus::Throw as i32
-            ; je =>prepare_pending
-            ; jmp =>prepare_fatal
-            ; captures_ready:
-        );
     }
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::call_structural(
@@ -839,9 +785,6 @@ fn emit_construct_with_arguments(
         ; =>prepare_throw
         ; add rsp, layout.frame_bytes as i32
         ; jmp =>throw_value
-        ; =>prepare_pending
-        ; add rsp, layout.frame_bytes as i32
-        ; jmp =>finish_error
         ; =>prepare_fatal
         ; add rsp, layout.frame_bytes as i32
         ; jmp =>fatal
@@ -866,7 +809,6 @@ fn emit_candidate(
     target_index: u32,
     target_count: u32,
     form: CallForm<'_>,
-    finish_error: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
     done: DynamicLabel,
@@ -921,8 +863,6 @@ fn emit_candidate(
     let result_ready = ops.new_dynamic_label();
     let fallback = ops.new_dynamic_label();
     let finished = ops.new_dynamic_label();
-    let prepare_pending = ops.new_dynamic_label();
-    let prepare_fatal = ops.new_dynamic_label();
 
     dynasm!(ops
         ; .arch x64
@@ -1001,15 +941,6 @@ fn emit_candidate(
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r11
         ; mov QWORD [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], arguments.fixed_len() as i32
     );
-    initialize_inherited_state(ops, view, target);
-    if target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; lea r10, [rsp + layout.upvalue_base as i32]
-            ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-            ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-        );
-    }
     match arguments {
         CallArguments::Fixed(arguments) => {
             for (index, &argument) in arguments.iter().enumerate() {
@@ -1042,33 +973,6 @@ fn emit_candidate(
             );
             dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
         }
-    }
-    if target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; mov rdi, r15
-            ; mov rsi, rsp
-            ; mov edx, target.plan.own_upvalue_count as i32
-            ; mov ecx, target.plan.inherited_upvalue_count as i32
-        );
-        emit_load_runtime_stub(
-            ops,
-            relocations,
-            transitions.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
-            abi::STUB_JIT_INITIALIZE_UPVALUES,
-        );
-        dynasm!(ops
-            ; .arch x64
-            ; call r11
-            ; test rdx, rdx
-            ; je >captures_ready
-            ; cmp edx, abi::NativeResultStatus::SideExit as i32
-            ; je =>unpublished_fail
-            ; cmp edx, abi::NativeResultStatus::Throw as i32
-            ; je =>prepare_pending
-            ; jmp =>prepare_fatal
-            ; captures_ready:
-        );
     }
 
     let native_entry_start = ops.offset().0;
@@ -1200,16 +1104,6 @@ fn emit_candidate(
         ; =>guard_fail
         ; jmp =>fallback
         ; =>fallback
-        ; jmp =>finished
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; =>prepare_pending
-        ; add rsp, layout.frame_bytes as i32
-        ; jmp =>finish_error
-        ; =>prepare_fatal
-        ; add rsp, layout.frame_bytes as i32
-        ; jmp =>fatal
         ; =>finished
     );
     Ok(true)
@@ -1438,37 +1332,6 @@ fn emit_method_guard(
     Ok(())
 }
 
-fn initialize_inherited_state(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    target: &otter_vm::JitDirectCallee,
-) {
-    let direct = ops.new_dynamic_label();
-    let ready = ops.new_dynamic_label();
-    emit_load_u64(
-        ops,
-        10,
-        otter_vm::value::tag::box_function_id(target.plan.function_id),
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; cmp r9, r10
-        ; je =>direct
-        ; mov r10, [r9 + view.closure_call_layout.upvalue_base_byte as i32]
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-        ; mov r10d, [r9 + view.closure_call_layout.upvalue_count_byte as i32]
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r10d
-        ; mov r10d, [r9 + view.closure_call_layout.eval_env_byte as i32]
-        ; mov [rsp + abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], r10d
-        ; jmp =>ready
-        ; =>direct
-        ; mov QWORD [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], 0
-        ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-        ; mov DWORD [rsp + abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], 0
-        ; =>ready
-    );
-}
-
 fn emit_callable_guard(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
@@ -1511,8 +1374,6 @@ fn emit_callable_guard(
         ; test r8d, r11d
         ; jnz =>miss
         ; cmp DWORD [r9 + view.closure_call_layout.function_id_byte as i32], target.plan.function_id as i32
-        ; jne =>miss
-        ; cmp DWORD [r9 + view.closure_call_layout.upvalue_count_byte as i32], target.plan.inherited_upvalue_count as i32
         ; jne =>miss
         ; =>direct
     );
@@ -1568,8 +1429,6 @@ fn emit_construct_callable_guard(
         ; test r8d, r11d
         ; jnz =>miss
         ; cmp DWORD [r9 + view.closure_call_layout.function_id_byte as i32], target.plan.function_id as i32
-        ; jne =>miss
-        ; cmp DWORD [r9 + view.closure_call_layout.upvalue_count_byte as i32], target.plan.inherited_upvalue_count as i32
         ; jne =>miss
         ; =>direct
     );
@@ -1704,8 +1563,6 @@ fn artifact(
                 ))?,
         ),
         callee_register_count: target.plan.register_count,
-        own_upvalue_count: target.plan.own_upvalue_count,
-        inherited_upvalue_count: target.plan.inherited_upvalue_count,
     })
 }
 
@@ -1745,8 +1602,6 @@ pub(super) fn forward_artifact(
         linkage_bytes: None,
         reserved_stack_bytes: None,
         callee_register_count: plan.register_count,
-        own_upvalue_count: plan.own_upvalue_count,
-        inherited_upvalue_count: plan.inherited_upvalue_count,
     })
 }
 
@@ -1795,7 +1650,5 @@ fn construct_artifact(
                 ))?,
         ),
         callee_register_count: target.plan.register_count,
-        own_upvalue_count: target.plan.own_upvalue_count,
-        inherited_upvalue_count: target.plan.inherited_upvalue_count,
     })
 }

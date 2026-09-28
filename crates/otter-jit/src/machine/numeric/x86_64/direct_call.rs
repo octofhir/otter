@@ -2,7 +2,9 @@
 //!
 //! # Contents
 //! - Exact callable and installed-generation guards.
-//! - Caller-owned `NativeFrame`, register window, and capture spine setup.
+//! - Caller-owned `NativeFrame` and register window setup. The frame carries
+//!   no binding storage: SELF is the exact callee closure, whose context the
+//!   callee reads through `LoadClosureContext`.
 //! - Exact actual-argument windows for callees that consume `arguments`.
 //! - Runtime-selected intrinsic-apply forwarding through generated entries,
 //!   with one committed value-span cold sibling.
@@ -50,7 +52,6 @@ struct StackLayout {
     register_base: u32,
     incoming_base: u32,
     incoming_count: u32,
-    upvalue_base: u32,
     result_word: u32,
     status_word: u32,
     caller_frame: u32,
@@ -79,13 +80,7 @@ impl StackLayout {
             .generated_stack_frame_bytes
             .filter(|bytes| *bytes != 0)?;
         let control = NATIVE_FRAME_STACK_SIZE;
-        let upvalue_base = control.checked_add(40)?;
-        let upvalue_count = u32::from(target.plan.own_upvalue_count)
-            .checked_add(u32::from(target.plan.inherited_upvalue_count))?;
-        let register_base = upvalue_base
-            .checked_add(upvalue_count.checked_mul(4)?)?
-            .checked_add(7)?
-            & !7;
+        let register_base = control.checked_add(40)?;
         let incoming_count = if target.plan.needs_incoming_arguments {
             u32::try_from(argument_count).ok()?
         } else {
@@ -101,7 +96,6 @@ impl StackLayout {
             register_base,
             incoming_base,
             incoming_count,
-            upvalue_base,
             result_word: control,
             status_word: control + 8,
             caller_frame: control + 16,
@@ -153,6 +147,30 @@ pub(super) fn emit(
             .get(result_index)
             .ok_or(Unsupported::OperandShape("x86-64 forward-call result"))?;
         let canonical = ops.new_dynamic_label();
+        // The native leaf copy and arguments-object materialization read
+        // context-held mapped formals through the frame's context register,
+        // which Machine code does not otherwise keep current: store the
+        // trailing context operand there first. The register window is
+        // traced, so the value survives any collection.
+        if let Some(frame_register) = view.code_block.forwarded_formals_context() {
+            let context = *result_index
+                .checked_sub(1)
+                .and_then(|index| locations.get(index))
+                .ok_or(Unsupported::OperandShape(
+                    "x86-64 forwarded formals context",
+                ))?;
+            // r11 is the only integer scratch; borrow rax around the store.
+            let offset = i32::from(frame_register) * 8;
+            dynasm!(ops ; .arch x64 ; push rax);
+            load_integer_with_bias(ops, frame, context, 11, 8)?;
+            dynasm!(ops
+                ; .arch x64
+                ; mov rax, [r15 + NATIVE_FRAME_OFFSET as i32]
+                ; mov rax, [rax + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
+                ; mov [rax + offset], r11
+                ; pop rax
+            );
+        }
         save_roots(ops, frame, site)?;
         publish_roots(ops, frame, site)?;
         dynasm!(ops
@@ -303,7 +321,6 @@ pub(super) fn emit(
                     byte_pc,
                     index != 0,
                     Some(next),
-                    finish_error,
                     fatal,
                     throw_value,
                     done,
@@ -354,7 +371,6 @@ pub(super) fn emit(
                 byte_pc,
                 false,
                 None,
-                finish_error,
                 fatal,
                 throw_value,
                 done,
@@ -675,32 +691,10 @@ pub(super) fn emit(
     }
     load_root_with_linkage(ops, frame, site, instruction.operands[0].value, layout, 9)?;
     dynasm!(ops ; .arch x64 ; mov r14, r9);
+    // SELF is the exact constructor body: a class wrapper publishes its inner
+    // callable, whose context the body reads.
     unwrap_constructor(ops, view, target, 9);
-    let direct_constructor = ops.new_dynamic_label();
-    let constructor_state_ready = ops.new_dynamic_label();
-    load64(
-        ops,
-        10,
-        otter_vm::value::tag::box_function_id(target.plan.function_id),
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; cmp r9, r10
-        ; je =>direct_constructor
-        ; mov r10, [r9 + view.closure_call_layout.upvalue_base_byte as i32]
-        ; mov r11d, [r9 + view.closure_call_layout.upvalue_count_byte as i32]
-        ; mov r8d, [r9 + view.closure_call_layout.eval_env_byte as i32]
-        ; jmp =>constructor_state_ready
-        ; =>direct_constructor
-        ; xor r10d, r10d
-        ; xor r11d, r11d
-        ; xor r8d, r8d
-        ; =>constructor_state_ready
-        ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r11d
-        ; mov [rsp + otter_vm::native_abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], r8d
-    );
+    dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9);
     if super_construct {
         dynasm!(ops
             ; .arch x64
@@ -717,43 +711,8 @@ pub(super) fn emit(
             ; or BYTE [rsp + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as i8
         );
     }
-    if target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; lea r10, [rsp + layout.upvalue_base as i32]
-            ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-            ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-        );
-    }
 
     copy_arguments(ops, frame, site, instruction, result_index, target, layout)?;
-    if target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; mov rdi, r15
-            ; mov rsi, rsp
-            ; mov edx, target.plan.own_upvalue_count as i32
-            ; mov ecx, target.plan.inherited_upvalue_count as i32
-        );
-        runtime(
-            ops,
-            relocations,
-            transitions.entry(otter_vm::native_abi::STUB_JIT_INITIALIZE_UPVALUES),
-            otter_vm::native_abi::STUB_JIT_INITIALIZE_UPVALUES,
-        );
-        dynasm!(ops
-            ; .arch x64
-            ; call r11
-            ; test rdx, rdx
-            ; je >captures_ready
-            ; cmp edx, NativeResultStatus::SideExit as i32
-            ; je =>unpublished_fail
-            ; cmp edx, NativeResultStatus::Throw as i32
-            ; je =>prepare_pending
-            ; jmp =>prepare_fatal
-            ; captures_ready:
-        );
-    }
 
     // Publish the initialized stack-owned callee and enter its selected
     // generation. The outer activation keeps that generation alive.
@@ -1008,7 +967,6 @@ fn emit_generated_value_call(
     byte_pc: u32,
     roots_published: bool,
     guard_miss: Option<DynamicLabel>,
-    finish_error: DynamicLabel,
     fatal: DynamicLabel,
     throw_value: DynamicLabel,
     done: DynamicLabel,
@@ -1055,8 +1013,6 @@ fn emit_generated_value_call(
     let started_throw = ops.new_dynamic_label();
     let started_fatal = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
-    let captures_pending = ops.new_dynamic_label();
-    let captures_fatal = ops.new_dynamic_label();
     let deopt_call_kind = if kind == DirectCallKind::Method { 1 } else { 0 };
 
     dynasm!(ops
@@ -1175,7 +1131,7 @@ fn emit_generated_value_call(
             "x86-64 generated method candidate guard",
         ))?;
         let guard_start = ops.offset().0;
-        super::emit_inline_method_guard(ops, relocations, view, guard, true, unpublished_fail)?;
+        super::emit_inline_method_guard(ops, relocations, view, guard, unpublished_fail)?;
         regions.method_guards.push((guard_start, ops.offset().0));
     }
     dynasm!(ops
@@ -1189,30 +1145,6 @@ fn emit_generated_value_call(
         ; .arch x64
         ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r11
         ; mov QWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], argument_count as i32
-    );
-    let direct_callable = ops.new_dynamic_label();
-    let inherited_ready = ops.new_dynamic_label();
-    load64(
-        ops,
-        10,
-        otter_vm::value::tag::box_function_id(target.plan.function_id),
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; cmp r9, r10
-        ; je =>direct_callable
-        ; mov r10, [r9 + view.closure_call_layout.upvalue_base_byte as i32]
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-        ; mov r10d, [r9 + view.closure_call_layout.upvalue_count_byte as i32]
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r10d
-        ; mov r10d, [r9 + view.closure_call_layout.eval_env_byte as i32]
-        ; mov [rsp + otter_vm::native_abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], r10d
-        ; jmp =>inherited_ready
-        ; =>direct_callable
-        ; mov QWORD [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], 0
-        ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-        ; mov DWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], 0
-        ; =>inherited_ready
     );
     if argument_mode == DirectCallArgumentMode::Fixed {
         copy_value_arguments(
@@ -1245,36 +1177,6 @@ fn emit_generated_value_call(
             otter_vm::native_abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
         );
         dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>unpublished_fail);
-    }
-    if target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; lea r10, [rsp + layout.upvalue_base as i32]
-            ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-            ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-            ; mov rdi, r15
-            ; mov rsi, rsp
-            ; mov edx, target.plan.own_upvalue_count as i32
-            ; mov ecx, target.plan.inherited_upvalue_count as i32
-        );
-        runtime(
-            ops,
-            relocations,
-            transitions.entry(otter_vm::native_abi::STUB_JIT_INITIALIZE_UPVALUES),
-            otter_vm::native_abi::STUB_JIT_INITIALIZE_UPVALUES,
-        );
-        dynasm!(ops
-            ; .arch x64
-            ; call r11
-            ; test rdx, rdx
-            ; je >captures_ready
-            ; cmp edx, NativeResultStatus::SideExit as i32
-            ; je =>unpublished_fail
-            ; cmp edx, NativeResultStatus::Throw as i32
-            ; je =>captures_pending
-            ; jmp =>captures_fatal
-            ; captures_ready:
-        );
     }
 
     dynasm!(ops
@@ -1382,11 +1284,6 @@ fn emit_generated_value_call(
             regions.generic_methods.push((start, ops.offset().0));
         }
     }
-    dynasm!(ops ; .arch x64 ; =>captures_pending);
-    release_unpublished(ops, frame, site, layout)?;
-    dynasm!(ops ; .arch x64 ; jmp =>finish_error ; =>captures_fatal);
-    release_unpublished(ops, frame, site, layout)?;
-    dynasm!(ops ; .arch x64 ; jmp =>fatal);
     Ok(())
 }
 
@@ -1593,8 +1490,6 @@ fn direct_call_artifact(
                 .ok_or(Unsupported::OperandShape("x86-64 direct stack reservation"))?,
         ),
         callee_register_count: target.register_count,
-        own_upvalue_count: target.own_upvalue_count,
-        inherited_upvalue_count: target.inherited_upvalue_count,
     })
 }
 
@@ -1648,8 +1543,6 @@ fn emit_callable_guard(
         ; test r8d, r11d
         ; jnz =>miss
         ; cmp DWORD [r9 + view.closure_call_layout.function_id_byte as i32], target.plan.function_id as i32
-        ; jne =>miss
-        ; cmp DWORD [r9 + view.closure_call_layout.upvalue_count_byte as i32], target.plan.inherited_upvalue_count as i32
         ; jne =>miss
         ; =>direct
     );

@@ -136,6 +136,18 @@ impl crate::Interpreter {
     /// Propagates [`otter_gc::ImageError`]; a fresh build leaves the
     /// nursery empty, so a capture taken right after one succeeds.
     pub fn capture_isolate_snapshot(&self) -> Result<IsolateSnapshot, otter_gc::ImageError> {
+        // An eval extension owns Rust-heap vectors a page image cannot carry;
+        // a bootstrap never runs a sloppy direct eval, so one here is a bug.
+        let mut live_extensions = 0usize;
+        self.gc_heap()
+            .for_each_live_payload::<crate::eval_env::EvalExtensionBody, _>(|_space, _body| {
+                live_extensions += 1;
+            });
+        if live_extensions != 0 {
+            return Err(otter_gc::ImageError::ForeignPayloadNotCapturable {
+                type_name: "EvalExtensionBody",
+            });
+        }
         let image = self.capture_heap_image()?;
         let code_space = self.snapshot_code_space();
         let dynamic_natives = crate::native_function::snapshot_dynamic_natives(self.gc_heap());

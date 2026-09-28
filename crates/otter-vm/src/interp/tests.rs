@@ -46,8 +46,7 @@ fn test_function(
         scratch,
         param_count,
         length: param_count,
-        own_upvalue_count: 0,
-        inherited_upvalue_count: 0,
+        scopes: Vec::new(),
         is_strict: false,
         is_arrow: false,
         is_method: false,
@@ -64,8 +63,6 @@ fn test_function(
         source_text_range: None,
         source_text_span: None,
         module_url: String::new(),
-        direct_eval_bindings: Vec::new(),
-        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: code.into(),
         spans,
@@ -600,7 +597,7 @@ fn direct_bytecode_call_window_populates_arguments_object() {
             Instruction {
                 pc: 0,
                 op: Op::CollectArguments,
-                operands: vec![Operand::Register(0)],
+                operands: vec![Operand::Register(0), Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
@@ -4150,7 +4147,7 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
             Instruction {
                 pc: 0,
                 op: Op::CollectArguments,
-                operands: vec![Operand::Register(0)],
+                operands: vec![Operand::Register(0), Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
@@ -4726,8 +4723,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         scratch: 1,
         param_count: 0,
         length: 0,
-        own_upvalue_count: 0,
-        inherited_upvalue_count: 0,
+        scopes: Vec::new(),
         is_strict: false,
         is_arrow: false,
         is_method: false,
@@ -4744,8 +4740,6 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         source_text_range: None,
         source_text_span: None,
         module_url: String::new(),
-        direct_eval_bindings: Vec::new(),
-        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![Instruction {
             pc: 0,
@@ -4799,8 +4793,7 @@ fn unwind_throw_lands_in_catch_handler() {
         scratch: 2,
         param_count: 0,
         length: 0,
-        own_upvalue_count: 0,
-        inherited_upvalue_count: 0,
+        scopes: Vec::new(),
         is_strict: false,
         is_arrow: false,
         is_method: false,
@@ -4817,8 +4810,6 @@ fn unwind_throw_lands_in_catch_handler() {
         source_text_range: None,
         source_text_span: None,
         module_url: String::new(),
-        direct_eval_bindings: Vec::new(),
-        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![Instruction {
             pc: 0,
@@ -4872,7 +4863,7 @@ fn is_callable_recognises_call_shapes() {
     assert!(is_callable(&Value::function(7)));
     let mut closure_heap = otter_gc::GcHeap::new().expect("closure heap");
     let closure_handle =
-        crate::closure::alloc_closure(&mut closure_heap, 7, &mut [], None, None, None, None)
+        crate::closure::alloc_closure(&mut closure_heap, 7, Value::undefined(), None, None)
             .expect("closure");
     assert!(is_callable(&Value::closure(closure_handle)));
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
@@ -5346,8 +5337,7 @@ fn arrow_closure_overrides_call_site_this() {
         scratch: 1,
         param_count: 0,
         length: 0,
-        own_upvalue_count: 0,
-        inherited_upvalue_count: 0,
+        scopes: Vec::new(),
         is_strict: false,
         is_arrow: false,
         is_method: false,
@@ -5364,8 +5354,6 @@ fn arrow_closure_overrides_call_site_this() {
         source_text_range: None,
         source_text_span: None,
         module_url: String::new(),
-        direct_eval_bindings: Vec::new(),
-        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![Instruction {
             pc: 0,
@@ -5388,8 +5376,7 @@ fn arrow_closure_overrides_call_site_this() {
         scratch: 1,
         param_count: 0,
         length: 0,
-        own_upvalue_count: 0,
-        inherited_upvalue_count: 0,
+        scopes: Vec::new(),
         is_strict: false,
         is_arrow: true,
         is_method: false,
@@ -5406,8 +5393,6 @@ fn arrow_closure_overrides_call_site_this() {
         source_text_range: None,
         source_text_span: None,
         module_url: String::new(),
-        direct_eval_bindings: Vec::new(),
-        eval_sites: Vec::new(),
         contains_direct_eval: false,
         code: vec![
             Instruction {
@@ -5447,10 +5432,8 @@ fn arrow_closure_overrides_call_site_this() {
     let closure_handle = crate::closure::alloc_closure(
         interp.gc_heap_mut(),
         1,
-        &mut [],
+        Value::undefined(),
         Some(Value::string(bound)),
-        None,
-        None,
         None,
     )
     .expect("closure alloc");

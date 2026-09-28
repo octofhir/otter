@@ -130,7 +130,7 @@ pub(super) fn select_probe(
     access: Option<otter_vm::JitElementAccess>,
     inputs: Inputs,
     values: Values,
-    representations: &mut Vec<MachineRepresentation>,
+    representations: &mut [MachineRepresentation],
     instructions: &mut Vec<MachineInstruction>,
 ) -> Result<(), super::super::VerificationError> {
     let Some(access) = access else {

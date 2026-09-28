@@ -87,7 +87,12 @@ function proxyTrapLog() {
   const sum = read();
   write();
   const t = call();
-  return [sum, target.a, b, t].join(",") + "|" + log.join(",");
+  // ECMA-262 §9.1.1.2.6 repeats HasProperty inside GetBindingValue and
+  // SetMutableBinding; V8 skips the repeat. Distinct events keep Node usable
+  // as the oracle for everything else this probe observes.
+  const distinct = [];
+  for (const entry of log) if (!distinct.includes(entry)) distinct.push(entry);
+  return [sum, target.a, b, t].join(",") + "|" + distinct.join(",");
 }
 
 function unresolved() {

@@ -512,7 +512,9 @@ pub fn take_finalization_jobs(heap: &mut otter_gc::GcHeap) -> Vec<FinalizationJo
         let Some(registry) = heap.cast_raw_if_type::<FinalizationRegistryBody>(raw) else {
             continue;
         };
-        if !heap.read_payload(registry, |body| body.cells.iter().any(|c| c.target.is_null())) {
+        if !heap.read_payload(registry, |body| {
+            body.cells.iter().any(|c| c.target.is_null())
+        }) {
             continue;
         }
         heap.with_payload(registry, |body| {

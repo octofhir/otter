@@ -119,32 +119,21 @@ impl Interpreter {
                 .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
             // The module environment record: link-phase and
-            // evaluation-phase invocations share one persistent set of
-            // own-upvalue cells so hoisted closures and the body bind the
-            // same module-scope storage.
+            // evaluation-phase invocations run one persistent SELF closure
+            // over the module-scope context, so hoisted closures and the body
+            // bind the same module-scope storage.
             let module_url: std::sync::Arc<str> =
                 std::sync::Arc::from(function.module_url.as_ref());
-            let upvalues = if let Some(cells) = interp.module_init_upvalues.get(&module_url) {
-                cells.clone()
+            let self_value = if let Some(closure) = interp.module_init_closures.get(&module_url) {
+                *closure
             } else {
-                let built = Frame::build_upvalues_for_exec(
-                    &mut interp.gc_heap,
-                    function,
-                    Frame::empty_upvalues(),
-                )?;
-                interp
-                    .module_init_upvalues
-                    .insert(module_url, built.clone());
-                built
+                let closure = interp.alloc_module_init_closure(context, function)?;
+                interp.module_init_closures.insert(module_url, closure);
+                closure
             };
             let window = interp.alloc_reg_window(function.register_count as usize)?;
-            let frame = Frame::with_exec_return_upvalues_and_this(
-                function,
-                None,
-                upvalues,
-                Value::undefined(),
-                window,
-            );
+            let frame =
+                Frame::for_code_block(function, None, self_value, Value::undefined(), window);
             stack.push(frame);
             let env_value = interp.escape_scoped(env);
             let import_meta_value = interp.escape_scoped(import_meta);
@@ -329,7 +318,7 @@ impl Interpreter {
     /// browser embeddings. Realm disposal drops the complete realm state.
     pub fn reset_module_state(&mut self) {
         self.module_environments.clear();
-        self.module_init_upvalues.clear();
+        self.module_init_closures.clear();
         self.module_hoisted.clear();
         self.module_resolution_cache.clear();
         self.module_records.clear();

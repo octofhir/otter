@@ -11,8 +11,8 @@ use crate::test_support::{
 };
 use crate::weak_refs::{
     FINALIZATION_REGISTRY_BODY_TYPE_TAG, WEAK_REF_BODY_TYPE_TAG, finalization_registry_cell_count,
-    finalization_registry_register, finalization_registry_unregister,
-    post_mark_processor, take_finalization_jobs, weak_ref_deref,
+    finalization_registry_register, finalization_registry_unregister, post_mark_processor,
+    take_finalization_jobs, weak_ref_deref,
 };
 use crate::{ExecutionContext, Interpreter, Value};
 use otter_bytecode::BytecodeModule;

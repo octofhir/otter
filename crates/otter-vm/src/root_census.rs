@@ -152,12 +152,10 @@ impl Interpreter {
             }),
         );
         push(
-            "module_init_upvalues",
+            "module_init_closures",
             count(|v| {
-                for spine in self.module_init_upvalues_for_trace() {
-                    for slot in spine.iter() {
-                        v(slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc);
-                    }
+                for closure in self.module_init_closures_for_trace() {
+                    closure.trace_value_slots(v);
                 }
             }),
         );

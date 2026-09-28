@@ -654,7 +654,8 @@ pub const STUB_JIT_MAKE_FN: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
     NativeResultDomain::None,
 );
-/// `MakeClosure` construction with captured parent upvalues.
+/// `MakeClosure dst, fn, ctx` construction: a closure over the context in the
+/// `ctx` register (the fifth word is that register index).
 pub const STUB_JIT_MAKE_CLOSURE: RuntimeStubDescriptor = descriptor(
     22,
     RuntimeStubClass::Alloc,
@@ -692,7 +693,7 @@ pub const STUB_JIT_NEW_ARRAY: RuntimeStubDescriptor = descriptor(
 /// Static-key object literal allocation (`Op::NewObjectLiteral`) from boxed
 /// values copied before collection; the published instruction names the keys.
 pub const STUB_JIT_NEW_OBJECT_LITERAL: RuntimeStubDescriptor = descriptor(
-    99,
+    98,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
@@ -701,16 +702,21 @@ pub const STUB_JIT_NEW_OBJECT_LITERAL: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Committed,
 );
-/// Fresh loop-iteration upvalue cell allocation.
-pub const STUB_JIT_FRESH_UPVALUE: RuntimeStubDescriptor = descriptor(
+/// `CreateContext` allocation: `(parent, function id, scope index)` as boxed
+/// words (the ids as int32 values). Fully initializes the context — scope
+/// identity, parent, and every slot as the hole or `undefined` per its scope
+/// descriptor — before returning it; the parent rides as a rooted stub
+/// argument. Heap refusal is reported through the status pair; the entry
+/// never raises a JavaScript exception.
+pub const STUB_CREATE_CONTEXT_ALLOC: RuntimeStubDescriptor = descriptor(
     25,
     RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, false),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
 );
 /// Registers a native activation's scalar root slots.
 pub const STUB_JIT_PUSH_NATIVE_ACTIVATION: RuntimeStubDescriptor = descriptor(
@@ -751,16 +757,20 @@ pub const STUB_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Probe,
 );
-/// Validates an inline-call closure and returns its upvalue base.
-pub const STUB_JIT_INLINE_CLOSURE_UPVALUES: RuntimeStubDescriptor = descriptor(
+/// `CopyContext` allocation (§14.7.4.4 CreatePerIterationEnvironment):
+/// `(source, _, _)` as boxed words. Returns a context with the source's scope
+/// identity, parent, and slot values; the source rides as a rooted stub
+/// argument and is re-read after the allocation. Heap refusal is reported
+/// through the status pair.
+pub const STUB_COPY_CONTEXT_ALLOC: RuntimeStubDescriptor = descriptor(
     29,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::leaf(false, false),
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, false),
     RuntimeStubException::Never,
-    RuntimeStubResultAbi::ValueWord,
-    NativeResultDomain::None,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
 );
 /// Leaf §7.2.15 IsStrictlyEqual probe over two raw operand words: never
 /// throws, never allocates; a null heap reports a miss so probe harnesses
@@ -1430,26 +1440,13 @@ pub const STUB_JIT_COPY_SPREAD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::ValueWord,
     NativeResultDomain::None,
 );
-/// Allocate fresh capture cells and complete an unpublished generated frame's
-/// stack-owned upvalue spine.
-pub const STUB_JIT_INITIALIZE_UPVALUES: RuntimeStubDescriptor = descriptor(
-    82,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::ContextWords,
-    3,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
 /// Allocating, non-reentrant `OrdinaryCreateFromConstructor` fast path for a
 /// generated base constructor. An uncertain or observable `prototype` lookup
 /// reports a pre-effect miss through the status pair. The third operand names
 /// the exact generated target so conservative straight-line initializers can
 /// allocate their receiver with the final hidden class and undefined slots.
 pub const STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT: RuntimeStubDescriptor = descriptor(
-    83,
+    82,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::ContextWords,
     4,
@@ -1531,7 +1528,7 @@ pub const STUB_MATH_MIN_LEAF: RuntimeStubDescriptor = descriptor(
 /// Other argument representations and all non-one-argument JavaScript call
 /// shapes retain the canonical coercing parser before any observable effect.
 pub const STUB_PARSE_INT_I32_LEAF: RuntimeStubDescriptor = descriptor(
-    84,
+    83,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
@@ -1548,7 +1545,7 @@ pub const STUB_PARSE_INT_I32_LEAF: RuntimeStubDescriptor = descriptor(
 /// frame. Heap refusal is reported separately through the status pair; this
 /// entry never constructs or parks a JavaScript exception.
 pub const STUB_ARRAY_CONSTRUCT_ALLOC: RuntimeStubDescriptor = descriptor(
-    85,
+    84,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -1566,7 +1563,7 @@ pub const STUB_ARRAY_CONSTRUCT_ALLOC: RuntimeStubDescriptor = descriptor(
 /// instruction before any observable operation. Success or throw commits
 /// exactly once and never asks generated code to replay the call.
 pub const STUB_JIT_CALL_METHOD_VALUE: RuntimeStubDescriptor = descriptor(
-    86,
+    85,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
@@ -1582,7 +1579,7 @@ pub const STUB_JIT_CALL_METHOD_VALUE: RuntimeStubDescriptor = descriptor(
 /// function/PC identity and precise roots; the call commits exactly once and
 /// never asks generated code to replay it.
 pub const STUB_JIT_CALL_WITH_THIS_VALUE: RuntimeStubDescriptor = descriptor(
-    91,
+    90,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
@@ -1597,7 +1594,7 @@ pub const STUB_JIT_CALL_WITH_THIS_VALUE: RuntimeStubDescriptor = descriptor(
 /// function/PC identity and precise roots; the construct commits exactly once
 /// and never asks generated code to replay it.
 pub const STUB_JIT_CONSTRUCT_VALUE: RuntimeStubDescriptor = descriptor(
-    92,
+    91,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
@@ -1612,7 +1609,7 @@ pub const STUB_JIT_CONSTRUCT_VALUE: RuntimeStubDescriptor = descriptor(
 /// published after the register window; a materialized activation supplies
 /// them from its cold record. Allocating, never reentrant.
 pub const STUB_JIT_COLLECT_ARGUMENTS: RuntimeStubDescriptor = descriptor(
-    93,
+    92,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
     VARIADIC_STUB_ARGUMENTS,
@@ -1627,7 +1624,7 @@ pub const STUB_JIT_COLLECT_ARGUMENTS: RuntimeStubDescriptor = descriptor(
 /// stack-owned caller materialization before effects. This entry commits once
 /// and returns a pure value/exception, never a destination or replay status.
 pub const STUB_JIT_CALL_FORWARD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
-    94,
+    93,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::ReentrantValueSpan,
     VARIADIC_STUB_ARGUMENTS,
@@ -1640,7 +1637,7 @@ pub const STUB_JIT_CALL_FORWARD_ARGUMENTS: RuntimeStubDescriptor = descriptor(
 /// Probe the already-resolved apply and count an elided live argument window.
 /// Returns the full Uint32 count, or `u64::MAX` for a pre-effect miss.
 pub const STUB_JIT_FORWARD_ARGUMENT_COUNT: RuntimeStubDescriptor = descriptor(
-    95,
+    94,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     1,
@@ -1654,7 +1651,7 @@ pub const STUB_JIT_FORWARD_ARGUMENT_COUNT: RuntimeStubDescriptor = descriptor(
 /// Returns the actual count, or `u64::MAX` on a pre-entry miss. Generated code
 /// patches register aliases from current rooted homes before publication.
 pub const STUB_JIT_COPY_FORWARDED_ARGUMENTS: RuntimeStubDescriptor = descriptor(
-    96,
+    95,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     2,
@@ -1667,7 +1664,7 @@ pub const STUB_JIT_COPY_FORWARDED_ARGUMENTS: RuntimeStubDescriptor = descriptor(
 /// Resolve current ordinary-call metadata into native scratch and count live
 /// forwarded actuals. Returns the count or u64::MAX before any call effects.
 pub const STUB_JIT_FORWARD_CALL_PLAN: RuntimeStubDescriptor = descriptor(
-    97,
+    96,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     3,
@@ -1680,7 +1677,7 @@ pub const STUB_JIT_FORWARD_CALL_PLAN: RuntimeStubDescriptor = descriptor(
 /// Probe whether a forwarding source can complete without materializing a
 /// stack-owned caller first. Returns one for admitted sources, zero otherwise.
 pub const STUB_JIT_FORWARD_SOURCE_READY: RuntimeStubDescriptor = descriptor(
-    98,
+    97,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Variadic,
     1,
@@ -1695,7 +1692,7 @@ pub const STUB_JIT_FORWARD_SOURCE_READY: RuntimeStubDescriptor = descriptor(
 /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
 /// register is committed by generated code only after the returned `Ok`.
 pub const STUB_JIT_BINDING_VALUE: RuntimeStubDescriptor = descriptor(
-    89,
+    88,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::CommittedValue2,
     2,
@@ -1709,7 +1706,7 @@ pub const STUB_JIT_BINDING_VALUE: RuntimeStubDescriptor = descriptor(
 /// initialization from two boxed values. Declarations remain a separate
 /// semantic family even though they share the committed physical ABI.
 pub const STUB_JIT_GLOBAL_DECLARATION_VALUE: RuntimeStubDescriptor = descriptor(
-    90,
+    89,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::CommittedValue2,
     2,
@@ -1726,7 +1723,7 @@ pub const STUB_JIT_GLOBAL_DECLARATION_VALUE: RuntimeStubDescriptor = descriptor(
 /// exception payload with `Throw`; it is never staged between compiled frames.
 /// This entry is never used by a Machine local landing.
 pub const STUB_JIT_ROUTE_THROW: RuntimeStubDescriptor = descriptor(
-    87,
+    86,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::RouteThrow1,
     1,
@@ -1742,7 +1739,7 @@ pub const STUB_JIT_ROUTE_THROW: RuntimeStubDescriptor = descriptor(
 /// stale rendered detail before the catch body can throw again. Propagating
 /// paths never call it.
 pub const STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW: RuntimeStubDescriptor = descriptor(
-    88,
+    87,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::AcknowledgeCaughtThrow0,
     0,
@@ -1780,11 +1777,11 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         22 => "jit_make_closure",
         23 => "jit_new_object",
         24 => "jit_new_array",
-        25 => "jit_fresh_upvalue",
+        25 => "create_context_alloc",
         26 => "jit_push_native_activation",
         27 => "jit_pop_native_activation",
         28 => "write_barrier",
-        29 => "jit_inline_closure_upvalues",
+        29 => "copy_context_alloc",
         30 => "strict_eq_leaf",
         31 => "jit_loose_eq",
         32 => "to_boolean_leaf",
@@ -1837,24 +1834,23 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         79 => "jit_derived_construct_result",
         80 => "jit_class_super_constructor",
         81 => "jit_copy_spread_arguments",
-        82 => "jit_initialize_upvalues",
-        83 => "jit_try_prepare_base_construct",
-        84 => "parse_int_i32_leaf",
-        85 => "array_construct_alloc",
-        86 => "jit_call_method_value",
-        87 => "jit_route_throw",
-        88 => "jit_acknowledge_caught_throw",
-        89 => "jit_binding_value",
-        90 => "jit_global_declaration_value",
-        91 => "jit_call_with_this_value",
-        92 => "jit_construct_value",
-        93 => "jit_collect_arguments",
-        94 => "jit_call_forward_arguments",
-        95 => "jit_forward_argument_count",
-        96 => "jit_copy_forwarded_arguments",
-        97 => "jit_forward_call_plan",
-        98 => "jit_forward_source_ready",
-        99 => "jit_new_object_literal",
+        82 => "jit_try_prepare_base_construct",
+        83 => "parse_int_i32_leaf",
+        84 => "array_construct_alloc",
+        85 => "jit_call_method_value",
+        86 => "jit_route_throw",
+        87 => "jit_acknowledge_caught_throw",
+        88 => "jit_binding_value",
+        89 => "jit_global_declaration_value",
+        90 => "jit_call_with_this_value",
+        91 => "jit_construct_value",
+        92 => "jit_collect_arguments",
+        93 => "jit_call_forward_arguments",
+        94 => "jit_forward_argument_count",
+        95 => "jit_copy_forwarded_arguments",
+        96 => "jit_forward_call_plan",
+        97 => "jit_forward_source_ready",
+        98 => "jit_new_object_literal",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1885,11 +1881,11 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_MAKE_CLOSURE,
     STUB_JIT_NEW_OBJECT,
     STUB_JIT_NEW_ARRAY,
-    STUB_JIT_FRESH_UPVALUE,
+    STUB_CREATE_CONTEXT_ALLOC,
     STUB_JIT_PUSH_NATIVE_ACTIVATION,
     STUB_JIT_POP_NATIVE_ACTIVATION,
     STUB_WRITE_BARRIER,
-    STUB_JIT_INLINE_CLOSURE_UPVALUES,
+    STUB_COPY_CONTEXT_ALLOC,
     STUB_STRICT_EQ_LEAF,
     STUB_JIT_LOOSE_EQ,
     STUB_TO_BOOLEAN_LEAF,
@@ -1942,7 +1938,6 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_DERIVED_CONSTRUCT_RESULT,
     STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
     STUB_JIT_COPY_SPREAD_ARGUMENTS,
-    STUB_JIT_INITIALIZE_UPVALUES,
     STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     STUB_PARSE_INT_I32_LEAF,
     STUB_ARRAY_CONSTRUCT_ALLOC,
@@ -2155,7 +2150,6 @@ mod tests {
                 STUB_JIT_LOAD_BUILTIN_ERROR,
                 STUB_JIT_MAKE_FN,
                 STUB_JIT_MAKE_CLOSURE,
-                STUB_JIT_FRESH_UPVALUE,
                 STUB_JIT_LOAD_REGEXP,
                 STUB_JIT_COERCE_UNARY,
                 STUB_JIT_NUMERIC_OP,
@@ -2213,11 +2207,33 @@ mod tests {
         for (descriptor, argument_count) in [
             (STUB_JIT_PREPARE_BASE_CONSTRUCT, 3),
             (STUB_JIT_DERIVED_CONSTRUCT_RESULT, 2),
-            (STUB_JIT_INITIALIZE_UPVALUES, 3),
             (STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT, 4),
         ] {
             assert_eq!(descriptor.signature, RuntimeStubSignature::ContextWords);
             assert_eq!(descriptor.argument_count, argument_count);
+        }
+    }
+
+    #[test]
+    fn context_allocation_entries_are_fixed_value_alloc_probes() {
+        for (descriptor, id) in [
+            (STUB_CREATE_CONTEXT_ALLOC, 25),
+            (STUB_COPY_CONTEXT_ALLOC, 29),
+        ] {
+            assert_eq!(descriptor.id, id);
+            assert_eq!(descriptor.class, RuntimeStubClass::Alloc);
+            assert_eq!(descriptor.signature, RuntimeStubSignature::AllocValue3);
+            assert_eq!(descriptor.argument_count, 3);
+            assert_eq!(descriptor.exception, RuntimeStubException::Never);
+            assert_eq!(descriptor.result_abi, RuntimeStubResultAbi::NativePair);
+            assert_eq!(descriptor.result_domain, NativeResultDomain::Probe);
+            assert_eq!(
+                descriptor,
+                RuntimeStubDescriptor {
+                    id,
+                    ..STUB_ARRAY_CONSTRUCT_ALLOC
+                }
+            );
         }
     }
 
@@ -2333,7 +2349,7 @@ mod tests {
 
     #[test]
     fn pure_throw_router_is_one_value_reentrant_compiled_pair() {
-        assert_eq!(STUB_JIT_ROUTE_THROW.id, 87);
+        assert_eq!(STUB_JIT_ROUTE_THROW.id, 86);
         assert_eq!(
             runtime_stub_name(STUB_JIT_ROUTE_THROW.id),
             "jit_route_throw"
@@ -2360,7 +2376,7 @@ mod tests {
 
     #[test]
     fn caught_throw_acknowledgement_is_an_exceptional_only_leaf() {
-        assert_eq!(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW.id, 88);
+        assert_eq!(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW.id, 87);
         assert_eq!(
             STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW.signature,
             RuntimeStubSignature::AcknowledgeCaughtThrow0
@@ -2378,7 +2394,7 @@ mod tests {
 
     #[test]
     fn collect_arguments_entry_is_an_allocating_status_word_transition() {
-        assert_eq!(STUB_JIT_COLLECT_ARGUMENTS.id, 93);
+        assert_eq!(STUB_JIT_COLLECT_ARGUMENTS.id, 92);
         assert_eq!(
             STUB_JIT_COLLECT_ARGUMENTS.signature,
             RuntimeStubSignature::Variadic
@@ -2396,7 +2412,7 @@ mod tests {
 
     #[test]
     fn call_forward_arguments_entry_is_a_committed_value_span() {
-        assert_eq!(STUB_JIT_CALL_FORWARD_ARGUMENTS.id, 94);
+        assert_eq!(STUB_JIT_CALL_FORWARD_ARGUMENTS.id, 93);
         assert_eq!(
             STUB_JIT_CALL_FORWARD_ARGUMENTS.class,
             RuntimeStubClass::Reentrant
@@ -2421,7 +2437,7 @@ mod tests {
 
     #[test]
     fn construct_entry_is_reentrant_value_span_committed_pair() {
-        assert_eq!(STUB_JIT_CONSTRUCT_VALUE.id, 92);
+        assert_eq!(STUB_JIT_CONSTRUCT_VALUE.id, 91);
         assert_eq!(
             STUB_JIT_CONSTRUCT_VALUE.signature,
             RuntimeStubSignature::ReentrantValueSpan
@@ -2438,7 +2454,7 @@ mod tests {
 
     #[test]
     fn call_with_this_entry_is_reentrant_value_span_committed_pair() {
-        assert_eq!(STUB_JIT_CALL_WITH_THIS_VALUE.id, 91);
+        assert_eq!(STUB_JIT_CALL_WITH_THIS_VALUE.id, 90);
         assert_eq!(
             STUB_JIT_CALL_WITH_THIS_VALUE.signature,
             RuntimeStubSignature::ReentrantValueSpan
@@ -2459,7 +2475,7 @@ mod tests {
 
     #[test]
     fn method_call_entry_is_reentrant_value_span_committed_pair() {
-        assert_eq!(STUB_JIT_CALL_METHOD_VALUE.id, 86);
+        assert_eq!(STUB_JIT_CALL_METHOD_VALUE.id, 85);
         assert_eq!(
             STUB_JIT_CALL_METHOD_VALUE.signature,
             RuntimeStubSignature::ReentrantValueSpan

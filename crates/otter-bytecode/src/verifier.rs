@@ -16,8 +16,25 @@
 //! - Every function id is dense from the caller-supplied base.
 //! - Wordcode storage, operand shapes, and control-flow targets are verified
 //!   before any operand is decoded by a VM consumer.
-//! - Register, constant, function, upvalue, and metadata indices are bounded by
-//!   their owning tables.
+//! - Register, constant, function, scope, and metadata indices are bounded by
+//!   their owning tables. Every packed binding immediate decodes in its
+//!   schema [`ImmediateDomain`]; context coordinates never name the reserved
+//!   slot.
+//! - Scope descriptors are well formed: a scope index and a slot index fit a
+//!   context's `u16` fields, slot names are unique within a scope, and a strict
+//!   scope never carries an eval extension.
+//! - Context-register typing is not tracked. The verifier does not prove that
+//!   a context operand holds a context, which scope it has, that a
+//!   coordinate's `depth` stays on the chain, or that its `slot` is below the
+//!   target scope's slot count; the VM validates each of those at run time and
+//!   reports a typed error instead of reading out of bounds.
+//! - Every context-held mapped formal names one parameter-context register,
+//!   and `CollectArguments` / `CallForwardArguments` name that same register
+//!   as their context operand.
+//! - A derived-class constructor whose `this` is a `DerivedThis` context slot
+//!   completes only through `ReturnDerived`, and `ReturnDerived` appears only
+//!   there. A derived constructor with a frame-held `this` uses the ordinary
+//!   return family.
 //! - A [`VerifiedBytecodeModule`] exposes no mutable access to its module, and
 //!   proof-preserving rebasing changes only function-id-bearing records.
 //! - Successful verification does not publish runtime state.
@@ -27,11 +44,12 @@
 //! - [`crate::binary`]
 
 use crate::encoding::{FunctionLayout, VerifyError, layout_wordcode_function};
-use crate::opcode_schema::{
-    BindingDelete, BindingRead, BindingSemantics, BindingWrite, RegisterAccess, opcode_schema,
-    register_access_at,
+use std::collections::HashSet;
+
+use crate::opcode_schema::{ImmediateDomain, RegisterAccess, operand_spec_at, register_access_at};
+use crate::{
+    ArgumentBindingStorage, BytecodeModule, Constant, ContextCoord, Function, Op, Operand,
 };
-use crate::{ArgumentBindingStorage, BytecodeModule, Constant, Function, Op, Operand};
 
 /// Constant-pool variant required by an opcode operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,59 +402,52 @@ pub enum BytecodeVerifyError {
         /// Exact register-window size.
         register_count: u32,
     },
-    /// An instruction addresses an upvalue outside the owning frame spine.
-    UpvalueOperand {
+    /// A packed binding immediate does not decode in its schema domain.
+    ImmediateOperand {
         /// Owning function table index.
         function_index: usize,
         /// Logical instruction PC.
         instruction_pc: usize,
         /// Opcode at the site.
         op: Op,
-        /// Operand position carrying the upvalue index.
+        /// Operand position.
         operand_index: usize,
-        /// Signed decoded upvalue index.
-        upvalue: i32,
-        /// Exclusive bound for this operation (`own` or `own + inherited`).
-        upvalue_count: u32,
-        /// Upvalue domain selected by the opcode.
-        domain: &'static str,
+        /// Encoded immediate.
+        value: i32,
+        /// Schema domain the immediate must decode in.
+        domain: ImmediateDomain,
     },
-    /// `MakeFunction` cannot instantiate a function that requires captures.
-    FunctionRequiresCaptures {
+    /// `ReturnDerived` completes a function without a `DerivedThis` context
+    /// slot, or a plain return completes one that has it. Such a derived
+    /// constructor's completion reads its raw `this` explicitly, so every one
+    /// of its returns is `ReturnDerived`.
+    DerivedConstructorReturn {
         /// Owning function table index.
         function_index: usize,
         /// Logical instruction PC.
         instruction_pc: usize,
-        /// Referenced target function id.
-        target_function_id: u32,
-        /// Captures required by the target.
-        inherited_upvalue_count: u16,
+        /// The offending return opcode.
+        op: Op,
     },
-    /// `MakeClosure` capture arity differs from the target function's spine.
-    ClosureCaptureCount {
+    /// `CreateContext` names a scope outside the function's scope table.
+    ContextScope {
         /// Owning function table index.
         function_index: usize,
         /// Logical instruction PC.
         instruction_pc: usize,
-        /// Referenced target function id.
-        target_function_id: u32,
-        /// Captures required by the target.
-        expected: u16,
-        /// Captures encoded at this site.
-        actual: u32,
+        /// Encoded scope index.
+        scope: i32,
+        /// Function scope-table length.
+        scope_count: usize,
     },
-    /// One `MakeClosure` parent-capture index is outside the current frame.
-    ClosureCaptureOperand {
+    /// A scope descriptor violates a structural invariant.
+    ScopeDescriptor {
         /// Owning function table index.
         function_index: usize,
-        /// Logical instruction PC.
-        instruction_pc: usize,
-        /// Zero-based capture position.
-        capture_index: usize,
-        /// Signed parent-upvalue index.
-        parent_upvalue: i32,
-        /// Exact current-frame upvalue spine size.
-        upvalue_count: u32,
+        /// Scope-table index (the table length for a table-wide defect).
+        scope_index: usize,
+        /// The violated invariant.
+        defect: ScopeDescriptorDefect,
     },
     /// `GetTemplateObject` points outside the module's template-site table.
     TemplateIndex {
@@ -556,7 +567,8 @@ pub enum BytecodeVerifyError {
         /// Exclusive last valid id.
         function_end: u32,
     },
-    /// Mapped-arguments metadata points outside parameters/registers/upvalues.
+    /// Mapped-arguments metadata points outside parameters, registers, or
+    /// addressable context slots.
     MappedArgument {
         /// Owning function table index.
         function_index: usize,
@@ -569,16 +581,20 @@ pub enum BytecodeVerifyError {
         /// Exclusive bound.
         limit: u32,
     },
-    /// Direct-eval metadata points outside the declared upvalue spine.
-    DirectEvalUpvalue {
+    /// Context-held mapped formals name more than one parameter-context
+    /// register, or a `CollectArguments` / `CallForwardArguments` site names a
+    /// different one.
+    MappedArgumentContext {
         /// Owning function table index.
         function_index: usize,
-        /// Binding vector index.
-        binding_index: usize,
-        /// Encoded upvalue index.
-        upvalue: u16,
-        /// Exact upvalue-spine size.
-        upvalue_count: u32,
+        /// Logical PC of the `CollectArguments` / `CallForwardArguments` site,
+        /// or `None` for a
+        /// disagreement inside the mapped-arguments table.
+        instruction_pc: Option<usize>,
+        /// Register named at the offending site.
+        register: u16,
+        /// Register the function's first context-held mapped formal names.
+        expected: u16,
     },
     /// A tagged-template site has different cooked and raw arity.
     TemplateArity {
@@ -660,46 +676,49 @@ impl std::fmt::Display for BytecodeVerifyError {
                 f,
                 "function {function_index} instruction {instruction_pc} {op:?} operand {operand_index} register {register} is outside 0..{register_count}"
             ),
-            Self::UpvalueOperand {
+            Self::ImmediateOperand {
                 function_index,
                 instruction_pc,
                 op,
                 operand_index,
-                upvalue,
-                upvalue_count,
+                value,
                 domain,
             } => write!(
                 f,
-                "function {function_index} instruction {instruction_pc} {op:?} operand {operand_index} {domain} upvalue {upvalue} is outside 0..{upvalue_count}"
+                "function {function_index} instruction {instruction_pc} {op:?} operand {operand_index} immediate {value:#x} is not a {domain:?}"
             ),
-            Self::FunctionRequiresCaptures {
+            Self::DerivedConstructorReturn {
                 function_index,
                 instruction_pc,
-                target_function_id,
-                inherited_upvalue_count,
+                op: Op::ReturnDerived,
             } => write!(
                 f,
-                "function {function_index} instruction {instruction_pc} MakeFunction target {target_function_id} requires {inherited_upvalue_count} captures"
+                "function {function_index} instruction {instruction_pc} ReturnDerived outside a derived-class constructor with a DerivedThis slot"
             ),
-            Self::ClosureCaptureCount {
+            Self::DerivedConstructorReturn {
                 function_index,
                 instruction_pc,
-                target_function_id,
-                expected,
-                actual,
+                op,
             } => write!(
                 f,
-                "function {function_index} instruction {instruction_pc} MakeClosure target {target_function_id} requires {expected} captures, encoded {actual}"
+                "function {function_index} instruction {instruction_pc} {op:?} completes a derived-class constructor with a DerivedThis slot, which only ReturnDerived may"
             ),
-            Self::ClosureCaptureOperand {
+            Self::ContextScope {
                 function_index,
                 instruction_pc,
-                capture_index,
-                parent_upvalue,
-                upvalue_count,
+                scope,
+                scope_count,
             } => write!(
                 f,
-                "function {function_index} instruction {instruction_pc} MakeClosure capture {capture_index} parent upvalue {parent_upvalue} is outside 0..{upvalue_count}"
+                "function {function_index} instruction {instruction_pc} CreateContext scope {scope} is outside 0..{scope_count}"
+            ),
+            Self::ScopeDescriptor {
+                function_index,
+                scope_index,
+                defect,
+            } => write!(
+                f,
+                "function {function_index} scope {scope_index} is malformed: {defect}"
             ),
             Self::TemplateIndex {
                 function_index,
@@ -798,14 +817,23 @@ impl std::fmt::Display for BytecodeVerifyError {
                 f,
                 "function {function_index} mapped argument {binding_index} {field} index {index} is outside 0..{limit}"
             ),
-            Self::DirectEvalUpvalue {
+            Self::MappedArgumentContext {
                 function_index,
-                binding_index,
-                upvalue,
-                upvalue_count,
+                instruction_pc: Some(instruction_pc),
+                register,
+                expected,
             } => write!(
                 f,
-                "function {function_index} direct-eval binding {binding_index} upvalue {upvalue} is outside 0..{upvalue_count}"
+                "function {function_index} instruction {instruction_pc} names context r{register}, mapped formals live in r{expected}"
+            ),
+            Self::MappedArgumentContext {
+                function_index,
+                instruction_pc: None,
+                register,
+                expected,
+            } => write!(
+                f,
+                "function {function_index} mapped formals name context registers r{expected} and r{register}"
             ),
             Self::TemplateArity {
                 site_index,
@@ -833,6 +861,51 @@ impl std::error::Error for BytecodeVerifyError {
         match self {
             Self::Wordcode { error, .. } => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Structural defect of one scope descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeDescriptorDefect {
+    /// The scope table is longer than a context's `u16` scope index can name.
+    TooManyScopes {
+        /// Scope-table length.
+        scope_count: usize,
+    },
+    /// The scope has more slots than a [`ContextCoord`] can address.
+    TooManySlots {
+        /// Declared slot count.
+        slot_count: usize,
+    },
+    /// A slot repeats the name of an earlier slot of the same scope.
+    DuplicateSlotName {
+        /// Index of the repeating slot.
+        slot_index: usize,
+    },
+    /// A strict scope declares an eval extension, which only a sloppy direct
+    /// eval can populate.
+    StrictExtension,
+}
+
+impl std::fmt::Display for ScopeDescriptorDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyScopes { scope_count } => write!(
+                f,
+                "{scope_count} scopes exceed the {} a context can name",
+                usize::from(u16::MAX) + 1
+            ),
+            Self::TooManySlots { slot_count } => write!(
+                f,
+                "{slot_count} slots exceed the {} a coordinate can address",
+                usize::from(ContextCoord::MAX_SLOT) + 1
+            ),
+            Self::DuplicateSlotName { slot_index } => {
+                write!(f, "slot {slot_index} repeats an earlier slot name")
+            }
+            Self::StrictExtension => write!(f, "a strict scope declares an eval extension"),
         }
     }
 }
@@ -1046,49 +1119,8 @@ fn verify_function(
         })?;
     }
 
-    let upvalue_count = u32::from(function.own_upvalue_count)
-        .checked_add(u32::from(function.inherited_upvalue_count))
-        .expect("two u16 counts fit u32");
-    for (binding_index, binding) in function.mapped_argument_bindings.iter().enumerate() {
-        if u32::from(binding.argument_index) >= u32::from(function.param_count) {
-            return Err(BytecodeVerifyError::MappedArgument {
-                function_index,
-                binding_index,
-                field: "argument",
-                index: u32::from(binding.argument_index),
-                limit: u32::from(function.param_count),
-            });
-        }
-        let (field, index, limit) = match binding.storage {
-            ArgumentBindingStorage::Register { reg } => {
-                ("register", u32::from(reg), register_count)
-            }
-            ArgumentBindingStorage::Upvalue { idx } => (
-                "upvalue",
-                u32::from(idx),
-                u32::from(function.own_upvalue_count),
-            ),
-        };
-        if index >= limit {
-            return Err(BytecodeVerifyError::MappedArgument {
-                function_index,
-                binding_index,
-                field,
-                index,
-                limit,
-            });
-        }
-    }
-    for (binding_index, binding) in function.direct_eval_bindings.iter().enumerate() {
-        if u32::from(binding.upvalue) >= upvalue_count {
-            return Err(BytecodeVerifyError::DirectEvalUpvalue {
-                function_index,
-                binding_index,
-                upvalue: binding.upvalue,
-                upvalue_count,
-            });
-        }
-    }
+    verify_scope_descriptors(function, function_index)?;
+    let mapped_context = verify_mapped_arguments(function, function_index, register_count)?;
 
     for (instruction_pc, instruction) in function.code.iter().enumerate() {
         if matches!(
@@ -1138,6 +1170,18 @@ fn verify_function(
                     });
                 }
             }
+            if let Some(domain) =
+                operand_spec_at(instruction.op, operand_index).and_then(|spec| spec.imm_domain)
+            {
+                verify_immediate_operand(
+                    function,
+                    function_index,
+                    instruction_pc,
+                    operand_index,
+                    operand,
+                    domain,
+                )?;
+            }
             if instruction.op.is_const_pool_operand(operand_index) {
                 let Operand::ConstIndex(constant_index) = operand else {
                     return Err(BytecodeVerifyError::OperandDecode {
@@ -1176,9 +1220,7 @@ fn verify_function(
             function,
             function_index,
             instruction_pc,
-            function_base,
-            function_end,
-            upvalue_count,
+            mapped_context,
         )?;
     }
     Ok(VerifiedFunction {
@@ -1187,79 +1229,196 @@ fn verify_function(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Check the function's scope table: sizes fit a context's `u16` fields,
+/// slot names are unique per scope, and no strict scope carries an eval
+/// extension.
+fn verify_scope_descriptors(
+    function: &Function,
+    function_index: usize,
+) -> Result<(), BytecodeVerifyError> {
+    if function.scopes.len() > usize::from(u16::MAX) + 1 {
+        return Err(BytecodeVerifyError::ScopeDescriptor {
+            function_index,
+            scope_index: function.scopes.len(),
+            defect: ScopeDescriptorDefect::TooManyScopes {
+                scope_count: function.scopes.len(),
+            },
+        });
+    }
+    for (scope_index, scope) in function.scopes.iter().enumerate() {
+        let defect = |defect| BytecodeVerifyError::ScopeDescriptor {
+            function_index,
+            scope_index,
+            defect,
+        };
+        if scope.slots.len() > usize::from(ContextCoord::MAX_SLOT) + 1 {
+            return Err(defect(ScopeDescriptorDefect::TooManySlots {
+                slot_count: scope.slots.len(),
+            }));
+        }
+        if scope.flags.strict && scope.flags.has_extension {
+            return Err(defect(ScopeDescriptorDefect::StrictExtension));
+        }
+        let mut names = HashSet::with_capacity(scope.slots.len());
+        for (slot_index, slot) in scope.slots.iter().enumerate() {
+            if !names.insert(slot.name.as_str()) {
+                return Err(defect(ScopeDescriptorDefect::DuplicateSlotName {
+                    slot_index,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bound the mapped-arguments table and return the one register every
+/// context-held mapped formal names, if any.
+fn verify_mapped_arguments(
+    function: &Function,
+    function_index: usize,
+    register_count: u32,
+) -> Result<Option<u16>, BytecodeVerifyError> {
+    let mut mapped_context = None;
+    for (binding_index, binding) in function.mapped_argument_bindings.iter().enumerate() {
+        let out_of_range = |field, index, limit| BytecodeVerifyError::MappedArgument {
+            function_index,
+            binding_index,
+            field,
+            index,
+            limit,
+        };
+        if u32::from(binding.argument_index) >= u32::from(function.param_count) {
+            return Err(out_of_range(
+                "argument",
+                u32::from(binding.argument_index),
+                u32::from(function.param_count),
+            ));
+        }
+        match binding.storage {
+            ArgumentBindingStorage::Register { reg } => {
+                if u32::from(reg) >= register_count {
+                    return Err(out_of_range("register", u32::from(reg), register_count));
+                }
+            }
+            ArgumentBindingStorage::Context { reg, slot } => {
+                if u32::from(reg) >= register_count {
+                    return Err(out_of_range(
+                        "context register",
+                        u32::from(reg),
+                        register_count,
+                    ));
+                }
+                if slot > ContextCoord::MAX_SLOT {
+                    return Err(out_of_range(
+                        "context slot",
+                        u32::from(slot),
+                        u32::from(ContextCoord::MAX_SLOT) + 1,
+                    ));
+                }
+                match mapped_context {
+                    Some(expected) if expected != reg => {
+                        return Err(BytecodeVerifyError::MappedArgumentContext {
+                            function_index,
+                            instruction_pc: None,
+                            register: reg,
+                            expected,
+                        });
+                    }
+                    _ => mapped_context = Some(reg),
+                }
+            }
+        }
+    }
+    Ok(mapped_context)
+}
+
+/// Admit one packed binding immediate against its schema domain; a scope
+/// index is additionally bounded by the function's scope table.
+fn verify_immediate_operand(
+    function: &Function,
+    function_index: usize,
+    instruction_pc: usize,
+    operand_index: usize,
+    operand: Operand,
+    domain: ImmediateDomain,
+) -> Result<(), BytecodeVerifyError> {
+    let Operand::Imm32(value) = operand else {
+        return Err(BytecodeVerifyError::OperandDecode {
+            function_index,
+            instruction_pc,
+            operand_index,
+        });
+    };
+    if !domain.admits(value) {
+        return Err(BytecodeVerifyError::ImmediateOperand {
+            function_index,
+            instruction_pc,
+            op: function.code[instruction_pc].op,
+            operand_index,
+            value,
+            domain,
+        });
+    }
+    if domain == ImmediateDomain::ScopeIndex && value as usize >= function.scopes.len() {
+        return Err(BytecodeVerifyError::ContextScope {
+            function_index,
+            instruction_pc,
+            scope: value,
+            scope_count: function.scopes.len(),
+        });
+    }
+    Ok(())
+}
+
 fn verify_instruction_semantics(
     module: &BytecodeModule,
     function: &Function,
     function_index: usize,
     instruction_pc: usize,
-    function_base: u32,
-    function_end: u32,
-    upvalue_count: u32,
+    mapped_context: Option<u16>,
 ) -> Result<(), BytecodeVerifyError> {
     let instruction = &function.code[instruction_pc];
-    if let Some(binding) = opcode_schema(instruction.op).binding {
-        let upvalue_operand = match binding {
-            BindingSemantics::Read(BindingRead::Upvalue { index, .. })
-            | BindingSemantics::Read(BindingRead::ShadowedUpvalue { index, .. })
-            | BindingSemantics::Write(BindingWrite::Upvalue { index, .. })
-            | BindingSemantics::Write(BindingWrite::ShadowedUpvalue { index, .. })
-            | BindingSemantics::Write(BindingWrite::ShadowedRestore { index, .. })
-            | BindingSemantics::Delete(BindingDelete::ShadowedUpvalue { index, .. }) => {
-                Some(usize::from(index))
-            }
-            _ => None,
-        };
-        if let Some(operand_index) = upvalue_operand {
-            verify_upvalue_operand(
-                function,
-                function_index,
-                instruction_pc,
-                operand_index,
-                upvalue_count,
-                "frame",
-            )?;
-        }
-    }
-
     match instruction.op {
-        Op::FreshUpvalue => verify_upvalue_operand(
-            function,
-            function_index,
-            instruction_pc,
-            0,
-            u32::from(function.own_upvalue_count),
-            "own",
-        ),
-        Op::MakeFunction => {
-            let (target_function_id, target) = instruction_function_target(
-                module,
-                function,
+        Op::ReturnDerived if !has_derived_this_slot(function) => {
+            Err(BytecodeVerifyError::DerivedConstructorReturn {
                 function_index,
                 instruction_pc,
-                1,
-                function_base,
-                function_end,
-            )?;
-            if target.inherited_upvalue_count != 0 {
-                return Err(BytecodeVerifyError::FunctionRequiresCaptures {
+                op: instruction.op,
+            })
+        }
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined if has_derived_this_slot(function) => {
+            Err(BytecodeVerifyError::DerivedConstructorReturn {
+                function_index,
+                instruction_pc,
+                op: instruction.op,
+            })
+        }
+        Op::CollectArguments | Op::CallForwardArguments => {
+            let Some(expected) = mapped_context else {
+                return Ok(());
+            };
+            let context_operand = if instruction.op == Op::CollectArguments {
+                1
+            } else {
+                4
+            };
+            match function.code.operand(instruction, context_operand) {
+                Some(Operand::Register(register)) if register == expected => Ok(()),
+                Some(Operand::Register(register)) => {
+                    Err(BytecodeVerifyError::MappedArgumentContext {
+                        function_index,
+                        instruction_pc: Some(instruction_pc),
+                        register,
+                        expected,
+                    })
+                }
+                _ => Err(BytecodeVerifyError::OperandDecode {
                     function_index,
                     instruction_pc,
-                    target_function_id,
-                    inherited_upvalue_count: target.inherited_upvalue_count,
-                });
+                    operand_index: context_operand,
+                }),
             }
-            Ok(())
         }
-        Op::MakeClosure => verify_make_closure(
-            module,
-            function,
-            function_index,
-            instruction_pc,
-            function_base,
-            function_end,
-            upvalue_count,
-        ),
         Op::GetTemplateObject => {
             let template_index = const_index_operand(function, function_index, instruction_pc, 1)?;
             if (template_index as usize) >= module.template_sites.len() {
@@ -1276,113 +1435,6 @@ fn verify_instruction_semantics(
     }
 }
 
-fn verify_upvalue_operand(
-    function: &Function,
-    function_index: usize,
-    instruction_pc: usize,
-    operand_index: usize,
-    upvalue_count: u32,
-    domain: &'static str,
-) -> Result<(), BytecodeVerifyError> {
-    let instruction = &function.code[instruction_pc];
-    let upvalue = imm32_operand(function, function_index, instruction_pc, operand_index)?;
-    if upvalue < 0 || (upvalue as u32) >= upvalue_count {
-        return Err(BytecodeVerifyError::UpvalueOperand {
-            function_index,
-            instruction_pc,
-            op: instruction.op,
-            operand_index,
-            upvalue,
-            upvalue_count,
-            domain,
-        });
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_make_closure(
-    module: &BytecodeModule,
-    function: &Function,
-    function_index: usize,
-    instruction_pc: usize,
-    function_base: u32,
-    function_end: u32,
-    upvalue_count: u32,
-) -> Result<(), BytecodeVerifyError> {
-    let (target_function_id, target) = instruction_function_target(
-        module,
-        function,
-        function_index,
-        instruction_pc,
-        1,
-        function_base,
-        function_end,
-    )?;
-    let actual = const_index_operand(function, function_index, instruction_pc, 2)?;
-    if actual != u32::from(target.inherited_upvalue_count) {
-        return Err(BytecodeVerifyError::ClosureCaptureCount {
-            function_index,
-            instruction_pc,
-            target_function_id,
-            expected: target.inherited_upvalue_count,
-            actual,
-        });
-    }
-    for capture_index in 0..actual as usize {
-        let parent_upvalue =
-            imm32_operand(function, function_index, instruction_pc, 3 + capture_index)?;
-        if parent_upvalue < 0 || (parent_upvalue as u32) >= upvalue_count {
-            return Err(BytecodeVerifyError::ClosureCaptureOperand {
-                function_index,
-                instruction_pc,
-                capture_index,
-                parent_upvalue,
-                upvalue_count,
-            });
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn instruction_function_target<'a>(
-    module: &'a BytecodeModule,
-    function: &Function,
-    function_index: usize,
-    instruction_pc: usize,
-    operand_index: usize,
-    function_base: u32,
-    function_end: u32,
-) -> Result<(u32, &'a Function), BytecodeVerifyError> {
-    let constant_index =
-        const_index_operand(function, function_index, instruction_pc, operand_index)?;
-    let Some(Constant::FunctionId {
-        index: target_function_id,
-    }) = module.constants.get(constant_index as usize)
-    else {
-        return Err(BytecodeVerifyError::ConstantIndex {
-            function_index,
-            instruction_pc,
-            op: function.code[instruction_pc].op,
-            operand_index,
-            constant_index,
-            constant_count: module.constants.len(),
-        });
-    };
-    let local_index = target_function_id
-        .checked_sub(function_base)
-        .and_then(|index| usize::try_from(index).ok())
-        .filter(|index| *index < module.functions.len())
-        .ok_or(BytecodeVerifyError::FunctionConstant {
-            constant_index: constant_index as usize,
-            function_id: *target_function_id,
-            function_base,
-            function_end,
-        })?;
-    Ok((*target_function_id, &module.functions[local_index]))
-}
-
 fn const_index_operand(
     function: &Function,
     function_index: usize,
@@ -1394,25 +1446,6 @@ fn const_index_operand(
         .operand(&function.code[instruction_pc], operand_index)
     {
         Some(Operand::ConstIndex(value)) => Ok(value),
-        _ => Err(BytecodeVerifyError::OperandDecode {
-            function_index,
-            instruction_pc,
-            operand_index,
-        }),
-    }
-}
-
-fn imm32_operand(
-    function: &Function,
-    function_index: usize,
-    instruction_pc: usize,
-    operand_index: usize,
-) -> Result<i32, BytecodeVerifyError> {
-    match function
-        .code
-        .operand(&function.code[instruction_pc], operand_index)
-    {
-        Some(Operand::Imm32(value)) => Ok(value),
         _ => Err(BytecodeVerifyError::OperandDecode {
             function_index,
             instruction_pc,
@@ -1471,11 +1504,24 @@ fn verify_source_span(
     Ok(())
 }
 
+/// Whether `function` keeps a derived constructor's `this` in a context slot.
+fn has_derived_this_slot(function: &Function) -> bool {
+    function.is_derived_constructor
+        && function.scopes.iter().any(|scope| {
+            scope
+                .slots
+                .iter()
+                .any(|slot| slot.kind == crate::SlotKind::DerivedThis)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        ClassHintSite, FunctionCodeBuilder, ModuleInit, SourceKind, SpanEntry, TemplateSite,
+        BindingStoreFallback, ClassHintSite, FunctionCodeBuilder, LookupGlobalMode,
+        LookupRefTarget, MappedArgumentBinding, ModuleInit, ScopeDescriptor, ScopeFlags, ScopeKind,
+        SlotDescriptor, SlotKind, SourceKind, SpanEntry, StoreRefMode, TemplateSite,
     };
 
     fn module_with(code: crate::FunctionCode) -> BytecodeModule {
@@ -1694,60 +1740,370 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn instruction_upvalue_domains_are_enforced() {
+    fn scope(kind: ScopeKind, slots: &[(&str, SlotKind)]) -> ScopeDescriptor {
+        ScopeDescriptor {
+            kind,
+            flags: ScopeFlags::default(),
+            slots: slots
+                .iter()
+                .map(|(name, kind)| SlotDescriptor {
+                    name: (*name).to_string(),
+                    kind: *kind,
+                    exported: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn module_with_instruction(op: Op, operands: &[Operand]) -> BytecodeModule {
         let mut code = FunctionCodeBuilder::new();
-        code.push(Op::LoadUpvalue, &[Operand::Register(0), Operand::Imm32(1)]);
+        code.push(op, operands);
         code.push(Op::ReturnUndefined, &[]);
         let mut module = module_with(code.finish());
-        module.functions[0].own_upvalue_count = 1;
-        assert!(matches!(
-            verify_module(&module),
-            Err(BytecodeVerifyError::UpvalueOperand {
-                op: Op::LoadUpvalue,
-                upvalue: 1,
-                upvalue_count: 1,
-                domain: "frame",
-                ..
-            })
-        ));
+        module.constants.push(Constant::String {
+            utf16: "x".encode_utf16().collect(),
+        });
+        module
+    }
 
-        let mut code = FunctionCodeBuilder::new();
-        code.push(Op::FreshUpvalue, &[Operand::Imm32(0)]);
-        code.push(Op::ReturnUndefined, &[]);
-        module.functions[0].code = code.finish();
-        module.functions[0].own_upvalue_count = 0;
-        module.functions[0].inherited_upvalue_count = 1;
-        assert!(matches!(
+    #[test]
+    fn create_context_scope_index_is_bounded_by_the_scope_table() {
+        let operands = |scope| {
+            [
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::Imm32(scope),
+            ]
+        };
+        let mut module = module_with_instruction(Op::CreateContext, &operands(0));
+        assert_eq!(
             verify_module(&module),
-            Err(BytecodeVerifyError::UpvalueOperand {
-                op: Op::FreshUpvalue,
-                upvalue: 0,
-                upvalue_count: 0,
-                domain: "own",
+            Err(BytecodeVerifyError::ContextScope {
+                function_index: 0,
+                instruction_pc: 0,
+                scope: 0,
+                scope_count: 0,
+            })
+        );
+        module.functions[0].scopes = vec![scope(ScopeKind::Block, &[("x", SlotKind::Let)])];
+        verify_module(&module).expect("scope 0 exists");
+
+        let negative = module_with_instruction(Op::CreateContext, &operands(-1));
+        assert!(matches!(
+            verify_module(&negative),
+            Err(BytecodeVerifyError::ImmediateOperand {
+                op: Op::CreateContext,
+                operand_index: 2,
+                value: -1,
+                domain: ImmediateDomain::ScopeIndex,
                 ..
             })
         ));
     }
 
     #[test]
-    fn closure_capture_shape_matches_target_and_parent_spines() {
-        let child_code = {
-            let mut code = FunctionCodeBuilder::new();
-            code.push(Op::ReturnUndefined, &[]);
-            code.finish()
+    fn context_coordinates_never_name_the_reserved_slot() {
+        let coord = |slot| ContextCoord { depth: 2, slot }.to_imm32();
+        for op in [
+            Op::LoadContextSlot,
+            Op::LoadContextSlotChecked,
+            Op::StoreContextSlot,
+            Op::StoreContextSlotChecked,
+            Op::BindThisContextSlot,
+        ] {
+            let valid = module_with_instruction(
+                op,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Imm32(coord(ContextCoord::MAX_SLOT)),
+                ],
+            );
+            verify_module(&valid).unwrap_or_else(|error| panic!("{op:?}: {error}"));
+            let reserved = (2 << 16) | i32::from(ContextCoord::RESERVED_SLOT);
+            let invalid = module_with_instruction(
+                op,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Imm32(reserved),
+                ],
+            );
+            assert!(
+                matches!(
+                    verify_module(&invalid),
+                    Err(BytecodeVerifyError::ImmediateOperand {
+                        operand_index: 2,
+                        domain: ImmediateDomain::ContextCoord,
+                        ..
+                    })
+                ),
+                "{op:?} admitted the reserved slot"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_immediates_are_admitted_only_in_their_domains() {
+        let lookup = |op, imm| {
+            module_with_instruction(
+                op,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(imm),
+                ],
+            )
         };
+        let rejects = |module: &BytecodeModule, domain| {
+            matches!(
+                verify_module(module),
+                Err(BytecodeVerifyError::ImmediateOperand { domain: actual, .. }) if actual == domain
+            )
+        };
+        for op in [
+            Op::DeleteLookupSlot,
+            Op::LoadLookupGlobal,
+            Op::TypeofLookupGlobal,
+            Op::DeleteLookupGlobal,
+            Op::StoreVarScope,
+        ] {
+            verify_module(&lookup(op, i32::from(u16::MAX))).expect("maximal depth");
+            assert!(rejects(&lookup(op, -1), ImmediateDomain::ContextDepth));
+            assert!(rejects(&lookup(op, 1 << 16), ImmediateDomain::ContextDepth));
+        }
+        let strict_global = LookupGlobalMode {
+            depth: 3,
+            strict: true,
+        };
+        verify_module(&lookup(Op::StoreLookupGlobal, strict_global.to_imm32()))
+            .expect("strict global mode");
+        assert!(rejects(
+            &lookup(Op::StoreLookupGlobal, 1 << 20),
+            ImmediateDomain::LookupGlobalMode
+        ));
+        verify_module(&lookup(
+            Op::ResolveLookupRef,
+            LookupRefTarget::Global { depth: 1 }.to_imm32(),
+        ))
+        .expect("every ref target decodes");
+        verify_module(&lookup(
+            Op::StoreRef,
+            StoreRefMode {
+                slot: None,
+                fallback: BindingStoreFallback::Mutable,
+                strict: false,
+            }
+            .to_imm32(),
+        ))
+        .expect("global store-ref mode");
+        assert!(rejects(
+            &lookup(Op::StoreRef, 3 << 16),
+            ImmediateDomain::StoreRefMode
+        ));
+        assert!(rejects(
+            &lookup(Op::LoadLookupSlot, i32::from(ContextCoord::RESERVED_SLOT)),
+            ImmediateDomain::ContextCoord
+        ));
+
+        let store_lookup_slot = |fallback| {
+            module_with_instruction(
+                Op::StoreLookupSlot,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(ContextCoord { depth: 1, slot: 0 }.to_imm32()),
+                    Operand::Imm32(fallback),
+                ],
+            )
+        };
+        verify_module(&store_lookup_slot(
+            BindingStoreFallback::ImmutableIgnore.to_imm32(),
+        ))
+        .expect("known fallback");
+        assert!(rejects(
+            &store_lookup_slot(3),
+            ImmediateDomain::StoreFallback
+        ));
+
+        let declare = |depth| {
+            module_with_instruction(
+                Op::DeclareEvalVar,
+                &[
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(depth),
+                ],
+            )
+        };
+        verify_module(&declare(0)).expect("var scope at hop 0");
+        assert!(rejects(&declare(-5), ImmediateDomain::ContextDepth));
+    }
+
+    #[test]
+    fn scope_descriptors_are_well_formed() {
         let mut module = returning_module();
-        module.functions[0].locals = 1;
-        module.functions[0].own_upvalue_count = 1;
+        module.functions[0].scopes = vec![
+            scope(
+                ScopeKind::Params,
+                &[("a", SlotKind::Param { checked: false })],
+            ),
+            scope(
+                ScopeKind::Body,
+                &[("x", SlotKind::Var), ("x", SlotKind::FunctionDecl)],
+            ),
+        ];
+        assert_eq!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::ScopeDescriptor {
+                function_index: 0,
+                scope_index: 1,
+                defect: ScopeDescriptorDefect::DuplicateSlotName { slot_index: 1 },
+            })
+        );
+
+        module.functions[0].scopes[1] = scope(ScopeKind::Body, &[("x", SlotKind::Var)]);
+        module.functions[0].scopes[1].flags = ScopeFlags {
+            strict: false,
+            var_scope: true,
+            has_extension: true,
+        };
+        verify_module(&module).expect("sloppy extension anchor");
+        module.functions[0].scopes[1].flags.strict = true;
+        assert_eq!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::ScopeDescriptor {
+                function_index: 0,
+                scope_index: 1,
+                defect: ScopeDescriptorDefect::StrictExtension,
+            })
+        );
+
+        module.functions[0].scopes = vec![ScopeDescriptor {
+            kind: ScopeKind::Block,
+            flags: ScopeFlags::default(),
+            slots: (0..=usize::from(ContextCoord::MAX_SLOT) + 1)
+                .map(|index| SlotDescriptor {
+                    name: format!("s{index}"),
+                    kind: SlotKind::Synthetic,
+                    exported: false,
+                })
+                .collect(),
+        }];
+        assert_eq!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::ScopeDescriptor {
+                function_index: 0,
+                scope_index: 0,
+                defect: ScopeDescriptorDefect::TooManySlots {
+                    slot_count: usize::from(ContextCoord::MAX_SLOT) + 2,
+                },
+            })
+        );
+        module.functions[0].scopes[0].slots.pop();
+        verify_module(&module).expect("a full context is addressable");
+
+        module.functions[0].scopes = vec![scope(ScopeKind::Block, &[]); usize::from(u16::MAX) + 2];
+        assert!(matches!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::ScopeDescriptor {
+                defect: ScopeDescriptorDefect::TooManyScopes { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mapped_formals_and_forwarded_arguments_share_one_context_register() {
+        let mut code = FunctionCodeBuilder::new();
+        code.push(
+            Op::CallForwardArguments,
+            &[
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::Register(1),
+                Operand::Register(1),
+                Operand::Register(2),
+            ],
+        );
+        code.push(Op::ReturnUndefined, &[]);
+        let mut module = module_with(code.finish());
+        module.functions[0].param_count = 2;
+        module.functions[0].locals = 2;
+        let mapped = |argument_index, reg, slot| MappedArgumentBinding {
+            argument_index,
+            formal_name: format!("p{argument_index}"),
+            storage: ArgumentBindingStorage::Context { reg, slot },
+        };
+        module.functions[0].mapped_argument_bindings = vec![mapped(0, 2, 0), mapped(1, 2, 1)];
+        verify_module(&module).expect("forward names the parameter context");
+
+        module.functions[0].mapped_argument_bindings[1] = mapped(1, 3, 1);
+        assert_eq!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::MappedArgumentContext {
+                function_index: 0,
+                instruction_pc: None,
+                register: 3,
+                expected: 2,
+            })
+        );
+
+        module.functions[0].mapped_argument_bindings = vec![mapped(0, 3, 0)];
+        assert_eq!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::MappedArgumentContext {
+                function_index: 0,
+                instruction_pc: Some(0),
+                register: 2,
+                expected: 3,
+            })
+        );
+
+        module.functions[0].mapped_argument_bindings = vec![mapped(0, 9, 0)];
+        assert!(matches!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::MappedArgument {
+                field: "context register",
+                index: 9,
+                ..
+            })
+        ));
+        module.functions[0].mapped_argument_bindings =
+            vec![mapped(0, 2, ContextCoord::RESERVED_SLOT)];
+        assert!(matches!(
+            verify_module(&module),
+            Err(BytecodeVerifyError::MappedArgument {
+                field: "context slot",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn make_closure_names_its_context_register() {
+        let mut module = returning_module();
         module.functions.push(Function {
             id: 1,
             name: "child".to_string(),
-            inherited_upvalue_count: 1,
-            code: child_code,
+            code: returning_module().functions.remove(0).code,
             ..Function::default()
         });
         module.constants.push(Constant::FunctionId { index: 1 });
+        let mut code = FunctionCodeBuilder::new();
+        code.push(
+            Op::MakeClosure,
+            &[
+                Operand::Register(0),
+                Operand::ConstIndex(0),
+                Operand::Register(1),
+            ],
+        );
+        code.push(Op::ReturnUndefined, &[]);
+        module.functions[0].code = code.finish();
+        verify_module(&module).expect("closure over r1");
 
         let mut code = FunctionCodeBuilder::new();
         code.push(
@@ -1755,72 +2111,63 @@ mod tests {
             &[
                 Operand::Register(0),
                 Operand::ConstIndex(0),
-                Operand::ConstIndex(0),
+                Operand::Register(7),
             ],
         );
         code.push(Op::ReturnUndefined, &[]);
         module.functions[0].code = code.finish();
         assert!(matches!(
             verify_module(&module),
-            Err(BytecodeVerifyError::ClosureCaptureCount {
-                target_function_id: 1,
-                expected: 1,
-                actual: 0,
+            Err(BytecodeVerifyError::RegisterOperand {
+                op: Op::MakeClosure,
+                operand_index: 2,
+                register: 7,
                 ..
             })
         ));
+    }
 
+    #[test]
+    fn derived_constructors_complete_only_through_return_derived() {
         let mut code = FunctionCodeBuilder::new();
         code.push(
-            Op::MakeClosure,
+            Op::ReturnDerived,
             &[
                 Operand::Register(0),
-                Operand::ConstIndex(0),
-                Operand::ConstIndex(1),
-                Operand::Imm32(1),
+                Operand::Register(1),
+                Operand::Imm32(ContextCoord::new(0, 0).expect("coord").to_imm32()),
             ],
         );
-        code.push(Op::ReturnUndefined, &[]);
-        module.functions[0].code = code.finish();
-        assert!(matches!(
+        let mut module = module_with(code.finish());
+        assert_eq!(
             verify_module(&module),
-            Err(BytecodeVerifyError::ClosureCaptureOperand {
-                capture_index: 0,
-                parent_upvalue: 1,
-                upvalue_count: 1,
-                ..
+            Err(BytecodeVerifyError::DerivedConstructorReturn {
+                function_index: 0,
+                instruction_pc: 0,
+                op: Op::ReturnDerived,
             })
-        ));
-
-        let mut code = FunctionCodeBuilder::new();
-        code.push(
-            Op::MakeClosure,
-            &[
-                Operand::Register(0),
-                Operand::ConstIndex(0),
-                Operand::ConstIndex(1),
-                Operand::Imm32(0),
-            ],
         );
-        code.push(Op::ReturnUndefined, &[]);
-        module.functions[0].code = code.finish();
-        verify_module(&module).expect("matching closure capture spine");
+        module.functions[0].is_derived_constructor = true;
+        let derived_this = scope(ScopeKind::Params, &[("this", SlotKind::DerivedThis)]);
+        module.functions[0].scopes = vec![derived_this.clone()];
+        verify_module(&module).expect("derived constructor return");
 
-        let mut code = FunctionCodeBuilder::new();
-        code.push(
-            Op::MakeFunction,
-            &[Operand::Register(0), Operand::ConstIndex(0)],
-        );
-        code.push(Op::ReturnUndefined, &[]);
-        module.functions[0].code = code.finish();
-        assert!(matches!(
-            verify_module(&module),
-            Err(BytecodeVerifyError::FunctionRequiresCaptures {
-                target_function_id: 1,
-                inherited_upvalue_count: 1,
-                ..
+        // A frame-held `this` keeps the ordinary return family.
+        let mut frame_this = returning_module();
+        frame_this.functions[0].is_derived_constructor = true;
+        verify_module(&frame_this).expect("frame-held derived this returns plainly");
+
+        let mut plain = returning_module();
+        plain.functions[0].is_derived_constructor = true;
+        plain.functions[0].scopes = vec![derived_this];
+        assert_eq!(
+            verify_module(&plain),
+            Err(BytecodeVerifyError::DerivedConstructorReturn {
+                function_index: 0,
+                instruction_pc: 0,
+                op: Op::ReturnUndefined,
             })
-        ));
+        );
     }
 
     #[test]

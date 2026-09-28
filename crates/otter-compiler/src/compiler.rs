@@ -1,156 +1,114 @@
-//! Compiler stack wrapper for nested function lowering.
+//! Compiler stack and static name resolution across frames and contexts.
+//!
+//! The compile stack mirrors lexical function nesting: a child function is
+//! compiled at its creation site, so every enclosing frame's scope stack is
+//! frozen exactly as the child's closure context will see it. Resolution
+//! walks that static chain innermost-first — the current frame's scopes, each
+//! enclosing frame's scopes, then (for a direct-eval body) the caller's
+//! context chain — counting one hop per scope that owns a context.
 //!
 //! # Contents
-//! - context stack management
-//! - private-name namespace stack
-//! - `Deref` access to the current function context
+//! - [`Compiler`] — the frame stack plus compilation-unit state.
+//! - [`ScopeLocation`] / [`Resolved`] / [`NameRef`] — a resolved binding and
+//!   how to reach it (own register or slot, a slot `depth` hops out of the
+//!   closure context, or the global environment), plus the eval-extension
+//!   probe range when a sloppy direct eval may shadow it.
+//! - [`VarTarget`] — where a sloppy eval or Annex B function sync writes its
+//!   variable-scope binding.
+//! - module-scope slot names ([`MODULE_ENV_BINDING`] and friends).
 //!
 //! # Invariants
 //! - The stack is never empty while lowering.
+//! - A depth counts only scopes that own a context; a function without
+//!   contexts is transparent, and its closure context is its creator's.
+//! - `Lookup*` operations are emitted exactly when a context carrying an
+//!   eval extension lies strictly between the reference and its target
+//!   (or anywhere on the chain for a global reference).
+//! - Outer-frame register bindings are never reached: capture analysis
+//!   promotes every name a nested function references to a slot.
 //!
 //! # See also
-//! - `function_context` for per-function state
+//! - `binding_emit` for the bytecode each resolution lowers to.
+//! - `function_context` for per-frame scopes and contexts.
+//! - `capture` for the capture pre-pass.
 
+use crate::scope::CtxReg;
 use crate::*;
+use otter_bytecode::{EvalCallerChain, SlotKind};
 
 /// Compile-time stack of function contexts. The innermost context
-/// is at the top; capture resolution walks this stack downward to
-/// find a binding declared by an ancestor.
+/// is at the top.
 ///
 /// The compiler exposes the inner-most [`FunctionContext`] through
-/// `Deref` / `DerefMut` so existing code continues to use `cx.emit`,
-/// `cx.scratch`, etc. without referencing the stack explicitly.
+/// `Deref` / `DerefMut` so code uses `cx.emit`, `cx.scratch`, etc.
+/// without referencing the stack explicitly.
 #[derive(Debug)]
 pub(crate) struct Compiler {
     pub(crate) stack: Vec<FunctionContext>,
-    /// One-shot hint set by the NAMED FunctionExpression lowering:
-    /// the next `compile_function_full` marks its self-name binding
-    /// as the §10.2.11 immutable function-expression name (strict
-    /// assignment throws TypeError; sloppy writes are dropped).
-    /// Function declarations leave this false — their name resolves
-    /// to the outer mutable var binding.
-    pub(crate) fn_self_immutable_hint: bool,
-    /// One-shot hint set by the class-constructor lowering: the next
+    /// The caller context chain of a direct-eval body (frame 0 is the eval
+    /// `<main>`); `None` for scripts, modules, and indirect eval.
+    pub(crate) eval_chain: Option<EvalCallerChain>,
+    /// One-shot hint set by class-constructor lowering: the next
     /// `compile_function_full` frame carries a [[HomeObject]] and (when
-    /// paired with `next_fn_derived_ctor`) is a derived constructor —
-    /// direct-eval `super` legality reads both off the frame.
+    /// paired with `next_fn_derived_ctor`) is a derived constructor.
     pub(crate) next_fn_has_home: bool,
     pub(crate) next_fn_derived_ctor: bool,
     /// One-shot: the next NAMED FunctionExpression lowering skips its
     /// §10.2.11 self-name funcEnv binding — §20.2.1.1
     /// CreateDynamicFunction's `function anonymous(...)` binds nothing.
     pub(crate) next_fn_expr_no_self_binding: bool,
-    /// One-shot hint set by MethodDefinition lowering (class and
-    /// object-literal methods / accessors): the next
-    /// `compile_function_full` marks its record `is_method`, so the
-    /// runtime never gives it an implicit `prototype` property
-    /// (§10.2.5 MakeConstructor skips methods).
+    /// One-shot hint set by MethodDefinition lowering: the next
+    /// `compile_function_full` marks its record `is_method`.
     pub(crate) next_fn_is_method: bool,
     /// One-shot hint paired with [`Self::next_fn_is_method`]: the
     /// next `compile_function_full` resolves `super.x` through the
-    /// statics-side home object (`static` MethodDefinition bodies).
+    /// statics-side home object.
     pub(crate) next_fn_static_home: bool,
-    /// One-shot hint set by class-constructor lowering: the next
-    /// `compile_function_full` skips the function-expression-style
-    /// self-name binding (the class name resolves through the class
-    /// scope) without marking the record as a MethodDefinition (a
-    /// class constructor IS a constructor).
-    pub(crate) next_fn_no_self_name: bool,
     /// One-shot byte range for the next compiled function's §20.2.3.5
-    /// [[SourceText]] when it differs from the function-body span — a
-    /// concise method / accessor reports its enclosing
-    /// `MethodDefinition` (key and prefixes included). Consumed by
-    /// `compile_function_full`.
+    /// [[SourceText]] when it differs from the function-body span.
     pub(crate) next_fn_source_text_span: Option<(u32, u32)>,
-    /// Stack of private-field namespace ids — one per enclosing
-    /// class declaration. The top entry is the namespace used to
-    /// mangle every `#name` reference inside the current class
-    /// body. Empty when no class encloses the current expression
-    /// (in which case `#name` references are a syntax error).
-    /// Each entry is the integer suffix of `__priv_<n>_<name>`
-    /// so peers across classes never collide.
-    /// <https://tc39.es/ecma262/#sec-private-names>
+    /// Stack of private-name class levels — one per enclosing class
+    /// declaration, innermost last. The value is a per-unit class id.
     pub(crate) private_namespaces: Vec<u32>,
     /// Private names declared by each enclosing class, parallel to
-    /// `private_namespaces`. Seeds §8.2.4 AllPrivateNamesValid when a
-    /// nested class body is compiled (its `#name` references may
-    /// resolve to an outer class).
+    /// `private_namespaces`.
     pub(crate) class_private_names: Vec<std::collections::HashSet<String>>,
-    /// Declaration-ordered private names per enclosing class —
-    /// parallel to `private_namespaces`; indexes the per-class
-    /// `__privarr_{ns}` symbol array.
-    pub(crate) class_private_ordered: Vec<Vec<String>>,
     /// Instance private METHOD / ACCESSOR names per enclosing class
     /// (parallel to `private_namespaces`). Access to these emits a
-    /// §7.3.31 brand check — the prototype-side lookup alone must
-    /// not satisfy access before `super()` installs the brand.
+    /// §7.3.31 brand check.
     pub(crate) class_private_instance_methods: Vec<std::collections::HashSet<String>>,
+    /// Scope of each enclosing class (parallel to `private_namespaces`):
+    /// its private names, brand, and homes are slots of that scope.
+    pub(crate) class_scope_locations: Vec<ScopeLocation>,
     /// `true` when compiling any `eval` body — §B.3.3.3 makes the
-    /// Annex B global function extension *deletable* for eval code
-    /// (CreateGlobalVarBinding(F, true)) where script code creates a
-    /// non-configurable binding.
+    /// Annex B global function extension *deletable* for eval code.
     pub(crate) in_eval: bool,
-    /// `true` when compiling a *strict* `eval` body: §19.2.1.1 gives
-    /// strict eval its own variable environment, so top-level `var` /
-    /// `function` declarations must NOT mirror onto the global object
-    /// (ordinary scripts mirror per §16.1.7 regardless of strictness).
+    /// `true` when compiling a *strict* `eval` body or a sloppy direct
+    /// eval whose variable environment is a function's: top-level `var` /
+    /// `function` declarations do not mirror onto the global object.
     pub(crate) suppress_global_mirror: bool,
-    /// §16.1.7 GlobalDeclarationInstantiation — names of script
-    /// top-level `var` and function declarations. These live as
-    /// global-object properties (the global environment's object
-    /// record), not `<main>` locals: every read and write — from the
-    /// script body, nested functions, sibling scripts, and eval
-    /// chunks — resolves through the global object, so none of them
-    /// can observe a stale copy. Empty for modules and eval bodies.
+    /// §16.1.7 — names of script top-level `var` and function
+    /// declarations, which live as global-object properties. Empty for
+    /// modules and function-caller eval bodies.
     pub(crate) script_global_vars: std::collections::HashSet<String>,
     /// §9.1.1.4 global declarative record — names of script
-    /// top-level `let` / `const` / `class` declarations. These live
-    /// in the interpreter's realm-wide lexical map (shared across
-    /// sibling scripts, shadowing global object properties), not as
-    /// `<main>` locals. Empty for modules and eval bodies (eval
-    /// lexicals are private to the eval, §19.2.1.1).
+    /// top-level `let` / `const` / `class` declarations.
     pub(crate) script_global_lexicals: std::collections::HashSet<String>,
-    /// Sloppy eval-body `var` / annex-B function names. §19.2.1.3
-    /// CreateMutableBinding(name, true) makes them deletable, so
-    /// `delete name` lowers to [`Op::DeleteDynamic`] instead of the
-    /// declarative-binding `false`.
-    pub(crate) eval_var_names: std::collections::HashSet<String>,
-    /// Lexical scope depth, inside the CALLER function, of each binding
-    /// a direct-eval chunk inherits through its caller scope. The chunk
-    /// declares them all in its own function scope, so this is the only
-    /// record of how they nested against the caller's `with` object
-    /// environments (§9.1.1.2.1). Empty outside an eval chunk.
-    pub(crate) caller_scope_depths: std::collections::HashMap<String, usize>,
     /// `true` while lowering class instance-field initializers
-    /// (which compile into the constructor frame). A direct eval
-    /// there may use `new.target` but observes `undefined`
-    /// (§15.7.10 — field initializers are their own function-like
-    /// code with no [[NewTarget]]). Cleared on entry to any nested
-    /// non-arrow function.
+    /// (which compile into the constructor frame).
     pub(crate) in_field_initializer: bool,
-    /// `true` when this eval body's caller permits `new.target` —
-    /// inherited so a nested direct eval keeps the signal
-    /// (§19.2.1.1 step 5).
+    /// `true` when this eval body's caller permits `new.target`.
     pub(crate) eval_new_target_allowed: bool,
     /// Memoized `expr_number_typed` results, keyed by AST-node address.
-    ///
-    /// Type hints are read top-down at every binary operator, so a chained
-    /// arithmetic expression would re-walk each subtree once per enclosing
-    /// operator. Nodes live in the parse arena for the whole compile, so their
-    /// addresses are stable keys. Purely a compile-time cache; dropping an
-    /// entry would only cost time.
     pub(crate) number_typed_cache: RefCell<HashMap<usize, bool>>,
     /// Interned annotation names referenced by [`TypeHint::Class`].
     pub(crate) class_hint_names: Vec<String>,
     /// Reverse index into [`Self::class_hint_names`].
     pub(crate) class_hint_name_ids: HashMap<String, u32>,
     /// Module-wide `class` declarations: name → constructor function id, or
-    /// `None` once a second class of the same name is seen. An ambiguous name
-    /// has no single instance shape, so its sites are dropped.
+    /// `None` once a second class of the same name is seen.
     pub(crate) declared_classes: HashMap<String, Option<u32>>,
-    /// Class-annotated property sites awaiting name resolution. Resolution is
-    /// deferred to the end of the module because a class may be declared after
-    /// the function whose parameters name it.
+    /// Class-annotated property sites awaiting name resolution.
     pub(crate) pending_class_hint_sites: Vec<PendingClassHintSite>,
 }
 
@@ -158,36 +116,127 @@ pub(crate) struct Compiler {
 /// name rather than a resolved class.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingClassHintSite {
-    /// Function whose code contains the site.
     pub(crate) function_id: u32,
-    /// Instruction PC of the property access.
     pub(crate) pc: u32,
-    /// Index into [`Compiler::class_hint_names`].
     pub(crate) name: u32,
+}
+
+/// Position of a scope on the static chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeLocation {
+    /// Scope `scope` of compile frame `frame`.
+    Frame { frame: usize, scope: usize },
+    /// Entry `hop` of the direct-eval caller chain.
+    Chain { hop: usize },
+}
+
+/// Probe range of an eval-extension lookup: `depth` hops from `base`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LookupSite {
+    pub(crate) base: CtxReg,
+    pub(crate) depth: u16,
+}
+
+/// How a resolved binding is reached from the current frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// A binding of the current frame; `info.storage` addresses it.
+    Own,
+    /// Slot `slot` of the context `depth` hops out of the closure context.
+    Outer { depth: u16, slot: u16 },
+}
+
+/// A statically resolved binding.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Resolved {
+    pub(crate) location: ScopeLocation,
+    pub(crate) info: BindingInfo,
+    pub(crate) access: Access,
+    /// Extension probe needed before the binding: a sloppy direct eval may
+    /// have created a shadowing `var` between here and the binding.
+    pub(crate) lookup: Option<LookupSite>,
+}
+
+impl Resolved {
+    /// Slot index of a context-slot binding.
+    pub(crate) fn slot(&self) -> Option<u16> {
+        match (self.access, self.info.storage) {
+            (Access::Outer { slot, .. }, _) => Some(slot),
+            (Access::Own, BindingStorage::Slot { slot, .. }) => Some(slot),
+            (Access::Own, BindingStorage::Register { .. }) => None,
+        }
+    }
+}
+
+/// A name reference: a static binding or the global environment.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NameRef {
+    Binding(Resolved),
+    /// No static binding; the extension probe range when one is needed.
+    Global(Option<LookupSite>),
+}
+
+impl NameRef {
+    pub(crate) fn lookup(&self) -> Option<LookupSite> {
+        match self {
+            Self::Binding(resolved) => resolved.lookup,
+            Self::Global(lookup) => *lookup,
+        }
+    }
+}
+
+/// Where a variable-scope binding (sloppy eval `var`, Annex B function
+/// sync) is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarTarget {
+    /// A binding of the current frame.
+    Own(BindingStorage),
+    /// A caller variable-scope slot `depth` hops out of the closure context.
+    Outer { depth: u16, slot: u16 },
+    /// The eval extension of the caller's variable scope, `depth` hops out
+    /// of the closure context.
+    Extension { depth: u16 },
+}
+
+/// One scope visited by [`Compiler::walk_chain`].
+#[derive(Debug, Clone, Copy)]
+struct ChainEntry {
+    location: ScopeLocation,
+    /// Hop from the walk base when the scope owns a context.
+    hop: Option<u16>,
+    extension: bool,
+}
+
+/// Walk state handed to each visited scope.
+#[derive(Debug, Clone, Copy)]
+struct WalkState {
+    base: CtxReg,
+    /// Hop of the current frame's closure context from the base; known once
+    /// the current frame's scopes are walked.
+    closure_hop: u16,
+    /// Hop of the innermost extension-capable context seen so far.
+    first_extension: Option<u16>,
 }
 
 impl Compiler {
     pub(crate) fn new(top: FunctionContext) -> Self {
         Self {
             stack: vec![top],
-            fn_self_immutable_hint: false,
+            eval_chain: None,
             next_fn_has_home: false,
             next_fn_derived_ctor: false,
             next_fn_expr_no_self_binding: false,
             next_fn_is_method: false,
             next_fn_static_home: false,
-            next_fn_no_self_name: false,
             next_fn_source_text_span: None,
             private_namespaces: Vec::new(),
             class_private_names: Vec::new(),
-            class_private_ordered: Vec::new(),
             class_private_instance_methods: Vec::new(),
+            class_scope_locations: Vec::new(),
             suppress_global_mirror: false,
             in_eval: false,
             script_global_vars: std::collections::HashSet::new(),
             script_global_lexicals: std::collections::HashSet::new(),
-            eval_var_names: std::collections::HashSet::new(),
-            caller_scope_depths: std::collections::HashMap::new(),
             in_field_initializer: false,
             eval_new_target_allowed: false,
             number_typed_cache: RefCell::new(HashMap::new()),
@@ -210,7 +259,6 @@ impl Compiler {
     }
 
     /// Record that `name` names the class whose constructor is `function_id`.
-    /// A repeated name becomes ambiguous and stops seeding anything.
     pub(crate) fn declare_class(&mut self, name: &str, function_id: u32) {
         match self.declared_classes.get_mut(name) {
             Some(slot) => *slot = None,
@@ -222,7 +270,7 @@ impl Compiler {
     }
 
     /// Move a finished function's class-annotated property sites onto the
-    /// module-wide list, where they wait for name resolution.
+    /// module-wide list.
     pub(crate) fn take_class_hint_sites(&mut self, function_id: u32, sites: Vec<(u32, u32)>) {
         self.pending_class_hint_sites
             .extend(sites.into_iter().map(|(pc, name)| PendingClassHintSite {
@@ -230,63 +278,6 @@ impl Compiler {
                 pc,
                 name,
             }));
-    }
-
-    /// `true` when a sloppy function on the compile stack contains a direct
-    /// eval call site. Only such eval code can leave a persistent var binding
-    /// in an activation's dynamic environment; strict eval owns its fresh
-    /// environment and cannot shadow later references.
-    pub(crate) fn any_enclosing_leaking_direct_eval(&self) -> bool {
-        self.stack
-            .iter()
-            .any(|frame| frame.contains_direct_eval && !frame.is_strict)
-    }
-
-    /// `true` when `name` resolves to one of THIS eval chunk's own
-    /// deletable var-scoped bindings (§19.2.1.3 CreateMutableBinding
-    /// with deletable = true): the innermost static declaration across
-    /// the whole compile stack is the eval `<main>`'s function scope.
-    /// Reads and writes of such a name must go through the dynamic
-    /// eval-environment ops so a later `delete` is observable — the
-    /// static cell would keep serving the value after the binding is
-    /// gone.
-    pub(crate) fn eval_var_dynamic_reference(&self, name: &str) -> bool {
-        if !self.eval_var_names.contains(name) {
-            return false;
-        }
-        for (frame_idx, frame) in self.stack.iter().enumerate().rev() {
-            for (scope_idx, scope) in frame.scopes.iter().enumerate().rev() {
-                if scope.bindings.contains_key(name) {
-                    return frame_idx == 0 && scope_idx == 0;
-                }
-            }
-        }
-        false
-    }
-
-    pub(crate) fn current_private_namespace(&self) -> Option<u32> {
-        self.private_namespaces.last().copied()
-    }
-
-    pub(crate) fn private_key_binding_name(&self, name: &str) -> Option<String> {
-        self.current_private_namespace()
-            .map(|ns| format!("__privsym_{ns}_{name}"))
-    }
-
-    /// `(fn_depth, scope_depth)` (both 1-based) of the innermost
-    /// live declaration of `name` across the whole function-context
-    /// stack, or `None` for unresolved / global names. Used by the
-    /// `with` probe to decide which object environments are inner
-    /// than the static binding (§9.1.1.2.1).
-    pub(crate) fn binding_position(&self, name: &str) -> Option<(usize, usize)> {
-        for (fi, frame) in self.stack.iter().enumerate().rev() {
-            for (si, scope) in frame.scopes.iter().enumerate().rev() {
-                if scope.bindings.contains_key(name) {
-                    return Some((fi + 1, si + 1));
-                }
-            }
-        }
-        None
     }
 
     pub(crate) fn top_mut(&mut self) -> &mut FunctionContext {
@@ -305,331 +296,224 @@ impl Compiler {
             .expect("compiler pop on empty context stack")
     }
 
-    /// Walk the ancestor chain (excluding the top frame) and resolve
-    /// `name` to an absolute upvalue index in the **top** frame's
-    /// `frame.upvalues`. Each intermediate ancestor that didn't yet
-    /// capture `name` gets a fresh capture slot pointing at the next
-    /// ancestor up.
-    pub(crate) fn resolve_capture(&mut self, name: &str) -> Option<u16> {
-        if self.stack.len() < 2 {
-            return None;
+    /// Location of scope `scope` in the current frame.
+    pub(crate) fn here(&self, scope: usize) -> ScopeLocation {
+        ScopeLocation::Frame {
+            frame: self.stack.len() - 1,
+            scope,
         }
-        let top_idx = self.stack.len() - 1;
-        // Already captured at top?
-        if let Some(&idx) = self.stack[top_idx].captured_uv.get(name) {
-            return Some(idx);
-        }
-        // Find the deepest ancestor that has `name` as an
-        // own-upvalue (or already-resolved capture). Search from
-        // direct-parent (top_idx - 1) downward.
-        let mut found: Option<(usize, u16)> = None;
-        for i in (0..top_idx).rev() {
-            // Local bindings shadow passthrough captures with the
-            // same name. This matters for functions with parameter
-            // expressions: a default initializer may capture outer
-            // `x`, while body `var x` must be captured by closures
-            // created in the body.
-            let mut hit: Option<u16> = None;
-            for scope in self.stack[i].scopes.iter().rev() {
-                if let Some(info) = scope.bindings.get(name) {
-                    if let BindingStorage::Upvalue { idx } = info.storage {
-                        hit = Some(idx);
-                    }
-                    break;
-                }
-            }
-            if let Some(idx) = hit {
-                found = Some((i, idx));
-                break;
-            }
-            // Already-captured upvalue in this ancestor?
-            if let Some(&idx) = self.stack[i].captured_uv.get(name) {
-                found = Some((i, idx));
-                break;
-            }
-        }
-        let (anchor_idx, mut current) = found?;
-        // Cascade the cell from anchor down to the top frame: each
-        // intermediate ancestor adds a capture entry pointing at the
-        // previous one.
-        for j in (anchor_idx + 1)..=top_idx {
-            let frame = &mut self.stack[j];
-            if let Some(&existing) = frame.captured_uv.get(name) {
-                current = existing;
-                continue;
-            }
-            // Issue the capture in the VIRTUAL index space — the
-            // frame may declare more own captured cells after this
-            // resolution, so the absolute `own_count + position`
-            // index is only computed at function finalization.
-            let new_idx = crate::function_context::VIRTUAL_CAPTURE_BASE
-                .checked_add(frame.parent_captures.len() as u16)
-                .expect("captured upvalue index overflow");
-            frame.parent_captures.push(current as u32);
-            frame.captured_uv.insert(name.to_string(), new_idx);
-            current = new_idx;
-        }
-        Some(current)
     }
 
-    /// Resolve the declaration-owner frame and [`BindingInfo`] for a captured
-    /// name. Passthrough `captured_uv` entries are deliberately ignored: an
-    /// eval record outside the actual declaration cannot shadow that binding.
-    pub(crate) fn captured_binding_owner(&self, name: &str) -> Option<(usize, BindingInfo)> {
-        for (frame_index, frame) in self.stack.iter().enumerate().rev() {
-            for scope in frame.scopes.iter().rev() {
-                if let Some(info) = scope.bindings.get(name) {
-                    return Some((frame_index, *info));
+    /// Location of the innermost scope of the current frame.
+    pub(crate) fn innermost_location(&self) -> ScopeLocation {
+        self.here(self.scopes.len().saturating_sub(1))
+    }
+
+    /// Walk the static chain innermost-first — the current frame's scopes,
+    /// each enclosing frame's scopes, then the eval caller chain — until
+    /// `visit` returns `Some`. `visit` sees each scope before it is counted
+    /// as an extension, so `first_extension` covers only inner scopes.
+    fn walk_chain<T>(
+        &self,
+        mut visit: impl FnMut(&ChainEntry, &WalkState) -> Option<T>,
+    ) -> Option<T> {
+        let top = self.stack.len() - 1;
+        let mut state = WalkState {
+            base: self.stack[top].innermost_ctx(),
+            closure_hop: 0,
+            first_extension: None,
+        };
+        let mut hop: u32 = 0;
+        for frame_index in (0..=top).rev() {
+            let frame = &self.stack[frame_index];
+            for scope_index in (0..frame.scopes.len()).rev() {
+                let scope = &frame.scopes[scope_index];
+                let this_hop = scope
+                    .context
+                    .map(|_| u16::try_from(hop).unwrap_or(u16::MAX));
+                let entry = ChainEntry {
+                    location: ScopeLocation::Frame {
+                        frame: frame_index,
+                        scope: scope_index,
+                    },
+                    hop: this_hop,
+                    extension: this_hop.is_some() && scope.flags.has_extension,
+                };
+                if let Some(found) = visit(&entry, &state) {
+                    return Some(found);
+                }
+                if this_hop.is_some() {
+                    hop += 1;
+                }
+                if entry.extension && state.first_extension.is_none() {
+                    state.first_extension = entry.hop;
+                }
+            }
+            if frame_index == top {
+                state.closure_hop = u16::try_from(hop).unwrap_or(u16::MAX);
+            }
+        }
+        if let Some(chain) = &self.eval_chain {
+            for (index, scope) in chain.scopes.iter().enumerate() {
+                let entry = ChainEntry {
+                    location: ScopeLocation::Chain { hop: index },
+                    hop: Some(u16::try_from(hop + index as u32).unwrap_or(u16::MAX)),
+                    extension: scope.descriptor.flags.has_extension,
+                };
+                if let Some(found) = visit(&entry, &state) {
+                    return Some(found);
+                }
+                if entry.extension && state.first_extension.is_none() {
+                    state.first_extension = entry.hop;
                 }
             }
         }
         None
     }
 
-    /// Resolve one source-level capture, its declaration metadata, and the
-    /// exact physical eval-chain prefix allowed to shadow it.
-    ///
-    /// The declaration owner is excluded and the current frame is included.
-    /// A shadow operation is needed only when that slice contains a sloppy
-    /// direct-eval site. Once needed, the encoded depth counts every physical
-    /// direct-eval record in the slice, including strict empty records that
-    /// occupy a parent-chain node.
-    pub(crate) fn resolve_capture_with_info(
-        &mut self,
-        name: &str,
-    ) -> Option<(u16, BindingInfo, u32)> {
-        let (owner_index, info) = self.captured_binding_owner(name)?;
-        let inner_frames = &self.stack[(owner_index + 1)..];
-        let may_shadow = inner_frames
-            .iter()
-            .any(|frame| frame.contains_direct_eval && !frame.is_strict);
-        let eval_depth = if may_shadow {
-            u32::try_from(
-                inner_frames
-                    .iter()
-                    .filter(|frame| frame.contains_direct_eval)
-                    .count(),
-            )
-            .expect("eval-environment depth overflow")
-        } else {
-            0
-        };
-        let index = self.resolve_capture(name)?;
-        Some((index, info, eval_depth))
-    }
-
-    /// Emit the complete captured-binding read family.
-    ///
-    /// A live eval environment can be owned by this frame or inherited by a
-    /// descendant closure. In that case the runtime must probe the eval chain
-    /// before falling back to the statically captured cell.
-    pub(crate) fn emit_captured_binding_load(
-        &mut self,
-        destination: u16,
-        name: &str,
-        index: u16,
-        eval_depth: u32,
-        span: (u32, u32),
-    ) {
-        self.emit_captured_binding_load_snap(destination, name, index, eval_depth, None, span);
-    }
-
-    /// [`Self::emit_captured_binding_load`] reading through a pre-resolved
-    /// reference: `snapshot` holds the eval-binding sequence captured by
-    /// [`Op::EvalBindingSeq`] before the RHS ran (§13.15.2).
-    pub(crate) fn emit_captured_binding_load_snap(
-        &mut self,
-        destination: u16,
-        name: &str,
-        index: u16,
-        eval_depth: u32,
-        snapshot: Option<u16>,
-        span: (u32, u32),
-    ) {
-        if eval_depth != 0 {
-            let name = self.intern_string_constant(name);
-            let depth_imm =
-                Operand::Imm32(i32::try_from(eval_depth).expect("eval-environment depth overflow"));
-            if let Some(snapshot) = snapshot {
-                self.emit(
-                    Op::LoadShadowedUpvalueSnap,
-                    vec![
-                        Operand::Register(destination),
-                        Operand::ConstIndex(name),
-                        Operand::Imm32(i32::from(index)),
-                        depth_imm,
-                        Operand::Register(snapshot),
-                    ],
-                    span,
-                );
-                return;
+    /// Ordering rank of a location: a larger rank is lexically inner.
+    pub(crate) fn location_rank(&self, location: ScopeLocation) -> (usize, usize) {
+        match location {
+            ScopeLocation::Frame { frame, scope } => (frame + 1, scope + 1),
+            ScopeLocation::Chain { hop } => {
+                let len = self.eval_chain.as_ref().map_or(0, |c| c.scopes.len());
+                (0, len.saturating_sub(hop))
             }
-            self.emit(
-                Op::LoadShadowedUpvalue,
-                [
-                    Operand::Register(destination),
-                    Operand::ConstIndex(name),
-                    Operand::Imm32(i32::from(index)),
-                    depth_imm,
-                ],
-                span,
-            );
-        } else {
-            self.emit(
-                Op::LoadUpvalue,
-                [
-                    Operand::Register(destination),
-                    Operand::Imm32(i32::from(index)),
-                ],
-                span,
-            );
         }
     }
 
-    /// Emit the complete captured-binding assignment family.
-    ///
-    /// Shadow lookup intentionally occurs when the store executes, after RHS
-    /// evaluation. This matches the live eval-environment behavior of V8 for
-    /// plain, compound, logical, destructuring, and update assignments.
-    pub(crate) fn emit_captured_binding_store(
-        &mut self,
-        value: u16,
-        name: &str,
-        index: u16,
+    /// Binding record of `name` directly in the scope at `location`.
+    fn binding_at(&self, location: ScopeLocation, name: &str) -> Option<BindingInfo> {
+        match location {
+            ScopeLocation::Frame { frame, scope } => {
+                self.stack[frame].scopes[scope].bindings.get(name).copied()
+            }
+            ScopeLocation::Chain { hop } => {
+                let descriptor = &self.eval_chain.as_ref()?.scopes.get(hop)?.descriptor;
+                let slot = descriptor.slots.iter().position(|slot| slot.name == name)?;
+                let kind = descriptor.slots[slot].kind;
+                let mut info = BindingInfo::new(
+                    BindingStorage::Slot {
+                        ctx: CtxReg::Closure,
+                        slot: slot as u16,
+                    },
+                    kind,
+                );
+                info.initialized = true;
+                info.fn_self_name = matches!(kind, SlotKind::FnSelfName | SlotKind::Class);
+                Some(info)
+            }
+        }
+    }
+
+    fn resolve_entry(
+        &self,
+        entry: &ChainEntry,
+        state: &WalkState,
         info: BindingInfo,
-        eval_depth: u32,
-        span: (u32, u32),
-    ) {
-        self.emit_captured_binding_store_snap(value, name, index, info, eval_depth, None, span);
-    }
-
-    /// [`Self::emit_captured_binding_store`] writing through a pre-resolved
-    /// reference (§13.15.2 PutValue): bindings a direct eval introduced
-    /// during the RHS are invisible to the bounded lookup.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn emit_captured_binding_store_snap(
-        &mut self,
-        value: u16,
-        name: &str,
-        index: u16,
-        info: BindingInfo,
-        eval_depth: u32,
-        snapshot: Option<u16>,
-        span: (u32, u32),
-    ) {
-        use otter_bytecode::opcode_schema::{ShadowedUpvalueFallback, ShadowedUpvalueStorePolicy};
-
-        let fallback = if info.fn_self_name {
-            if self.is_strict {
-                ShadowedUpvalueFallback::ImmutableThrow
-            } else {
-                ShadowedUpvalueFallback::ImmutableIgnore
-            }
-        } else if info.is_const {
-            ShadowedUpvalueFallback::ImmutableThrow
+    ) -> Option<Resolved> {
+        let top = self.stack.len() - 1;
+        let own = matches!(entry.location, ScopeLocation::Frame { frame, .. } if frame == top);
+        let access = if own {
+            Access::Own
         } else {
-            ShadowedUpvalueFallback::Mutable
+            let BindingStorage::Slot { slot, .. } = info.storage else {
+                return None;
+            };
+            let hop = entry.hop?;
+            Access::Outer {
+                depth: hop.checked_sub(state.closure_hop)?,
+                slot,
+            }
         };
-        if eval_depth != 0 {
-            let name = self.intern_string_constant(name);
-            let policy = ShadowedUpvalueStorePolicy {
-                eval_depth,
-                fallback,
+        let lookup = match (entry.hop, info.storage) {
+            (Some(target), BindingStorage::Slot { .. })
+                if state.first_extension.is_some_and(|hop| hop < target) =>
+            {
+                Some(LookupSite {
+                    base: state.base,
+                    depth: target,
+                })
             }
-            .to_imm32()
-            .expect("shadowed-upvalue store policy overflow");
-            if let Some(snapshot) = snapshot {
-                self.emit(
-                    Op::StoreShadowedUpvalueCheckedSnap,
-                    vec![
-                        Operand::Register(value),
-                        Operand::ConstIndex(name),
-                        Operand::Imm32(i32::from(index)),
-                        Operand::Imm32(policy),
-                        Operand::Register(snapshot),
-                    ],
-                    span,
-                );
-                return;
-            }
-            self.emit(
-                Op::StoreShadowedUpvalueChecked,
-                [
-                    Operand::Register(value),
-                    Operand::ConstIndex(name),
-                    Operand::Imm32(i32::from(index)),
-                    Operand::Imm32(policy),
-                ],
-                span,
-            );
-            return;
-        }
-        match fallback {
-            ShadowedUpvalueFallback::Mutable => self.emit(
-                Op::StoreUpvalueChecked,
-                [Operand::Register(value), Operand::Imm32(i32::from(index))],
-                span,
-            ),
-            ShadowedUpvalueFallback::ImmutableThrow => {
-                crate::assignment::emit_assignment_type_error(
-                    self,
-                    &format!("Assignment to constant variable '{name}'."),
-                    span,
-                );
-            }
-            ShadowedUpvalueFallback::ImmutableIgnore => {}
-        }
+            _ => None,
+        };
+        Some(Resolved {
+            location: entry.location,
+            info,
+            access,
+            lookup,
+        })
     }
 
-    /// Mirror an assignment to an exported module binding through to
-    /// `module_env`, including assignments emitted inside nested
-    /// functions. Nested functions capture the synthetic module-env
-    /// binding through the normal upvalue cascade.
-    pub(crate) fn emit_module_export_mirror(
-        &mut self,
-        name: &str,
-        value_reg: u16,
-        span: (u32, u32),
-    ) {
-        let exported = self.stack.iter().any(|ctx| {
-            ctx.module_state
-                .as_ref()
-                .is_some_and(|state| state.exported_names.contains(name))
+    /// Resolve `name` to its innermost static binding, if any. An
+    /// outer-frame register binding (never reachable) is skipped.
+    pub(crate) fn resolve_name(&self, name: &str) -> Option<Resolved> {
+        self.walk_chain(|entry, state| {
+            let info = self.binding_at(entry.location, name)?;
+            self.resolve_entry(entry, state, info)
+        })
+    }
+
+    /// Resolve `name` as declared directly in the scope at `location`.
+    pub(crate) fn resolve_at(&self, location: ScopeLocation, name: &str) -> Option<Resolved> {
+        self.walk_chain(|entry, state| {
+            if entry.location != location {
+                return None;
+            }
+            let info = self.binding_at(location, name)?;
+            self.resolve_entry(entry, state, info)
+        })
+    }
+
+    /// Extension probe range for a reference with no static binding.
+    pub(crate) fn global_lookup(&self) -> Option<LookupSite> {
+        let mut outermost: Option<u16> = None;
+        let mut base = CtxReg::Closure;
+        self.walk_chain::<()>(|entry, state| {
+            base = state.base;
+            if entry.extension {
+                outermost = entry.hop;
+            }
+            None
         });
-        // Renamed local re-export targets (`export { name as alias }`)
-        // are mirrored under their *alias* on every write to `name`, so
-        // the aliased export tracks later assignments (live binding).
-        let aliases: Vec<String> = self
-            .stack
-            .iter()
-            .filter_map(|ctx| ctx.module_state.as_ref())
-            .filter_map(|state| state.reexport_local_targets.get(name))
-            .flatten()
-            .cloned()
-            .collect();
-        if !exported && aliases.is_empty() {
-            return;
-        }
-        let env_uv = match self.stack.last().and_then(|ctx| ctx.module_state.as_ref()) {
-            Some(state) => state.module_env_uv,
-            None => match self.resolve_capture(&module_env_synthetic_name()) {
-                Some(idx) => idx,
-                None => return,
-            },
-        };
-        let env_reg = self.alloc_scratch();
-        self.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-            span,
-        );
-        if exported {
-            self.emit_store_property(env_reg, name, value_reg, span);
-        }
-        for alias in &aliases {
-            self.emit_store_property(env_reg, alias, value_reg, span);
+        Some(LookupSite {
+            base,
+            depth: outermost?.saturating_add(1),
+        })
+    }
+
+    /// Resolve `name` for a load / store / `typeof` / `delete`.
+    pub(crate) fn resolve_ref(&self, name: &str) -> NameRef {
+        match self.resolve_name(name) {
+            Some(resolved) => NameRef::Binding(resolved),
+            None => NameRef::Global(self.global_lookup()),
         }
     }
+
+    /// Rank of the innermost static binding of `name`, for ordering it
+    /// against `with` object environments (§9.1.1.2.1).
+    pub(crate) fn binding_position(&self, name: &str) -> Option<(usize, usize)> {
+        self.resolve_name(name)
+            .map(|resolved| self.location_rank(resolved.location))
+    }
+
+    /// `true` when `name` has no static binding and no eval extension or
+    /// `with` object can intercept it, so it reads the global object.
+    pub(crate) fn resolves_to_plain_global(&self, name: &str) -> bool {
+        self.active_with_envs.is_empty()
+            && self.resolve_name(name).is_none()
+            && self.global_lookup().is_none()
+    }
+}
+
+/// Module-scope slot holding the module environment object.
+pub(crate) const MODULE_ENV_BINDING: &str = "%module_env";
+/// Module-scope slot holding the `import.meta` object.
+pub(crate) const IMPORT_META_BINDING: &str = "%import_meta";
+
+/// Module-scope slot holding the import record of request number `index`.
+pub(crate) fn import_record_binding(index: u16) -> String {
+    format!("%import_record_{index}")
 }
 
 impl std::ops::Deref for Compiler {

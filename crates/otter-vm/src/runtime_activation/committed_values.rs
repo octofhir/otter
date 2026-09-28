@@ -183,9 +183,9 @@ pub enum ScalarValueOp {
     NewBuiltinError,
     /// Bind the completed `super()` result as derived-constructor `this`.
     BindThisValue,
-    /// Create the site's closure over the activation's parent upvalue cells.
+    /// Create the site's closure over its boxed context input.
     MakeClosure,
-    /// Create the site's capture-free function.
+    /// Create the site's function over no context.
     MakeFunction,
     /// Materialize the site's fresh RegExp literal.
     LoadRegExp,
@@ -529,7 +529,7 @@ impl RuntimeCall<'_> {
             return Ok(value0);
         }
         if operation == ScalarValueOp::MakeClosure {
-            return self.make_closure_value();
+            return self.make_closure_value(value0);
         }
         if operation == ScalarValueOp::MakeFunction {
             return self.make_function_value();
@@ -602,23 +602,12 @@ impl RuntimeCall<'_> {
         .map_err(CommittedValueError::JavaScript)
     }
 
-    /// Create the published `MakeClosure` site's closure over this
-    /// activation's upvalue cells, exactly as the interpreter does.
-    fn make_closure_value(&mut self) -> Result<Value, CommittedValueError> {
+    /// Create the published `MakeClosure` site's closure over the boxed
+    /// context input (`value0`, the site's `ctx` register), exactly as the
+    /// interpreter does.
+    fn make_closure_value(&mut self, closure_context: Value) -> Result<Value, CommittedValueError> {
         let function_index = self
             .published_const_index(1)
-            .map_err(CommittedValueError::Fatal)?;
-        let count = self
-            .published_const_index(2)
-            .map_err(CommittedValueError::Fatal)?;
-        let parents = (0..count)
-            .map(|slot| {
-                u8::try_from(3 + slot)
-                    .map_err(|_| VmError::InvalidOperand)
-                    .and_then(|operand| self.published_imm32(operand))
-                    .and_then(|index| u32::try_from(index).map_err(|_| VmError::InvalidOperand))
-            })
-            .collect::<Result<smallvec::SmallVec<[u32; 16]>, _>>()
             .map_err(CommittedValueError::Fatal)?;
         let resolved = self
             .context
@@ -637,9 +626,8 @@ impl RuntimeCall<'_> {
             &resolved,
             &mut frame,
             function_index,
-            &parents,
+            closure_context,
             lexical_new_target,
-            None,
         )
         .map_err(CommittedValueError::JavaScript)
     }
@@ -656,10 +644,7 @@ impl RuntimeCall<'_> {
             .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
-        // SAFETY: construction validated the frame and owns it exclusively.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
-            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        vm.make_function_value(&resolved, &mut frame, function_index)
+        vm.make_function_value(&resolved, function_index)
             .map_err(CommittedValueError::JavaScript)
     }
 

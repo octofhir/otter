@@ -288,16 +288,12 @@ impl CodeBlock {
         (std::mem::size_of_val::<[ExecMappedArgumentBinding]>(&self.mapped_argument_bindings)
             as u64)
             .saturating_add(self.module_url.len() as u64)
-            .saturating_add(std::mem::size_of_val::<[ExecDirectEvalBinding]>(
-                &self.direct_eval_bindings,
-            ) as u64)
             .saturating_add(
-                self.direct_eval_bindings
-                    .iter()
-                    .fold(0u64, |total, binding| {
-                        total.saturating_add(binding.name.len() as u64)
-                    }),
+                std::mem::size_of_val::<[otter_bytecode::ScopeDescriptor]>(&self.scopes) as u64,
             )
+            .saturating_add(self.scopes.iter().fold(0u64, |total, scope| {
+                total.saturating_add(scope.retained_bytes())
+            }))
             .saturating_add(std::mem::size_of_val::<[CodeBlockInstruction]>(&self.code) as u64)
             .saturating_add(std::mem::size_of_val::<[u32]>(&self.overflow_operand_words) as u64)
             .saturating_add(self.control_flow.retained_bytes())
@@ -365,12 +361,7 @@ impl CodeBlock {
                 function_id_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,
                 flags_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_CALL_FLAGS_OFFSET as u32,
-                upvalue_base_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_UPVALUE_BASE_OFFSET as u32,
-                upvalue_count_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_UPVALUE_COUNT_OFFSET as u32,
-                eval_env_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_EVAL_ENV_OFFSET as u32,
+                context_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_CONTEXT_OFFSET as u32,
                 bound_this_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_BOUND_THIS_OFFSET as u32,
                 bound_new_target_byte: gc_header_bytes
@@ -403,8 +394,9 @@ impl CodeBlock {
                 crate::symbol::SYMBOL_BODY_TYPE_TAG,
                 crate::bigint::BIG_INT_BODY_TYPE_TAG,
             ],
-            upvalue_value_byte: otter_gc::header::HEADER_SIZE as u32
+            global_lexical_value_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
+            context_layout: crate::jit::JitContextLayout::current(),
             collection_layout: crate::jit::JitCollectionLayout {
                 map_type_tag: crate::collections::MAP_BODY_TYPE_TAG,
                 set_type_tag: crate::collections::SET_BODY_TYPE_TAG,
@@ -444,7 +436,6 @@ impl CodeBlock {
                     byte_pc: self.byte_pcs[index],
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can map a `MakeFunction` constant index to its target id.
-                    make_self: false,
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can inspect constant strings without exposing them to the
                     // external JIT crate.
@@ -553,8 +544,6 @@ impl CodeBlock {
             id,
             param_count,
             register_count,
-            own_upvalue_count: 0,
-            inherited_upvalue_count: 0,
             is_strict: false,
             is_arrow: false,
             is_method: false,
@@ -564,14 +553,12 @@ impl CodeBlock {
             is_async_generator: false,
             is_derived_constructor: false,
             makes_function: false,
-            observes_eval_env: false,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Box::new([]),
             is_module: false,
             module_url: Box::<str>::from(""),
-            direct_eval_bindings: Box::new([]),
-            eval_sites: Box::new([]),
+            scopes: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
@@ -1009,10 +996,6 @@ pub struct CodeBlock {
     pub param_count: u16,
     /// Total register window size: params + locals + scratch.
     pub register_count: u16,
-    /// Number of fresh upvalue cells owned by each frame.
-    pub(crate) own_upvalue_count: u16,
-    /// Exact number of closure-owned cells appended after fresh frame cells.
-    pub(crate) inherited_upvalue_count: u16,
     /// `true` when this function uses strict-mode call semantics.
     pub is_strict: bool,
     /// `true` when this function is an arrow function.
@@ -1034,18 +1017,8 @@ pub struct CodeBlock {
     /// it in the TDZ.
     pub(crate) is_derived_constructor: bool,
     /// `true` when this function body contains an `Op::MakeFunction` or
-    /// `Op::MakeClosure`. The per-instance SELF binding (cold-frame
-    /// `callee_closure`) is read only by those opcodes, so the call dispatcher
-    /// records the closure (and acquires a cold frame for it) only when this is
-    /// set — leaf functions and most callbacks skip it entirely.
+    /// `Op::MakeClosure`.
     pub(crate) makes_function: bool,
-    /// `true` when this body can observe its closure's direct-eval variable
-    /// environment: it contains a direct eval, creates a function (which
-    /// captures the environment), or resolves a name through the eval chain.
-    /// A body without such an opcode behaves identically whatever
-    /// environment its closure carries, so frameless inlining need not prove
-    /// that environment absent.
-    pub observes_eval_env: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
     /// Arguments object shape requested by the compiler.
@@ -1056,17 +1029,13 @@ pub struct CodeBlock {
     pub(crate) is_module: bool,
     /// Source module URL carried by frames for module resolution.
     pub(crate) module_url: Box<str>,
-    /// §19.2.1.3 — name → own-upvalue table for direct eval. On a
-    /// function containing a direct eval call site this lists every
-    /// function-scope binding; on a compiled eval `<main>` it lists
-    /// the new var-scoped bindings the body introduced.
-    pub(crate) direct_eval_bindings: Box<[ExecDirectEvalBinding]>,
-    /// Per-`Op::Eval`-site caller-scope refinements (block-scope
-    /// bindings visible at each direct-eval site, all `inner`).
-    pub(crate) eval_sites: Box<[Box<[ExecDirectEvalBinding]>]>,
-    /// §19.2.1.1 `inFunction` signal for `Op::Eval` — `true` when
-    /// this function contains a direct eval call site (the binding
-    /// table may still be empty).
+    /// Scope descriptors of every context this function creates, indexed by
+    /// `Op::CreateContext`'s scope operand. A live context names one entry by
+    /// `(id, scope index)`; run-time TDZ messages and direct eval read slot
+    /// names and kinds from here.
+    pub(crate) scopes: Box<[otter_bytecode::ScopeDescriptor]>,
+    /// `true` when this function's own code contains a direct eval call
+    /// site, so its activation stays materialized.
     pub(crate) contains_direct_eval: bool,
     /// Sole hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[CodeBlockInstruction]>,
@@ -1182,44 +1151,15 @@ impl CodeBlock {
         let byte_spans =
             translate_spans_to_byte_pcs(&function.spans, &instr_to_byte_pc, code_byte_len)
                 .into_boxed_slice();
-        // The per-instance SELF binding (`callee_closure` in the cold frame) is
-        // consumed *only* by `Op::MakeFunction` / `Op::MakeClosure` resolving the
-        // running function id. A body with neither opcode can never read it, so
-        // the call dispatcher skips recording the closure — and thus the cold
-        // frame acquire/release entirely — for such functions. Conservative: a
-        // body that makes *any* closure keeps it (self-reference can't be ruled
-        // out without resolving operands), which is the rare case in hot code.
         let makes_function = function
             .code
             .iter()
             .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
-        let observes_eval_env = function.contains_direct_eval
-            || function.code.iter().any(|instr| {
-                matches!(
-                    instr.op,
-                    Op::MakeFunction
-                        | Op::MakeClosure
-                        | Op::Eval
-                        | Op::LoadDynamic
-                        | Op::StoreDynamic
-                        | Op::TypeofDynamic
-                        | Op::DeleteDynamic
-                        | Op::LoadShadowedUpvalue
-                        | Op::LoadShadowedUpvalueSnap
-                        | Op::StoreShadowedUpvalueChecked
-                        | Op::StoreShadowedUpvalueCheckedSnap
-                        | Op::DeleteShadowedUpvalue
-                        | Op::EvalRestoreBinding
-                )
-            });
         Self {
             id: function.id,
             makes_function,
-            observes_eval_env,
             param_count: function.param_count,
             register_count,
-            own_upvalue_count: function.own_upvalue_count,
-            inherited_upvalue_count: function.inherited_upvalue_count,
             is_strict: function.is_strict,
             is_arrow: function.is_arrow,
             is_method: function.is_method,
@@ -1237,16 +1177,7 @@ impl CodeBlock {
             } else {
                 function.module_url.clone().into_boxed_str()
             },
-            direct_eval_bindings: function
-                .direct_eval_bindings
-                .iter()
-                .map(exec_direct_eval_binding)
-                .collect(),
-            eval_sites: function
-                .eval_sites
-                .iter()
-                .map(|site| site.iter().map(exec_direct_eval_binding).collect())
-                .collect(),
+            scopes: function.scopes.clone().into_boxed_slice(),
             contains_direct_eval: function.contains_direct_eval,
             code,
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
@@ -1277,57 +1208,6 @@ impl CodeBlock {
         self.number_hints
             .get(word)
             .is_some_and(|bits| bits & (1 << (instruction_index % 64)) != 0)
-    }
-}
-
-/// One direct-eval caller binding: name → own-upvalue cell index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecDirectEvalBinding {
-    /// Source-level binding name.
-    pub(crate) name: Box<str>,
-    /// Own-upvalue cell index inside the owning function's frame.
-    pub(crate) upvalue: u16,
-    /// `true` for `let` / `const` / `class` bindings.
-    pub(crate) lexical: bool,
-    /// Passthrough capture from an enclosing function (§19.2.1.3 —
-    /// readable, but not part of the caller's varEnv).
-    pub(crate) captured: bool,
-    /// `true` for a `const` / `class` caller binding — an eval-body
-    /// assignment throws `TypeError` in every mode (§13.3.1).
-    pub(crate) is_const: bool,
-    /// `true` for a named function expression's self-name binding —
-    /// an eval-body assignment throws `TypeError` in strict mode only
-    /// (§10.2.11, §9.1.1.1.5).
-    pub(crate) fn_self_name: bool,
-    /// Block-scope binding between the variable environment and the
-    /// eval site (§19.2.1.3, §B.3.5) — shadows the baseline table and
-    /// eval-environment records; a body `var` never re-binds it.
-    pub(crate) inner: bool,
-    /// Formal-parameter binding (or the implicit `arguments` object):
-    /// part of the function environment a parameter-initializer eval
-    /// already sees; body var/function bindings are not (§10.2.11).
-    pub(crate) param: bool,
-    /// Deletable eval-introduced caller binding (§19.2.1.3
-    /// CreateMutableBinding with deletable = true).
-    pub(crate) deletable: bool,
-    /// 1-based lexical scope depth inside the owning function (function
-    /// scope is `1`), used to order the binding against a `with` object
-    /// environment (§9.1.1.2.1).
-    pub(crate) scope_depth: u16,
-}
-
-fn exec_direct_eval_binding(binding: &otter_bytecode::DirectEvalBinding) -> ExecDirectEvalBinding {
-    ExecDirectEvalBinding {
-        name: binding.name.clone().into_boxed_str(),
-        upvalue: binding.upvalue,
-        lexical: binding.lexical,
-        captured: binding.captured,
-        is_const: binding.is_const,
-        fn_self_name: binding.fn_self_name,
-        inner: binding.inner,
-        param: binding.param,
-        deletable: binding.deletable,
-        scope_depth: binding.scope_depth,
     }
 }
 
@@ -1606,12 +1486,7 @@ mod tests {
                 function_id_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,
                 flags_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_CALL_FLAGS_OFFSET as u32,
-                upvalue_base_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_UPVALUE_BASE_OFFSET as u32,
-                upvalue_count_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_UPVALUE_COUNT_OFFSET as u32,
-                eval_env_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_EVAL_ENV_OFFSET as u32,
+                context_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_CONTEXT_OFFSET as u32,
                 bound_this_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_BOUND_THIS_OFFSET as u32,
                 bound_new_target_byte: gc_header_bytes

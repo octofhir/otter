@@ -44,6 +44,7 @@ const ALIASES: [MachineAliasClass; MachineAliasClass::COUNT] = [
     MachineAliasClass::ElementMetadata,
     MachineAliasClass::ElementField,
     MachineAliasClass::Binding,
+    MachineAliasClass::ContextSlot,
     MachineAliasClass::ConstantCell,
     MachineAliasClass::Allocation,
     MachineAliasClass::GcBarrier,

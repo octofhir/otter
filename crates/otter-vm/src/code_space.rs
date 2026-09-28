@@ -1175,22 +1175,26 @@ mod tests {
     }
 
     #[test]
-    fn hostile_closure_spine_is_rejected_before_jit_visible_code_exists() {
+    fn hostile_context_scope_is_rejected_before_jit_visible_code_exists() {
         let space = Arc::new(CodeSpace::default());
         let mut malformed = module_with_functions(2);
-        malformed.functions[1].inherited_upvalue_count = 1;
         malformed.functions[0].code = vec![
             Instruction {
                 pc: 0,
-                op: Op::MakeClosure,
-                operands: vec![
-                    Operand::Register(0),
-                    Operand::ConstIndex(0),
-                    Operand::ConstIndex(0),
-                ],
+                op: Op::LoadUndefined,
+                operands: vec![Operand::Register(1)],
             },
             Instruction {
                 pc: 1,
+                op: Op::CreateContext,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Imm32(3),
+                ],
+            },
+            Instruction {
+                pc: 2,
                 op: Op::ReturnUndefined,
                 operands: Vec::new(),
             },
@@ -1203,10 +1207,10 @@ mod tests {
         assert!(matches!(
             result,
             Ok(Err(BytecodeLinkError::Verify(
-                BytecodeVerifyError::ClosureCaptureCount {
-                    target_function_id: 1,
-                    expected: 1,
-                    actual: 0,
+                BytecodeVerifyError::ContextScope {
+                    function_index: 0,
+                    scope: 3,
+                    scope_count: 0,
                     ..
                 }
             )))

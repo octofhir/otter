@@ -73,14 +73,12 @@ pub(crate) enum PropertySourceAccess {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TemplateOperandArena {
     Registers,
-    Indices,
 }
 
 /// Semantic role of one template-plan operand slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TemplateOperandRole {
-    ClosureParents,
     ConstructArguments,
 }
 
@@ -1218,10 +1216,8 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(TARGET_TEMPLATE_OPERAND_SLICE);
             output.push(match arena {
                 TemplateOperandArena::Registers => 0,
-                TemplateOperandArena::Indices => 1,
             });
             output.push(match role {
-                TemplateOperandRole::ClosureParents => 0,
                 TemplateOperandRole::ConstructArguments => 3,
             });
             put_u32(output, *start);
@@ -1277,8 +1273,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, direct_call.linkage_bytes.unwrap_or(u32::MAX));
             put_u32(output, direct_call.reserved_stack_bytes.unwrap_or(u32::MAX));
             put_u16(output, direct_call.callee_register_count);
-            put_u16(output, direct_call.own_upvalue_count);
-            put_u16(output, direct_call.inherited_upvalue_count);
         }
     }
     Ok(())
@@ -1354,8 +1348,6 @@ mod tests {
                 linkage_bytes: Some(112),
                 reserved_stack_bytes: Some(272),
                 callee_register_count: 6,
-                own_upvalue_count: 2,
-                inherited_upvalue_count: 1,
             },
         }
     }
@@ -1731,9 +1723,25 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_METHOD_VALUE),
             RelocationTarget::RuntimeStub {
-                id: 86,
+                id: 85,
                 name: "jit_call_method_value",
                 signature: "reentrantValueSpan",
+            }
+        );
+        assert_eq!(
+            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC),
+            RelocationTarget::RuntimeStub {
+                id: 25,
+                name: "create_context_alloc",
+                signature: "allocValue3",
+            }
+        );
+        assert_eq!(
+            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC),
+            RelocationTarget::RuntimeStub {
+                id: 29,
+                name: "copy_context_alloc",
+                signature: "allocValue3",
             }
         );
     }

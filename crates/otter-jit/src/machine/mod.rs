@@ -12,8 +12,10 @@
 //! - [`InstructionSequence`] — verified block, value, and instruction storage.
 //! - [`MachineInstruction`] — one selected operation and its allocator inputs.
 //! - [`MachineCacheIrSite`] — source-owned immutable CacheIR programs.
-//! - [`MachineOpcode`] — scalar operations, guarded element accesses, control
-//!   flow, and descriptor-backed calls.
+//! - [`MachineOpcode`] — scalar operations, guarded element accesses, context
+//!   word reads and slot stores, control flow, and descriptor-backed calls.
+//! - [`ContextField`] — the closure-context, parent and slot words of the
+//!   per-scope context chain.
 //! - [`CallDescriptor`], [`CallTarget`], [`DirectCallCandidate`], and
 //!   [`DirectCallKind`] — complete semantic targets, guards, ABI, effects, and
 //!   normal/exceptional exits.
@@ -63,6 +65,15 @@
 //!   Success/Throw/Fatal branch, and join. Guard-produced owner/storage
 //!   addresses are untraced and verifier-confined to the generated hit block;
 //!   no safepoint, block argument, or backedge may retain them.
+//! - Context words are read and written through the tagged owning value: a
+//!   heap `Value` is its header address, so no derived context address exists
+//!   and every context value is an ordinary root at safepoints. Parent and
+//!   closure-context words are immutable (pure); slots belong to the
+//!   `ContextSlot` alias class. Every context slot store is immediately
+//!   followed by its `ContextWriteBarrier` over the same owner and value,
+//!   except a store of a value produced by scalar boxing or a non-cell
+//!   constant. A committed checked context slot's generated binding guard
+//!   walks the chain itself and confines the slot address to its hit block.
 //! - Root and deopt maps are built from the same per-operand allocation table
 //!   consumed by the emitter; there is no pre-allocation location fallback.
 //! - OSR sources are immutable entry metadata aligned with ordinary late-use
@@ -397,15 +408,6 @@ pub enum MachineOsrType {
     Boolean,
 }
 
-/// One live loop-header value materialized by an OSR entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MachineOsrInput {
-    /// Interpreter frame register containing the tagged source value.
-    pub frame_register: u16,
-    /// Unboxed scalar contract expected by the loop header.
-    pub value_type: MachineOsrType,
-}
-
 /// Memory and dependency effects declared by a machine call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallEffects(u8);
@@ -490,23 +492,16 @@ pub enum MachineCallGuard {
         function_id: u32,
         /// Already-profiled ordinary `this` policy to prove before entry.
         this_mode: otter_vm::JitDirectCallThisMode,
-        /// The spliced body observes its closure's dynamic eval environment,
-        /// so the guard proves that environment absent.
-        rejects_eval_env: bool,
     },
     /// Class-wrapper unwrapping followed by exact constructor identity.
     Construct {
         /// Canonical bytecode constructor identity.
         function_id: u32,
-        /// As for [`MachineCallGuard::Plain`].
-        rejects_eval_env: bool,
     },
     /// Exact receiver/prototype/slot method program.
     Method {
         /// Complete guarded method chain.
         guard: Box<otter_vm::jit::JitMethodGuard>,
-        /// As for [`MachineCallGuard::Plain`].
-        rejects_eval_env: bool,
     },
 }
 
@@ -631,19 +626,29 @@ pub enum MachineBindingTarget {
     Cold,
     /// Realm-global object reached through the snapshot's global-this cell.
     GlobalThis,
-    /// One stable captured cell in the current native-frame spine.
-    Upvalue {
-        /// Zero-based stable cell index.
-        index: u32,
-    },
-    /// One captured cell of the closure the guard's tagged input names: an
-    /// inlined callee's own upvalue.
-    ClosureUpvalue {
-        /// Zero-based cell index in the closure's upvalue spine.
-        index: u32,
-    },
     /// VM-baked global lexical/object proof.
     Global(otter_vm::jit::BindingHitProof),
+    /// Checked context slot: the guard walks `depth` parent words from the
+    /// context input and misses to the committed sibling on the TDZ hole.
+    ContextSlot {
+        /// Parent links to follow from the context input.
+        depth: u16,
+        /// Slot index in the target context.
+        slot: u16,
+    },
+}
+
+/// One word of a context or closure read by [`MachineOpcode::ContextLoad`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextField {
+    /// A closure's context word; `undefined` when the input is not a closure
+    /// (a bare function value has no context). Immutable after creation.
+    ClosureContext,
+    /// A context's parent word. Immutable after creation.
+    Parent,
+    /// One context slot. Mutable: slot stores and every reentrant or
+    /// collecting boundary invalidate it.
+    Slot(u16),
 }
 
 /// Renumbers safepoint ids densely in instruction order.
@@ -673,20 +678,21 @@ fn binding_target_matches_semantics(
             BindingSemantics::Read(BindingRead::GlobalThis { .. }),
             MachineBindingTarget::GlobalThis,
         ) | (
-            BindingSemantics::Read(BindingRead::Upvalue { .. })
-                | BindingSemantics::Write(BindingWrite::Upvalue { .. }),
-            MachineBindingTarget::Upvalue { .. },
-        ) | (
-            BindingSemantics::Read(BindingRead::Upvalue { .. }),
-            MachineBindingTarget::ClosureUpvalue { .. },
-        ) | (
             BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Exists { .. })
                 | BindingSemantics::Write(
                     BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. },
                 ),
             MachineBindingTarget::Global(_),
+        ) | (
+            BindingSemantics::Read(BindingRead::ContextSlot { .. })
+                | BindingSemantics::Write(BindingWrite::ContextSlot { .. }),
+            MachineBindingTarget::ContextSlot { .. },
         ) | (_, MachineBindingTarget::Cold)
     )
+}
+
+fn context_access_clobbers(target: &TargetSpec) -> Vec<PhysicalRegister> {
+    target.clobbers(TargetClobberSet::ContextAccess).to_vec()
 }
 
 fn binding_guard_clobbers(target: &TargetSpec) -> Vec<PhysicalRegister> {
@@ -828,6 +834,28 @@ pub enum MachineOpcode {
     EntryValue(u16),
     /// Materialize the current frame's tagged `this` binding.
     EntryThis,
+    /// Materialize the running closure (the native frame's SELF word).
+    EntryCallee,
+    /// Read one immutable or slot word of a context or closure. The tagged
+    /// input is the owning heap value itself: a heap `Value` is its header
+    /// address, so the read is one load at a layout offset and no derived
+    /// address outlives the instruction.
+    ContextLoad {
+        /// Which word to read.
+        field: ContextField,
+    },
+    /// Write one context slot without a check. The explicit
+    /// [`MachineOpcode::ContextWriteBarrier`] that follows owns the barrier.
+    ContextStore {
+        /// Slot index in the context.
+        slot: u16,
+    },
+    /// Post-store generational/incremental barrier for a context slot store.
+    /// The owner is the tagged context value, never a raw address.
+    ContextWriteBarrier,
+    /// Boolean proof that a tagged value is not the TDZ hole. A following
+    /// [`MachineOpcode::GuardCondition`] exits before the checked access.
+    TaggedIsNotHole,
     /// Prove one callable identity without resolving its `this` binding.
     GuardCallTarget {
         /// Immutable identity proof selected from source-owned feedback.
@@ -1303,13 +1331,29 @@ pub enum MachineOpcode {
     },
     /// Target ABI call through a call descriptor.
     Call(u32),
-    /// Interpreter-to-native loop-header entry marker. Its late-use operands
-    /// name the exact allocator locations populated by the cold trampoline.
-    OsrEntry {
-        /// Canonical instruction index of the loop header.
+    /// Entry dispatch of a function with OSR-capable loop headers: the sole
+    /// instruction of the entry block. Successor 0 is the ordinary function
+    /// entry; successor `i + 1` is the OSR block of the loop header at
+    /// `logical_pcs[i]`. An OSR entry enters the function's start with the
+    /// native frame's `OSR_ENTRY` bit set and the header's PC in the frame, as
+    /// V8's OSR code and SpiderMonkey's OSR entry block receive the baseline
+    /// frame; the OSR block then defines every header value from the frame.
+    OsrDispatch {
+        /// Canonical instruction indices of the OSR-capable loop headers.
+        logical_pcs: Vec<u32>,
+    },
+    /// Read one interpreter frame register at an OSR entry as the header
+    /// parameter's representation (`MachineOsrType`). A value outside that
+    /// representation leaves before any effect: the frame is still the
+    /// interpreter's, so the side exit resumes the header with nothing to
+    /// rebuild and asks for recompilation.
+    OsrValue {
+        /// Canonical instruction index of the loop header being entered.
         logical_pc: u32,
-        /// Interpreter sources aligned one-for-one with instruction operands.
-        inputs: Vec<MachineOsrInput>,
+        /// Interpreter frame register holding the tagged value.
+        frame_register: u16,
+        /// Representation the header parameter carries.
+        value_type: MachineOsrType,
     },
     /// Loop backedge poll with an exact interpreter reconstruction state.
     BackedgePoll,
@@ -2512,6 +2556,101 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
+                    MachineOpcode::EntryCallee
+                    | MachineOpcode::ContextLoad { .. }
+                    | MachineOpcode::TaggedIsNotHole => {
+                        let (inputs, output) = match instruction.operands.as_slice() {
+                            [output] => (&[][..], output),
+                            [input, output] => (std::slice::from_ref(input), output),
+                            _ => return Err(VerificationError::OpcodeSignatureMismatch(id)),
+                        };
+                        let expected_inputs =
+                            usize::from(instruction.opcode != MachineOpcode::EntryCallee);
+                        let output_representation =
+                            if instruction.opcode == MachineOpcode::TaggedIsNotHole {
+                                MachineRepresentation::Boolean
+                            } else {
+                                MachineRepresentation::Tagged
+                            };
+                        if inputs.len() != expected_inputs
+                            || inputs.iter().any(|input| {
+                                *input != MachineOperand::register_input(input.value)
+                                    || self.representations[input.value.0 as usize]
+                                        != MachineRepresentation::Tagged
+                            })
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != output_representation
+                            || instruction.clobbers != context_access_clobbers(target_spec)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                            || instruction.frame_state.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::ContextStore { .. } => {
+                        let [context, value] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        // The barrier immediately follows the store over the
+                        // same pair. Only a value produced by scalar boxing or
+                        // a non-cell constant is statically barrier-free; the
+                        // owner's age never elides it (tenured contexts exist).
+                        let barrier = instruction_index + 1 < block.end.0
+                            && self.instructions[instruction_index as usize + 1].opcode
+                                == MachineOpcode::ContextWriteBarrier
+                            && self.instructions[instruction_index as usize + 1]
+                                .operands
+                                .iter()
+                                .map(|operand| operand.value)
+                                .eq([context.value, value.value]);
+                        let non_cell = values.producers(value.value).iter().all(|&producer| {
+                            match self.instructions[producer as usize].opcode {
+                                MachineOpcode::BoxInt32
+                                | MachineOpcode::BoxUint32
+                                | MachineOpcode::BoxNumber
+                                | MachineOpcode::BoxBoolean => true,
+                                MachineOpcode::TaggedConstant(bits) => {
+                                    !otter_vm::value::tag::is_cell_bits(bits)
+                                }
+                                _ => false,
+                            }
+                        }) && !values.producers(value.value).is_empty();
+                        if [context, value].iter().any(|operand| {
+                            **operand != MachineOperand::register_input(operand.value)
+                                || self.representations[operand.value.0 as usize]
+                                    != MachineRepresentation::Tagged
+                        }) || !(barrier || non_cell)
+                            || instruction.clobbers != context_access_clobbers(target_spec)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                            || instruction.frame_state.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::ContextWriteBarrier => {
+                        let [owner, value] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let follows_store = instruction_index > block.first.0
+                            && matches!(
+                                self.instructions[instruction_index as usize - 1].opcode,
+                                MachineOpcode::ContextStore { .. }
+                            );
+                        if [owner, value].iter().any(|operand| {
+                            **operand != MachineOperand::location_input(operand.value)
+                                || self.representations[operand.value.0 as usize]
+                                    != MachineRepresentation::Tagged
+                        }) || !follows_store
+                            || instruction.clobbers != binding_write_barrier_clobbers(target_spec)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
                     MachineOpcode::PropertySource { .. } => {
                         let [output] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -3087,11 +3226,7 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
                         let expected_inputs =
-                            semantics.value_operands().into_iter().flatten().count()
-                                + usize::from(matches!(
-                                    target,
-                                    MachineBindingTarget::ClosureUpvalue { .. }
-                                ));
+                            semantics.value_operands().into_iter().flatten().count();
                         let valid_outputs = outputs
                             .iter()
                             .zip([
@@ -3178,8 +3313,7 @@ impl InstructionSequence {
                             ) => *writable,
                             MachineBindingTarget::Cold
                             | MachineBindingTarget::GlobalThis
-                            | MachineBindingTarget::Upvalue { .. }
-                            | MachineBindingTarget::ClosureUpvalue { .. } => true,
+                            | MachineBindingTarget::ContextSlot { .. } => true,
                         };
                         if !valid_outputs
                             || !valid_inputs
@@ -3315,6 +3449,40 @@ impl InstructionSequence {
                             || instruction.safepoint.is_some() =>
                     {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                    MachineOpcode::OsrDispatch { logical_pcs }
+                        if !instruction.operands.is_empty()
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                            || instruction.frame_state.is_some()
+                            || instruction.control != ControlFlow::Branch
+                            || logical_pcs.is_empty()
+                            || block_id != self.entry
+                            || block.first != id
+                            || block.successors.len() != logical_pcs.len() + 1 =>
+                    {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                    MachineOpcode::OsrValue { value_type, .. } => {
+                        let [output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        let expected = match value_type {
+                            MachineOsrType::Tagged => MachineRepresentation::Tagged,
+                            MachineOsrType::Int32 => MachineRepresentation::Int32,
+                            MachineOsrType::Uint32 => MachineRepresentation::Uint32,
+                            MachineOsrType::Float64 => MachineRepresentation::Float64,
+                            MachineOsrType::Boolean => MachineRepresentation::Boolean,
+                        };
+                        if *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize] != expected
+                            || !instruction.clobbers.is_empty()
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
                     }
                     MachineOpcode::LoopPreheader
                         if !instruction.operands.is_empty()

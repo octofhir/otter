@@ -95,8 +95,8 @@ pub(crate) fn compile_method_call(
     let call_mark = cx.scratch;
     let callee = peel_paren_eval(unwrap_ts_expr(&call.callee));
     // `super(args...)` — direct super-constructor call. Only valid
-    // inside a derived-class constructor; the upvalue lookup will
-    // surface a clear diagnostic when used elsewhere.
+    // inside a derived-class constructor; resolving the class-scope
+    // parent slot surfaces a clear diagnostic when used elsewhere.
     if let Expression::Super(_) = callee {
         return compile_super_call(cx, &call.arguments, span);
     }
@@ -168,11 +168,8 @@ pub(crate) fn compile_method_call(
     // binding, `with` object, or live sloppy direct-eval scope wins over
     // the global error class.
     if let Expression::Identifier(id) = callee
-        && cx.lookup_binding(id.name.as_str()).is_none()
-        && cx.captured_binding_owner(id.name.as_str()).is_none()
-        && !cx.any_enclosing_leaking_direct_eval()
-        && cx.active_with_envs.is_empty()
         && find_module_import_binding(cx, id.name.as_str()).is_none()
+        && cx.resolves_to_plain_global(id.name.as_str())
         && is_builtin_error_class_name(id.name.as_str())
         && builtin_error_construct_fast_path_applies(id.name.as_str(), &call.arguments)
     {
@@ -575,17 +572,7 @@ pub(crate) fn compile_method_call(
             );
             let dst = cx.alloc_scratch();
             let flags = compute_eval_flags(cx);
-            let site = crate::functions::record_eval_site(cx);
-            cx.emit(
-                Op::Eval,
-                [
-                    Operand::Register(dst),
-                    Operand::Register(src_reg),
-                    Operand::Imm32(flags),
-                    Operand::Imm32(site as i32),
-                ],
-                span,
-            );
+            emit_direct_eval(cx, dst, src_reg, flags, span);
             return Ok(dst);
         }
         if !has_spread {
@@ -839,11 +826,28 @@ pub(crate) fn emit_tail_free_call(
     Ok(dst)
 }
 
+/// Emit `Op::Eval` over the innermost context at the call site: the eval
+/// body resolves names through that context chain.
+fn emit_direct_eval(cx: &mut Compiler, dst: u16, src_reg: u16, flags: i32, span: (u32, u32)) {
+    let ctx = cx.innermost_ctx();
+    cx.emit_ctx(
+        Op::Eval,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(src_reg),
+            Operand::Register(0),
+            Operand::Imm32(flags),
+        ],
+        2,
+        ctx,
+        span,
+    );
+}
+
 /// §19.2.1.1 eval-body flag bits shared by the direct-eval lowerings.
 /// Bit 0 forbid var-`arguments`; 1 parameter-initializer window; 2
 /// `new.target` legal; 3 field-initializer (new.target undefined); 4
-/// `super.x` legal (HomeObject in scope). `&mut` because resolving the
-/// super-home capture installs the cell the eval body reads.
+/// `super.x` legal (HomeObject in scope); 5 `super()` legal.
 pub(crate) fn compute_eval_flags(cx: &mut Compiler) -> i32 {
     let forbid_var_arguments = cx.in_param_init && cx.binds_arguments;
     let new_target_allowed = cx.eval_new_target_allowed
@@ -852,8 +856,8 @@ pub(crate) fn compute_eval_flags(cx: &mut Compiler) -> i32 {
     // §19.2.1.1 — `super.x` in eval is legal only when the innermost
     // non-arrow enclosing function carries a [[HomeObject]] (method,
     // class constructor, static block). A plain function nested in a
-    // method is opaque even though the capture chain could still reach
-    // the home cell.
+    // method is opaque even though its context chain could still reach
+    // the home slot.
     let home_frame = cx
         .stack
         .iter()
@@ -862,10 +866,9 @@ pub(crate) fn compute_eval_flags(cx: &mut Compiler) -> i32 {
         .is_some_and(|frame| frame.has_home_object);
     let super_allowed = cx.in_field_initializer
         || (home_frame
-            && (cx.lookup_binding(crate::class::SUPER_HOME_NAME).is_some()
-                || cx.resolve_capture(crate::class::SUPER_HOME_NAME).is_some()
+            && (cx.resolve_name(crate::class::SUPER_HOME_NAME).is_some()
                 || cx
-                    .resolve_capture(crate::class::SUPER_STATIC_HOME_NAME)
+                    .resolve_name(crate::class::SUPER_STATIC_HOME_NAME)
                     .is_some()));
     // §19.2.1.1 — `super()` in eval is legal only when the innermost
     // non-arrow enclosing function is a derived class constructor —
@@ -879,10 +882,8 @@ pub(crate) fn compute_eval_flags(cx: &mut Compiler) -> i32 {
             .rev()
             .find(|frame| !frame.is_arrow)
             .is_some_and(|frame| frame.is_derived_ctor)
-        && (cx.lookup_binding(crate::class::SUPER_CTOR_NAME).is_some()
-            || cx.resolve_capture(crate::class::SUPER_CTOR_NAME).is_some()
-            || cx.lookup_binding(crate::class::CLASS_SELF_NAME).is_some()
-            || cx.resolve_capture(crate::class::CLASS_SELF_NAME).is_some());
+        && (cx.resolve_name(crate::class::SUPER_CTOR_NAME).is_some()
+            || cx.resolve_name(crate::class::CLASS_SELF_NAME).is_some());
     i32::from(forbid_var_arguments)
         | (i32::from(cx.in_param_init) << 1)
         | (i32::from(new_target_allowed) << 2)
@@ -954,17 +955,7 @@ pub(crate) fn emit_guarded_eval(
     );
     let to_ordinary = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_eval), span);
     // Direct-eval branch.
-    let site = crate::functions::record_eval_site(cx);
-    cx.emit(
-        Op::Eval,
-        [
-            Operand::Register(dst),
-            Operand::Register(src_reg),
-            Operand::Imm32(flags),
-            Operand::Imm32(site as i32),
-        ],
-        span,
-    );
+    emit_direct_eval(cx, dst, src_reg, flags, span);
     let to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
     // Ordinary-call branch — `eval` was shadowed at runtime.
     cx.patch_branch_to_here(to_ordinary);
@@ -1098,6 +1089,9 @@ fn try_compile_forwarded_apply(
     );
     let this_reg = compile_expr(cx, this_argument, span)?;
     let dst = cx.alloc_scratch();
+    // The mapped formals' context register; any register when none is
+    // context-held.
+    let mapped_ctx = cx.top_mut().mapped_arguments_ctx.unwrap_or(dst);
     cx.emit(
         Op::CallForwardArguments,
         vec![
@@ -1105,6 +1099,7 @@ fn try_compile_forwarded_apply(
             Operand::Register(method_reg),
             Operand::Register(receiver_reg),
             Operand::Register(this_reg),
+            Operand::Register(mapped_ctx),
         ],
         span,
     );

@@ -14,7 +14,7 @@
 //! # See also
 //! - `crate::template::plan`, the machine-code consumer of these rules.
 
-use otter_bytecode::{Op, Operand, opcode_schema::opcode_schema};
+use otter_bytecode::{ContextCoord, Op, Operand, opcode_schema::opcode_schema};
 use otter_vm::{
     JitCompileSnapshot,
     native_abi::{NO_FRAME_STATE, SafepointId, SafepointRecord},
@@ -179,25 +179,57 @@ pub(crate) struct IncrementOperands {
     pub(crate) delta: i32,
 }
 
-/// Typed direct-eval operands including compiler-emitted context flags.
+/// Typed direct-eval operands: the source, the innermost caller context
+/// register, and the compiler-emitted flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EvalOperands {
     pub(crate) dst: u16,
     pub(crate) src: u16,
+    pub(crate) context: u16,
     pub(crate) flags: i32,
-    pub(crate) site: i32,
+}
+
+/// Typed unchecked context-slot access. `value` is the loaded destination or
+/// the stored source according to the opcode; `context` holds the context the
+/// packed coordinate's hop count starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextSlotOperands {
+    pub(crate) value: u16,
+    pub(crate) context: u16,
+    pub(crate) coord: ContextCoord,
+}
+
+/// Typed `CreateContext dst, parent, scope` operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreateContextOperands {
+    pub(crate) dst: u16,
+    pub(crate) parent: u16,
+    pub(crate) scope: u32,
+}
+
+/// Typed `ReturnDerived value, ctx, coord` operands: the completion value and
+/// the constructor's `DerivedThis` context slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReturnDerivedOperands {
+    pub(crate) value: u16,
+    pub(crate) context: u16,
+    pub(crate) depth: u16,
+    pub(crate) slot: u16,
 }
 
 /// Schema-derived boxed-value inputs and normal result of one binding access.
 ///
-/// Immutable names, upvalue indices, strictness flags, and module identities
-/// stay in the published instruction. Generated code passes only these boxed
+/// Immutable names, context coordinates, strictness flags, and module
+/// identities stay in the published instruction. Generated code passes only these boxed
 /// values to the committed binding boundary; the VM decodes the exact site
 /// from the native frame's function/PC identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BindingValueOperands {
     pub(crate) result: Option<u16>,
     pub(crate) values: [Option<u16>; 2],
+    /// Static slot coordinate of a checked context-slot access, the only
+    /// binding family whose hit path generated code can complete inline.
+    pub(crate) context_coord: Option<ContextCoord>,
 }
 
 /// Boxed-value input of one global declaration/initialization operation.
@@ -251,12 +283,13 @@ pub(crate) struct NewArrayOperands {
     pub(crate) elements: OperandRange,
 }
 
-/// Typed closure-construction operands backed by the plan's index side buffer.
+/// Typed `MakeClosure dst, fn, ctx` operands: the closure closes over the
+/// context held in register `context`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MakeClosureOperands {
     pub(crate) dst: u16,
     pub(crate) function: u32,
-    pub(crate) parents: OperandRange,
+    pub(crate) context: u16,
 }
 
 /// Typed plain-call prefix plus plan-owned argument-register range.
@@ -390,6 +423,9 @@ enum LoweredOperands {
     ElementStore(ElementStoreOperands),
     Increment(IncrementOperands),
     Eval(EvalOperands),
+    ContextSlot(ContextSlotOperands),
+    CreateContext(CreateContextOperands),
+    ReturnDerived(ReturnDerivedOperands),
     BindingValue(BindingValueOperands),
     GlobalDeclaration(GlobalDeclarationOperands),
     ImportBinding(ImportBindingOperands),
@@ -512,6 +548,27 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Eval(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered Eval operands")),
+        }
+    }
+
+    pub(crate) fn context_slot_operands(self) -> Result<ContextSlotOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ContextSlot(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered context-slot operands")),
+        }
+    }
+
+    pub(crate) fn create_context_operands(self) -> Result<CreateContextOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::CreateContext(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered CreateContext operands")),
+        }
+    }
+
+    pub(crate) fn return_derived_operands(self) -> Result<ReturnDerivedOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ReturnDerived(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered ReturnDerived operands")),
         }
     }
 
@@ -683,7 +740,6 @@ impl LoweredInstr {
 pub(crate) struct BaselinePlan {
     pub(crate) instructions: Vec<LoweredInstr>,
     register_operands: Box<[u16]>,
-    index_operands: Box<[u32]>,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
@@ -692,6 +748,9 @@ pub(crate) struct BaselinePlan {
     /// `ArrayConstruct` path. The byte PC is the stable join key consumed by
     /// both template planning and artifact capture.
     pub(crate) array_construct_alloc_safepoints: BTreeMap<u32, SafepointId>,
+    /// Allocating safepoints owned by `CreateContext` / `CopyContext`, keyed
+    /// by byte PC like [`Self::array_construct_alloc_safepoints`].
+    pub(crate) context_alloc_safepoints: BTreeMap<u32, SafepointId>,
 }
 
 impl BaselinePlan {
@@ -702,7 +761,6 @@ impl BaselinePlan {
         let mut load_property_count = 0;
         let mut store_property_count = 0;
         let mut register_operands = Vec::new();
-        let mut index_operands = Vec::new();
         for instr in &view.instructions {
             let op = instr.op(code_block);
             let pc = instr.instruction_pc(code_block);
@@ -737,6 +795,26 @@ impl BaselinePlan {
                                 .map(|position| reg(operands, usize::from(position)))
                                 .transpose()?,
                         ],
+                        context_coord: match binding {
+                            otter_bytecode::opcode_schema::BindingSemantics::Read(
+                                otter_bytecode::opcode_schema::BindingRead::ContextSlot {
+                                    coord,
+                                    ..
+                                },
+                            )
+                            | otter_bytecode::opcode_schema::BindingSemantics::Write(
+                                otter_bytecode::opcode_schema::BindingWrite::ContextSlot {
+                                    coord,
+                                    ..
+                                },
+                            ) => Some(
+                                ContextCoord::from_imm32(imm32(operands, usize::from(coord))?)
+                                    .ok_or(Unsupported::OperandShape(
+                                        "binding context coordinate",
+                                    ))?,
+                            ),
+                            _ => None,
+                        },
                     }),
                 });
                 continue;
@@ -781,13 +859,10 @@ impl BaselinePlan {
                         value: imm32(operands, 0)?,
                     })
                 }
-                Op::MakeFunction | Op::MakeClosure if instr.make_self => {
-                    LoweredOperands::Destination(DestinationOperands {
-                        dst: reg(operands, 0)?,
-                    })
-                }
                 Op::NewObject
                 | Op::LoadThis
+                | Op::LoadClosureContext
+                | Op::LoadSelf
                 | Op::LoadNewTarget
                 | Op::CollectRest
                 | Op::CollectArguments
@@ -894,9 +969,37 @@ impl BaselinePlan {
                 Op::Eval => LoweredOperands::Eval(EvalOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
-                    flags: imm32(operands, 2)?,
-                    site: imm32(operands, 3)?,
+                    context: reg(operands, 2)?,
+                    flags: imm32(operands, 3)?,
                 }),
+                Op::LoadContextSlot | Op::StoreContextSlot => {
+                    LoweredOperands::ContextSlot(ContextSlotOperands {
+                        value: reg(operands, 0)?,
+                        context: reg(operands, 1)?,
+                        coord: ContextCoord::from_imm32(imm32(operands, 2)?)
+                            .ok_or(Unsupported::OperandShape("context-slot coordinate"))?,
+                    })
+                }
+                Op::CreateContext => LoweredOperands::CreateContext(CreateContextOperands {
+                    dst: reg(operands, 0)?,
+                    parent: reg(operands, 1)?,
+                    scope: u32::try_from(imm32(operands, 2)?)
+                        .map_err(|_| Unsupported::OperandShape("CreateContext scope index"))?,
+                }),
+                Op::CopyContext => LoweredOperands::Unary(UnaryOperands {
+                    dst: reg(operands, 0)?,
+                    src: reg(operands, 1)?,
+                }),
+                Op::ReturnDerived => {
+                    let coord = ContextCoord::from_imm32(imm32(operands, 2)?)
+                        .ok_or(Unsupported::OperandShape("derived-this coordinate"))?;
+                    LoweredOperands::ReturnDerived(ReturnDerivedOperands {
+                        value: reg(operands, 0)?,
+                        context: reg(operands, 1)?,
+                        depth: coord.depth,
+                        slot: coord.slot,
+                    })
+                }
                 Op::LoadElement => LoweredOperands::ElementLoad(ElementLoadOperands {
                     dst: reg(operands, 0)?,
                     receiver: reg(operands, 1)?,
@@ -1031,24 +1134,10 @@ impl BaselinePlan {
                         arguments: elements,
                     })
                 }
-                Op::MakeClosure => {
-                    let count = const_index(operands, 2)? as usize;
-                    let parents = append_index_tail(
-                        &mut index_operands,
-                        operands,
-                        operands.len(),
-                        3,
-                        count,
-                        "MakeClosure upvalue tail",
-                    )?;
-                    LoweredOperands::MakeClosure(MakeClosureOperands {
-                        dst: reg(operands, 0)?,
-                        function: const_index(operands, 1)?,
-                        parents,
-                    })
-                }
-                Op::FreshUpvalue => LoweredOperands::Immediate(ImmediateOperands {
-                    value: imm32(operands, 0)?,
+                Op::MakeClosure => LoweredOperands::MakeClosure(MakeClosureOperands {
+                    dst: reg(operands, 0)?,
+                    function: const_index(operands, 1)?,
+                    context: reg(operands, 2)?,
                 }),
                 Op::DefineDataProperty | Op::DefineOwnProperty => {
                     let (first, second, third) = reg3(operands)?;
@@ -1205,9 +1294,11 @@ impl BaselinePlan {
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
         let mut array_construct_alloc_safepoints = BTreeMap::new();
+        let mut context_alloc_safepoints = BTreeMap::new();
         for lowered in &instructions {
             let allocating_site = match lowered.op {
                 Op::Add | Op::AddImm => Some(&mut add_alloc_safepoints),
+                Op::CreateContext | Op::CopyContext => Some(&mut context_alloc_safepoints),
                 Op::ArrayConstruct => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = self::slice_range(&register_operands, operands.elements)?;
@@ -1230,21 +1321,17 @@ impl BaselinePlan {
         Ok(Self {
             instructions,
             register_operands: register_operands.into_boxed_slice(),
-            index_operands: index_operands.into_boxed_slice(),
             load_property_count,
             store_property_count,
             safepoint_records,
             add_alloc_safepoints,
             array_construct_alloc_safepoints,
+            context_alloc_safepoints,
         })
     }
 
     pub(crate) fn register_tail(&self, range: OperandRange) -> Result<&[u16], Unsupported> {
         slice_range(&self.register_operands, range)
-    }
-
-    pub(crate) fn index_tail(&self, range: OperandRange) -> Result<&[u32], Unsupported> {
-        slice_range(&self.index_operands, range)
     }
 }
 
@@ -1338,30 +1425,6 @@ fn append_register_tail(
     }
     let len =
         u32::try_from(count).map_err(|_| Unsupported::OperandShape("lowered register tail"))?;
-    Ok(OperandRange { start, len })
-}
-
-fn append_index_tail(
-    storage: &mut Vec<u32>,
-    operands: impl WordOperands,
-    operand_len: usize,
-    tail_start: usize,
-    count: usize,
-    shape: &'static str,
-) -> Result<OperandRange, Unsupported> {
-    if operand_len != tail_start.saturating_add(count) {
-        return Err(Unsupported::OperandShape(shape));
-    }
-    let start = u32::try_from(storage.len())
-        .map_err(|_| Unsupported::OperandShape("lowered index side buffer"))?;
-    for slot in 0..count {
-        let index = imm32(operands, tail_start + slot)?;
-        storage.push(
-            u32::try_from(index)
-                .map_err(|_| Unsupported::OperandShape("MakeClosure parent upvalue"))?,
-        );
-    }
-    let len = u32::try_from(count).map_err(|_| Unsupported::OperandShape("lowered index tail"))?;
     Ok(OperandRange { start, len })
 }
 

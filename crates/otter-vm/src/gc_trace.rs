@@ -105,14 +105,9 @@ pub trait GcTrace {
 // matching migration task replaces their storage.
 // ---------------------------------------------------------------------------
 
-// Task-76 note: `UpvalueCell` is now `otter_gc::Gc<UpvalueCellBody>`,
-// a foreign type — its outgoing references are walked by the GC's
-// own [`otter_gc::Traceable`] dispatch on `UpvalueCellBody`, not
-// by `GcTrace`. Closure spines that hold `UpvalueCell` slots are
-// reached through [`crate::Value::trace_value_slots`] inside
-// [`Frame`]'s register walk (still a stub today; lands fully when
-// the interpreter starts triggering GC from inside its alloc
-// paths).
+// `UpvalueCell` (global-lexical cells) and context bodies are foreign
+// `otter_gc::Gc` types: their outgoing references are walked by the GC's own
+// [`otter_gc::Traceable`] dispatch, not by `GcTrace`.
 
 impl GcTrace for JsObject {
     /// Emit the storage address of `*self` as a slot pointer.

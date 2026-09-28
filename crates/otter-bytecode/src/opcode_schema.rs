@@ -7,6 +7,11 @@
 //! - [`opcode_schema`] provides an exhaustive `Op` lookup.
 //! - [`encode_operand_word`], [`decode_operand_word`], and
 //!   [`operand_kind_at`] define schema-typed CodeBlock word operands.
+//! - [`ImmediateDomain`] types the packed immediates of the context and
+//!   lookup families: [`ContextCoord`], [`LookupRefTarget`],
+//!   [`LookupGlobalMode`], [`StoreRefMode`], and [`BindingStoreFallback`].
+//! - [`BindingSemantics`] is the single semantic authority for binding
+//!   accesses that may throw or consult eval extensions.
 //!
 //! # Invariants
 //! - One macro invocation owns opcode identity and byte assignment; generated
@@ -14,12 +19,20 @@
 //! - The serialized compiler/debug format remains self-describing while active
 //!   CodeBlocks store untagged operand words whose kinds come only from this
 //!   schema. Fixed and variadic families have exact operand/register roles.
-//! - Conservative effects never claim a leaf opcode may allocate, throw,
-//!   trigger GC, re-enter JavaScript, or require a safepoint.
+//! - Every packed immediate has exactly one encoder and one decoder, here;
+//!   the verifier admits an operand only when its domain decodes it.
+//! - Effects are exact for register/frame leaves and for the context-slot
+//!   family, and conservative (everything possible) for every other opcode.
+//!   A leaf never claims to allocate, trigger GC, re-enter JavaScript, or
+//!   require a safepoint.
+//! - Only checked, lookup, and global binding accesses carry
+//!   [`BindingSemantics`]. Unchecked context-slot loads and stores are plain
+//!   memory operations with no binding row and no exception edge.
 //!
 //! # See also
 //! - [`crate::encoding`] for the unchanged executable byte format.
 //! - [`crate::opcode_audit`] for the machine-readable schema projection.
+//! - [`crate::ScopeDescriptor`] for the scopes a [`ContextCoord`] addresses.
 
 use serde::Serialize;
 
@@ -89,6 +102,47 @@ pub enum RegisterSource {
     Imm32RegisterIndex,
 }
 
+/// Typed meaning of one `Imm32` operand of the context and lookup families.
+///
+/// The verifier admits the operand only when its domain decodes it; the
+/// disassembler renders it through the same decoder.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImmediateDomain {
+    /// Index into the executing function's [`crate::Function::scopes`].
+    ScopeIndex,
+    /// A packed [`ContextCoord`] naming one slot.
+    ContextCoord,
+    /// A context-chain hop count in `0..=u16::MAX`.
+    ContextDepth,
+    /// A packed [`LookupRefTarget`].
+    LookupRefTarget,
+    /// A packed [`LookupGlobalMode`].
+    LookupGlobalMode,
+    /// A [`BindingStoreFallback`].
+    StoreFallback,
+    /// A packed [`StoreRefMode`].
+    StoreRefMode,
+}
+
+impl ImmediateDomain {
+    /// Whether `value` decodes in this domain. [`Self::ScopeIndex`] admits
+    /// every non-negative value here; its upper bound is the owning
+    /// function's scope table, which only the verifier sees.
+    #[must_use]
+    pub const fn admits(self, value: i32) -> bool {
+        match self {
+            Self::ScopeIndex => value >= 0,
+            Self::ContextCoord => ContextCoord::from_imm32(value).is_some(),
+            Self::ContextDepth => value >= 0 && value <= u16::MAX as i32,
+            Self::LookupRefTarget => true,
+            Self::LookupGlobalMode => LookupGlobalMode::from_imm32(value).is_some(),
+            Self::StoreFallback => BindingStoreFallback::from_imm32(value).is_some(),
+            Self::StoreRefMode => StoreRefMode::from_imm32(value).is_some(),
+        }
+    }
+}
+
 /// One fixed operand position in an authoritative instruction shape.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct OperandSpec {
@@ -98,6 +152,8 @@ pub struct OperandSpec {
     pub register_access: RegisterAccess,
     /// Register-number representation when this operand has a data-flow role.
     pub register_source: Option<RegisterSource>,
+    /// Typed domain of a packed `Imm32` operand, when the schema owns one.
+    pub imm_domain: Option<ImmediateDomain>,
 }
 
 impl OperandSpec {
@@ -106,6 +162,16 @@ impl OperandSpec {
             kind,
             register_access: RegisterAccess::None,
             register_source: None,
+            imm_domain: None,
+        }
+    }
+
+    const fn immediate(domain: ImmediateDomain) -> Self {
+        Self {
+            kind: OperandKind::Imm32,
+            register_access: RegisterAccess::None,
+            register_source: None,
+            imm_domain: Some(domain),
         }
     }
 
@@ -114,6 +180,7 @@ impl OperandSpec {
             kind: OperandKind::Register,
             register_access: access,
             register_source: Some(RegisterSource::RegisterOperand),
+            imm_domain: None,
         }
     }
 
@@ -122,6 +189,7 @@ impl OperandSpec {
             kind: OperandKind::Imm32,
             register_access: access,
             register_source: Some(RegisterSource::Imm32RegisterIndex),
+            imm_domain: None,
         }
     }
 }
@@ -381,7 +449,238 @@ pub enum BindingMissing {
     Undefined,
 }
 
+/// Packed context-chain coordinate: `depth << 16 | slot`.
+///
+/// `depth` counts parent links from the context a register names; `slot`
+/// indexes the target context's slots in its scope descriptor. Slot
+/// [`Self::RESERVED_SLOT`] marks the global forms of [`LookupRefTarget`] and
+/// [`StoreRefMode`], so one context holds at most `MAX_SLOT + 1` slots and a
+/// larger scope is a compile error.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+pub struct ContextCoord {
+    /// Parent links to follow from the named context.
+    pub depth: u16,
+    /// Slot index in the target context.
+    pub slot: u16,
+}
+
+impl ContextCoord {
+    /// Slot value that never names a slot.
+    pub const RESERVED_SLOT: u16 = u16::MAX;
+    /// Largest addressable slot index.
+    pub const MAX_SLOT: u16 = u16::MAX - 1;
+
+    /// A coordinate, or `None` for the reserved slot.
+    #[must_use]
+    pub const fn new(depth: u16, slot: u16) -> Option<Self> {
+        if slot == Self::RESERVED_SLOT {
+            return None;
+        }
+        Some(Self { depth, slot })
+    }
+
+    /// Encode as `depth << 16 | slot`.
+    #[must_use]
+    pub const fn to_imm32(self) -> i32 {
+        debug_assert!(self.slot != Self::RESERVED_SLOT);
+        (((self.depth as u32) << 16) | self.slot as u32) as i32
+    }
+
+    /// Decode a packed coordinate; the reserved slot is not a coordinate.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        let bits = value as u32;
+        Self::new((bits >> 16) as u16, bits as u16)
+    }
+}
+
+/// Target of a [`crate::Op::ResolveLookupRef`]: where the reference
+/// resolves when no eval extension holds the name.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum LookupRefTarget {
+    /// A context-slot binding; extensions at hops `[0, depth)` are probed
+    /// first.
+    Slot(ContextCoord),
+    /// No static binding; extensions at hops `[0, depth)` are probed, then
+    /// the global Environment Record.
+    Global {
+        /// Hop count bounding the extension probe.
+        depth: u16,
+    },
+}
+
+impl LookupRefTarget {
+    /// Hop count bounding the extension probe.
+    #[must_use]
+    pub const fn depth(self) -> u16 {
+        match self {
+            Self::Slot(coord) => coord.depth,
+            Self::Global { depth } => depth,
+        }
+    }
+
+    /// Encode as a [`ContextCoord`] word; the global form carries
+    /// [`ContextCoord::RESERVED_SLOT`] in the slot half.
+    #[must_use]
+    pub const fn to_imm32(self) -> i32 {
+        match self {
+            Self::Slot(coord) => coord.to_imm32(),
+            Self::Global { depth } => {
+                (((depth as u32) << 16) | ContextCoord::RESERVED_SLOT as u32) as i32
+            }
+        }
+    }
+
+    /// Decode; every 32-bit word is a target.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Self {
+        match ContextCoord::from_imm32(value) {
+            Some(coord) => Self::Slot(coord),
+            None => Self::Global {
+                depth: ((value as u32) >> 16) as u16,
+            },
+        }
+    }
+}
+
+/// Store behavior when a lookup store lands on a context slot rather than an
+/// eval-extension entry.
+///
+/// A context slot holds only the moving value, not its binding's
+/// mutability, so the store site carries it (§9.1.1.1.5 SetMutableBinding).
+/// An extension entry is always mutable and always written.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[repr(i32)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingStoreFallback {
+    /// Assignment to a mutable binding: a TDZ hole raises `ReferenceError`,
+    /// otherwise the slot is written.
+    Mutable = 0,
+    /// Assignment to an immutable binding raises `TypeError`.
+    ImmutableThrow = 1,
+    /// Assignment to a sloppy function self-name is silently dropped.
+    ImmutableIgnore = 2,
+}
+
+impl BindingStoreFallback {
+    /// Decode the complete schema-owned immediate alphabet.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Mutable),
+            1 => Some(Self::ImmutableThrow),
+            2 => Some(Self::ImmutableIgnore),
+            _ => None,
+        }
+    }
+
+    /// Encode as the schema-owned immediate.
+    #[must_use]
+    pub const fn to_imm32(self) -> i32 {
+        self as i32
+    }
+}
+
+/// Packed immediate of [`crate::Op::StoreLookupGlobal`]:
+/// `depth | strict << 31`, bits 16–30 zero.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+pub struct LookupGlobalMode {
+    /// Hop count bounding the extension probe.
+    pub depth: u16,
+    /// Strictness of the global `SetMutableBinding` fallback.
+    pub strict: bool,
+}
+
+impl LookupGlobalMode {
+    const STRICT_BIT: u32 = 1 << 31;
+    const DEPTH_BITS: u32 = u16::MAX as u32;
+
+    /// Encode as `depth | strict << 31`.
+    #[must_use]
+    pub const fn to_imm32(self) -> i32 {
+        let strict = if self.strict { Self::STRICT_BIT } else { 0 };
+        (self.depth as u32 | strict) as i32
+    }
+
+    /// Decode, rejecting any set reserved bit.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        let bits = value as u32;
+        if bits & !(Self::DEPTH_BITS | Self::STRICT_BIT) != 0 {
+            return None;
+        }
+        Some(Self {
+            depth: (bits & Self::DEPTH_BITS) as u16,
+            strict: bits & Self::STRICT_BIT != 0,
+        })
+    }
+}
+
+/// Packed immediate of [`crate::Op::StoreRef`].
+///
+/// Bit layout: bits 0–15 slot ([`ContextCoord::RESERVED_SLOT`] = no slot,
+/// the global form), bits 16–17 [`BindingStoreFallback`], bits 18–30 zero,
+/// bit 31 strict.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+pub struct StoreRefMode {
+    /// Slot written when the resolved base is a context; `None` when the
+    /// reference was resolved against the global environment.
+    pub slot: Option<u16>,
+    /// Behavior of a store that lands on that context slot.
+    pub fallback: BindingStoreFallback,
+    /// Strictness of the extension and global store paths.
+    pub strict: bool,
+}
+
+impl StoreRefMode {
+    const SLOT_BITS: u32 = u16::MAX as u32;
+    const FALLBACK_SHIFT: u32 = 16;
+    const FALLBACK_BITS: u32 = 0b11 << Self::FALLBACK_SHIFT;
+    const STRICT_BIT: u32 = 1 << 31;
+
+    /// Encode with the documented bit layout.
+    #[must_use]
+    pub const fn to_imm32(self) -> i32 {
+        let slot = match self.slot {
+            Some(slot) => {
+                debug_assert!(slot != ContextCoord::RESERVED_SLOT);
+                slot as u32
+            }
+            None => ContextCoord::RESERVED_SLOT as u32,
+        };
+        let strict = if self.strict { Self::STRICT_BIT } else { 0 };
+        (slot | ((self.fallback as u32) << Self::FALLBACK_SHIFT) | strict) as i32
+    }
+
+    /// Decode, rejecting reserved bits and an unknown fallback.
+    #[must_use]
+    pub const fn from_imm32(value: i32) -> Option<Self> {
+        let bits = value as u32;
+        if bits & !(Self::SLOT_BITS | Self::FALLBACK_BITS | Self::STRICT_BIT) != 0 {
+            return None;
+        }
+        let Some(fallback) = BindingStoreFallback::from_imm32(
+            ((bits & Self::FALLBACK_BITS) >> Self::FALLBACK_SHIFT) as i32,
+        ) else {
+            return None;
+        };
+        let slot = (bits & Self::SLOT_BITS) as u16;
+        Some(Self {
+            slot: if slot == ContextCoord::RESERVED_SLOT {
+                None
+            } else {
+                Some(slot)
+            },
+            fallback,
+            strict: bits & Self::STRICT_BIT != 0,
+        })
+    }
+}
+
 /// Typed read semantics and their authoritative operand roles.
+///
+/// Every field names an operand position of the instruction.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum BindingRead {
@@ -406,146 +705,58 @@ pub enum BindingRead {
         /// String-constant operand position.
         name: u8,
     },
-    /// Read one captured cell, including its TDZ check.
-    Upvalue {
+    /// TDZ-checked read of one context slot.
+    ContextSlot {
         /// Result-register operand position.
         destination: u8,
-        /// Upvalue-index operand position.
-        index: u8,
+        /// Context-register operand position.
+        context: u8,
+        /// [`ContextCoord`] immediate operand position.
+        coord: u8,
     },
-    /// Read the eval chain, then the global Environment Record.
-    Dynamic {
+    /// Eval-extension probe at hops `[0, depth)`, then a TDZ-checked
+    /// context-slot read.
+    LookupSlot {
         /// Result-register operand position.
         destination: u8,
+        /// Context-register operand position.
+        context: u8,
         /// String-constant operand position.
         name: u8,
+        /// [`ContextCoord`] immediate operand position.
+        coord: u8,
+    },
+    /// Eval-extension probe at hops `[0, depth)`, then the global
+    /// Environment Record.
+    LookupGlobal {
+        /// Result-register operand position.
+        destination: u8,
+        /// Context-register operand position.
+        context: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Hop-count immediate operand position.
+        depth: u8,
         /// Unresolved-reference behavior.
         missing: BindingMissing,
     },
-    /// Read the eval chain, then one captured cell.
-    ShadowedUpvalue {
-        /// Result-register operand position.
+    /// Resolve an assignment target's reference base before its right-hand
+    /// side runs (§13.15.2).
+    ResolveRef {
+        /// Reference-register operand position.
         destination: u8,
+        /// Context-register operand position.
+        context: u8,
         /// String-constant operand position.
         name: u8,
-        /// Captured-cell index operand position.
-        index: u8,
-        /// Number of physical eval-environment records that may shadow the
-        /// captured declaration.
-        eval_depth: u8,
-        /// Register operand position of the eval-binding sequence snapshot
-        /// that bounds which eval bindings the read may see (§13.15.2: the
-        /// assignment target resolves before its right-hand side), or `None`
-        /// when every live eval binding is visible.
-        snapshot: Option<u8>,
+        /// [`LookupRefTarget`] immediate operand position.
+        target: u8,
     },
-    /// Snapshot the isolate's monotonic eval-binding sequence into a register
-    /// so a later shadowed read or write resolves against the bindings that
-    /// existed at this point.
-    EvalBindingSeq {
-        /// Result-register operand position.
-        destination: u8,
-    },
-}
-
-/// Whether an upvalue store initializes a fresh cell or assigns a live binding.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum BindingWriteCheck {
-    /// Binding initialization may replace the TDZ hole.
-    Initialize,
-    /// Assignment must reject a TDZ hole.
-    Checked,
-}
-
-/// Captured-binding behavior when a shadowed write finds no eval-chain cell.
-///
-/// The physical [`crate::Op::StoreShadowedUpvalueChecked`] site carries this
-/// because an [`otter_vm::UpvalueCell`](https://docs.rs/otter-vm) stores only
-/// the moving value, not the source binding's mutability. The eval-chain hit
-/// always writes; this alphabet governs only the captured fallback.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[repr(i32)]
-#[serde(rename_all = "kebab-case")]
-pub enum ShadowedUpvalueFallback {
-    /// Assignment-check the captured cell and write it.
-    Mutable = 0,
-    /// Reject the captured fallback as an immutable binding.
-    ImmutableThrow = 1,
-    /// Silently retain an immutable named-function self binding.
-    ImmutableIgnore = 2,
-}
-
-impl ShadowedUpvalueFallback {
-    /// Decode the complete schema-owned immediate alphabet.
-    #[must_use]
-    pub const fn from_imm32(value: i32) -> Option<Self> {
-        match value {
-            0 => Some(Self::Mutable),
-            1 => Some(Self::ImmutableThrow),
-            2 => Some(Self::ImmutableIgnore),
-            _ => None,
-        }
-    }
-}
-
-/// One packed store policy for a shadowed captured binding.
-///
-/// The fixed-width instruction record has four inline operands. Packing the
-/// positive physical eval depth with the three-value fallback alphabet keeps
-/// `StoreShadowedUpvalueChecked` inline while this schema remains the sole
-/// encoder/decoder authority.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub struct ShadowedUpvalueStorePolicy {
-    /// Number of physical eval-environment records permitted for lookup.
-    pub eval_depth: u32,
-    /// Captured-cell behavior when the bounded prefix has no matching name.
-    pub fallback: ShadowedUpvalueFallback,
-}
-
-impl ShadowedUpvalueStorePolicy {
-    const FALLBACK_CARDINALITY: u32 = 3;
-
-    /// Encode a positive depth and fallback into the schema-owned immediate.
-    #[must_use]
-    pub const fn to_imm32(self) -> Option<i32> {
-        if self.eval_depth == 0 {
-            return None;
-        }
-        let Some(depth) = self.eval_depth.checked_mul(Self::FALLBACK_CARDINALITY) else {
-            return None;
-        };
-        let Some(encoded) = depth.checked_add(self.fallback as u32) else {
-            return None;
-        };
-        if encoded > i32::MAX as u32 {
-            return None;
-        }
-        Some(encoded as i32)
-    }
-
-    /// Decode the complete packed policy domain.
-    #[must_use]
-    pub const fn from_imm32(value: i32) -> Option<Self> {
-        if value < Self::FALLBACK_CARDINALITY as i32 {
-            return None;
-        }
-        let encoded = value as u32;
-        let eval_depth = encoded / Self::FALLBACK_CARDINALITY;
-        let fallback = match encoded % Self::FALLBACK_CARDINALITY {
-            0 => ShadowedUpvalueFallback::Mutable,
-            1 => ShadowedUpvalueFallback::ImmutableThrow,
-            2 => ShadowedUpvalueFallback::ImmutableIgnore,
-            _ => return None,
-        };
-        Some(Self {
-            eval_depth,
-            fallback,
-        })
-    }
 }
 
 /// Typed write semantics and their authoritative operand roles.
+///
+/// Every field names an operand position of the instruction.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum BindingWrite {
@@ -567,46 +778,82 @@ pub enum BindingWrite {
         /// Pre-RHS existence-register operand position.
         exists: u8,
     },
-    /// Write one captured cell.
-    Upvalue {
+    /// TDZ-checked assignment of one context slot.
+    ContextSlot {
         /// Boxed source-register operand position.
         value: u8,
-        /// Upvalue-index operand position.
-        index: u8,
-        /// Initialization versus assignment semantics.
-        check: BindingWriteCheck,
+        /// Context-register operand position.
+        context: u8,
+        /// [`ContextCoord`] immediate operand position.
+        coord: u8,
     },
-    /// Write the eval chain, then the sloppy global Environment Record.
-    Dynamic {
+    /// BindThisValue into a derived-constructor `this` slot: a slot that is
+    /// no longer the hole raises `ReferenceError`.
+    BindThis {
         /// Boxed source-register operand position.
         value: u8,
-        /// String-constant operand position.
-        name: u8,
-        /// Strictness-immediate operand position for the global fallback.
-        strict: u8,
+        /// Context-register operand position.
+        context: u8,
+        /// [`ContextCoord`] immediate operand position.
+        coord: u8,
     },
-    /// Write the eval chain, then an assignment-checked captured cell.
-    ShadowedUpvalue {
+    /// Eval-extension probe at hops `[0, depth)`, then the context slot
+    /// under a [`BindingStoreFallback`].
+    LookupSlot {
         /// Boxed source-register operand position.
         value: u8,
+        /// Context-register operand position.
+        context: u8,
         /// String-constant operand position.
         name: u8,
-        /// Captured-cell index operand position.
-        index: u8,
-        /// Packed [`ShadowedUpvalueStorePolicy`] immediate operand position.
-        policy: u8,
-        /// Register operand position of the eval-binding sequence snapshot
-        /// that bounds which eval bindings the write may reach, or `None`
-        /// when every live eval binding is a candidate.
-        snapshot: Option<u8>,
+        /// [`ContextCoord`] immediate operand position.
+        coord: u8,
+        /// [`BindingStoreFallback`] immediate operand position.
+        fallback: u8,
     },
-    /// Re-create a deleted sloppy-eval `var` binding in the current
-    /// eval-environment record from its captured cell (Annex B.3.3.3 sync).
-    ShadowedRestore {
+    /// Eval-extension probe at hops `[0, depth)`, then the global
+    /// `SetMutableBinding`.
+    LookupGlobal {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// Context-register operand position.
+        context: u8,
         /// String-constant operand position.
         name: u8,
-        /// Captured-cell index operand position.
-        index: u8,
+        /// [`LookupGlobalMode`] immediate operand position.
+        mode: u8,
+    },
+    /// PutValue through a reference base resolved before the right-hand
+    /// side.
+    StoreRef {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// Reference-register operand position.
+        reference: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// [`StoreRefMode`] immediate operand position.
+        mode: u8,
+    },
+    /// Create-if-absent of an eval `var` in the var-scope extension.
+    DeclareEvalVar {
+        /// Context-register operand position.
+        context: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Hop-count immediate operand position of the var-scope context.
+        var_depth: u8,
+    },
+    /// Set-or-create in the var-scope extension.
+    VarScope {
+        /// Boxed source-register operand position.
+        value: u8,
+        /// Context-register operand position.
+        context: u8,
+        /// String-constant operand position.
+        name: u8,
+        /// Hop-count immediate operand position of the var-scope context.
+        var_depth: u8,
     },
 }
 
@@ -614,28 +861,34 @@ pub enum BindingWrite {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum BindingDelete {
-    /// Delete an eval-chain binding, otherwise a global binding.
-    Dynamic {
+    /// Delete an eval-extension entry at hops `[0, depth)`; a miss leaves
+    /// the declarative slot intact and yields `false`.
+    LookupSlot {
         /// Boolean result-register operand position.
         destination: u8,
+        /// Context-register operand position.
+        context: u8,
         /// String-constant operand position.
         name: u8,
+        /// Hop-count immediate operand position.
+        depth: u8,
     },
-    /// Delete an eval-chain shadow, otherwise retain the captured binding.
-    ShadowedUpvalue {
+    /// Delete an eval-extension entry at hops `[0, depth)`, otherwise a
+    /// global binding.
+    LookupGlobal {
         /// Boolean result-register operand position.
         destination: u8,
+        /// Context-register operand position.
+        context: u8,
         /// String-constant operand position.
         name: u8,
-        /// Captured-cell index operand position used for structural validation.
-        index: u8,
-        /// Number of physical eval-environment records in which deletion is
-        /// permitted.
-        eval_depth: u8,
+        /// Hop-count immediate operand position.
+        depth: u8,
     },
 }
 
-/// Single semantic authority for all bytecode binding accesses.
+/// Single semantic authority for binding accesses that may throw or consult
+/// eval extensions.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "access", content = "semantics")]
 pub enum BindingSemantics {
@@ -655,32 +908,48 @@ impl BindingSemantics {
             Self::Read(BindingRead::GlobalThis { destination })
             | Self::Read(BindingRead::Global { destination, .. })
             | Self::Read(BindingRead::Exists { destination, .. })
-            | Self::Read(BindingRead::Upvalue { destination, .. })
-            | Self::Read(BindingRead::Dynamic { destination, .. })
-            | Self::Read(BindingRead::ShadowedUpvalue { destination, .. })
-            | Self::Read(BindingRead::EvalBindingSeq { destination })
-            | Self::Delete(BindingDelete::Dynamic { destination, .. })
-            | Self::Delete(BindingDelete::ShadowedUpvalue { destination, .. }) => Some(destination),
+            | Self::Read(BindingRead::ContextSlot { destination, .. })
+            | Self::Read(BindingRead::LookupSlot { destination, .. })
+            | Self::Read(BindingRead::LookupGlobal { destination, .. })
+            | Self::Read(BindingRead::ResolveRef { destination, .. })
+            | Self::Delete(BindingDelete::LookupSlot { destination, .. })
+            | Self::Delete(BindingDelete::LookupGlobal { destination, .. }) => Some(destination),
             Self::Write(_) => None,
         }
     }
 
-    /// Boxed SSA input-register operands in ABI order.
+    /// Every register operand the operation reads, as boxed inputs in ABI
+    /// order: the stored value first, then the context or reference
+    /// register (or the pre-RHS existence Boolean). A context register is a
+    /// boxed input like any other value, so these operations take at most
+    /// two register inputs.
     #[must_use]
     pub const fn value_operands(self) -> [Option<u8>; 2] {
         match self {
-            Self::Write(BindingWrite::Global { value, .. })
-            | Self::Write(BindingWrite::Upvalue { value, .. })
-            | Self::Write(BindingWrite::Dynamic { value, .. }) => [Some(value), None],
-            Self::Write(BindingWrite::ShadowedUpvalue {
-                value, snapshot, ..
-            }) => [Some(value), snapshot],
+            Self::Read(BindingRead::GlobalThis { .. })
+            | Self::Read(BindingRead::Global { .. })
+            | Self::Read(BindingRead::Exists { .. }) => [None, None],
+            Self::Read(BindingRead::ContextSlot { context, .. })
+            | Self::Read(BindingRead::LookupSlot { context, .. })
+            | Self::Read(BindingRead::LookupGlobal { context, .. })
+            | Self::Read(BindingRead::ResolveRef { context, .. })
+            | Self::Write(BindingWrite::DeclareEvalVar { context, .. })
+            | Self::Delete(BindingDelete::LookupSlot { context, .. })
+            | Self::Delete(BindingDelete::LookupGlobal { context, .. }) => [Some(context), None],
+            Self::Write(BindingWrite::Global { value, .. }) => [Some(value), None],
             Self::Write(BindingWrite::GlobalChecked { value, exists, .. }) => {
                 [Some(value), Some(exists)]
             }
-            Self::Write(BindingWrite::ShadowedRestore { .. }) => [None, None],
-            Self::Read(BindingRead::ShadowedUpvalue { snapshot, .. }) => [snapshot, None],
-            Self::Read(_) | Self::Delete(_) => [None, None],
+            Self::Write(BindingWrite::ContextSlot { value, context, .. })
+            | Self::Write(BindingWrite::BindThis { value, context, .. })
+            | Self::Write(BindingWrite::LookupSlot { value, context, .. })
+            | Self::Write(BindingWrite::LookupGlobal { value, context, .. })
+            | Self::Write(BindingWrite::VarScope { value, context, .. }) => {
+                [Some(value), Some(context)]
+            }
+            Self::Write(BindingWrite::StoreRef {
+                value, reference, ..
+            }) => [Some(value), Some(reference)],
         }
     }
 }
@@ -781,6 +1050,72 @@ pub struct OpcodeEffects {
     pub may_reenter_javascript: bool,
     /// Compiled slow paths must publish a safepoint.
     pub safepoint_required: bool,
+    /// The opcode may read mutable managed-heap state — object, context,
+    /// or eval-extension contents another instruction can change.
+    /// Register, frame, constant-pool, and immutable closure-field reads
+    /// are not heap reads.
+    pub may_read_heap: bool,
+    /// The opcode may store into a managed-heap object that existed before
+    /// it ran. Initializing a freshly allocated object is not a heap write.
+    pub may_write_heap: bool,
+}
+
+impl OpcodeEffects {
+    /// A register or frame operation with no exception exit.
+    const LEAF: Self = Self {
+        may_throw: false,
+        may_allocate: false,
+        may_trigger_gc: false,
+        may_reenter_javascript: false,
+        safepoint_required: false,
+        may_read_heap: false,
+        may_write_heap: false,
+    };
+
+    /// Everything an opcode can do; the default for every row without an
+    /// exact classification.
+    const CONSERVATIVE: Self = Self {
+        may_throw: true,
+        may_allocate: true,
+        may_trigger_gc: true,
+        may_reenter_javascript: true,
+        safepoint_required: true,
+        may_read_heap: true,
+        may_write_heap: true,
+    };
+
+    const fn throwing(self) -> Self {
+        Self {
+            may_throw: true,
+            ..self
+        }
+    }
+
+    const fn reading_heap(self) -> Self {
+        Self {
+            may_read_heap: true,
+            ..self
+        }
+    }
+
+    const fn writing_heap(self) -> Self {
+        Self {
+            may_write_heap: true,
+            ..self
+        }
+    }
+
+    /// Allocates (and may therefore collect or hit the heap limit, a
+    /// catchable `RangeError`) without re-entering JavaScript.
+    const fn allocating(self) -> Self {
+        Self {
+            may_throw: true,
+            may_allocate: true,
+            may_trigger_gc: true,
+            safepoint_required: true,
+            ..self
+        }
+    }
 }
 
 /// One generated schema row.
@@ -908,8 +1243,8 @@ opcode_schema! {
     (Op::TdzError, 0x2F),
     (Op::MakeFunction, 0x30),
     (Op::MakeClosure, 0x31),
-    (Op::LoadUpvalue, 0x32),
-    (Op::StoreUpvalue, 0x33),
+    (Op::LoadContextSlot, 0x32),
+    (Op::StoreContextSlot, 0x33),
     (Op::Call, 0x34),
     (Op::CallWithThis, 0x35),
     (Op::BindFunction, 0x36),
@@ -992,18 +1327,18 @@ opcode_schema! {
     (Op::SetSuperProperty, 0x83),
     (Op::SetSuperElement, 0x84),
     (Op::JumpViaFinally, 0x85),
-    (Op::FreshUpvalue, 0x86),
+    (Op::CreateContext, 0x86),
     (Op::ImportNamespaceDeferred, 0x87),
     (Op::EvaluateModule, 0x88),
     (Op::MarkModuleEvaluated, 0x89),
     (Op::StarReexport, 0x8A),
     (Op::ModuleNamespaceObject, 0x8B),
     (Op::LoadImportBinding, 0x8C),
-    (Op::StoreUpvalueChecked, 0x8D),
+    (Op::StoreContextSlotChecked, 0x8D),
     (Op::DeclareGlobalVar, 0x8E),
-    (Op::LoadDynamic, 0x8F),
-    (Op::StoreDynamic, 0x90),
-    (Op::TypeofDynamic, 0x91),
+    (Op::LoadLookupGlobal, 0x8F),
+    (Op::StoreLookupGlobal, 0x90),
+    (Op::TypeofLookupGlobal, 0x91),
     (Op::DefineGlobalFunction, 0x92),
     (Op::DeclareGlobalLex, 0x93),
     (Op::StoreGlobalBinding, 0x94),
@@ -1020,9 +1355,9 @@ opcode_schema! {
     (Op::ToPropertyKey, 0x9F),
     (Op::Increment, 0xA0),
     (Op::PrivateBrandCheck, 0xA1),
-    (Op::LoadShadowedUpvalue, 0xA2),
+    (Op::LoadLookupSlot, 0xA2),
     (Op::GetTemplateObject, 0xA3),
-    (Op::DeleteDynamic, 0xA4),
+    (Op::DeleteLookupGlobal, 0xA4),
     (Op::NewPrivateName, 0xA5),
     (Op::TailCall, 0xA6),
     (Op::IsEvalIntrinsic, 0xA7),
@@ -1036,20 +1371,26 @@ opcode_schema! {
     (Op::EqualImm, 0xAF),
     (Op::NotEqualImm, 0xB0),
     (Op::SuperConstruct, 0xB1),
-    (Op::StoreShadowedUpvalueChecked, 0xB2),
-    (Op::DeleteShadowedUpvalue, 0xB3),
+    (Op::StoreLookupSlot, 0xB2),
+    (Op::DeleteLookupSlot, 0xB3),
     (Op::AsyncIteratorReturn, 0xB4),
     (Op::CheckIteratorResult, 0xB5),
-    (Op::EvalBindingSeq, 0xB6),
-    (Op::LoadShadowedUpvalueSnap, 0xB7),
-    (Op::StoreShadowedUpvalueCheckedSnap, 0xB8),
-    (Op::EvalRestoreBinding, 0xB9),
+    (Op::ResolveLookupRef, 0xB6),
+    (Op::LoadContextSlotChecked, 0xB7),
+    (Op::StoreRef, 0xB8),
+    (Op::DeclareEvalVar, 0xB9),
     (Op::StorePropertyStrict, 0xBA),
     (Op::StoreElementStrict, 0xBB),
     (Op::CallForwardArguments, 0xBC),
     (Op::NewObjectLiteral, 0xBD),
     (Op::LoadArgumentsLength, 0xBE),
     (Op::LoadArgumentsElement, 0xBF),
+    (Op::LoadClosureContext, 0xC0),
+    (Op::LoadSelf, 0xC1),
+    (Op::CopyContext, 0xC2),
+    (Op::BindThisContextSlot, 0xC3),
+    (Op::ReturnDerived, 0xC4),
+    (Op::StoreVarScope, 0xC5),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1205,7 +1546,7 @@ const JUMP: &[OperandSpec] = &[IMM];
 const BRANCH: &[OperandSpec] = &[IMM, R];
 const CALL_PREFIX: &[OperandSpec] = &[W, R, CONST];
 const CALL_WITH_THIS_PREFIX: &[OperandSpec] = &[W, R, R, CONST];
-const CALL_FORWARD_ARGUMENTS: &[OperandSpec] = &[W, R, R, R];
+const CALL_FORWARD_ARGUMENTS: &[OperandSpec] = &[W, R, R, R, R];
 const COUNTED_VALUES_PREFIX: &[OperandSpec] = &[W, CONST];
 const OBJECT_LITERAL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
 const METHOD_CALL_PREFIX: &[OperandSpec] = &[W, R, CONST, CONST];
@@ -1217,7 +1558,6 @@ const READ_CONST_READ_WRITE: &[OperandSpec] = &[R, CONST, R, W];
 const READ_READ: &[OperandSpec] = &[R, R];
 const READ_READ_READ: &[OperandSpec] = &[R, R, R];
 const WRITE_WRITE_READ: &[OperandSpec] = &[W, W, R];
-const WRITE_CONST_IMM_IMM: &[OperandSpec] = &[W, CONST, IMM, IMM];
 const JUMP_VIA_FINALLY: &[OperandSpec] = &[IMM, IMM];
 const READ_CONST: &[OperandSpec] = &[R, CONST];
 const CONST_READ: &[OperandSpec] = &[CONST, R];
@@ -1225,11 +1565,29 @@ const WRITE_READ_WRITE: &[OperandSpec] = &[W, R, W];
 const WRITE_READ_READ_READ: &[OperandSpec] = &[W, R, R, R];
 const WRITE_FOUR_READS: &[OperandSpec] = &[W, R, R, R, R];
 const WRITE_READ_IMM: &[OperandSpec] = &[W, R, IMM];
-const WRITE_READ_IMM_IMM: &[OperandSpec] = &[W, R, IMM, IMM];
 const CONST_READ_IMM: &[OperandSpec] = &[CONST, R, IMM];
 const CONST_IMM: &[OperandSpec] = &[CONST, IMM];
 const READ_CONST_IMM: &[OperandSpec] = &[R, CONST, IMM];
-const READ_CONST_IMM_IMM: &[OperandSpec] = &[R, CONST, IMM, IMM];
+const SCOPE: OperandSpec = OperandSpec::immediate(ImmediateDomain::ScopeIndex);
+const COORD: OperandSpec = OperandSpec::immediate(ImmediateDomain::ContextCoord);
+const DEPTH: OperandSpec = OperandSpec::immediate(ImmediateDomain::ContextDepth);
+const REF_TARGET: OperandSpec = OperandSpec::immediate(ImmediateDomain::LookupRefTarget);
+const GLOBAL_MODE: OperandSpec = OperandSpec::immediate(ImmediateDomain::LookupGlobalMode);
+const FALLBACK: OperandSpec = OperandSpec::immediate(ImmediateDomain::StoreFallback);
+const REF_MODE: OperandSpec = OperandSpec::immediate(ImmediateDomain::StoreRefMode);
+const CREATE_CONTEXT: &[OperandSpec] = &[W, R, SCOPE];
+const LOAD_CONTEXT_SLOT: &[OperandSpec] = &[W, R, COORD];
+const STORE_CONTEXT_SLOT: &[OperandSpec] = &[R, R, COORD];
+const MAKE_CLOSURE: &[OperandSpec] = &[W, CONST, R];
+const LOAD_LOOKUP_SLOT: &[OperandSpec] = &[W, R, CONST, COORD];
+const STORE_LOOKUP_SLOT: &[OperandSpec] = &[R, R, CONST, COORD, FALLBACK];
+const LOOKUP_BY_DEPTH: &[OperandSpec] = &[W, R, CONST, DEPTH];
+const STORE_LOOKUP_GLOBAL: &[OperandSpec] = &[R, R, CONST, GLOBAL_MODE];
+const RESOLVE_LOOKUP_REF: &[OperandSpec] = &[W, R, CONST, REF_TARGET];
+const STORE_REF: &[OperandSpec] = &[R, R, CONST, REF_MODE];
+const DECLARE_EVAL_VAR: &[OperandSpec] = &[R, CONST, DEPTH];
+const STORE_VAR_SCOPE: &[OperandSpec] = &[R, R, CONST, DEPTH];
+const EVAL: &[OperandSpec] = &[W, R, R, IMM];
 
 const fn operand_shape(op: Op) -> OperandShape {
     match op {
@@ -1241,7 +1599,9 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::LoadFalse
         | Op::LoadThis
         | Op::LoadNewTarget
-        | Op::LoadGlobalThis => OperandShape::Fixed(WRITE),
+        | Op::LoadGlobalThis
+        | Op::LoadClosureContext
+        | Op::LoadSelf => OperandShape::Fixed(WRITE),
         Op::LoadString | Op::LoadNumber | Op::LoadBigInt | Op::LoadRegExp => {
             OperandShape::Fixed(WRITE_CONST)
         }
@@ -1250,6 +1610,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => OperandShape::Fixed(BRANCH),
         Op::Return | Op::ReturnValue => OperandShape::Fixed(&[R]),
         Op::ReturnUndefined => OperandShape::Fixed(EMPTY),
+        Op::ReturnDerived => OperandShape::Fixed(STORE_CONTEXT_SLOT),
         Op::Call | Op::TailCall => OperandShape::Variadic {
             prefix: CALL_PREFIX,
             count_operand_index: 2,
@@ -1312,17 +1673,23 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::CheckIteratorResult => OperandShape::Fixed(&[R]),
         Op::AsyncIteratorReturn => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::ForInKeys => OperandShape::Fixed(WRITE_READ),
-        Op::LoadUpvalue => OperandShape::Fixed(WRITE_IMM),
-        Op::StoreUpvalue | Op::StoreUpvalueChecked => OperandShape::Fixed(&[R, IMM]),
-        Op::FreshUpvalue => OperandShape::Fixed(&[IMM]),
-        Op::LoadShadowedUpvalue | Op::DeleteShadowedUpvalue => {
-            OperandShape::Fixed(WRITE_CONST_IMM_IMM)
+        Op::CreateContext => OperandShape::Fixed(CREATE_CONTEXT),
+        Op::CopyContext => OperandShape::Fixed(WRITE_READ),
+        Op::LoadContextSlot | Op::LoadContextSlotChecked => OperandShape::Fixed(LOAD_CONTEXT_SLOT),
+        Op::StoreContextSlot | Op::StoreContextSlotChecked | Op::BindThisContextSlot => {
+            OperandShape::Fixed(STORE_CONTEXT_SLOT)
         }
-        Op::StoreShadowedUpvalueChecked => OperandShape::Fixed(READ_CONST_IMM_IMM),
-        Op::EvalBindingSeq => OperandShape::Fixed(WRITE),
-        Op::LoadShadowedUpvalueSnap => OperandShape::Fixed(&[W, CONST, IMM, IMM, R]),
-        Op::StoreShadowedUpvalueCheckedSnap => OperandShape::Fixed(&[R, CONST, IMM, IMM, R]),
-        Op::EvalRestoreBinding => OperandShape::Fixed(CONST_IMM),
+        Op::LoadLookupSlot => OperandShape::Fixed(LOAD_LOOKUP_SLOT),
+        Op::StoreLookupSlot => OperandShape::Fixed(STORE_LOOKUP_SLOT),
+        Op::DeleteLookupSlot
+        | Op::LoadLookupGlobal
+        | Op::TypeofLookupGlobal
+        | Op::DeleteLookupGlobal => OperandShape::Fixed(LOOKUP_BY_DEPTH),
+        Op::StoreLookupGlobal => OperandShape::Fixed(STORE_LOOKUP_GLOBAL),
+        Op::ResolveLookupRef => OperandShape::Fixed(RESOLVE_LOOKUP_REF),
+        Op::StoreRef => OperandShape::Fixed(STORE_REF),
+        Op::DeclareEvalVar => OperandShape::Fixed(DECLARE_EVAL_VAR),
+        Op::StoreVarScope => OperandShape::Fixed(STORE_VAR_SCOPE),
         Op::JumpViaFinally => OperandShape::Fixed(JUMP_VIA_FINALLY),
         Op::PopParkedFinally => OperandShape::Fixed(&[IMM]),
         Op::QueueMicrotask => OperandShape::Variadic {
@@ -1360,11 +1727,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::GetTemplateObject
         | Op::NewPrivateName
         | Op::EvaluateModule => OperandShape::Fixed(WRITE_CONST),
-        Op::MakeClosure => OperandShape::Variadic {
-            prefix: NAMESPACE_CALL_PREFIX,
-            count_operand_index: 2,
-            tail: IMM,
-        },
+        Op::MakeClosure => OperandShape::Fixed(MAKE_CLOSURE),
         Op::LeaveTry | Op::GeneratorStart => OperandShape::Fixed(EMPTY),
         Op::NewError
         | Op::ImportMetaResolve
@@ -1377,12 +1740,11 @@ const fn operand_shape(op: Op) -> OperandShape {
             OperandShape::Fixed(WRITE_READ_READ)
         }
         Op::MakeClass => OperandShape::Fixed(WRITE_FOUR_READS),
-        Op::CollectRest | Op::CollectArguments | Op::LoadArgumentsLength => {
-            OperandShape::Fixed(WRITE)
-        }
+        Op::CollectRest | Op::LoadArgumentsLength => OperandShape::Fixed(WRITE),
+        Op::CollectArguments => OperandShape::Fixed(WRITE_READ),
         Op::LoadArgumentsElement => OperandShape::Fixed(WRITE_READ),
         Op::Increment => OperandShape::Fixed(WRITE_READ_IMM),
-        Op::Eval => OperandShape::Fixed(WRITE_READ_IMM_IMM),
+        Op::Eval => OperandShape::Fixed(EVAL),
         Op::DefineGlobalVar => OperandShape::Fixed(CONST_READ),
         Op::NewCollection | Op::NewBuiltinError => OperandShape::Fixed(&[W, CONST, R]),
         Op::ToPrimitive => OperandShape::Fixed(WRITE_READ_CONST),
@@ -1401,8 +1763,6 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::DeclareGlobalVar => OperandShape::Fixed(CONST_IMM),
         Op::StarReexport => OperandShape::Fixed(READ_READ),
         Op::LoadImportBinding => OperandShape::Fixed(WRITE_CONST_CONST),
-        Op::LoadDynamic | Op::TypeofDynamic | Op::DeleteDynamic => OperandShape::Fixed(WRITE_CONST),
-        Op::StoreDynamic => OperandShape::Fixed(READ_CONST_IMM),
         Op::InitGlobalLex => OperandShape::Fixed(READ_CONST),
         Op::DefineGlobalFunction => OperandShape::Fixed(CONST_READ_IMM),
         Op::DeclareGlobalLex | Op::ValidateGlobalDecl => OperandShape::Fixed(CONST_IMM),
@@ -1462,7 +1822,7 @@ const fn successor_shape(op: Op) -> SuccessorShape {
         Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => {
             SuccessorShape::new(BRANCH_SUCCESSORS)
         }
-        Op::Return | Op::ReturnValue | Op::ReturnUndefined => {
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived => {
             SuccessorShape::new(RETURN_SUCCESSORS)
         }
         Op::TailCall => SuccessorShape::new(TAIL_CALL_SUCCESSORS),
@@ -1520,7 +1880,7 @@ const fn exception_successor_shape(op: Op) -> ExceptionSuccessorShape {
     match op {
         Op::EnterTry => ExceptionSuccessorShape::new(ENTER_TRY_EXCEPTION_SUCCESSORS),
         Op::Throw => ExceptionSuccessorShape::new(THROW_EXCEPTION_SUCCESSORS),
-        Op::Return | Op::ReturnValue | Op::ReturnUndefined => {
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived => {
             ExceptionSuccessorShape::new(RETURN_EXCEPTION_SUCCESSORS)
         }
         Op::Yield => ExceptionSuccessorShape::new(YIELD_EXCEPTION_SUCCESSORS),
@@ -1536,7 +1896,9 @@ const fn control_flow(op: Op) -> ControlFlow {
     match op {
         Op::Jump | Op::JumpViaFinally => ControlFlow::Jump,
         Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => ControlFlow::Branch,
-        Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::TailCall => ControlFlow::Return,
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived | Op::TailCall => {
+            ControlFlow::Return
+        }
         Op::Throw => ControlFlow::Throw,
         Op::EnterTry | Op::LeaveTry | Op::EndFinally | Op::PopParkedFinally => {
             ControlFlow::ExceptionRegion
@@ -1576,36 +1938,36 @@ const fn binding_semantics(op: Op) -> Option<BindingSemantics> {
             destination: 0,
             name: 1,
         })),
-        Op::LoadUpvalue => Some(BindingSemantics::Read(BindingRead::Upvalue {
+        Op::LoadContextSlotChecked => Some(BindingSemantics::Read(BindingRead::ContextSlot {
             destination: 0,
-            index: 1,
+            context: 1,
+            coord: 2,
         })),
-        Op::LoadDynamic => Some(BindingSemantics::Read(BindingRead::Dynamic {
+        Op::LoadLookupSlot => Some(BindingSemantics::Read(BindingRead::LookupSlot {
             destination: 0,
-            name: 1,
+            context: 1,
+            name: 2,
+            coord: 3,
+        })),
+        Op::LoadLookupGlobal => Some(BindingSemantics::Read(BindingRead::LookupGlobal {
+            destination: 0,
+            context: 1,
+            name: 2,
+            depth: 3,
             missing: BindingMissing::Throw,
         })),
-        Op::TypeofDynamic => Some(BindingSemantics::Read(BindingRead::Dynamic {
+        Op::TypeofLookupGlobal => Some(BindingSemantics::Read(BindingRead::LookupGlobal {
             destination: 0,
-            name: 1,
+            context: 1,
+            name: 2,
+            depth: 3,
             missing: BindingMissing::Undefined,
         })),
-        Op::LoadShadowedUpvalue => Some(BindingSemantics::Read(BindingRead::ShadowedUpvalue {
+        Op::ResolveLookupRef => Some(BindingSemantics::Read(BindingRead::ResolveRef {
             destination: 0,
-            name: 1,
-            index: 2,
-            eval_depth: 3,
-            snapshot: None,
-        })),
-        Op::LoadShadowedUpvalueSnap => Some(BindingSemantics::Read(BindingRead::ShadowedUpvalue {
-            destination: 0,
-            name: 1,
-            index: 2,
-            eval_depth: 3,
-            snapshot: Some(4),
-        })),
-        Op::EvalBindingSeq => Some(BindingSemantics::Read(BindingRead::EvalBindingSeq {
-            destination: 0,
+            context: 1,
+            name: 2,
+            target: 3,
         })),
         Op::StoreGlobalBinding => Some(BindingSemantics::Write(BindingWrite::Global {
             value: 0,
@@ -1617,55 +1979,58 @@ const fn binding_semantics(op: Op) -> Option<BindingSemantics> {
             name: 1,
             exists: 2,
         })),
-        Op::StoreUpvalue => Some(BindingSemantics::Write(BindingWrite::Upvalue {
+        Op::StoreContextSlotChecked => Some(BindingSemantics::Write(BindingWrite::ContextSlot {
             value: 0,
-            index: 1,
-            check: BindingWriteCheck::Initialize,
+            context: 1,
+            coord: 2,
         })),
-        Op::StoreUpvalueChecked => Some(BindingSemantics::Write(BindingWrite::Upvalue {
+        Op::BindThisContextSlot => Some(BindingSemantics::Write(BindingWrite::BindThis {
             value: 0,
-            index: 1,
-            check: BindingWriteCheck::Checked,
+            context: 1,
+            coord: 2,
         })),
-        Op::StoreDynamic => Some(BindingSemantics::Write(BindingWrite::Dynamic {
+        Op::StoreLookupSlot => Some(BindingSemantics::Write(BindingWrite::LookupSlot {
             value: 0,
+            context: 1,
+            name: 2,
+            coord: 3,
+            fallback: 4,
+        })),
+        Op::StoreLookupGlobal => Some(BindingSemantics::Write(BindingWrite::LookupGlobal {
+            value: 0,
+            context: 1,
+            name: 2,
+            mode: 3,
+        })),
+        Op::StoreRef => Some(BindingSemantics::Write(BindingWrite::StoreRef {
+            value: 0,
+            reference: 1,
+            name: 2,
+            mode: 3,
+        })),
+        Op::DeclareEvalVar => Some(BindingSemantics::Write(BindingWrite::DeclareEvalVar {
+            context: 0,
             name: 1,
-            strict: 2,
+            var_depth: 2,
         })),
-        Op::StoreShadowedUpvalueChecked => {
-            Some(BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
-                value: 0,
-                name: 1,
-                index: 2,
-                policy: 3,
-                snapshot: None,
-            }))
-        }
-        Op::StoreShadowedUpvalueCheckedSnap => {
-            Some(BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
-                value: 0,
-                name: 1,
-                index: 2,
-                policy: 3,
-                snapshot: Some(4),
-            }))
-        }
-        Op::EvalRestoreBinding => Some(BindingSemantics::Write(BindingWrite::ShadowedRestore {
-            name: 0,
-            index: 1,
+        Op::StoreVarScope => Some(BindingSemantics::Write(BindingWrite::VarScope {
+            value: 0,
+            context: 1,
+            name: 2,
+            var_depth: 3,
         })),
-        Op::DeleteDynamic => Some(BindingSemantics::Delete(BindingDelete::Dynamic {
+        Op::DeleteLookupSlot => Some(BindingSemantics::Delete(BindingDelete::LookupSlot {
             destination: 0,
-            name: 1,
+            context: 1,
+            name: 2,
+            depth: 3,
         })),
-        Op::DeleteShadowedUpvalue => {
-            Some(BindingSemantics::Delete(BindingDelete::ShadowedUpvalue {
-                destination: 0,
-                name: 1,
-                index: 2,
-                eval_depth: 3,
-            }))
-        }
+        Op::DeleteLookupGlobal => Some(BindingSemantics::Delete(BindingDelete::LookupGlobal {
+            destination: 0,
+            context: 1,
+            name: 2,
+            depth: 3,
+        })),
         _ => None,
     }
 }
@@ -1735,42 +2100,46 @@ const fn feedback(op: Op) -> FeedbackKind {
 }
 
 const fn effects(op: Op) -> OpcodeEffects {
-    let leaf = matches!(
-        op,
+    match op {
         Op::Nop
-            | Op::LoadUndefined
-            | Op::LoadHole
-            | Op::LoadTrue
-            | Op::LoadFalse
-            | Op::LoadNull
-            | Op::LoadInt32
-            | Op::LoadNumber
-            | Op::LoadLocal
-            | Op::StoreLocal
-            | Op::LoadThis
-            | Op::LoadNewTarget
-            | Op::Jump
-            | Op::JumpIfTrue
-            | Op::JumpIfFalse
-            | Op::JumpIfNullish
-            | Op::LeaveTry
-            | Op::Return
-            | Op::ReturnValue
-            | Op::ReturnUndefined
-    );
-    OpcodeEffects {
-        // These remain allocation-free, non-reentrant leaf operations while
-        // owning typed exception exits: `LoadThis` can hit the derived-`this`
-        // TDZ, while return completion can fail only after leaving this frame.
-        may_throw: !leaf
-            || matches!(
-                op,
-                Op::LoadThis | Op::Return | Op::ReturnValue | Op::ReturnUndefined
-            ),
-        may_allocate: !leaf,
-        may_trigger_gc: !leaf,
-        may_reenter_javascript: !leaf,
-        safepoint_required: !leaf,
+        | Op::LoadUndefined
+        | Op::LoadHole
+        | Op::LoadTrue
+        | Op::LoadFalse
+        | Op::LoadNull
+        | Op::LoadInt32
+        | Op::LoadNumber
+        | Op::LoadLocal
+        | Op::StoreLocal
+        | Op::LoadNewTarget
+        | Op::LoadClosureContext
+        | Op::LoadSelf
+        | Op::Jump
+        | Op::JumpIfTrue
+        | Op::JumpIfFalse
+        | Op::JumpIfNullish
+        | Op::LeaveTry => OpcodeEffects::LEAF,
+        // Allocation-free, non-reentrant leaves that own a typed exception
+        // exit: `LoadThis` can hit the derived-`this` TDZ, and a return
+        // completion can fail only after leaving this frame.
+        Op::LoadThis | Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived => {
+            OpcodeEffects::LEAF.throwing()
+        }
+        // Plain context memory: a load, and a write-barriered store. The
+        // barrier records an edge and never collects.
+        Op::LoadContextSlot => OpcodeEffects::LEAF.reading_heap(),
+        Op::StoreContextSlot => OpcodeEffects::LEAF.writing_heap(),
+        // Hole-checked context accesses raise their `ReferenceError` from
+        // the exception exit without allocating on the success path.
+        Op::LoadContextSlotChecked => OpcodeEffects::LEAF.reading_heap().throwing(),
+        Op::StoreContextSlotChecked | Op::BindThisContextSlot => {
+            OpcodeEffects::LEAF.reading_heap().writing_heap().throwing()
+        }
+        // Non-reentrant allocations of a context or a closure.
+        Op::CreateContext | Op::CopyContext | Op::MakeClosure => {
+            OpcodeEffects::LEAF.reading_heap().allocating()
+        }
+        _ => OpcodeEffects::CONSERVATIVE,
     }
 }
 
@@ -1875,20 +2244,20 @@ mod tests {
             Op::GlobalBindingExists,
             Op::StoreGlobalBinding,
             Op::StoreGlobalChecked,
-            Op::LoadUpvalue,
-            Op::StoreUpvalue,
-            Op::StoreUpvalueChecked,
-            Op::LoadDynamic,
-            Op::StoreDynamic,
-            Op::TypeofDynamic,
-            Op::LoadShadowedUpvalue,
-            Op::DeleteDynamic,
-            Op::StoreShadowedUpvalueChecked,
-            Op::DeleteShadowedUpvalue,
-            Op::LoadShadowedUpvalueSnap,
-            Op::StoreShadowedUpvalueCheckedSnap,
-            Op::EvalBindingSeq,
-            Op::EvalRestoreBinding,
+            Op::LoadContextSlotChecked,
+            Op::StoreContextSlotChecked,
+            Op::BindThisContextSlot,
+            Op::LoadLookupSlot,
+            Op::StoreLookupSlot,
+            Op::DeleteLookupSlot,
+            Op::LoadLookupGlobal,
+            Op::TypeofLookupGlobal,
+            Op::StoreLookupGlobal,
+            Op::DeleteLookupGlobal,
+            Op::ResolveLookupRef,
+            Op::StoreRef,
+            Op::DeclareEvalVar,
+            Op::StoreVarScope,
         ]);
         let actual = OPCODE_SCHEMA
             .iter()
@@ -1907,63 +2276,384 @@ mod tests {
     }
 
     #[test]
-    fn shadowed_store_policy_owns_the_complete_packed_domain() {
-        for fallback in [
-            ShadowedUpvalueFallback::Mutable,
-            ShadowedUpvalueFallback::ImmutableThrow,
-            ShadowedUpvalueFallback::ImmutableIgnore,
-        ] {
-            for eval_depth in [1, 2, 17, 1_000_000] {
-                let policy = ShadowedUpvalueStorePolicy {
-                    eval_depth,
-                    fallback,
-                };
-                let encoded = policy.to_imm32().expect("representable policy");
+    fn context_coordinates_pack_depth_over_slot() {
+        for (depth, slot) in [(0, 0), (1, 2), (7, 300), (u16::MAX, ContextCoord::MAX_SLOT)] {
+            let coord = ContextCoord::new(depth, slot).expect("addressable slot");
+            let imm = coord.to_imm32();
+            assert_eq!(imm as u32, (u32::from(depth) << 16) | u32::from(slot));
+            assert_eq!(ContextCoord::from_imm32(imm), Some(coord));
+            assert_eq!(
+                LookupRefTarget::from_imm32(imm),
+                LookupRefTarget::Slot(coord)
+            );
+        }
+        assert_eq!(ContextCoord::new(3, ContextCoord::RESERVED_SLOT), None);
+        assert_eq!(ContextCoord::from_imm32(0x0003_FFFF), None);
+        assert_eq!(ContextCoord::from_imm32(-1), None);
+
+        for depth in [0, 3, u16::MAX] {
+            let target = LookupRefTarget::Global { depth };
+            assert_eq!(LookupRefTarget::from_imm32(target.to_imm32()), target);
+            assert_eq!(target.depth(), depth);
+            assert!(ImmediateDomain::LookupRefTarget.admits(target.to_imm32()));
+            assert!(!ImmediateDomain::ContextCoord.admits(target.to_imm32()));
+        }
+    }
+
+    #[test]
+    fn lookup_global_mode_packs_depth_and_strict_bit() {
+        for depth in [0, 1, 0x1234, u16::MAX] {
+            for strict in [false, true] {
+                let mode = LookupGlobalMode { depth, strict };
+                let imm = mode.to_imm32();
                 assert_eq!(
-                    ShadowedUpvalueStorePolicy::from_imm32(encoded),
-                    Some(policy)
+                    imm as u32,
+                    u32::from(depth) | if strict { 1 << 31 } else { 0 }
                 );
+                assert_eq!(LookupGlobalMode::from_imm32(imm), Some(mode));
             }
         }
-        assert_eq!(
-            ShadowedUpvalueStorePolicy {
-                eval_depth: 0,
-                fallback: ShadowedUpvalueFallback::Mutable,
+        for reserved in [1 << 16, 1 << 30, 0x7FFF_0000] {
+            assert_eq!(LookupGlobalMode::from_imm32(reserved), None);
+            assert!(!ImmediateDomain::LookupGlobalMode.admits(reserved));
+        }
+    }
+
+    #[test]
+    fn store_ref_mode_owns_its_bit_layout() {
+        for slot in [Some(0), Some(9), Some(ContextCoord::MAX_SLOT), None] {
+            for fallback in [
+                BindingStoreFallback::Mutable,
+                BindingStoreFallback::ImmutableThrow,
+                BindingStoreFallback::ImmutableIgnore,
+            ] {
+                for strict in [false, true] {
+                    let mode = StoreRefMode {
+                        slot,
+                        fallback,
+                        strict,
+                    };
+                    let imm = mode.to_imm32() as u32;
+                    assert_eq!(
+                        imm & 0xFFFF,
+                        u32::from(slot.unwrap_or(ContextCoord::RESERVED_SLOT))
+                    );
+                    assert_eq!((imm >> 16) & 0b11, fallback.to_imm32() as u32);
+                    assert_eq!(imm >> 31, u32::from(strict));
+                    assert_eq!(imm & 0x7FFC_0000, 0);
+                    assert_eq!(StoreRefMode::from_imm32(imm as i32), Some(mode));
+                }
             }
-            .to_imm32(),
-            None
-        );
-        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(-1), None);
-        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(0), None);
-        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(1), None);
-        assert_eq!(ShadowedUpvalueStorePolicy::from_imm32(2), None);
+        }
+        // Fallback 3 is outside the alphabet; bits 18–30 are reserved.
+        assert_eq!(StoreRefMode::from_imm32(3 << 16), None);
+        assert_eq!(StoreRefMode::from_imm32(1 << 18), None);
+        assert_eq!(StoreRefMode::from_imm32(1 << 30), None);
+        for value in [-1, 3, 4, i32::MIN] {
+            assert_eq!(BindingStoreFallback::from_imm32(value), None);
+        }
+    }
+
+    fn assert_row(
+        op: Op,
+        byte: u8,
+        operands: &[(OperandKind, RegisterAccess, Option<ImmediateDomain>)],
+        binding: Option<BindingSemantics>,
+    ) {
+        let schema = opcode_schema(op);
+        assert_eq!(schema.byte, byte, "{op:?} byte");
+        let shape = schema.operand_shape.fixed().expect("fixed shape");
+        assert_eq!(shape.len(), operands.len(), "{op:?} arity");
+        for (index, (spec, (kind, access, domain))) in shape.iter().zip(operands).enumerate() {
+            assert_eq!(spec.kind, *kind, "{op:?} operand {index} kind");
+            assert_eq!(
+                spec.register_access, *access,
+                "{op:?} operand {index} access"
+            );
+            assert_eq!(spec.imm_domain, *domain, "{op:?} operand {index} domain");
+        }
+        assert_eq!(schema.binding, binding, "{op:?} binding");
         assert_eq!(
-            ShadowedUpvalueStorePolicy {
-                eval_depth: u32::MAX,
-                fallback: ShadowedUpvalueFallback::ImmutableIgnore,
-            }
-            .to_imm32(),
-            None
+            schema.control_flow == ControlFlow::Return,
+            op == Op::ReturnDerived
         );
+    }
+
+    #[test]
+    fn context_family_rows_are_exact() {
+        use OperandKind::{ConstIndex as K, Imm32 as I, Register as Reg};
+        use RegisterAccess::{None as N, Read as Rd, Write as Wr};
+        let w = (Reg, Wr, None);
+        let r = (Reg, Rd, None);
+        let k = (K, N, None);
+        let coord = (I, N, Some(ImmediateDomain::ContextCoord));
+
+        assert_row(Op::LoadClosureContext, 0xC0, &[w], None);
+        assert_row(Op::LoadSelf, 0xC1, &[w], None);
+        assert_row(
+            Op::CreateContext,
+            0x86,
+            &[w, r, (I, N, Some(ImmediateDomain::ScopeIndex))],
+            None,
+        );
+        assert_row(Op::CopyContext, 0xC2, &[w, r], None);
+        assert_row(Op::LoadContextSlot, 0x32, &[w, r, coord], None);
+        assert_row(Op::StoreContextSlot, 0x33, &[r, r, coord], None);
+        assert_row(
+            Op::LoadContextSlotChecked,
+            0xB7,
+            &[w, r, coord],
+            Some(BindingSemantics::Read(BindingRead::ContextSlot {
+                destination: 0,
+                context: 1,
+                coord: 2,
+            })),
+        );
+        assert_row(
+            Op::StoreContextSlotChecked,
+            0x8D,
+            &[r, r, coord],
+            Some(BindingSemantics::Write(BindingWrite::ContextSlot {
+                value: 0,
+                context: 1,
+                coord: 2,
+            })),
+        );
+        assert_row(
+            Op::BindThisContextSlot,
+            0xC3,
+            &[r, r, coord],
+            Some(BindingSemantics::Write(BindingWrite::BindThis {
+                value: 0,
+                context: 1,
+                coord: 2,
+            })),
+        );
+        assert_row(Op::ReturnDerived, 0xC4, &[r, r, coord], None);
+        assert_row(Op::MakeClosure, 0x31, &[w, k, r], None);
+        assert_row(Op::Eval, 0x56, &[w, r, r, (I, N, None)], None);
+        assert_row(Op::CallForwardArguments, 0xBC, &[w, r, r, r, r], None);
+    }
+
+    #[test]
+    fn lookup_family_rows_are_exact() {
+        use OperandKind::{ConstIndex as K, Imm32 as I, Register as Reg};
+        use RegisterAccess::{None as N, Read as Rd, Write as Wr};
+        let w = (Reg, Wr, None);
+        let r = (Reg, Rd, None);
+        let k = (K, N, None);
+        let coord = (I, N, Some(ImmediateDomain::ContextCoord));
+        let depth = (I, N, Some(ImmediateDomain::ContextDepth));
+
+        assert_row(
+            Op::LoadLookupSlot,
+            0xA2,
+            &[w, r, k, coord],
+            Some(BindingSemantics::Read(BindingRead::LookupSlot {
+                destination: 0,
+                context: 1,
+                name: 2,
+                coord: 3,
+            })),
+        );
+        assert_row(
+            Op::StoreLookupSlot,
+            0xB2,
+            &[r, r, k, coord, (I, N, Some(ImmediateDomain::StoreFallback))],
+            Some(BindingSemantics::Write(BindingWrite::LookupSlot {
+                value: 0,
+                context: 1,
+                name: 2,
+                coord: 3,
+                fallback: 4,
+            })),
+        );
+        assert_row(
+            Op::DeleteLookupSlot,
+            0xB3,
+            &[w, r, k, depth],
+            Some(BindingSemantics::Delete(BindingDelete::LookupSlot {
+                destination: 0,
+                context: 1,
+                name: 2,
+                depth: 3,
+            })),
+        );
+        for (op, byte, missing) in [
+            (Op::LoadLookupGlobal, 0x8F, BindingMissing::Throw),
+            (Op::TypeofLookupGlobal, 0x91, BindingMissing::Undefined),
+        ] {
+            assert_row(
+                op,
+                byte,
+                &[w, r, k, depth],
+                Some(BindingSemantics::Read(BindingRead::LookupGlobal {
+                    destination: 0,
+                    context: 1,
+                    name: 2,
+                    depth: 3,
+                    missing,
+                })),
+            );
+        }
+        assert_row(
+            Op::StoreLookupGlobal,
+            0x90,
+            &[r, r, k, (I, N, Some(ImmediateDomain::LookupGlobalMode))],
+            Some(BindingSemantics::Write(BindingWrite::LookupGlobal {
+                value: 0,
+                context: 1,
+                name: 2,
+                mode: 3,
+            })),
+        );
+        assert_row(
+            Op::DeleteLookupGlobal,
+            0xA4,
+            &[w, r, k, depth],
+            Some(BindingSemantics::Delete(BindingDelete::LookupGlobal {
+                destination: 0,
+                context: 1,
+                name: 2,
+                depth: 3,
+            })),
+        );
+        assert_row(
+            Op::ResolveLookupRef,
+            0xB6,
+            &[w, r, k, (I, N, Some(ImmediateDomain::LookupRefTarget))],
+            Some(BindingSemantics::Read(BindingRead::ResolveRef {
+                destination: 0,
+                context: 1,
+                name: 2,
+                target: 3,
+            })),
+        );
+        assert_row(
+            Op::StoreRef,
+            0xB8,
+            &[r, r, k, (I, N, Some(ImmediateDomain::StoreRefMode))],
+            Some(BindingSemantics::Write(BindingWrite::StoreRef {
+                value: 0,
+                reference: 1,
+                name: 2,
+                mode: 3,
+            })),
+        );
+        assert_row(
+            Op::DeclareEvalVar,
+            0xB9,
+            &[r, k, depth],
+            Some(BindingSemantics::Write(BindingWrite::DeclareEvalVar {
+                context: 0,
+                name: 1,
+                var_depth: 2,
+            })),
+        );
+        assert_row(
+            Op::StoreVarScope,
+            0xC5,
+            &[r, r, k, depth],
+            Some(BindingSemantics::Write(BindingWrite::VarScope {
+                value: 0,
+                context: 1,
+                name: 2,
+                var_depth: 3,
+            })),
+        );
+    }
+
+    #[test]
+    fn context_family_effects_are_exact() {
+        let effects = |op| opcode_schema(op).effects;
+        for op in [Op::LoadClosureContext, Op::LoadSelf] {
+            assert_eq!(effects(op), OpcodeEffects::LEAF, "{op:?}");
+        }
+        let load = effects(Op::LoadContextSlot);
+        assert!(load.may_read_heap && !load.may_write_heap && !load.may_throw);
+        let store = effects(Op::StoreContextSlot);
+        assert!(store.may_write_heap && !store.may_throw && !store.may_allocate);
+        assert!(!store.safepoint_required);
+        for op in [
+            Op::LoadContextSlotChecked,
+            Op::StoreContextSlotChecked,
+            Op::BindThisContextSlot,
+        ] {
+            let checked = effects(op);
+            assert!(checked.may_throw && !checked.may_allocate, "{op:?}");
+            assert!(
+                !checked.may_trigger_gc && !checked.safepoint_required,
+                "{op:?}"
+            );
+            assert_eq!(
+                checked.may_write_heap,
+                op != Op::LoadContextSlotChecked,
+                "{op:?}"
+            );
+        }
+        for op in [Op::CreateContext, Op::CopyContext, Op::MakeClosure] {
+            let allocation = effects(op);
+            assert!(
+                allocation.may_allocate && allocation.may_trigger_gc,
+                "{op:?}"
+            );
+            assert!(
+                allocation.safepoint_required && allocation.may_throw,
+                "{op:?}"
+            );
+            assert!(!allocation.may_reenter_javascript, "{op:?}");
+            assert!(!allocation.may_write_heap, "{op:?}");
+        }
+        // Unchecked context accesses have no exception edge; checked ones do.
+        for op in [Op::LoadContextSlot, Op::StoreContextSlot] {
+            assert!(
+                opcode_schema(op)
+                    .exception_successor_shape
+                    .exact()
+                    .is_empty()
+            );
+        }
+        for op in [Op::LoadContextSlotChecked, Op::StoreContextSlotChecked] {
+            assert_eq!(
+                opcode_schema(op).exception_successor_shape.exact(),
+                &[ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller]
+            );
+        }
+        let return_derived = opcode_schema(Op::ReturnDerived);
+        assert_eq!(return_derived.effects, OpcodeEffects::LEAF.throwing());
+        assert_eq!(
+            return_derived.successor_shape.exact(),
+            &[SuccessorSpec::FrameReturn]
+        );
+        assert_eq!(
+            return_derived.exception_successor_shape.exact(),
+            &[ExceptionSuccessorSpec::CallerHandlerOrUncaught]
+        );
+        assert!(Op::ReturnDerived.is_branch());
     }
 
     #[test]
     fn binding_semantic_operands_agree_with_wire_roles() {
         let assert_operand =
             |schema: &OpcodeSchema, index: u8, kind: OperandKind, access: RegisterAccess| {
-                let actual = operand_spec_at(schema.op, usize::from(index));
+                let actual = operand_spec_at(schema.op, usize::from(index))
+                    .unwrap_or_else(|| panic!("{:?} operand {index} is missing", schema.op));
                 assert_eq!(
-                    actual,
-                    Some(OperandSpec {
-                        kind,
-                        register_access: access,
-                        register_source: (access != RegisterAccess::None)
-                            .then_some(RegisterSource::RegisterOperand),
-                    }),
+                    (actual.kind, actual.register_access),
+                    (kind, access),
                     "{:?} operand {index}",
                     schema.op
                 );
             };
+        let assert_immediate = |schema: &OpcodeSchema, index: u8, domain: ImmediateDomain| {
+            assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+            assert_eq!(
+                operand_spec_at(schema.op, usize::from(index)).and_then(|spec| spec.imm_domain),
+                Some(domain),
+                "{:?} operand {index}",
+                schema.op
+            );
+        };
         for schema in OPCODE_SCHEMA {
             let Some(binding) = schema.binding else {
                 continue;
@@ -1974,64 +2664,91 @@ mod tests {
             for value in binding.value_operands().into_iter().flatten() {
                 assert_operand(schema, value, OperandKind::Register, RegisterAccess::Read);
             }
+            let name = |index| {
+                assert_operand(schema, index, OperandKind::ConstIndex, RegisterAccess::None);
+            };
             match binding {
                 BindingSemantics::Read(BindingRead::GlobalThis { .. }) => {}
-                BindingSemantics::Read(BindingRead::Upvalue { index, .. }) => {
-                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+                BindingSemantics::Read(BindingRead::Global { name: n, .. })
+                | BindingSemantics::Read(BindingRead::Exists { name: n, .. })
+                | BindingSemantics::Write(BindingWrite::GlobalChecked { name: n, .. }) => name(n),
+                BindingSemantics::Write(BindingWrite::Global {
+                    name: n, strict, ..
+                }) => {
+                    name(n);
+                    assert_operand(schema, strict, OperandKind::Imm32, RegisterAccess::None);
                 }
-                BindingSemantics::Read(BindingRead::Global { name, .. })
-                | BindingSemantics::Read(BindingRead::Exists { name, .. })
-                | BindingSemantics::Read(BindingRead::Dynamic { name, .. })
-                | BindingSemantics::Delete(BindingDelete::Dynamic { name, .. }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
+                BindingSemantics::Read(BindingRead::ContextSlot { coord, .. })
+                | BindingSemantics::Write(BindingWrite::ContextSlot { coord, .. })
+                | BindingSemantics::Write(BindingWrite::BindThis { coord, .. }) => {
+                    assert_immediate(schema, coord, ImmediateDomain::ContextCoord);
                 }
-                BindingSemantics::Read(BindingRead::ShadowedUpvalue {
-                    name,
-                    index,
-                    eval_depth,
+                BindingSemantics::Read(BindingRead::LookupSlot { name: n, coord, .. }) => {
+                    name(n);
+                    assert_immediate(schema, coord, ImmediateDomain::ContextCoord);
+                }
+                BindingSemantics::Write(BindingWrite::LookupSlot {
+                    name: n,
+                    coord,
+                    fallback,
+                    ..
+                }) => {
+                    name(n);
+                    assert_immediate(schema, coord, ImmediateDomain::ContextCoord);
+                    assert_immediate(schema, fallback, ImmediateDomain::StoreFallback);
+                }
+                BindingSemantics::Read(BindingRead::LookupGlobal { name: n, depth, .. })
+                | BindingSemantics::Delete(BindingDelete::LookupSlot { name: n, depth, .. })
+                | BindingSemantics::Delete(BindingDelete::LookupGlobal {
+                    name: n, depth, ..
+                })
+                | BindingSemantics::Write(BindingWrite::DeclareEvalVar {
+                    name: n,
+                    var_depth: depth,
                     ..
                 })
-                | BindingSemantics::Delete(BindingDelete::ShadowedUpvalue {
-                    name,
-                    index,
-                    eval_depth,
+                | BindingSemantics::Write(BindingWrite::VarScope {
+                    name: n,
+                    var_depth: depth,
                     ..
                 }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
-                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
-                    assert_operand(schema, eval_depth, OperandKind::Imm32, RegisterAccess::None);
+                    name(n);
+                    assert_immediate(schema, depth, ImmediateDomain::ContextDepth);
                 }
-                BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
-                    assert_operand(schema, strict, OperandKind::Imm32, RegisterAccess::None);
+                BindingSemantics::Write(BindingWrite::LookupGlobal { name: n, mode, .. }) => {
+                    name(n);
+                    assert_immediate(schema, mode, ImmediateDomain::LookupGlobalMode);
                 }
-                BindingSemantics::Write(BindingWrite::GlobalChecked { name, .. }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
-                }
-                BindingSemantics::Write(BindingWrite::Dynamic { name, strict, .. }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
-                    assert_operand(schema, strict, OperandKind::Imm32, RegisterAccess::None);
-                }
-                BindingSemantics::Write(BindingWrite::Upvalue { index, .. }) => {
-                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
-                }
-                BindingSemantics::Write(BindingWrite::ShadowedUpvalue {
-                    name,
-                    index,
-                    policy,
-                    ..
+                BindingSemantics::Read(BindingRead::ResolveRef {
+                    name: n, target, ..
                 }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
-                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
-                    assert_operand(schema, policy, OperandKind::Imm32, RegisterAccess::None);
+                    name(n);
+                    assert_immediate(schema, target, ImmediateDomain::LookupRefTarget);
                 }
-                BindingSemantics::Read(BindingRead::EvalBindingSeq { .. }) => {}
-                BindingSemantics::Write(BindingWrite::ShadowedRestore { name, index }) => {
-                    assert_operand(schema, name, OperandKind::ConstIndex, RegisterAccess::None);
-                    assert_operand(schema, index, OperandKind::Imm32, RegisterAccess::None);
+                BindingSemantics::Write(BindingWrite::StoreRef { name: n, mode, .. }) => {
+                    name(n);
+                    assert_immediate(schema, mode, ImmediateDomain::StoreRefMode);
                 }
             }
         }
+    }
+
+    #[test]
+    fn binding_register_inputs_name_context_after_value() {
+        let context_write = opcode_schema(Op::StoreLookupSlot).binding.unwrap();
+        assert_eq!(context_write.value_operands(), [Some(0), Some(1)]);
+        assert_eq!(context_write.result_operand(), None);
+        let store_ref = opcode_schema(Op::StoreRef).binding.unwrap();
+        assert_eq!(store_ref.value_operands(), [Some(0), Some(1)]);
+        let context_read = opcode_schema(Op::LoadLookupGlobal).binding.unwrap();
+        assert_eq!(context_read.value_operands(), [Some(1), None]);
+        assert_eq!(context_read.result_operand(), Some(0));
+        let declare = opcode_schema(Op::DeclareEvalVar).binding.unwrap();
+        assert_eq!(declare.value_operands(), [Some(0), None]);
+        assert_eq!(declare.result_operand(), None);
+        let delete = opcode_schema(Op::DeleteLookupSlot).binding.unwrap();
+        assert_eq!(delete.value_operands(), [Some(1), None]);
+        assert_eq!(delete.result_operand(), Some(0));
     }
 
     #[test]
@@ -2106,6 +2823,11 @@ mod tests {
             operand_spec_at(Op::LoadLocal, 1),
             Some(OperandSpec::local_index(RegisterAccess::Read))
         );
+        assert_eq!(
+            operand_spec_at(Op::StoreLookupSlot, 4),
+            Some(OperandSpec::immediate(ImmediateDomain::StoreFallback))
+        );
+        assert_eq!(operand_spec_at(Op::StoreLookupSlot, 5), None);
     }
 
     #[test]

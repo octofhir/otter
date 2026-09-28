@@ -8,6 +8,9 @@
 //! - Every possible use of the arguments identity is checked, including aliases.
 //! - A join with an ordinary value cannot become an activation argument read.
 //! - Unsupported control flow or an escaping use retains ordinary construction.
+//! - A closure-context operand still holds its placeholder register until
+//!   `FunctionContext::finish_code` routes it to a fresh register, so it is
+//!   never a use of the arguments identity.
 //! - Logical PCs stay unchanged, preserving branches, spans and source metadata.
 //!
 //! # See also
@@ -46,6 +49,7 @@ pub(crate) fn analyze(
     code: &FunctionCodeBuilder,
     constants: &[Constant],
     registers: u16,
+    closure_context_operands: &[(u32, usize)],
 ) -> Option<ArgumentsReadPlan> {
     let width = usize::from(registers);
     let count = code.len();
@@ -143,7 +147,9 @@ pub(crate) fn analyze(
         }
         let op = code.op(pc as u32)?;
         for index in 0..code.operand_count(pc as u32)? {
-            if operand_spec_at(op, index)?.register_access != RegisterAccess::Read {
+            if operand_spec_at(op, index)?.register_access != RegisterAccess::Read
+                || closure_context_operands.contains(&(pc as u32, index))
+            {
                 continue;
             }
             let src = register(code.operand(pc as u32, index)?)?;
@@ -182,7 +188,7 @@ pub(crate) fn lower(code: &mut FunctionCodeBuilder, plan: &ArgumentsReadPlan) {
         if pc == plan.allocation_pc {
             // Every use of the identity is either a dead copy or replaced
             // below. A normal tagged undefined keeps all register roots valid.
-            result.push(Op::LoadUndefined, &operands);
+            result.push(Op::LoadUndefined, &operands[..1]);
         } else if plan.lengths.binary_search(&pc).is_ok() {
             result.push(Op::LoadArgumentsLength, &operands[..1]);
         } else if plan.elements.binary_search(&pc).is_ok() {
@@ -210,7 +216,7 @@ mod tests {
     #[test]
     fn follows_local_aliases_through_a_loop_and_register_reuse() {
         let code = body(&[
-            (Op::CollectArguments, &[R(0)]),
+            (Op::CollectArguments, &[R(0), R(0)]),
             (Op::StoreLocal, &[R(0), I(1)]),
             (Op::LoadLocal, &[R(2), I(1)]),
             (Op::LoadProperty, &[R(2), R(2), K(0)]),
@@ -225,7 +231,8 @@ mod tests {
                 &[Constant::String {
                     utf16: "length".encode_utf16().collect()
                 }],
-                6
+                6,
+                &[]
             ),
             Some(ArgumentsReadPlan {
                 allocation_pc: 0,
@@ -238,7 +245,7 @@ mod tests {
     #[test]
     fn a_join_with_an_ordinary_receiver_keeps_the_object() {
         let code = body(&[
-            (Op::CollectArguments, &[R(0)]),
+            (Op::CollectArguments, &[R(0), R(0)]),
             (Op::JumpIfTrue, &[I(1), R(1)]),
             (Op::LoadNull, &[R(0)]),
             (Op::LoadProperty, &[R(2), R(0), K(0)]),
@@ -250,7 +257,8 @@ mod tests {
                 &[Constant::String {
                     utf16: "length".encode_utf16().collect()
                 }],
-                3
+                3,
+                &[]
             )
             .is_none()
         );
@@ -260,19 +268,19 @@ mod tests {
     fn calls_captures_and_argument_keys_escape() {
         for (op, operands) in [
             (Op::Call, vec![R(2), R(1), K(1), R(0)]),
-            (Op::StoreUpvalue, vec![R(0), I(0)]),
+            (Op::StoreContextSlot, vec![R(0), R(1), I(0)]),
             (Op::LoadElement, vec![R(2), R(0), R(0)]),
             (Op::ReturnValue, vec![R(0)]),
         ] {
-            let code = body(&[(Op::CollectArguments, &[R(0)]), (op, &operands)]);
-            assert!(analyze(&code, &[], 3).is_none(), "{op:?}");
+            let code = body(&[(Op::CollectArguments, &[R(0), R(0)]), (op, &operands)]);
+            assert!(analyze(&code, &[], 3, &[]).is_none(), "{op:?}");
         }
     }
 
     #[test]
     fn use_before_alias_initialization_is_not_a_virtual_receiver() {
         let code = body(&[
-            (Op::CollectArguments, &[R(0)]),
+            (Op::CollectArguments, &[R(0), R(0)]),
             (Op::LoadProperty, &[R(2), R(1), K(0)]),
             (Op::StoreLocal, &[R(0), I(1)]),
             (Op::LoadProperty, &[R(2), R(1), K(0)]),
@@ -284,8 +292,27 @@ mod tests {
                 utf16: "length".encode_utf16().collect(),
             }],
             3,
+            &[],
         )
         .unwrap();
         assert_eq!(plan.lengths, vec![3]);
+    }
+
+    #[test]
+    fn closure_context_placeholder_is_not_an_arguments_use() {
+        // The closure-context operand of `LoadContextSlot` still names the
+        // placeholder `r0`, which here also holds the arguments identity.
+        let code = body(&[
+            (Op::CollectArguments, &[R(0), R(0)]),
+            (Op::LoadContextSlot, &[R(1), R(0), I(0)]),
+            (Op::LoadProperty, &[R(2), R(0), K(0)]),
+            (Op::ReturnValue, &[R(2)]),
+        ]);
+        let constants = [Constant::String {
+            utf16: "length".encode_utf16().collect(),
+        }];
+        assert!(analyze(&code, &constants, 3, &[]).is_none());
+        let plan = analyze(&code, &constants, 3, &[(1, 1)]).unwrap();
+        assert_eq!(plan.lengths, vec![2]);
     }
 }

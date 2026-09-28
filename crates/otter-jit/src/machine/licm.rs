@@ -11,14 +11,15 @@
 //!
 //! # Invariants
 //! - Only non-throwing, non-allocating, non-writing instructions move.
+//!   Their results are scalar, except SELF and context-chain reads, whose
+//!   tagged results are ordinary rooted values addressed from their input.
 //! - The preheader holds hoisted instructions in dependency order: block
 //!   indices stop following dominance once splits append body blocks.
 //! - A memory read moves only when the loop has no invalidating boundary or
 //!   overlapping write.
-//! - Loop parameters are variant. External entry and OSR execute the same
+//! - Loop parameters are variant unless every backedge passes them unchanged.
+//!   Every external entry, ordinary and OSR block alike, executes the same
 //!   preheader; generated backedges target its split body.
-//! - The header's OSR entry leads the preheader, so it is not a loop boundary:
-//!   an OSR entry performs every hoisted read after its own frame mapping.
 //! - Safepoint ids are renumbered in the new instruction order after every
 //!   split, because the split body block is appended after all others.
 //! - The transform owns no raw-pointer cache or alternate semantic lowering.
@@ -220,17 +221,6 @@ fn invariant_instructions(
     for &block in &natural_loop.blocks {
         let data = &sequence.blocks[block];
         for index in data.first.0 as usize..data.end.0 as usize {
-            // The header's OSR entry moves to the front of the split
-            // preheader, ahead of every hoisted instruction, so an OSR entry
-            // performs the hoisted run itself and the loop no longer holds it.
-            if block == natural_loop.header
-                && matches!(
-                    sequence.instructions[index].opcode,
-                    MachineOpcode::OsrEntry { .. }
-                )
-            {
-                continue;
-            }
             let effects = effects_for_instruction(
                 &sequence.instructions[index].opcode,
                 &sequence.call_descriptors,
@@ -317,15 +307,25 @@ fn invariant_instructions(
                 }) {
                     continue;
                 }
-                if outputs.iter().any(|output| {
-                    !matches!(
-                        sequence.representations[output.0 as usize],
+                // Tagged results move only for context-chain reads: their
+                // tagged input is the owning heap value itself, so a hoisted
+                // result is an ordinary rooted value and no derived address
+                // crosses a backedge or a safepoint.
+                let tagged_movable = matches!(
+                    instruction.opcode,
+                    MachineOpcode::EntryCallee | MachineOpcode::ContextLoad { .. }
+                );
+                if outputs
+                    .iter()
+                    .any(|output| match sequence.representations[output.0 as usize] {
                         super::MachineRepresentation::Int32
-                            | super::MachineRepresentation::Uint32
-                            | super::MachineRepresentation::Int64
-                            | super::MachineRepresentation::Boolean
-                    )
-                }) {
+                        | super::MachineRepresentation::Uint32
+                        | super::MachineRepresentation::Int64
+                        | super::MachineRepresentation::Boolean => false,
+                        super::MachineRepresentation::Tagged => !tagged_movable,
+                        _ => true,
+                    })
+                {
                     continue;
                 }
                 candidates.insert(index);
@@ -465,7 +465,6 @@ fn split_preheader_and_hoist(
         .zip(new_parameters.iter().copied())
         .collect::<BTreeMap<_, _>>();
 
-    let mut osr_entry = None;
     let mut invariants = Vec::new();
     for &block in &natural_loop.blocks {
         let first = sequence.blocks[block].first.0 as usize;
@@ -475,10 +474,7 @@ fn split_preheader_and_hoist(
             .enumerate()
         {
             let index = first + offset;
-            if block == header && matches!(instruction.opcode, MachineOpcode::OsrEntry { .. }) {
-                rewrite_parameter_uses(&mut instruction, &parameter_map);
-                osr_entry = Some(instruction);
-            } else if candidates.contains(&index) {
+            if candidates.contains(&index) {
                 rewrite_parameter_uses(&mut instruction, &parameter_map);
                 invariants.push(instruction);
             } else {
@@ -487,8 +483,7 @@ fn split_preheader_and_hoist(
         }
         block_instructions[block] = retained;
     }
-    let mut hoisted = osr_entry.into_iter().collect::<Vec<_>>();
-    hoisted.extend(in_dependency_order(invariants));
+    let mut hoisted = in_dependency_order(invariants);
     let hoisted_outputs = hoisted
         .iter()
         .flat_map(|instruction| instruction.operands.iter())
@@ -689,9 +684,7 @@ fn innermost_natural_loops(sequence: &InstructionSequence) -> Vec<NaturalLoop> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::{
-        MachineOperand, MachineOsrInput, MachineRepresentation, TargetClobberSet,
-    };
+    use crate::machine::{MachineOperand, MachineOsrType, MachineRepresentation, TargetClobberSet};
 
     #[test]
     fn hoisted_invariants_define_before_they_use() {
@@ -739,7 +732,6 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum LoopBoundary {
         None,
-        HeaderOsrEntry,
         LatchShapeWrite,
     }
 
@@ -763,15 +755,6 @@ mod tests {
         let mut jump = MachineInstruction::plain(MachineOpcode::Jump, vec![]);
         jump.control = ControlFlow::Branch;
         instructions.push(jump.clone());
-        if boundary == LoopBoundary::HeaderOsrEntry {
-            instructions.push(MachineInstruction::plain(
-                MachineOpcode::OsrEntry {
-                    logical_pc: 1,
-                    inputs: Vec::<MachineOsrInput>::new(),
-                },
-                vec![],
-            ));
-        }
         let mut guard = MachineInstruction::plain(
             MachineOpcode::CacheIrGuardShape {
                 byte_pc: 8,
@@ -1009,32 +992,172 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn header_osr_entry_leads_the_preheader_ahead_of_a_hoisted_memory_guard() {
+    /// A loop entered from the ordinary entry and from its OSR block: both
+    /// external predecessors reach the one preheader that runs the hoisted
+    /// guard, and the header parameters they pass stay loop parameters.
+    fn osr_entered_shape_guard_loop() -> InstructionSequence {
         let target = TargetSpec::aarch64();
-        let (sequence, stats) = optimize(shape_guard_loop(LoopBoundary::HeaderOsrEntry), &target)
-            .expect("OSR-entered guard LICM");
+        let receiver = MachineValue(0);
+        let active = MachineValue(1);
+        let guarded = MachineValue(2);
+        let loop_receiver = MachineValue(3);
+        let loop_active = MachineValue(4);
+        let osr_receiver = MachineValue(5);
+        let osr_active = MachineValue(6);
+        let mut dispatch = MachineInstruction::plain(
+            MachineOpcode::OsrDispatch {
+                logical_pcs: vec![1],
+            },
+            vec![],
+        );
+        dispatch.control = ControlFlow::Branch;
+        let mut jump = MachineInstruction::plain(MachineOpcode::Jump, vec![]);
+        jump.control = ControlFlow::Branch;
+        let mut instructions = vec![
+            dispatch,
+            MachineInstruction::plain(
+                MachineOpcode::EntryValue(0),
+                vec![MachineOperand::register_output(receiver)],
+            ),
+            MachineInstruction::plain(
+                MachineOpcode::BooleanConstant(true),
+                vec![MachineOperand::register_output(active)],
+            ),
+            jump.clone(),
+            MachineInstruction::plain(
+                MachineOpcode::OsrValue {
+                    logical_pc: 1,
+                    frame_register: 0,
+                    value_type: MachineOsrType::Tagged,
+                },
+                vec![MachineOperand::register_output(osr_receiver)],
+            ),
+            MachineInstruction::plain(
+                MachineOpcode::OsrValue {
+                    logical_pc: 1,
+                    frame_register: 1,
+                    value_type: MachineOsrType::Boolean,
+                },
+                vec![MachineOperand::register_output(osr_active)],
+            ),
+            jump.clone(),
+        ];
+        let header_start = MachineInstructionId(instructions.len() as u32);
+        let mut guard = MachineInstruction::plain(
+            MachineOpcode::CacheIrGuardShape {
+                byte_pc: 8,
+                shape: 1,
+            },
+            vec![
+                MachineOperand::location_input(loop_receiver),
+                MachineOperand::register_input(loop_active),
+                MachineOperand::register_output(guarded),
+            ],
+        );
+        guard.clobbers = target.clobbers(TargetClobberSet::PropertyLoad).to_vec();
+        instructions.push(guard);
+        let mut branch = MachineInstruction::plain(
+            MachineOpcode::BranchIf(false),
+            vec![MachineOperand::register_input(guarded)],
+        );
+        branch.control = ControlFlow::Branch;
+        instructions.push(branch);
+        let header_end = MachineInstructionId(instructions.len() as u32);
+        instructions.push(jump);
+        let latch_end = MachineInstructionId(instructions.len() as u32);
+        let mut ret = MachineInstruction::plain(
+            MachineOpcode::Return,
+            vec![MachineOperand::register_input(loop_receiver)],
+        );
+        ret.control = ControlFlow::Return;
+        instructions.push(ret);
+        let end = MachineInstructionId(instructions.len() as u32);
+        InstructionSequence::new(
+            &target,
+            MachineBlock(0),
+            vec![
+                MachineRepresentation::Tagged,
+                MachineRepresentation::Boolean,
+                MachineRepresentation::Boolean,
+                MachineRepresentation::Tagged,
+                MachineRepresentation::Boolean,
+                MachineRepresentation::Tagged,
+                MachineRepresentation::Boolean,
+            ],
+            vec![],
+            vec![
+                MachineBlockData {
+                    first: MachineInstructionId(0),
+                    end: MachineInstructionId(1),
+                    predecessors: vec![],
+                    successors: vec![MachineBlock(1), MachineBlock(2)],
+                    parameters: vec![],
+                    successor_arguments: vec![vec![], vec![]],
+                },
+                MachineBlockData {
+                    first: MachineInstructionId(1),
+                    end: MachineInstructionId(4),
+                    predecessors: vec![MachineBlock(0)],
+                    successors: vec![MachineBlock(3)],
+                    parameters: vec![],
+                    successor_arguments: vec![vec![receiver, active]],
+                },
+                MachineBlockData {
+                    first: MachineInstructionId(4),
+                    end: header_start,
+                    predecessors: vec![MachineBlock(0)],
+                    successors: vec![MachineBlock(3)],
+                    parameters: vec![],
+                    successor_arguments: vec![vec![osr_receiver, osr_active]],
+                },
+                MachineBlockData {
+                    first: header_start,
+                    end: header_end,
+                    predecessors: vec![MachineBlock(1), MachineBlock(2), MachineBlock(4)],
+                    successors: vec![MachineBlock(5), MachineBlock(4)],
+                    parameters: vec![loop_receiver, loop_active],
+                    successor_arguments: vec![vec![], vec![]],
+                },
+                MachineBlockData {
+                    first: header_end,
+                    end: latch_end,
+                    predecessors: vec![MachineBlock(3)],
+                    successors: vec![MachineBlock(3)],
+                    parameters: vec![],
+                    successor_arguments: vec![vec![loop_receiver, loop_active]],
+                },
+                MachineBlockData {
+                    first: latch_end,
+                    end,
+                    predecessors: vec![MachineBlock(3)],
+                    successors: vec![],
+                    parameters: vec![],
+                    successor_arguments: vec![],
+                },
+            ],
+            instructions,
+        )
+        .expect("OSR-entered guard loop")
+    }
+
+    #[test]
+    fn osr_block_enters_the_shared_preheader_that_runs_a_hoisted_guard() {
+        let target = TargetSpec::aarch64();
+        let (sequence, stats) =
+            optimize(osr_entered_shape_guard_loop(), &target).expect("OSR-entered guard LICM");
         assert_eq!(stats.versioned_loops, 1);
         assert_eq!(stats.hoisted_instructions, 1);
-        let preheader = &sequence.blocks[1];
+        let preheader = &sequence.blocks[3];
+        assert_eq!(
+            preheader.predecessors,
+            vec![MachineBlock(1), MachineBlock(2)]
+        );
         let opcodes = (preheader.first.0..preheader.end.0)
             .map(|index| &sequence.instructions[index as usize].opcode)
             .collect::<Vec<_>>();
         assert!(matches!(
             opcodes.as_slice(),
-            [
-                MachineOpcode::OsrEntry { .. },
-                MachineOpcode::CacheIrGuardShape { .. },
-                MachineOpcode::Jump
-            ]
+            [MachineOpcode::CacheIrGuardShape { .. }, MachineOpcode::Jump]
         ));
-        assert!(sequence.blocks[2..].iter().all(|block| {
-            (block.first.0..block.end.0).all(|index| {
-                !matches!(
-                    sequence.instructions[index as usize].opcode,
-                    MachineOpcode::OsrEntry { .. } | MachineOpcode::CacheIrGuardShape { .. }
-                )
-            })
-        }));
     }
 }

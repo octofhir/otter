@@ -312,20 +312,12 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_new_object_literal_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_FRESH_UPVALUE,
-            jit_fresh_upvalue_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_PUSH_NATIVE_ACTIVATION,
             jit_push_native_activation_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_POP_NATIVE_ACTIVATION,
             jit_pop_native_activation_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_INLINE_CLOSURE_UPVALUES,
-            jit_inline_closure_upvalues_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_LOOSE_EQ,
@@ -373,11 +365,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         binding(
             abi::STUB_JIT_COPY_SPREAD_ARGUMENTS,
             jit_copy_spread_arguments_stub as *const () as usize,
-        ),
-        context_words_binding!(
-            abi::STUB_JIT_INITIALIZE_UPVALUES,
-            jit_initialize_upvalues_stub,
-            3
         ),
         binding(
             abi::STUB_JIT_COERCE_UNARY,
@@ -481,7 +468,7 @@ mod tests {
     //! coverage lives in [`crate::template`]'s test suite.
 
     use super::{BaselinePlan, Unsupported};
-    use otter_bytecode::{Op, Operand};
+    use otter_bytecode::{ContextCoord, Op, Operand};
     use otter_vm::{JitCompileSnapshot, jit::JitTestInstruction};
 
     const STRIDE: u32 = 4;
@@ -754,12 +741,20 @@ mod tests {
                 ],
             ),
             (
-                Op::LoadUpvalue,
-                vec![Operand::Register(4), Operand::Imm32(5)],
+                Op::LoadContextSlotChecked,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(6),
+                    Operand::Imm32(ContextCoord::new(1, 5).unwrap().to_imm32()),
+                ],
             ),
             (
-                Op::StoreUpvalueChecked,
-                vec![Operand::Register(4), Operand::Imm32(5)],
+                Op::StoreContextSlotChecked,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(6),
+                    Operand::Imm32(ContextCoord::new(1, 5).unwrap().to_imm32()),
+                ],
             ),
             (
                 Op::StoreGlobalChecked,
@@ -788,16 +783,18 @@ mod tests {
             (store.object, store.name, store.value, store.scratch),
             (0, 7, 2, 3)
         );
-        let load_upvalue = plan.instructions[2]
+        // The context register is a boxed input like any other value: the
+        // checked load passes it alone, the checked store after the value.
+        let load_slot = plan.instructions[2]
             .binding_value_operands()
-            .expect("LoadUpvalue binding operands");
-        assert_eq!(load_upvalue.result, Some(4));
-        assert_eq!(load_upvalue.values, [None, None]);
-        let store_upvalue = plan.instructions[3]
+            .expect("LoadContextSlotChecked binding operands");
+        assert_eq!(load_slot.result, Some(4));
+        assert_eq!(load_slot.values, [Some(6), None]);
+        let store_slot = plan.instructions[3]
             .binding_value_operands()
-            .expect("StoreUpvalueChecked binding operands");
-        assert_eq!(store_upvalue.result, None);
-        assert_eq!(store_upvalue.values, [Some(4), None]);
+            .expect("StoreContextSlotChecked binding operands");
+        assert_eq!(store_slot.result, None);
+        assert_eq!(store_slot.values, [Some(4), Some(6)]);
         let store_global = plan.instructions[4]
             .binding_value_operands()
             .expect("StoreGlobalChecked binding operands");
@@ -826,12 +823,13 @@ mod tests {
                 vec![
                     Operand::Register(4),
                     Operand::ConstIndex(9),
-                    Operand::ConstIndex(2),
-                    Operand::Imm32(0),
-                    Operand::Imm32(1),
+                    Operand::Register(6),
                 ],
             ),
-            (Op::FreshUpvalue, vec![Operand::Imm32(6)]),
+            (
+                Op::CopyContext,
+                vec![Operand::Register(5), Operand::Register(6)],
+            ),
             (
                 Op::DefineDataProperty,
                 vec![
@@ -852,18 +850,86 @@ mod tests {
         let closure = plan.instructions[1]
             .make_closure_operands()
             .expect("MakeClosure operands");
-        assert_eq!((closure.dst, closure.function), (4, 9));
-        assert_eq!(plan.index_tail(closure.parents), Ok(&[0, 1][..]));
-        assert_eq!(
-            plan.instructions[2]
-                .immediate_operands()
-                .map(|operands| operands.value),
-            Ok(6)
-        );
+        assert_eq!((closure.dst, closure.function, closure.context), (4, 9, 6));
+        let copy = plan.instructions[2]
+            .unary_operands()
+            .expect("CopyContext operands");
+        assert_eq!((copy.dst, copy.src), (5, 6));
         let triple = plan.instructions[3]
             .triple_operands()
             .expect("DefineDataProperty operands");
         assert_eq!((triple.first, triple.second, triple.third), (0, 1, 2));
+    }
+
+    #[test]
+    fn lowering_plan_decodes_context_operations() {
+        let coord = ContextCoord::new(2, 7).unwrap();
+        let v = view(&[
+            (Op::LoadClosureContext, vec![Operand::Register(0)]),
+            (
+                Op::CreateContext,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(3),
+                ],
+            ),
+            (
+                Op::LoadContextSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(1),
+                    Operand::Imm32(coord.to_imm32()),
+                ],
+            ),
+            (
+                Op::StoreContextSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(1),
+                    Operand::Imm32(coord.to_imm32()),
+                ],
+            ),
+            (
+                Op::CopyContext,
+                vec![Operand::Register(3), Operand::Register(1)],
+            ),
+            (
+                Op::Eval,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                    Operand::Imm32(5),
+                ],
+            ),
+            (
+                Op::ReturnDerived,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(2),
+                    Operand::Imm32(otter_bytecode::ContextCoord { depth: 0, slot: 1 }.to_imm32()),
+                ],
+            ),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+        assert_eq!(plan.instructions[0].destination_operands().unwrap().dst, 0);
+        let create = plan.instructions[1].create_context_operands().unwrap();
+        assert_eq!((create.dst, create.parent, create.scope), (1, 0, 3));
+        for index in [2, 3] {
+            let slot = plan.instructions[index].context_slot_operands().unwrap();
+            assert_eq!((slot.value, slot.context, slot.coord), (2, 1, coord));
+        }
+        let eval = plan.instructions[5].eval_operands().unwrap();
+        assert_eq!((eval.dst, eval.src, eval.context, eval.flags), (4, 2, 1, 5));
+        let ret = plan.instructions[6].return_derived_operands().unwrap();
+        assert_eq!((ret.value, ret.context, ret.depth, ret.slot), (4, 2, 0, 1));
+        // Both context allocations own a full-window allocating safepoint.
+        assert_eq!(plan.context_alloc_safepoints.len(), 2);
+        for index in [1, 4] {
+            let id = plan.context_alloc_safepoints[&plan.instructions[index].byte_pc];
+            assert!(plan.safepoint_records.iter().any(|record| record.id == id));
+        }
     }
 
     #[test]

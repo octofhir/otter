@@ -23,7 +23,11 @@
 //!   post-effect rejection can replay `New`.
 //! - Callee registers published by the copied frame header are initialized
 //!   tagged slots on the machine stack. The register-base field locates them;
-//!   fixed control slots and the upvalue spine precede the tagged windows.
+//!   fixed control slots precede the tagged windows.
+//! - The callee frame carries no binding storage. SELF is always the exact
+//!   callee closure (or bare function value), so the callee reaches its
+//!   captured bindings through `LoadClosureContext`; the function-id guard
+//!   fixes the closure's context-chain shape.
 //!   Safepoint-free scalar generations may
 //!   publish only their parameter prefix; every cold exit expands it before
 //!   VM reentry. Moving GC therefore sees exactly the initialized window.
@@ -91,17 +95,17 @@ use crate::{
         FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GC_PAGE_SIZE, GENERATED_FEEDBACK_CLEAN_OFFSET,
         GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
         NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NEW_FROM_SPACE_KIND,
-        OBJECT_BODY_TYPE_TAG, PAGE_ALLOCATED_BYTES_OFFSET, PAGE_BUMP_CURSOR_OFFSET,
-        PAGE_SPACE_OFFSET, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
-        RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET,
-        RECEIVER_ALLOC_PAGE_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
-        RECEIVER_ALLOC_TRACKED_BYTES_OFFSET, RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
-        RECEIVER_ALLOC_TYPE_COUNT_OFFSET, RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
-        RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
-        VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CODE_REGISTRY_OFFSET,
-        VM_THREAD_CURRENT_FRAME_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
+        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET,
+        NEW_FROM_SPACE_KIND, OBJECT_BODY_TYPE_TAG, PAGE_ALLOCATED_BYTES_OFFSET,
+        PAGE_BUMP_CURSOR_OFFSET, PAGE_SPACE_OFFSET, RECEIVER_ALLOC_ATTEMPTS_OFFSET,
+        RECEIVER_ALLOC_GENERATED_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
+        RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET, RECEIVER_ALLOC_PAGE_OFFSET,
+        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RECEIVER_ALLOC_TRACKED_BYTES_OFFSET,
+        RECEIVER_ALLOC_TYPE_BYTES_OFFSET, RECEIVER_ALLOC_TYPE_COUNT_OFFSET,
+        RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported,
+        VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
+        VM_THREAD_CODE_REGISTRY_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET,
+        VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
     },
 };
 
@@ -615,8 +619,6 @@ fn layout_and_artifact(
             .is_none()
             .then_some(reserved_stack_bytes),
         callee_register_count: site.target.plan.register_count,
-        own_upvalue_count: site.target.plan.own_upvalue_count,
-        inherited_upvalue_count: site.target.plan.inherited_upvalue_count,
     };
     Ok((layout, direct_call))
 }
@@ -647,7 +649,6 @@ pub(crate) fn emit_direct_call(
     site: DirectCallSite<'_>,
     deopt_entry: u64,
     resolve_direct_entry: u64,
-    initialize_upvalues_entry: u64,
     code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
     transition: DynamicLabel,
@@ -667,7 +668,6 @@ pub(crate) fn emit_direct_call(
         0,
         0,
         0,
-        initialize_upvalues_entry,
         0,
         code_map,
         bail,
@@ -732,7 +732,6 @@ pub(crate) fn emit_direct_call_with_access<
     prepare_construct_entry: u64,
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
-    initialize_upvalues_entry: u64,
     copy_forwarded_arguments_entry: u64,
     mut code_map: Option<&mut CodeMapCapture>,
     bail: DynamicLabel,
@@ -800,31 +799,10 @@ where
 
     match site.form {
         DirectCallForm::Method { callable, receiver } => {
+            // `method_guard` proved this exact value is the target's bare
+            // function value or a compatible closure. No safepoint or mutation
+            // occurs between guards; SELF publishes it unchanged.
             dynasm!(ops ; .arch aarch64 ; mov x9, X(callable));
-            emit_load_u64(
-                ops,
-                10,
-                value_tag::box_function_id(site.target.plan.function_id),
-            );
-            dynasm!(ops
-                ; .arch aarch64
-                ; cmp x9, x10
-                ; b.eq =>direct_function
-                // `method_guard` proved this exact value is a compatible
-                // closure. No safepoint or mutation occurs between guards.
-                ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
-                ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
-                ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
-            );
-            load(ops, receiver, 12, 0)?;
-            dynasm!(ops
-                ; .arch aarch64
-                ; b =>callable_ready
-                ; =>direct_function
-                ; mov x10, xzr
-                ; mov w11, wzr
-                ; mov w15, wzr
-            );
             load(ops, receiver, 12, 0)?;
         }
         DirectCallForm::Plain { callable } | DirectCallForm::CallWithThis { callable, .. } => {
@@ -868,9 +846,6 @@ where
                 ; .arch aarch64
                 ; cmp w10, w11
                 ; b.ne =>caller_bail
-                ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
-                ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
-                ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
             );
 
             if site.target.plan.this_mode == JitDirectCallThisMode::StrictOrLexical {
@@ -887,9 +862,6 @@ where
                     ; ldr x12, [x9, view.closure_call_layout.bound_this_byte]
                     ; b =>callable_ready
                     ; =>direct_function
-                    ; mov x10, xzr
-                    ; mov w11, wzr
-                    ; mov w15, wzr
                 );
                 if let Some(receiver) = explicit_receiver {
                     load(ops, receiver, 12, 0)?;
@@ -909,9 +881,6 @@ where
                     ; b.ne =>caller_bail
                     ; b =>sloppy_this
                     ; =>direct_function
-                    ; mov x10, xzr
-                    ; mov w11, wzr
-                    ; mov w15, wzr
                     ; =>sloppy_this
                 );
                 // OrdinaryCallBindThis for a sloppy callee: `undefined` and
@@ -990,14 +959,8 @@ where
                 ; .arch aarch64
                 ; cmp w10, w11
                 ; b.ne =>caller_bail
-                ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
-                ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
-                ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
                 ; b =>callable_ready
                 ; =>direct_function
-                ; mov x10, xzr
-                ; mov w11, wzr
-                ; mov w15, wzr
                 ; b =>callable_ready
                 ; =>class_wrapper
                 ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
@@ -1006,12 +969,6 @@ where
         }
     }
     dynasm!(ops ; .arch aarch64 ; =>callable_ready);
-    emit_load_u64(ops, 13, u64::from(site.target.plan.inherited_upvalue_count));
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp w11, w13
-        ; b.ne =>caller_bail
-    );
     record_region(
         &mut code_map,
         "directCallGuard",
@@ -1047,8 +1004,6 @@ where
         ; .arch aarch64
         ; str x25, [sp, layout.saved_x25]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
-        ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-        ; str w15, [sp, abi::NATIVE_FRAME_EVAL_ENV_OFFSET]
     );
     match site.form {
         form if form.is_construct() => {
@@ -1059,8 +1014,6 @@ where
                 ; str x13, [sp, NATIVE_FRAME_SELF_OFFSET]
                 ; str x13, [sp, NATIVE_FRAME_THIS_OFFSET]
                 ; str X(initial_new_target), [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
-                ; str xzr, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             );
         }
         DirectCallForm::Plain { .. }
@@ -1070,18 +1023,9 @@ where
             dynasm!(ops
                 ; .arch aarch64
                 ; stp x12, x13, [sp, NATIVE_FRAME_THIS_OFFSET as i32]
-                ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
             );
         }
         _ => unreachable!("construct forms handled above"),
-    }
-    if site.target.plan.own_upvalue_count != 0 {
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, sp, layout.upvalue_base
-            ; str x13, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-            ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-        );
     }
 
     // Copy arguments before the cold generation resolver can clobber
@@ -1177,7 +1121,7 @@ where
             ; str x13, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         );
     } else {
-        // Every actual slot is a valid root before upvalue allocation can GC.
+        // Every actual slot is a valid root before the frame is published.
         let initialized = ops.new_dynamic_label();
         let initialize = ops.new_dynamic_label();
         emit_load_u64(ops, 15, VALUE_UNDEFINED);
@@ -1377,8 +1321,8 @@ where
         } else {
             dynasm!(ops ; .arch aarch64 ; mov x14, x9);
         }
-        let direct_constructor = ops.new_dynamic_label();
-        let closure_constructor = ops.new_dynamic_label();
+        // SELF is the exact constructor body: a class wrapper publishes its
+        // inner callable, whose context the body reads.
         let constructor_state_ready = ops.new_dynamic_label();
         emit_load_u64(
             ops,
@@ -1388,29 +1332,15 @@ where
         dynasm!(ops
             ; .arch aarch64
             ; cmp x9, x10
-            ; b.eq =>direct_constructor
+            ; b.eq =>constructor_state_ready
             ; ldrb w13, [x9]
             ; cmp w13, view.class_constructor_layout.type_tag as u32
-            ; b.ne =>closure_constructor
+            ; b.ne =>constructor_state_ready
             ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
-            ; cmp x9, x10
-            ; b.eq =>direct_constructor
-            ; =>closure_constructor
-            ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
-            ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
-            ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
-            ; b =>constructor_state_ready
-            ; =>direct_constructor
-            ; mov x10, xzr
-            ; mov w11, wzr
-            ; mov w15, wzr
             ; =>constructor_state_ready
             ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
             ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
             ; str x14, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
-            ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-            ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-            ; str w15, [sp, abi::NATIVE_FRAME_EVAL_ENV_OFFSET]
         );
         emit_copy_fixed_arguments(ops, &layout, site, "construct argument index", &mut load)?;
         record_region(
@@ -1428,8 +1358,6 @@ where
             .construct_callable()
             .expect("derived construct carries callable");
         load(ops, callable, 9, layout.frame_bytes)?;
-        let direct_constructor = ops.new_dynamic_label();
-        let closure_constructor = ops.new_dynamic_label();
         let constructor_state_ready = ops.new_dynamic_label();
         emit_load_u64(
             ops,
@@ -1440,22 +1368,11 @@ where
             ; .arch aarch64
             ; mov x14, x9
             ; cmp x9, x13
-            ; b.eq =>direct_constructor
+            ; b.eq =>constructor_state_ready
             ; ldrb w15, [x9]
             ; cmp w15, view.class_constructor_layout.type_tag as u32
-            ; b.ne =>closure_constructor
+            ; b.ne =>constructor_state_ready
             ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
-            ; cmp x9, x13
-            ; b.eq =>direct_constructor
-            ; =>closure_constructor
-            ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
-            ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
-            ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
-            ; b =>constructor_state_ready
-            ; =>direct_constructor
-            ; mov x10, xzr
-            ; mov w11, wzr
-            ; mov w15, wzr
             ; =>constructor_state_ready
         );
         if site.form.inherits_new_target() {
@@ -1471,52 +1388,9 @@ where
             ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
             ; str x12, [sp, NATIVE_FRAME_THIS_OFFSET]
             ; str x14, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
-            ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-            ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-            ; str w15, [sp, abi::NATIVE_FRAME_EVAL_ENV_OFFSET]
             ; ldrb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
             ; orr w15, w15, abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as u32
             ; strb w15, [sp, NATIVE_FRAME_FLAGS_OFFSET]
-        );
-    }
-    if site.target.plan.own_upvalue_count != 0 {
-        if initialize_upvalues_entry == 0 {
-            return Err(Unsupported::OperandShape(
-                "direct call upvalue initialization transition",
-            ));
-        }
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, sp, layout.upvalue_base
-            ; str x13, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-            ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x0, X(context_register)
-            ; mov x1, sp
-        );
-        emit_load_u64(ops, 2, u64::from(site.target.plan.own_upvalue_count));
-        emit_load_u64(ops, 3, u64::from(site.target.plan.inherited_upvalue_count));
-        emit_runtime_stub(
-            ops,
-            relocations,
-            16,
-            initialize_upvalues_entry,
-            abi::STUB_JIT_INITIALIZE_UPVALUES,
-        );
-        let initialized = ops.new_dynamic_label();
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x1, abi::NativeResultStatus::Success as u32
-            ; b.eq =>initialized
-            ; cmp x1, abi::NativeResultStatus::SideExit as u32
-            ; b.eq =>uncommitted_rejected
-            ; cmp x1, abi::NativeResultStatus::Throw as u32
-            ; b.eq =>construct_prepare_error
-            ; b =>construct_prepare_fatal
-            ; =>initialized
         );
     }
     if let DirectCallArguments::Spread(arguments) = site.arguments {

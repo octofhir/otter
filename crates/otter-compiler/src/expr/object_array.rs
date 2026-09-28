@@ -126,23 +126,27 @@ pub(crate) fn compile_object_literal(
     // and setter definitions in an object literal receive
     // [[HomeObject]] = the object being constructed, so any `super`
     // reference inside their bodies walks one hop up the object's
-    // own [[Prototype]] chain. Install the synthetic `__class_home`
-    // binding in a fresh scope so inner method bodies pick it up
-    // through the standard upvalue walker — same mechanism the class
-    // lowering uses (see `crate::class::SUPER_HOME_NAME`).
+    // own [[Prototype]] chain. Install the `%home` binding in a fresh
+    // `ObjectHome` scope slot so inner method bodies resolve it by name —
+    // same mechanism the class lowering uses
+    // (see `crate::class::SUPER_HOME_NAME`).
     // <https://tc39.es/ecma262/#sec-object-initializer-runtime-semantics-propertydefinitionevaluation>
     // <https://tc39.es/ecma262/#sec-makemethod>
     let needs_home = object_literal_uses_super_in_methods(obj);
     if needs_home {
-        cx.enter_scope();
-        let storage = cx.declare_captured_binding(crate::class::SUPER_HOME_NAME, true, span)?;
+        cx.enter_scope(otter_bytecode::ScopeKind::ObjectHome);
+        let storage = cx.declare_forced_slot(
+            crate::class::SUPER_HOME_NAME,
+            otter_bytecode::SlotKind::SuperHome,
+            span,
+        )?;
         cx.emit_store_storage(dst, storage, span);
         cx.mark_initialized(crate::class::SUPER_HOME_NAME);
     }
     // Each property's key/value temps are dead once its store opcode
     // has folded them into `dst`, so recycle the whole range at the top
     // of every iteration (this also covers the `continue` arms below).
-    // `dst` and the optional `__class_home` cell sit below this mark and
+    // `dst` and the optional `%home` context sit below this mark and
     // stay live. See `FunctionContext::reset_scratch`.
     let prop_mark = cx.scratch;
     let mut seen_proto = false;
@@ -616,7 +620,7 @@ fn compile_static_object_literal(
 /// §15.7.1, so we stop descending into them — arrow functions stay
 /// transparent because their `super` resolves through the enclosing
 /// method's home. Returns `true` if at least one method body or
-/// parameter initializer needs the synthetic `__class_home` capture.
+/// parameter initializer needs the `%home` slot.
 fn object_literal_uses_super_in_methods(obj: &ObjectExpression<'_>) -> bool {
     use oxc_ast_visit::Visit;
 

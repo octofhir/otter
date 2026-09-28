@@ -50,11 +50,11 @@ pub use code::TemplateCode;
 pub(crate) use inline_leaf::{InlineEntryValue, InlineLeafPlan, InlineScratchSlot};
 #[cfg(any(test, target_arch = "aarch64"))]
 pub(crate) use plan::FusedChainStep;
+#[cfg(any(test, target_arch = "aarch64"))]
+pub(crate) use plan::TemplateTail;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use plan::{ACCUMULATOR_DREG, FusedArithKind};
-pub(crate) use plan::{
-    ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan, TemplateTail,
-};
+pub(crate) use plan::{ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan};
 
 use crate::entry::{TransitionTable, Unsupported};
 
@@ -1026,5 +1026,120 @@ mod tests {
             let mut regs = [box_i32(n), 0, 0, 0, 0, 0, 0, 0];
             assert_eq!(run(&v, &mut regs), Exit::Returned(box_i32(expected)));
         }
+    }
+
+    /// A chain of context-shaped words: element `i` names element `i + 1` as
+    /// its parent, and slot `s` of element `i` holds `int32(100 * i + s)`.
+    /// A heap Value is its header address, so generated code walks these
+    /// buffers exactly as it walks real contexts.
+    fn context_chain(length: usize, slots: usize) -> Vec<Vec<u64>> {
+        let layout = otter_vm::jit::JitContextLayout::current();
+        let slot_base = (layout.slots_byte / 8) as usize;
+        let mut chain: Vec<Vec<u64>> = (0..length)
+            .map(|index| {
+                let mut words = vec![0u64; slot_base + slots];
+                for slot in 0..slots {
+                    words[slot_base + slot] = box_i32((100 * index + slot) as i32);
+                }
+                words
+            })
+            .collect();
+        for index in 0..length {
+            let parent = chain
+                .get(index + 1)
+                .map_or(VALUE_UNDEFINED, |next| next.as_ptr() as u64);
+            chain[index][(layout.parent_byte / 8) as usize] = parent;
+        }
+        chain
+    }
+
+    fn coord(depth: u16, slot: u16) -> Operand {
+        Operand::Imm32(
+            otter_bytecode::ContextCoord::new(depth, slot)
+                .expect("addressable slot")
+                .to_imm32(),
+        )
+    }
+
+    #[test]
+    fn unchecked_context_slots_walk_static_parent_chains() {
+        // Depth 1 unrolls its hop; depth 10 takes the counted walk.
+        for depth in [0u16, 1, 10] {
+            let chain = context_chain(12, 4);
+            let v = view(&[
+                (
+                    Op::LoadContextSlot,
+                    vec![Operand::Register(1), Operand::Register(0), coord(depth, 2)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ]);
+            let mut regs = [chain[0].as_ptr() as u64, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(
+                run(&v, &mut regs),
+                Exit::Returned(box_i32(100 * i32::from(depth) + 2)),
+                "depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn unchecked_context_slot_store_writes_the_target_context() {
+        let layout = otter_vm::jit::JitContextLayout::current();
+        let slot_base = (layout.slots_byte / 8) as usize;
+        let chain = context_chain(3, 3);
+        let v = view(&[
+            (
+                Op::StoreContextSlot,
+                vec![Operand::Register(1), Operand::Register(0), coord(1, 2)],
+            ),
+            (
+                Op::LoadContextSlot,
+                vec![Operand::Register(2), Operand::Register(0), coord(1, 2)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [chain[0].as_ptr() as u64, box_i32(-7), 0, 0, 0, 0, 0, 0];
+        assert_eq!(run(&v, &mut regs), Exit::Returned(box_i32(-7)));
+        assert_eq!(chain[1][slot_base + 2], box_i32(-7));
+        assert_eq!(chain[0][slot_base + 2], box_i32(2));
+        assert_eq!(chain[2][slot_base + 2], box_i32(202));
+    }
+
+    #[test]
+    fn closure_context_of_a_bare_self_is_undefined() {
+        // The fixture frame's SELF is `undefined`, which closes over nothing.
+        let v = view(&[
+            (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(9)]),
+            (Op::LoadClosureContext, vec![Operand::Register(0)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        let mut regs = [0u64; 8];
+        assert_eq!(run(&v, &mut regs), Exit::Returned(VALUE_UNDEFINED));
+    }
+
+    #[test]
+    fn derived_return_completes_only_an_undefined_value_over_a_bound_receiver() {
+        // r1 holds the constructor's context; its slot 0 is `DerivedThis`.
+        let v = view(&[(
+            Op::ReturnDerived,
+            vec![Operand::Register(0), Operand::Register(1), coord(0, 0)],
+        )]);
+        let layout = otter_vm::jit::JitContextLayout::current();
+        let slot0 = (layout.slots_byte / 8) as usize;
+        let mut bound = context_chain(1, 1);
+        let receiver = context_chain(1, 1);
+        let receiver = receiver[0].as_ptr() as u64;
+        bound[0][slot0] = receiver;
+        let context = bound[0].as_ptr() as u64;
+        let mut regs = [VALUE_UNDEFINED, context, 0, 0, 0, 0, 0, 0];
+        assert_eq!(run(&v, &mut regs), Exit::Returned(receiver));
+        // An unbound receiver and any explicit value re-run the opcode in the
+        // interpreter, which owns the override and both errors.
+        bound[0][slot0] = VALUE_HOLE;
+        let mut regs = [VALUE_UNDEFINED, context, 0, 0, 0, 0, 0, 0];
+        assert_eq!(run(&v, &mut regs), Exit::Bailed(0));
+        bound[0][slot0] = receiver;
+        let mut regs = [box_i32(1), context, 0, 0, 0, 0, 0, 0];
+        assert_eq!(run(&v, &mut regs), Exit::Bailed(0));
     }
 }

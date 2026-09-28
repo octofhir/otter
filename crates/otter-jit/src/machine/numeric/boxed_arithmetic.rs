@@ -143,6 +143,7 @@ fn visit_inputs(
         | BlockParameter(_)
         | TaggedConstant(_)
         | This
+        | Callee
         | StringConstantCell { .. }
         | BindingGuardedRead { .. }
         | ElementUnseenExit { .. }
@@ -172,6 +173,17 @@ fn visit_inputs(
         BaseConstructResult { result, receiver } => {
             visit(result, true);
             visit(receiver, true);
+        }
+        ClosureContext(source)
+        | ContextParent(source)
+        | ContextSlotLoad {
+            context: source, ..
+        }
+        | ContextHoleGuard { value: source, .. }
+        | ContextAllocation { input: source, .. } => visit(source, true),
+        ContextSlotStore { context, value, .. } => {
+            visit(context, true);
+            visit(value, true);
         }
         ConstructReceiver { source, .. }
         | ConstructReceiverHit(source)

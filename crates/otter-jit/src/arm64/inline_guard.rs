@@ -1,15 +1,14 @@
 //! Shared exact identity proof for frameless inline callees.
 //!
 //! # Contents
-//! - Callable identity and unsupported dynamic-environment rejection.
+//! - Callable identity for a frameless inline body.
 //! - Plain-call this binding for the Machine inline activation recipe.
 //!
 //! # Invariants
 //! - x9 holds the callable; x10..x12 and x14 are reserved scratch.
-//! - Misses occur before callee effects. A dynamic eval environment is
-//!   rejected only for a callee that can observe it
-//!   ([`otter_vm::CodeBlock::observes_eval_env`]); any other callee behaves
-//!   identically whatever environment its closure carries.
+//! - Misses occur before callee effects. The guard proves function identity;
+//!   a spliced body that reads its SELF reads the guarded callable value, so
+//!   closures of one function id still see their own contexts.
 //! - The Machine guard returns exact this in x12 without allocating a frame.
 
 use crate::artifact::relocation::RelocationCapture;
@@ -25,7 +24,6 @@ pub(crate) fn emit_inline_identity(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     function_id: u32,
-    rejects_eval_env: bool,
     bail: DynamicLabel,
 ) {
     let guarded = ops.new_dynamic_label();
@@ -58,16 +56,6 @@ pub(crate) fn emit_inline_identity(
             ; .arch aarch64
             ; tst w11, w12
             ; b.ne =>bail
-        );
-    }
-    // Frameless inlining has no callee NativeFrame slot to carry a closure's
-    // dynamic eval chain. A generated call propagates this handle; an inline
-    // body that can observe it must prove it null before entering.
-    if rejects_eval_env {
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr w11, [x9, view.closure_call_layout.eval_env_byte]
-            ; cbnz w11, =>bail
         );
     }
     dynasm!(ops ; .arch aarch64 ; ldr w11, [x9, closure_fid_byte]);

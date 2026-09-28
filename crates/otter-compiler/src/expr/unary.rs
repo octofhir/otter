@@ -47,14 +47,14 @@ pub(crate) fn compile_unary(
             && matches!(member.object, Expression::Super(_))
         {
             let this_guard = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            cx.emit_load_this(this_guard, span);
             return Ok(emit_delete_super_reference_error(cx, span));
         }
         if let Expression::ComputedMemberExpression(member) = delete_arg
             && matches!(member.object, Expression::Super(_))
         {
             let this_guard = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            cx.emit_load_this(this_guard, span);
             let _ = compile_expr(cx, &member.expression, span)?;
             return Ok(emit_delete_super_reference_error(cx, span));
         }
@@ -116,86 +116,11 @@ pub(crate) fn compile_unary(
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            let block_shadowed = cx
-                .scopes
-                .iter()
-                .skip(1)
-                .any(|scope| scope.bindings.contains_key(&name));
-            let own_binding = cx.lookup_binding(&name).is_some();
-            if cx.eval_var_names.contains(&name)
-                && !block_shadowed
-                && (cx.stack.len() == 1 || !own_binding)
-            {
-                // §19.2.1.3 — this eval body's own sloppy `var` /
-                // annex-B function binding was adopted into the
-                // caller's eval-environment record as deletable
-                // (CreateMutableBinding(name, true)). A nearer block
-                // lexical shadowing the name keeps the declarative
-                // `false` below instead.
-                let name_idx = cx.intern_string_constant(&name);
-                cx.emit(
-                    Op::DeleteDynamic,
-                    [Operand::Register(dst), Operand::ConstIndex(name_idx)],
-                    span,
-                );
-            } else if cx.lookup_binding(&name).is_some()
-                || cx.script_global_lexicals.contains(&name)
-            {
-                // §9.1.1.1.7 DeleteBinding on a declarative
-                // environment record — bindings created by
-                // declarations (including the script-level global
-                // lexical environment) are not deletable.
-                cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
-            } else if let Some((index, _, eval_depth)) = cx.resolve_capture_with_info(&name) {
-                if eval_depth != 0 {
-                    let name_idx = cx.intern_string_constant(&name);
-                    cx.emit(
-                        Op::DeleteShadowedUpvalue,
-                        [
-                            Operand::Register(dst),
-                            Operand::ConstIndex(name_idx),
-                            Operand::Imm32(i32::from(index)),
-                            Operand::Imm32(
-                                i32::try_from(eval_depth).expect("eval-environment depth overflow"),
-                            ),
-                        ],
-                        span,
-                    );
-                } else {
-                    // The captured declarative fallback itself is fixed.
-                    cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
-                }
-            } else if cx.any_enclosing_leaking_direct_eval() {
-                // §19.2.1.3 — eval-created var bindings are
-                // CreateMutableBinding(vn, true): deletable. The name
-                // may live in the frame's eval-var map / captured
-                // eval-env chain; otherwise the op falls through to
-                // the global-object delete.
-                let name_idx = cx.intern_string_constant(&name);
-                cx.emit(
-                    Op::DeleteDynamic,
-                    [Operand::Register(dst), Operand::ConstIndex(name_idx)],
-                    span,
-                );
-            } else {
-                // Global fallback: §9.1.1.4.7 deletes the global
-                // object property; `DeleteProperty` already returns
-                // `false` for non-configurable entries (script vars,
-                // functions) and `true` for absent / configurable
-                // ones.
-                let global_reg = cx.alloc_scratch();
-                cx.emit(Op::LoadGlobalThis, [Operand::Register(global_reg)], span);
-                let name_idx = cx.intern_string_constant(&name);
-                cx.emit(
-                    Op::DeleteProperty,
-                    vec![
-                        Operand::Register(dst),
-                        Operand::Register(global_reg),
-                        Operand::ConstIndex(name_idx),
-                    ],
-                    span,
-                );
-            }
+            // §9.1.1.1.7 — declaration-created bindings are not deletable;
+            // a sloppy eval's `var`s (extension entries) and global object
+            // properties are.
+            let reference = cx.resolve_ref(&name);
+            cx.emit_name_delete(dst, &name, &reference, span);
             if let Some(done) = with_done {
                 cx.patch_branch_to_here(done);
             }
@@ -294,18 +219,13 @@ pub(crate) fn compile_unary(
         && let Expression::Identifier(id) = typeof_arg
     {
         let name = id.name.as_str();
-        // §19.2.1.3 — `typeof` of a deletable eval-introduced var goes
-        // through the dynamic probe so a deleted binding yields
-        // "undefined" instead of the orphaned static cell's value.
-        let eval_var_dynamic = cx.eval_var_dynamic_reference(name);
-        if eval_var_dynamic
-            || (cx.lookup_binding(name).is_none()
-                && find_module_import_binding(cx, name).is_none()
-                && cx.resolve_capture(name).is_none()
-                && !is_builtin_error_class_name(name)
-                && name != "NaN"
-                && name != "Infinity"
-                && name != "undefined")
+        let reference = cx.resolve_ref(name);
+        if matches!(reference, crate::compiler::NameRef::Global(_))
+            && find_module_import_binding(cx, name).is_none()
+            && !is_builtin_error_class_name(name)
+            && name != "NaN"
+            && name != "Infinity"
+            && name != "undefined"
         {
             let value_reg = cx.alloc_scratch();
             // §9.1.1.2.1 — an enclosing `with` environment shadows the
@@ -322,19 +242,8 @@ pub(crate) fn compile_unary(
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            let name_idx = cx.intern_string_constant(name);
-            // An eval-introduced frame binding shadows the global
-            // fallback inside a function with a direct eval.
-            let op = if eval_var_dynamic || cx.any_enclosing_leaking_direct_eval() {
-                Op::TypeofDynamic
-            } else {
-                Op::LoadGlobalOrUndefined
-            };
-            cx.emit(
-                op,
-                [Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
-                span,
-            );
+            // An eval-created `var` shadows the global fallback.
+            cx.emit_name_load(value_reg, name, &reference, true, span);
             if let Some(done) = with_done {
                 cx.patch_branch_to_here(done);
             }
@@ -453,8 +362,8 @@ pub(crate) fn compile_update(
     enum UpdateTarget<'b, 'c> {
         Identifier {
             name: String,
-            storage: Option<BindingStorage>,
-            capture: Option<(u16, BindingInfo, u32)>,
+            reference: crate::compiler::NameRef,
+            eval_ref: Option<u16>,
             with_ref: Option<WithBindingProbe>,
         },
         StaticMember {
@@ -486,29 +395,29 @@ pub(crate) fn compile_update(
             if let Some(info) = cx
                 .lookup_binding(&name)
                 .filter(|info| info.is_const || info.fn_self_name)
+                && matches!(
+                    cx.resolve_ref(&name),
+                    crate::compiler::NameRef::Binding(resolved) if resolved.lookup.is_none()
+                )
             {
-                cx.emit_load_storage(old, info.storage, span);
+                if info.initialized {
+                    cx.emit_load_storage(old, info.storage, span);
+                } else {
+                    cx.emit(
+                        Op::TdzError,
+                        [Operand::Imm32(info.storage.diagnostic_index())],
+                        span,
+                    );
+                }
                 let throws = info.is_const || cx.is_strict;
                 return finish_immutable_update(cx, &name, old, u, span, throws);
             }
-            // §19.2.1.3 — a deletable eval-introduced var updates
-            // through the dynamic eval-environment ops.
-            let eval_var_dynamic = cx.eval_var_dynamic_reference(&name);
-            let local = if eval_var_dynamic {
-                None
-            } else {
-                cx.lookup_binding(&name)
-            };
-            let capture = if local.is_none() && !eval_var_dynamic {
-                cx.resolve_capture_with_info(&name)
-            } else {
-                None
-            };
-            let storage = local
-                .map(|info| info.storage)
-                .or_else(|| capture.map(|(idx, _, _)| BindingStorage::Upvalue { idx }));
+            let reference = cx.resolve_ref(&name);
             let active_with_envs = cx.active_with_envs.clone();
             let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+            // §13.15.2 — the reference resolves before ToNumeric can run
+            // user code.
+            let eval_ref = cx.emit_resolve_ref(&name, &reference, span);
             let mut with_done = None;
             if let Some(probe) = &with_ref {
                 let fallback =
@@ -526,36 +435,14 @@ pub(crate) fn compile_update(
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            match storage {
-                Some(_) if capture.is_some() => {
-                    let (index, _, eval_depth) = capture.expect("captured update target");
-                    cx.emit_captured_binding_load(old, &name, index, eval_depth, span);
-                }
-                Some(s) => cx.emit_load_storage(old, s, span),
-                None => {
-                    // §13.4.2 — GetValue resolves through the global
-                    // environment (realm-wide lexicals first); a
-                    // missing binding is a ReferenceError.
-                    let name_idx = cx.intern_string_constant(&name);
-                    let op = if eval_var_dynamic || cx.any_enclosing_leaking_direct_eval() {
-                        Op::LoadDynamic
-                    } else {
-                        Op::LoadGlobalOrThrow
-                    };
-                    cx.emit(
-                        op,
-                        [Operand::Register(old), Operand::ConstIndex(name_idx)],
-                        span,
-                    );
-                }
-            }
+            cx.emit_name_load(old, &name, &reference, false, span);
             if let Some(done) = with_done {
                 cx.patch_branch_to_here(done);
             }
             UpdateTarget::Identifier {
                 name,
-                storage,
-                capture,
+                reference,
+                eval_ref,
                 with_ref,
             }
         }
@@ -565,7 +452,7 @@ pub(crate) fn compile_update(
             // §13.4 update on `super.name` — read and write both go
             // through the super reference (parent-prototype lookup,
             // `this` receiver).
-            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
             // §13.3.5.3 — the base is captured when the reference is
             // made, before ToNumeric on the old value can run user
             // code.
@@ -586,11 +473,11 @@ pub(crate) fn compile_update(
         SimpleAssignmentTarget::ComputedMemberExpression(member)
             if matches!(member.object, Expression::Super(_)) =>
         {
-            let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+            let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
             // §13.3.7.1 step 2 — `GetThisBinding` precedes key
             // evaluation (derived-constructor TDZ fires first).
             let this_guard = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            cx.emit_load_this(this_guard, span);
             let key_reg = compile_expr(cx, &member.expression, span)?;
             // §13.3.5.3 — base captured after the key evaluates.
             let base_reg = crate::class::emit_super_base(cx, span)?;
@@ -699,8 +586,8 @@ pub(crate) fn compile_update(
     match target {
         UpdateTarget::Identifier {
             name,
-            storage,
-            capture,
+            reference,
+            eval_ref,
             with_ref,
         } => {
             let mut with_store_done = None;
@@ -720,33 +607,11 @@ pub(crate) fn compile_update(
                 with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            match storage {
-                Some(_) if capture.is_some() => {
-                    let (index, info, eval_depth) = capture.expect("captured update target");
-                    cx.emit_captured_binding_store(next, &name, index, info, eval_depth, span);
-                }
-                Some(s) => cx.emit_store_storage(next, s, span),
-                None => {
-                    let name_idx = cx.intern_string_constant(&name);
-                    let op = if cx.eval_var_dynamic_reference(&name)
-                        || cx.any_enclosing_leaking_direct_eval()
-                    {
-                        Op::StoreDynamic
-                    } else {
-                        Op::StoreGlobalBinding
-                    };
-                    let strict = i32::from(cx.is_strict);
-                    cx.emit(
-                        op,
-                        [
-                            Operand::Register(next),
-                            Operand::ConstIndex(name_idx),
-                            Operand::Imm32(strict),
-                        ],
-                        span,
-                    );
-                }
+            match eval_ref {
+                Some(ref_reg) => cx.emit_store_ref(next, ref_reg, &name, &reference, span),
+                None => cx.emit_name_assign(next, &name, &reference, span),
             }
+            cx.emit_module_export_mirror(&name, next, span);
             if let Some(done) = with_store_done {
                 cx.patch_branch_to_here(done);
             }

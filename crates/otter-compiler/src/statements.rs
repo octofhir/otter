@@ -10,9 +10,13 @@
 //! - Statement lowering keeps transient results in scratch registers and may
 //!   lower a declaration initializer directly into its register-backed binding.
 //! - A statement releases its temporaries when it completes: only bindings it
-//!   declared into the enclosing scope, and an observable completion result the
-//!   enclosing form still reads, keep their registers. A statement list
-//!   therefore needs the window of its widest statement, not the sum.
+//!   declared into the enclosing scope, the contexts of scopes still active,
+//!   and an observable completion result the enclosing form still reads, keep
+//!   their registers. A statement list therefore needs the window of its
+//!   widest statement, not the sum.
+//! - A `for (let …;;)` head's context is copied (§14.7.4.4
+//!   CreatePerIterationEnvironment) after the initializer and before each
+//!   increment, so each iteration's closures keep their own bindings.
 //!
 //! # See also
 //! - `for_loops` and `try_catch`
@@ -176,7 +180,7 @@ fn compile_if_branch_statement(
         && !cx.is_strict
     {
         let name = f.id.as_ref().map(|id| id.name.as_str().to_string());
-        cx.enter_scope();
+        cx.enter_scope(otter_bytecode::ScopeKind::Block);
         let removed = name
             .as_ref()
             .is_some_and(|name| cx.top_mut().hoisted_function_names.remove(name));
@@ -226,7 +230,8 @@ fn compile_statement_releasing(
     let scope_depth = cx.scopes.len();
     let scope_bindings = cx.scopes.last().map_or(0, |scope| scope.bindings.len());
     let result = compile_statement_body(cx, stmt)?;
-    let mut floor = mark;
+    // Contexts of the scopes still active stay live.
+    let mut floor = mark.max(cx.context_register_floor());
     // A fallback declaration (one no pre-pass reserved) lands in the
     // enclosing scope and must keep its register for the rest of that scope.
     if cx.scopes.len() == scope_depth
@@ -282,32 +287,10 @@ fn compile_statement_body(
 
         Statement::BlockStatement(b) => {
             let span = (b.span.start, b.span.end);
-            cx.enter_scope();
             // §14.2.3 BlockDeclarationInstantiation — lexical names
             // pre-declare (TDZ) and function declarations instantiate
-            // on block entry, before any statement runs. The
-            // hoisted-name set is scoped to this block so the same
-            // name hoists independently elsewhere.
-            let mut block_lex: Vec<(String, bool)> = Vec::new();
-            hoist_lexical_names(&b.body, &mut block_lex);
-            let (mut block_captured, nested_eval) =
-                crate::capture::nested_function_refs_in_statements(&b.body);
-            if nested_eval {
-                block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
-            }
-            pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
-            let saved_hoisted = cx.hoisted_function_names.clone();
-            hoist_function_declarations(cx, &b.body)?;
-            let mut last = None;
-            for inner in &b.body {
-                if let Some(r) = compile_statement(cx, inner)? {
-                    last = Some(r);
-                }
-            }
-            cx.exit_scope();
-            cx.hoisted_function_names = saved_hoisted;
-            let _ = span;
-            Ok(last)
+            // on block entry, before any statement runs.
+            compile_block_body(cx, &b.body, otter_bytecode::ScopeKind::Block, span)
         }
 
         Statement::VariableDeclaration(decl) => {
@@ -330,18 +313,20 @@ fn compile_statement_body(
                     );
                     return Ok(());
                 }
-                let (info, depth) =
-                    cx.lookup_binding_with_depth(name)
-                        .ok_or(CompileError::Unsupported {
-                            node: format!("var `{name}` not pre-hoisted"),
-                            span,
-                        })?;
+                let Some((info, scope)) = cx.lookup_binding_with_scope(name) else {
+                    // A sloppy direct eval's `var` lives in the caller's
+                    // variable scope (a slot or its eval extension).
+                    let reference = cx.resolve_ref(name);
+                    cx.emit_name_assign(init_reg, name, &reference, span);
+                    cx.emit_module_export_mirror(name, init_reg, span);
+                    return Ok(());
+                };
                 cx.emit_store_storage(init_reg, info.storage, span);
                 // §B.3.5 — when an inner binding (a catch parameter)
                 // shadows the hoisted var, the initializer assigns THAT
-                // binding; the var-scope value (and its global/module
-                // mirror) stays untouched.
-                let shadowed = depth != 0;
+                // binding; the var-scope value (and its global mirror)
+                // stays untouched.
+                let shadowed = scope != cx.var_scope;
                 if !shadowed
                     && cx.stack.len() == 1
                     && cx.module_state.is_none()
@@ -354,9 +339,7 @@ fn compile_statement_body(
                         span,
                     );
                 }
-                if !shadowed {
-                    cx.emit_module_export_mirror(name, init_reg, span);
-                }
+                cx.emit_module_export_mirror(name, init_reg, span);
                 Ok(())
             }
             let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
@@ -492,7 +475,7 @@ fn compile_statement_body(
                     // create a fresh one.
                     let storage = match cx.lookup_in_current_scope(&name) {
                         Some(info) => info.storage,
-                        None => cx.declare_binding(&name, is_const, span)?,
+                        None => cx.declare_binding(&name, lexical_kind(is_const), span)?,
                     };
                     let hint = annotation_hint(cx, declarator.type_annotation.as_deref());
                     cx.annotate_binding(&name, hint);
@@ -505,7 +488,7 @@ fn compile_statement_body(
                                     cx, init, &name, reg, span,
                                 )?
                             }
-                            BindingStorage::Upvalue { .. } => {
+                            BindingStorage::Slot { .. } => {
                                 crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
                             }
                         },
@@ -615,7 +598,7 @@ fn compile_statement_body(
         Statement::ForStatement(s) => {
             let span = (s.span.start, s.span.end);
             cx.emit_completion_reset(span);
-            cx.enter_scope();
+            cx.enter_scope(otter_bytecode::ScopeKind::ForHead);
             // Initializer.
             if let Some(init) = &s.init {
                 match init {
@@ -629,34 +612,28 @@ fn compile_statement_body(
                     }
                 }
             }
-            // §14.7.4.2 ForBodyEvaluation — a captured `let` head gets
-            // CreatePerIterationEnvironment semantics: each iteration
-            // re-mints the binding cells and copies the previous
-            // iteration's values, so body closures capture distinct
-            // bindings. `const` heads and uncaptured (register) `let`
-            // bindings are exempt (perIterationBindings only lists
-            // non-constant declarations; registers have no shared cell).
-            let per_iter_cells: Vec<u16> = match &s.init {
+            // §14.7.4.2 ForBodyEvaluation — a `let` head whose bindings
+            // live in the head's context gets CreatePerIterationEnvironment
+            // semantics: a copy of the context per iteration, so body
+            // closures capture distinct bindings. `const` heads (no
+            // perIterationBindings) and register-only heads need no copy.
+            let per_iteration_ctx = match &s.init {
                 Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(decl))
                     if matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Let) =>
                 {
-                    let mut names: Vec<String> = Vec::new();
-                    for d in &decl.declarations {
-                        crate::hoist::collect_pattern_var_names(&d.id, &mut names);
+                    match cx.scopes.last().and_then(|scope| scope.context) {
+                        Some(crate::scope::ScopeContext {
+                            reg: crate::scope::CtxReg::Reg(reg),
+                            ..
+                        }) => Some(reg),
+                        _ => None,
                     }
-                    names
-                        .iter()
-                        .filter_map(|name| match cx.lookup_binding(name)?.storage {
-                            crate::scope::BindingStorage::Upvalue { idx } => Some(idx),
-                            crate::scope::BindingStorage::Register { .. } => None,
-                        })
-                        .collect()
                 }
-                _ => Vec::new(),
+                _ => None,
             };
             // Step 2 — the first iteration's environment copies the
             // loop-initialiser values before the first test runs.
-            emit_per_iteration_copy(cx, &per_iter_cells, span);
+            emit_per_iteration_copy(cx, per_iteration_ctx, span);
             // §14.7.4 — completion value is the last non-empty body
             // completion (undefined when the body never runs).
             let completion_reg = cx.alloc_completion_reg(span);
@@ -673,13 +650,13 @@ fn compile_statement_body(
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
                 cx.store_completion(completion_reg, body_reg, span);
             }
-            // Continue lands on the update.
+            // Continue lands on the copy, then the update.
             let update_pc = cx.next_pc();
             // §14.7.4.2 step 3.e — CreatePerIterationEnvironment runs
             // before the increment, so the increment mutates the *next*
-            // iteration's cells while this iteration's closures keep
+            // iteration's bindings while this iteration's closures keep
             // their values.
-            emit_per_iteration_copy(cx, &per_iter_cells, span);
+            emit_per_iteration_copy(cx, per_iteration_ctx, span);
             if let Some(update) = &s.update {
                 compile_expr(cx, update, span)?;
             }
@@ -764,16 +741,15 @@ fn compile_statement_body(
                 // position also updates the variable-scope binding
                 // (and the global own property for script bodies)
                 // with the block binding's current value.
-                if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name)
+                if let Some(&(var_target, global_mirror)) = cx.annex_b_var_targets.get(&name)
                     && cx.annex_b_eligible_spans.contains(&f.span.start)
                     && let Some(info) = cx.lookup_binding(&name)
-                    && var_storage != Some(info.storage)
+                    && var_target != Some(crate::compiler::VarTarget::Own(info.storage))
                 {
                     let tmp = cx.alloc_scratch();
                     cx.emit_load_storage(tmp, info.storage, span);
-                    if let Some(var_storage) = var_storage {
-                        cx.emit_store_storage(tmp, var_storage, span);
-                        emit_eval_restore_binding(cx, &name, var_storage, span);
+                    if let Some(var_target) = var_target {
+                        cx.emit_var_target_store(tmp, &name, var_target, span);
                     }
                     if global_mirror {
                         let name_idx = cx.intern_string_constant(&name);
@@ -786,7 +762,19 @@ fn compile_statement_body(
                 }
                 return Ok(None);
             }
-            let (function_id, captures) = compile_function_full(
+            // §B.3.2 / §B.3.3 web-compat — in sloppy mode a nested
+            // function declaration whose name collides with an
+            // existing binding in the same scope reuses that binding
+            // rather than redeclaring. The binding exists before the
+            // body compiles, so a recursive reference resolves to it.
+            //
+            // <https://tc39.es/ecma262/#sec-block-level-function-declarations-web-legacy-compatibility-semantics>
+            let storage = match cx.lookup_in_current_scope(&name) {
+                Some(info) => info.storage,
+                None => cx.declare_binding(&name, otter_bytecode::SlotKind::FunctionDecl, span)?,
+            };
+            cx.mark_initialized(&name);
+            let record = compile_function_full(
                 cx,
                 &name,
                 &f.params,
@@ -796,34 +784,19 @@ fn compile_statement_body(
                 f.generator,
                 false,
             )?;
-            // §B.3.2 / §B.3.3 web-compat — in sloppy mode a nested
-            // function declaration whose name collides with an
-            // existing `var` (or pre-hoisted) binding in the same
-            // scope reuses that binding rather than redeclaring.
-            // The `var f = 123; if (true) function f(){}` shape at
-            // global scope is the canonical case.
-            //
-            // <https://tc39.es/ecma262/#sec-block-level-function-declarations-web-legacy-compatibility-semantics>
-            let storage = match cx.lookup_in_current_scope(&name) {
-                Some(info) => info.storage,
-                None => cx.declare_binding(&name, false, span)?,
-            };
-            let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
-            emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
+            emit_make_callable(cx, tmp, &record, span);
             cx.emit_store_storage(tmp, storage, span);
-            cx.mark_initialized(&name);
             // §B.3.2 — `if (x) function f(){}` single-statement
             // declarations sync the var-scope extension exactly like
             // block-level declarations.
-            if let Some(&(var_storage, global_mirror)) = cx.annex_b_var_storages.get(&name)
+            if let Some(&(var_target, global_mirror)) = cx.annex_b_var_targets.get(&name)
                 && cx.annex_b_eligible_spans.contains(&f.span.start)
             {
-                if let Some(var_storage) = var_storage
-                    && var_storage != storage
+                if let Some(var_target) = var_target
+                    && var_target != crate::compiler::VarTarget::Own(storage)
                 {
-                    cx.emit_store_storage(tmp, var_storage, span);
-                    emit_eval_restore_binding(cx, &name, var_storage, span);
+                    cx.emit_var_target_store(tmp, &name, var_target, span);
                 }
                 if global_mirror {
                     let name_idx = cx.intern_string_constant(&name);
@@ -927,7 +900,7 @@ fn compile_statement_body(
             // class name (TDZ) so inner functions could capture it.
             let storage = match cx.lookup_in_current_scope(&name) {
                 Some(info) => info.storage,
-                None => cx.declare_binding(&name, false, span)?,
+                None => cx.declare_binding(&name, otter_bytecode::SlotKind::Let, span)?,
             };
             cx.emit_store_storage(class_reg, storage, span);
             cx.mark_initialized(&name);
@@ -948,7 +921,7 @@ fn compile_statement_body(
             // Type-only `import type { … }` is erased earlier via
             // `is_erased_ts_statement`. Runtime imports were
             // pre-resolved by `compile_module_program`'s pre-pass:
-            // the import-record upvalue is already populated and
+            // the import-record slot is already populated and
             // identifier resolution routes references through
             // `imported_names`. Nothing left to do at the
             // statement site.
@@ -1006,7 +979,7 @@ fn compile_statement_body(
                 let exported = module_export_name_to_str(&spec.exported);
                 let local = module_export_name_to_str(&spec.local);
                 let value_reg = if let Some(src) = &from_source {
-                    let record_uv = cx
+                    let record = cx
                         .module_state
                         .as_ref()
                         .and_then(|s| s.import_records.get(src).copied())
@@ -1017,15 +990,7 @@ fn compile_statement_body(
                             ),
                             span,
                         })?;
-                    let record_reg = cx.alloc_scratch();
-                    cx.emit(
-                        Op::LoadUpvalue,
-                        vec![
-                            Operand::Register(record_reg),
-                            Operand::Imm32(record_uv as i32),
-                        ],
-                        span,
-                    );
+                    let record_reg = load_import_record(cx, record, span)?;
                     let dst = cx.alloc_scratch();
                     cx.emit_load_property(dst, record_reg, &local, span);
                     dst
@@ -1036,7 +1001,7 @@ fn compile_statement_body(
                 } else {
                     // `export { name }` — read from the local
                     // binding or from an imported alias.
-                    if let Some((binding, synthetic)) = find_module_import_binding(cx, &local) {
+                    if let Some(binding) = find_module_import_binding(cx, &local) {
                         if binding.is_namespace && !binding.is_deferred {
                             // Re-exporting an eager `import * as ns`
                             // binding forwards the Module Namespace
@@ -1051,22 +1016,8 @@ fn compile_statement_body(
                             );
                             dst
                         } else {
-                            let resolved_uv = if cx.module_state.is_some() {
-                                binding.record_uv_idx
-                            } else {
-                                cx.resolve_capture(&synthetic)
-                                    .expect("synthetic import-record binding must resolve")
-                            };
-                            let record_dst = cx.alloc_scratch();
-                            cx.emit(
-                                Op::LoadUpvalue,
-                                vec![
-                                    Operand::Register(record_dst),
-                                    Operand::Imm32(resolved_uv as i32),
-                                ],
-                                span,
-                            );
-                            // A deferred namespace binding's cell already
+                            let record_dst = load_import_record(cx, binding.record, span)?;
+                            // A deferred namespace binding's slot already
                             // holds the namespace object; forward it.
                             if binding.is_namespace {
                                 record_dst
@@ -1081,22 +1032,14 @@ fn compile_statement_body(
                             node: format!("export of undeclared `{local}`"),
                             span,
                         })?;
+                        // An uninitialized lexical carries its TDZ hole
+                        // onto the module environment.
                         let dst = cx.alloc_scratch();
                         cx.emit_load_storage(dst, info.storage, span);
                         dst
                     }
                 };
-                let env_uv = cx
-                    .module_state
-                    .as_ref()
-                    .map(|s| s.module_env_uv)
-                    .expect("module_state checked above");
-                let env_reg = cx.alloc_scratch();
-                cx.emit(
-                    Op::LoadUpvalue,
-                    [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-                    span,
-                );
+                let env_reg = module_env_register(cx, span)?;
                 cx.emit_store_property(env_reg, &exported, value_reg, span);
             }
             Ok(None)
@@ -1140,7 +1083,7 @@ fn compile_statement_body(
                         f.id.as_ref()
                             .map(|id| id.name.as_str().to_string())
                             .unwrap_or_else(|| "default".to_string());
-                    let (function_id, captures) = compile_function_full(
+                    let record = compile_function_full(
                         cx,
                         &name,
                         &f.params,
@@ -1150,9 +1093,8 @@ fn compile_statement_body(
                         f.generator,
                         false,
                     )?;
-                    let const_idx = cx.intern_function_id(function_id);
                     let dst = cx.alloc_scratch();
-                    emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
+                    emit_make_callable(cx, dst, &record, span);
                     dst
                 }
                 oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
@@ -1170,17 +1112,7 @@ fn compile_statement_body(
                     compile_expr_with_inferred_name(cx, expr, "default", span)?
                 }
             };
-            let env_uv = cx
-                .module_state
-                .as_ref()
-                .map(|s| s.module_env_uv)
-                .expect("module_state checked above");
-            let env_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUpvalue,
-                [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-                span,
-            );
+            let env_reg = module_env_register(cx, span)?;
             cx.emit_store_property(env_reg, "default", value_reg, span);
             Ok(None)
         }
@@ -1209,7 +1141,7 @@ fn compile_statement_body(
                 decl.source.value.as_str(),
                 import_attribute_type(decl.with_clause.as_deref()),
             );
-            let record_uv = cx
+            let record = cx
                 .module_state
                 .as_ref()
                 .and_then(|s| s.import_records.get(&source).copied())
@@ -1220,17 +1152,7 @@ fn compile_statement_body(
                     ),
                     span,
                 })?;
-            let env_uv = cx
-                .module_state
-                .as_ref()
-                .map(|s| s.module_env_uv)
-                .expect("module_state checked above");
-            let env_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUpvalue,
-                [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-                span,
-            );
+            let env_reg = module_env_register(cx, span)?;
             match decl.exported.as_ref().map(module_export_name_to_str) {
                 // `export * as ns from "mod"` — the source's Module
                 // Namespace Exotic Object becomes a named export.
@@ -1247,19 +1169,9 @@ fn compile_statement_body(
                 }
                 // Bare `export * from "mod"` — copy the source's
                 // exported names onto module_env (excluding `default`,
-                // local exports take precedence). The source module is
-                // evaluated before this body by dependency order, so
-                // its env is already populated.
+                // local exports take precedence).
                 None => {
-                    let record_reg = cx.alloc_scratch();
-                    cx.emit(
-                        Op::LoadUpvalue,
-                        vec![
-                            Operand::Register(record_reg),
-                            Operand::Imm32(record_uv as i32),
-                        ],
-                        span,
-                    );
+                    let record_reg = load_import_record(cx, record, span)?;
                     cx.emit(
                         Op::StarReexport,
                         [Operand::Register(env_reg), Operand::Register(record_reg)],
@@ -1335,52 +1247,48 @@ fn compile_statement_body(
     }
 }
 
-/// Helper for the `for(...; ...; ...)` initializer's
-/// `let`/`const`/`var` declaration form. Mirrors the
-/// `VariableDeclaration` arm of `compile_statement` but operates on
-/// the borrowed declaration without re-cloning it through OXC's
-/// allocator.
-/// §14.7.4.2 CreatePerIterationEnvironment — re-mint each captured
-/// `let` head cell and copy the previous cell's value into it. Closures
-/// made before this point keep the old cell; the loop's test / body /
-/// increment continue through the fresh one.
-fn emit_per_iteration_copy(cx: &mut Compiler, cells: &[u16], span: (u32, u32)) {
-    for &idx in cells {
-        let storage = crate::scope::BindingStorage::Upvalue { idx };
-        let tmp = cx.alloc_scratch();
-        cx.emit_load_storage(tmp, storage, span);
-        cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
-        cx.emit_store_storage(tmp, storage, span);
+/// §14.7.4.4 CreatePerIterationEnvironment — replace the head context with
+/// a copy: closures made before this point keep the old bindings; the
+/// loop's test / body / increment continue through the fresh ones.
+fn emit_per_iteration_copy(cx: &mut Compiler, ctx: Option<u16>, span: (u32, u32)) {
+    if let Some(reg) = ctx {
+        cx.emit(
+            Op::CopyContext,
+            [Operand::Register(reg), Operand::Register(reg)],
+            span,
+        );
     }
 }
 
-/// §9.1.1.1.5 / §B.3.3.3 — inside a sloppy eval body, the block-level
-/// function sync writes through the variable-scope cell AND re-creates
-/// the (deletable, possibly `delete`-d) name in the caller's current
-/// eval-environment record so code outside the eval observes it again.
-fn emit_eval_restore_binding(
+/// Load the module environment object into a register.
+pub(crate) fn module_env_register(
     cx: &mut Compiler,
-    name: &str,
-    var_storage: crate::scope::BindingStorage,
     span: (u32, u32),
-) {
-    if !cx.eval_var_names.contains(name) {
-        return;
-    }
-    let crate::scope::BindingStorage::Upvalue { idx } = var_storage else {
-        return;
-    };
-    let name_idx = cx.intern_string_constant(name);
-    cx.emit(
-        Op::EvalRestoreBinding,
-        [
-            Operand::ConstIndex(name_idx),
-            Operand::Imm32(i32::from(idx)),
-        ],
+) -> Result<u16, CompileError> {
+    cx.load_module_env(span).ok_or(CompileError::Unsupported {
+        node: "module environment outside an ES-module fragment".to_string(),
         span,
-    );
+    })
 }
 
+/// Load import record `record` of the enclosing module into a register.
+pub(crate) fn load_import_record(
+    cx: &mut Compiler,
+    record: u16,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let binding = crate::compiler::import_record_binding(record);
+    cx.load_internal(&binding, span)
+        .ok_or(CompileError::Unsupported {
+            node: "import record outside an ES-module fragment".to_string(),
+            span,
+        })
+}
+
+/// Lower the `for(...; ...; ...)` initializer's `let` / `const` / `var`
+/// declaration. Every `let` / `const` name is declared (in its TDZ) in
+/// the loop scope before any initializer runs, so closures in an earlier
+/// initializer resolve later head bindings.
 pub(crate) fn compile_for_init_decl(
     cx: &mut Compiler,
     decl: &oxc_ast::ast::VariableDeclaration<'_>,
@@ -1388,6 +1296,16 @@ pub(crate) fn compile_for_init_decl(
 ) -> Result<(), CompileError> {
     let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
     let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+    if !is_var {
+        let mut names: Vec<(String, bool)> = Vec::new();
+        collect_lexical_var_names(decl, &mut names);
+        let decl_span = (decl.span.start, decl.span.end);
+        for (name, _) in &names {
+            if cx.lookup_in_current_scope(name).is_none() {
+                cx.declare_binding(name, lexical_kind(is_const), decl_span)?;
+            }
+        }
+    }
     for declarator in &decl.declarations {
         let span = (declarator.span.start, declarator.span.end);
         match &declarator.id {
@@ -1411,21 +1329,22 @@ pub(crate) fn compile_for_init_decl(
                     );
                     continue;
                 }
-                // §14.7.4 ForLoopEvaluation — `var` re-uses the
-                // function-scope binding pre-hoisted at function
-                // entry; `let`/`const` declare a fresh per-loop
-                // binding.
-                let storage = if is_var {
-                    cx.lookup_binding(&name)
-                        .ok_or(CompileError::Unsupported {
-                            node: format!("for-init var `{name}` not pre-hoisted"),
-                            span,
-                        })?
-                        .storage
-                } else {
-                    cx.declare_binding(&name, is_const, span)?
-                };
                 let hint = annotation_hint(cx, declarator.type_annotation.as_deref());
+                if is_var {
+                    // §14.7.4 ForLoopEvaluation — `var` assigns the
+                    // variable-scope binding pre-hoisted at entry.
+                    cx.annotate_binding(&name, hint);
+                    let Some(init) = &declarator.init else {
+                        continue;
+                    };
+                    let init_reg = compile_expr(cx, init, span)?;
+                    store_identifier(cx, &name, init_reg, span)?;
+                    continue;
+                }
+                let storage = cx
+                    .lookup_in_current_scope(&name)
+                    .expect("for-head lexical pre-declared")
+                    .storage;
                 cx.annotate_binding(&name, hint);
                 let init_reg = match &declarator.init {
                     Some(init) => compile_expr(cx, init, span)?,
@@ -1439,9 +1358,6 @@ pub(crate) fn compile_for_init_decl(
                 cx.mark_initialized(&name);
             }
             // §14.7.4 — destructuring init: `for (const [a, b] = …; …)`.
-            // The initializer is required (let/const/var destructuring
-            // without an initializer is a SyntaxError; oxc enforces
-            // that).
             _ => {
                 let init = declarator.init.as_ref().ok_or(CompileError::Unsupported {
                     node: "for-init destructuring without initializer".to_string(),
@@ -1497,7 +1413,7 @@ pub(crate) fn compile_switch_statement(
     let completion_reg = cx.alloc_completion_reg(span);
 
     // Fresh lexical scope so per-case `let` bindings don't leak.
-    cx.enter_scope();
+    cx.enter_scope(otter_bytecode::ScopeKind::Switch);
     // §14.12.3 / §14.2.3 — the CaseBlock instantiates its lexical
     // names (TDZ) and function declarations on entry, across every
     // clause and before any selector expression runs, so selectors

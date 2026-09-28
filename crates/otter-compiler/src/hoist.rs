@@ -7,8 +7,12 @@
 //!
 //! # Invariants
 //! - Pre-passes collect names without emitting unrelated runtime effects.
-//! - Register-backed `var` bindings inherit the VM register-window
-//!   initialization to `undefined`; captured cells are initialized explicitly.
+//! - Declarations need no initializing stores: register-backed `var`
+//!   bindings inherit the VM register-window initialization to `undefined`,
+//!   and a context slot starts as `undefined` or the TDZ hole according to
+//!   its descriptor kind when `CreateContext` allocates the scope.
+//! - Declarations land in the innermost scope, which is the scope being
+//!   instantiated.
 //!
 //! # See also
 //! - `entry` and `statements`
@@ -173,15 +177,13 @@ pub(crate) fn collect_pattern_var_names(
     }
 }
 
-/// Pre-declare each hoisted `var` name on the current scope per
+/// Pre-declare each hoisted `var` name on the current (variable) scope per
 /// §10.2.11 FunctionDeclarationInstantiation step 28: bind to
 /// `undefined` with `[[Mutable]]`, no TDZ. Register-backed bindings need no
 /// bytecode store because every fresh VM register window is already filled
-/// with `undefined`; upvalue cells still need an explicit initialization.
-/// Names that already live in the current scope (formal parameters,
-/// `let`/`const` shadowing, the function's self-name) are skipped — this
-/// matches §10.2.11 step 27 ("If the same name is bound by both a parameter
-/// and a VarDeclaration, the parameter binding wins").
+/// with `undefined`; a slot starts as `undefined` when its context is
+/// created. Names already bound in the scope (formal parameters of a simple
+/// parameter list, `arguments`) are skipped — §10.2.11 step 27.
 pub(crate) fn pre_declare_var_bindings(
     cx: &mut Compiler,
     names: &[String],
@@ -192,17 +194,10 @@ pub(crate) fn pre_declare_var_bindings(
         if !seen.insert(name.clone()) {
             continue;
         }
-        if cx.lookup_binding(name).is_some() {
-            // Already bound by a parameter or the function self-name —
-            // §10.2.11 step 27.b leaves the existing binding intact.
+        if cx.lookup_in_current_scope(name).is_some() {
             continue;
         }
-        let storage = cx.declare_binding(name, false, span)?;
-        if matches!(storage, BindingStorage::Upvalue { .. }) {
-            let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-            cx.emit_store_storage(dst, storage, span);
-        }
+        cx.declare_binding(name, otter_bytecode::SlotKind::Var, span)?;
         cx.mark_initialized(name);
     }
     Ok(())
@@ -213,9 +208,8 @@ pub(crate) fn pre_declare_var_bindings(
 /// function / script / module scope. Top-level only: nested blocks,
 /// loop bodies, etc., own their own block scope and aren't touched.
 ///
-/// Names are returned with their declaration kind so the pre-pass
-/// can call [`Compiler::declare_binding`] with the right `is_const`
-/// flag.
+/// Names are returned with their `const`-ness so the pre-pass can
+/// declare them with the right [`otter_bytecode::SlotKind`].
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-static-semantics-lexicallydeclarednames>
@@ -316,9 +310,9 @@ pub(crate) fn collect_lexical_var_names(
 /// Pre-declare each top-level lexical name from
 /// [`hoist_lexical_names`] so inner function declarations (which
 /// hoist *above* the lexical declarations) can resolve their
-/// captures. Bindings start in TDZ — the source-level `let` /
-/// `const` / `class` arm flips them to initialized once the
-/// initialiser stores its value.
+/// captures. Bindings start in TDZ — a slot holds the hole from its
+/// context's creation, a register is statically uninitialized — and the
+/// source-level `let` / `const` / `class` arm flips them to initialized.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
@@ -330,44 +324,32 @@ pub(crate) fn pre_declare_lexical_bindings(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     for (name, is_const) in names {
-        if cx.lookup_binding(name).is_some() {
-            // Already pre-declared (parameter, var-hoist clash, …).
-            // §10.2.11 forbids let / const / class from shadowing a
-            // var-hoisted name at the same scope; surface a clear
-            // diagnostic at declaration time rather than here.
+        if cx.lookup_in_current_scope(name).is_some() {
+            // Already pre-declared in this scope (a var-hoist clash is an
+            // early error surfaced elsewhere).
             continue;
         }
-        // §10.2.11 step 33 — a captured top-level lexical lives in an
-        // own-upvalue cell so closures can observe it. The cell starts
-        // life holding `undefined`, which a closure that runs before
-        // the source-level declaration would misread as an initialized
-        // value. Install the TDZ hole now so such a forward read is a
-        // `ReferenceError` until the declaration's store clears it.
-        // The hole is written INTO the existing cell (not via
-        // `Op::FreshUpvalue`, which replaces the cell) so module-init
-        // link/eval phases sharing one persistent spine observe the
-        // same cell.
-        if let crate::scope::BindingStorage::Upvalue { idx } =
-            cx.declare_binding(name, *is_const, span)?
-        {
-            let hole = cx.alloc_scratch();
-            cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
-            cx.emit(
-                Op::StoreUpvalue,
-                [Operand::Register(hole), Operand::Imm32(idx as i32)],
-                span,
-            );
-        }
+        cx.declare_binding(name, lexical_kind(*is_const), span)?;
     }
     Ok(())
+}
+
+/// Descriptor kind of a `let` (or class declaration) / `const` binding.
+pub(crate) fn lexical_kind(is_const: bool) -> otter_bytecode::SlotKind {
+    if is_const {
+        otter_bytecode::SlotKind::Const
+    } else {
+        otter_bytecode::SlotKind::Let
+    }
 }
 
 /// §14.2.3 BlockDeclarationInstantiation — pre-declare a block's
 /// top-level lexical names (TDZ) at block entry, so case selectors,
 /// closures, and statements textually before the declaration resolve
-/// to the block binding instead of an outer same-named one. Unlike
-/// [`pre_declare_lexical_bindings`], an outer binding does not
-/// suppress the block-scope declaration — only a same-scope one does.
+/// to the block binding instead of an outer same-named one. Only a
+/// same-scope binding suppresses the declaration. A captured name takes a
+/// slot of the block's context, which every entry into the block creates
+/// afresh — the per-entry binding a loop body's closures need.
 pub(crate) fn pre_declare_block_lexical_bindings(
     cx: &mut Compiler,
     names: &[(String, bool)],
@@ -378,28 +360,55 @@ pub(crate) fn pre_declare_block_lexical_bindings(
         if cx.lookup_in_current_scope(name).is_some() {
             continue;
         }
-        // §14.2.3 — a captured block lexical gets a *fresh* hole cell
-        // on every block entry (`Op::FreshUpvalue`), not a hole
-        // written into the existing cell. The distinction is what
-        // gives loop-body lexicals per-iteration capture semantics:
-        // closures made during one entry keep that entry's cell, the
-        // next entry re-mints the slot, and the hole preserves the
-        // TDZ either way. Holing in place made every iteration's
-        // closures share one cell — all observing the last
-        // iteration's value.
-        // §19.2.1.3 — a direct eval anywhere in the function reads
-        // and writes block lexicals through upvalue cells too, so a
-        // body containing one promotes every block binding
-        // (`captured_names` on the context carries the eval-driven
-        // promotion set).
         let captured = captured_names.contains(name) || cx.captured_names.contains(name.as_str());
-        if let crate::scope::BindingStorage::Upvalue { idx } =
-            cx.declare_binding_with_capture(name, *is_const, span, captured)?
-        {
-            cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
-        }
+        cx.declare_binding_with_capture(name, lexical_kind(*is_const), span, captured)?;
     }
     Ok(())
+}
+
+/// §14.2.3 — lower a statement list as a Block: enter a scope of `kind`,
+/// instantiate its lexical and function declarations, then compile the
+/// statements. Returns the last statement completion register.
+pub(crate) fn compile_block_body(
+    cx: &mut Compiler,
+    stmts: &[Statement<'_>],
+    kind: otter_bytecode::ScopeKind,
+    span: (u32, u32),
+) -> Result<Option<u16>, CompileError> {
+    cx.enter_scope(kind);
+    let result = compile_block_statements(cx, stmts, span);
+    cx.exit_scope();
+    result
+}
+
+/// Instantiate a block's declarations into the current scope and compile
+/// its statements.
+pub(crate) fn compile_block_statements(
+    cx: &mut Compiler,
+    stmts: &[Statement<'_>],
+    span: (u32, u32),
+) -> Result<Option<u16>, CompileError> {
+    let mut block_lex: Vec<(String, bool)> = Vec::new();
+    hoist_lexical_names(stmts, &mut block_lex);
+    let (mut block_captured, nested_eval) =
+        crate::capture::nested_function_refs_in_statements(stmts);
+    if nested_eval {
+        block_captured.extend(block_lex.iter().map(|(name, _)| name.clone()));
+    }
+    pre_declare_block_lexical_bindings(cx, &block_lex, &block_captured, span)?;
+    let saved_hoisted = cx.hoisted_function_names.clone();
+    let result = (|| {
+        hoist_function_declarations(cx, stmts)?;
+        let mut last = None;
+        for inner in stmts {
+            if let Some(r) = compile_statement(cx, inner)? {
+                last = Some(r);
+            }
+        }
+        Ok(last)
+    })();
+    cx.top_mut().hoisted_function_names = saved_hoisted;
+    result
 }
 
 /// Hoist top-level `function f() {…}` declarations from `stmts` to
@@ -520,16 +529,13 @@ pub(crate) fn hoist_function_declarations_from(
         // var-hoisted name, a sibling declaration) is reused; an
         // outer-scope binding must not be captured by a block-level
         // declaration's instantiation.
-        if !script_global && cx.lookup_in_current_scope(&name).is_none() {
-            let storage = cx.declare_binding(&name, false, span)?;
-            // The initializer's temporary dies at the store; recycling it
-            // keeps a function with thousands of declarations inside the
-            // register window.
-            let mark = cx.scratch;
-            let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-            cx.emit_store_storage(dst, storage, span);
-            cx.reset_scratch(mark);
+        if !script_global
+            && cx.lookup_in_current_scope(&name).is_none()
+            && crate::entry::eval_var_function_target(cx, &name).is_none()
+        {
+            // Pass 3 stores the closure before any statement runs, so the
+            // binding needs no `undefined` initialization of its own.
+            cx.declare_binding(&name, otter_bytecode::SlotKind::FunctionDecl, span)?;
             cx.mark_initialized(&name);
         }
         cx.top_mut().hoisted_function_names.insert(name);
@@ -553,12 +559,8 @@ pub(crate) fn hoist_function_declarations_from(
         // §10.2.11 — a function *declaration* has no funcEnv self-name
         // binding: the name inside the body resolves to the enclosing
         // binding pass 2 pre-declared (or the global object property for
-        // script globals). Suppressing the child-side self-binding keeps
-        // the identity of `F` inside `F`'s body equal to the hoisted
-        // closure, so expando properties (`F.x = …`) stay visible and no
-        // throwaway closure is allocated per call.
-        cx.next_fn_no_self_name = true;
-        let (function_id, captures) = compile_function_full(
+        // script globals).
+        let record = compile_function_full(
             cx,
             &name,
             &f.params,
@@ -568,10 +570,9 @@ pub(crate) fn hoist_function_declarations_from(
             f.generator,
             false,
         )?;
-        let const_idx = cx.intern_function_id(function_id);
         let mark = cx.scratch;
         let tmp = cx.alloc_scratch();
-        emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
+        emit_make_callable(cx, tmp, &record, span);
         let script_global =
             cx.stack.len() == 1 && cx.scopes.len() == 1 && cx.script_global_vars.contains(&name);
         if script_global {
@@ -589,6 +590,10 @@ pub(crate) fn hoist_function_declarations_from(
                 ],
                 span,
             );
+        } else if let Some(target) = crate::entry::eval_var_function_target(cx, &name) {
+            // A sloppy direct eval's function declaration initializes the
+            // caller's variable-scope binding (§19.2.1.3 step 16).
+            cx.emit_var_target_store(tmp, &name, target, span);
         } else {
             let storage = cx
                 .lookup_in_current_scope(&name)
@@ -649,7 +654,7 @@ pub(crate) fn hoist_function_declarations_from(
             continue;
         }
         let span = (f.span.start, f.span.end);
-        let (function_id, captures) = compile_function_full(
+        let record = compile_function_full(
             cx,
             "default",
             &f.params,
@@ -659,28 +664,14 @@ pub(crate) fn hoist_function_declarations_from(
             f.generator,
             false,
         )?;
-        let const_idx = cx.intern_function_id(function_id);
         let tmp = cx.alloc_scratch();
-        emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
+        emit_make_callable(cx, tmp, &record, span);
         cx.emit_module_export_default_mirror(tmp, span);
         cx.top_mut().default_function_hoisted = true;
     }
     Ok(())
 }
 
-/// Compile a function body into a fresh `Function` record and
-/// return its id together with the captures it inherits from
-/// `parent`. Parameters live in registers `0..param_count` (the
-/// raw incoming argv slots); each one is then destructured /
-/// defaulted / aliased into named bindings as the body expects.
-/// Rest parameters (`...t`) are materialised by the runtime via
-/// [`Op::CollectRest`] reading from the call frame's stashed
-/// trailing argument list.
-/// `true` when any expression at module-top-level (i.e. outside
-/// any function / class body) uses `await`. The compiler upgrades
-/// `<main>` / `<module-init>` to `is_async = true` when this
-/// returns true so `Op::Await` can park the entry frame, matching
-/// §16.2.1.7 `top-level-await` modules.
 /// Walk a non-arrow function body and report whether it references
 /// the `arguments` identifier in a binding that escapes the body's
 /// own arrow / nested-function scopes. Arrow functions inherit
@@ -943,6 +934,11 @@ pub(crate) fn body_uses_arguments_callee(
     finder.found
 }
 
+/// `true` when any expression at module-top-level (i.e. outside
+/// any function / class body) uses `await`. The compiler upgrades
+/// `<main>` / `<module-init>` to `is_async = true` when this
+/// returns true so `Op::Await` can park the entry frame, matching
+/// §16.2.1.7 `top-level-await` modules.
 pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool {
     use oxc_ast_visit::Visit;
     #[derive(Default)]
@@ -1050,17 +1046,31 @@ pub(crate) fn pre_declare_annex_b_functions(
     let global_mirror =
         cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror;
     for name in candidates {
-        match cx.lookup_binding(&name) {
+        // §B.3.2.3 — a caller binding between a direct eval and its
+        // variable scope blocks the extension.
+        if cx.stack.len() == 1 && cx.in_eval && crate::entry::eval_annex_b_blocked(cx, &name) {
+            continue;
+        }
+        // A sloppy direct eval in a function: the variable scope is the
+        // caller's (§B.3.2.3 — a missing binding is created deletable).
+        if let Some(target) = crate::entry::eval_var_declaration_target(cx, &name, span) {
+            cx.annex_b_var_targets.insert(name, (Some(target), false));
+            continue;
+        }
+        match cx.lookup_in_current_scope(&name) {
             Some(info) => {
-                cx.annex_b_var_storages
-                    .insert(name, (Some(info.storage), global_mirror));
+                cx.annex_b_var_targets.insert(
+                    name,
+                    (
+                        Some(crate::compiler::VarTarget::Own(info.storage)),
+                        global_mirror,
+                    ),
+                );
             }
             None if global_mirror => {
                 // Script / sloppy-eval bodies: the var extension IS
-                // the global own property — a local shadow would mask
-                // a pre-existing global's value inside this body.
-                // §B.3.3.2 script bindings are non-configurable;
-                // §B.3.3.3 eval bindings are deletable.
+                // the global own property. §B.3.3.2 script bindings are
+                // non-configurable; §B.3.3.3 eval bindings are deletable.
                 let configurable = i32::from(cx.in_eval);
                 let name_idx = cx.intern_string_constant(&name);
                 cx.emit(
@@ -1068,15 +1078,15 @@ pub(crate) fn pre_declare_annex_b_functions(
                     [Operand::ConstIndex(name_idx), Operand::Imm32(configurable)],
                     span,
                 );
-                cx.annex_b_var_storages.insert(name, (None, true));
+                cx.annex_b_var_targets.insert(name, (None, true));
             }
             None => {
-                let storage = cx.declare_binding(&name, false, span)?;
-                let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
-                cx.emit_store_storage(dst, storage, span);
+                let storage = cx.declare_binding(&name, otter_bytecode::SlotKind::Var, span)?;
                 cx.mark_initialized(&name);
-                cx.annex_b_var_storages.insert(name, (Some(storage), false));
+                cx.annex_b_var_targets.insert(
+                    name,
+                    (Some(crate::compiler::VarTarget::Own(storage)), false),
+                );
             }
         }
     }

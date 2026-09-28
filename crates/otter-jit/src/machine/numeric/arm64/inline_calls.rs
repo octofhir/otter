@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Bounded native headers and register windows in the owning Machine frame.
-//! - Exact source PCs, closure spines and moving values from safepoint homes.
+//! - Exact source PCs, SELF closures and moving values from safepoint homes.
 //! - Publication and release through the existing native activation cursor.
 //!
 //! # Invariants
@@ -138,21 +138,6 @@ pub(super) fn enter(
             load_slot(ops, frame, site, value, 14)?;
             dynasm!(ops ; .arch aarch64 ; str x14, [x13, member as u32]);
         }
-        // The closure's immutable old-space spine remains stable while SELF is rooted.
-        let no_spine = ops.new_dynamic_label();
-        crate::template::arm64::values::emit_cell_test(
-            ops,
-            14,
-            15,
-            crate::template::arm64::values::CellTest::IsNotCell,
-            no_spine,
-        );
-        dynasm!(ops ; .arch aarch64
-            ; ldr x10, [x14, view.closure_call_layout.upvalue_base_byte]
-            ; ldr w11, [x14, view.closure_call_layout.upvalue_count_byte]
-            ; str x10, [x13, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-            ; str w11, [x13, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-            ; =>no_spine);
         for (index, value) in recipe.slots.iter().enumerate() {
             load_slot(ops, frame, site, *value, 14)?;
             emit_frame_str_x(ops, 14, start + (HEADER_WORDS + index) as u32 * 8);

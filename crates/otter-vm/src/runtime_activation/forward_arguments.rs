@@ -50,9 +50,11 @@ impl RuntimeCall<'_> {
             || self.forward_argument_count(method).is_some()
     }
 
-    /// Complete one forwarded call from `[method, callee, receiver, bindings…]`.
-    /// Register bindings follow the immutable CodeBlock mapping order; captured
-    /// aliases remain live cells. No interpreter destination crosses this API.
+    /// Complete one forwarded call from `[method, callee, receiver, register
+    /// bindings…, formals context]`. Register bindings follow the immutable
+    /// CodeBlock mapping order; the trailing context word is present exactly
+    /// when a mapped formal is context-held. No interpreter destination
+    /// crosses this API.
     pub fn call_forward_values(
         &mut self,
         values: &[crate::Value],
@@ -75,8 +77,9 @@ impl RuntimeCall<'_> {
                 )
             })
             .count();
+        let context_words = usize::from(function.forwarded_formals_context().is_some());
         if function.op(instruction) != otter_bytecode::Op::CallForwardArguments
-            || values.len() != bindings + 3
+            || values.len() != bindings + 3 + context_words
             || !self.forward_call_can_complete(values[0])
         {
             return Err(crate::VmError::InvalidOperand);
@@ -112,20 +115,19 @@ impl RuntimeCall<'_> {
         let caller = context.exec_function(source.function_id())?;
         let call_pc = unsafe { self.frame.as_ref() }.header.pc;
         vm.record_call_attempt_feedback(caller, call_pc, source.function_id());
-        let (function_id, captures, flags) = if let Some(function_id) = callee.as_function() {
-            (function_id, 0, 0)
+        let (function_id, flags) = if let Some(function_id) = callee.as_function() {
+            (function_id, 0)
         } else {
             let closure = callee.as_closure(&vm.gc_heap)?;
             let header = closure.call_header(&vm.gc_heap);
             if header.requires_runtime_setup() {
                 return None;
             }
-            (header.function_id, header.upvalue_count, header.flags)
+            (header.function_id, header.flags)
         };
         let callee_context = context.for_function(function_id).ok()?;
         let function = callee_context.exec_function(function_id)?;
         if !function.admits_generated_call(crate::jit::JitDirectCallKind::Plain)
-            || captures != u32::from(function.inherited_upvalue_count)
             || (!(function.is_strict || function.is_arrow)
                 && flags & crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS != 0)
         {

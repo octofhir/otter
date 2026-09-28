@@ -4,8 +4,8 @@
 //! - [`VmThread`] is the only process state generated code receives.
 //! - [`VmFrameHeader`] is the tier-independent frame prefix.
 //! - [`NativeFrame`] is the compact activation record shared by every tier.
-//! - [`NATIVE_FRAME_EVAL_ENV_OFFSET`] is the sole compiler-visible location of
-//!   the VM-private direct-eval root slot.
+//! - `NATIVE_FRAME_*_OFFSET` constants give generated code the byte offset of
+//!   every field it reads or writes.
 //! - [`NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET`] locates the lazy arguments root.
 //!
 //! # Invariants
@@ -14,8 +14,9 @@
 //!   layout. Generated code must not cast its opaque addresses to Rust types.
 //! - VM and JIT are built together and consume one current layout; there is no
 //!   compatibility/version protocol inside the process.
-//! - Typed direct-eval root access stays inside the VM; generated code receives
-//!   only the VM-derived numeric slot offset.
+//! - A frame carries no binding storage. Captured bindings live in contexts
+//!   reached through registers; the incoming context is `SELF`'s closure
+//!   context, so SELF is always the exact closure being executed.
 //! - The nullable arguments cache is initialized before publication and traced
 //!   in place; exact deopt preserves its identity in the interpreter frame.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
@@ -24,7 +25,7 @@
 //! # See also
 //! - [`super::safepoints`] for precise root maps.
 
-use crate::{Value, eval_env::EvalEnvHandle};
+use crate::Value;
 
 /// Stable VM-thread fields visible to native code.
 #[repr(C, align(8))]
@@ -127,6 +128,12 @@ impl NativeFrameFlags {
     /// the bit: a materialized activation keeps the same list in its cold
     /// record instead.
     pub const INCOMING_ARGUMENTS: u8 = 1 << 3;
+    /// The optimizing tier is entered at a loop header rather than at the
+    /// function's start: the header's canonical PC is the frame's `pc`, and
+    /// every live register holds the interpreter's current value. The
+    /// generated entry dispatch reads the bit once to select the header's OSR
+    /// block; nothing else consults it.
+    pub const OSR_ENTRY: u8 = 1 << 4;
 
     /// Empty flag set.
     #[must_use]
@@ -185,8 +192,8 @@ impl VmFrameHeader {
 
 /// Authoritative machine-observed synchronous activation shared by every tier.
 ///
-/// Interpreter, baseline, and optimizer dispatch reuse the same register and
-/// upvalue windows. `header.kind` changes execution mode, not activation
+/// Interpreter, baseline, and optimizer dispatch reuse the same register
+/// window. `header.kind` changes execution mode, not activation
 /// ownership. A [`crate::Frame`] exists only for interpreter execution or a
 /// cold native bailout that has explicitly transferred ownership.
 #[repr(C, align(8))]
@@ -196,23 +203,13 @@ pub struct NativeFrame {
     pub header: VmFrameHeader,
     /// Base address of initialized tagged register slots.
     pub register_base: u64,
-    /// Base address of a contiguous [`crate::UpvalueCell`] handle spine, or
-    /// zero when `upvalue_count == 0`.
-    pub upvalue_base: u64,
     /// Boxed `this` value.
     pub this_value_bits: u64,
     /// Boxed `new.target` value.
     pub new_target_bits: u64,
-    /// Exact running function object used by named SELF and `arguments.callee`.
+    /// Exact running function object (SELF): the closure whose context
+    /// `LoadClosureContext` reads, also `LoadSelf` and `arguments.callee`.
     pub self_value_bits: u64,
-    /// Number of initialized handles at `upvalue_base`.
-    pub upvalue_count: u32,
-    /// Nullable compressed direct-eval environment handle.
-    ///
-    /// This is an ordinary traced frame slot and the sole owner while the
-    /// native activation is published. Materialization moves the handle into
-    /// the replacement [`crate::Frame`]; it never copies the root.
-    pub(crate) eval_env: EvalEnvHandle,
     /// Number of actual arguments published after the register window when
     /// [`NativeFrameFlags::INCOMING_ARGUMENTS`] is set; otherwise unused.
     pub argument_count: u32,
@@ -224,8 +221,8 @@ pub struct NativeFrame {
 impl NativeFrame {
     /// Construct the common state of a live native JS call.
     ///
-    /// Upvalues and register-window ownership are published through the
-    /// intent-level setters below before execution.
+    /// Register-window ownership is published through the intent-level
+    /// setters below before execution.
     #[must_use]
     pub const fn new(
         header: VmFrameHeader,
@@ -236,12 +233,9 @@ impl NativeFrame {
         Self {
             header,
             register_base,
-            upvalue_base: 0,
             this_value_bits: this_value.to_abi_bits(),
             new_target_bits: Value::UNDEFINED.to_abi_bits(),
             self_value_bits: self_value.to_abi_bits(),
-            upvalue_count: 0,
-            eval_env: EvalEnvHandle::null(),
             argument_count: 0,
             arguments_object: crate::object::JsObject::null(),
         }
@@ -288,30 +282,6 @@ impl NativeFrame {
     /// Replace the current `new.target` binding.
     pub fn set_new_target(&mut self, value: Value) {
         self.new_target_bits = value.to_abi_bits();
-    }
-
-    /// Publish the stable handle spine consumed by native upvalue operations.
-    ///
-    /// The owner must keep `base..base + count * size_of::<UpvalueCell>()`
-    /// initialized and alive until this native frame is no longer active.
-    pub fn set_upvalue_window(&mut self, base: u64, count: u32) {
-        self.upvalue_base = base;
-        self.upvalue_count = count;
-    }
-
-    /// Direct-eval environment inherited by this activation, if any.
-    #[must_use]
-    pub(crate) const fn eval_env(&self) -> Option<EvalEnvHandle> {
-        if self.eval_env.is_null() {
-            None
-        } else {
-            Some(self.eval_env)
-        }
-    }
-
-    /// Publish one nullable direct-eval environment handle.
-    pub(crate) fn set_eval_env(&mut self, eval_env: Option<EvalEnvHandle>) {
-        self.eval_env = eval_env.unwrap_or_else(EvalEnvHandle::null);
     }
 
     /// Mark the register window as generated-code stack storage.
@@ -374,7 +344,7 @@ impl NativeFrame {
     }
 
     /// Switch this activation to interpreter dispatch without moving or
-    /// copying its register/upvalue windows.
+    /// copying its register window.
     pub fn enter_interpreter(&mut self) -> bool {
         if self
             .header
@@ -388,7 +358,7 @@ impl NativeFrame {
     }
 
     /// Switch this activation to a compiled tier without moving or copying its
-    /// register/upvalue windows.
+    /// register window.
     pub fn enter_compiled(&mut self, kind: NativeFrameKind) -> bool {
         if !matches!(
             kind,
@@ -404,7 +374,7 @@ impl NativeFrame {
 const _: [(); 96] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
-const _: [(); 72] = [(); std::mem::size_of::<NativeFrame>()];
+const _: [(); 56] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmThread, current_code_object_id)];
@@ -419,20 +389,22 @@ const _: [(); 4] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 11] = [(); std::mem::offset_of!(VmFrameHeader, flags)];
 const _: [(); 16] = [(); std::mem::offset_of!(NativeFrame, register_base)];
-const _: [(); 24] = [(); std::mem::offset_of!(NativeFrame, upvalue_base)];
-const _: [(); 32] = [(); std::mem::offset_of!(NativeFrame, this_value_bits)];
-const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, new_target_bits)];
-const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, self_value_bits)];
-const _: [(); 56] = [(); std::mem::offset_of!(NativeFrame, upvalue_count)];
-const _: [(); 60] = [(); std::mem::offset_of!(NativeFrame, eval_env)];
-const _: [(); 64] = [(); std::mem::offset_of!(NativeFrame, argument_count)];
+const _: [(); 24] = [(); std::mem::offset_of!(NativeFrame, this_value_bits)];
+const _: [(); 32] = [(); std::mem::offset_of!(NativeFrame, new_target_bits)];
+const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, self_value_bits)];
+const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, argument_count)];
 
-/// Byte offset of the VM-owned direct-eval environment root in
-/// [`NativeFrame`].
-///
-/// Generated code may write the nullable compressed handle at this numeric
-/// offset, but the Rust field and its typed accessors remain VM-private.
-pub const NATIVE_FRAME_EVAL_ENV_OFFSET: u32 = std::mem::offset_of!(NativeFrame, eval_env) as u32;
+/// Byte offset of [`NativeFrame::register_base`].
+pub const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, register_base) as u32;
+/// Byte offset of [`NativeFrame::this_value_bits`].
+pub const NATIVE_FRAME_THIS_OFFSET: u32 = std::mem::offset_of!(NativeFrame, this_value_bits) as u32;
+/// Byte offset of [`NativeFrame::new_target_bits`].
+pub const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
+/// Byte offset of [`NativeFrame::self_value_bits`] (SELF). Generated
+/// `LoadClosureContext` loads the closure here, then its context word.
+pub const NATIVE_FRAME_SELF_OFFSET: u32 = std::mem::offset_of!(NativeFrame, self_value_bits) as u32;
 
 /// Byte offset of [`NativeFrame::argument_count`], written by generated
 /// callers that publish the actual-argument window.
@@ -442,7 +414,7 @@ pub const NATIVE_FRAME_ARGUMENT_COUNT_OFFSET: u32 =
 /// Nullable arguments object root; zero admits direct actual-window reads.
 pub const NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, arguments_object) as u32;
-const _: [(); 68] = [(); std::mem::offset_of!(NativeFrame, arguments_object)];
+const _: [(); 52] = [(); std::mem::offset_of!(NativeFrame, arguments_object)];
 
 #[cfg(test)]
 mod tests {
@@ -522,15 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn native_frame_layout_includes_traced_eval_env_slot() {
+    fn native_frame_layout_holds_no_binding_storage() {
         assert_eq!(std::mem::size_of::<VmFrameHeader>(), 12);
-        assert_eq!(std::mem::size_of::<NativeFrame>(), 72);
-        assert_eq!(std::mem::offset_of!(NativeFrame, register_base), 16);
-        assert_eq!(std::mem::offset_of!(NativeFrame, upvalue_base), 24);
-        assert_eq!(std::mem::offset_of!(NativeFrame, self_value_bits), 48);
-        assert_eq!(std::mem::offset_of!(NativeFrame, eval_env), 60);
-        assert_eq!(std::mem::offset_of!(NativeFrame, argument_count), 64);
-        assert_eq!(NATIVE_FRAME_ARGUMENT_COUNT_OFFSET, 64);
-        assert_eq!(NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET, 68);
+        assert_eq!(std::mem::size_of::<NativeFrame>(), 56);
+        assert_eq!(NATIVE_FRAME_REGISTER_BASE_OFFSET, 16);
+        assert_eq!(NATIVE_FRAME_THIS_OFFSET, 24);
+        assert_eq!(NATIVE_FRAME_NEW_TARGET_OFFSET, 32);
+        assert_eq!(NATIVE_FRAME_SELF_OFFSET, 40);
+        assert_eq!(NATIVE_FRAME_ARGUMENT_COUNT_OFFSET, 48);
+        assert_eq!(NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET, 52);
     }
 }

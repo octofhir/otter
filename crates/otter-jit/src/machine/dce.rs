@@ -160,7 +160,8 @@ fn removable(sequence: &InstructionSequence, instruction: &MachineInstruction) -
             instruction.opcode,
             MachineOpcode::EntryValue(_)
                 | MachineOpcode::EntryThis
-                | MachineOpcode::OsrEntry { .. }
+                | MachineOpcode::OsrValue { .. }
+                | MachineOpcode::OsrDispatch { .. }
                 | MachineOpcode::LoopPreheader
         )
     {

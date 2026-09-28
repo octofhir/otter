@@ -2,8 +2,8 @@
 //!
 //! The stack owns bytecode-interpreter frames while register storage lives in
 //! the separate reservation-stable [`crate::RegisterStack`]. The frame vector
-//! may therefore grow and move: consumers keep indices and register/upvalue
-//! windows, never `Frame` addresses, across a push.
+//! may therefore grow and move: consumers keep indices and register windows,
+//! never `Frame` addresses, across a push.
 //!
 //! # Contents
 //! - [`ActivationStack`] — the frame stack and its stack-discipline API.
@@ -170,7 +170,7 @@ impl ActivationStack {
     ///
     /// The frame is fully constructed before it is published (its register
     /// window is already `Value::undefined()`-filled by
-    /// [`Frame::with_exec_return_upvalues_and_this`] and friends), so it is never visible to
+    /// [`Frame::for_code_block`] and friends), so it is never visible to
     /// GC in a partially-initialized state.
     #[inline]
     pub fn push(&mut self, frame: Frame) {
@@ -350,8 +350,7 @@ mod tests {
                 scratch: 1,
                 param_count: 0,
                 length: 0,
-                own_upvalue_count: 0,
-                inherited_upvalue_count: 0,
+                scopes: Vec::new(),
                 is_strict: false,
                 is_arrow: false,
                 is_method: false,
@@ -368,8 +367,6 @@ mod tests {
                 source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
-                direct_eval_bindings: Vec::new(),
-                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: Vec::<Instruction>::new().into(),
                 spans: Vec::<SpanEntry>::new(),
@@ -390,7 +387,13 @@ mod tests {
         registers: &mut crate::register_stack::RegisterStack,
     ) -> Frame {
         let window = registers.allocate(1).unwrap();
-        let mut frame = Frame::for_function(function, window);
+        let mut frame = Frame::for_function(
+            function,
+            None,
+            Value::function(function.id),
+            Value::undefined(),
+            window,
+        );
         frame.registers[0] = Value::number_i32(tag);
         frame
     }

@@ -16,8 +16,8 @@
 //! - Allocating calls build the frozen call-packet layout on the machine
 //!   stack, name a concrete safepoint, and are followed by no derived-pointer
 //!   reuse — operands re-load from the rooted frame window.
-//! - Runtime entries, cage bases, and plan-owned operand slices are recorded
-//!   with stable semantic identities during the existing emission pass.
+//! - Runtime entries are recorded with stable semantic identities during the
+//!   existing emission pass.
 //!
 //! # See also
 //! - `crates/otter-vm/src/native_abi/runtime_stubs.rs` — the authoritative
@@ -30,20 +30,15 @@ use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 use super::ic_probe::{
     DenseIndexForm, element_access_for, emit_element_address, emit_element_read, emit_element_write,
 };
-use super::values::{
-    emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64, emit_store_reg,
-};
+use super::values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg};
 pub(super) use crate::entry::TransitionTable;
 use otter_vm::JitCompileSnapshot;
 
-use crate::artifact::relocation::{
-    RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
-};
+use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
     ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, THREAD_OFFSET, Unsupported, VALUE_UNDEFINED,
 };
-use crate::template::TemplateTail;
 
 /// Decode the sole status-word alphabet after a runtime call. Unknown words
 /// are structural ABI failures and go directly to the compiled fatal exit.
@@ -90,29 +85,6 @@ fn emit_transition_call(
     emit_status_word_result(ops, None, threw, fatal);
 }
 
-fn emit_operand_slice_address(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    register: u8,
-    address: u64,
-    arena: TemplateOperandArena,
-    role: TemplateOperandRole,
-    tail: TemplateTail,
-) {
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        register,
-        address,
-        RelocationTarget::TemplateOperandSlice {
-            arena,
-            role,
-            start: u32::try_from(tail.start).expect("template operand offset fits u32"),
-            len: u32::try_from(tail.len).expect("template operand length fits u32"),
-        },
-    );
-}
-
 /// Stage the entry context into `x0` (the first transition argument).
 fn emit_ctx_arg(ops: &mut Assembler) {
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
@@ -140,6 +112,8 @@ pub(super) fn emit_make_function(
     );
 }
 
+/// `MakeClosure dst, fn, ctx`: `x1` the compiling function id, `x2` the
+/// destination, `x3` the function constant, `x4` the context register.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_make_closure(
     ops: &mut Assembler,
@@ -148,8 +122,7 @@ pub(super) fn emit_make_closure(
     code_block_id: u32,
     dst: u16,
     function: u32,
-    parents: &[u32],
-    parents_tail: TemplateTail,
+    context: u16,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) {
@@ -157,16 +130,7 @@ pub(super) fn emit_make_closure(
     emit_load_u64(ops, 1, u64::from(code_block_id));
     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
     emit_load_u64(ops, 3, u64::from(function));
-    emit_operand_slice_address(
-        ops,
-        relocations,
-        4,
-        parents.as_ptr() as u64,
-        TemplateOperandArena::Indices,
-        TemplateOperandRole::ClosureParents,
-        parents_tail,
-    );
-    emit_load_u64(ops, 5, parents.len() as u64);
+    dynasm!(ops ; .arch aarch64 ; movz x4, context as u32);
     emit_transition_call(
         ops,
         relocations,
@@ -311,26 +275,6 @@ pub(super) fn emit_new_object_literal(
         throw_value,
         fatal,
     )
-}
-
-pub(super) fn emit_fresh_upvalue(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    index: i32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    emit_load_u64(ops, 1, u64::from(index as u32));
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_FRESH_UPVALUE),
-        abi::STUB_JIT_FRESH_UPVALUE,
-        threw,
-        fatal,
-    );
 }
 
 pub(super) fn emit_define_data_property(

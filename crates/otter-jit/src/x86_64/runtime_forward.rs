@@ -8,7 +8,9 @@
 //! # Invariants
 //! - Scratch metadata contains no moving roots. The published caller remains the
 //!   authoritative root owner until the private callee frame is complete.
-//! - Every register and incoming-argument word is initialized before allocation.
+//! - Every register and incoming-argument word is initialized before the frame
+//!   is published. The frame carries no binding storage; the callee reads its
+//!   context through SELF.
 //! - The dynamic allocation-size slot releases the callee and plan scratch on
 //!   every pre-entry rejection and every completed generated call.
 //! - `restore_roots` preserves `r11`, which carries a pure result or exception.
@@ -34,9 +36,8 @@ use crate::{
         FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
         GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NATIVE_STACK_LIMIT_OFFSET, THREAD_OFFSET,
-        TransitionTable, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET, THREAD_OFFSET, TransitionTable,
+        VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
         VM_THREAD_CURRENT_FRAME_OFFSET,
     },
 };
@@ -54,14 +55,12 @@ const CALLER_FRAME: u32 = NATIVE_FRAME_STACK_SIZE + 16;
 const CALLER_CODE_OBJECT_ID: u32 = NATIVE_FRAME_STACK_SIZE + 24;
 const TARGET_CELL: u32 = NATIVE_FRAME_STACK_SIZE + 32;
 const ALLOCATION_SIZE: u32 = NATIVE_FRAME_STACK_SIZE + 40;
-const UPVALUE_BASE: u32 = NATIVE_FRAME_STACK_SIZE + 48;
+const REGISTER_BASE: u32 = NATIVE_FRAME_STACK_SIZE + 48;
 
 const PLAN_ENTRY: u32 = std::mem::offset_of!(JitDirectCallPlan, entry_cell) as u32;
 const PLAN_THIS: u32 = std::mem::offset_of!(JitDirectCallPlan, this_mode) as u32;
 const PLAN_PARAMS: u32 = std::mem::offset_of!(JitDirectCallPlan, param_count) as u32;
 const PLAN_REGISTERS: u32 = std::mem::offset_of!(JitDirectCallPlan, register_count) as u32;
-const PLAN_OWN: u32 = std::mem::offset_of!(JitDirectCallPlan, own_upvalue_count) as u32;
-const PLAN_INHERITED: u32 = std::mem::offset_of!(JitDirectCallPlan, inherited_upvalue_count) as u32;
 const PLAN_ACTUALS: u32 = std::mem::offset_of!(JitDirectCallPlan, needs_incoming_arguments) as u32;
 
 const INCOMING_ARGUMENTS_HEADER_WORD: u32 = (abi::NativeFrameFlags::INCOMING_ARGUMENTS as u32)
@@ -216,12 +215,7 @@ where
         ; cmp rax, -1
         ; je =>scratch_miss
         ; mov [rsp + SCRATCH_COUNT as i32], rax
-        ; movzx r8d, WORD [rsp + PLAN_OWN as i32]
-        ; movzx r9d, WORD [rsp + PLAN_INHERITED as i32]
-        ; add r8, r9
-        ; shl r8, 2
-        ; add r8, (UPVALUE_BASE + 7) as i32
-        ; and r8, -8
+        ; mov r8d, REGISTER_BASE as i32
         ; movzx r9d, WORD [rsp + PLAN_REGISTERS as i32]
         ; lea r9, [r8 + r9 * 8]
         ; cmp BYTE [rsp + PLAN_ACTUALS as i32], 0
@@ -274,7 +268,8 @@ where
         ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
     );
 
-    let direct_function = ops.new_dynamic_label();
+    // A bare function value carries no bound receiver; the plan admitted a
+    // cell only as a closure, whose flags name an arrow's lexical `this`.
     let closure_ready = ops.new_dynamic_label();
     load64(ops, 10, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops
@@ -282,28 +277,12 @@ where
         ; mov r8, r9
         ; and r8, r10
         ; test r8, r8
-        ; jnz =>direct_function
-        ; mov r8, [r9 + view.closure_call_layout.upvalue_base_byte as i32]
-        ; mov r10d, [r9 + view.closure_call_layout.upvalue_count_byte as i32]
-        ; mov edx, [r9 + view.closure_call_layout.eval_env_byte as i32]
+        ; jnz =>closure_ready
         ; mov eax, [r9 + view.closure_call_layout.flags_byte as i32]
-    );
-    let no_bound_this = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch x64
         ; test eax, view.closure_call_layout.bound_this_flag as i32
-        ; jz =>no_bound_this
+        ; jz =>closure_ready
         ; mov rcx, [r9 + view.closure_call_layout.bound_this_byte as i32]
-        ; =>no_bound_this
-        ; jmp =>closure_ready
-        ; =>direct_function
-        ; xor r8d, r8d
-        ; xor r10d, r10d
-        ; xor edx, edx
         ; =>closure_ready
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r8
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r10d
-        ; mov [rsp + abi::NATIVE_FRAME_EVAL_ENV_OFFSET as i32], edx
     );
 
     let this_ready = ops.new_dynamic_label();
@@ -349,7 +328,7 @@ where
     load64(ops, 10, VALUE_UNDEFINED);
     dynasm!(ops ; .arch x64 ; mov [rsp + NATIVE_FRAME_NEW_TARGET_OFFSET as i32], r10);
 
-    // Initialize the complete traced register/actual window before allocation.
+    // Initialize the complete traced register/actual window before publication.
     dynasm!(ops
         ; .arch x64
         ; mov r11, [rsp + CALLER_CODE_OBJECT_ID as i32]
@@ -367,29 +346,6 @@ where
         ; sub ecx, 1
         ; jne <initialize_loop
         ; initialized:
-        ; movzx edx, WORD [r11 + PLAN_OWN as i32]
-        ; test edx, edx
-        ; jz >captures_ready
-        ; movzx ecx, WORD [r11 + PLAN_INHERITED as i32]
-        ; lea rax, [rsp + UPVALUE_BASE as i32]
-        ; mov [rsp + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], rax
-        ; mov DWORD [rsp + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], 0
-        ; mov rdi, r15
-        ; mov rsi, rsp
-    );
-    runtime(ops, relocations, table, abi::STUB_JIT_INITIALIZE_UPVALUES);
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rdx, rdx
-        ; je >captures_ready
-        ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>uncommitted_rejected
-        ; cmp edx, abi::NativeResultStatus::Throw as i32
-        ; je =>prepare_error
-        ; jmp =>prepare_fatal
-        ; captures_ready:
-        ; mov r11, [rsp + CALLER_CODE_OBJECT_ID as i32]
         ; movzx edx, WORD [r11 + PLAN_PARAMS as i32]
         ; mov rdi, r15
         ; mov rsi, rsp

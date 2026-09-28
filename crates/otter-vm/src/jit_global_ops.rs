@@ -4,15 +4,14 @@
 //! - `LoadGlobalThis`, `LoadGlobalOrUndefined`, `StoreGlobalBinding`, and
 //!   `StoreGlobalChecked` completion through the VM's global environment-record
 //!   helpers.
-//! - Dynamic-scope `LoadDynamic`, `StoreDynamic`, and `TypeofDynamic` name
-//!   resolution through the same environment helpers.
 //!
 //! # Invariants
 //! - Every transition delegates to the interpreter's register helper or its
 //!   shared value-level kernel, so accessor globals fire identical
 //!   getters/setters and both tiers observe identical global-record state.
-//! - Dynamic-scope operations resolve the eval environment from the published
-//!   native frame; the parked materialized frame is not a second root owner.
+//! - Names a sloppy direct eval may have introduced resolve through the
+//!   `Lookup*` binding family (`crate::context_ops`), not through this
+//!   transition.
 //! - Accessor getter/setter reentry runs through the shared ActivationStack/VmThread
 //!   path; a committed global effect is never replayed by an exact side exit.
 //!
@@ -81,41 +80,6 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 as u16,
                 )?;
-            }
-            value if value == Op::LoadDynamic as u8 => {
-                let value = self.load_dynamic_value(
-                    context,
-                    stack,
-                    frame.function_id(),
-                    frame.eval_env(),
-                    arg1 as u32,
-                )?;
-                frame.write(arg0 as u16, value)?;
-                frame.advance_pc()?;
-            }
-            value if value == Op::StoreDynamic as u8 => {
-                let value = frame.read(arg0 as u16)?;
-                self.store_dynamic_value(
-                    context,
-                    stack,
-                    frame.function_id(),
-                    frame.eval_env(),
-                    value,
-                    arg1 as u32,
-                    false,
-                )?;
-                frame.advance_pc()?;
-            }
-            value if value == Op::TypeofDynamic as u8 => {
-                let value = self.typeof_dynamic_value(
-                    context,
-                    stack,
-                    frame.function_id(),
-                    frame.eval_env(),
-                    arg1 as u32,
-                )?;
-                frame.write(arg0 as u16, value)?;
-                frame.advance_pc()?;
             }
             value if value == Op::DeclareGlobalVar as u8 => {
                 self.run_declare_global_var_reg(

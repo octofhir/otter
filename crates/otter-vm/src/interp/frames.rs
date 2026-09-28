@@ -26,20 +26,13 @@ impl Interpreter {
             .saturating_add(function.locals)
             .saturating_add(function.scratch) as usize;
         let window = self.alloc_reg_window(total)?;
-        Ok(Frame::for_function(function, window))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_frame_for_function_with_heap(
-        &mut self,
-        function: &otter_bytecode::Function,
-    ) -> Result<Frame, VmError> {
-        let total = function
-            .param_count
-            .saturating_add(function.locals)
-            .saturating_add(function.scratch) as usize;
-        let window = self.alloc_reg_window(total)?;
-        Frame::for_function_with_heap(function, &mut self.gc_heap, window).map_err(VmError::from)
+        Ok(Frame::for_function(
+            function,
+            None,
+            Value::function(function.id),
+            Value::undefined(),
+            window,
+        ))
     }
 
     /// Borrow the cold record attached to `frame`, if any.
@@ -173,7 +166,7 @@ impl Interpreter {
     /// access.
     ///
     /// # Safety
-    /// `frame` and its explicit register/upvalue windows must remain live,
+    /// `frame` and its explicit register window must remain live,
     /// initialized, stable, and exclusively owned by the active mutator until
     /// the matching [`Self::jit_pop_native_activation`].
     pub unsafe fn jit_push_native_frame(
@@ -498,24 +491,25 @@ impl Interpreter {
         // pool probe rather than from a probe per question.
         let mut construct_target = None;
         let mut is_derived_ctor = false;
-        let mut derived_this_cell = None;
+        let mut derived_this_slot = None;
         let mut async_state = None;
         if let Some(idx) = popped.cold.take() {
             let cold = self.cold_frames.get_mut(idx);
             construct_target = cold.construct_target;
             is_derived_ctor = cold.is_derived_constructor;
-            derived_this_cell = cold.derived_this_cell;
+            derived_this_slot = cold.derived_this_slot.take();
             async_state = cold.async_state.take();
             // Release the cold slot now so the pool can reuse it; every
             // remaining cold-record read already happened.
             self.cold_frames.release(idx);
         }
-        let mut derived_this = popped.this_value;
-        if derived_this.is_hole()
-            && let Some(cell) = derived_this_cell
-        {
-            derived_this = crate::read_upvalue(&self.gc_heap, cell);
-        }
+        // A derived constructor's `this`: the frame-held binding, or the
+        // `DerivedThis` context slot `ReturnDerived` named, read now that every
+        // crossed `finally` has run.
+        let derived_this = match derived_this_slot {
+            Some((ctx, coord)) => self.derived_this_slot_value(ctx, coord)?,
+            None => popped.this_value,
+        };
         // The frame is terminal — return its spilled register window to the
         // pool. Nothing below reads `popped.registers`.
         self.reclaim_registers(&mut popped);
@@ -528,7 +522,9 @@ impl Interpreter {
                 value
             } else if value.is_undefined() {
                 if derived_this.is_hole() {
-                    return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
+                    return Err(
+                        self.err_this_uninit(crate::context_ops::DERIVED_THIS_UNINITIALIZED.into())
+                    );
                 }
                 derived_this
             } else {

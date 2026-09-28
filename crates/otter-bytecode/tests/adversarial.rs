@@ -9,7 +9,8 @@
 //! - [`seed_corpus`] — modules spanning the opcode families with distinct
 //!   verification domains: control flow, closures, constants, metadata,
 //!   variadic call and construct sites, the iteration protocol, suspension
-//!   points, classes and private names, and module linkage.
+//!   points, classes and private names, module linkage, and context chains
+//!   with their scope descriptors, eval lookups, and packed coordinates.
 //! - Byte mutations — single- and two-byte flips, truncation, insertion, and
 //!   tampering with the leading counts a decoder sizes allocations from.
 //! - Structural mutations — decoded fields moved out of their legal domain,
@@ -25,8 +26,11 @@
 use otter_bytecode::binary::{ModuleDecodeError, decode_module, encode_module};
 use otter_bytecode::wordcode::FunctionCodeBuilder;
 use otter_bytecode::{
-    ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant, Function, ModuleInit,
-    ModuleResolution, NO_HANDLER_OFFSET, Op, Operand, SourceKind, SpanEntry, TemplateSite,
+    ArgumentBindingStorage, ArgumentsObjectKind, BindingStoreFallback, BytecodeModule,
+    ClassHintSite, Constant, ContextCoord, Function, LookupGlobalMode, LookupRefTarget,
+    MappedArgumentBinding, ModuleInit, ModuleResolution, NO_HANDLER_OFFSET, Op, Operand,
+    ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanEntry,
+    StoreRefMode, TemplateSite,
 };
 
 /// Deterministic 64-bit xorshift. The corpus must reproduce byte for byte
@@ -133,11 +137,19 @@ fn seed_handlers() -> BytecodeModule {
     }
 }
 
-/// Two functions, a closure capture spine, a populated constant pool, a
+/// Two functions, a closure-context read, a populated constant pool, a
 /// template site, and source metadata — the index-bearing domains.
 fn seed_rich() -> BytecodeModule {
     let mut inner = FunctionCodeBuilder::new();
-    inner.push(Op::LoadUpvalue, &[Operand::Register(0), Operand::Imm32(0)]);
+    inner.push(Op::LoadClosureContext, &[Operand::Register(0)]);
+    inner.push(
+        Op::LoadContextSlot,
+        &[
+            Operand::Register(0),
+            Operand::Register(0),
+            Operand::Imm32(coord(0, 0)),
+        ],
+    );
     inner.push(Op::Return, &[Operand::Register(0)]);
 
     let mut outer = FunctionCodeBuilder::new();
@@ -184,7 +196,6 @@ fn seed_rich() -> BytecodeModule {
                 id: 1,
                 name: "inner".to_string(),
                 locals: 1,
-                inherited_upvalue_count: 1,
                 is_strict: true,
                 arguments_object_kind: ArgumentsObjectKind::Unmapped,
                 code: inner.finish(),
@@ -215,7 +226,15 @@ fn seed_calls() -> BytecodeModule {
     callee.push(Op::Return, &[Operand::Register(0)]);
 
     let mut captured = FunctionCodeBuilder::new();
-    captured.push(Op::LoadUpvalue, &[Operand::Register(0), Operand::Imm32(0)]);
+    captured.push(Op::LoadClosureContext, &[Operand::Register(0)]);
+    captured.push(
+        Op::LoadContextSlotChecked,
+        &[
+            Operand::Register(0),
+            Operand::Register(0),
+            Operand::Imm32(coord(0, 0)),
+        ],
+    );
     captured.push(Op::Return, &[Operand::Register(0)]);
 
     let mut tail = FunctionCodeBuilder::new();
@@ -232,7 +251,15 @@ fn seed_calls() -> BytecodeModule {
     tail.push(Op::ReturnUndefined, &[]);
 
     let mut main = FunctionCodeBuilder::new();
-    main.push(Op::FreshUpvalue, &[Operand::Imm32(0)]);
+    main.push(Op::LoadUndefined, &[Operand::Register(4)]);
+    main.push(
+        Op::CreateContext,
+        &[
+            Operand::Register(4),
+            Operand::Register(4),
+            Operand::Imm32(0),
+        ],
+    );
     main.push(
         Op::MakeFunction,
         &[Operand::Register(0), Operand::ConstIndex(0)],
@@ -242,8 +269,7 @@ fn seed_calls() -> BytecodeModule {
         &[
             Operand::Register(1),
             Operand::ConstIndex(1),
-            Operand::ConstIndex(1),
-            Operand::Imm32(0),
+            Operand::Register(4),
         ],
     );
     main.push(Op::NewObject, &[Operand::Register(2)]);
@@ -311,8 +337,8 @@ fn seed_calls() -> BytecodeModule {
             Function {
                 id: 0,
                 name: "<main>".to_string(),
-                locals: 4,
-                own_upvalue_count: 1,
+                locals: 5,
+                scopes: vec![scope(ScopeKind::Block, &[("x", SlotKind::Let)])],
                 code: main.finish(),
                 module_url: "file:///calls.js".to_string(),
                 ..Default::default()
@@ -331,7 +357,6 @@ fn seed_calls() -> BytecodeModule {
                 id: 2,
                 name: "captured".to_string(),
                 locals: 1,
-                inherited_upvalue_count: 1,
                 code: captured.finish(),
                 module_url: "file:///calls.js".to_string(),
                 ..Default::default()
@@ -582,7 +607,22 @@ fn seed_classes() -> BytecodeModule {
             Operand::Register(0),
         ],
     );
-    constructor.push(Op::ReturnUndefined, &[]);
+    constructor.push(
+        Op::CreateContext,
+        &[
+            Operand::Register(4),
+            Operand::Register(4),
+            Operand::Imm32(0),
+        ],
+    );
+    constructor.push(
+        Op::ReturnDerived,
+        &[
+            Operand::Register(0),
+            Operand::Register(4),
+            Operand::Imm32(ContextCoord::new(0, 0).expect("coord").to_imm32()),
+        ],
+    );
 
     let mut method = FunctionCodeBuilder::new();
     method.push(Op::LoadThis, &[Operand::Register(0)]);
@@ -670,6 +710,18 @@ fn seed_classes() -> BytecodeModule {
                 locals: 5,
                 is_strict: true,
                 is_derived_constructor: true,
+                scopes: vec![ScopeDescriptor {
+                    kind: ScopeKind::Params,
+                    flags: ScopeFlags {
+                        strict: true,
+                        ..ScopeFlags::default()
+                    },
+                    slots: vec![SlotDescriptor {
+                        name: ".this".to_string(),
+                        kind: SlotKind::DerivedThis,
+                        exported: false,
+                    }],
+                }],
                 code: constructor.finish(),
                 module_url: "file:///classes.js".to_string(),
                 ..Default::default()
@@ -812,6 +864,202 @@ fn seed_modules() -> BytecodeModule {
     }
 }
 
+/// Packed context coordinate for a seed.
+fn coord(depth: u16, slot: u16) -> i32 {
+    ContextCoord::new(depth, slot)
+        .expect("seed slot is addressable")
+        .to_imm32()
+}
+
+/// One scope descriptor with default flags.
+fn scope(kind: ScopeKind, slots: &[(&str, SlotKind)]) -> ScopeDescriptor {
+    ScopeDescriptor {
+        kind,
+        flags: ScopeFlags::default(),
+        slots: slots
+            .iter()
+            .map(|(name, kind)| SlotDescriptor {
+                name: (*name).to_string(),
+                kind: *kind,
+                exported: false,
+            })
+            .collect(),
+    }
+}
+
+/// Context chains end to end: a sloppy function with an eval-extension
+/// anchor, a mapped formal held in its parameter context, a per-iteration
+/// copy, every eval-lookup form with its packed immediate, direct eval, a
+/// forwarded `arguments`, a closure over the chain, and a derived
+/// constructor whose `this` lives in a context slot.
+fn seed_contexts() -> BytecodeModule {
+    let r = Operand::Register;
+    let k = Operand::ConstIndex;
+    let imm = Operand::Imm32;
+
+    let mut main = FunctionCodeBuilder::new();
+    main.push(Op::LoadClosureContext, &[r(1)]);
+    main.push(Op::CreateContext, &[r(2), r(1), imm(0)]);
+    main.push(Op::StoreContextSlot, &[r(0), r(2), imm(coord(0, 0))]);
+    main.push(Op::CreateContext, &[r(3), r(2), imm(1)]);
+    main.push(Op::CopyContext, &[r(3), r(3)]);
+    main.push(Op::LoadContextSlotChecked, &[r(4), r(3), imm(coord(0, 0))]);
+    main.push(Op::StoreContextSlotChecked, &[r(4), r(3), imm(coord(0, 0))]);
+    main.push(Op::LoadLookupSlot, &[r(4), r(3), k(0), imm(coord(1, 0))]);
+    main.push(
+        Op::StoreLookupSlot,
+        &[
+            r(4),
+            r(3),
+            k(0),
+            imm(coord(1, 0)),
+            imm(BindingStoreFallback::Mutable.to_imm32()),
+        ],
+    );
+    main.push(Op::DeleteLookupSlot, &[r(5), r(3), k(0), imm(1)]);
+    main.push(Op::LoadLookupGlobal, &[r(5), r(3), k(1), imm(2)]);
+    main.push(Op::TypeofLookupGlobal, &[r(5), r(3), k(1), imm(2)]);
+    main.push(
+        Op::StoreLookupGlobal,
+        &[
+            r(5),
+            r(3),
+            k(1),
+            imm(LookupGlobalMode {
+                depth: 2,
+                strict: false,
+            }
+            .to_imm32()),
+        ],
+    );
+    main.push(Op::DeleteLookupGlobal, &[r(5), r(3), k(1), imm(2)]);
+    main.push(
+        Op::ResolveLookupRef,
+        &[
+            r(6),
+            r(3),
+            k(0),
+            imm(LookupRefTarget::Slot(ContextCoord { depth: 1, slot: 0 }).to_imm32()),
+        ],
+    );
+    main.push(
+        Op::StoreRef,
+        &[
+            r(4),
+            r(6),
+            k(0),
+            imm(StoreRefMode {
+                slot: Some(0),
+                fallback: BindingStoreFallback::Mutable,
+                strict: false,
+            }
+            .to_imm32()),
+        ],
+    );
+    main.push(Op::DeclareEvalVar, &[r(3), k(1), imm(1)]);
+    main.push(Op::StoreVarScope, &[r(4), r(3), k(1), imm(1)]);
+    main.push(Op::Eval, &[r(7), r(4), r(3), imm(0)]);
+    main.push(Op::CallForwardArguments, &[r(7), r(5), r(5), r(5), r(2)]);
+    main.push(Op::MakeClosure, &[r(7), k(2), r(3)]);
+    main.push(Op::Return, &[r(7)]);
+
+    let mut constructor = FunctionCodeBuilder::new();
+    constructor.push(Op::LoadClosureContext, &[r(0)]);
+    constructor.push(Op::CreateContext, &[r(1), r(0), imm(0)]);
+    constructor.push(Op::LoadUndefined, &[r(2)]);
+    constructor.push(Op::SuperConstruct, &[r(2), r(2), k(0)]);
+    constructor.push(Op::BindThisContextSlot, &[r(2), r(1), imm(coord(0, 0))]);
+    constructor.push(Op::LoadSelf, &[r(0)]);
+    constructor.push(Op::ReturnDerived, &[r(0), r(1), imm(coord(0, 0))]);
+
+    let mut inner = FunctionCodeBuilder::new();
+    inner.push(Op::LoadClosureContext, &[r(0)]);
+    inner.push(Op::LoadContextSlot, &[r(0), r(0), imm(coord(0, 0))]);
+    inner.push(Op::Return, &[r(0)]);
+
+    let mut params = scope(
+        ScopeKind::Params,
+        &[
+            ("a", SlotKind::Param { checked: false }),
+            ("arguments", SlotKind::Arguments),
+        ],
+    );
+    params.flags = ScopeFlags {
+        strict: false,
+        var_scope: true,
+        has_extension: true,
+    };
+
+    BytecodeModule {
+        module: "file:///contexts.js".to_string(),
+        template_sites: Vec::new(),
+        source_kind: SourceKind::JavaScript,
+        functions: vec![
+            Function {
+                id: 0,
+                name: "<main>".to_string(),
+                param_count: 1,
+                length: 1,
+                locals: 8,
+                needs_arguments: true,
+                contains_direct_eval: true,
+                arguments_object_kind: ArgumentsObjectKind::Mapped,
+                mapped_argument_bindings: vec![MappedArgumentBinding {
+                    argument_index: 0,
+                    formal_name: "a".to_string(),
+                    storage: ArgumentBindingStorage::Context { reg: 2, slot: 0 },
+                }],
+                scopes: vec![params, scope(ScopeKind::ForHead, &[("i", SlotKind::Let)])],
+                code: main.finish(),
+                module_url: "file:///contexts.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 1,
+                name: "C".to_string(),
+                locals: 3,
+                is_strict: true,
+                is_derived_constructor: true,
+                scopes: vec![ScopeDescriptor {
+                    kind: ScopeKind::Params,
+                    flags: ScopeFlags {
+                        strict: true,
+                        ..ScopeFlags::default()
+                    },
+                    slots: vec![SlotDescriptor {
+                        name: ".this".to_string(),
+                        kind: SlotKind::DerivedThis,
+                        exported: false,
+                    }],
+                }],
+                code: constructor.finish(),
+                module_url: "file:///contexts.js".to_string(),
+                ..Default::default()
+            },
+            Function {
+                id: 2,
+                name: "inner".to_string(),
+                locals: 1,
+                code: inner.finish(),
+                module_url: "file:///contexts.js".to_string(),
+                ..Default::default()
+            },
+        ],
+        function_source: None,
+        constants: vec![
+            Constant::String {
+                utf16: "a".encode_utf16().collect(),
+            },
+            Constant::String {
+                utf16: "g".encode_utf16().collect(),
+            },
+            Constant::FunctionId { index: 2 },
+        ],
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
+    }
+}
+
 /// Rewrite one control-flow operand so it lands on `target`.
 ///
 /// Wordcode targets are relative to the instruction AFTER the one carrying
@@ -835,6 +1083,7 @@ fn seed_corpus() -> Vec<(&'static str, BytecodeModule)> {
         ("suspensions", seed_suspensions()),
         ("classes", seed_classes()),
         ("modules", seed_modules()),
+        ("contexts", seed_contexts()),
     ]
 }
 
@@ -979,9 +1228,9 @@ fn structural_mutations_are_typed_rejections() {
         module.functions[0].scratch = 0;
         module
     };
-    let missing_capture_spine = {
-        let mut module = seed_rich();
-        module.functions[1].inherited_upvalue_count = 0;
+    let dangling_context_scope = {
+        let mut module = seed_calls();
+        module.functions[0].scopes.clear();
         module
     };
     let dangling_class_hint = {
@@ -1009,16 +1258,84 @@ fn structural_mutations_are_typed_rejections() {
         module.functions[0].spans[0].pc = 4_000;
         module
     };
-    let closure_capture_count_mismatch = {
+    let closure_context_out_of_window = {
         let mut module = seed_calls();
-        module.functions[2].inherited_upvalue_count = 2;
+        let mut code = module.functions[0].code.to_builder();
+        code.replace(
+            3,
+            Op::MakeClosure,
+            &[
+                Operand::Register(1),
+                Operand::ConstIndex(1),
+                Operand::Register(300),
+            ],
+        );
+        module.functions[0].code = code.finish();
+        module
+    };
+    let reserved_context_slot = {
+        let mut module = seed_contexts();
+        let mut code = module.functions[0].code.to_builder();
+        code.replace(
+            5,
+            Op::LoadContextSlotChecked,
+            &[
+                Operand::Register(4),
+                Operand::Register(3),
+                Operand::Imm32(i32::from(ContextCoord::RESERVED_SLOT)),
+            ],
+        );
+        module.functions[0].code = code.finish();
+        module
+    };
+    let truncated_scope_table = {
+        let mut module = seed_contexts();
+        module.functions[0].scopes.truncate(1);
+        module
+    };
+    let strict_extension_anchor = {
+        let mut module = seed_contexts();
+        module.functions[0].scopes[0].flags.strict = true;
+        module
+    };
+    let duplicate_scope_slot = {
+        let mut module = seed_contexts();
+        let first = module.functions[0].scopes[0].slots[0].clone();
+        module.functions[0].scopes[0].slots.push(first);
+        module
+    };
+    let forwarded_arguments_name_another_context = {
+        let mut module = seed_contexts();
+        module.functions[0].mapped_argument_bindings[0].storage =
+            ArgumentBindingStorage::Context { reg: 3, slot: 0 };
+        module
+    };
+    let invalid_store_ref_mode = {
+        let mut module = seed_contexts();
+        let mut code = module.functions[0].code.to_builder();
+        code.replace(
+            15,
+            Op::StoreRef,
+            &[
+                Operand::Register(4),
+                Operand::Register(6),
+                Operand::ConstIndex(0),
+                Operand::Imm32(1 << 20),
+            ],
+        );
+        module.functions[0].code = code.finish();
+        module
+    };
+    let derived_return_in_a_base_constructor = {
+        let mut module = seed_contexts();
+        module.functions[1].is_derived_constructor = false;
         module
     };
     let call_argument_out_of_window = {
         let mut module = seed_calls();
         let mut code = module.functions[0].code.to_builder();
         code.replace(
-            4,
+            5,
             Op::Call,
             &[
                 Operand::Register(3),
@@ -1059,7 +1376,10 @@ fn structural_mutations_are_typed_rejections() {
         ("sparse function ids", sparse),
         ("dangling constant index", dangling_constant),
         ("short register window", short_register_window),
-        ("missing capture spine", missing_capture_spine),
+        (
+            "context scope outside the scope table",
+            dangling_context_scope,
+        ),
         ("dangling class hint", dangling_class_hint),
         ("out-of-range span pc", out_of_range_span),
         (
@@ -1067,8 +1387,21 @@ fn structural_mutations_are_typed_rejections() {
             aliased_immediate_destination,
         ),
         (
-            "closure capture count mismatch",
-            closure_capture_count_mismatch,
+            "closure context outside the window",
+            closure_context_out_of_window,
+        ),
+        ("reserved context slot", reserved_context_slot),
+        ("truncated scope table", truncated_scope_table),
+        ("strict extension anchor", strict_extension_anchor),
+        ("duplicate scope slot", duplicate_scope_slot),
+        (
+            "forwarded arguments naming another context",
+            forwarded_arguments_name_another_context,
+        ),
+        ("invalid StoreRef mode", invalid_store_ref_mode),
+        (
+            "ReturnDerived in a base constructor",
+            derived_return_in_a_base_constructor,
         ),
         (
             "call argument outside the window",

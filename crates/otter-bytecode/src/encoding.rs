@@ -816,7 +816,7 @@ impl<'a> WordcodeControlFlowVerifier<'a> {
                     })?;
                 self.route_abrupt(instruction_index, state, floor, Some(target))
             }
-            Op::Return | Op::ReturnValue | Op::ReturnUndefined => {
+            Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived => {
                 self.route_abrupt(instruction_index, state, 0, None)
             }
             Op::Throw => self.route_throw(instruction_index, state),

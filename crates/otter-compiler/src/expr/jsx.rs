@@ -104,7 +104,7 @@ fn compile_jsx_element_name(
         JSXElementName::MemberExpression(member) => compile_jsx_member_expression(cx, member, span),
         JSXElementName::ThisExpression(_) => {
             let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(dst)], span);
+            cx.emit_load_this(dst, span);
             Ok(dst)
         }
         JSXElementName::NamespacedName(name) => Err(CompileError::Unsupported {
@@ -152,7 +152,7 @@ fn compile_jsx_member_expression(
         }
         JSXMemberExpressionObject::ThisExpression(_) => {
             let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(dst)], span);
+            cx.emit_load_this(dst, span);
             dst
         }
     };

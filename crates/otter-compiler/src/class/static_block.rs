@@ -1,16 +1,31 @@
-//! Static block lowering for class declarations and expressions.
+//! Static block and static field initializer lowering.
 //!
 //! # Contents
 //! - [`compile_static_block`] - compile a `static { ... }` block as a synthesized function.
+//! - [`compile_static_field_initializer`] - compile one static field initializer function.
 //!
 //! # Invariants
-//! - Static blocks compile under their own strict function scope.
-//! - Captures are analyzed before bytecode emission so outer locals become upvalues.
+//! - Both compile under their own strict function scope (`this` is the
+//!   class, `super.x` resolves through the statics-side home object).
+//! - Captures are analyzed before bytecode emission so their bindings a
+//!   nested closure or eval reaches become context slots.
 //!
 //! # See also
 //! - [`super`]
 
 use crate::*;
+
+/// Enter the strict variable scope of a synthesized class-element function.
+fn enter_element_scope(parent: &mut Compiler) {
+    parent.enter_scope_with_flags(
+        otter_bytecode::ScopeKind::Body,
+        otter_bytecode::ScopeFlags {
+            strict: true,
+            var_scope: true,
+            has_extension: false,
+        },
+    );
+}
 
 /// - <https://tc39.es/ecma262/#sec-class-static-block>
 pub(crate) fn compile_static_block(
@@ -18,23 +33,29 @@ pub(crate) fn compile_static_block(
     class_name: &str,
     body: &oxc_allocator::Vec<'_, Statement<'_>>,
     span: (u32, u32),
-) -> Result<(u32, Vec<u32>), CompileError> {
+) -> Result<ClosureRecord, CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(true)
         .with_module_url(parent.module_url.clone());
     // §15.7.4 — `var` / `let` / `function` declarations inside a
-    // static block live in the block's own scope. Compute the
-    // capture-name set so identifier references to outer locals
-    // can promote to upvalues just like any nested function body.
+    // static block live in the block's own scope.
     child.captured_names = capture::analyze_module(body);
     // §15.7.4 — `super.x` inside a static block resolves through the
     // statics-side home object.
     child.super_home_static = true;
     child.has_home_object = true;
     child.contains_direct_eval = crate::capture::program_contains_direct_eval(body);
+    if child.contains_direct_eval {
+        child
+            .captured_names
+            .extend(crate::capture::all_program_names(body));
+    }
+    let parent_ctx = parent.innermost_ctx();
+    child.closure_context_empty =
+        parent_ctx == crate::scope::CtxReg::Closure && parent.closure_context_empty;
     parent.push(child);
-    parent.enter_scope();
+    enter_element_scope(parent);
 
     let function_id = module.borrow().functions.len() as u32;
     module.borrow_mut().functions.push(Function {
@@ -47,65 +68,35 @@ pub(crate) fn compile_static_block(
         ..Default::default()
     });
 
-    let mut var_names: Vec<String> = Vec::new();
-    hoist_var_names(body, &mut var_names);
-    pre_declare_var_bindings(parent, &var_names, span)?;
-    let mut lex_names: Vec<(String, bool)> = Vec::new();
-    hoist_lexical_names(body, &mut lex_names);
-    pre_declare_lexical_bindings(parent, &lex_names, span)?;
-    hoist_function_declarations(parent, body)?;
-    for stmt in body {
-        compile_discarded_statement(parent, stmt)?;
-    }
-    // §19.2.1.3 — a direct eval inside the block resolves the caller
-    // chain's bindings (the inner class-name binding included) through
-    // this frame's eval-binding table.
-    let mut eval_meta: Vec<otter_bytecode::DirectEvalBinding> =
-        if parent.top_mut().contains_direct_eval {
-            capture_lexical_environment_for_eval(parent);
-            capture_private_environment_for_eval(parent);
-            capture_super_bindings_for_eval(parent);
-            collect_direct_eval_bindings(parent, &[])
-        } else {
-            Vec::new()
-        };
+    let result: Result<(), CompileError> = (|| {
+        let mut var_names: Vec<String> = Vec::new();
+        hoist_var_names(body, &mut var_names);
+        pre_declare_var_bindings(parent, &var_names, span)?;
+        let mut lex_names: Vec<(String, bool)> = Vec::new();
+        hoist_lexical_names(body, &mut lex_names);
+        pre_declare_lexical_bindings(parent, &lex_names, span)?;
+        hoist_function_declarations(parent, body)?;
+        for stmt in body {
+            compile_discarded_statement(parent, stmt)?;
+        }
+        parent.emit(Op::ReturnUndefined, vec![], span);
+        Ok(())
+    })();
     parent.exit_scope();
-    parent.emit(Op::ReturnUndefined, vec![], span);
-
     let mut child = parent.pop();
-    if child.register_overflow {
-        return Err(CompileError::Unsupported {
-            node: "function body exhausts the 65535-register window".to_string(),
-            span,
-        });
-    }
-
-    let captures = child.parent_captures.clone();
-    crate::function_context::finalize_virtual_capture_indices(
-        &mut child.code,
-        &mut eval_meta,
-        &mut child.eval_sites,
-        child.own_upvalue_count,
-    );
-    let mut module_mut = module.borrow_mut();
-    let slot = module_mut
-        .functions
-        .get_mut(function_id as usize)
-        .expect("reserved static-block slot");
-    slot.locals = 0;
-    slot.scratch = child.scratch_window();
-    // Direct eval routing (§19.2.1.1 `inFunction`) reads this flag —
-    // without it the eval body runs on the script path and loses the
-    // synthesized frame's `this` (= the class).
-    slot.contains_direct_eval = child.contains_direct_eval;
-    slot.direct_eval_bindings = eval_meta;
-    slot.eval_sites = std::mem::take(&mut child.eval_sites);
-    slot.param_count = 0;
-    slot.own_upvalue_count = child.own_upvalue_count;
-    slot.inherited_upvalue_count = captures.len() as u16;
-    slot.code = child.code.finish();
-    slot.spans = child.spans;
-    Ok((function_id, captures))
+    result?;
+    let contains_direct_eval = child.contains_direct_eval;
+    let needs_context = finish_function(parent, &mut child, function_id, span, |slot| {
+        // Direct eval routing (§19.2.1.1 `inFunction`) reads this flag.
+        slot.contains_direct_eval = contains_direct_eval;
+        slot.param_count = 0;
+    })?;
+    Ok(ClosureRecord {
+        function_id,
+        ctx: parent_ctx,
+        needs_context,
+        is_arrow: false,
+    })
 }
 
 /// §15.7.10 ClassFieldDefinitionEvaluation for a STATIC field — the
@@ -120,7 +111,7 @@ pub(crate) fn compile_static_field_initializer(
     value: Option<&oxc_ast::ast::Expression<'_>>,
     inferred_name: Option<&str>,
     span: (u32, u32),
-) -> Result<(u32, Vec<u32>), CompileError> {
+) -> Result<ClosureRecord, CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module))
         .with_strict(true)
@@ -130,8 +121,11 @@ pub(crate) fn compile_static_field_initializer(
     child.contains_direct_eval = value
         .as_ref()
         .is_some_and(|expr| crate::capture::expression_contains_direct_eval(expr));
+    let parent_ctx = parent.innermost_ctx();
+    child.closure_context_empty =
+        parent_ctx == crate::scope::CtxReg::Closure && parent.closure_context_empty;
     parent.push(child);
-    parent.enter_scope();
+    enter_element_scope(parent);
 
     let function_id = module.borrow().functions.len() as u32;
     module.borrow_mut().functions.push(Function {
@@ -144,62 +138,34 @@ pub(crate) fn compile_static_field_initializer(
         ..Default::default()
     });
 
-    match value {
-        Some(expr) => {
-            let value_reg = match inferred_name {
-                Some(key) => crate::expr::compile_expr_with_inferred_name(parent, expr, key, span)?,
-                None => compile_expr(parent, expr, span)?,
-            };
-            parent.emit(Op::Return, [Operand::Register(value_reg)], span);
+    let result: Result<(), CompileError> = (|| {
+        match value {
+            Some(expr) => {
+                let value_reg = match inferred_name {
+                    Some(key) => {
+                        crate::expr::compile_expr_with_inferred_name(parent, expr, key, span)?
+                    }
+                    None => compile_expr(parent, expr, span)?,
+                };
+                parent.emit(Op::Return, [Operand::Register(value_reg)], span);
+            }
+            None => parent.emit(Op::ReturnUndefined, vec![], span),
         }
-        None => parent.emit(Op::ReturnUndefined, vec![], span),
-    }
-    // §19.2.1.3 — a direct eval inside the initializer resolves the
-    // caller chain's bindings (the inner class-name binding included)
-    // through this frame's eval-binding table.
-    let mut eval_meta: Vec<otter_bytecode::DirectEvalBinding> =
-        if parent.top_mut().contains_direct_eval {
-            capture_lexical_environment_for_eval(parent);
-            capture_private_environment_for_eval(parent);
-            capture_super_bindings_for_eval(parent);
-            collect_direct_eval_bindings(parent, &[])
-        } else {
-            Vec::new()
-        };
+        Ok(())
+    })();
     parent.exit_scope();
-
     let mut child = parent.pop();
-    if child.register_overflow {
-        return Err(CompileError::Unsupported {
-            node: "function body exhausts the 65535-register window".to_string(),
-            span,
-        });
-    }
-
-    let captures = child.parent_captures.clone();
-    crate::function_context::finalize_virtual_capture_indices(
-        &mut child.code,
-        &mut eval_meta,
-        &mut child.eval_sites,
-        child.own_upvalue_count,
-    );
-    let mut module_mut = module.borrow_mut();
-    let slot = module_mut
-        .functions
-        .get_mut(function_id as usize)
-        .expect("reserved static-field-init slot");
-    slot.locals = 0;
-    slot.scratch = child.scratch_window();
-    // Direct eval routing (§19.2.1.1 `inFunction`) reads this flag —
-    // without it the eval body runs on the script path and loses the
-    // synthesized frame's `this` (= the class).
-    slot.contains_direct_eval = child.contains_direct_eval;
-    slot.direct_eval_bindings = eval_meta;
-    slot.eval_sites = std::mem::take(&mut child.eval_sites);
-    slot.param_count = 0;
-    slot.own_upvalue_count = child.own_upvalue_count;
-    slot.inherited_upvalue_count = captures.len() as u16;
-    slot.code = child.code.finish();
-    slot.spans = child.spans;
-    Ok((function_id, captures))
+    result?;
+    let contains_direct_eval = child.contains_direct_eval;
+    let needs_context = finish_function(parent, &mut child, function_id, span, |slot| {
+        // Direct eval routing (§19.2.1.1 `inFunction`) reads this flag.
+        slot.contains_direct_eval = contains_direct_eval;
+        slot.param_count = 0;
+    })?;
+    Ok(ClosureRecord {
+        function_id,
+        ctx: parent_ctx,
+        needs_context,
+        is_arrow: false,
+    })
 }

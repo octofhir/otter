@@ -317,7 +317,7 @@ pub struct DeoptFrameEntry<Slot = DeoptSlot> {
     pub return_register: u16,
     /// Where the frame's `this` binding lives at this exit.
     pub this: Slot,
-    /// Exact callable whose captured cells and self binding the activation owns.
+    /// Exact callable (SELF) whose context the activation closes over.
     pub closure: Slot,
     /// The own or lexical new.target binding; undefined when not bound.
     pub new_target: Slot,

@@ -10,7 +10,12 @@
 //!   wordcode and schema-driven operand access.
 //! - [`Instruction`] — cold decoded wire/debug DTO.
 //! - [`Function`] — one compiled function: registers, compiler wordcode,
-//!   spans, and constants index.
+//!   spans, scope descriptors, and constants index.
+//! - [`ScopeDescriptor`] / [`SlotDescriptor`] — the static shape of every
+//!   context a function creates; [`EvalCallerChain`] — the same descriptors
+//!   along a live context chain, handed to the direct-eval compiler.
+//! - [`ContextCoord`] and the other packed binding immediates, re-exported
+//!   from [`opcode_schema`].
 //! - [`BytecodeModule`] — top-level container the compiler emits and
 //!   the VM consumes.
 //! - [`VerifiedBytecodeModule`] — immutable admission proof carried by caches
@@ -32,6 +37,11 @@
 //!   disassembler emits.
 //! - Opcode byte assignments have one source in [`opcode_schema`]; encoding
 //!   retains a generated compatibility view of the unchanged wire format.
+//! - Bindings live in registers or in context slots. A context slot is named
+//!   by a register holding a context plus a [`ContextCoord`] hop count and
+//!   slot; no instruction reads a register it does not name as an operand.
+//! - Scope descriptors own their slot names, so a context's names stay
+//!   valid after its chunk's constant pool is gone.
 //!
 //! # See also
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
@@ -47,9 +57,12 @@ pub mod scalar_semantics;
 pub mod verifier;
 pub mod wordcode;
 
+pub use opcode_schema::{
+    BindingStoreFallback, ContextCoord, LookupGlobalMode, LookupRefTarget, StoreRefMode,
+};
 pub use verifier::{
-    BytecodeConstantKind, BytecodeRebaseError, BytecodeVerifyError, VerifiedBytecodeModule,
-    VerifiedFunction, verify_module, verify_module_at_base,
+    BytecodeConstantKind, BytecodeRebaseError, BytecodeVerifyError, ScopeDescriptorDefect,
+    VerifiedBytecodeModule, VerifiedFunction, verify_module, verify_module_at_base,
 };
 
 pub use wordcode::{
@@ -260,50 +273,97 @@ pub enum Op {
     /// environments arrive.
     TdzError,
 
-    /// `r<dst> = function-value(constants[k<idx>])`. The constant
-    /// is a [`Constant::FunctionId`] referencing
-    /// [`BytecodeModule::functions`].
+    /// `r<dst> = function-value(constants[k<idx>])` closing over no
+    /// context. The constant is a [`Constant::FunctionId`] referencing
+    /// [`BytecodeModule::functions`]. [`Op::LoadClosureContext`] in the
+    /// created function's frames reads `undefined`.
     MakeFunction,
-    /// `r<dst> = closure(constants[k<idx>], upvalues...)`. Variadic.
-    /// Operands: `dst, function_const, upvalue_count, src0, src1, ...`.
-    /// Each `srcN` is `Imm32(parent_upvalue_idx)` — a non-negative
-    /// index into the **enclosing** frame's `upvalues` array. The
-    /// runtime clones each GC cell handle into the new closure's
-    /// upvalue spine, so writes through one are visible through all.
+    /// `r<dst> = closure(constants[k<fn>], context = r<ctx>)`. Operands:
+    /// `Register(dst), ConstIndex(fn), Register(ctx)`.
     ///
-    /// Captured locals always live in the declaring frame's own
-    /// upvalue cells (see [`Function::own_upvalue_count`]); a fresh
-    /// frame appends `own_upvalue_count` empty cells after the
-    /// inherited parent ones, and the function body initialises them
-    /// via [`Op::StoreUpvalue`]. Subsequent `MakeClosure` calls just
-    /// pick those indices off the current frame's `upvalues`.
+    /// `ctx` holds the innermost context at the creation site, or
+    /// `undefined`. The closure keeps exactly that one context; every
+    /// outer binding the function body reaches is a [`ContextCoord`] hop
+    /// from it. An arrow function additionally snapshots the activation's
+    /// `this` and `new.target` values, which are immutable per activation.
+    /// Allocates and may trigger a collection; never re-enters JavaScript.
     MakeClosure,
-    /// `r<dst> = upvalue<idx>` — read the captured cell at index
-    /// `idx` in the current frame's upvalue table.
-    /// Operands: `Register(dst), Imm32(upvalue_idx)`.
-    LoadUpvalue,
-    /// `upvalue<idx> = r<src>` — write the captured cell at index
-    /// `idx` in the current frame's upvalue table.
-    /// Operands: `Register(src), Imm32(upvalue_idx)`.
-    StoreUpvalue,
-    /// Like [`Op::StoreUpvalue`], but raises `ReferenceError` when the
-    /// target cell still holds the Temporal Dead Zone hole. Emitted for
-    /// an *assignment* (PutValue, §6.2.4.6) to a captured `let` / `const`
-    /// binding — a write before the declaration's initializer ran. The
-    /// binding-initialization stores keep using [`Op::StoreUpvalue`],
-    /// which legitimately clears the hole.
-    /// Operands: `Register(src), Imm32(upvalue_idx)`.
-    StoreUpvalueChecked,
-    /// Replace own-upvalue cell `idx` with a freshly allocated cell
-    /// holding a hole (Temporal Dead Zone). Operands: `Imm32(idx)`.
-    /// Closures created *before* this op keep the previous cell, so a
-    /// `for (let x of …)` body materialises a distinct `x` per
-    /// iteration (§14.7.5.6 CreatePerIterationEnvironment) and a head
-    /// `let` name spends RHS evaluation in the TDZ (§14.7.5.12
-    /// ForIn/OfHeadEvaluation). A subsequent [`Op::StoreUpvalue`]
-    /// writes the iteration's value into the new cell; reading the hole
-    /// through [`Op::LoadUpvalue`] throws a `ReferenceError`.
-    FreshUpvalue,
+    /// `r<dst> = context of SELF`. Operands: `Register(dst)`.
+    ///
+    /// Reads the context the running closure was created over by
+    /// [`Op::MakeClosure`], or `undefined` when it closes over none. A
+    /// closure's context never changes after creation, so the read is
+    /// pure. A function emits it once, at entry, when it reaches an outer
+    /// binding or creates a closure over its incoming context.
+    LoadClosureContext,
+    /// `r<dst> = SELF`, the exact closure being executed. Operands:
+    /// `Register(dst)`.
+    ///
+    /// A named function expression initializes its own name binding
+    /// (§15.2.5 funcEnv) from this value.
+    LoadSelf,
+    /// `r<dst> = new context of Function::scopes[scope]` with parent
+    /// `r<parent>`. Operands: `Register(dst), Register(parent),
+    /// Imm32(scope)`.
+    ///
+    /// `parent` holds the enclosing context or `undefined`. `scope`
+    /// indexes the executing function's [`Function::scopes`]; the context
+    /// records that `(function, scope)` identity so run-time errors and
+    /// direct eval can name its slots. Each slot starts as the TDZ hole
+    /// when [`SlotKind::initial_hole`] says so and as `undefined`
+    /// otherwise; the eval extension starts `undefined`. Allocates and may
+    /// trigger a collection; never re-enters JavaScript.
+    CreateContext,
+    /// `r<dst> = copy of the context in r<src>` — §14.7.4.4
+    /// CreatePerIterationEnvironment. Operands: `Register(dst),
+    /// Register(src)`.
+    ///
+    /// The copy has the source's scope identity, parent, and slot values
+    /// (holes included). Only a scope without an eval extension
+    /// (`has_extension == false`) is copied. Allocates and may trigger a
+    /// collection; never re-enters JavaScript.
+    CopyContext,
+    /// `r<dst> = ctx^depth.slots[slot]` with no hole check. Operands:
+    /// `Register(dst), Register(ctx), Imm32(coord)`, `coord` a packed
+    /// [`ContextCoord`].
+    ///
+    /// Walks `depth` parent links from the context in `ctx`, then reads
+    /// the slot. Emitted where the slot is statically initialized (a slot
+    /// whose kind never holds the hole, or a read dominated by its
+    /// initialization) and to read a raw derived-constructor `this` for
+    /// [`Op::ReturnDerived`]. A plain memory load: no binding semantics,
+    /// never throws.
+    LoadContextSlot,
+    /// [`Op::LoadContextSlot`] with the TDZ check (§9.1.1.1.6
+    /// GetBindingValue). Operands: `Register(dst), Register(ctx),
+    /// Imm32(coord)`.
+    ///
+    /// A hole raises `ReferenceError` naming the slot from its scope
+    /// descriptor; a [`SlotKind::DerivedThis`] slot raises the
+    /// "`super()` not called" `ReferenceError` instead.
+    LoadContextSlotChecked,
+    /// `ctx^depth.slots[slot] = r<value>` — binding initialization,
+    /// which may replace the TDZ hole. Operands: `Register(value),
+    /// Register(ctx), Imm32(coord)`.
+    ///
+    /// Write-barriered. A plain memory store: no binding semantics, never
+    /// throws.
+    StoreContextSlot,
+    /// Assignment to a context-slot binding (§9.1.1.1.5
+    /// SetMutableBinding). Operands: `Register(value), Register(ctx),
+    /// Imm32(coord)`.
+    ///
+    /// A hole raises `ReferenceError` naming the slot; otherwise the
+    /// write-barriered store of [`Op::StoreContextSlot`] runs.
+    StoreContextSlotChecked,
+    /// BindThisValue (§9.1.1.3.1) for a derived-constructor `this` held in
+    /// a context slot (captured by an arrow or visible to a direct eval).
+    /// Operands: `Register(value), Register(ctx), Imm32(coord)`.
+    ///
+    /// A slot that no longer holds the hole raises `ReferenceError`
+    /// (`super()` called twice); otherwise stores `value` with the write
+    /// barrier. A register-held derived `this` uses [`Op::BindThisValue`].
+    BindThisContextSlot,
     /// Variadic call. Operands: `dst, callee, argc, args...`. The
     /// callee must be a function value at this slice. The callee
     /// receives `this = undefined` (foundation default).
@@ -325,14 +385,19 @@ pub enum Op {
     CallWithThis,
     /// `callee.apply(thisArg, arguments)` where `arguments` is the
     /// function's own object and every use of it in the body is such a
-    /// forward. Operands: `dst, method, callee, this_arg`. `method` holds
-    /// the observable `GetV(callee, "apply")` result. When it is
+    /// forward. Operands: `dst, method, callee, this_arg, ctx`. `method`
+    /// holds the observable `GetV(callee, "apply")` result. When it is
     /// %Function.prototype.apply%, the activation's actual arguments are
     /// forwarded to `callee` without materializing an arguments object;
     /// otherwise `method` is called with `callee` as receiver and
     /// `[this_arg, arguments]`, the arguments object being created once
     /// per activation. Emitted only for bodies whose prologue therefore
     /// skips [`Op::CollectArguments`].
+    ///
+    /// `ctx` names the parameter-scope context a mapped arguments object
+    /// aliases: the `reg` of every [`ArgumentBindingStorage::Context`]
+    /// binding. A function without context-held mapped formals names any
+    /// register there, and the operand is not consulted.
     CallForwardArguments,
     /// `r<dst> = bound function`. Operands:
     /// `dst, callee, this, argc, args...`. Builds a
@@ -463,11 +528,12 @@ pub enum Op {
     /// Bind the derived-constructor `this` to the value produced by
     /// a `super(...)` call (§13.3.7.3 SuperCall, steps 7–9 —
     /// `BindThisValue`). Operand: `Register(src)`. Reads the super
-    /// result from `src`, installs it as the frame's `this`, marks
-    /// `this` initialized, and records it as the construct target so
-    /// an implicit `return` yields the bound object. Throws a
-    /// `ReferenceError` if `this` was already initialized (i.e.
-    /// `super()` ran twice).
+    /// result from `src`, installs it as the frame's `this`, and marks
+    /// `this` initialized. Throws a `ReferenceError` if `this` was
+    /// already initialized (i.e. `super()` ran twice). A `this` held in
+    /// a context slot binds through [`Op::BindThisContextSlot`]; the
+    /// constructor's completion reads `this` through
+    /// [`Op::ReturnDerived`].
     BindThisValue,
     /// `super.name` read (§13.3.5 MakeSuperPropertyReference +
     /// GetValue). Operands: `Register(dst), Register(home),
@@ -543,6 +609,21 @@ pub enum Op {
     /// Return `undefined` from the current function. Convenience
     /// emitted at fall-through end of function bodies.
     ReturnUndefined,
+    /// Return from a derived-class constructor (§10.2.2 `[[Construct]]`
+    /// steps 10–12). Operands: `Register(value), Register(ctx),
+    /// Imm32(coord)`.
+    ///
+    /// `value` is the completion value (`undefined` for a bare `return`
+    /// or the fall-through end); `ctx` plus the [`crate::ContextCoord`]
+    /// name the constructor's `DerivedThis` context slot. Both registers are
+    /// read when this instruction executes, but the slot is read only when
+    /// the frame actually completes: crossed `finally` blocks run first and
+    /// may still call `super()` (directly or through an arrow). Then
+    /// `[[Construct]]` yields `value` when it is an Object, the `this`
+    /// binding when `value` is `undefined` (a hole raises `ReferenceError`),
+    /// and raises `TypeError` otherwise. Both errors are raised after the
+    /// frame is gone, so no handler of the returning function observes them.
+    ReturnDerived,
 
     /// `r<dst> = new JsObject()`. Operand: `dst`.
     NewObject,
@@ -624,19 +705,29 @@ pub enum Op {
     /// - Anything else returns `false`.
     Instanceof,
 
-    /// `r<dst> = eval(r<source>)` — indirect eval. Operands:
-    /// `Register(dst), Register(source_reg)`.
+    /// `r<dst> = eval(r<source>)` — direct eval (§19.2.1.1 PerformEval
+    /// with `direct = true`). Operands: `Register(dst), Register(source),
+    /// Register(ctx), Imm32(flags)`.
     ///
-    /// The runtime parses + compiles the source string as a fresh
-    /// script, runs `<main>` to completion, and writes the program's
-    /// completion value (or `undefined` when the script ended on a
-    /// non-expression statement) into `dst`. Foundation runs eval'd
-    /// code in a fresh global scope per ECMA-262 §19.4.1.1 indirect-
-    /// eval semantics — direct-eval access to caller-local bindings
-    /// is intentionally not supported.
+    /// A non-String `source` is the result unchanged. Otherwise the
+    /// runtime compiles `source` against the context chain in `ctx` — the
+    /// innermost context at the call site, or `undefined` — and runs the
+    /// compiled `<main>` as a closure over `ctx` with the caller's `this`
+    /// and `new.target`; its completion value lands in `dst`. The chain
+    /// is the body's lexical heritage. A sloppy body's `var`s extend the
+    /// first context on the chain whose scope sets
+    /// [`ScopeFlags::var_scope`], or the global environment when there is
+    /// none.
+    ///
+    /// `flags` carries the call site's §19.2.1.1 early-error context:
+    /// bit 0 — declaring `arguments` is forbidden (parameter initializer
+    /// of a function that binds `arguments`); bit 1 — inside a parameter
+    /// initializer; bit 2 — `new.target` allowed; bit 3 — inside a class
+    /// field initializer; bit 4 — `super.x` allowed; bit 5 — `super()`
+    /// allowed. Other bits are zero.
     ///
     /// # See also
-    /// - <https://tc39.es/ecma262/#sec-eval-x>
+    /// - <https://tc39.es/ecma262/#sec-performeval>
     Eval,
     /// `r<dst> = (r<val> is the original %eval% intrinsic)`. Operands:
     /// `dst, val`. Lets a syntactic `eval(...)` site decide at runtime
@@ -674,7 +765,7 @@ pub enum Op {
     /// `Register(dst), ConstIndex(name)`.
     ///
     /// The compiler emits this for free-identifier reads that did
-    /// not resolve to a local / upvalue / module import / known
+    /// not resolve to a local / context slot / module import / known
     /// intrinsic. Strict-mode behaviour (every test262 test runs
     /// strict) is the only mode the foundation supports.
     ///
@@ -695,6 +786,9 @@ pub enum Op {
     /// (strict functions, non-simple parameter lists, and arrows use
     /// the unmapped variant; sloppy simple-parameter functions may
     /// expose mapped indexed properties).
+    /// Operands: `Register(dst), Register(ctx)`. `ctx` is the register the
+    /// mapped formals' [`ArgumentBindingStorage::Context`] entries name; for
+    /// unmapped kinds it is read but ignored (the compiler passes `dst`).
     CollectArguments,
     /// Read the activation's argument count while its implicit object is
     /// unobserved, or the live `length` property after materialization.
@@ -775,8 +869,8 @@ pub enum Op {
     ///   binds `ns` to the source module's `module_env` directly.
     /// - `import { x } from "./other.ts"` lowering — the compiler
     ///   loads the source `module_env` once at the top of the
-    ///   importing module's body, hoists the result into a captured
-    ///   upvalue, then emits per-reference `LoadProperty` against
+    ///   importing module's body, hoists the result into a module
+    ///   context slot, then emits per-reference `LoadProperty` against
     ///   it. Live bindings fall out: every read traverses the
     ///   exporter's current `module_env.x`.
     /// - `import("./literal.ts")` (literal-string dynamic import).
@@ -1140,38 +1234,37 @@ pub enum Op {
     /// pre-existing global) never resets a live value.
     DeclareGlobalVar,
 
-    /// Read an identifier that may resolve to an eval-introduced
-    /// caller binding. Operands: `Register(dst), ConstIndex(name)`.
+    /// Read an identifier with no static binding that a sloppy direct eval
+    /// may have introduced (§9.1.2.1 GetIdentifierReference). Operands:
+    /// `Register(dst), Register(ctx), ConstIndex(name), Imm32(depth)`.
     ///
-    /// §9.1.2.1 GetIdentifierReference over a function environment a
-    /// direct eval extended at runtime: consult the frame's
-    /// eval-introduced binding map first, then fall back to the
-    /// global environment (`ReferenceError` when absent, like
-    /// [`Op::LoadGlobalOrThrow`]). Emitted only inside functions
-    /// whose body contains a direct eval call site.
-    LoadDynamic,
+    /// Probes the eval extension of every context at hops `[0, depth)`
+    /// from `ctx`, innermost first; the first extension holding `name`
+    /// supplies the value. Otherwise reads the global Environment Record
+    /// like [`Op::LoadGlobalOrThrow`] (`ReferenceError` when absent).
+    LoadLookupGlobal,
 
-    /// Write an identifier that may resolve to an eval-introduced
-    /// caller binding. Operands:
-    /// `Register(value), ConstIndex(name), Imm32(strict)`.
+    /// PutValue counterpart of [`Op::LoadLookupGlobal`]. Operands:
+    /// `Register(value), Register(ctx), ConstIndex(name), Imm32(mode)`,
+    /// `mode` a packed [`LookupGlobalMode`] (`depth | strict << 31`).
     ///
-    /// §10.2.4.2 PutValue counterpart of [`Op::LoadDynamic`]: store
-    /// through the frame's eval-introduced binding when present,
-    /// else fall back to global `SetMutableBinding`; `strict` selects whether
-    /// an unresolved fallback throws or creates a `globalThis` property.
-    StoreDynamic,
+    /// An extension hit at hops `[0, depth)` writes the entry; otherwise
+    /// the global `SetMutableBinding` of [`Op::StoreGlobalBinding`] runs
+    /// with the mode's strictness.
+    StoreLookupGlobal,
 
-    /// `typeof` flavour of [`Op::LoadDynamic`]. Operands:
-    /// `Register(dst), ConstIndex(name)`. An unresolvable name
-    /// yields `undefined` instead of throwing (§13.5.3).
-    TypeofDynamic,
+    /// `typeof` flavour of [`Op::LoadLookupGlobal`]. Operands:
+    /// `Register(dst), Register(ctx), ConstIndex(name), Imm32(depth)`. An
+    /// unresolvable name yields `undefined` instead of throwing (§13.5.3).
+    TypeofLookupGlobal,
 
-    /// `delete` flavour of [`Op::LoadDynamic`] — §19.2.1.3 eval-created
-    /// var bindings are deletable. Operands:
-    /// `Register(dst), ConstIndex(name)`. Removes the binding from the
-    /// frame's eval-var map / captured eval-env chain (`true`), else
-    /// falls through to the global-object delete.
-    DeleteDynamic,
+    /// `delete` flavour of [`Op::LoadLookupGlobal`] — §19.2.1.3
+    /// eval-created bindings are deletable. Operands: `Register(dst),
+    /// Register(ctx), ConstIndex(name), Imm32(depth)`. An extension hit at
+    /// hops `[0, depth)` removes the entry and yields `true`; otherwise
+    /// the global delete runs (a global lexical yields `false`, an object
+    /// property its `[[Delete]]` result).
+    DeleteLookupGlobal,
 
     /// Mint a Private Name carrier (§6.2.12) — a symbol whose
     /// `private_name` marker keeps it out of Proxy traps and arms
@@ -1348,52 +1441,78 @@ pub enum Op {
     /// missing brand throws TypeError. Fields skip this (their own
     /// store lookup already fails).
     PrivateBrandCheck,
-    /// `LoadShadowedUpvalue dst, name_const, upvalue_idx, eval_depth` — read a
-    /// captured binding after probing at most `eval_depth` physical eval
-    /// records strictly inside its declaration owner. An outer eval record can
-    /// never shadow a more deeply declared lexical binding.
-    LoadShadowedUpvalue,
+    /// Read a context-slot binding that a sloppy direct eval may have
+    /// shadowed. Operands: `Register(dst), Register(ctx), ConstIndex(name),
+    /// Imm32(coord)`, `coord` a packed [`ContextCoord`].
+    ///
+    /// Probes the eval extension of every context at hops `[0, depth)`
+    /// from `ctx`, innermost first; the first extension holding `name`
+    /// supplies the value. Otherwise reads the slot with the TDZ check of
+    /// [`Op::LoadContextSlotChecked`]. The declaring context's own
+    /// extension is never probed: an eval `var` naming a slot of that
+    /// scope rebinds the slot instead of creating an extension entry.
+    LoadLookupSlot,
     /// `GetTemplateObject dst, site_const` — §13.2.8.4: the frozen
     /// (with frozen non-enumerable `.raw`) template-strings object
     /// for tagged-template site `site_const`, cached realm-wide per
     /// site.
     GetTemplateObject,
-    /// `StoreShadowedUpvalueChecked value, name_const, upvalue_idx, policy`
-    /// — assign a captured binding in a function whose live eval chain may
-    /// contain a nearer binding of the same name. The eval chain is resolved at
-    /// the store point (after RHS evaluation). The schema-owned `policy` packs
-    /// the bounded physical eval depth with mutable checked assignment,
-    /// immutable throw, or immutable silent fallback behavior.
-    StoreShadowedUpvalueChecked,
-    /// `EvalBindingSeq dst` — snapshot the isolate's monotonically
-    /// increasing eval-binding sequence into `dst`. §13.15.2 resolves an
-    /// assignment target's reference BEFORE the RHS runs; bindings a
-    /// direct eval introduces during the RHS carry later sequence numbers,
-    /// so the snapshot-filtered load/store variants below see exactly the
-    /// pre-RHS environment.
-    EvalBindingSeq,
-    /// `LoadShadowedUpvalueSnap dst, name_const, upvalue_idx, eval_depth,
-    /// snapshot_reg` — [`Op::LoadShadowedUpvalue`] restricted to
-    /// eval-chain bindings created before the snapshot in `snapshot_reg`.
-    LoadShadowedUpvalueSnap,
-    /// `StoreShadowedUpvalueCheckedSnap value, name_const, upvalue_idx,
-    /// policy, snapshot_reg` — [`Op::StoreShadowedUpvalueChecked`]
-    /// restricted the same way, so PutValue writes through the reference
-    /// resolved before the RHS even when the RHS's direct eval shadowed
-    /// the name.
-    StoreShadowedUpvalueCheckedSnap,
-    /// `EvalRestoreBinding name_const, upvalue_idx` — re-insert
-    /// `name → own cell[upvalue_idx]` into the frame's current
-    /// eval-environment record when the record no longer has the
-    /// name (§9.1.1.1.5 SetMutableBinding auto-creates a deleted
-    /// sloppy-eval `var` binding). Emitted by the Annex B.3.3.3
-    /// block-function sync inside a sloppy eval body.
-    EvalRestoreBinding,
-    /// `DeleteShadowedUpvalue dst, name_const, upvalue_idx, eval_depth` —
-    /// delete a nearer binding only within the bounded inner eval prefix. If
-    /// the name still resolves to the captured declarative binding, leave it
-    /// intact and return `false`.
-    DeleteShadowedUpvalue,
+    /// Assign a context-slot binding that a sloppy direct eval may have
+    /// shadowed, resolving the reference at the store. Operands:
+    /// `Register(value), Register(ctx), ConstIndex(name), Imm32(coord),
+    /// Imm32(fallback)`, `fallback` a [`BindingStoreFallback`].
+    ///
+    /// An extension hit at hops `[0, depth)` writes the entry; a miss
+    /// applies `fallback` to the slot. An assignment whose right-hand side
+    /// runs between resolution and store uses [`Op::ResolveLookupRef`] and
+    /// [`Op::StoreRef`] instead (§13.15.2).
+    StoreLookupSlot,
+    /// Resolve the base of an assignment target before its right-hand side
+    /// runs (§13.15.2, §9.1.2.1). Operands: `Register(ref), Register(ctx),
+    /// ConstIndex(name), Imm32(target)`, `target` a packed
+    /// [`LookupRefTarget`].
+    ///
+    /// Writes the eval extension that holds `name` among hops
+    /// `[0, depth)`; otherwise, for a slot target, the context at hop
+    /// `depth`; otherwise `undefined` (a global reference). The value is
+    /// engine-internal and consumed only by [`Op::StoreRef`].
+    ResolveLookupRef,
+    /// PutValue through a base resolved by [`Op::ResolveLookupRef`].
+    /// Operands: `Register(value), Register(ref), ConstIndex(name),
+    /// Imm32(mode)`, `mode` a packed [`StoreRefMode`].
+    ///
+    /// An extension base sets `name`; an entry the right-hand side deleted
+    /// is re-created by a sloppy store and raises `ReferenceError` in a
+    /// strict one (§9.1.1.1.5). A context base stores `slots[mode.slot]`
+    /// under `mode.fallback`. An `undefined` base runs the global
+    /// `SetMutableBinding` of [`Op::StoreGlobalBinding`] with
+    /// `mode.strict`; a strict store that must honour a pre-RHS
+    /// unresolvable reference pairs [`Op::GlobalBindingExists`] with
+    /// [`Op::StoreGlobalChecked`] instead.
+    StoreRef,
+    /// CreateMutableBinding(`name`, deletable = true) for a sloppy direct
+    /// eval's `var` or function declaration that no scope slot holds
+    /// (§19.2.1.3 step 16). Operands: `Register(ctx), ConstIndex(name),
+    /// Imm32(var_depth)`.
+    ///
+    /// Gives the context at hop `var_depth` an eval extension when it has
+    /// none, then adds `name = undefined` when the extension lacks it; an
+    /// existing entry keeps its value.
+    DeclareEvalVar,
+    /// `delete name` where `name` is a context-slot binding a sloppy direct
+    /// eval may have shadowed. Operands: `Register(dst), Register(ctx),
+    /// ConstIndex(name), Imm32(depth)`.
+    ///
+    /// An extension hit at hops `[0, depth)` removes the entry and yields
+    /// `true`; a miss leaves the declarative slot intact and yields
+    /// `false`.
+    DeleteLookupSlot,
+    /// Set-or-create `name` in the eval extension of the context at hop
+    /// `var_depth` (Annex B.3.3.3 function sync inside a sloppy eval;
+    /// §9.1.1.1.5 re-creates an entry a `delete` removed). Operands:
+    /// `Register(value), Register(ctx), ConstIndex(name),
+    /// Imm32(var_depth)`.
+    StoreVarScope,
     /// Build an ordinary object from a static-key literal
     /// (`{ a: x, b: y }`) in one step. Operands:
     /// `dst, count, first_key_const, value0, value1, …`. The keys are the
@@ -1502,14 +1621,20 @@ impl Op {
             Op::TdzError => "TDZ_ERROR",
             Op::MakeFunction => "MAKE_FUNCTION",
             Op::MakeClosure => "MAKE_CLOSURE",
-            Op::LoadUpvalue => "LOAD_UPVALUE",
-            Op::StoreUpvalue => "STORE_UPVALUE",
-            Op::StoreUpvalueChecked => "STORE_UPVALUE_CHECKED",
-            Op::FreshUpvalue => "FRESH_UPVALUE",
+            Op::LoadClosureContext => "LOAD_CLOSURE_CONTEXT",
+            Op::LoadSelf => "LOAD_SELF",
+            Op::CreateContext => "CREATE_CONTEXT",
+            Op::CopyContext => "COPY_CONTEXT",
+            Op::LoadContextSlot => "LOAD_CONTEXT_SLOT",
+            Op::LoadContextSlotChecked => "LOAD_CONTEXT_SLOT_CHECKED",
+            Op::StoreContextSlot => "STORE_CONTEXT_SLOT",
+            Op::StoreContextSlotChecked => "STORE_CONTEXT_SLOT_CHECKED",
+            Op::BindThisContextSlot => "BIND_THIS_CONTEXT_SLOT",
             Op::Call => "CALL",
             Op::TailCall => "TAIL_CALL",
             Op::ReturnValue => "RETURN_VALUE",
             Op::ReturnUndefined => "RETURN_UNDEFINED",
+            Op::ReturnDerived => "RETURN_DERIVED",
             Op::NewObject => "NEW_OBJECT",
             Op::LoadProperty => "LOAD_PROPERTY",
             Op::StoreProperty => "STORE_PROPERTY",
@@ -1561,10 +1686,10 @@ impl Op {
             Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
             Op::DefineGlobalVar => "DEFINE_GLOBAL_VAR",
             Op::DeclareGlobalVar => "DECLARE_GLOBAL_VAR",
-            Op::LoadDynamic => "LOAD_DYNAMIC",
-            Op::StoreDynamic => "STORE_DYNAMIC",
-            Op::TypeofDynamic => "TYPEOF_DYNAMIC",
-            Op::DeleteDynamic => "DELETE_DYNAMIC",
+            Op::LoadLookupGlobal => "LOAD_LOOKUP_GLOBAL",
+            Op::StoreLookupGlobal => "STORE_LOOKUP_GLOBAL",
+            Op::TypeofLookupGlobal => "TYPEOF_LOOKUP_GLOBAL",
+            Op::DeleteLookupGlobal => "DELETE_LOOKUP_GLOBAL",
             Op::NewPrivateName => "NEW_PRIVATE_NAME",
             Op::DefineGlobalFunction => "DEFINE_GLOBAL_FUNCTION",
             Op::DeclareGlobalLex => "DECLARE_GLOBAL_LEX",
@@ -1582,13 +1707,13 @@ impl Op {
             Op::ToPropertyKey => "TO_PROPERTY_KEY",
             Op::Increment => "INCREMENT",
             Op::PrivateBrandCheck => "PRIVATE_BRAND_CHECK",
-            Op::LoadShadowedUpvalue => "LOAD_SHADOWED_UPVALUE",
-            Op::StoreShadowedUpvalueChecked => "STORE_SHADOWED_UPVALUE_CHECKED",
-            Op::EvalBindingSeq => "EVAL_BINDING_SEQ",
-            Op::LoadShadowedUpvalueSnap => "LOAD_SHADOWED_UPVALUE_SNAP",
-            Op::StoreShadowedUpvalueCheckedSnap => "STORE_SHADOWED_UPVALUE_CHECKED_SNAP",
-            Op::EvalRestoreBinding => "EVAL_RESTORE_BINDING",
-            Op::DeleteShadowedUpvalue => "DELETE_SHADOWED_UPVALUE",
+            Op::LoadLookupSlot => "LOAD_LOOKUP_SLOT",
+            Op::StoreLookupSlot => "STORE_LOOKUP_SLOT",
+            Op::DeleteLookupSlot => "DELETE_LOOKUP_SLOT",
+            Op::ResolveLookupRef => "RESOLVE_LOOKUP_REF",
+            Op::StoreRef => "STORE_REF",
+            Op::DeclareEvalVar => "DECLARE_EVAL_VAR",
+            Op::StoreVarScope => "STORE_VAR_SCOPE",
             Op::NewObjectLiteral => "NEW_OBJECT_LITERAL",
             Op::GetTemplateObject => "GET_TEMPLATE_OBJECT",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
@@ -1610,202 +1735,17 @@ impl Op {
     /// length; consumers walk the variadic tail by reading `argc`.
     /// `CallWithThis` and `BindFunction` follow the same convention
     /// with an extra `this` register before `argc`.
+    ///
+    /// The opcode schema is the only source: every row declares an exact
+    /// fixed shape or an exact variadic prefix.
     #[must_use]
     pub const fn operand_count(self) -> usize {
-        if let Some(operands) = crate::opcode_schema::opcode_schema(self)
+        match crate::opcode_schema::opcode_schema(self)
             .operand_shape
             .prefix()
         {
-            return operands.len();
-        }
-        match self {
-            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => 0,
-            Op::EvalBindingSeq => 1,
-            Op::LoadShadowedUpvalueSnap | Op::StoreShadowedUpvalueCheckedSnap => 5,
-            Op::EvalRestoreBinding => 2,
-            Op::LoadUndefined
-            | Op::LoadHole
-            | Op::LoadNull
-            | Op::LoadTrue
-            | Op::LoadFalse
-            | Op::LoadThis
-            | Op::LoadNewTarget
-            | Op::Return
-            | Op::ReturnValue
-            | Op::Jump
-            | Op::TdzError
-            | Op::Throw
-            | Op::NewObject
-            | Op::CollectRest
-            | Op::IteratorClose
-            | Op::IteratorCloseStart
-            | Op::IteratorCloseEnd
-            | Op::CheckIteratorResult
-            | Op::CollectArguments
-            | Op::LoadArgumentsLength
-            | Op::FreshUpvalue
-            | Op::MarkModuleEvaluated
-            | Op::LoadGlobalThis => 1,
-            Op::LoadString
-            | Op::LoadNumber
-            | Op::LoadInt32
-            | Op::LoadBigInt
-            | Op::LoadRegExp
-            | Op::LoadLength
-            | Op::LoadArgumentsElement
-            | Op::Neg
-            | Op::BitwiseNot
-            | Op::ToNumber
-            | Op::LogicalNot
-            | Op::ToBoolean
-            | Op::JumpIfTrue
-            | Op::JumpIfFalse
-            | Op::JumpIfNullish
-            | Op::LoadLocal
-            | Op::StoreLocal
-            | Op::LoadUpvalue
-            | Op::StoreUpvalue
-            | Op::StoreUpvalueChecked
-            | Op::MakeFunction
-            | Op::MathLoad
-            | Op::Await
-            | Op::IsEvalIntrinsic
-            | Op::ImportNamespace
-            | Op::ImportNamespaceDeferred
-            | Op::ModuleNamespaceObject
-            | Op::ImportNamespaceDynamic
-            | Op::ImportMetaResolve
-            | Op::EvaluateModule
-            | Op::Eval
-            | Op::PromiseFulfilledOf
-            | Op::SymbolLoad
-            | Op::TypeOf
-            | Op::TemporalLoad
-            | Op::IsArray
-            | Op::LoadBuiltinError
-            | Op::LoadGlobalOrThrow
-            | Op::LoadGlobalOrUndefined
-            | Op::DefineGlobalVar
-            | Op::DeclareGlobalVar
-            | Op::LoadDynamic
-            | Op::TypeofDynamic
-            | Op::DeleteDynamic
-            | Op::NewPrivateName
-            | Op::DeclareGlobalLex
-            | Op::InitGlobalLex
-            | Op::ValidateGlobalDecl
-            | Op::ClassCheck
-            | Op::ToObject
-            | Op::ToPropertyKey
-            | Op::PrivateBrandCheck
-            | Op::GetTemplateObject
-            | Op::ToNumeric => 2,
-            Op::StoreShadowedUpvalueChecked => 4,
-            Op::StoreDynamic
-            | Op::Increment
-            | Op::GetStringIndex
-            | Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Rem
-            | Op::Pow
-            | Op::BitwiseAnd
-            | Op::BitwiseOr
-            | Op::BitwiseXor
-            | Op::Shl
-            | Op::Shr
-            | Op::Ushr
-            | Op::Equal
-            | Op::NotEqual
-            | Op::LessThan
-            | Op::LessEq
-            | Op::GreaterThan
-            | Op::GreaterEq
-            | Op::LoadProperty
-            | Op::DeleteProperty
-            | Op::Instanceof
-            | Op::HasProperty
-            | Op::SameValue
-            | Op::ToPrimitive
-            | Op::LooseEqual
-            | Op::LooseNotEqual
-            | Op::LoadImportBinding
-            | Op::NewBuiltinError
-            | Op::DefineGlobalFunction
-            | Op::PrivateGet
-            | Op::PrivateSet
-            | Op::YieldDelegate
-            | Op::DefineDataProperty
-            | Op::SetFunctionName
-            | Op::StoreGlobalBinding
-            | Op::AddImm
-            | Op::SubImm
-            | Op::BitwiseAndImm
-            | Op::LessThanImm
-            | Op::EqualImm
-            | Op::NotEqualImm => 3,
-            Op::LoadShadowedUpvalue | Op::DeleteShadowedUpvalue => 4,
-            Op::GetPrototype
-            | Op::SetPrototype
-            | Op::ArrayLength
-            | Op::NewError
-            | Op::GetIterator
-            | Op::GetAsyncIterator
-            | Op::ArrayPush
-            | Op::NewWeakRef
-            | Op::NewFinalizationRegistry => 2,
-            Op::IteratorNext => 3,
-            Op::AsyncIteratorReturn => 3,
-            Op::NewCollection => 3,
-            Op::CallSpread => 4,
-            Op::NewSpread | Op::SuperConstructSpread => 3,
-            Op::BindThisValue => 1,
-            Op::LoadSuperProperty | Op::LoadSuperElement => 3,
-            Op::SetSuperProperty | Op::SetSuperElement => 3,
-            Op::JumpViaFinally => 2,
-            Op::PopParkedFinally => 1,
-            Op::GlobalBindingExists => 2,
-            Op::StoreGlobalChecked => 3,
-            // dst, name_const, src, scratch_dst.
-            Op::StoreProperty | Op::StorePropertyStrict => 4,
-            // `NewArray` is variadic: `dst, count, elems...`. The
-            // dispatcher reads the count and walks the trailing
-            // operands.
-            Op::NewArray => 2,
-            // `dst, count, first_key_const, values...`.
-            Op::NewObjectLiteral => 3,
-            Op::LoadElement | Op::DeleteElement => 3,
-            // recv, key, src.
-            Op::StoreElement | Op::StoreElementStrict => 3,
-            Op::CallMethodValue => 4,    // dst, recv, name_const, argc
-            Op::ForInKeys => 2,          // dst, obj
-            Op::CopyDataProperties => 2, // target, src
-            Op::StarReexport => 2,       // target_env, src_env
-            Op::DefineOwnProperty => 3,  // target, key, desc
-            // dst, argc — args follow as `Register(arg0)…`.
-            Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
-            Op::BigIntCall => 3,      // dst, name_const, argc — args follow
-            Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
-            Op::DataViewCall => 3,    // dst, name_const, argc — args follow
-            Op::Yield => 2,           // dst, src
-            Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
-            Op::NewFunction => 2,     // dst, argc — args follow
-            Op::QueueMicrotask => 2,  // callee, argc — args follow
-            Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
-            Op::PromiseCall => 3,     // dst, name_const, argc — args follow
-            Op::Call | Op::TailCall | Op::New | Op::SuperConstruct => 3, // dst, callee, argc — args follow
-            Op::MakeClass => 5, // dst, ctor, prototype, statics, parent
-            // dst, callee, this, argc — args follow.
-            Op::CallWithThis | Op::BindFunction => 4,
-            // dst, method, callee, this_arg.
-            Op::CallForwardArguments => 4,
-            // catch_offset, finally_offset, exc_dst.
-            Op::EnterTry => 3,
-            // `MakeClosure` is variadic: `dst, function_const,
-            // upvalue_count, srcs...`. The dispatcher reads the
-            // count and walks the trailing operands.
-            Op::MakeClosure => 3,
+            Some(operands) => operands.len(),
+            None => panic!("every opcode schema row declares its operand prefix"),
         }
     }
 
@@ -1827,7 +1767,7 @@ impl Op {
     ///   [`BytecodeModule::constants`]`[idx]` to a string, number,
     ///   bigint, regexp, or function-id constant.
     /// - **Raw count / immediate** (returns `false`): the operand
-    ///   carries `argc`, `upvalue_count`, a method-id enum
+    ///   carries `argc`, a packed context coordinate, a method-id enum
     ///   (`MathMethod`, `JsonMethod`, `ObjectMethod`, …), or a
     ///   typed-array kind enum. The linker must leave these
     ///   unchanged.
@@ -1853,11 +1793,20 @@ impl Op {
             | Op::LoadBuiltinError
             | Op::LoadGlobalOrThrow
             | Op::LoadGlobalOrUndefined
-            | Op::LoadDynamic
-            | Op::StoreDynamic
-            | Op::TypeofDynamic
-            | Op::DeleteDynamic
             | Op::NewPrivateName => pos == 1,
+            // [reg, ctx_reg, name_const, imm(, imm)]
+            Op::LoadLookupSlot
+            | Op::StoreLookupSlot
+            | Op::DeleteLookupSlot
+            | Op::LoadLookupGlobal
+            | Op::TypeofLookupGlobal
+            | Op::StoreLookupGlobal
+            | Op::DeleteLookupGlobal
+            | Op::ResolveLookupRef
+            | Op::StoreRef
+            | Op::StoreVarScope => pos == 2,
+            // [ctx_reg, name_const, var_depth_imm]
+            Op::DeclareEvalVar => pos == 1,
             // [name_const, value_reg]
             Op::DefineGlobalVar => pos == 0,
             Op::DeclareGlobalVar => pos == 0,
@@ -1880,7 +1829,7 @@ impl Op {
             Op::SetFunctionName => pos == 2,
             // [reg, name_const, src_reg, scratch_dst]
             Op::StoreProperty | Op::StorePropertyStrict => pos == 1,
-            // [reg, function_const, count, parent_idxs...]
+            // [reg, function_const, ctx_reg]
             Op::MakeClosure => pos == 1,
             // [reg, recv, name_const, argc, args...]
             Op::CallMethodValue => pos == 2,
@@ -1917,6 +1866,7 @@ impl Op {
                 | Op::Return
                 | Op::ReturnValue
                 | Op::ReturnUndefined
+                | Op::ReturnDerived
                 | Op::Throw
                 | Op::EndFinally
                 | Op::Await
@@ -1981,19 +1931,15 @@ pub struct Function {
     /// ECMAScript `Function.prototype.length` metadata.
     #[serde(default)]
     pub length: u16,
-    /// Number of fresh [`UpvalueCell`]s the prologue allocates for
-    /// this function's own locals that are captured by inner
-    /// closures. The frame's `upvalues` array is laid out as
-    /// `[own_upvalues..., parent_upvalues...]`; own-upvalues live
-    /// at indices `0..own_upvalue_count` (stable from compile-time)
-    /// and parent-passed captures follow.
+    /// Scope descriptors of every context this function can create, in
+    /// the order the compiler declared them.
+    ///
+    /// [`Op::CreateContext`] names an entry by index; a live context
+    /// carries `(function id, scope index)` so run-time diagnostics and
+    /// direct eval read slot names and kinds from here. Scopes that never
+    /// own a slot or an eval extension are not listed.
     #[serde(default)]
-    pub own_upvalue_count: u16,
-    /// Number of captured cells inherited from the closure that invokes this
-    /// function. Together with [`Self::own_upvalue_count`] this fixes the exact
-    /// frame spine width before call entry.
-    #[serde(default)]
-    pub inherited_upvalue_count: u16,
+    pub scopes: Vec<ScopeDescriptor>,
     /// `true` when this compiled function body executes as strict
     /// ECMAScript code. The compiler sets this from the source type
     /// and directive prologue; runtime call setup reads it for
@@ -2062,8 +2008,8 @@ pub struct Function {
     /// `<module-init>` for an ES module fragment. Module-init
     /// functions take two implicit parameters (`module_env`,
     /// `import_meta`) that the linker's `<entry>` driver passes
-    /// in; closures defined inside the body capture these via
-    /// upvalues.
+    /// in; closures defined inside the body reach them through
+    /// module-scope context slots.
     ///
     /// The flag is currently informational — the runtime treats
     /// the `<module-init>` body identically to any other call.
@@ -2088,8 +2034,8 @@ pub struct Function {
     /// `true` when the function body references the `arguments`
     /// identifier and the function is not an arrow (arrows
     /// inherit `arguments` lexically per §10.2.1.4 — the foundation
-    /// flags arrows as `false` so their parent frame's
-    /// `incoming_args` is consulted via the upvalue chain).
+    /// flags arrows as `false` and they read the enclosing function's
+    /// `arguments` binding through its context slot).
     ///
     /// When set, the call dispatcher stashes the full incoming
     /// argv into the new frame's `incoming_args` so
@@ -2125,32 +2071,16 @@ pub struct Function {
     /// caller's URL or stay empty.
     #[serde(default)]
     pub module_url: String,
-    /// §19.2.1.3 EvalDeclarationInstantiation support. Non-empty when
-    /// this function body contains a direct `eval(...)` call site: the
-    /// compiler promotes every function-scope binding (parameters,
-    /// `var` / function declarations, top-level lexicals, the
-    /// `arguments` binding) into an own-upvalue cell and records the
-    /// name → cell-index mapping here. `Op::Eval` reads the table to
-    /// hand the eval body its caller variable environment.
+    /// `true` when this function's own code (including class field
+    /// initializers compiled into a constructor) contains a direct-eval
+    /// call site.
     ///
-    /// Also set on a compiled eval `<main>` itself, where it lists the
-    /// *new* var-scoped names the eval body declares (cells the caller
-    /// frame must adopt so later code observes the bindings).
-    #[serde(default)]
-    pub direct_eval_bindings: Vec<DirectEvalBinding>,
-    /// Per-`Op::Eval`-site caller-environment refinements. Entry `i`
-    /// holds the block-scope bindings (all `inner: true`) visible at
-    /// the function's `i`-th direct-eval site; the site index rides
-    /// as the opcode's fourth operand. Merged over
-    /// [`Self::direct_eval_bindings`] when the runtime builds the
-    /// caller scope, innermost binding winning per name.
-    #[serde(default)]
-    pub eval_sites: Vec<Vec<DirectEvalBinding>>,
-    /// `true` when this function body (including class field
-    /// initializers compiled into a constructor) contains a direct
-    /// eval call site. `Op::Eval` uses it as the §19.2.1.1
-    /// `inFunction` signal — the binding table above may legitimately
-    /// be empty (a synthesized constructor with no own bindings).
+    /// A direct eval reads the activation's `this`, `new.target`,
+    /// `arguments` binding, and caller context, so such an activation must
+    /// stay materialized: inlining, frame elision, and the
+    /// activation-window `arguments` reads decline it. Scope visibility for
+    /// the eval body comes from the context chain and [`Self::scopes`],
+    /// not from this flag.
     #[serde(default)]
     pub contains_direct_eval: bool,
     /// Byte range into [`BytecodeModule::function_source`] for the
@@ -2228,78 +2158,225 @@ pub enum ArgumentsObjectKind {
     Mapped,
 }
 
-/// One caller-scope binding a direct `eval` body can see, or one new
-/// var-scoped binding an eval body introduces into its caller.
-/// `upvalue` indexes the owning frame's upvalue array.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectEvalBinding {
-    /// `true` when the cell is a PASSTHROUGH CAPTURE rather than the
-    /// owning function/eval's own variable-environment binding. A
-    /// direct eval may READ it, but must not adopt the alias into its
-    /// caller's current eval record. A `var` of the same name in the
-    /// eval body instead declares a fresh caller-frame binding
-    /// (§19.2.1.3 — HasVarDeclaration consults the caller's varEnv
-    /// only).
-    #[serde(default)]
-    pub captured: bool,
-    /// Source-level binding name.
-    pub name: String,
-    /// Own-upvalue cell index inside the owning function's frame.
-    pub upvalue: u16,
-    /// `true` for `let` / `const` / `class` bindings. A sloppy direct
-    /// eval whose body var-declares a name that collides with a caller
-    /// lexical binding is a runtime `SyntaxError` (§19.2.1.3 step 5).
-    pub lexical: bool,
-    /// `true` for a `const` / `class` caller binding. An eval body
-    /// assigning to it throws `TypeError` in every mode (§13.3.1).
-    #[serde(default)]
-    pub is_const: bool,
-    /// `true` for a named function expression's self-name binding
-    /// (§10.2.11 funcEnv). An eval body assigning to it throws
-    /// `TypeError` in strict mode and is silently dropped in sloppy
-    /// mode (§9.1.1.1.5 SetMutableBinding, immutable binding).
-    #[serde(default)]
-    pub fn_self_name: bool,
-    /// `true` for a binding declared in a block (or catch clause)
-    /// lexically BETWEEN the caller's variable environment and the
-    /// eval call site. Inner bindings shadow both the function-scope
-    /// baseline and any eval-environment record for name resolution,
-    /// and an eval-body `var` of the same name never re-binds them
-    /// (the var lands in the variable environment underneath).
-    #[serde(default)]
-    pub inner: bool,
-    /// `true` for a formal-parameter binding (or an ordinary
-    /// function's implicit `arguments` object binding): part of the
-    /// function environment the parameter initializers already see. A
-    /// direct eval running inside a parameter initializer resolves
-    /// only these (plus captured passthroughs and the self-name);
-    /// body var/function bindings do not exist yet at that point
-    /// (§10.2.11 step 28 — the body gets its own variable
-    /// environment when parameter expressions are present).
-    #[serde(default)]
-    pub param: bool,
-    /// `true` for a binding a sloppy eval introduced into its caller's
-    /// variable environment (§19.2.1.3 CreateMutableBinding with
-    /// deletable = true): reads, writes, and `delete` of the name must
-    /// go through the dynamic eval-environment ops so a later `delete`
-    /// is observable through every alias.
-    #[serde(default)]
-    pub deletable: bool,
-    /// 1-based lexical scope depth of the binding inside the owning
-    /// function: the function scope is `1` and each enclosing block or
-    /// catch clause between it and the eval site adds one. A direct eval
-    /// nested in a `with` compares this against the object environments'
-    /// own depths to decide which of them a name resolution walks
-    /// (§9.1.1.2.1 — only object environments inner to the declaration
-    /// participate).
-    #[serde(default = "one_u16")]
-    pub scope_depth: u16,
+/// Kind of one scope that can own a context.
+///
+/// A function's own scopes chain outward `Lexical` → `Body` → `Params` →
+/// `Callee` → `FunctionName` and then into the context its closure was
+/// created over; `Block`, `Catch`, `ForHead`, `Switch`, `With`, `Class`,
+/// and `ObjectHome` nest inside them. Each scope gets a context only when
+/// it owns at least one slot or an eval-extension anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    /// Self-name binding of a named function expression (§15.2.5
+    /// funcEnv), outside every other scope of the function.
+    FunctionName,
+    /// The callee environment of a sloppy function with parameter
+    /// expressions (§10.2.11 step 20): the extension anchor for a direct
+    /// eval inside a parameter initializer, outside the parameters.
+    Callee,
+    /// Formal parameters and the `arguments` binding.
+    Params,
+    /// The body's VariableEnvironment: `var` and function declarations,
+    /// and the extension anchor of a sloppy function whose own code
+    /// contains a direct eval.
+    Body,
+    /// Top-level lexical declarations of a function body (§10.2.11 step
+    /// 30 lexEnv).
+    Lexical,
+    /// A block statement.
+    Block,
+    /// A `catch` clause parameter.
+    Catch,
+    /// `let` / `const` declarations of a `for` / `for-in` / `for-of` head.
+    ForHead,
+    /// The CaseBlock of a `switch` statement.
+    Switch,
+    /// A `with` statement body; its slot holds the binding object.
+    With,
+    /// A class body: class name, private names, brand, home objects.
+    Class,
+    /// Home object of object-literal methods that reference `super`.
+    ObjectHome,
+    /// VariableEnvironment of a strict direct eval (§19.2.1.3).
+    EvalVar,
+    /// LexicalEnvironment of a direct eval body.
+    EvalLexical,
+    /// Module Environment Record bindings reached from nested code.
+    Module,
 }
 
-/// `serde` default for [`DirectEvalBinding::scope_depth`] — the function
-/// scope.
-fn one_u16() -> u16 {
-    1
+/// Per-scope facts that shape context allocation and name resolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScopeFlags {
+    /// The scope's code is strict mode code.
+    pub strict: bool,
+    /// The context is a VariableEnvironment: a sloppy direct eval's `var`
+    /// declarations extend the first context on its chain with this flag.
+    pub var_scope: bool,
+    /// The context can carry an eval extension — the bindings a sloppy
+    /// direct eval creates at run time. `Lookup*` operations probe the
+    /// extensions of exactly these contexts. Never set on a strict scope.
+    pub has_extension: bool,
+}
+
+/// Binding kind of one context slot: its initial value, its checks, and
+/// how an assignment through its name behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotKind {
+    /// A `var` binding.
+    Var,
+    /// A function declaration binding.
+    FunctionDecl,
+    /// The implicit `arguments` binding.
+    Arguments,
+    /// A formal parameter. `checked` parameters start in the TDZ: a
+    /// parameter list with expressions and no duplicates binds them one by
+    /// one (§10.2.11 steps 21–26), so an earlier default can observe a
+    /// later parameter uninitialized.
+    Param {
+        /// The slot starts as the hole and reads are TDZ-checked.
+        checked: bool,
+    },
+    /// A `let` binding, including a class declaration's outer binding.
+    Let,
+    /// A `const` binding.
+    Const,
+    /// The immutable class-name binding inside a class scope (§15.7.14
+    /// step 3), in its TDZ until the class definition completes.
+    Class,
+    /// A derived constructor's `this`, bound by `super()`.
+    DerivedThis,
+    /// A named function expression's immutable self-name binding.
+    FnSelfName,
+    /// A `catch` parameter. `simple` marks a single-identifier parameter,
+    /// which Annex B.3.4 lets an eval `var` of the same name coexist with.
+    CatchParam {
+        /// The parameter is a single identifier, not a pattern.
+        simple: bool,
+    },
+    /// The binding object of a `with` statement.
+    WithObject,
+    /// A private name carrier of a class scope.
+    PrivateName,
+    /// The private-methods brand of a class scope.
+    PrivateBrand,
+    /// The home object of instance methods (`super` property base).
+    SuperHome,
+    /// The home object of static methods.
+    SuperStaticHome,
+    /// The parent constructor `super()` calls.
+    SuperCtor,
+    /// The class constructor, for `super()` and field initialization.
+    ClassSelf,
+    /// The module environment object.
+    ModuleEnv,
+    /// The module's `import.meta` object.
+    ImportMeta,
+    /// A compiler-private temporary.
+    Synthetic,
+}
+
+impl SlotKind {
+    /// Whether a fresh context starts this slot as the TDZ hole rather than
+    /// `undefined`.
+    #[must_use]
+    pub const fn initial_hole(self) -> bool {
+        matches!(
+            self,
+            Self::Let
+                | Self::Const
+                | Self::Class
+                | Self::DerivedThis
+                | Self::Param { checked: true }
+        )
+    }
+
+    /// Store behavior of an assignment through this binding's name
+    /// (§9.1.1.1.5 SetMutableBinding): `const` and class-name bindings
+    /// always reject it; a function self-name rejects it only in strict
+    /// code and otherwise ignores it.
+    #[must_use]
+    pub const fn store_fallback(self, strict: bool) -> opcode_schema::BindingStoreFallback {
+        match self {
+            Self::Const | Self::Class => opcode_schema::BindingStoreFallback::ImmutableThrow,
+            Self::FnSelfName if strict => opcode_schema::BindingStoreFallback::ImmutableThrow,
+            Self::FnSelfName => opcode_schema::BindingStoreFallback::ImmutableIgnore,
+            _ => opcode_schema::BindingStoreFallback::Mutable,
+        }
+    }
+
+    /// Whether an assignment through this binding's name never writes it.
+    #[must_use]
+    pub const fn is_const_like(self) -> bool {
+        matches!(self, Self::Const | Self::Class | Self::FnSelfName)
+    }
+}
+
+/// One named slot of a scope descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotDescriptor {
+    /// Source-level binding name, or a compiler-private name for internal
+    /// slots. Owned: contexts outlive their chunk's constant pool and are
+    /// read by eval code compiled into other chunks.
+    pub name: String,
+    /// Binding kind.
+    pub kind: SlotKind,
+    /// A module-scope binding that a local `export` names: every store to
+    /// it, including one compiled inside a direct eval, also updates the
+    /// exported value.
+    #[serde(default)]
+    pub exported: bool,
+}
+
+/// Static description of one scope's context: kind, flags, and slots in
+/// slot-index order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeDescriptor {
+    /// Scope kind.
+    pub kind: ScopeKind,
+    /// Strictness, variable-environment, and extension facts.
+    #[serde(default)]
+    pub flags: ScopeFlags,
+    /// Slots, indexed by the `slot` half of a [`ContextCoord`]. Names are
+    /// unique within one scope.
+    #[serde(default)]
+    pub slots: Vec<SlotDescriptor>,
+}
+
+impl ScopeDescriptor {
+    /// Heap bytes this descriptor retains beyond its own record.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        self.slots.iter().fold(
+            std::mem::size_of_val::<[SlotDescriptor]>(&self.slots) as u64,
+            |total, slot| total.saturating_add(slot.name.len() as u64),
+        )
+    }
+}
+
+/// The context chain a direct eval runs under, as the runtime hands it to
+/// the eval compiler.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalCallerChain {
+    /// One entry per live context from the call site's innermost context
+    /// outward; an entry's index is its hop count from that context.
+    pub scopes: Vec<EvalCallerScope>,
+    /// Hop count of the VariableEnvironment context a sloppy eval body's
+    /// `var`s extend, or `None` for the global environment.
+    pub var_depth: Option<u32>,
+}
+
+/// One live context on an [`EvalCallerChain`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalCallerScope {
+    /// The context's scope descriptor.
+    pub descriptor: ScopeDescriptor,
+    /// Names currently held by the context's eval extension, in insertion
+    /// order; empty when it has none.
+    #[serde(default)]
+    pub extension_names: Vec<String>,
 }
 
 /// One argument index aliased to one formal parameter binding.
@@ -2322,10 +2399,14 @@ pub enum ArgumentBindingStorage {
         /// Frame register index.
         reg: u16,
     },
-    /// Parameter lives in one of the frame's own upvalue cells.
-    Upvalue {
-        /// Frame upvalue-cell index.
-        idx: u16,
+    /// Parameter lives in a slot of the parameter-scope context.
+    Context {
+        /// Frame register holding the parameter-scope context. Every
+        /// context-held mapped formal of one function names the same
+        /// register, and [`Op::CallForwardArguments`] names it explicitly.
+        reg: u16,
+        /// Slot index within that context.
+        slot: u16,
     },
 }
 
@@ -2553,7 +2634,7 @@ impl BytecodeModule {
 
 impl Function {
     /// Heap bytes this compiled function retains: name, wordcode body, span
-    /// table, eval-binding and mapped-arguments tables, and annotation-hint
+    /// table, scope descriptors, mapped-arguments table, and annotation-hint
     /// tables. Excludes `size_of::<Self>()`, which the owning function table
     /// accounts for.
     #[must_use]
@@ -2565,11 +2646,10 @@ impl Function {
         for binding in &self.mapped_argument_bindings {
             total = total.saturating_add(binding.formal_name.len() as u64);
         }
-        total = total.saturating_add(std::mem::size_of_val::<[DirectEvalBinding]>(
-            &self.direct_eval_bindings,
-        ) as u64);
-        for binding in &self.direct_eval_bindings {
-            total = total.saturating_add(binding.name.len() as u64);
+        total =
+            total.saturating_add(std::mem::size_of_val::<[ScopeDescriptor]>(&self.scopes) as u64);
+        for scope in &self.scopes {
+            total = total.saturating_add(scope.retained_bytes());
         }
         total
             .saturating_add(self.code.retained_bytes())

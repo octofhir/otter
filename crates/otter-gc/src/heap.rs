@@ -12,7 +12,9 @@
 //!   collections in the VM.
 //! - Weak-reference/finalization registry bookkeeping used by VM
 //!   post-mark processing.
-//! - Old-space batch reservation with independent per-cell headers and tracing.
+//! - Initialized trailing allocation
+//!   ([`GcHeap::alloc_trailing_with_roots_initialized`]): a young body whose
+//!   variable tail is filled before any collection can observe it.
 //!
 //! # Invariants
 //!
@@ -21,6 +23,9 @@
 //!   trace table by tag.
 //! - Registered observation prologues run before nursery movement, each
 //!   incremental marking step or sweep; observations cannot become strong roots.
+//! - An initializer passed to an `_initialized` allocator runs at the body's
+//!   final address with no intervening safepoint, before the old-placement
+//!   barrier scan; the body is never traced with an unfilled tail.
 //! - Black allocation: when a marking cycle is in progress
 //!   (`marking.is_marking() == true`), new objects start black so
 //!   the marker doesn't have to re-discover them.
@@ -67,8 +72,6 @@ use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::stats::{GcStats, TYPE_TAG_COUNT};
 use crate::store::GcStore;
 use crate::trace::{TraceTable, Traceable};
-
-mod old_batch;
 
 /// Embedder weak-semantics pass run between strong marking and sweep.
 ///
@@ -1378,9 +1381,49 @@ impl GcHeap {
     #[inline]
     pub fn alloc_trailing_with_roots<T: Traceable>(
         &mut self,
+        value: T,
+        extra_bytes: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_trailing_with_roots_inner(value, extra_bytes, external_visit, |_| {})
+    }
+
+    /// [`Self::alloc_trailing_with_roots`] that initializes the trailing
+    /// storage before the cell can be observed by any collection.
+    ///
+    /// `initialize` runs once the fixed body and zeroed tail sit at their
+    /// final address and before any barrier scan of the new cell: in the
+    /// nursery it runs right after the payload write; when the body lands in
+    /// old space (bootstrap tenuring, a large body, or nursery overflow) it
+    /// runs before the allocator records the cell's outgoing edges, exactly
+    /// as in [`Self::alloc_variable_with_roots_initialized`]. No safepoint
+    /// separates the allocation from the initializer, so a body whose trace
+    /// reads the tail never exposes uninitialized slots. Values the
+    /// initializer copies in must be reachable from `external_visit` (or be
+    /// immediates), so a collection this allocation triggers rewrites them
+    /// before the copy.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc`].
+    #[inline]
+    pub fn alloc_trailing_with_roots_initialized<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_trailing_with_roots_inner(value, extra_bytes, external_visit, initialize)
+    }
+
+    #[inline]
+    fn alloc_trailing_with_roots_inner<T: Traceable>(
+        &mut self,
         mut value: T,
         extra_bytes: usize,
         external_visit: &mut RootSlotVisitor<'_>,
+        initialize: impl FnOnce(&mut T),
     ) -> Result<Gc<T>, OutOfMemory> {
         if self.tenure_all {
             return self.alloc_old_with_roots_inner(
@@ -1388,7 +1431,7 @@ impl GcHeap {
                 true,
                 extra_bytes,
                 external_visit,
-                |_| {},
+                initialize,
             );
         }
         // A cell payload sits one `GcHeader` past an
@@ -1540,6 +1583,9 @@ impl GcHeap {
                     aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
                 );
             }
+            // The cell is still unreachable: fill any trailing storage at its
+            // final address before the barrier scan below reads it.
+            initialize(&mut *payload_ptr);
             // When this object was tenured straight into old-space (large
             // object, or the nursery-deadlock overflow), the `ptr::write`
             // bypassed the mutator write barrier. Any young children in the
@@ -1930,6 +1976,17 @@ impl GcHeap {
     /// whether it is armed yet.
     pub fn gc_stress_enabled(&self) -> bool {
         self.gc_stress_stride != 0
+    }
+
+    /// Configure GC stress on this heap: a scavenge (and, with `full`, a
+    /// major collection) every `stride` allocations; `0` disables it. The
+    /// in-process counterpart of `OTTER_GC_STRESS`, for tests that drive one
+    /// heap without touching the process environment.
+    pub fn set_gc_stress(&mut self, stride: u32, full: bool) {
+        self.gc_stress_stride = stride;
+        self.gc_stress_full = full;
+        self.gc_stress_counter = 0;
+        self.gc_stress_armed = stride != 0;
     }
 
     /// Growth-ratio major-GC trigger for cap-less heaps.

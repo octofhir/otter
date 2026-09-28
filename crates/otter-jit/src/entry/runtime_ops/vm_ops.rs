@@ -3,7 +3,7 @@
 //! # Contents
 //! - Immutable property source cells and committed cold handlers.
 //! - Effect-once boxed-span method-call completion.
-//! - Element/global/upvalue/object runtime operations.
+//! - Element/global/object runtime operations.
 //!
 //! # Invariants
 //! Register-index operands address the published JIT window. Computed element

@@ -110,3 +110,88 @@ fn young_trailing_allocation_uses_pending_trace_before_publication() {
     assert!(heap.gc_stats().gc_cycles > 0);
     assert!(PENDING.load(Ordering::Relaxed) > 0);
 }
+
+/// Allocate an [`OpaqueVector`] of `len` elements with every element set to
+/// `leaf` by the allocation's initializer. `leaf` rides through the
+/// allocation as an external root, the way a VM kernel roots the values it
+/// copies into a new context.
+fn initialized_vector(
+    heap: &mut GcHeap,
+    len: usize,
+    leaf: &mut RawGc,
+) -> otter_gc::Gc<OpaqueVector> {
+    let leaf_slot: *mut RawGc = leaf;
+    let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| visitor(leaf_slot);
+    heap.alloc_trailing_with_roots_initialized(
+        OpaqueVector::new(len),
+        OpaqueVector::trailing_bytes(len),
+        &mut roots,
+        |body| {
+            for index in 0..len {
+                // SAFETY: the root visitor above kept `leaf_slot` current
+                // across any collection this allocation triggered.
+                body.set(index, unsafe { *leaf_slot });
+            }
+        },
+    )
+    .expect("initialized trailing allocation")
+}
+
+#[test]
+fn an_initialized_young_tail_survives_scavenges_and_full_collections() {
+    let mut heap = GcHeap::new().expect("heap");
+    let mut leaf = heap
+        .alloc(otter_gc::test_support::OpaqueLeaf { payload: 0xC0FFEE })
+        .expect("leaf")
+        .raw();
+    let mut vector = initialized_vector(&mut heap, 5, &mut leaf).raw();
+    for round in 0..3 {
+        let vector_slot: *mut RawGc = &mut vector;
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| visitor(vector_slot);
+        if round == 2 {
+            heap.collect_full(&mut roots).expect("full collection");
+        } else {
+            heap.collect_minor_with_roots(&mut roots).expect("scavenge");
+        }
+    }
+    let handle = heap
+        .cast_raw_if_type::<OpaqueVector>(vector)
+        .expect("vector survives");
+    let elements = heap.with_payload(handle, |body| {
+        (0..body.len())
+            .map(|index| body.get(index))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(elements.len(), 5);
+    let first = elements[0];
+    assert!(elements.iter().all(|element| *element == first));
+    let leaf = heap
+        .cast_raw_if_type::<otter_gc::test_support::OpaqueLeaf>(first)
+        .expect("tail element still names the leaf");
+    assert_eq!(heap.with_payload(leaf, |body| body.payload), 0xC0FFEE);
+}
+
+#[test]
+fn an_initialized_tail_under_bootstrap_tenuring_is_barriered_to_its_young_children() {
+    let mut heap = GcHeap::new().expect("heap");
+    let mut leaf = heap
+        .alloc(otter_gc::test_support::OpaqueLeaf { payload: 7 })
+        .expect("young leaf")
+        .raw();
+    heap.set_tenure_all(true);
+    let mut vector = initialized_vector(&mut heap, 3, &mut leaf).raw();
+    heap.set_tenure_all(false);
+    // Only the old vector roots the young leaf: the scavenge finds it
+    // through the card the initializer's barrier scan recorded.
+    let vector_slot: *mut RawGc = &mut vector;
+    let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| visitor(vector_slot);
+    heap.collect_minor_with_roots(&mut roots).expect("scavenge");
+    let handle = heap
+        .cast_raw_if_type::<OpaqueVector>(vector)
+        .expect("vector survives");
+    let element = heap.with_payload(handle, |body| body.get(2));
+    let leaf = heap
+        .cast_raw_if_type::<otter_gc::test_support::OpaqueLeaf>(element)
+        .expect("tail element rewritten to the evacuated leaf");
+    assert_eq!(heap.with_payload(leaf, |body| body.payload), 7);
+}

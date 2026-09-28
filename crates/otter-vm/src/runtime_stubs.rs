@@ -38,13 +38,14 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
     STUB_COLLECTION_MAP_SET_MUTATING, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF, STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF,
-    STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF,
-    STUB_NUMBER_TO_INT32_F64_LEAF, STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF,
-    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
-    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_MATH_ABS_LEAF, STUB_MATH_FLOOR_LEAF,
+    STUB_MATH_MAX_LEAF, STUB_MATH_MIN_LEAF, STUB_MATH_SQRT_LEAF, STUB_NUMBER_POW_F64_LEAF,
+    STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
+    STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
+    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
+    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
+    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
+    validate_stub_descriptor,
 };
 use crate::rooting::RootScopeExt;
 use crate::{Interpreter, Value, collections};
@@ -529,6 +530,12 @@ impl<'a> AllocValueStubCallRoots<'a> {
         // while this root source is synchronously visiting roots.
         unsafe { *self.values[index].get() }
     }
+
+    /// Address of rooted argument `index`: a slot the collector rewrites in
+    /// place while this root source is registered.
+    fn value_slot(&self, index: usize) -> *const Value {
+        self.values[index].get().cast_const()
+    }
 }
 
 impl otter_gc::ExtraRootSource for AllocValueStubCallRoots<'_> {
@@ -734,6 +741,18 @@ pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(array_construct_alloc),
 };
 
+/// ABI descriptor for `CreateContext` allocation.
+pub const CREATE_CONTEXT_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_CREATE_CONTEXT_ALLOC,
+    entry: Some(create_context_alloc),
+};
+
+/// ABI descriptor for `CopyContext` allocation.
+pub const COPY_CONTEXT_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_COPY_CONTEXT_ALLOC,
+    entry: Some(copy_context_alloc),
+};
+
 /// Callable ABI entry for `Array.prototype.pop` over a dense array.
 pub const ARRAY_POP_LEAF: MutatingLeafStub2 = MutatingLeafStub2 {
     descriptor: STUB_ARRAY_POP_LEAF,
@@ -885,6 +904,8 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
         id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),
+        id if id == STUB_CREATE_CONTEXT_ALLOC.id => Some(CREATE_CONTEXT_ALLOC),
+        id if id == STUB_COPY_CONTEXT_ALLOC.id => Some(COPY_CONTEXT_ALLOC),
         id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => Some(ARRAY_UNSHIFT_ALLOC),
         _ => None,
     }
@@ -1153,6 +1174,147 @@ pub extern "C" fn array_construct_alloc(
         ctx,
         array_construct_alloc_inner(ctx, safepoint, length_bits, padding0_bits, padding1_bits),
     )
+}
+
+/// `CreateContext` stub: `(parent, function id, scope index)` as boxed words.
+///
+/// The ids are int32 values; a malformed word is a pre-effect miss. The
+/// parent is rooted in the stub's call roots and carried by the pending
+/// context body, so a collection rewrites it before it is stored.
+#[must_use]
+pub extern "C" fn create_context_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    parent_bits: u64,
+    function_id_bits: u64,
+    scope_index_bits: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        create_context_alloc_inner(
+            ctx,
+            safepoint,
+            parent_bits,
+            function_id_bits,
+            scope_index_bits,
+        ),
+    )
+}
+
+/// `CopyContext` stub: `(source, _, _)` as boxed words.
+///
+/// The source is rooted in the stub's call roots and read back through that
+/// root after the allocation.
+#[must_use]
+pub extern "C" fn copy_context_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    source_bits: u64,
+    padding0_bits: u64,
+    padding1_bits: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        copy_context_alloc_inner(ctx, safepoint, source_bits, padding0_bits, padding1_bits),
+    )
+}
+
+fn create_context_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    parent_bits: u64,
+    function_id_bits: u64,
+    scope_index_bits: u64,
+) -> NativeResultPair {
+    let parent = Value::from_abi_bits(parent_bits);
+    if crate::context_ops::context_operand(parent).is_err() {
+        return NativeResultPair::miss();
+    }
+    let (Some(function_id), Some(scope_index)) = (
+        Value::from_abi_bits(function_id_bits)
+            .as_i32()
+            .and_then(|id| u32::try_from(id).ok()),
+        Value::from_abi_bits(scope_index_bits)
+            .as_i32()
+            .and_then(|index| u32::try_from(index).ok()),
+    ) else {
+        return NativeResultPair::miss();
+    };
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(execution_context) = alloc_execution_context(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame/spill windows stay published for this synchronous call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                parent,
+                Value::from_abi_bits(function_id_bits),
+                Value::from_abi_bits(scope_index_bits),
+            ],
+        )
+    }) else {
+        return NativeResultPair::miss();
+    };
+    let _call_roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    match interp.create_context_value(execution_context, function_id, scope_index, roots.value(0)) {
+        Ok(context) => NativeResultPair::success(context),
+        Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
+        Err(_) => NativeResultPair::miss(),
+    }
+}
+
+fn copy_context_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    source_bits: u64,
+    padding0_bits: u64,
+    padding1_bits: u64,
+) -> NativeResultPair {
+    if Value::from_abi_bits(source_bits).as_context().is_none() {
+        return NativeResultPair::miss();
+    }
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame/spill windows stay published for this synchronous call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(source_bits),
+                Value::from_abi_bits(padding0_bits),
+                Value::from_abi_bits(padding1_bits),
+            ],
+        )
+    }) else {
+        return NativeResultPair::miss();
+    };
+    let _call_roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    // SAFETY: the rooted argument slot stays registered with the heap for the
+    // whole copy and holds the source context.
+    match unsafe { interp.copy_context_from_slot(roots.value_slot(0)) } {
+        Ok(context) => NativeResultPair::success(context),
+        Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
+        Err(_) => NativeResultPair::miss(),
+    }
 }
 
 /// Debug guard proving a `LeafNoAlloc` entry neither allocated nor triggered
@@ -2462,6 +2624,28 @@ fn alloc_interpreter_mut(ctx: &RuntimeStubAllocContext) -> Option<&'static mut I
     // SAFETY: `runtime_context` is published from a live VmRuntimeActivation value.
     let reentry = unsafe { &*(thread.runtime_context as *const crate::jit::VmRuntimeActivation) };
     interpreter_mut(reentry.vm_ptr().cast())
+}
+
+/// The execution context of the compiled activation making this allocating
+/// call. Function ids resolve through its code space, so a callee in a
+/// sibling chunk still finds its scope table.
+fn alloc_execution_context(
+    ctx: &RuntimeStubAllocContext,
+) -> Option<&'static crate::ExecutionContext> {
+    if ctx.thread.is_null() {
+        return None;
+    }
+    // SAFETY: allocating stubs execute synchronously while the JIT entry keeps
+    // both the VmThread and its VM-owned reentry record live.
+    let thread = unsafe { &*ctx.thread };
+    if thread.runtime_context == 0 {
+        return None;
+    }
+    // SAFETY: `runtime_context` is published from a live VmRuntimeActivation
+    // whose context outlives the compiled entry.
+    let reentry = unsafe { &*(thread.runtime_context as *const crate::jit::VmRuntimeActivation) };
+    // SAFETY: as above; the context pointer is null or live.
+    unsafe { reentry.context.as_ref() }
 }
 
 unsafe fn alloc_value_stub_call_roots<'a>(

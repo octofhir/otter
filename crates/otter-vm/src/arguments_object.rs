@@ -6,7 +6,8 @@
 //! follows ECMA-262 §10.4.4.6: indexed own data properties, a
 //! non-enumerable `length`, and a restricted `callee` accessor using
 //! the realm's shared `%ThrowTypeError%` function. The mapped variant
-//! adds a VM-internal ParameterMap over selected indexed properties.
+//! adds a VM-internal ParameterMap over selected indexed properties: each
+//! mapped index aliases a slot of the parameter-scope context.
 //!
 //! # Contents
 //! - [`initialize_unmapped`] — populate an unmapped arguments object.
@@ -31,14 +32,14 @@ use otter_gc::raw::RawGc;
 
 use crate::Value;
 use crate::number::NumberValue;
-use crate::object::{self, JsObject, MappedArgumentEntry, PartialPropertyDescriptor};
+use crate::object::{self, JsObject, MappedArguments, PartialPropertyDescriptor};
 use crate::rooting::RootScopeExt;
 use crate::symbol::JsSymbol;
 
 /// GC-safety: each `define_own_property` below can allocate (wide-number
 /// boxing in `SlotData::into_flat`, dictionary conversion) and move the
 /// heap, so the object handle, remaining argv values, callee / iterator
-/// method, and parameter-map cells are all registered on a
+/// method, and the parameter-scope context are all registered on a
 /// [`otter_gc::RootScope`] for the whole initialization; a collection
 /// forwards them in place.
 /// Populate an unmapped `arguments` object from a captured argv list.
@@ -102,13 +103,13 @@ pub(crate) fn initialize_unmapped(
 }
 
 /// Populate a sloppy mapped `arguments` object from a captured argv
-/// list plus VM-internal parameter cells.
+/// list plus its VM-internal ParameterMap over the parameter-scope context.
 pub(crate) fn initialize_mapped(
     mut obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     mut args: SmallVec<[Value; 4]>,
     mut callee: Value,
-    mut mapped_entries: Vec<MappedArgumentEntry>,
+    mut mapped: Option<MappedArguments>,
     iterator: Option<(JsSymbol, Value)>,
     shape: crate::object::ShapeHandle,
 ) -> JsObject {
@@ -123,9 +124,9 @@ pub(crate) fn initialize_mapped(
         scope.add_value_smallvec(&mut args);
         scope.add_value(&mut callee);
         scope.add_value(&mut iterator_method);
-        for entry in mapped_entries.iter_mut() {
+        if let Some(mapped) = &mut mapped {
             scope.add_raw_slot(
-                (&mut entry.cell as *mut crate::upvalue::UpvalueCell).cast::<RawGc>(),
+                (&mut mapped.context as *mut crate::context::ContextHandle).cast::<RawGc>(),
             );
         }
     }
@@ -154,11 +155,12 @@ pub(crate) fn initialize_mapped(
             },
         );
     }
-    // The entry cells are rooted as individual slots (stable Vec storage:
-    // the vector is not resized while the scope is open), so the vector can
-    // move into `install_mapped_arguments` only after the scope closes; by
-    // then `obj` and the cells are current.
+    // The context is rooted in place, so the map moves into
+    // `install_mapped_arguments` only after the scope closes; by then `obj`
+    // and the context are current.
     drop(scope);
-    object::install_mapped_arguments(obj, heap, mapped_entries);
+    if let Some(mapped) = mapped {
+        object::install_mapped_arguments(obj, heap, mapped);
+    }
     obj
 }

@@ -41,8 +41,14 @@
 //!   proven non-cell before boxing omit that barrier entirely. Dense-array and
 //!   primitive-string `.length` reads use the shared exotic layout guard before
 //!   that chain.
-//! - Typed binding guards validate global-this cells, captured-cell spines,
-//!   TDZ/writability, or baked global lexical/object proofs. A hit reads or
+//! - Context words load and store at [`otter_vm::jit::JitContextLayout`]
+//!   offsets from the tagged owning value in one instruction; only an offset
+//!   past the scaled immediate uses the declared `x16`. SELF's closure context
+//!   tests the cell and closure tag first and yields `undefined` otherwise.
+//!   Context slot barriers use the `x19` Machine context like binding stores.
+//! - Typed binding guards validate global-this cells, TDZ/writability, the
+//!   hole of a checked context slot reached by an explicit parent walk, or
+//!   baked global lexical/object proofs. A hit reads or
 //!   writes directly and stores run the generated barrier. Every miss enters
 //!   the single rooted committed binding call, whose payload and descriptor-
 //!   owned status remain explicit SSA through Success/Throw/Fatal control;
@@ -51,8 +57,10 @@
 //!   live into the loop header across the leaf runtime call. An `x29` local
 //!   countdown amortizes shared interrupt and fuel-cell traffic over the same
 //!   bounded batch used by the general optimizing tier.
-//! - OSR trampolines decode only live loop-header inputs into the exact
-//!   late-use locations selected by regalloc2; rejection never mutates VM slots.
+//! - The entry dispatch reads the frame's OSR bit and PC once; an OSR block
+//!   decodes each loop-header value from the interpreter frame into the
+//!   location regalloc2 gave its definition, and a rejected value leaves
+//!   before any effect without mutating VM slots.
 //! - Successful results use the VM's canonical tagged representation.
 //! - SSA constructor probes reuse the shared nursery allocator without reentry;
 //!   a miss produces undefined for the explicit full-call sibling. Base result
@@ -92,31 +100,30 @@ mod value_span;
 use value_span::emit_value_span_arguments;
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
-use otter_bytecode::opcode_schema::{
-    BindingRead, BindingSemantics, BindingWrite, BindingWriteCheck,
-};
+use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
 pub(super) mod inline_calls;
 
 use otter_vm::{
     JitCompileSnapshot, Value,
+    closure::JS_CLOSURE_BODY_TYPE_TAG,
     deopt::DeoptRuntime,
     native_abi::{
         ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
         RuntimeStubResultAbi, RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC,
-        STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE,
-        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_STRICT_EQ_LEAF,
-        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
+        STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE, STUB_JIT_CALL_METHOD_VALUE,
+        STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE,
+        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY,
+        STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
+        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
     },
 };
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallDescriptor,
-    CallTarget, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
+    CallTarget, ContextField, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBindingTarget, MachineCallGuard, MachineFrameLayout,
-    MachineInstructionId, MachineOpcode, MachineOsrInput, MachineOsrType, MachineRepresentation,
+    MachineInstructionId, MachineOpcode, MachineOsrType, MachineRepresentation,
     MachineSafepointSite, MachineSafepointTable, MachineValue, OperandPurpose,
     binding_target_matches_semantics, is_explicit_committed_runtime_call,
 };
@@ -136,9 +143,8 @@ use crate::{
         MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET, MACHINE_ROOT_RECORD_SIZE,
         MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET,
-        NATIVE_FRAME_UPVALUE_COUNT_OFFSET, NUMBER_TAG_HI16, PropertySourceCell, THREAD_OFFSET,
-        TransitionTable, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
+        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, PropertySourceCell,
+        THREAD_OFFSET, TransitionTable, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
         VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
@@ -154,7 +160,7 @@ use crate::{
         emit_slab_base, emit_write_barrier_with_context,
     },
 };
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use super::super::target::{
     AARCH64_BASE_FIXED_FRAME_BYTES, AARCH64_DEOPT_FP_BUDGET, AARCH64_DEOPT_GPR_BUDGET,
@@ -210,16 +216,9 @@ pub(super) struct Emission {
     pub(super) code: CompiledCode,
     pub(super) generated_stack_frame_bytes: u32,
     pub(super) relocations: RelocationCapture,
-    pub(super) osr_entries: BTreeMap<u32, usize>,
+    pub(super) osr_headers: BTreeSet<u32>,
     pub(super) osr_regions: Vec<(u32, usize, usize)>,
     pub(super) structural_regions: Vec<(&'static str, Option<u32>, usize, usize)>,
-}
-
-struct OsrSite {
-    instruction: MachineInstructionId,
-    logical_pc: u32,
-    inputs: Vec<MachineOsrInput>,
-    continuation: DynamicLabel,
 }
 
 fn instruction_deopt_label(
@@ -351,20 +350,16 @@ fn emit_landing_pad_transfer(
     frame: MachineFrameLayout,
     result_location: AllocatedLocation,
     result_register: u8,
-    allocation_edits: &[AllocationEdit],
+    allocation: &AllocatedSequence,
     instruction: MachineInstructionId,
     target: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_store_allocated_tagged(ops, frame, result_location, result_register, 0)?;
     // A local throw branches around the instruction loop's normal fallthrough.
-    // Apply the result live-range transition before entering the successor: a
-    // catch block parameter is not required to share the call result's home.
-    emit_edits(
-        ops,
-        allocation_edits,
-        AllocationPoint::After(instruction),
-        frame,
-    )?;
+    // Apply the moves the normal path makes after the call and around the
+    // block terminator before entering the successor: a catch block parameter
+    // is not required to share the call result's home.
+    emit_edit_run(ops, allocation.exceptional_edge_edits(instruction), frame)?;
     dynasm!(ops ; .arch aarch64 ; b =>target);
     Ok(())
 }
@@ -380,7 +375,7 @@ fn emit_committed_runtime_call(
     id: MachineInstructionId,
     descriptor: &CallDescriptor,
     locations: &[AllocatedLocation],
-    allocation_edits: &[AllocationEdit],
+    allocation: &AllocatedSequence,
     safepoints: &MachineSafepointTable,
     block_labels: &[DynamicLabel],
     throw_value: DynamicLabel,
@@ -525,15 +520,7 @@ fn emit_committed_runtime_call(
                     .ok_or(Unsupported::OperandShape(
                         "scalar committed runtime landing pad",
                     ))?;
-            emit_landing_pad_transfer(
-                ops,
-                frame,
-                result_location,
-                17,
-                allocation_edits,
-                id,
-                target,
-            )?;
+            emit_landing_pad_transfer(ops, frame, result_location, 17, allocation, id, target)?;
         }
         ExceptionalEdge::Propagate => {
             emit_clear_machine_roots(ops);
@@ -705,14 +692,10 @@ fn emit_committed_pair_call(
 fn binding_requires_live_cell(semantics: BindingSemantics) -> bool {
     matches!(
         semantics,
-        BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Upvalue { .. })
+        BindingSemantics::Read(BindingRead::Global { .. })
             | BindingSemantics::Write(
                 BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. }
             )
-            | BindingSemantics::Write(BindingWrite::Upvalue {
-                check: BindingWriteCheck::Checked,
-                ..
-            })
     )
 }
 
@@ -727,12 +710,7 @@ fn emit_binding_guard(
     byte_pc: u32,
     locations: &[AllocatedLocation],
 ) -> Result<(), Unsupported> {
-    let closure_input = usize::from(matches!(
-        target,
-        MachineBindingTarget::ClosureUpvalue { .. }
-    ));
-    if locations.len()
-        != 3 + semantics.value_operands().into_iter().flatten().count() + closure_input
+    if locations.len() != 3 + semantics.value_operands().into_iter().flatten().count()
         || !binding_target_matches_semantics(semantics, target)
     {
         return Err(Unsupported::OperandShape("scalar binding guard"));
@@ -740,7 +718,7 @@ fn emit_binding_guard(
     let condition = integer_register(locations[0])?;
     let owner = integer_register(locations[1])?;
     let storage = integer_register(locations[2])?;
-    let upvalue_value_byte = view.upvalue_value_byte;
+    let global_lexical_value_byte = view.global_lexical_value_byte;
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
 
@@ -755,6 +733,27 @@ fn emit_binding_guard(
 
     match target {
         MachineBindingTarget::Cold => dynasm!(ops ; .arch aarch64 ; b =>miss),
+        MachineBindingTarget::ContextSlot { depth, slot } => {
+            // The context is the last boxed input: after the stored value
+            // for a write, alone for a read.
+            let context = *locations
+                .last()
+                .ok_or(Unsupported::OperandShape("scalar context binding input"))?;
+            emit_load_allocated_tagged(ops, frame, context, 13, 0)?;
+            let parent = view.context_layout.parent_byte;
+            for _ in 0..depth {
+                emit_context_word_load(ops, 13, 13, parent)?;
+            }
+            emit_load_u64(ops, 16, u64::from(context_slot_offset(view, slot)?));
+            dynasm!(ops
+                ; .arch aarch64
+                ; mov X(owner), x13
+                ; add X(storage), x13, x16
+                ; ldr x9, [X(storage)]
+            );
+            emit_load_u64(ops, 11, VALUE_HOLE);
+            dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
+        }
         MachineBindingTarget::GlobalThis => {
             if view.cage_base == 0 {
                 return Err(Unsupported::OperandShape("scalar global-this binding cage"));
@@ -773,59 +772,11 @@ fn emit_binding_guard(
                 view.cage_base as u64,
                 RelocationTarget::GcCageBase,
             );
-            emit_load_u64(ops, 16, u64::from(upvalue_value_byte));
             dynasm!(ops
                 ; .arch aarch64
                 ; add X(owner), x13, x12
                 ; mov X(storage), x14
             );
-        }
-        MachineBindingTarget::Upvalue { index }
-        | MachineBindingTarget::ClosureUpvalue { index } => {
-            if view.cage_base == 0 || index > 1023 || upvalue_value_byte > 4095 {
-                return Err(Unsupported::OperandShape("scalar upvalue binding target"));
-            }
-            // The verifier bounds `index` by the owning function's exact
-            // spine, and every activation of that function publishes a
-            // complete spine of live cells: inherited cells come from the
-            // closure, own cells are allocated before entry and replaced only
-            // by fresh cells. Only the TDZ state of the binding is dynamic.
-            if matches!(target, MachineBindingTarget::ClosureUpvalue { .. }) {
-                // The call guard proved this tagged value is the inlined
-                // callee's closure; a heap-cell Value carries its full
-                // address, and the call header holds the upvalue spine.
-                emit_load_allocated_tagged(ops, frame, locations[3], 10, 0)?;
-                let base_byte = view.closure_call_layout.upvalue_base_byte;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x9, [x10, base_byte]
-                    ; ldr w9, [x9, index * 4]
-                );
-            } else {
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
-                    ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                    ; ldr w9, [x9, index * 4]
-                );
-            }
-            emit_load_symbolic_u64(
-                ops,
-                relocations,
-                13,
-                view.cage_base as u64,
-                RelocationTarget::GcCageBase,
-            );
-            dynasm!(ops
-                ; .arch aarch64
-                ; add X(owner), x13, x9
-                ; add XSP(storage), XSP(owner), upvalue_value_byte
-            );
-            if binding_requires_live_cell(semantics) {
-                dynasm!(ops ; .arch aarch64 ; ldr x9, [X(storage)]);
-                emit_load_u64(ops, 11, VALUE_HOLE);
-                dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
-            }
         }
         MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalLexical {
             cell_offset,
@@ -852,7 +803,7 @@ fn emit_binding_guard(
                     byte_pc,
                 },
             );
-            emit_load_u64(ops, 16, u64::from(upvalue_value_byte));
+            emit_load_u64(ops, 16, u64::from(global_lexical_value_byte));
             dynasm!(ops
                 ; .arch aarch64
                 ; mov X(owner), x13
@@ -970,14 +921,14 @@ fn emit_binding_hit(
                 BindingRead::Exists { .. } => {
                     emit_load_u64(ops, 9, Value::boolean(true).to_bits());
                 }
-                BindingRead::Global { .. } | BindingRead::Upvalue { .. } => {
+                BindingRead::Global { .. } | BindingRead::ContextSlot { .. } => {
                     emit_load_allocated_integer(ops, frame, locations[1], 13, 0)?;
                     dynasm!(ops ; .arch aarch64 ; ldr x9, [x13]);
                 }
-                BindingRead::Dynamic { .. }
-                | BindingRead::ShadowedUpvalue { .. }
-                | BindingRead::EvalBindingSeq { .. } => {
-                    return Err(Unsupported::OperandShape("scalar dynamic binding hit"));
+                BindingRead::LookupSlot { .. }
+                | BindingRead::LookupGlobal { .. }
+                | BindingRead::ResolveRef { .. } => {
+                    return Err(Unsupported::OperandShape("scalar context binding hit"));
                 }
             }
             emit_store_allocated_tagged(ops, frame, locations[2], 9, 0)?;
@@ -993,6 +944,57 @@ fn emit_binding_hit(
         BindingSemantics::Delete(_) => {
             return Err(Unsupported::OperandShape("scalar delete binding hit"));
         }
+    }
+    Ok(())
+}
+
+/// Largest scaled unsigned 64-bit `ldr`/`str` displacement.
+const MAX_SCALED_WORD_OFFSET: u32 = 32_760;
+
+/// Byte offset of context slot `slot` from the context's header address.
+fn context_slot_offset(view: &JitCompileSnapshot, slot: u16) -> Result<u32, Unsupported> {
+    view.context_layout
+        .slots_byte
+        .checked_add(u32::from(slot) * 8)
+        .ok_or(Unsupported::OperandShape("scalar context slot offset"))
+}
+
+/// `X(target) = [X(base) + offset]` for one aligned context or closure word.
+/// An offset past the scaled immediate uses `x16`, declared by every
+/// context-access clobber set.
+fn emit_context_word_load(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    target: u8,
+    base: u8,
+    offset: u32,
+) -> Result<(), Unsupported> {
+    if !offset.is_multiple_of(8) {
+        return Err(Unsupported::OperandShape("unaligned context word"));
+    }
+    if offset <= MAX_SCALED_WORD_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; ldr X(target), [X(base), offset]);
+    } else {
+        emit_load_u64(ops, 16, u64::from(offset));
+        dynasm!(ops ; .arch aarch64 ; ldr X(target), [X(base), x16]);
+    }
+    Ok(())
+}
+
+/// `[X(base) + offset] = X(source)` for one aligned context slot.
+fn emit_context_word_store(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    source: u8,
+    base: u8,
+    offset: u32,
+) -> Result<(), Unsupported> {
+    if !offset.is_multiple_of(8) {
+        return Err(Unsupported::OperandShape("unaligned context word"));
+    }
+    if offset <= MAX_SCALED_WORD_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; str X(source), [X(base), offset]);
+    } else {
+        emit_load_u64(ops, 16, u64::from(offset));
+        dynasm!(ops ; .arch aarch64 ; str X(source), [X(base), x16]);
     }
     Ok(())
 }
@@ -1017,7 +1019,6 @@ pub(super) fn emit(
     prepare_construct_entry: u64,
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
-    initialize_upvalues_entry: u64,
     string_concat_entry: u64,
     array_construct_entry: u64,
     number_rem_entry: u64,
@@ -1052,7 +1053,6 @@ pub(super) fn emit(
         prepare_construct_entry,
         derived_construct_result_entry,
         copy_spread_arguments_entry,
-        initialize_upvalues_entry,
         string_concat_entry,
         array_construct_entry,
         number_rem_entry,
@@ -1088,7 +1088,6 @@ pub(super) fn emit(
                 prepare_construct_entry,
                 derived_construct_result_entry,
                 copy_spread_arguments_entry,
-                initialize_upvalues_entry,
                 string_concat_entry,
                 array_construct_entry,
                 number_rem_entry,
@@ -1131,7 +1130,6 @@ fn emit_with_reach(
     prepare_construct_entry: u64,
     derived_construct_result_entry: u64,
     copy_spread_arguments_entry: u64,
-    initialize_upvalues_entry: u64,
     string_concat_entry: u64,
     array_construct_entry: u64,
     number_rem_entry: u64,
@@ -1190,25 +1188,11 @@ fn emit_with_reach(
         .iter()
         .map(|_| ops.new_dynamic_label())
         .collect::<Vec<_>>();
-    let mut osr_sites = Vec::new();
-    for (index, instruction) in sequence.instructions().iter().enumerate() {
-        let MachineOpcode::OsrEntry {
-            logical_pc,
-            ref inputs,
-        } = instruction.opcode
-        else {
-            continue;
-        };
-        if inputs.len() != instruction.operands.len() {
-            return Err(Unsupported::OperandShape("scalar OSR input arity"));
-        }
-        osr_sites.push(OsrSite {
-            instruction: MachineInstructionId(index as u32),
-            logical_pc,
-            inputs: inputs.clone(),
-            continuation: ops.new_dynamic_label(),
-        });
-    }
+    // OSR frame reads that miss their header representation leave through
+    // one side exit per read, emitted after the body.
+    let mut osr_bails = Vec::<(DynamicLabel, u32)>::new();
+    let mut osr_headers = BTreeSet::new();
+    let mut osr_regions = Vec::new();
     let has_backedge_poll = sequence
         .instructions()
         .iter()
@@ -1271,13 +1255,65 @@ fn emit_with_reach(
             .instruction_locations(id)
             .ok_or(Unsupported::OperandShape("scalar Machine IR locations"))?;
         match instruction.opcode {
-            MachineOpcode::OsrEntry { .. } => {
-                let site = osr_sites
-                    .iter()
-                    .find(|site| site.instruction == id)
-                    .ok_or(Unsupported::OperandShape("scalar OSR continuation"))?;
-                let continuation = site.continuation;
-                dynasm!(ops ; .arch aarch64 ; =>continuation);
+            MachineOpcode::OsrDispatch { ref logical_pcs } => {
+                // The prologue leaves the register base in x17 for the
+                // ordinary entry's parameter reads; the dispatch uses only
+                // x15 and x16.
+                let block = &sequence.blocks()[block_index];
+                let osr = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                    ; ldrb w15, [x16, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
+                    ; tst w15, u32::from(otter_vm::native_abi::NativeFrameFlags::OSR_ENTRY)
+                    ; b.ne =>osr
+                );
+                let ordinary = block_labels[block.successors[0].0 as usize];
+                dynasm!(ops ; .arch aarch64 ; b =>ordinary ; =>osr);
+                // The dispatch consumes the entry bit: the OSR block leaves an
+                // ordinary optimizing frame behind it.
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; and w15, w15, !u32::from(otter_vm::native_abi::NativeFrameFlags::OSR_ENTRY)
+                    ; strb w15, [x16, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
+                    ; ldr w15, [x16, NATIVE_FRAME_PC_OFFSET]
+                );
+                for (&logical_pc, successor) in logical_pcs.iter().zip(&block.successors[1..]) {
+                    let next = ops.new_dynamic_label();
+                    emit_load_u64(&mut ops, 16, u64::from(logical_pc));
+                    let target = block_labels[successor.0 as usize];
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp w15, w16
+                        ; b.ne =>next
+                        ; b =>target
+                        ; =>next
+                    );
+                    if !osr_headers.insert(logical_pc) {
+                        return Err(Unsupported::OperandShape("duplicate scalar OSR header"));
+                    }
+                }
+                // No other header can carry the entry bit.
+                dynasm!(ops ; .arch aarch64 ; b =>fatal);
+                continue;
+            }
+            MachineOpcode::OsrValue {
+                logical_pc,
+                frame_register,
+                value_type,
+            } => {
+                let start = ops.offset().0;
+                let bail = ops.new_dynamic_label();
+                emit_osr_value(
+                    &mut ops,
+                    frame,
+                    frame_register,
+                    value_type,
+                    locations[0],
+                    bail,
+                )?;
+                osr_bails.push((bail, logical_pc));
+                osr_regions.push((logical_pc, start, ops.offset().0));
             }
             MachineOpcode::EntryValue(parameter) => {
                 let destination = integer_register(locations[0])?;
@@ -1292,6 +1328,74 @@ fn emit_with_reach(
                     ; .arch aarch64
                     ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
                     ; ldr X(destination), [x16, NATIVE_FRAME_THIS_OFFSET]
+                );
+            }
+            MachineOpcode::EntryCallee => {
+                let destination = integer_register(locations[0])?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
+                    ; ldr X(destination), [x16, NATIVE_FRAME_SELF_OFFSET]
+                );
+            }
+            MachineOpcode::ContextLoad { field } => {
+                // The early input may share the late output's register:
+                // every path reads the input before its one output write.
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                match field {
+                    ContextField::ClosureContext => {
+                        let not_closure = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        emit_cell_test(&mut ops, source, 16, CellTest::IsNotCell, not_closure);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldrb w16, [X(source)]
+                            ; cmp w16, JS_CLOSURE_BODY_TYPE_TAG as u32
+                            ; b.ne =>not_closure
+                        );
+                        emit_context_word_load(
+                            &mut ops,
+                            destination,
+                            source,
+                            view.closure_call_layout.context_byte,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done ; =>not_closure);
+                        emit_load_u64(&mut ops, destination, VALUE_UNDEFINED);
+                        dynasm!(ops ; .arch aarch64 ; =>done);
+                    }
+                    ContextField::Parent => emit_context_word_load(
+                        &mut ops,
+                        destination,
+                        source,
+                        view.context_layout.parent_byte,
+                    )?,
+                    ContextField::Slot(slot) => emit_context_word_load(
+                        &mut ops,
+                        destination,
+                        source,
+                        context_slot_offset(view, slot)?,
+                    )?,
+                }
+            }
+            MachineOpcode::ContextStore { slot } => {
+                let context = integer_register(locations[0])?;
+                let value = integer_register(locations[1])?;
+                emit_context_word_store(
+                    &mut ops,
+                    value,
+                    context,
+                    context_slot_offset(view, slot)?,
+                )?;
+            }
+            MachineOpcode::TaggedIsNotHole => {
+                let source = integer_register(locations[0])?;
+                let destination = integer_register(locations[1])?;
+                emit_load_u64(&mut ops, 16, VALUE_HOLE);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp X(source), x16
+                    ; cset W(destination), ne
                 );
             }
             MachineOpcode::TryBindDerivedThis { byte_pc } => {
@@ -1385,7 +1489,9 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::BindingWriteBarrier => {
+            // A binding owner is a raw cell address and a context owner is
+            // the context value; both are the header address.
+            MachineOpcode::BindingWriteBarrier | MachineOpcode::ContextWriteBarrier => {
                 if locations.len() != 2 {
                     return Err(Unsupported::OperandShape("scalar binding write barrier"));
                 }
@@ -1404,11 +1510,7 @@ fn emit_with_reach(
                 emit_load_u64(&mut ops, integer_register(locations[0])?, bits);
             }
             MachineOpcode::GuardCallTarget {
-                guard:
-                    MachineCallGuard::Method {
-                        ref guard,
-                        rejects_eval_env,
-                    },
+                guard: MachineCallGuard::Method { ref guard },
             } => {
                 let start = ops.offset().0;
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
@@ -1421,7 +1523,6 @@ fn emit_with_reach(
                     9,
                     9,
                     None,
-                    !rejects_eval_env,
                     miss,
                 )?;
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
@@ -1432,19 +1533,12 @@ fn emit_with_reach(
                     MachineCallGuard::Plain {
                         function_id,
                         this_mode,
-                        rejects_eval_env,
                     },
             } => {
                 let start = ops.offset().0;
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
-                crate::arm64::inline_guard::emit_inline_identity(
-                    &mut ops,
-                    view,
-                    function_id,
-                    rejects_eval_env,
-                    miss,
-                );
+                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
                 crate::arm64::inline_guard::emit_inline_this(
                     &mut ops,
                     view,
@@ -1457,11 +1551,7 @@ fn emit_with_reach(
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
             MachineOpcode::GuardCallTarget {
-                guard:
-                    MachineCallGuard::Construct {
-                        function_id,
-                        rejects_eval_env,
-                    },
+                guard: MachineCallGuard::Construct { function_id },
             } => {
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                 let callable = ops.new_dynamic_label();
@@ -1479,13 +1569,7 @@ fn emit_with_reach(
                     ; b.ne =>callable
                     ; ldr x9, [x9, view.class_constructor_layout.callable_byte]
                     ; =>callable);
-                crate::arm64::inline_guard::emit_inline_identity(
-                    &mut ops,
-                    view,
-                    function_id,
-                    rejects_eval_env,
-                    miss,
-                );
+                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
             }
             MachineOpcode::ResolveCallThis { this_mode } => {
@@ -3305,6 +3389,15 @@ fn emit_with_reach(
                         &deopt_targets,
                     )?;
                     let final_method_guard_miss = ops.new_dynamic_label();
+                    if *kind == DirectCallKind::Forward {
+                        emit_publish_forwarded_formals_context(
+                            &mut ops,
+                            view,
+                            frame,
+                            locations,
+                            descriptor.arguments.len(),
+                        )?;
+                    }
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_publish_machine_roots(&mut ops, frame, site)?;
                     let packet = super::value_packet_frame(sequence)?;
@@ -3428,7 +3521,6 @@ fn emit_with_reach(
                                     9,
                                     17,
                                     None,
-                                    true,
                                     method_guard_miss,
                                 )?;
                                 structural_regions.push((
@@ -3484,7 +3576,6 @@ fn emit_with_reach(
                             prepare_construct_entry,
                             derived_construct_result_entry,
                             copy_spread_arguments_entry,
-                            initialize_upvalues_entry,
                             0,
                             None,
                             if *kind == DirectCallKind::CallWithThis {
@@ -3756,7 +3847,7 @@ fn emit_with_reach(
                                 frame,
                                 locations[result_index],
                                 0,
-                                allocation.edits(),
+                                allocation,
                                 id,
                                 block_labels[target.0 as usize],
                             )?;
@@ -3892,7 +3983,7 @@ fn emit_with_reach(
                             id,
                             descriptor,
                             locations,
-                            allocation.edits(),
+                            allocation,
                             safepoints,
                             &block_labels,
                             throw_value,
@@ -4049,6 +4140,26 @@ fn emit_with_reach(
                                 return Err(Unsupported::OperandShape("scalar string concat call"));
                             }
                             (*target, string_concat_entry, 3, true)
+                        }
+                        CallTarget::RuntimeStub(target)
+                            if *target == STUB_CREATE_CONTEXT_ALLOC
+                                || *target == STUB_COPY_CONTEXT_ALLOC =>
+                        {
+                            if locations.len() < 4
+                                || integer_register(locations[0])? != 2
+                                || integer_register(locations[1])? != 3
+                                || integer_register(locations[2])? != 4
+                            {
+                                return Err(Unsupported::OperandShape(
+                                    "scalar context allocation call",
+                                ));
+                            }
+                            let entry = otter_vm::runtime_stubs::alloc_value_stub_by_id(target.id)
+                                .and_then(|stub| stub.entry_addr())
+                                .ok_or(Unsupported::OperandShape(
+                                    "scalar context allocation entry",
+                                ))?;
+                            (*target, entry as u64, 3, true)
                         }
                         CallTarget::RuntimeStub(target)
                             if *target == STUB_ARRAY_CONSTRUCT_ALLOC =>
@@ -4305,60 +4416,19 @@ fn emit_with_reach(
         emit_epilogue(&mut ops, frame, saved);
     }
 
-    let mut osr_entries = BTreeMap::new();
-    let mut osr_regions = Vec::with_capacity(osr_sites.len());
-    for site in &osr_sites {
-        let offset = ops.offset().0;
-        let representation_bail = ops.new_dynamic_label();
-        emit_prologue(&mut ops, frame, saved);
-        if has_backedge_poll {
-            dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
-        }
-        let locations = allocation
-            .instruction_locations(site.instruction)
-            .ok_or(Unsupported::OperandShape("scalar OSR allocation coverage"))?;
-        for ((input, &location), operand) in site
-            .inputs
-            .iter()
-            .zip(locations)
-            .zip(&sequence.instructions()[site.instruction.0 as usize].operands)
-        {
-            emit_osr_materialization(
-                &mut ops,
-                frame,
-                *input,
-                sequence.representations()[operand.value.0 as usize],
-                location,
-                representation_bail,
-            )?;
-        }
-        let continuation = site.continuation;
-        dynasm!(ops
-            ; .arch aarch64
-            ; b =>continuation
-            ; =>representation_bail
-        );
-        emit_load_u64(&mut ops, 16, u64::from(site.logical_pc));
+    for (bail, logical_pc) in osr_bails {
+        dynasm!(ops ; .arch aarch64 ; =>bail);
+        emit_load_u64(&mut ops, 16, u64::from(logical_pc));
         dynasm!(ops
             ; .arch aarch64
             ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
             ; str w16, [x17, NATIVE_FRAME_PC_OFFSET]
-            ; mov w0, w16
         );
-        let osr_bail = SideExit::new(
-            site.logical_pc,
-            ExitReason::TypeMismatch,
-            ExitAction::Recompile,
-        )
-        .to_bits();
+        let osr_bail =
+            SideExit::new(logical_pc, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits();
         emit_load_u64(&mut ops, 0, osr_bail);
         dynasm!(ops ; .arch aarch64 ; movz x1, NativeResultStatus::SideExit as u32);
         emit_epilogue(&mut ops, frame, saved);
-        let end = ops.offset().0;
-        if osr_entries.insert(site.logical_pc, offset).is_some() {
-            return Err(Unsupported::OperandShape("duplicate scalar OSR logical PC"));
-        }
-        osr_regions.push((site.logical_pc, offset, end));
     }
 
     let buffer = crate::entry::finalize_assembler(ops)?;
@@ -4389,7 +4459,7 @@ fn emit_with_reach(
         code: CompiledCode::new(buffer, AssemblyOffset(0)),
         generated_stack_frame_bytes,
         relocations,
-        osr_entries,
+        osr_headers,
         osr_regions,
         structural_regions,
     })
@@ -4773,7 +4843,16 @@ fn emit_edits(
     point: AllocationPoint,
     frame: MachineFrameLayout,
 ) -> Result<(), Unsupported> {
-    for edit in super::super::regalloc::edits_at(edits, point) {
+    emit_edit_run(ops, super::super::regalloc::edits_at(edits, point), frame)
+}
+
+/// Emit one contiguous run of allocation edits in program order.
+fn emit_edit_run(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    run: &[AllocationEdit],
+    frame: MachineFrameLayout,
+) -> Result<(), Unsupported> {
+    for edit in run {
         if edit.from == edit.to {
             continue;
         }
@@ -4961,6 +5040,39 @@ fn emit_prologue(
     );
 }
 
+/// Store the forwarding function's parameter-scope context, the forward
+/// call's trailing argument, into its frame register. The native leaf copy
+/// and arguments-object materialization read the context-held mapped formals
+/// through that register, which Machine code does not otherwise keep current.
+/// The register window is traced, so the stored value stays valid across any
+/// collection the call performs.
+fn emit_publish_forwarded_formals_context(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    view: &JitCompileSnapshot,
+    frame: MachineFrameLayout,
+    locations: &[AllocatedLocation],
+    argument_count: usize,
+) -> Result<(), Unsupported> {
+    let Some(frame_register) = view.code_block.forwarded_formals_context() else {
+        return Ok(());
+    };
+    let context = *argument_count
+        .checked_sub(1)
+        .and_then(|index| locations.get(index))
+        .ok_or(Unsupported::OperandShape(
+            "forwarded formals context operand",
+        ))?;
+    emit_load_allocated_integer(ops, frame, context, 16, 0)?;
+    emit_load_u64(ops, 15, u64::from(frame_register) * 8);
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
+        ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; str x16, [x17, x15]
+    );
+    Ok(())
+}
+
 fn emit_load_osr_source(ops: &mut dynasmrt::aarch64::Assembler, frame_register: u16) {
     let offset = u32::from(frame_register) * 8;
     dynasm!(ops
@@ -5059,27 +5171,18 @@ fn emit_store_osr_float(
     Ok(())
 }
 
-fn emit_osr_materialization(
+/// Read interpreter frame register `frame_register` into `location` as
+/// `value_type`, branching to `bail` when the tagged value lies outside it.
+fn emit_osr_value(
     ops: &mut dynasmrt::aarch64::Assembler,
     frame: MachineFrameLayout,
-    input: MachineOsrInput,
-    representation: MachineRepresentation,
+    frame_register: u16,
+    value_type: MachineOsrType,
     location: AllocatedLocation,
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let expected = match input.value_type {
-        MachineOsrType::Tagged => MachineRepresentation::Tagged,
-        MachineOsrType::Int32 => MachineRepresentation::Int32,
-        MachineOsrType::Uint32 => MachineRepresentation::Uint32,
-        MachineOsrType::Float64 => MachineRepresentation::Float64,
-        MachineOsrType::Boolean => MachineRepresentation::Boolean,
-    };
-    if representation != expected {
-        return Err(Unsupported::OperandShape("scalar OSR representation"));
-    }
-
-    emit_load_osr_source(ops, input.frame_register);
-    match input.value_type {
+    emit_load_osr_source(ops, frame_register);
+    match value_type {
         MachineOsrType::Tagged => emit_store_osr_tagged(ops, frame, location),
         MachineOsrType::Int32 => {
             dynasm!(ops
@@ -5089,7 +5192,7 @@ fn emit_osr_materialization(
                 ; cmp x16, x17
                 ; b.ne =>bail
             );
-            emit_load_osr_source(ops, input.frame_register);
+            emit_load_osr_source(ops, frame_register);
             dynasm!(ops ; .arch aarch64 ; mov w16, w16);
             emit_store_osr_integer(ops, frame, location)
         }
@@ -5644,7 +5747,6 @@ mod tests {
                 1,
                 1,
                 1,
-                1,
                 &mut load_ic_cells,
                 &mut store_ic_cells,
                 3,
@@ -5738,7 +5840,6 @@ mod tests {
             1,
             1,
             1,
-            1,
             &mut load_ic_cells,
             &mut store_ic_cells,
             4,
@@ -5791,49 +5892,6 @@ mod tests {
         ] {
             assert_eq!(checked_element_index_model(rejected), None, "{rejected}");
         }
-    }
-
-    #[test]
-    fn upvalue_binding_guard_materializes_the_value_field_offset() {
-        let sequence = committed_runtime_sequence(0);
-        let allocation = sequence
-            .allocate(&TargetSpec::aarch64())
-            .expect("fixture allocation");
-        let frame = frame_layout(&allocation, 1).expect("fixture frame");
-        let mut view = JitCompileSnapshot::without_feedback(19, 0, 1, Vec::new());
-        view.cage_base = 0x1000;
-        view.upvalue_value_byte = 0x38;
-        let mut assembler = dynasmrt::aarch64::Assembler::new().expect("binding assembler");
-        let mut relocations = RelocationCapture::default();
-        emit_binding_guard(
-            &mut assembler,
-            &mut relocations,
-            &view,
-            frame,
-            BindingSemantics::Read(BindingRead::Upvalue {
-                destination: 0,
-                index: 1,
-            }),
-            MachineBindingTarget::Upvalue { index: 3 },
-            24,
-            &[
-                AllocatedLocation::Register(PhysicalRegister::integer(0)),
-                AllocatedLocation::Register(PhysicalRegister::integer(1)),
-                AllocatedLocation::Register(PhysicalRegister::integer(2)),
-            ],
-        )
-        .expect("upvalue binding guard emission");
-        let code = assembler.finalize().expect("binding guard code");
-
-        let mut expected = dynasmrt::aarch64::Assembler::new().expect("expected assembler");
-        dynasmrt::dynasm!(expected ; .arch aarch64 ; add x2, x1, 0x38);
-        let expected = expected.finalize().expect("offset add code");
-        assert!(
-            code.as_ref()
-                .windows(expected.len())
-                .any(|window| window == expected.as_ref()),
-            "generated upvalue storage address must materialize upvalue_value_byte"
-        );
     }
 
     #[test]

@@ -238,6 +238,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             &self.transitions,
             request.debug.events_enabled(),
             artifact_request,
+            request.osr_pc,
         );
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let compiled = {
@@ -246,6 +247,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 &request.snapshot,
                 request.code_object_id,
                 &self.transitions,
+                request.osr_pc,
             )
             .map(|code| artifact::NativeCompileOutput {
                 code,

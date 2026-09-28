@@ -202,8 +202,7 @@ pub unsafe fn scavenge(
             .from_pages()
             .iter()
             .filter(|page| {
-                page.header().allocated_bytes != 0
-                    && page.header().age_mark > PAGE_HEADER_SIZE
+                page.header().allocated_bytes != 0 && page.header().age_mark > PAGE_HEADER_SIZE
             })
             .count()
     } else {

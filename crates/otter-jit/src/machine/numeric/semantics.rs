@@ -30,12 +30,18 @@ use otter_vm::{
     native_abi::{ExitReason, ObjectProtocolValueOp, ScalarValueOp},
 };
 
+// Snapshot-selected paths classify exceptions, allocation, collection,
+// reentry and safepoints exactly. Heap reads and writes stay conservative:
+// Machine memory proofs come from its own alias classes, not from these rows.
+
 const EFFECTS_NONE: OpcodeEffects = OpcodeEffects {
     may_throw: false,
     may_allocate: false,
     may_trigger_gc: false,
     may_reenter_javascript: false,
     safepoint_required: false,
+    may_read_heap: true,
+    may_write_heap: true,
 };
 
 const EFFECTS_ALLOCATING: OpcodeEffects = OpcodeEffects {
@@ -44,6 +50,8 @@ const EFFECTS_ALLOCATING: OpcodeEffects = OpcodeEffects {
     may_trigger_gc: true,
     may_reenter_javascript: false,
     safepoint_required: true,
+    may_read_heap: true,
+    may_write_heap: true,
 };
 
 const EFFECTS_COMMITTED_RUNTIME: OpcodeEffects = OpcodeEffects {
@@ -52,6 +60,8 @@ const EFFECTS_COMMITTED_RUNTIME: OpcodeEffects = OpcodeEffects {
     may_trigger_gc: true,
     may_reenter_javascript: true,
     safepoint_required: true,
+    may_read_heap: true,
+    may_write_heap: true,
 };
 
 /// Typed semantic family completed by the fixed boxed-value runtime boundary.
@@ -194,9 +204,14 @@ fn classify_instruction(
             {
                 EFFECTS_NONE
             }
-            Op::ArrayConstruct | Op::NewObject | Op::NewArray | Op::NewObjectLiteral => {
-                EFFECTS_ALLOCATING
-            }
+            // A refused context allocation exits before any effect; the
+            // interpreter re-executes it and owns the heap-limit error.
+            Op::ArrayConstruct
+            | Op::NewObject
+            | Op::NewArray
+            | Op::NewObjectLiteral
+            | Op::CreateContext
+            | Op::CopyContext => EFFECTS_ALLOCATING,
             Op::Add
                 if instruction
                     .arith_feedback()

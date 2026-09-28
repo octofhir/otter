@@ -7,7 +7,7 @@
 //! - [`load_super_method`] - load a method from the parent prototype.
 //!
 //! # Invariants
-//! - Super operations resolve through the synthetic class captures installed by the parent class lowering.
+//! - Super operations resolve through the class-scope slots installed by the parent class lowering.
 //! - Calls preserve the current frame's `this` binding.
 //!
 //! # See also
@@ -32,9 +32,7 @@ pub(crate) fn compile_super_call(
     // through the class's LIVE [[GetPrototypeOf]] (setPrototypeOf
     // between definition and `new` is observable), BEFORE the
     // argument list evaluates; IsConstructor is checked after.
-    let super_ctor = if cx.lookup_binding(crate::class::CLASS_SELF_NAME).is_some()
-        || cx.resolve_capture(crate::class::CLASS_SELF_NAME).is_some()
-    {
+    let super_ctor = if cx.resolve_name(crate::class::CLASS_SELF_NAME).is_some() {
         let class_reg = load_synthetic_capture(cx, crate::class::CLASS_SELF_NAME, span)?;
         let proto_reg = cx.alloc_scratch();
         cx.emit(
@@ -71,9 +69,10 @@ pub(crate) fn compile_super_call(
         cx.emit(Op::SuperConstruct, operands, span);
     }
     // §13.3.7.3 steps 7–9 — bind the derived constructor's `this` to
-    // the constructed value. The result of the `super(...)`
-    // expression is this same bound `this`.
-    cx.emit(Op::BindThisValue, [Operand::Register(dst)], span);
+    // the constructed value (its `DerivedThis` slot when an arrow or eval
+    // observes it). The result of the `super(...)` expression is this
+    // same bound `this`.
+    cx.emit_bind_this(dst, span);
     Ok(dst)
 }
 
@@ -86,7 +85,7 @@ pub(crate) fn compile_super_method_call(
 ) -> Result<u16, CompileError> {
     let method_reg = load_super_method(cx, method_name, span)?;
     let this_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+    cx.emit_load_this(this_reg, span);
     let has_spread = arguments
         .iter()
         .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
@@ -146,7 +145,7 @@ pub(crate) fn compile_super_computed_method_call(
         span,
     );
     let this_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+    cx.emit_load_this(this_reg, span);
     let has_spread = arguments
         .iter()
         .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));

@@ -455,6 +455,7 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         | N::BlockParameter(_)
         | N::TaggedConstant(_)
         | N::This
+        | N::Callee
         | N::StringConstantCell { .. }
         | N::BindingGuardedRead { .. }
         | N::ElementUnseenExit { .. }
@@ -462,6 +463,12 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         | N::IntegerConstant(_)
         | N::BooleanConstant(_)
         | N::Constant(_) => {}
+        N::ClosureContext(value)
+        | N::ContextParent(value)
+        | N::ContextSlotLoad { context: value, .. }
+        | N::ContextHoleGuard { value, .. }
+        | N::ContextAllocation { input: value, .. } => inputs.push(value),
+        N::ContextSlotStore { context, value, .. } => inputs.extend([context, value]),
         N::TaggedToNumber(value)
         | N::TaggedToInt32(value)
         | N::ClassSuperConstructor(value)
@@ -677,6 +684,15 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         | N::BooleanNot(value)
         | N::Neg(value) => replacement(value),
         N::ArrayConstruct { length, .. } => replacement(length),
+        N::ClosureContext(value)
+        | N::ContextParent(value)
+        | N::ContextSlotLoad { context: value, .. }
+        | N::ContextHoleGuard { value, .. }
+        | N::ContextAllocation { input: value, .. } => replacement(value),
+        N::ContextSlotStore { context, value, .. } => {
+            replacement(context);
+            replacement(value);
+        }
         N::TaggedNullishEqual { value, .. } => replacement(value),
         N::InlineMethodGuard { source, .. }
         | N::InlineConstructGuard { source, .. }
@@ -791,6 +807,7 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         | N::BlockParameter(_)
         | N::TaggedConstant(_)
         | N::This
+        | N::Callee
         | N::StringConstantCell { .. }
         | N::BindingGuardedRead { .. }
         | N::ElementUnseenExit { .. }

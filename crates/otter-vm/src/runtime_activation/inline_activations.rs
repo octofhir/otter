@@ -6,15 +6,15 @@
 //!
 //! # Invariants
 //! - The already-published caller is retained, never copied or replayed.
-//! - Register recipes are boxed before entry. Host frame/spine allocation cannot
+//! - Register recipes are boxed before entry. Host frame allocation cannot
 //!   collect; every native frame is published before the semantic operation.
 //! - Generated hits need no activation records. Only committed cold reentry uses
 //!   this scope, and the operation must normalize JS exceptions before it exits.
 //! - Every publication is removed on normal return, failure, or Rust unwinding.
-//! - Captured handles, this/SELF and the closure's eval environment remain
-//!   precise moving roots. Direct eval, fresh capture cells, and
-//!   incoming-arguments bodies require richer entry recipes and are rejected
-//!   before effects.
+//! - this/SELF remain precise moving roots; each inlined activation reaches
+//!   its incoming context through its exact SELF closure, and its own
+//!   contexts through its boxed registers. Direct eval and incoming-arguments
+//!   bodies require richer entry recipes and are rejected before effects.
 //!
 //! # See also
 //! - `crate::native_stack_snapshot` observes the same native activation chain.
@@ -93,7 +93,6 @@ impl RuntimeCall<'_> {
             });
         }
         let mut natives = Vec::with_capacity(frames.len());
-        let mut spines = Vec::with_capacity(frames.len());
         // SAFETY: RuntimeCall retains this validated, already-published caller.
         let mut parent_registers =
             usize::from(unsafe { self.frame.as_ref() }.header.register_count);
@@ -107,7 +106,6 @@ impl RuntimeCall<'_> {
                 .ok_or(VmError::InvalidOperand)?;
             if recipe.slots.len() != usize::from(function.register_count)
                 || usize::from(entry.return_register) >= parent_registers
-                || function.own_upvalue_count != 0
                 || function.needs_arguments
                 || function.contains_direct_eval
                 || (!entry.new_target.is_undefined()
@@ -121,23 +119,12 @@ impl RuntimeCall<'_> {
                 .find(|&index| function.instruction_byte_pc(index) == Some(recipe.byte_pc))
                 .and_then(|index| u32::try_from(index).ok())
                 .ok_or(VmError::InvalidOperand)?;
-            let (upvalues, eval_env) = if let Some(closure) =
-                entry.closure.as_closure(&vm.gc_heap)
-            {
+            if let Some(closure) = entry.closure.as_closure(&vm.gc_heap) {
                 let header = closure.call_header(&vm.gc_heap);
                 if closure.function_id() != recipe.function_id || header.requires_runtime_setup() {
                     return Err(VmError::InvalidOperand);
                 }
-                (
-                    closure.upvalues_snapshot(&vm.gc_heap).into_boxed_slice(),
-                    closure.eval_env(&vm.gc_heap),
-                )
-            } else if entry.closure.as_function_id() == Some(recipe.function_id) {
-                (Box::default(), None)
-            } else {
-                return Err(VmError::InvalidOperand);
-            };
-            if upvalues.len() != usize::from(function.inherited_upvalue_count) {
+            } else if entry.closure.as_function_id() != Some(recipe.function_id) {
                 return Err(VmError::InvalidOperand);
             }
             let mut native = NativeFrame::new(
@@ -151,13 +138,10 @@ impl RuntimeCall<'_> {
                 entry.this,
             );
             native.set_new_target(entry.new_target);
-            native.set_eval_env(eval_env);
             if !entry.new_target.is_undefined() && function.is_derived_constructor {
                 native.set_derived_constructor();
             }
             native.set_stack_registers();
-            native.set_upvalue_window(upvalues.as_ptr() as u64, upvalues.len() as u32);
-            spines.push(upvalues);
             natives.push(native);
             parent_registers = recipe.slots.len();
         }
@@ -169,8 +153,8 @@ impl RuntimeCall<'_> {
             count: frames.len(),
         };
         for native in &mut natives {
-            // SAFETY: vectors are fully built; frames, boxed slots and spines
-            // stay stationary until the lexical publication is dropped.
+            // SAFETY: vectors are fully built; frames and boxed slots stay
+            // stationary until the lexical publication is dropped.
             unsafe { vm.jit_push_native_frame(native) }?;
         }
         let inner_context = context

@@ -1,21 +1,62 @@
-//! Per-function bytecode emission state and helper methods.
+//! Per-function bytecode emission state: registers, scopes, contexts, and
+//! instruction emission.
+//!
+//! A function's bindings live in registers or in context slots. Each
+//! compile-time [`Scope`] owns a context once it declares its first slot (or
+//! is forced to anchor a sloppy direct eval's extension); the context is a
+//! register filled by `CreateContext` whose parent is the innermost enclosing
+//! context of the same function, or the function's closure context.
 //!
 //! # Contents
-//! - instruction emission
-//! - constant interning
-//! - scope and capture helpers
-//! - jump patching
+//! - [`FunctionContext`] — per-function emission state (its scope entry,
+//!   context creation, and binding declaration live in `scope`).
+//! - closure-context operands: patched to a dedicated register filled by a
+//!   prologue `LoadClosureContext` at finalization
+//! - constant interning and jump patching
+//! - [`FinishedCode`] — the finalized wordcode, spans, and scope table
 //!
 //! # Invariants
 //! - Instruction spans are emitted alongside bytecode positions.
+//! - A context is created only for the innermost scope, so its parent chain
+//!   is fixed at creation and matches every later static depth computation.
 //! - Plain uncaptured formals may bind their incoming ABI register directly;
 //!   all later scratch allocation starts above the reserved argument window.
 //! - Storing a value into its existing register is a bytecode no-op.
+//! - A derived constructor whose `this` lives in a `DerivedThis` slot
+//!   completes only through `ReturnDerived`: every return emitted into such a
+//!   frame is rewritten at emission.
+//! - The closure-context register is chosen at finalization above every other
+//!   register, so no temporary ever aliases it.
 //!
 //! # See also
-//! - `compiler` for the context stack
+//! - `scope` for scope and binding records.
+//! - `compiler` for cross-frame resolution.
 
+use crate::scope::{CtxReg, ScopeContext};
 use crate::*;
+use otter_bytecode::{ContextCoord, ScopeDescriptor};
+
+/// The `DerivedThis` slot of a derived constructor frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DerivedThisSlot {
+    /// Register holding the parameter-scope context that owns the slot.
+    pub(crate) ctx: u16,
+    /// Slot index.
+    pub(crate) slot: u16,
+}
+
+/// Finalized output of one function body.
+#[derive(Debug)]
+pub(crate) struct FinishedCode {
+    pub(crate) code: otter_bytecode::FunctionCode,
+    pub(crate) spans: Vec<SpanEntry>,
+    pub(crate) scratch: u16,
+    pub(crate) scopes: Vec<ScopeDescriptor>,
+    /// The body reads its closure context (`LoadClosureContext` prologue).
+    pub(crate) uses_closure_context: bool,
+    pub(crate) number_hint_sites: Vec<u32>,
+    pub(crate) class_hint_sites: Vec<(u32, u32)>,
+}
 
 /// Per-function compilation context.
 #[derive(Debug)]
@@ -24,9 +65,28 @@ pub(crate) struct FunctionContext {
     pub(crate) code: FunctionCodeBuilder,
     pub(crate) spans: Vec<SpanEntry>,
     pub(crate) scratch: u16,
-    /// Stack of lexical scopes. Index 0 is the function-body
-    /// scope.
+    /// Stack of lexical scopes, outermost first.
     pub(crate) scopes: Vec<Scope>,
+    /// Index into [`Self::scopes`] of the function's VariableEnvironment
+    /// scope (where hoisted `var` and function declarations live).
+    pub(crate) var_scope: usize,
+    /// Scope descriptors of every context this function creates, indexed
+    /// by `CreateContext`'s scope operand.
+    pub(crate) scope_descriptors: Vec<ScopeDescriptor>,
+    /// Operand positions `(pc, operand index)` that name the closure
+    /// context; patched to one dedicated register at finalization.
+    pub(crate) closure_ctx_patches: Vec<(u32, usize)>,
+    /// The derived-constructor `this` slot, when this frame keeps `this`
+    /// in its parameter-scope context.
+    pub(crate) derived_this: Option<DerivedThisSlot>,
+    /// Register holding the context of the mapped formals a sloppy
+    /// arguments object aliases, named by `CallForwardArguments`.
+    pub(crate) mapped_arguments_ctx: Option<u16>,
+    /// The function's closure context is statically `undefined`: a script
+    /// `<main>`, an indirect eval `<main>`, or a function created without
+    /// a context. A closure-context operand then reads a register holding
+    /// `undefined` instead of loading the closure context.
+    pub(crate) closure_context_empty: bool,
     /// ECMAScript strictness for the function currently being
     /// lowered. This is compile-time metadata stored on the
     /// resulting bytecode function and also drives early errors.
@@ -36,178 +96,97 @@ pub(crate) struct FunctionContext {
     /// EvalDeclarationInstantiation `var arguments` early error
     /// (§19.2.1.3) for direct eval call sites inside the body.
     pub(crate) is_arrow: bool,
+    /// `true` for a direct-eval `<main>` whose `this` is the caller's
+    /// derived-constructor `DerivedThis` slot (the eval may call
+    /// `super()`): `this` resolves through the caller chain like an arrow.
+    pub(crate) eval_this_from_chain: bool,
     /// The frame carries a [[HomeObject]] — MethodDefinition bodies,
     /// class constructors, and static blocks. `super.x` inside a
     /// direct eval is legal only when the innermost non-arrow frame
-    /// has one (§19.2.1.1); a plain function nested in a method does
-    /// not, even though the capture chain could still reach the
-    /// home-object cell.
+    /// has one (§19.2.1.1).
     pub(crate) has_home_object: bool,
     /// The frame is a DERIVED class constructor — `super()` inside a
     /// direct eval is legal only when the innermost non-arrow frame
     /// is one (§19.2.1.1 direct-eval SuperCall).
     pub(crate) is_derived_ctor: bool,
     /// `true` when `super.x` in this context resolves its
-    /// [[HomeObject]] through the class STATICS side
-    /// (`__class_static_home`): static methods / accessors, static
-    /// blocks, and static field initializers. Arrows inherit the
-    /// flag lexically from their enclosing context.
+    /// [[HomeObject]] through the class STATICS side: static methods /
+    /// accessors, static blocks, and static field initializers. Arrows
+    /// inherit the flag lexically from their enclosing context.
     pub(crate) super_home_static: bool,
     /// `true` while formal-parameter defaults of this function are
     /// being lowered. A direct eval in that window var-declaring
     /// `arguments` is an early SyntaxError when [`Self::binds_arguments`]
-    /// holds (§19.2.1.3); after parameter instantiation the binding is
-    /// initialized and the same eval body is legal.
+    /// holds (§19.2.1.3).
     pub(crate) in_param_init: bool,
     /// `true` when this function will have an `arguments` binding in
-    /// its variable environment: every non-arrow function, and arrows
-    /// only when a parameter / body `var` / body lexical / body
-    /// function declaration introduces the name.
+    /// its variable environment.
     pub(crate) binds_arguments: bool,
     /// `true` when every `arguments` reference in this body is the
-    /// forwarded list of `<callee>.apply(<this>, arguments)`. The prologue
-    /// then materializes no arguments object; each such call lowers to
-    /// `Op::CallForwardArguments`, which forwards the activation's actual
-    /// arguments directly and builds the object only for a non-intrinsic
-    /// `apply`.
+    /// forwarded list of `<callee>.apply(<this>, arguments)`.
     pub(crate) arguments_forward_only: bool,
     /// `true` when the compilation unit reads a `.arguments` property
-    /// somewhere, so a sloppy ordinary function's arguments object may be
-    /// observed through the legacy `fn.arguments` accessor and has to be
-    /// materialized even when the body never names it. Inherited by every
-    /// nested function.
+    /// somewhere. Inherited by every nested function.
     pub(crate) dot_arguments_observed: bool,
-    /// Canonical source URL inherited by nested functions. Dynamic
-    /// import uses this as the referrer when it runs inside a
-    /// function body rather than at top level.
+    /// Canonical source URL inherited by nested functions.
     pub(crate) module_url: String,
     pub(crate) is_async_generator: bool,
     /// Stack of enclosing loops; the innermost is on top.
     pub(crate) loops: Vec<LoopFrame>,
-    /// Count of active `try` handlers (`EnterTry` not yet `LeaveTry`'d)
-    /// at the current compile point. Mirrors the runtime frame
-    /// handler-stack depth so `break`/`continue` can pass a `floor` to
-    /// [`otter_bytecode::Op::JumpViaFinally`].
+    /// Count of active `try` handlers at the current compile point.
     pub(crate) active_handlers: u32,
-    /// Subset of [`Self::active_handlers`] that carry a `finally`
-    /// block. `break`/`continue` only need the finally-routing opcode
-    /// when this exceeds the target loop's recorded floor.
+    /// Subset of [`Self::active_handlers`] that carry a `finally` block.
     pub(crate) active_finally: u32,
     /// Label deposited by the immediately-enclosing
     /// `LabeledStatement` waiting to be consumed by the next pushed
-    /// loop / switch frame. See [`compile_labeled_statement`].
+    /// loop / switch frame.
     pub(crate) pending_label: Option<String>,
-    /// Names that the entry-point pre-pass already compiled +
-    /// stored as hoisted function declarations. The
-    /// `Statement::FunctionDeclaration` arm checks this set and
-    /// skips the source-position emission so the function isn't
-    /// recompiled and its closure isn't re-stored.
-    /// <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
+    /// Names that a scope-entry pre-pass already compiled + stored as
+    /// hoisted function declarations.
     pub(crate) hoisted_function_names: HashSet<String>,
     /// §B.3.3 — block-level function names receiving the sloppy-mode
-    /// var-scope extension, mapped to the variable-scope storage the
+    /// var-scope extension, mapped to the variable-scope target the
     /// declaration's source position syncs into. The `bool` marks
     /// global-script bindings that also mirror via `DefineGlobalVar`.
-    pub(crate) annex_b_var_storages:
-        std::collections::HashMap<String, (Option<crate::scope::BindingStorage>, bool)>,
+    pub(crate) annex_b_var_targets:
+        std::collections::HashMap<String, (Option<crate::compiler::VarTarget>, bool)>,
     /// Source span starts of block-level function declarations whose
-    /// own path is Annex B eligible — only these sync the var-scope
-    /// binding at their source position (§B.3.3.1 step 1.a.ii.1).
+    /// own path is Annex B eligible.
     pub(crate) annex_b_eligible_spans: std::collections::HashSet<u32>,
-    /// Per-`Op::Eval`-site caller-scope refinements: block-scope
-    /// bindings visible at each direct-eval call site, in emission
-    /// order. Becomes [`otter_bytecode::Function::eval_sites`].
-    pub(crate) eval_sites: Vec<Vec<otter_bytecode::DirectEvalBinding>>,
     /// `true` when an anonymous `export default function/function*` was
-    /// already hoisted (compiled + mirrored to `module_env.default`) at
-    /// instantiation, so its source-position arm must be a no-op.
+    /// already hoisted at instantiation.
     pub(crate) default_function_hoisted: bool,
-    /// Names of this function's own bindings that some nested
-    /// function references — populated by
-    /// [`capture::analyze_function`] before code gen starts. Each
-    /// such binding is allocated as an
-    /// [`UpvalueCell`](otter_vm::UpvalueCell) instead of a register.
+    /// Names of this function's own bindings that some nested function
+    /// references or a direct eval may see — populated by the capture
+    /// pre-pass. A binding with such a name lives in a context slot.
     pub(crate) captured_names: HashSet<String>,
-    /// Simple formal names that must live in own-upvalue cells so a
-    /// sloppy mapped arguments object can alias them without exposing
-    /// frame registers outside the VM.
+    /// Simple formal names that must live in context slots so a sloppy
+    /// mapped arguments object can alias them.
     pub(crate) mapped_argument_names: HashSet<String>,
-    /// Pre-assigned own-upvalue slots for names known before codegen
-    /// starts. This keeps later parent-capture slots stable when
-    /// parameter default expressions capture outer bindings before
-    /// body `var` declarations are lowered.
-    pub(crate) reserved_own_upvalues: HashMap<String, u16>,
-    /// Number of own-upvalue cells allocated so far. The first
-    /// `own_upvalue_count` slots in `frame.upvalues` belong to this
-    /// function's own captured bindings.
-    pub(crate) own_upvalue_count: u16,
-    /// One entry per capture from the enclosing function. Each
-    /// value is an absolute index into the **enclosing** frame's
-    /// `upvalues` array — used as the source operand of
-    /// `MakeClosure` when the parent emits the closure value.
-    pub(crate) parent_captures: Vec<u32>,
-    /// Map from captured-name → upvalue index in **this** function's
-    /// `frame.upvalues`. Captures live at
-    /// `own_upvalue_count..own_upvalue_count + parent_captures.len()`.
-    pub(crate) captured_uv: HashMap<String, u16>,
-    /// `Some` when this context is the top-level `<module-init>`
-    /// of an ES-module fragment. Drives the lowering of
-    /// `import` / `export` declarations + `import.meta` references
-    /// against captured `module_env` / `import_meta` upvalues.
-    /// Inner functions inherit module-mode lookups via the
-    /// existing capture walk — they never set this themselves.
+    /// `Some` when this context is the top-level `<module-init>` of an
+    /// ES-module fragment.
     pub(crate) module_state: Option<ModuleState>,
-    /// Synthetic object-environment bindings introduced by sloppy
-    /// `with` statements that enclose the code currently being
-    /// lowered. Entries are binding names whose values are captured
-    /// `JsObject` references.
+    /// `with` object environments enclosing the code being lowered.
     pub(crate) active_with_envs: Vec<crate::with_statement::WithEnv>,
-    /// Set when `alloc_scratch` exhausted the u16 register window;
-    /// surfaced as a CompileError when the function is finalized.
+    /// Set when `alloc_scratch` exhausted the u16 register window.
     pub(crate) register_overflow: bool,
-    /// High-water mark of `alloc_scratch` — the real window size
-    /// when call sites recycle registers by rolling `scratch` back.
+    /// High-water mark of `alloc_scratch`.
     pub(crate) scratch_peak: u16,
-    /// Monotonic suffix for synthetic `with` bindings in this
-    /// function.
-    pub(crate) next_with_env_id: u32,
-    /// `true` when this function body contains a direct-eval call
-    /// site. Every function-scope binding is promoted to an
-    /// own-upvalue cell and the name → cell map is recorded on the
-    /// emitted [`Function::direct_eval_bindings`] so `Op::Eval` can
-    /// hand the eval body its caller variable environment
-    /// (§19.2.1.3 EvalDeclarationInstantiation).
+    /// `true` when this function's own code contains a direct-eval call
+    /// site.
     pub(crate) contains_direct_eval: bool,
-    /// §15.7.1 — a class definition's heritage / computed-key
-    /// expressions are being lowered inline into this (sloppy)
-    /// function frame: property stores emitted here must carry
-    /// strict PutValue failure semantics via the `*Strict` opcodes.
+    /// §15.7.1 — class heritage / computed keys lowered inline into a
+    /// sloppy frame use the `*Strict` property-store opcodes.
     pub(crate) strict_class_parts: bool,
-    /// §8.4 / §14 — the script / eval `<main>` completion-value
-    /// register (spec `V`). Expression statements store into it as
-    /// they evaluate; composite statements reset it to `undefined`
-    /// on entry (their completion is never *empty*, per UpdateEmpty
-    /// with `undefined`). `None` inside ordinary function bodies —
-    /// only program completion is observable (via `eval` /
-    /// `evalScript` return values).
+    /// §8.4 / §14 — the script / eval `<main>` completion-value register.
     pub(crate) completion_reg: Option<u16>,
-    /// `true` while lowering a `finally` block body: a normal
-    /// finalizer's completion value is discarded (§14.15.3 step 4),
-    /// so its statements must not touch the completion register.
+    /// `true` while lowering a `finally` block body.
     pub(crate) completion_suppressed: bool,
-    /// Number of `finally` block BODIES currently being lowered. A
-    /// `break`/`continue` whose target lies outside `n` of them must
-    /// discard the `n` completions those finallys parked
-    /// ([`otter_bytecode::Op::PopParkedFinally`]).
+    /// Number of `finally` block BODIES currently being lowered.
     pub(crate) finally_body_depth: u32,
-    /// Instruction PCs whose operands are statically `number` per the
-    /// TypeScript annotations in scope. Emitted onto
-    /// [`Function::number_hint_sites`] and consumed as an advisory seed for an
-    /// empty feedback cell — never as a proof.
+    /// Instruction PCs whose operands are statically `number`.
     pub(crate) number_hint_sites: Vec<u32>,
-    /// Property sites whose receiver is a class-annotated binding, as
-    /// `(instruction pc, interned annotation name)`. The name is resolved to a
-    /// class function id once the whole module is compiled.
+    /// Property sites whose receiver is a class-annotated binding.
     pub(crate) class_hint_sites: Vec<(u32, u32)>,
 }
 
@@ -219,8 +198,15 @@ impl FunctionContext {
             spans: Vec::new(),
             scratch: 0,
             scopes: Vec::new(),
+            var_scope: 0,
+            scope_descriptors: Vec::new(),
+            closure_ctx_patches: Vec::new(),
+            derived_this: None,
+            mapped_arguments_ctx: None,
+            closure_context_empty: false,
             is_strict: false,
             is_arrow: false,
+            eval_this_from_chain: false,
             has_home_object: false,
             is_derived_ctor: false,
             super_home_static: false,
@@ -234,22 +220,16 @@ impl FunctionContext {
             active_finally: 0,
             pending_label: None,
             hoisted_function_names: HashSet::new(),
-            annex_b_var_storages: std::collections::HashMap::new(),
+            annex_b_var_targets: std::collections::HashMap::new(),
             annex_b_eligible_spans: std::collections::HashSet::new(),
-            eval_sites: Vec::new(),
             default_function_hoisted: false,
             captured_names: HashSet::new(),
             arguments_forward_only: false,
             mapped_argument_names: HashSet::new(),
-            reserved_own_upvalues: HashMap::new(),
-            own_upvalue_count: 0,
-            parent_captures: Vec::new(),
-            captured_uv: HashMap::new(),
             module_state: None,
             active_with_envs: Vec::new(),
             register_overflow: false,
             scratch_peak: 0,
-            next_with_env_id: 0,
             contains_direct_eval: false,
             strict_class_parts: false,
             completion_reg: None,
@@ -275,43 +255,10 @@ impl FunctionContext {
         self
     }
 
-    pub(crate) fn reserve_known_own_upvalues(&mut self) {
-        if !self.reserved_own_upvalues.is_empty() {
-            return;
-        }
-        let mut names: Vec<String> = self
-            .captured_names
-            .union(&self.mapped_argument_names)
-            .cloned()
-            .collect();
-        names.sort();
-        for name in names {
-            let idx = self.own_upvalue_count;
-            self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");
-            self.reserved_own_upvalues.insert(name, idx);
-        }
-    }
-
-    /// Check `name` against this function's `captured_names` set
-    /// (computed by the pre-pass) and, when present, allocate a
-    /// fresh own-upvalue index for it. Returns the assigned index
-    /// or `None` if the name is not captured (use a register
-    /// instead).
-    pub(crate) fn allocate_own_upvalue(&mut self, name: &str) -> Option<u16> {
-        if !self.captured_names.contains(name) && !self.mapped_argument_names.contains(name) {
-            return None;
-        }
-        // A reserved slot answers only the FIRST declaration of the name.
-        // The capture pre-pass is name-keyed, so a later block-scoped
-        // declaration shadowing the same name must get its own fresh cell —
-        // sharing the slot would alias two distinct bindings (an inner
-        // `let i` loop counter overwriting the outer one).
-        if let Some(idx) = self.reserved_own_upvalues.remove(name) {
-            return Some(idx);
-        }
-        let idx = self.own_upvalue_count;
-        self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");
-        Some(idx)
+    /// Whether a binding named `name` declared in this function must live
+    /// in a context slot.
+    pub(crate) fn name_needs_slot(&self, name: &str) -> bool {
+        self.captured_names.contains(name) || self.mapped_argument_names.contains(name)
     }
 
     pub(crate) fn alloc_scratch(&mut self) -> u16 {
@@ -339,40 +286,50 @@ impl FunctionContext {
     /// bump scratch upward), then — immediately before emitting the
     /// single result-producing instruction — call this and allocate the
     /// destination at `mark`, so sibling subexpressions reuse the same
-    /// low register range instead of stacking new ones. That overlap is
-    /// what shrinks the frame's `scratch_peak` (and hence its register
-    /// count), not just the bytecode's register numbering.
+    /// low register range instead of stacking new ones.
     ///
     /// Sound because (a) expression lowering never declares a persistent
     /// binding — those are statement-level and always sit below `mark` —
-    /// so no live value beneath the result is clobbered, and (b) every
-    /// result opcode reads all of its source operands before writing its
-    /// destination, so a destination that aliases a just-freed operand
-    /// register is read-before-write safe.
+    /// and the watermark never drops below the context register of an
+    /// active scope, and (b) every result opcode reads all of its source
+    /// operands before writing its destination.
     pub(crate) fn reset_scratch(&mut self, mark: u16) {
         debug_assert!(
             mark <= self.scratch,
             "reset_scratch above current watermark"
         );
-        // The window must cover every register ever handed out, including
-        // bindings reserved above an earlier rollback point.
         self.scratch_peak = self.scratch_peak.max(self.scratch);
-        self.scratch = mark;
+        // A context created since `mark` belongs to a scope that is still
+        // active; its register stays reserved.
+        self.scratch = mark.max(self.context_register_floor()).min(self.scratch);
     }
 
     /// Final register-window size: the high-water mark survives
-    /// scratch recycling (`cx.scratch = mark` rollbacks).
+    /// scratch recycling.
     pub(crate) fn scratch_window(&self) -> u16 {
         self.scratch.max(self.scratch_peak)
     }
 
+    /// Lowest register a statement may release down to without dropping
+    /// a live scope context: one above the highest context register of
+    /// every active scope.
+    pub(crate) fn context_register_floor(&self) -> u16 {
+        self.scopes
+            .iter()
+            .filter_map(|scope| match scope.context {
+                Some(ScopeContext {
+                    reg: CtxReg::Reg(reg),
+                    ..
+                }) => Some(reg.saturating_add(1)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Push `frame` onto the loop stack, consuming any pending
-    /// `LabeledStatement` label so `break label;` / `continue label;`
-    /// inside the body resolves to this frame.
+    /// `LabeledStatement` label.
     pub(crate) fn push_loop_frame(&mut self, mut frame: LoopFrame) {
-        // A synthetic labeled-block frame arrives with its label
-        // already set — only loop/switch frames consume the pending
-        // label stashed by `compile_labeled_statement`.
         if frame.label.is_none() {
             frame.label = self.pending_label.take();
         }
@@ -382,169 +339,7 @@ impl FunctionContext {
         self.loops.push(frame);
     }
 
-    pub(crate) fn enter_scope(&mut self) {
-        self.scopes.push(Scope::default());
-    }
-
-    pub(crate) fn exit_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    /// Declare a synthetic binding whose storage is **always** an
-    /// own-upvalue cell, regardless of whether the capture pre-pass
-    /// flagged the name. Used by class lowering to set up
-    /// `__class_home` and `__class_super` slots that inner methods
-    /// resolve through the standard `resolve_capture` walk.
-    pub(crate) fn declare_captured_binding(
-        &mut self,
-        name: &str,
-        is_const: bool,
-        span: (u32, u32),
-    ) -> Result<BindingStorage, CompileError> {
-        if self
-            .scopes
-            .last()
-            .expect("declare_captured_binding called outside any scope")
-            .bindings
-            .contains_key(name)
-        {
-            return Err(CompileError::Unsupported {
-                node: format!("redeclaration of `{name}` in same scope"),
-                span,
-            });
-        }
-        let idx = self.own_upvalue_count;
-        self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");
-        let storage = BindingStorage::Upvalue { idx };
-        let scope = self
-            .scopes
-            .last_mut()
-            .expect("declare_captured_binding called outside any scope");
-        scope.bindings.insert(
-            name.to_string(),
-            BindingInfo {
-                storage,
-                is_const,
-                initialized: false,
-                fn_self_name: false,
-                type_hint: TypeHint::Unknown,
-                catch_param: false,
-                param: false,
-            },
-        );
-        Ok(storage)
-    }
-
-    pub(crate) fn declare_binding(
-        &mut self,
-        name: &str,
-        is_const: bool,
-        span: (u32, u32),
-    ) -> Result<BindingStorage, CompileError> {
-        self.declare_binding_with_capture(name, is_const, span, true)
-    }
-
-    /// Declare one simple formal parameter over its incoming ABI register.
-    ///
-    /// Captured and mapped-arguments formals still need stable upvalue cells;
-    /// every other simple formal can use the argument slot directly and avoid
-    /// a prologue copy into a second register.
-    pub(crate) fn declare_parameter_binding(
-        &mut self,
-        name: &str,
-        argument_register: u16,
-        span: (u32, u32),
-    ) -> Result<BindingStorage, CompileError> {
-        debug_assert!(
-            argument_register < self.scratch,
-            "parameter register must be inside the reserved argument window"
-        );
-        self.ensure_binding_name_available(name, span)?;
-        let storage = self.allocate_own_upvalue(name).map_or(
-            BindingStorage::Register {
-                reg: argument_register,
-            },
-            |idx| BindingStorage::Upvalue { idx },
-        );
-        self.insert_binding_info(name, storage, false);
-        Ok(storage)
-    }
-
-    pub(crate) fn declare_binding_with_capture(
-        &mut self,
-        name: &str,
-        is_const: bool,
-        span: (u32, u32),
-        allow_capture: bool,
-    ) -> Result<BindingStorage, CompileError> {
-        self.ensure_binding_name_available(name, span)?;
-        let storage = if allow_capture && let Some(idx) = self.allocate_own_upvalue(name) {
-            BindingStorage::Upvalue { idx }
-        } else {
-            let reg = self.alloc_scratch();
-            BindingStorage::Register { reg }
-        };
-        self.insert_binding_info(name, storage, is_const);
-        Ok(storage)
-    }
-
-    fn ensure_binding_name_available(
-        &self,
-        name: &str,
-        span: (u32, u32),
-    ) -> Result<(), CompileError> {
-        if self
-            .scopes
-            .last()
-            .expect("binding declaration called outside any scope")
-            .bindings
-            .contains_key(name)
-        {
-            return Err(CompileError::Unsupported {
-                node: format!("redeclaration of `{name}` in same scope"),
-                span,
-            });
-        }
-        Ok(())
-    }
-
-    fn insert_binding_info(&mut self, name: &str, storage: BindingStorage, is_const: bool) {
-        let scope = self
-            .scopes
-            .last_mut()
-            .expect("binding declaration called outside any scope");
-        scope.bindings.insert(
-            name.to_string(),
-            BindingInfo {
-                storage,
-                is_const,
-                initialized: false,
-                fn_self_name: false,
-                type_hint: TypeHint::Unknown,
-                catch_param: false,
-                param: false,
-            },
-        );
-    }
-
-    /// Flag the current-scope binding of `name` as a formal-parameter
-    /// binding (§10.2.11 function environment) so a direct eval inside
-    /// a parameter initializer may resolve it while body-var bindings
-    /// stay invisible there.
-    pub(crate) fn mark_param(&mut self, name: &str) {
-        if let Some(info) = self
-            .scopes
-            .last_mut()
-            .and_then(|scope| scope.bindings.get_mut(name))
-        {
-            info.param = true;
-        }
-    }
-
     /// Attach a static type hint to the innermost binding of `name`.
-    ///
-    /// Silently does nothing when the name is not bound in this context: the
-    /// hint is advisory, so losing it is only a missed optimization.
     pub(crate) fn annotate_binding(&mut self, name: &str, hint: TypeHint) {
         if hint == TypeHint::Unknown {
             return;
@@ -565,81 +360,14 @@ impl FunctionContext {
     }
 
     /// Mark the next emitted instruction as a property access on a receiver
-    /// annotated with the interned class name `name`. Call immediately before
-    /// the [`Self::emit`] it describes.
+    /// annotated with the interned class name `name`.
     pub(crate) fn mark_class_hint_site(&mut self, name: u32) {
         let pc = self.next_pc();
         self.class_hint_sites.push((pc, name));
     }
 
-    pub(crate) fn lookup_binding(&self, name: &str) -> Option<BindingInfo> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(info) = scope.bindings.get(name) {
-                return Some(*info);
-            }
-        }
-        None
-    }
-
-    /// As [`Self::lookup_binding`], also reporting the 0-based scope
-    /// index the name resolved in (0 = the function/script top scope
-    /// where hoisted `var`s live). Lets `var` initializers detect a
-    /// shadowing inner binding (a catch parameter, §B.3.5) whose store
-    /// must not mirror to the global / module export.
-    pub(crate) fn lookup_binding_with_depth(&self, name: &str) -> Option<(BindingInfo, usize)> {
-        for (idx, scope) in self.scopes.iter().enumerate().rev() {
-            if let Some(info) = scope.bindings.get(name) {
-                return Some((*info, idx));
-            }
-        }
-        None
-    }
-
-    /// Look up `name` only in the *innermost* scope. Used by the
-    /// `let` / `const` arm to detect bindings the lexical pre-pass
-    /// already created at the function / script / module top level.
-    pub(crate) fn lookup_in_current_scope(&self, name: &str) -> Option<BindingInfo> {
-        self.scopes
-            .last()
-            .and_then(|scope| scope.bindings.get(name).copied())
-    }
-
-    /// Flip a binding's `initialized` flag to `true` once we've
-    /// emitted its initializer's store. The compiler is intentionally
-    /// conservative: we never flip back to `false` and we never
-    /// "merge" branch states — task 14 ships the simple definite-
-    /// assignment rule and leaves branch-aware refinement for a
-    /// future slice.
-    /// Flag `name`'s innermost binding as a §10.2.11 named
-    /// function expression self-name (immutable; sloppy writes
-    /// silently drop, strict writes throw TypeError).
-    pub(crate) fn mark_fn_self_name(&mut self, name: &str) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(info) = scope.bindings.get_mut(name) {
-                info.fn_self_name = true;
-                return;
-            }
-        }
-    }
-
-    pub(crate) fn mark_initialized(&mut self, name: &str) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(info) = scope.bindings.get_mut(name) {
-                info.initialized = true;
-                return;
-            }
-        }
-    }
-
     /// Emit an [`Op::EnterTry`] with placeholder catch / finally
-    /// offsets and an exception register. Returns the instruction
-    /// pc so the caller can patch the targeted offset to the
-    /// emitted catch / finally landing.
-    ///
-    /// `catch_offset` and `finally_offset` are the **initial**
-    /// values stored in the operand list — typically a real
-    /// `0` placeholder for whichever clause needs patching, and
-    /// [`otter_vm::NO_HANDLER_OFFSET`] for the absent clause.
+    /// offsets and an exception register. Returns the instruction pc.
     pub(crate) fn emit_enter_try(
         &mut self,
         catch_offset: i32,
@@ -661,11 +389,7 @@ impl FunctionContext {
     }
 
     /// Patch a previously emitted [`Op::EnterTry`] so that one of
-    /// its offsets targets the **current** `next_pc`. Pass `true`
-    /// for `is_catch` to patch the catch offset, `false` to patch
-    /// the finally offset. The non-targeted offset is left
-    /// untouched (kept as the `NO_HANDLER_OFFSET` sentinel the
-    /// initial emit installed).
+    /// its offsets targets the **current** `next_pc`.
     pub(crate) fn patch_enter_try_offset(&mut self, enter_pc: u32, is_catch: bool) {
         let target = self.next_pc();
         let offset = target as i64 - (enter_pc as i64 + 1);
@@ -716,9 +440,7 @@ impl FunctionContext {
     }
 
     /// Append `values` as one contiguous run of string constants and return
-    /// the index of the first. Unlike [`Self::intern_string_constant`] the run
-    /// is never merged with existing entries, because an operand names it by
-    /// its start and length (`Op::NewObjectLiteral` keys).
+    /// the index of the first.
     pub(crate) fn push_string_constant_run(&mut self, values: &[&str]) -> u32 {
         let mut module = self.module.borrow_mut();
         let first = module.constants.len() as u32;
@@ -735,12 +457,7 @@ impl FunctionContext {
         self.intern_utf16_string_constant(utf16)
     }
 
-    /// Intern a pre-built WTF-16 unit vector. Used for string
-    /// literals that carry lone surrogates: oxc encodes those via
-    /// the §11.8.4 [`StringLiteral`](https://tc39.es/ecma262/#sec-literals-string-literals)
-    /// lossy scheme (`\u{FFFD}XXXX` per lone surrogate, `\u{FFFD}fffd`
-    /// for a literal U+FFFD), so the compiler decodes it into the
-    /// original code-unit sequence before interning.
+    /// Intern a pre-built WTF-16 unit vector.
     pub(crate) fn intern_utf16_string_constant(&mut self, utf16: Vec<u16>) -> u32 {
         let mut module = self.module.borrow_mut();
         for (i, c) in module.constants.iter().enumerate() {
@@ -818,10 +535,71 @@ impl FunctionContext {
         (module.constants.len() - 1) as u32
     }
 
+    /// Emit one instruction. A return emitted into a derived constructor
+    /// that keeps `this` in a `DerivedThis` slot becomes `ReturnDerived`
+    /// naming that slot; the VM reads it only when the frame completes, after
+    /// crossed `finally` blocks.
     pub(crate) fn emit(&mut self, op: Op, operands: impl AsRef<[Operand]>, span: (u32, u32)) {
+        if let Some(derived) = self.derived_this
+            && matches!(op, Op::Return | Op::ReturnValue | Op::ReturnUndefined)
+        {
+            let value = match operands.as_ref().first() {
+                Some(Operand::Register(reg)) => *reg,
+                _ => {
+                    let reg = self.alloc_scratch();
+                    self.push_raw(Op::LoadUndefined, &[Operand::Register(reg)], span);
+                    reg
+                }
+            };
+            let coord = ContextCoord {
+                depth: 0,
+                slot: derived.slot,
+            }
+            .to_imm32();
+            self.push_raw(
+                Op::ReturnDerived,
+                &[
+                    Operand::Register(value),
+                    Operand::Register(derived.ctx),
+                    Operand::Imm32(coord),
+                ],
+                span,
+            );
+            return;
+        }
+        self.push_raw(op, operands.as_ref(), span);
+    }
+
+    fn push_raw(&mut self, op: Op, operands: &[Operand], span: (u32, u32)) {
         let pc = self.next_pc();
-        self.code.push(op, operands.as_ref());
+        self.code.push(op, operands);
         self.spans.push(SpanEntry { pc, span });
+    }
+
+    /// Emit `op` whose operand `ctx_index` names the context in `ctx`.
+    /// A closure-context operand is recorded for finalization patching.
+    pub(crate) fn emit_ctx(
+        &mut self,
+        op: Op,
+        mut operands: Vec<Operand>,
+        ctx_index: usize,
+        ctx: CtxReg,
+        span: (u32, u32),
+    ) {
+        match ctx {
+            CtxReg::Reg(reg) => operands[ctx_index] = Operand::Register(reg),
+            CtxReg::Closure if self.closure_context_empty => {
+                let reg = self.alloc_scratch();
+                self.emit(Op::LoadUndefined, [Operand::Register(reg)], span);
+                operands[ctx_index] = Operand::Register(reg);
+            }
+            CtxReg::Closure => {
+                operands[ctx_index] = Operand::Register(0);
+                let pc = self.next_pc();
+                self.closure_ctx_patches.push((pc, ctx_index));
+            }
+        }
+        self.emit(op, operands, span);
     }
 
     /// Logical PC assigned to the next emitted instruction.
@@ -829,10 +607,8 @@ impl FunctionContext {
         self.code.next_pc()
     }
 
-    /// UpdateEmpty(…, undefined) — a composite statement (`if`,
-    /// loops, `switch`, `try`, `with`, labelled) resets the program
-    /// completion register on entry: its completion is `undefined`
-    /// unless an inner statement produces a value.
+    /// UpdateEmpty(…, undefined) — a composite statement resets the
+    /// program completion register on entry.
     pub(crate) fn emit_completion_reset(&mut self, span: (u32, u32)) {
         if self.completion_suppressed {
             return;
@@ -843,19 +619,12 @@ impl FunctionContext {
     }
 
     /// Whether a statement's completion value can still be observed.
-    ///
-    /// Only a script or `eval` program keeps a completion register. Inside a
-    /// function body a statement's value is unobservable — a call's result
-    /// comes from `return` — so the statement forms need neither reserve a
-    /// running `V` nor thread their body completions through one.
     pub(crate) fn completion_tracking(&self) -> bool {
         self.completion_reg.is_some() && !self.completion_suppressed
     }
 
     /// Reserve the running completion register (`V`) a statement form threads
-    /// its body completions through, initialized to `undefined`. Returns
-    /// `None` when the completion value is unobservable, in which case the
-    /// form emits no completion bookkeeping at all.
+    /// its body completions through, initialized to `undefined`.
     pub(crate) fn alloc_completion_reg(&mut self, span: (u32, u32)) -> Option<u16> {
         if !self.completion_tracking() {
             return None;
@@ -883,8 +652,7 @@ impl FunctionContext {
         }
     }
 
-    /// Statement-list `V` threading — store a non-empty statement
-    /// completion value into the program completion register.
+    /// Statement-list `V` threading.
     pub(crate) fn emit_completion_value(&mut self, value_reg: u16, span: (u32, u32)) {
         if self.completion_suppressed {
             return;
@@ -900,55 +668,7 @@ impl FunctionContext {
         }
     }
 
-    /// Emit the appropriate "load this binding into `dst`" op pair
-    /// for the binding's storage kind.
-    pub(crate) fn emit_load_storage(
-        &mut self,
-        dst: u16,
-        storage: BindingStorage,
-        span: (u32, u32),
-    ) {
-        match storage {
-            BindingStorage::Register { reg } => self.emit(
-                Op::LoadLocal,
-                [Operand::Register(dst), Operand::Imm32(reg as i32)],
-                span,
-            ),
-            BindingStorage::Upvalue { idx } => self.emit(
-                Op::LoadUpvalue,
-                [Operand::Register(dst), Operand::Imm32(idx as i32)],
-                span,
-            ),
-        }
-    }
-
-    /// Mirror `value_reg` through to `module_env.default`. Used by
-    /// `export default function f(){}` from the hoist pass: the
-    /// default export entry was registered by the module pre-pass
-    /// so the closure must land on `module_env.default` even when
-    /// no source-position store ever runs (the source-position arm
-    /// becomes a no-op for hoisted names).
-    ///
-    /// Spec: <https://tc39.es/ecma262/#sec-exports-runtime-semantics-evaluation>
-    pub(crate) fn emit_module_export_default_mirror(&mut self, value_reg: u16, span: (u32, u32)) {
-        let env_uv = match &self.module_state {
-            Some(state) => state.module_env_uv,
-            None => return,
-        };
-        let env_reg = self.alloc_scratch();
-        self.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-            span,
-        );
-        self.emit_store_property(env_reg, "default", value_reg, span);
-    }
-
     /// Emit `Op::StoreProperty obj_reg, name_const, src_reg, scratch`.
-    /// Used by the module-mode lowering to mirror writes through
-    /// to `module_env` for exported bindings, and by the export
-    /// declaration arms. The `scratch` slot is reserved for
-    /// accessor-setter dispatch per [`Op::StoreProperty`]'s contract.
     pub(crate) fn emit_store_property(
         &mut self,
         obj_reg: u16,
@@ -972,8 +692,7 @@ impl FunctionContext {
     }
 
     /// §15.7.1 — the property-store opcode for PutValue emission at
-    /// the current compile point: the `Strict` variant while class
-    /// heritage / computed keys lower into a sloppy frame.
+    /// the current compile point.
     pub(crate) fn store_property_op(&self) -> Op {
         if self.strict_class_parts {
             Op::StorePropertyStrict
@@ -1011,9 +730,7 @@ impl FunctionContext {
         );
     }
 
-    /// Emit `Op::LoadProperty dst, obj_reg, name_const`. Used by
-    /// the module-mode lowering for imported-name reads
-    /// (`LoadProperty import_record, "name"`) and `import.meta.url`.
+    /// Emit `Op::LoadProperty dst, obj_reg, name_const`.
     pub(crate) fn emit_load_property(
         &mut self,
         dst: u16,
@@ -1033,97 +750,67 @@ impl FunctionContext {
         );
     }
 
-    /// Emit the "write `src` into this binding" op pair for the
-    /// storage kind. Used for *binding initialization* (declarations,
-    /// loop-head per-iteration bindings) — it clears any TDZ hole.
-    pub(crate) fn emit_store_storage(
-        &mut self,
-        src: u16,
-        storage: BindingStorage,
-        span: (u32, u32),
-    ) {
-        match storage {
-            BindingStorage::Register { reg } => {
-                if src != reg {
-                    self.emit(
-                        Op::StoreLocal,
-                        [Operand::Register(src), Operand::Imm32(reg as i32)],
-                        span,
-                    );
-                }
+    /// Finalize the body: route every closure-context operand to one fresh
+    /// register filled by a `LoadClosureContext` prepended at pc 0, and
+    /// hand back the code, spans, and scope table.
+    ///
+    /// Branch offsets are PC-relative, so the prepended instruction shifts
+    /// every target uniformly; source spans and hint sites shift by one.
+    pub(crate) fn finish_code(&mut self, entry_span: (u32, u32)) -> FinishedCode {
+        let mut scratch = self.scratch_window();
+        let mut code = std::mem::take(&mut self.code);
+        let mut spans = std::mem::take(&mut self.spans);
+        let mut number_hint_sites = std::mem::take(&mut self.number_hint_sites);
+        let mut class_hint_sites = std::mem::take(&mut self.class_hint_sites);
+        let uses_closure_context = !self.closure_ctx_patches.is_empty();
+        if uses_closure_context {
+            let reg = scratch;
+            match scratch.checked_add(1) {
+                Some(next) => scratch = next,
+                None => self.register_overflow = true,
             }
-            BindingStorage::Upvalue { idx } => self.emit(
-                Op::StoreUpvalue,
-                [Operand::Register(src), Operand::Imm32(idx as i32)],
-                span,
-            ),
+            for &(pc, index) in &self.closure_ctx_patches {
+                assert!(
+                    code.set_operand(pc, index, Operand::Register(reg)),
+                    "closure-context operand is a register"
+                );
+            }
+            let mut rebuilt = FunctionCodeBuilder::new();
+            rebuilt.push(Op::LoadClosureContext, &[Operand::Register(reg)]);
+            for pc in 0..code.len() as u32 {
+                let op = code.op(pc).expect("compiler instruction");
+                let operands: Vec<Operand> = (0..code.operand_count(pc).expect("operand count"))
+                    .map(|index| code.operand(pc, index).expect("compiler operand"))
+                    .collect();
+                rebuilt.push(op, &operands);
+            }
+            code = rebuilt;
+            for span in &mut spans {
+                span.pc += 1;
+            }
+            spans.insert(
+                0,
+                SpanEntry {
+                    pc: 0,
+                    span: entry_span,
+                },
+            );
+            for pc in &mut number_hint_sites {
+                *pc += 1;
+            }
+            for (pc, _) in &mut class_hint_sites {
+                *pc += 1;
+            }
+            self.closure_ctx_patches.clear();
         }
-    }
-}
-
-/// Compile-time marker bit for parent-capture upvalue indices.
-/// `resolve_capture` cannot know the frame's FINAL own-upvalue
-/// count (own captured cells may be declared after a capture
-/// resolves — e.g. a nested class's synthetic cells inside a
-/// constructor that already captured the outer brand), so capture
-/// indices are issued in a virtual space and rewritten to
-/// `own_count + position` when the function finalizes.
-pub(crate) const VIRTUAL_CAPTURE_BASE: u16 = 0x8000;
-
-/// Rewrite every virtual parent-capture index in `code` (and the
-/// direct-eval binding table) to its final absolute position now
-/// that the frame's own-upvalue count is known.
-pub(crate) fn finalize_virtual_capture_indices(
-    code: &mut otter_bytecode::FunctionCodeBuilder,
-    direct_eval_meta: &mut [otter_bytecode::DirectEvalBinding],
-    eval_sites: &mut [Vec<otter_bytecode::DirectEvalBinding>],
-    own_count: u16,
-) {
-    let base = VIRTUAL_CAPTURE_BASE as i32;
-    let remap = |v: i32| -> i32 {
-        if v >= base {
-            own_count as i32 + (v - base)
-        } else {
-            v
-        }
-    };
-    for pc in 0..code.len() as u32 {
-        match code.op(pc).expect("compiler wordcode instruction") {
-            // `FreshUpvalue` only ever targets OWN cells (for-of
-            // per-iteration bindings) — never a parent capture.
-            Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked => {
-                if let Some(Operand::Imm32(v)) = code.operand(pc, 1) {
-                    assert!(code.set_operand(pc, 1, Operand::Imm32(remap(v))));
-                }
-            }
-            Op::LoadShadowedUpvalue
-            | Op::LoadShadowedUpvalueSnap
-            | Op::StoreShadowedUpvalueChecked
-            | Op::StoreShadowedUpvalueCheckedSnap
-            | Op::DeleteShadowedUpvalue => {
-                if let Some(Operand::Imm32(v)) = code.operand(pc, 2) {
-                    assert!(code.set_operand(pc, 2, Operand::Imm32(remap(v))));
-                }
-            }
-            Op::MakeClosure => {
-                let operand_count = code
-                    .operand_count(pc)
-                    .expect("MakeClosure instruction operand count");
-                for index in 3..operand_count {
-                    if let Some(Operand::Imm32(v)) = code.operand(pc, index) {
-                        assert!(code.set_operand(pc, index, Operand::Imm32(remap(v))));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for binding in direct_eval_meta
-        .iter_mut()
-        .chain(eval_sites.iter_mut().flat_map(|site| site.iter_mut()))
-    {
-        if binding.upvalue >= VIRTUAL_CAPTURE_BASE {
-            binding.upvalue = own_count + (binding.upvalue - VIRTUAL_CAPTURE_BASE);
+        FinishedCode {
+            code: code.finish(),
+            spans,
+            scratch,
+            scopes: std::mem::take(&mut self.scope_descriptors),
+            uses_closure_context,
+            number_hint_sites,
+            class_hint_sites,
         }
     }
 }

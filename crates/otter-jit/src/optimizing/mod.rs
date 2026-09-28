@@ -33,7 +33,7 @@
 //! - [`crate::machine`] — the sole optimizing instruction and allocation path.
 //! - [`crate::template`] — the runtime-wired baseline compiler.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
@@ -79,8 +79,9 @@ pub struct OptimizedCode {
     /// allocation must live exactly as long as the code.
     deopt: Box<otter_vm::deopt::DeoptRuntime>,
     safepoint_records: Box<[SafepointRecord]>,
-    /// Loop-header logical PC → assembler offset of its OSR trampoline.
-    osr_entries: BTreeMap<u32, usize>,
+    /// Loop-header logical PCs the entry dispatch can enter through an OSR
+    /// block: the compile's OSR target, or nothing for an entry compile.
+    osr_headers: BTreeSet<u32>,
     /// Exact installed callee generations entered by emitted direct edges.
     dependencies: Box<[CodeDependency]>,
     /// Per-`LoadProperty`-site inline caches. Their addresses are baked into
@@ -100,7 +101,7 @@ impl OptimizedCode {
         generated_stack_frame_bytes: Option<u32>,
         deopt: Box<otter_vm::deopt::DeoptRuntime>,
         safepoint_records: Box<[SafepointRecord]>,
-        osr_entries: BTreeMap<u32, usize>,
+        osr_headers: BTreeSet<u32>,
         dependencies: Box<[CodeDependency]>,
         load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
@@ -121,7 +122,7 @@ impl OptimizedCode {
             generated_stack_frame_bytes,
             deopt,
             safepoint_records,
-            osr_entries,
+            osr_headers,
             dependencies,
             _load_ic_cells: load_ic_cells,
             _store_ic_cells: store_ic_cells,
@@ -149,10 +150,8 @@ impl OptimizedCode {
     }
 
     #[cfg(test)]
-    pub(crate) unsafe fn osr_entry_ptr_for_test(&self, logical_pc: u32) -> Option<*const u8> {
-        let offset = *self.osr_entries.get(&logical_pc)?;
-        // SAFETY: tests keep this code object alive through the native call.
-        Some(unsafe { self.code.ptr_at(offset) })
+    pub(crate) fn has_osr_header_for_test(&self, logical_pc: u32) -> bool {
+        self.osr_headers.contains(&logical_pc)
     }
 }
 
@@ -166,7 +165,7 @@ impl std::fmt::Debug for OptimizedCode {
             )
             .field("deopt_points", &self.deopt.table.len())
             .field("safepoints", &self.safepoint_records.len())
-            .field("osr_entries", &self.osr_entries.len())
+            .field("osr_headers", &self.osr_headers.len())
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -185,7 +184,7 @@ impl JitFunctionCode for OptimizedCode {
                 std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
                 std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self._load_ic_cells),
                 std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self._store_ic_cells),
-                self.osr_entries.len() * std::mem::size_of::<(u32, usize)>(),
+                self.osr_headers.len() * std::mem::size_of::<u32>(),
             ],
         )
         .saturating_add(self.deopt.retained_bytes())
@@ -250,8 +249,13 @@ impl JitFunctionCode for OptimizedCode {
                 self.metadata.register_count,
                 otter_vm::native_abi::NativeFrameKind::Optimizing,
                 !self.safepoint_records.is_empty(),
+                None,
             )
         })
+    }
+
+    fn enters_optimized_osr_header(&self, logical_pc: u32) -> bool {
+        self.osr_headers.contains(&logical_pc)
     }
 
     fn run_optimized_osr_entry(
@@ -259,10 +263,12 @@ impl JitFunctionCode for OptimizedCode {
         activation: VmRuntimeActivation,
         logical_pc: u32,
     ) -> Option<JitExecOutcome> {
-        let offset = *self.osr_entries.get(&logical_pc)?;
-        // SAFETY: the recorded offset belongs to this live executable mapping
-        // and names a trampoline emitted with the shared `JitCtx` ABI.
-        let entry = unsafe { self.code.ptr_at(offset) };
+        if !self.osr_headers.contains(&logical_pc) {
+            return None;
+        }
+        // SAFETY: the entry dispatch at this live mapping's entry reads the
+        // OSR frame bit and PC and enters the header's OSR block.
+        let entry = unsafe { self.code.entry_ptr() };
         Some(unsafe {
             enter_compiled(
                 activation,
@@ -272,6 +278,7 @@ impl JitFunctionCode for OptimizedCode {
                 self.metadata.register_count,
                 otter_vm::native_abi::NativeFrameKind::Optimizing,
                 !self.safepoint_records.is_empty(),
+                Some(logical_pc),
             )
         })
     }
@@ -283,9 +290,10 @@ impl JitFunctionCode for OptimizedCode {
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    osr_pc: Option<u32>,
 ) -> Result<OptimizedCode, Unsupported> {
     let transitions = TransitionTable::resolve();
-    compile_optimized_with_artifacts(view, code_object_id, &transitions, false, None)
+    compile_optimized_with_artifacts(view, code_object_id, &transitions, false, None, osr_pc)
         .map(|output| output.code)
 }
 
@@ -296,6 +304,7 @@ pub(crate) fn compile_optimized_with_artifacts(
     transitions: &TransitionTable,
     capture_events: bool,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
+    osr_pc: Option<u32>,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
     #[cfg(target_arch = "aarch64")]
     let target_spec = crate::machine::TargetSpec::aarch64();
@@ -308,6 +317,7 @@ pub(crate) fn compile_optimized_with_artifacts(
         transitions,
         capture_events,
         artifact_request,
+        osr_pc,
     )
 }
 
@@ -316,8 +326,9 @@ pub(crate) fn compile_optimized_with_artifacts(
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    osr_pc: Option<u32>,
 ) -> Result<OptimizedCode, Unsupported> {
-    let _ = (view, code_object_id);
+    let _ = (view, code_object_id, osr_pc);
     Err(Unsupported::OperandShape(
         "optimizing compiler target is unavailable",
     ))
@@ -328,9 +339,10 @@ pub(crate) fn compile_optimized_with_transitions(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    osr_pc: Option<u32>,
 ) -> Result<OptimizedCode, Unsupported> {
     let _ = transitions;
-    compile_optimized(view, code_object_id)
+    compile_optimized(view, code_object_id, osr_pc)
 }
 
 #[cfg(test)]
@@ -352,7 +364,7 @@ mod tests {
             JitTestInstruction::new(Op::ReturnValue, 1, 29, vec![Operand::Register(1)]),
         ];
         let view = JitCompileSnapshot::without_feedback(17, 1, 2, instructions);
-        let result = compile_optimized(&view, 91);
+        let result = compile_optimized(&view, 91, None);
         assert!(result.is_err());
         // The refusal names the opcode the Machine HIR has no lowering for.
         #[cfg(target_arch = "aarch64")]

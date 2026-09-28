@@ -1,18 +1,27 @@
 //! Public and internal entry points for script and module compilation.
 //!
 //! # Contents
-//! - source parsing entry points
-//! - borrowed AST lowering
+//! - source parsing entry points ([`compile_script_source`],
+//!   [`compile_eval_source`], [`compile_module_program`])
+//! - borrowed AST lowering of script, eval, and module bodies
+//! - direct-eval variable-environment targets and step-3 conflict checks
 //! - module metadata assembly
 //! - export declaration lowering
 //!
 //! # Invariants
 //! - The first function record is the entry function for the produced bytecode module.
+//! - A direct eval's `<main>` reads its caller's context chain through
+//!   `LoadClosureContext`; caller bindings resolve by static hop counts over
+//!   the [`EvalCallerChain`] descriptors, and a sloppy body's `var`s bind in
+//!   the caller's variable scope (a static slot or its eval extension).
+//! - `<module-init>`'s scope 0 is the Module scope: descriptor 0, allocated
+//!   by the runtime and shared by the link and evaluation invocations.
 //!
 //! # See also
 //! - `errors` and `module_state`
 
 use crate::*;
+use otter_bytecode::EvalCallerChain;
 
 /// Compile source text through a single OXC parse.
 ///
@@ -70,57 +79,6 @@ pub fn compile_script_source_with_forced_strict(
     .map_err(CompileError::from)?
 }
 
-/// Synthetic binding-name prefix for the fresh variable-environment
-/// cell a sloppy eval body `var` creates underneath a same-named
-/// INNER caller binding (§B.3.5). The adoption table re-exports the
-/// cell under the real name.
-const EVAL_INNER_VAR_PREFIX: &str = "__evalvar_";
-
-/// One caller-environment binding a direct eval body can see. Slot
-/// `i` of the caller-scope list maps to upvalue slot `i` of the
-/// compiled `<main>`; the runtime splices the caller's cells into
-/// those slots before running the chunk.
-#[derive(Debug, Clone)]
-pub struct EvalCallerBinding {
-    /// Source-level binding name.
-    pub name: String,
-    /// `true` for `let` / `const` / `class` caller bindings — a
-    /// sloppy eval body var-declaring the same name is a runtime
-    /// `SyntaxError` (§19.2.1.3 step 5).
-    pub lexical: bool,
-    /// `true` when the cell is a passthrough capture from a function
-    /// ENCLOSING the caller: readable, but a `var` of the same name
-    /// in the eval body declares a FRESH caller binding instead of
-    /// re-binding the outer variable (§19.2.1.3 HasVarDeclaration).
-    pub captured: bool,
-    /// `true` for a `const` / `class` caller binding — an eval-body
-    /// assignment throws `TypeError` in every mode (§13.3.1).
-    pub is_const: bool,
-    /// `true` for a named function expression's self-name binding —
-    /// an eval-body assignment throws `TypeError` in strict mode and
-    /// is silently dropped in sloppy mode (§10.2.11, §9.1.1.1.5).
-    pub fn_self_name: bool,
-    /// `true` for a binding declared in a block or catch clause
-    /// lexically between the caller's variable environment and the
-    /// eval site. The eval body resolves the name to this cell, but a
-    /// body `var` of the same name declares a FRESH
-    /// variable-environment binding underneath it (§19.2.1.3; §B.3.5
-    /// for catch parameters, which also skip the var-collision
-    /// SyntaxError via `lexical: false`).
-    pub inner: bool,
-    /// `true` for a binding a previous sloppy eval introduced into the
-    /// caller's variable environment (§19.2.1.3 CreateMutableBinding
-    /// with deletable = true). The chunk routes such names through the
-    /// dynamic eval-environment ops so a `delete` from any alias is
-    /// observable everywhere.
-    pub deletable: bool,
-    /// 1-based lexical scope depth of the binding inside the caller
-    /// function — the function scope is `1`, each enclosing block or
-    /// catch clause adds one. Orders the binding against the caller's
-    /// `with` object environments (§9.1.1.2.1).
-    pub scope_depth: u16,
-}
-
 /// Compile an `eval` / `new Function` body. Differs from script
 /// compilation in two details: a *strict* eval body gets its own
 /// variable environment (§19.2.1.1), so top-level `var` / `function`
@@ -129,13 +87,15 @@ pub struct EvalCallerBinding {
 /// (`forbid_var_arguments`), a sloppy body var-declaring `arguments`
 /// is an early SyntaxError (§19.2.1.3 EvalDeclarationInstantiation).
 ///
-/// `caller_scope` carries the caller variable environment of a
-/// direct eval running inside a function: each binding maps to a
-/// reserved leading upvalue slot of the produced `<main>`, sloppy
-/// `var` / function declarations matching a caller binding reuse the
-/// caller's cell, and new var-scoped names are reported back through
-/// the `<main>`'s `direct_eval_bindings` table for the runtime to
-/// adopt into the caller frame.
+/// `caller_chain` is the context chain of a direct eval's call site:
+/// `chain.scopes[0]` is the caller's innermost context, and
+/// `chain.var_depth` the hop count of the variable-scope context whose
+/// eval extension receives a sloppy body's `var`s (`None` = the global
+/// variable environment). The produced `<main>` reads that chain through
+/// `LoadClosureContext` (the runtime runs it as a closure over the call
+/// site's context) and resolves caller bindings by static hop counts.
+/// `None` compiles an indirect eval or a `Function` constructor body:
+/// global code with no caller context.
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
@@ -146,8 +106,7 @@ pub fn compile_eval_source(
     module_specifier: &str,
     force_strict: bool,
     forbid_var_arguments: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
-    global_var_env: bool,
+    caller_chain: Option<&EvalCallerChain>,
     new_target_allowed: bool,
     in_class_field_initializer: bool,
     super_property_allowed: bool,
@@ -170,8 +129,7 @@ pub fn compile_eval_source(
                 module_specifier,
                 force_strict,
                 forbid_var_arguments,
-                caller_scope,
-                global_var_env,
+                caller_chain,
                 new_target_allowed,
                 in_class_field_initializer,
                 super_property_allowed,
@@ -237,8 +195,7 @@ pub fn compile_eval_source(
                         module_specifier,
                         force_strict,
                         forbid_var_arguments,
-                        caller_scope,
-                        global_var_env,
+                        caller_chain,
                         new_target_allowed,
                         in_class_field_initializer,
                         super_property_allowed,
@@ -380,8 +337,7 @@ fn compile_eval_parts(
     module_specifier: &str,
     force_strict: bool,
     forbid_var_arguments: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
-    global_var_env: bool,
+    caller_chain: Option<&EvalCallerChain>,
     new_target_allowed: bool,
     in_class_field_initializer: bool,
     super_property_allowed: bool,
@@ -433,8 +389,7 @@ fn compile_eval_parts(
             kind,
             module_specifier,
             force_strict,
-            caller_scope,
-            global_var_env,
+            caller_chain,
             new_target_allowed,
             super_property_allowed,
             super_call_allowed,
@@ -481,14 +436,7 @@ pub(crate) fn compile_program(
     module_specifier: &str,
     force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode(
-        program,
-        source_kind,
-        module_specifier,
-        force_strict,
-        false,
-        None,
-    )
+    compile_program_with_mode(program, source_kind, module_specifier, force_strict)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,25 +445,25 @@ pub(crate) fn compile_program_for_eval(
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
-    global_var_env: bool,
+    caller_chain: Option<&EvalCallerChain>,
     new_target_allowed: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
     function_constructor: bool,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode_impl_super_fnctor(
+    compile_program_parts(
         program,
         source_kind,
         module_specifier,
-        force_strict,
-        true,
-        caller_scope,
-        global_var_env,
-        new_target_allowed,
-        super_property_allowed,
-        super_call_allowed,
-        function_constructor,
+        ProgramMode {
+            force_strict,
+            eval_mode: true,
+            caller_chain,
+            new_target_allowed,
+            super_property_allowed,
+            super_call_allowed,
+            function_constructor,
+        },
     )
 }
 
@@ -524,17 +472,20 @@ pub(crate) fn compile_program_with_mode(
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
-    eval_mode: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode_impl(
+    compile_program_parts(
         ProgramParts::of(program),
         source_kind,
         module_specifier,
-        force_strict,
-        eval_mode,
-        caller_scope,
-        false,
+        ProgramMode {
+            force_strict,
+            eval_mode: false,
+            caller_chain: None,
+            new_target_allowed: false,
+            super_property_allowed: false,
+            super_call_allowed: false,
+            function_constructor: false,
+        },
     )
 }
 
@@ -600,70 +551,206 @@ pub(crate) fn attach_source_text(module: &mut BytecodeModule, source: &str) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compile_program_with_mode_impl(
-    program: ProgramParts<'_, '_>,
-    source_kind: SyntaxSourceKind,
-    module_specifier: &str,
-    force_strict: bool,
-    eval_mode: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
-    new_target_allowed: bool,
-) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode_impl_super(
-        program,
-        source_kind,
-        module_specifier,
-        force_strict,
-        eval_mode,
-        caller_scope,
-        new_target_allowed,
-        false,
-        false,
-    )
+/// How a script or eval body lowers.
+pub(crate) struct ProgramMode<'c> {
+    pub(crate) force_strict: bool,
+    pub(crate) eval_mode: bool,
+    /// Direct-eval caller context chain; `None` for scripts, indirect
+    /// eval, and `Function` constructor bodies.
+    pub(crate) caller_chain: Option<&'c EvalCallerChain>,
+    pub(crate) new_target_allowed: bool,
+    pub(crate) super_property_allowed: bool,
+    pub(crate) super_call_allowed: bool,
+    pub(crate) function_constructor: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compile_program_with_mode_impl_super(
+/// `true` when `cx` lowers the top level of a sloppy direct eval whose
+/// variable environment is a caller function's (§19.2.1.3 step 16): its
+/// `var` and function declarations bind in that scope, not locally.
+fn in_function_var_env_eval(cx: &Compiler) -> bool {
+    cx.stack.len() == 1
+        && cx.scopes.len() == 1
+        && cx.in_eval
+        && !cx.is_strict
+        && cx
+            .eval_chain
+            .as_ref()
+            .is_some_and(|chain| chain.var_depth.is_some())
+}
+
+/// Variable-scope target of a sloppy direct eval's top-level function
+/// declaration named `name`: the caller's static var-scope slot, or its
+/// eval extension. `None` outside such an eval body.
+pub(crate) fn eval_var_function_target(
+    cx: &Compiler,
+    name: &str,
+) -> Option<crate::compiler::VarTarget> {
+    if !in_function_var_env_eval(cx) {
+        return None;
+    }
+    let chain = cx.eval_chain.as_ref()?;
+    let var_depth = chain.var_depth?;
+    let depth = u16::try_from(var_depth).ok()?;
+    let scope = chain.scopes.get(var_depth as usize)?;
+    match scope
+        .descriptor
+        .slots
+        .iter()
+        .position(|slot| slot.name == name)
+    {
+        Some(slot) => Some(crate::compiler::VarTarget::Outer {
+            depth,
+            slot: slot as u16,
+        }),
+        None => Some(crate::compiler::VarTarget::Extension { depth }),
+    }
+}
+
+/// [`eval_var_function_target`] for a declaration instantiated at the eval
+/// prologue: an extension target gets its deletable binding now
+/// (`DeclareEvalVar`, §19.2.1.3 step 16 / §B.3.2.3).
+pub(crate) fn eval_var_declaration_target(
+    cx: &mut Compiler,
+    name: &str,
+    span: (u32, u32),
+) -> Option<crate::compiler::VarTarget> {
+    let target = eval_var_function_target(cx, name)?;
+    if let crate::compiler::VarTarget::Extension { depth } = target {
+        let name_idx = cx.intern_string_constant(name);
+        cx.emit_ctx(
+            Op::DeclareEvalVar,
+            vec![
+                Operand::Register(0),
+                Operand::ConstIndex(name_idx),
+                Operand::Imm32(i32::from(depth)),
+            ],
+            0,
+            crate::scope::CtxReg::Closure,
+            span,
+        );
+    }
+    Some(target)
+}
+
+/// §19.2.1.3 step 3 — a sloppy direct eval may not hoist a `var` over a
+/// lexical declaration between its call site and its variable scope
+/// (Annex B.3.4 exempts simple catch parameters). The caller chain's
+/// descriptors carry every binding such an eval can see.
+fn check_eval_var_conflicts(
+    chain: &EvalCallerChain,
+    var_names: &[String],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    use otter_bytecode::{ScopeKind, SlotKind};
+    let last = match chain.var_depth {
+        Some(depth) => depth as usize,
+        None => chain.scopes.len().saturating_sub(1),
+    };
+    for (hop, scope) in chain.scopes.iter().enumerate().take(last + 1) {
+        if scope.descriptor.kind == ScopeKind::With {
+            continue;
+        }
+        let is_var_scope = chain.var_depth == Some(hop as u32);
+        for name in var_names {
+            let Some(slot) = scope
+                .descriptor
+                .slots
+                .iter()
+                .find(|slot| &slot.name == name)
+            else {
+                continue;
+            };
+            let conflicts = if is_var_scope {
+                matches!(slot.kind, SlotKind::Let | SlotKind::Const | SlotKind::Class)
+            } else {
+                !matches!(slot.kind, SlotKind::CatchParam { simple: true })
+            };
+            if conflicts {
+                return Err(CompileError::Unsupported {
+                    node: format!("SyntaxError: Identifier '{name}' has already been declared"),
+                    span,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `true` when an Annex B block function named `name` is shadowed by a
+/// binding between a sloppy direct eval and its variable scope, which
+/// skips its var extension (§B.3.2.3 bindingExists).
+pub(crate) fn eval_annex_b_blocked(cx: &Compiler, name: &str) -> bool {
+    let Some(chain) = cx.eval_chain.as_ref() else {
+        return false;
+    };
+    let last = match chain.var_depth {
+        Some(depth) => depth as usize,
+        None => chain.scopes.len(),
+    };
+    chain.scopes.iter().take(last).any(|scope| {
+        scope.descriptor.kind != otter_bytecode::ScopeKind::With
+            && scope.descriptor.slots.iter().any(|slot| slot.name == name)
+    })
+}
+
+/// Rebuild the compile-time state a direct eval inherits from its caller
+/// chain: the `with` object environments (§9.1.1.2.1) and the
+/// PrivateEnvironment (§19.2.1.1) of enclosing classes.
+fn inherit_eval_chain_state(cx: &mut Compiler) {
+    use otter_bytecode::{ScopeKind, SlotKind};
+    let Some(chain) = cx.eval_chain.clone() else {
+        return;
+    };
+    // Outermost first, so the innermost entry ends up last.
+    for hop in (0..chain.scopes.len()).rev() {
+        let descriptor = &chain.scopes[hop].descriptor;
+        let location = crate::compiler::ScopeLocation::Chain { hop };
+        match descriptor.kind {
+            ScopeKind::With => cx
+                .active_with_envs
+                .push(crate::with_statement::WithEnv { location }),
+            ScopeKind::Class => {
+                let names: std::collections::HashSet<String> = descriptor
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.kind == SlotKind::PrivateName)
+                    .filter_map(|slot| slot.name.strip_prefix('#').map(str::to_string))
+                    .collect();
+                let namespace = {
+                    let module = Rc::clone(&cx.top_mut().module);
+                    let mut m = module.borrow_mut();
+                    let id = m.next_private_namespace;
+                    m.next_private_namespace = id.saturating_add(1);
+                    id
+                };
+                cx.private_namespaces.push(namespace);
+                cx.class_private_names.push(names);
+                cx.class_private_instance_methods
+                    .push(std::collections::HashSet::new());
+                cx.class_scope_locations.push(location);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Lower a script or eval body into a stand-alone module whose function 0
+/// is `<main>`.
+pub(crate) fn compile_program_parts(
     program: ProgramParts<'_, '_>,
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
-    force_strict: bool,
-    eval_mode: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
-    new_target_allowed: bool,
-    super_property_allowed: bool,
-    super_call_allowed: bool,
+    mode: ProgramMode<'_>,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program_with_mode_impl_super_fnctor(
-        program,
-        source_kind,
-        module_specifier,
+    let ProgramMode {
         force_strict,
         eval_mode,
-        caller_scope,
-        false,
+        caller_chain,
         new_target_allowed,
         super_property_allowed,
         super_call_allowed,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compile_program_with_mode_impl_super_fnctor(
-    program: ProgramParts<'_, '_>,
-    source_kind: SyntaxSourceKind,
-    module_specifier: &str,
-    force_strict: bool,
-    eval_mode: bool,
-    caller_scope: Option<&[EvalCallerBinding]>,
-    global_var_env: bool,
-    new_target_allowed: bool,
-    super_property_allowed: bool,
-    super_call_allowed: bool,
-    function_constructor: bool,
-) -> Result<BytecodeModule, CompileError> {
+        function_constructor,
+    } = mode;
     let source_text = program.source_text;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let script_module_url = if module_specifier.starts_with("file://") {
@@ -671,12 +758,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     } else {
         Default::default()
     };
-    // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
-    // the dispatch loop's async machinery parks / resumes the
-    // entry frame on suspension points.
     // §12.9.3.1 + §15.7 strict-mode early errors that oxc_parser
-    // does not flag on its own (legacy octal / non-octal-decimal
-    // integer literals, etc.).
+    // does not flag on its own.
     strict_validation::validate_strict_mode_early_errors(
         program.directives,
         program.body,
@@ -686,19 +769,20 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     if !new_target_allowed {
         strict_validation::validate_script_new_target_early_errors(program.body)?;
     }
-    // §14.2.1 / §14.12.1 block-level lexical early errors (duplicate
-    // LexicallyDeclaredNames, lexical/var clashes) with the Annex B
-    // §B.3.3.1 sloppy-mode plain-function exemption.
+    // §14.2.1 / §14.12.1 block-level lexical early errors.
     strict_validation::validate_block_early_errors(
         program.body,
         force_strict || program.strict_directive,
     )?;
     let main_is_async = module_body_uses_top_level_await(program.body);
     let main_is_strict = force_strict || program.strict_directive;
-    // Reserve slot 0 for `<main>` so nested function compilation
-    // can pre-register their ids deterministically (slice 13 only
-    // needs the immediate id, but the slot reservation keeps the
-    // table densely populated).
+    let caller_chain = if eval_mode { caller_chain } else { None };
+    let var_depth = caller_chain.and_then(|chain| chain.var_depth);
+    // §19.2.1.1 — a strict eval owns its variable environment; a sloppy
+    // direct eval in a function extends the caller's; everything else
+    // (scripts, sloppy global-level evals) declares on the global object.
+    let function_var_env = eval_mode && !main_is_strict && var_depth.is_some();
+    let global_var_bindings = !eval_mode || (!main_is_strict && var_depth.is_none());
     module.borrow_mut().functions.push(Function {
         id: 0,
         name: "<main>".to_string(),
@@ -711,279 +795,73 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     let mut top = FunctionContext::new(Rc::clone(&module))
         .with_strict(main_is_strict)
         .with_module_url(script_module_url);
+    // A nested closure or direct eval reaching a body binding keeps it in
+    // a slot (every body binding when the body contains a direct eval).
     top.captured_names = capture::analyze_module(program.body);
     top.dot_arguments_observed = capture::program_reads_dot_arguments(program.body);
+    top.contains_direct_eval = capture::program_contains_direct_eval(program.body);
 
-    // §19.2.1.3 EvalDeclarationInstantiation — direct eval inside a
-    // function. The caller's bindings occupy the leading own-upvalue
-    // slots (the runtime splices the caller's cells in); the body's
-    // own var-scoped names are forced into cells so the caller can
-    // adopt them after the eval returns.
-    let caller = caller_scope.unwrap_or(&[]);
-    let caller_slot_count = u16::try_from(caller.len()).expect("eval caller scope too large");
-    if !caller.is_empty() && !main_is_strict {
-        // Step 5 — a sloppy body var-scoped name colliding with a
-        // caller lexical binding is a SyntaxError thrown at the eval
-        // call site.
-        let caller_lexical: HashSet<&str> = caller
-            .iter()
-            .filter(|b| b.lexical)
-            .map(|b| b.name.as_str())
-            .collect();
-        let mut body_var_names: Vec<String> = Vec::new();
-        hoist_var_names(program.body, &mut body_var_names);
-        body_var_names.extend(crate::annex_b::collect_annex_b_candidates(
-            program.body,
-            &HashSet::new(),
-        ));
-        if let Some(name) = body_var_names
-            .iter()
-            .find(|name| caller_lexical.contains(name.as_str()))
-        {
-            return Err(CompileError::Unsupported {
-                node: format!("SyntaxError: Identifier '{name}' has already been declared"),
-                span: program.span,
-            });
-        }
-        let caller_reusable: HashSet<&str> = caller
-            .iter()
-            .filter(|b| !b.captured)
-            .map(|b| b.name.as_str())
-            .collect();
-        // §19.2.1.3 step 16.a — a global-caller eval's var-scoped
-        // names bind on the global object, never in eval-local cells.
-        if !global_var_env {
-            for name in body_var_names {
-                // §19.2.1.3 HasVarDeclaration — only the caller's OWN
-                // variable-environment bindings are re-bound; a name the
-                // caller merely CAPTURES gets a fresh cell here.
-                if !caller_reusable.contains(name.as_str()) {
-                    top.captured_names.insert(name);
-                }
-            }
-        }
-    }
-    if !caller.is_empty() {
-        // A body lexical shadowing a caller binding needs a cell: the chunk's
-        // binding table must record the shadow so a nested direct eval splices
-        // the eval-local lexical instead of the stale caller passthrough.
-        let caller_names: HashSet<&str> = caller.iter().map(|b| b.name.as_str()).collect();
-        let mut body_lexical_names = Vec::new();
-        hoist_lexical_names(program.body, &mut body_lexical_names);
-        for (name, _) in body_lexical_names {
-            if caller_names.contains(name.as_str()) {
-                top.captured_names.insert(name);
-            }
-        }
-    }
-    // §19.2.1.1 — a strict top-level eval owns a private variable
-    // environment; a nested direct eval must splice its cells just
-    // like a function caller's, so the same promotion applies.
-    let strict_top_eval = eval_mode && main_is_strict && caller.is_empty();
-    if (!caller.is_empty() || strict_top_eval)
-        && capture::program_contains_direct_eval(program.body)
+    let mut top_level_vars: Vec<String> = Vec::new();
+    hoist_var_names(program.body, &mut top_level_vars);
+    // §19.2.1.3 step 3 — var/lexical conflicts against the caller chain.
+    if eval_mode
+        && !main_is_strict
+        && let Some(chain) = caller_chain
     {
-        // A nested direct eval sees this chunk's scope as *its*
-        // caller environment — promote every body-level binding to a
-        // cell so the inner chunk can splice them. A sloppy
-        // global-caller chunk's var-scoped names live on the global
-        // object instead, and the nested eval reaches them there.
-        let mut names = capture::all_program_names(program.body);
-        if global_var_env && !main_is_strict {
-            let mut var_names: Vec<String> = Vec::new();
-            hoist_var_names(program.body, &mut var_names);
-            for name in &var_names {
-                names.remove(name);
-            }
-        }
-        top.captured_names.extend(names);
+        check_eval_var_conflicts(chain, &top_level_vars, program.span)?;
     }
-    top.own_upvalue_count = caller_slot_count;
 
     // §19.2.1.1 — a nested direct eval inside this eval body inherits
-    // the caller's `super` legality: the eval main frame stands in for
-    // the method / derived-constructor frame the outer eval ran in.
+    // the caller's `super` legality.
     top.has_home_object = super_property_allowed;
     top.is_derived_ctor = super_call_allowed;
+    // `this` of a `super()`-capable eval is the caller constructor's
+    // `DerivedThis` slot when it has one.
+    top.eval_this_from_chain = super_call_allowed
+        && caller_chain.is_some_and(|chain| {
+            chain.scopes.iter().any(|scope| {
+                scope
+                    .descriptor
+                    .slots
+                    .iter()
+                    .any(|slot| slot.kind == otter_bytecode::SlotKind::DerivedThis)
+            })
+        });
+    // A script `<main>` and an indirect eval run with no closure context.
+    top.closure_context_empty = caller_chain.is_none();
     let mut cx = Compiler::new(top);
-    cx.suppress_global_mirror =
-        eval_mode && (main_is_strict || (!caller.is_empty() && !global_var_env));
+    cx.eval_chain = caller_chain.cloned();
+    cx.suppress_global_mirror = eval_mode && (main_is_strict || function_var_env);
     cx.in_eval = eval_mode;
-    // Unresolved names may hit bindings a nested direct eval
-    // introduces into this chunk's own frame at runtime.
-    cx.contains_direct_eval = !caller.is_empty();
     cx.eval_new_target_allowed = new_target_allowed;
     // §20.2.1.1 step 32 — the dynamic function's outer NFE gets no
     // self-name binding: `anonymous` inside the body resolves free.
     if function_constructor {
         cx.next_fn_expr_no_self_binding = true;
     }
-    cx.enter_scope();
-
-    if !caller.is_empty() {
-        // Every body lexical owns a fresh eval-local binding. A strict eval's
-        // body vars do too (§19.2.1.1); a sloppy body var only needs a fresh
-        // cell when the same name is a passthrough capture rather than the
-        // caller variable environment's own binding.
-        let shadowed: HashSet<String> = {
-            let mut lexical_names = Vec::new();
-            hoist_lexical_names(program.body, &mut lexical_names);
-            let mut shadowed = lexical_names
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect::<HashSet<_>>();
-            let mut var_names = Vec::new();
-            hoist_var_names(program.body, &mut var_names);
-            if main_is_strict {
-                shadowed.extend(var_names);
-            } else {
-                // Sloppy eval: a body `var` matching a CAPTURED
-                // caller binding declares fresh (§19.2.1.3 —
-                // HasVarDeclaration consults the caller's varEnv,
-                // which does not contain passthrough captures).
-                let captured: HashSet<&str> = caller
-                    .iter()
-                    .filter(|b| b.captured)
-                    .map(|b| b.name.as_str())
-                    .collect();
-                shadowed.extend(
-                    var_names
-                        .into_iter()
-                        .filter(|name| captured.contains(name.as_str())),
-                );
-            }
-            shadowed
-        };
-        for (slot, binding) in caller.iter().enumerate() {
-            if shadowed.contains(&binding.name) {
-                continue;
-            }
-            // §19.2.1.3 — a caller binding a previous sloppy eval
-            // introduced stays deletable through this chunk: route its
-            // reads / writes / `delete` through the dynamic ops.
-            if binding.deletable {
-                cx.eval_var_names.insert(binding.name.clone());
-            }
-            cx.scopes[0].bindings.insert(
-                binding.name.clone(),
-                BindingInfo {
-                    storage: BindingStorage::Upvalue { idx: slot as u16 },
-                    is_const: binding.is_const,
-                    initialized: true,
-                    fn_self_name: binding.fn_self_name,
-                    type_hint: TypeHint::Unknown,
-                    catch_param: false,
-                    param: false,
-                },
-            );
-        }
-        // §9.1.1.2.1 — a direct eval inside a `with` body resolves
-        // identifiers against the same object environments as the
-        // caller. Their captured cells arrive as ordinary caller
-        // bindings; rebuild the chain from them, outermost first, so
-        // identifier sites probe the innermost object first. The
-        // whole chain sits at the chunk's own scope depth: an eval-body
-        // block declaration shadows it, an eval-body `var` — which lands
-        // in the caller's variable environment, outside the `with` —
-        // does not.
-        cx.caller_scope_depths = caller
-            .iter()
-            .map(|binding| (binding.name.clone(), binding.scope_depth as usize))
-            .collect();
-        let mut with_envs: Vec<(u32, String, usize)> = caller
-            .iter()
-            .filter_map(|binding| {
-                let id = binding
-                    .name
-                    .strip_prefix(crate::with_statement::WITH_ENV_PREFIX)?;
-                Some((
-                    id.parse::<u32>().ok()?,
-                    binding.name.clone(),
-                    binding.scope_depth as usize,
-                ))
-            })
-            .collect();
-        with_envs.sort_unstable();
-        let fn_depth = cx.stack.len();
-        cx.active_with_envs = with_envs
-            .into_iter()
-            .map(|(_, binding, scope_depth)| crate::with_statement::WithEnv {
-                binding,
-                fn_depth,
-                scope_depth,
-            })
-            .collect();
-        // §19.2.1.1 — reconstruct the caller's PrivateEnvironment
-        // from the spliced `__privsym_{ns}_{name}` cells so the eval
-        // body resolves `obj.#name` through the ordinary
-        // private-name machinery. Namespace ids are allocation-
-        // ordered (inner classes allocate later), giving the correct
-        // innermost-last stack.
-        {
-            let mut env: std::collections::BTreeMap<u32, std::collections::HashSet<String>> =
-                std::collections::BTreeMap::new();
-            for binding in caller.iter() {
-                if let Some(rest) = binding.name.strip_prefix("__privsym_")
-                    && let Some((ns_str, priv_name)) = rest.split_once('_')
-                    && let Ok(ns) = ns_str.parse::<u32>()
-                {
-                    env.entry(ns).or_default().insert(priv_name.to_string());
-                }
-            }
-            for (ns, names) in env {
-                cx.private_namespaces.push(ns);
-                cx.class_private_names.push(names);
-            }
-        }
-    }
+    let scope_kind = if !eval_mode {
+        otter_bytecode::ScopeKind::Block
+    } else if main_is_strict {
+        otter_bytecode::ScopeKind::EvalVar
+    } else {
+        otter_bytecode::ScopeKind::EvalLexical
+    };
+    cx.enter_scope_with_flags(
+        scope_kind,
+        otter_bytecode::ScopeFlags {
+            strict: main_is_strict,
+            var_scope: eval_mode && main_is_strict,
+            has_extension: false,
+        },
+    );
+    inherit_eval_chain_state(&mut cx);
 
     // §16.1.7 GlobalDeclarationInstantiation step 16 / §19.2.1.3
     // EvalDeclarationInstantiation step 16.a — script global code and
-    // sloppy global-caller eval code create their top-level `var` /
-    // function bindings on the global object's environment record,
-    // not as `<main>` locals: nested functions, sibling scripts, and
-    // eval chunks all resolve the same property, so no reader can
-    // observe a stale local copy. Script bindings are
-    // non-configurable; eval bindings are deletable. Strict eval and
-    // function-caller eval keep the local / caller-cell model.
+    // sloppy global-level eval code create their top-level `var` /
+    // function bindings on the global object's environment record.
+    // Script bindings are non-configurable; eval bindings are deletable.
     let program_span = program.span;
-    let mut top_level_vars: Vec<String> = Vec::new();
-    hoist_var_names(program.body, &mut top_level_vars);
-    let global_var_bindings =
-        !eval_mode || ((caller.is_empty() || global_var_env) && !main_is_strict);
-    if eval_mode && !global_var_bindings && !main_is_strict {
-        // §19.2.1.3 step 16.b — only names WITHOUT a pre-existing
-        // caller variable-environment binding create fresh deletable
-        // bindings; a name that re-binds the caller's own var keeps
-        // the caller's non-deletable cell.
-        let caller_owned: HashSet<&str> = caller
-            .iter()
-            .filter(|b| !b.captured && !b.inner && !b.lexical)
-            .map(|b| b.name.as_str())
-            .collect();
-        cx.eval_var_names.extend(
-            top_level_vars
-                .iter()
-                .filter(|name| !caller_owned.contains(name.as_str()))
-                .cloned(),
-        );
-        // §B.3.3.3 — a block-level function whose name collides with a
-        // top-level lexical declaration is skipped by the annex-B
-        // var-hoisting (the early-error exemption does not apply), so
-        // the name never becomes an eval var binding.
-        let lexical_blocked: HashSet<String> = {
-            let mut names: Vec<(String, bool)> = Vec::new();
-            hoist_lexical_names(program.body, &mut names);
-            names.into_iter().map(|(name, _)| name).collect()
-        };
-        cx.eval_var_names.extend(
-            crate::annex_b::collect_annex_b_candidates(program.body, &HashSet::new())
-                .into_iter()
-                .filter(|name| {
-                    !caller_owned.contains(name.as_str()) && !lexical_blocked.contains(name)
-                }),
-        );
-    }
     if global_var_bindings {
         cx.script_global_vars = top_level_vars.iter().cloned().collect();
         // §16.1.7 steps 1–12 / §19.2.1.3 steps 5–11 — validate every
@@ -1022,37 +900,18 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
                 program_span,
             );
         }
+    } else if function_var_env {
+        // §19.2.1.3 steps 16–17 — a name the caller's variable scope does
+        // not bind statically becomes a deletable binding of its eval
+        // extension; a statically bound one is re-bound in place.
+        let mut seen: HashSet<&str> = HashSet::new();
+        for name in &top_level_vars {
+            if seen.insert(name.as_str()) {
+                eval_var_declaration_target(&mut cx, name, program_span);
+            }
+        }
     } else {
         pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
-    }
-    // §19.2.1.3 / §B.3.5 — a sloppy body `var` whose name matches an
-    // INNER caller binding (a catch parameter between the caller's
-    // variable environment and the eval site) still creates a fresh
-    // variable-environment binding underneath it. The name keeps
-    // resolving to the inner cell inside the body (the initializer
-    // assigns the catch binding), so the fresh cell lives behind a
-    // synthetic name and is re-exported for adoption under the real
-    // one.
-    if !main_is_strict && !global_var_bindings {
-        let caller_inner: HashSet<&str> = caller
-            .iter()
-            .filter(|b| b.inner)
-            .map(|b| b.name.as_str())
-            .collect();
-        for name in &top_level_vars {
-            if !caller_inner.contains(name.as_str()) {
-                continue;
-            }
-            let synthetic = format!("{EVAL_INNER_VAR_PREFIX}{name}");
-            if cx.lookup_binding(&synthetic).is_some() {
-                continue;
-            }
-            let storage = cx.declare_captured_binding(&synthetic, false, program_span)?;
-            let tmp = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(tmp)], program_span);
-            cx.emit_store_storage(tmp, storage, program_span);
-            cx.mark_initialized(&synthetic);
-        }
     }
     // §B.3.3.2/3 — sloppy script / eval bodies extend the variable
     // scope with block-level function declaration names.
@@ -1063,11 +922,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
         program_span,
     )?;
     // §10.2.11 step 33 — pre-declare top-level `let` / `const` /
-    // `class` names with TDZ so the function-hoist pass below can
-    // see them when an inner function captures one of these
-    // forward references. Script global code instead declares them
-    // on the realm's global declarative record (§16.1.7 step 15) so
-    // sibling scripts and eval chunks resolve the same binding; eval
+    // `class` names with TDZ. Script global code instead declares them
+    // on the realm's global declarative record (§16.1.7 step 15); eval
     // lexicals stay private to the eval body (§19.2.1.1).
     let mut top_level_lex: Vec<(String, bool)> = Vec::new();
     hoist_lexical_names(program.body, &mut top_level_lex);
@@ -1091,12 +947,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     } else {
         pre_declare_lexical_bindings(&mut cx, &top_level_lex, program_span)?;
     }
-    // §10.2.11 step 30 — top-level `function f() {…}` declarations
-    // hoist to the script scope so calls before the source-level
-    // declaration resolve to the function value. In global-binding
-    // mode this runs *before* the var pre-pass per §16.1.7 steps
-    // 16–17 / §19.2.1.3 steps 14–15: a CanDeclareGlobalFunction
-    // TypeError must abort before any var binding is created.
+    // §10.2.11 step 30 — top-level function declarations hoist so calls
+    // before the source-level declaration resolve to the function value.
     hoist_function_declarations(&mut cx, program.body)?;
     if global_var_bindings {
         let function_names: HashSet<String> = top_level_hoistable_function_names(program.body)
@@ -1120,10 +972,7 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
         }
     }
 
-    // §8.4 — the program completion register (spec `V`). Expression
-    // statements store into it as they evaluate; composite statements
-    // reset it on entry, so abrupt exits (break out of a switch,
-    // throw into a catch) still observe the right value.
+    // §8.4 — the program completion register (spec `V`).
     let completion_reg = cx.alloc_scratch();
     cx.emit(
         Op::LoadUndefined,
@@ -1131,11 +980,8 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
         program_span,
     );
     cx.completion_reg = Some(completion_reg);
-    // A directive prologue (`"use strict"`, etc.) is a sequence of
-    // string-literal expression statements; each contributes its
-    // string value to the script / `eval` completion value (so
-    // `eval('"x"')` evaluates to `"x"`). oxc lifts these out of
-    // `body` into `directives`, so emit them here first.
+    // A directive prologue contributes its string values to the script /
+    // `eval` completion value (so `eval('"x"')` evaluates to `"x"`).
     for directive in program.directives {
         let dst = cx.alloc_scratch();
         let const_idx = cx.intern_string_constant(&directive.expression.value);
@@ -1149,95 +995,6 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     for stmt in program.body {
         compile_discarded_statement(&mut cx, stmt)?;
     }
-    // The chunk's full cell-backed scope table. The runtime adopts
-    // the var-shaped entries that were not part of the caller scope
-    // into the caller frame (§19.2.1.3 step 16.b); the whole table
-    // doubles as the caller environment for a nested direct eval
-    // running from this chunk's frame.
-    let mut eval_new_bindings: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
-    if !caller.is_empty() || strict_top_eval {
-        let mut body_var_names = top_level_vars
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let annex_b_names =
-            crate::annex_b::collect_annex_b_candidates(program.body, &HashSet::new());
-        body_var_names.extend(annex_b_names.iter().map(String::as_str));
-        let caller_captures: HashSet<&str> = caller
-            .iter()
-            .filter(|binding| binding.captured)
-            .map(|binding| binding.name.as_str())
-            .collect();
-        let body_lexical: HashSet<&str> = top_level_lex
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let caller_lexical: HashSet<&str> = caller
-            .iter()
-            .filter(|binding| binding.lexical)
-            .map(|binding| binding.name.as_str())
-            .collect();
-        let caller_inner: HashSet<&str> = caller
-            .iter()
-            .filter(|binding| binding.inner)
-            .map(|binding| binding.name.as_str())
-            .collect();
-        if let Some(scope) = cx.scopes.first() {
-            for (name, info) in &scope.bindings {
-                if let BindingStorage::Upvalue { idx } = info.storage {
-                    // §B.3.5 — re-export the fresh under-the-catch
-                    // `var` cell for adoption under its real name.
-                    if let Some(real) = name.strip_prefix(EVAL_INNER_VAR_PREFIX) {
-                        eval_new_bindings.push(otter_bytecode::DirectEvalBinding {
-                            captured: false,
-                            name: real.to_string(),
-                            upvalue: idx,
-                            lexical: main_is_strict,
-                            is_const: false,
-                            fn_self_name: false,
-                            inner: false,
-                            param: false,
-                            deletable: cx.eval_var_names.contains(real),
-                            scope_depth: 1,
-                        });
-                        continue;
-                    }
-                    eval_new_bindings.push(otter_bytecode::DirectEvalBinding {
-                        // A caller passthrough remains a passthrough unless
-                        // this eval body itself declares the name. The
-                        // runtime must not adopt unrelated captures into the
-                        // current eval record: doing so would let
-                        // `eval("var y")` shadow a nearer static `x` with an
-                        // alias to an outer dynamic `x`.
-                        // An INNER caller alias (catch parameter /
-                        // block lexical) is never this eval's own
-                        // variable-environment binding either.
-                        captured: caller_inner.contains(name.as_str())
-                            || (caller_captures.contains(name.as_str())
-                                && !body_var_names.contains(name.as_str())
-                                && !body_lexical.contains(name.as_str())),
-                        name: name.clone(),
-                        upvalue: idx,
-                        // A strict eval's own variable environment is
-                        // private (§19.2.1.1) — flagging every entry
-                        // non-adoptable keeps the bindings visible to
-                        // nested evals without leaking them into the
-                        // caller frame.
-                        lexical: main_is_strict
-                            || body_lexical.contains(name.as_str())
-                            || caller_lexical.contains(name.as_str()),
-                        is_const: info.is_const,
-                        fn_self_name: info.fn_self_name,
-                        inner: false,
-                        param: false,
-                        deletable: cx.eval_var_names.contains(name.as_str()),
-                        scope_depth: 1,
-                    });
-                }
-            }
-        }
-        eval_new_bindings.sort_by(|a, b| a.name.cmp(&b.name));
-    }
     cx.exit_scope();
 
     // The program completion value is whatever the completion
@@ -1245,36 +1002,25 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
     let span = program.span;
     cx.emit(Op::Return, [Operand::Register(completion_reg)], span);
 
-    // Finalize `<main>` into the module's function table, then
-    // drop `cx` so the module Rc has a single owner before
-    // `try_unwrap`.
     {
+        let finished = cx.finish_code(span);
+        if cx.register_overflow {
+            return Err(CompileError::Unsupported {
+                node: "program body exhausts the 65535-register window".to_string(),
+                span,
+            });
+        }
+        let contains_direct_eval = cx.contains_direct_eval;
+        cx.take_class_hint_sites(0, finished.class_hint_sites);
         let mut m = module.borrow_mut();
         m.functions[0].locals = 0;
-        m.functions[0].scratch = cx.scratch_window();
-        m.functions[0].own_upvalue_count = cx.own_upvalue_count;
-        m.functions[0].direct_eval_bindings = eval_new_bindings;
-        // §19.2.1.1 — a nested direct eval from this chunk inherits
-        // the in-function signal from the chunk's own caller. A
-        // global-caller chunk keeps the script-top-level shape: a
-        // nested eval's variable environment is still the global one.
-        m.functions[0].contains_direct_eval = (!caller.is_empty() && !global_var_env)
-            || (strict_top_eval && !m.functions[0].direct_eval_bindings.is_empty());
-        let mut code = std::mem::take(&mut cx.code);
-        let mut main_eval_sites = std::mem::take(&mut cx.eval_sites);
-        crate::function_context::finalize_virtual_capture_indices(
-            &mut code,
-            &mut m.functions[0].direct_eval_bindings,
-            &mut main_eval_sites,
-            cx.own_upvalue_count,
-        );
-        m.functions[0].eval_sites = main_eval_sites;
-        m.functions[0].number_hint_sites = std::mem::take(&mut cx.number_hint_sites);
-        let main_class_hint_sites = std::mem::take(&mut cx.class_hint_sites);
-        cx.take_class_hint_sites(0, main_class_hint_sites);
+        m.functions[0].scratch = finished.scratch;
+        m.functions[0].scopes = finished.scopes;
+        m.functions[0].contains_direct_eval = contains_direct_eval;
+        m.functions[0].number_hint_sites = finished.number_hint_sites;
         crate::type_hints::resolve_class_hint_sites(&cx, &mut m.functions);
-        m.functions[0].code = code.finish();
-        m.functions[0].spans = std::mem::take(&mut cx.spans);
+        m.functions[0].code = finished.code;
+        m.functions[0].spans = finished.spans;
     }
     drop(cx);
 
@@ -1313,23 +1059,23 @@ pub(crate) fn compile_program_with_mode_impl_super_fnctor(
 /// `BytecodeModule`.
 ///
 /// # Algorithm (spec mapping: ECMA-262 §16.2 Modules)
-/// 1. Run an import pre-pass over the program body, registering a
-///    fresh `import_record_<n>` upvalue per source specifier and
-///    recording each importer-side alias → `(record_uv, source_name)`
+/// 1. Run an import pre-pass over the program body, numbering one
+///    import record per source specifier and recording each
+///    importer-side alias → `(record, source_name)`
 ///    binding (§16.2.2 ModuleNamespaceObject for `import * as`,
 ///    §16.2.3 ImportEntry for named imports).
 /// 2. Run an export pre-pass to collect the names this module
 ///    exports (§16.2.3 ExportEntry). Every later assignment to one
 ///    of those names emits an extra `StoreProperty module_env,
 ///    name, value` so live bindings propagate across modules.
-/// 3. Allocate own-upvalue cells for `module_env` (param 0) and
-///    `import_meta` (param 1), hoist the parameters into those
-///    cells at function entry so closures defined inside the body
-///    can capture them via the regular upvalue mechanism.
-/// 4. Allocate one own-upvalue cell per import source and emit
-///    `Op::ImportNamespace cell_dst, target_url_const` followed by
-///    a `StoreUpvalue` to populate it. Subsequent reads of an
-///    imported alias resolve through this cell.
+/// 3. Declare module-scope slots for `module_env` (param 0) and
+///    `import_meta` (param 1) and store the parameters into them at
+///    entry, so closures defined inside the body reach them through
+///    their context chain. The module scope's context is allocated by
+///    the runtime from descriptor 0 and shared by the link and
+///    evaluation invocations.
+/// 4. Declare one module-scope slot per import source and fill it with
+///    `Op::ImportNamespace`.
 /// 5. Compile the rest of the body via the existing
 ///    [`compile_statement`] path; the import / export awareness
 ///    stays in [`FunctionContext::module_state`] and the identifier
@@ -1401,32 +1147,26 @@ pub fn compile_module_program(
     top.captured_names = capture::analyze_module(&program.body);
     // Hoisted function declarations instantiate during the link-phase
     // init invocation; the evaluation-phase invocation (a separate
-    // frame) must observe the same closure values, so their bindings
-    // are forced into the persistent own-upvalue cells.
+    // frame over the same module context) must observe the same closure
+    // values, so their bindings live in module-scope slots.
     for name in top_level_hoistable_function_names(&program.body) {
         top.captured_names.insert(name);
     }
-    // Also capture names that any inner function references whose
-    // bindings live as `module_env` / `import_meta` / `import_record_*`
-    // — those are forced own-upvalues (see allocate_module_upvalues).
-
-    // Allocate own-upvalues for module_env, import_meta, and
-    // every imported source. These slots must be stable for the
-    // body's compilation so we reserve them up front.
-    let module_env_uv = top.own_upvalue_count;
-    top.own_upvalue_count = top.own_upvalue_count.checked_add(1).expect("uv overflow");
-    let import_meta_uv = top.own_upvalue_count;
-    top.own_upvalue_count = top.own_upvalue_count.checked_add(1).expect("uv overflow");
+    top.contains_direct_eval = capture::program_contains_direct_eval(&program.body);
 
     let mut state = ModuleState {
-        module_env_uv,
-        import_meta_uv,
+        pre_resolved_imports: host.resolved_imports.clone(),
         ..ModuleState::default()
     };
-    state.pre_resolved_imports = host.resolved_imports.clone();
+    let mut next_record: u16 = 0;
+    let mut allocate_record = || {
+        let record = next_record;
+        next_record = next_record.checked_add(1).expect("import record overflow");
+        record
+    };
 
-    // Pre-pass: collect import sources + record per-source upvalue
-    // slots; collect exported names + import bindings.
+    // Pre-pass: collect import sources + number their records; collect
+    // exported names + import bindings.
     let mut import_sources_in_order: Vec<ImportRequest> = Vec::new();
     let mut deferred_sources_in_order: Vec<ImportRequest> = Vec::new();
     // §16.2.1.7 InitializeEnvironment — exported binding slots that
@@ -1449,7 +1189,7 @@ pub fn compile_module_program(
             Statement::ImportDeclaration(decl) if !decl.import_kind.is_type() => {
                 // The `type` attribute is half the request key: the same
                 // specifier read as two formats is two targets and two
-                // record cells, never one shared binding.
+                // records, never one shared binding.
                 let request = ImportRequest::new(
                     decl.source.value.as_str(),
                     import_attribute_type(decl.with_clause.as_deref()),
@@ -1482,26 +1222,24 @@ pub fn compile_module_program(
                         });
                     }
                 }
-                // Deferred imports bind to a dedicated cell so they are
+                // Deferred imports bind to a dedicated record so they are
                 // not pulled into the eager-evaluation set and stay
                 // distinct from any eager namespace of the same module.
-                let record_uv = if is_defer_phase {
-                    if let Some(&uv) = state.deferred_import_records.get(&request) {
-                        uv
+                let record = if is_defer_phase {
+                    if let Some(&record) = state.deferred_import_records.get(&request) {
+                        record
                     } else {
-                        let uv = top.own_upvalue_count;
-                        top.own_upvalue_count =
-                            top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                        state.deferred_import_records.insert(request.clone(), uv);
+                        let record = allocate_record();
+                        state
+                            .deferred_import_records
+                            .insert(request.clone(), record);
                         deferred_sources_in_order.push(request.clone());
-                        uv
+                        record
                     }
                 } else {
                     if !state.import_records.contains_key(&request) {
-                        let uv = top.own_upvalue_count;
-                        top.own_upvalue_count =
-                            top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                        state.import_records.insert(request.clone(), uv);
+                        let record = allocate_record();
+                        state.import_records.insert(request.clone(), record);
                         import_sources_in_order.push(request.clone());
                     }
                     state.import_records[&request]
@@ -1525,7 +1263,7 @@ pub fn compile_module_program(
                                 state.imported_names.insert(
                                     alias,
                                     ImportBinding {
-                                        record_uv_idx: record_uv,
+                                        record,
                                         source_name,
                                         is_namespace: false,
                                         request: request.clone(),
@@ -1538,7 +1276,7 @@ pub fn compile_module_program(
                                 state.imported_names.insert(
                                     alias,
                                     ImportBinding {
-                                        record_uv_idx: record_uv,
+                                        record,
                                         source_name: "default".to_string(),
                                         is_namespace: false,
                                         request: request.clone(),
@@ -1553,7 +1291,7 @@ pub fn compile_module_program(
                                 state.imported_names.insert(
                                     alias,
                                     ImportBinding {
-                                        record_uv_idx: record_uv,
+                                        record,
                                         source_name: String::new(),
                                         is_namespace: true,
                                         request: request.clone(),
@@ -1616,10 +1354,8 @@ pub fn compile_module_program(
                         import_attribute_type(decl.with_clause.as_deref()),
                     );
                     if !state.import_records.contains_key(&request) {
-                        let uv = top.own_upvalue_count;
-                        top.own_upvalue_count =
-                            top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                        state.import_records.insert(request.clone(), uv);
+                        let record = allocate_record();
+                        state.import_records.insert(request.clone(), record);
                         import_sources_in_order.push(request);
                     }
                 }
@@ -1680,10 +1416,8 @@ pub fn compile_module_program(
                     import_attribute_type(decl.with_clause.as_deref()),
                 );
                 if !state.import_records.contains_key(&request) {
-                    let uv = top.own_upvalue_count;
-                    top.own_upvalue_count =
-                        top.own_upvalue_count.checked_add(1).expect("uv overflow");
-                    state.import_records.insert(request.clone(), uv);
+                    let record = allocate_record();
+                    state.import_records.insert(request.clone(), record);
                     import_sources_in_order.push(request);
                 }
                 if let Some(exported) = decl.exported.as_ref() {
@@ -1720,90 +1454,53 @@ pub fn compile_module_program(
         }
     }
 
+    let record_count = next_record;
     top.module_state = Some(state);
 
     let mut cx = Compiler::new(top);
-    cx.enter_scope();
-
-    // Register synthetic bindings for module_env and each
-    // import_record so inner functions can capture them through
-    // the regular `resolve_capture` cascade. Without these, an
-    // inner function that references an imported alias would see
-    // no binding in its scope chain and fail with
-    // "unresolved identifier".
-    {
-        let env_uv_sb = cx.module_state.as_ref().unwrap().module_env_uv;
-        let meta_uv_sb = cx.module_state.as_ref().unwrap().import_meta_uv;
-        let record_uvs: Vec<u16> = {
-            let ms = cx.module_state.as_ref().unwrap();
-            ms.import_records
-                .values()
-                .chain(ms.deferred_import_records.values())
-                .copied()
-                .collect()
-        };
-        cx.scopes[0].bindings.insert(
-            module_env_synthetic_name(),
-            BindingInfo {
-                storage: BindingStorage::Upvalue { idx: env_uv_sb },
-                is_const: true,
-                initialized: true,
-                fn_self_name: false,
-                type_hint: TypeHint::Unknown,
-                catch_param: false,
-                param: false,
-            },
-        );
-        cx.scopes[0].bindings.insert(
-            import_meta_synthetic_name(),
-            BindingInfo {
-                storage: BindingStorage::Upvalue { idx: meta_uv_sb },
-                is_const: true,
-                initialized: true,
-                fn_self_name: false,
-                type_hint: TypeHint::Unknown,
-                catch_param: false,
-                param: false,
-            },
-        );
-        for uv in &record_uvs {
-            cx.scopes[0].bindings.insert(
-                import_record_synthetic_name(*uv),
-                BindingInfo {
-                    storage: BindingStorage::Upvalue { idx: *uv },
-                    is_const: true,
-                    initialized: true,
-                    fn_self_name: false,
-                    type_hint: TypeHint::Unknown,
-                    catch_param: false,
-                    param: false,
-                },
-            );
-        }
+    // The module scope's context (descriptor 0) is allocated by the runtime
+    // once per module and handed to both `<module-init>` invocations (link
+    // and evaluation) as their closure context.
+    cx.enter_scope_with_flags(
+        otter_bytecode::ScopeKind::Module,
+        otter_bytecode::ScopeFlags {
+            strict: true,
+            var_scope: true,
+            has_extension: false,
+        },
+    );
+    cx.install_runtime_created_scope();
+    let span0 = (program.span.start, program.span.end);
+    // The module environment, `import.meta`, and every import record live
+    // in module-scope slots, so nested functions reach them by name.
+    let env_storage = cx.declare_forced_slot(
+        crate::compiler::MODULE_ENV_BINDING,
+        otter_bytecode::SlotKind::ModuleEnv,
+        span0,
+    )?;
+    cx.mark_initialized(crate::compiler::MODULE_ENV_BINDING);
+    let meta_storage = cx.declare_forced_slot(
+        crate::compiler::IMPORT_META_BINDING,
+        otter_bytecode::SlotKind::ImportMeta,
+        span0,
+    )?;
+    cx.mark_initialized(crate::compiler::IMPORT_META_BINDING);
+    let mut record_storages = Vec::with_capacity(usize::from(record_count));
+    for record in 0..record_count {
+        let name = crate::compiler::import_record_binding(record);
+        let storage = cx.declare_forced_slot(&name, otter_bytecode::SlotKind::Synthetic, span0)?;
+        cx.mark_initialized(&name);
+        record_storages.push(storage);
     }
 
-    // Hoist params into upvalue cells: param 0 → module_env_uv,
-    // param 1 → import_meta_uv. The runtime stores params in
-    // registers 0..param_count; we re-emit StoreUpvalue from those.
-    let span0 = (program.span.start, program.span.end);
-    let env_uv = cx.module_state.as_ref().unwrap().module_env_uv;
-    let meta_uv = cx.module_state.as_ref().unwrap().import_meta_uv;
-    cx.emit(
-        Op::StoreUpvalue,
-        [Operand::Register(0), Operand::Imm32(env_uv as i32)],
-        span0,
-    );
-    cx.emit(
-        Op::StoreUpvalue,
-        [Operand::Register(1), Operand::Imm32(meta_uv as i32)],
-        span0,
-    );
-    cx.scratch = 3; // params occupy r0 (env), r1 (meta), r2 (link-phase flag)
+    // Params: r0 = module_env, r1 = import_meta, r2 = link-phase flag.
+    cx.scratch = 3;
+    cx.emit_store_storage(0, env_storage, span0);
+    cx.emit_store_storage(1, meta_storage, span0);
 
-    // For each import source, emit Op::ImportNamespace then
-    // StoreUpvalue to populate the per-source record cell.
+    // For each import source, resolve its namespace into the record slot.
     for request in &import_sources_in_order {
-        let record_uv = cx.module_state.as_ref().unwrap().import_records[request];
+        let record = cx.module_state.as_ref().unwrap().import_records[request];
         let scratch = cx.alloc_scratch();
         let target = import_target_constant(&cx, request);
         let target_const = cx.intern_string_constant(&target);
@@ -1815,18 +1512,13 @@ pub fn compile_module_program(
             ],
             span0,
         );
-        cx.emit(
-            Op::StoreUpvalue,
-            [Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
-            span0,
-        );
+        cx.emit_store_storage(scratch, record_storages[usize::from(record)], span0);
     }
 
-    // For each `import defer` source, emit Op::ImportNamespaceDeferred
-    // (resolves a deferred namespace object without evaluating the
-    // module) then StoreUpvalue into the deferred record cell.
+    // For each `import defer` source, resolve a deferred namespace object
+    // without evaluating the module.
     for request in &deferred_sources_in_order {
-        let record_uv = cx.module_state.as_ref().unwrap().deferred_import_records[request];
+        let record = cx.module_state.as_ref().unwrap().deferred_import_records[request];
         let scratch = cx.alloc_scratch();
         let target = import_target_constant(&cx, request);
         let target_const = cx.intern_string_constant(&target);
@@ -1838,18 +1530,14 @@ pub fn compile_module_program(
             ],
             span0,
         );
-        cx.emit(
-            Op::StoreUpvalue,
-            [Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
-            span0,
-        );
+        cx.emit_store_storage(scratch, record_storages[usize::from(record)], span0);
     }
 
     // §16.2.1.7 InitializeEnvironment — the prologue below runs only
     // during the link-phase invocation (third argument truthy); the
     // evaluation-phase invocation jumps straight to the body. Both
-    // frames share the module's persistent own-upvalue cells, so the
-    // closures and TDZ slots the link phase created stay visible.
+    // frames share the module's context, so the closures and TDZ slots
+    // the link phase created stay visible.
     let eval_phase_jump = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(2), span0);
 
     // §16.2.1.7 InitializeEnvironment — pre-declare exported binding
@@ -1872,17 +1560,7 @@ pub fn compile_module_program(
             slots.push((exported.clone(), false));
         }
         if !slots.is_empty() {
-            let env_uv = cx
-                .module_state
-                .as_ref()
-                .map(|s| s.module_env_uv)
-                .expect("module_state present for module fragment");
-            let env_reg = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUpvalue,
-                [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
-                span0,
-            );
+            let env_reg = crate::statements::module_env_register(&mut cx, span0)?;
             let mut seen = std::collections::HashSet::new();
             for (name, is_var) in slots {
                 if !seen.insert(name.clone()) {
@@ -1930,26 +1608,24 @@ pub fn compile_module_program(
     cx.emit(Op::ReturnUndefined, [], span0);
 
     {
+        let finished = cx.finish_code(span0);
+        if cx.register_overflow {
+            return Err(CompileError::Unsupported {
+                node: "module body exhausts the 65535-register window".to_string(),
+                span: span0,
+            });
+        }
+        let contains_direct_eval = cx.contains_direct_eval;
+        cx.take_class_hint_sites(0, finished.class_hint_sites);
         let mut m = module.borrow_mut();
         m.functions[0].locals = 0;
-        m.functions[0].scratch = cx.scratch_window();
-        m.functions[0].own_upvalue_count = cx.own_upvalue_count;
-        let mut code = std::mem::take(&mut cx.code);
-        let mut no_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = Vec::new();
-        let mut main_eval_sites = std::mem::take(&mut cx.eval_sites);
-        crate::function_context::finalize_virtual_capture_indices(
-            &mut code,
-            &mut no_eval_meta,
-            &mut main_eval_sites,
-            cx.own_upvalue_count,
-        );
-        m.functions[0].eval_sites = main_eval_sites;
-        m.functions[0].number_hint_sites = std::mem::take(&mut cx.number_hint_sites);
-        let main_class_hint_sites = std::mem::take(&mut cx.class_hint_sites);
-        cx.take_class_hint_sites(0, main_class_hint_sites);
+        m.functions[0].scratch = finished.scratch;
+        m.functions[0].scopes = finished.scopes;
+        m.functions[0].contains_direct_eval = contains_direct_eval;
+        m.functions[0].number_hint_sites = finished.number_hint_sites;
         crate::type_hints::resolve_class_hint_sites(&cx, &mut m.functions);
-        m.functions[0].code = code.finish();
-        m.functions[0].spans = std::mem::take(&mut cx.spans);
+        m.functions[0].code = finished.code;
+        m.functions[0].spans = finished.spans;
     }
     // Capture deferred import specifiers before dropping the compiler
     // so resolution edges can be flagged. A specifier imported both
@@ -2196,9 +1872,8 @@ pub(crate) fn compile_export_inner_declaration(
                 // module-scope binding pre-hoisted at module entry
                 // (var-hoist); `export let x` / `export const x`
                 // were pre-declared at module entry by
-                // `hoist_lexical_names` so inner functions could
-                // capture them through the standard upvalue
-                // cascade. Reuse the pre-declared binding when
+                // `hoist_lexical_names` so inner functions resolve
+                // them. Reuse the pre-declared binding when
                 // present; fall back to a fresh declaration only
                 // for the foundation cases the lexical hoist pass
                 // doesn't yet cover (e.g. destructuring leaves
@@ -2213,7 +1888,7 @@ pub(crate) fn compile_export_inner_declaration(
                 } else if let Some(info) = cx.lookup_in_current_scope(&name) {
                     info.storage
                 } else {
-                    cx.declare_binding(&name, is_const, dspan)?
+                    cx.declare_binding(&name, lexical_kind(is_const), dspan)?
                 };
                 let init_reg = match &declarator.init {
                     Some(init) => compile_expr(cx, init, dspan)?,
@@ -2249,7 +1924,11 @@ pub(crate) fn compile_export_inner_declaration(
             if cx.hoisted_function_names.contains(&name) {
                 return Ok(());
             }
-            let (function_id, captures) = compile_function_full(
+            let storage = match cx.lookup_in_current_scope(&name) {
+                Some(info) => info.storage,
+                None => cx.declare_binding(&name, otter_bytecode::SlotKind::FunctionDecl, fspan)?,
+            };
+            let record = compile_function_full(
                 cx,
                 &name,
                 &f.params,
@@ -2259,10 +1938,8 @@ pub(crate) fn compile_export_inner_declaration(
                 f.generator,
                 false,
             )?;
-            let storage = cx.declare_binding(&name, false, fspan)?;
-            let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
-            emit_make_callable(cx, tmp, const_idx, &captures, false, fspan)?;
+            emit_make_callable(cx, tmp, &record, fspan);
             cx.emit_store_storage(tmp, storage, fspan);
             cx.mark_initialized(&name);
             cx.emit_module_export_mirror(&name, tmp, fspan);
@@ -2287,7 +1964,7 @@ pub(crate) fn compile_export_inner_declaration(
             let storage = if let Some(info) = cx.lookup_in_current_scope(&name) {
                 info.storage
             } else {
-                cx.declare_binding(&name, false, cspan)?
+                cx.declare_binding(&name, otter_bytecode::SlotKind::Let, cspan)?
             };
             cx.emit_store_storage(class_reg, storage, cspan);
             cx.mark_initialized(&name);

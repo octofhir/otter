@@ -147,13 +147,9 @@ pub struct JitClosureCallLayout {
     pub function_id_byte: u32,
     /// Byte offset of [`crate::closure::ClosureCallHeader::flags`].
     pub flags_byte: u32,
-    /// Byte offset of [`crate::closure::ClosureCallHeader::upvalue_base`].
-    pub upvalue_base_byte: u32,
-    /// Byte offset of [`crate::closure::ClosureCallHeader::upvalue_count`].
-    pub upvalue_count_byte: u32,
-    /// Byte offset of the nullable compressed
-    /// [`crate::closure::ClosureCallHeader::eval_env`] handle.
-    pub eval_env_byte: u32,
+    /// Byte offset of the 8-byte [`crate::closure::ClosureCallHeader::context`]
+    /// word: a context value (full heap address) or `undefined`.
+    pub context_byte: u32,
     /// Byte offset of canonical [`crate::closure::JsClosureBody::bound_this`].
     pub bound_this_byte: u32,
     /// Byte offset of canonical
@@ -244,18 +240,60 @@ pub(crate) struct JitConstructorFieldTransitionPlan {
     pub(crate) slot: u16,
 }
 
-const _: [(); 60] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 52] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
-const _: [(); 8] = [(); std::mem::offset_of!(JitClosureCallLayout, upvalue_base_byte)];
-const _: [(); 12] = [(); std::mem::offset_of!(JitClosureCallLayout, upvalue_count_byte)];
-const _: [(); 16] = [(); std::mem::offset_of!(JitClosureCallLayout, eval_env_byte)];
-const _: [(); 20] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_byte)];
-const _: [(); 24] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte)];
-const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_flag)];
-const _: [(); 32] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag)];
-const _: [(); 36] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags)];
+const _: [(); 8] = [(); std::mem::offset_of!(JitClosureCallLayout, context_byte)];
+const _: [(); 12] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_byte)];
+const _: [(); 16] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte)];
+const _: [(); 20] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_flag)];
+const _: [(); 24] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag)];
+const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags)];
+
+/// Machine-readable [`crate::context::ContextBody`] layout.
+///
+/// Every byte offset is measured from the cell's [`otter_gc::GcHeader`] — a
+/// heap `Value` is the header's full address, so `parent`, `extension`, and a
+/// closure's context word are each one 8-byte load away from the next hop.
+/// Slot `i` of a context is at `slots_byte + 8 * i`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitContextLayout {
+    /// GC body tag of a context cell.
+    pub type_tag: u8,
+    /// Byte offset of the `u32` descriptor-owning function id.
+    pub scope_function_id_byte: u32,
+    /// Byte offset of the `u16` scope index.
+    pub scope_index_byte: u32,
+    /// Byte offset of the `u16` slot count.
+    pub slot_count_byte: u32,
+    /// Byte offset of the 8-byte parent word (context value or `undefined`).
+    pub parent_byte: u32,
+    /// Byte offset of the 8-byte eval-extension word (extension value or
+    /// `undefined`). Mutable: a direct eval may install it at any call.
+    pub extension_byte: u32,
+    /// Byte offset of slot 0.
+    pub slots_byte: u32,
+}
+
+impl JitContextLayout {
+    /// The layout of the current [`crate::context::ContextBody`].
+    #[must_use]
+    pub const fn current() -> Self {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        Self {
+            type_tag: crate::context::CONTEXT_BODY_TYPE_TAG,
+            scope_function_id_byte: header
+                + crate::context::CONTEXT_BODY_SCOPE_FUNCTION_ID_OFFSET as u32,
+            scope_index_byte: header + crate::context::CONTEXT_BODY_SCOPE_INDEX_OFFSET as u32,
+            slot_count_byte: header + crate::context::CONTEXT_BODY_SLOT_COUNT_OFFSET as u32,
+            parent_byte: header + crate::context::CONTEXT_BODY_PARENT_OFFSET as u32,
+            extension_byte: header + crate::context::CONTEXT_BODY_EXTENSION_OFFSET as u32,
+            slots_byte: header + crate::context::CONTEXT_BODY_SLOTS_OFFSET as u32,
+        }
+    }
+}
 
 /// Owned, moving-GC-stable snapshot of one executable function body.
 ///
@@ -324,9 +362,12 @@ pub struct JitCompileSnapshot {
     pub unseen_element_sites: rustc_hash::FxHashSet<u32>,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
-    /// Byte offset from a decompressed upvalue-cell pointer to its captured
-    /// `Value`, for the inline captured-binding read.
-    pub upvalue_value_byte: u32,
+    /// Byte offset from a decompressed global-lexical cell pointer to its
+    /// `Value`, for the inline global declarative-record read.
+    pub global_lexical_value_byte: u32,
+    /// Byte offsets of [`crate::context::ContextBody`] for inline
+    /// context-slot access, parent hops, and the extension probe.
+    pub context_layout: JitContextLayout,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
     /// emitter reads `[obj_ptr + object_shape_byte]` for CacheIR shape guards
@@ -412,7 +453,7 @@ pub struct JitCompileSnapshot {
     pub jit_proto_byte: u32,
     /// Complete VM-owned closure-call ABI contract. Method identity guards use
     /// its function-id offset; native call linkage additionally consumes its
-    /// flags, immutable upvalue spine, and canonical bound-value metadata.
+    /// flags, context word, and canonical bound-value metadata.
     pub closure_call_layout: JitClosureCallLayout,
     /// VM-baked class wrapper layout used by generated construct guards.
     pub class_constructor_layout: JitClassConstructorLayout,
@@ -447,8 +488,8 @@ pub struct JitCompileSnapshot {
     pub static_native_calls: rustc_hash::FxHashMap<u32, JitStaticNativeCall>,
     /// Compiler-native ordinary-call candidates keyed by byte PC. Fixed and
     /// spread calls have one target; forwarded arguments admit the bounded
-    /// feedback population. Each synchronous target has an exact fresh/inherited
-    /// upvalue spine and a stable non-OSR entry cell. Generated code guards
+    /// feedback population. Each synchronous target has a stable non-OSR entry
+    /// cell and receives its context through its exact SELF closure. Generated code guards
     /// callable identity and binds the current generation. A miss precedes call
     /// effects; forwarding retains its committed apply value for canonical
     /// completion. Body-inline candidates remain separate and monomorphic.
@@ -1046,10 +1087,6 @@ pub struct JitDirectCallPlan {
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
-    /// Fresh capture cells allocated by each invocation.
-    pub own_upvalue_count: u16,
-    /// Closure-owned capture cells copied after the fresh prefix.
-    pub inherited_upvalue_count: u16,
     /// The body materializes an `arguments` object, so the generated caller
     /// must publish every actual argument after the callee's register window
     /// and flag the frame with
@@ -1081,7 +1118,7 @@ pub struct JitDirectCallee {
 pub enum BindingHitProof {
     /// Permanent global-declarative cell rooted by the environment record.
     GlobalLexical {
-        /// Compressed GC-cage offset of the non-moving upvalue cell.
+        /// Compressed GC-cage offset of the non-moving global-lexical cell.
         cell_offset: u32,
         /// Whether assignment may update the live cell.
         writable: bool,
@@ -1106,7 +1143,7 @@ pub enum BindingHitProof {
 /// One permanent global-declarative binding available to generated code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitGlobalLexicalLoad {
-    /// Compressed GC-cage offset of the rooted, non-moving upvalue cell.
+    /// Compressed GC-cage offset of the rooted, non-moving global-lexical cell.
     pub cell_offset: u32,
 }
 
@@ -1481,11 +1518,6 @@ pub struct JitInstructionMetadata {
     pub(crate) instruction_index: u32,
     /// Cold serialized byte PC used by profiling and diagnostics.
     pub byte_pc: u32,
-    /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
-    /// being compiled (the named-function SELF binding). The emitter
-    /// materializes it as a direct read of the frame's own closure (carried in
-    /// `JitCtx`) instead of a Rust round-trip through the closure builder.
-    pub make_self: bool,
     /// `true` when this instruction is a named-property read of literal
     /// `"length"`. The emitter uses it to try the Array exotic length fast
     /// path before falling back to ordinary property semantics.
@@ -1514,7 +1546,6 @@ impl JitInstructionMetadata {
         Self {
             instruction_index,
             byte_pc,
-            make_self: false,
             load_array_length: false,
             method_hint: JitMethodHint::None,
             load_number: None,
@@ -1607,7 +1638,8 @@ impl JitCompileSnapshot {
             closure_call_layout: JitClosureCallLayout::default(),
             class_constructor_layout: JitClassConstructorLayout::default(),
             primitive_cell_type_tags: [0; 3],
-            upvalue_value_byte: 0,
+            global_lexical_value_byte: 0,
+            context_layout: JitContextLayout::current(),
             collection_layout: JitCollectionLayout::default(),
             native_ref_byte: 0,
             instructions,
@@ -1917,8 +1949,8 @@ impl VmRuntimeActivation {
     /// This is the sole materialized-entry bridge. The activation stores no
     /// tagged or compressed GC handles: it re-reads the materialized frame's
     /// cold call state immediately before the caller publishes `native_frame`.
-    /// Direct-eval environment ownership is transferred separately by
-    /// [`Self::with_native_eval_env_owner`].
+    /// The arguments identity flows back through
+    /// [`Self::with_native_frame_extent`].
     ///
     /// # Errors
     ///
@@ -1950,14 +1982,9 @@ impl VmRuntimeActivation {
         Ok(())
     }
 
-    /// Transfer the materialized frame's direct-eval environment to its
-    /// published native frame for exactly one compiled dynamic extent.
-    ///
-    /// The materialized slot is null while generated code can allocate. A
-    /// normal return, side exit, throw, or fatal status restores the surviving
-    /// native handle before the activation is unpublished. Cold deopt paths
-    /// may instead move that handle into a temporary materialized continuation;
-    /// in that case both outer slots remain null when `operation` returns.
+    /// Run one compiled dynamic extent over the native frame published for
+    /// this materialized activation, then write back the arguments identity
+    /// generated code materialized into the native frame.
     ///
     /// # Safety
     ///
@@ -1965,7 +1992,7 @@ impl VmRuntimeActivation {
     /// activation. `operation` may access it only through the generated-code
     /// ABI and must return before the stack frame or native record is reclaimed.
     #[doc(hidden)]
-    pub unsafe fn with_native_eval_env_owner<T>(
+    pub unsafe fn with_native_frame_extent<T>(
         &self,
         native_frame: *mut crate::native_abi::NativeFrame,
         operation: impl FnOnce() -> T,
@@ -1975,10 +2002,9 @@ impl VmRuntimeActivation {
             .get_mut(self.frame_index)
             .ok_or(crate::VmError::InvalidOperand)?;
         let native = unsafe { native_frame.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        if frame.header.function_id != native.header.function_id || !native.eval_env.is_null() {
+        if frame.header.function_id != native.header.function_id {
             return Err(crate::VmError::InvalidOperand);
         }
-        std::mem::swap(&mut frame.eval_env, &mut native.eval_env);
 
         let result = operation();
 
@@ -1989,10 +2015,9 @@ impl VmRuntimeActivation {
             .get_mut(self.frame_index)
             .ok_or(crate::VmError::InvalidOperand)?;
         let native = unsafe { native_frame.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        if frame.header.function_id != native.header.function_id || !frame.eval_env.is_null() {
+        if frame.header.function_id != native.header.function_id {
             return Err(crate::VmError::InvalidOperand);
         }
-        std::mem::swap(&mut frame.eval_env, &mut native.eval_env);
         if let Some(object) = native.arguments_object() {
             let vm = unsafe { self.vm.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
             vm.frame_ensure_cold(frame).arguments_object = Some(crate::Value::object(object));
@@ -2158,6 +2183,14 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// runtime-capable context and native frame as [`Self::run_entry`].
     fn run_optimized_entry(&self, _activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
         None
+    }
+
+    /// Whether [`Self::run_optimized_osr_entry`] can enter the loop header
+    /// whose logical PC is `logical_pc`. Optimized code is compiled for at
+    /// most one OSR header (the one whose back-edge requested it); an entry
+    /// compile has none.
+    fn enters_optimized_osr_header(&self, _logical_pc: u32) -> bool {
+        false
     }
 
     /// Enter optimizing code at one loop header from an interpreter frame.
@@ -2357,65 +2390,37 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 60);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 52);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
-        assert_eq!(
+        let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
-            0
-        );
-        assert_eq!(std::mem::offset_of!(JitClosureCallLayout, flags_byte), 4);
-        assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, upvalue_base_byte),
-            8
-        );
-        assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, upvalue_count_byte),
-            12
-        );
-        assert_eq!(
-            std::mem::offset_of!(JitClosureCallLayout, eval_env_byte),
-            16
-        );
-        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, flags_byte),
+            std::mem::offset_of!(JitClosureCallLayout, context_byte),
             std::mem::offset_of!(JitClosureCallLayout, bound_this_byte),
-            20
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte),
-            24
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, bound_this_flag),
-            28
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag),
-            32
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
-            36
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, own_props_byte),
-            40
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, prototype_shape_byte),
-            44
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, prototype_slot_byte),
-            48
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, learned_instance_fields_byte),
-            52
-        );
-        assert_eq!(
             std::mem::offset_of!(JitClosureCallLayout, last_instance_byte),
-            56
-        );
+        ];
+        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]);
+    }
+
+    #[test]
+    fn context_layout_names_header_relative_words() {
+        let layout = JitContextLayout::current();
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        assert_eq!(layout.type_tag, crate::context::CONTEXT_BODY_TYPE_TAG);
+        assert_eq!(layout.scope_function_id_byte, header);
+        assert_eq!(layout.scope_index_byte, header + 4);
+        assert_eq!(layout.slot_count_byte, header + 6);
+        assert_eq!(layout.parent_byte, header + 8);
+        assert_eq!(layout.extension_byte, header + 16);
+        assert_eq!(layout.slots_byte, header + 24);
     }
 
     #[test]

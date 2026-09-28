@@ -39,9 +39,9 @@
 
 use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
-    DirectEvalBinding, Function, MappedArgumentBinding, ModuleInit, ModuleResolution, SourceKind,
-    SpanEntry, TemplateSite,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant, Function,
+    MappedArgumentBinding, ModuleInit, ModuleResolution, ScopeDescriptor, ScopeFlags, ScopeKind,
+    SlotDescriptor, SlotKind, SourceKind, SpanEntry, TemplateSite,
     encoding::{op_from_byte, op_to_byte},
     verifier::{BytecodeVerifyError, VerifiedBytecodeModule},
 };
@@ -415,17 +415,22 @@ impl Writer {
         self.u32(site.class_function_id);
     }
 
-    fn direct_eval_binding(&mut self, binding: &DirectEvalBinding) {
-        self.bool(binding.captured);
-        self.string(&binding.name);
-        self.u16(binding.upvalue);
-        self.bool(binding.lexical);
-        self.bool(binding.is_const);
-        self.bool(binding.fn_self_name);
-        self.bool(binding.inner);
-        self.bool(binding.param);
-        self.bool(binding.deletable);
-        self.u16(binding.scope_depth);
+    fn slot_descriptor(&mut self, slot: &SlotDescriptor) {
+        self.string(&slot.name);
+        let (tag, payload) = slot_kind_tag(slot.kind);
+        self.u8(tag);
+        if let Some(payload) = payload {
+            self.bool(payload);
+        }
+        self.bool(slot.exported);
+    }
+
+    fn scope_descriptor(&mut self, scope: &ScopeDescriptor) {
+        self.u8(scope_kind_tag(scope.kind));
+        self.bool(scope.flags.strict);
+        self.bool(scope.flags.var_scope);
+        self.bool(scope.flags.has_extension);
+        self.seq(&scope.slots, Self::slot_descriptor);
     }
 
     fn mapped_argument_binding(&mut self, binding: &MappedArgumentBinding) {
@@ -436,9 +441,10 @@ impl Writer {
                 self.u8(0);
                 self.u16(reg);
             }
-            ArgumentBindingStorage::Upvalue { idx } => {
+            ArgumentBindingStorage::Context { reg, slot } => {
                 self.u8(1);
-                self.u16(idx);
+                self.u16(reg);
+                self.u16(slot);
             }
         }
     }
@@ -475,8 +481,7 @@ impl Writer {
         self.u16(function.scratch);
         self.u16(function.param_count);
         self.u16(function.length);
-        self.u16(function.own_upvalue_count);
-        self.u16(function.inherited_upvalue_count);
+        self.seq(&function.scopes, Self::scope_descriptor);
         for flag in [
             function.is_strict,
             function.is_arrow,
@@ -502,11 +507,6 @@ impl Writer {
             Self::mapped_argument_binding,
         );
         self.string(&function.module_url);
-        self.seq(&function.direct_eval_bindings, Self::direct_eval_binding);
-        self.u32(function.eval_sites.len() as u32);
-        for site in &function.eval_sites {
-            self.seq(site, Self::direct_eval_binding);
-        }
         match function.source_text_range {
             Some(range) => {
                 self.bool(true);
@@ -723,18 +723,30 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn direct_eval_binding(&mut self) -> Option<DirectEvalBinding> {
-        Some(DirectEvalBinding {
-            captured: self.bool()?,
-            name: self.string()?,
-            upvalue: self.u16()?,
-            lexical: self.bool()?,
-            is_const: self.bool()?,
-            fn_self_name: self.bool()?,
-            inner: self.bool()?,
-            param: self.bool()?,
-            deletable: self.bool()?,
-            scope_depth: self.u16()?,
+    fn slot_descriptor(&mut self) -> Option<SlotDescriptor> {
+        let name = self.string()?;
+        let tag = self.u8()?;
+        let payload = if slot_kind_has_payload(tag) {
+            Some(self.bool()?)
+        } else {
+            None
+        };
+        Some(SlotDescriptor {
+            name,
+            kind: slot_kind_from_tag(tag, payload)?,
+            exported: self.bool()?,
+        })
+    }
+
+    fn scope_descriptor(&mut self) -> Option<ScopeDescriptor> {
+        Some(ScopeDescriptor {
+            kind: scope_kind_from_tag(self.u8()?)?,
+            flags: ScopeFlags {
+                strict: self.bool()?,
+                var_scope: self.bool()?,
+                has_extension: self.bool()?,
+            },
+            slots: self.seq(Self::slot_descriptor)?,
         })
     }
 
@@ -743,7 +755,10 @@ impl<'a> Reader<'a> {
         let formal_name = self.string()?;
         let storage = match self.u8()? {
             0 => ArgumentBindingStorage::Register { reg: self.u16()? },
-            1 => ArgumentBindingStorage::Upvalue { idx: self.u16()? },
+            1 => ArgumentBindingStorage::Context {
+                reg: self.u16()?,
+                slot: self.u16()?,
+            },
             _ => return None,
         };
         Some(MappedArgumentBinding {
@@ -785,8 +800,7 @@ impl<'a> Reader<'a> {
         let scratch = self.u16()?;
         let param_count = self.u16()?;
         let length = self.u16()?;
-        let own_upvalue_count = self.u16()?;
-        let inherited_upvalue_count = self.u16()?;
+        let scopes = self.seq(Self::scope_descriptor)?;
         let is_strict = self.bool()?;
         let is_arrow = self.bool()?;
         let is_method = self.bool()?;
@@ -806,12 +820,6 @@ impl<'a> Reader<'a> {
         };
         let mapped_argument_bindings = self.seq(Self::mapped_argument_binding)?;
         let module_url = self.string()?;
-        let direct_eval_bindings = self.seq(Self::direct_eval_binding)?;
-        let site_count = self.u32()? as usize;
-        let mut eval_sites = Vec::with_capacity(site_count);
-        for _ in 0..site_count {
-            eval_sites.push(self.seq(Self::direct_eval_binding)?);
-        }
         let source_text_range = if self.bool()? {
             Some(self.span()?)
         } else {
@@ -834,8 +842,7 @@ impl<'a> Reader<'a> {
             scratch,
             param_count,
             length,
-            own_upvalue_count,
-            inherited_upvalue_count,
+            scopes,
             is_strict,
             is_arrow,
             is_method,
@@ -850,8 +857,6 @@ impl<'a> Reader<'a> {
             arguments_object_kind,
             mapped_argument_bindings,
             module_url,
-            direct_eval_bindings,
-            eval_sites,
             contains_direct_eval,
             source_text_range,
             source_text_span,
@@ -861,6 +866,103 @@ impl<'a> Reader<'a> {
             class_hint_sites,
         })
     }
+}
+
+const fn scope_kind_tag(kind: ScopeKind) -> u8 {
+    match kind {
+        ScopeKind::FunctionName => 0,
+        ScopeKind::Callee => 1,
+        ScopeKind::Params => 2,
+        ScopeKind::Body => 3,
+        ScopeKind::Lexical => 4,
+        ScopeKind::Block => 5,
+        ScopeKind::Catch => 6,
+        ScopeKind::ForHead => 7,
+        ScopeKind::Switch => 8,
+        ScopeKind::With => 9,
+        ScopeKind::Class => 10,
+        ScopeKind::ObjectHome => 11,
+        ScopeKind::EvalVar => 12,
+        ScopeKind::EvalLexical => 13,
+        ScopeKind::Module => 14,
+    }
+}
+
+const fn scope_kind_from_tag(tag: u8) -> Option<ScopeKind> {
+    Some(match tag {
+        0 => ScopeKind::FunctionName,
+        1 => ScopeKind::Callee,
+        2 => ScopeKind::Params,
+        3 => ScopeKind::Body,
+        4 => ScopeKind::Lexical,
+        5 => ScopeKind::Block,
+        6 => ScopeKind::Catch,
+        7 => ScopeKind::ForHead,
+        8 => ScopeKind::Switch,
+        9 => ScopeKind::With,
+        10 => ScopeKind::Class,
+        11 => ScopeKind::ObjectHome,
+        12 => ScopeKind::EvalVar,
+        13 => ScopeKind::EvalLexical,
+        14 => ScopeKind::Module,
+        _ => return None,
+    })
+}
+
+/// Slot-kind tag plus the Boolean payload `Param` and `CatchParam` carry.
+const fn slot_kind_tag(kind: SlotKind) -> (u8, Option<bool>) {
+    match kind {
+        SlotKind::Var => (0, None),
+        SlotKind::FunctionDecl => (1, None),
+        SlotKind::Arguments => (2, None),
+        SlotKind::Param { checked } => (3, Some(checked)),
+        SlotKind::Let => (4, None),
+        SlotKind::Const => (5, None),
+        SlotKind::Class => (6, None),
+        SlotKind::DerivedThis => (7, None),
+        SlotKind::FnSelfName => (8, None),
+        SlotKind::CatchParam { simple } => (9, Some(simple)),
+        SlotKind::WithObject => (10, None),
+        SlotKind::PrivateName => (11, None),
+        SlotKind::PrivateBrand => (12, None),
+        SlotKind::SuperHome => (13, None),
+        SlotKind::SuperStaticHome => (14, None),
+        SlotKind::SuperCtor => (15, None),
+        SlotKind::ClassSelf => (16, None),
+        SlotKind::ModuleEnv => (17, None),
+        SlotKind::ImportMeta => (18, None),
+        SlotKind::Synthetic => (19, None),
+    }
+}
+
+const fn slot_kind_has_payload(tag: u8) -> bool {
+    matches!(tag, 3 | 9)
+}
+
+const fn slot_kind_from_tag(tag: u8, payload: Option<bool>) -> Option<SlotKind> {
+    Some(match (tag, payload) {
+        (0, None) => SlotKind::Var,
+        (1, None) => SlotKind::FunctionDecl,
+        (2, None) => SlotKind::Arguments,
+        (3, Some(checked)) => SlotKind::Param { checked },
+        (4, None) => SlotKind::Let,
+        (5, None) => SlotKind::Const,
+        (6, None) => SlotKind::Class,
+        (7, None) => SlotKind::DerivedThis,
+        (8, None) => SlotKind::FnSelfName,
+        (9, Some(simple)) => SlotKind::CatchParam { simple },
+        (10, None) => SlotKind::WithObject,
+        (11, None) => SlotKind::PrivateName,
+        (12, None) => SlotKind::PrivateBrand,
+        (13, None) => SlotKind::SuperHome,
+        (14, None) => SlotKind::SuperStaticHome,
+        (15, None) => SlotKind::SuperCtor,
+        (16, None) => SlotKind::ClassSelf,
+        (17, None) => SlotKind::ModuleEnv,
+        (18, None) => SlotKind::ImportMeta,
+        (19, None) => SlotKind::Synthetic,
+        _ => return None,
+    })
 }
 
 const fn source_kind_tag(kind: SourceKind) -> u8 {
@@ -883,6 +985,52 @@ mod tests {
     use super::*;
     use crate::{FunctionCodeBuilder, Op, Operand};
 
+    fn slot(name: &str, kind: SlotKind) -> SlotDescriptor {
+        SlotDescriptor {
+            name: name.to_string(),
+            kind,
+            exported: false,
+        }
+    }
+
+    fn sample_scopes() -> Vec<ScopeDescriptor> {
+        vec![
+            ScopeDescriptor {
+                kind: ScopeKind::Params,
+                flags: ScopeFlags {
+                    strict: false,
+                    var_scope: true,
+                    has_extension: true,
+                },
+                slots: vec![
+                    slot("x", SlotKind::Param { checked: false }),
+                    slot("arguments", SlotKind::Arguments),
+                ],
+            },
+            ScopeDescriptor {
+                kind: ScopeKind::Catch,
+                flags: ScopeFlags {
+                    strict: true,
+                    ..ScopeFlags::default()
+                },
+                slots: vec![
+                    slot("e", SlotKind::CatchParam { simple: false }),
+                    slot("y", SlotKind::Param { checked: true }),
+                    SlotDescriptor {
+                        name: "z".to_string(),
+                        kind: SlotKind::Const,
+                        exported: true,
+                    },
+                ],
+            },
+            ScopeDescriptor {
+                kind: ScopeKind::Module,
+                flags: ScopeFlags::default(),
+                slots: Vec::new(),
+            },
+        ]
+    }
+
     fn sample_module() -> BytecodeModule {
         let mut code = FunctionCodeBuilder::new();
         code.push(Op::LoadUndefined, &[Operand::Register(0)]);
@@ -902,8 +1050,7 @@ mod tests {
                 scratch: 1,
                 param_count: 1,
                 length: 1,
-                own_upvalue_count: 1,
-                inherited_upvalue_count: 2,
+                scopes: sample_scopes(),
                 is_strict: true,
                 is_arrow: false,
                 is_method: true,
@@ -919,33 +1066,9 @@ mod tests {
                 mapped_argument_bindings: vec![MappedArgumentBinding {
                     argument_index: 0,
                     formal_name: "x".to_string(),
-                    storage: ArgumentBindingStorage::Upvalue { idx: 0 },
+                    storage: ArgumentBindingStorage::Context { reg: 1, slot: 0 },
                 }],
                 module_url: "file:///entry.ts".to_string(),
-                direct_eval_bindings: vec![DirectEvalBinding {
-                    captured: true,
-                    name: "outer".to_string(),
-                    upvalue: 1,
-                    lexical: true,
-                    is_const: false,
-                    fn_self_name: false,
-                    inner: false,
-                    param: false,
-                    deletable: false,
-                    scope_depth: 1,
-                }],
-                eval_sites: vec![vec![DirectEvalBinding {
-                    captured: false,
-                    name: "z".to_string(),
-                    upvalue: 2,
-                    lexical: true,
-                    is_const: false,
-                    fn_self_name: false,
-                    inner: true,
-                    param: false,
-                    deletable: false,
-                    scope_depth: 2,
-                }]],
                 contains_direct_eval: true,
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
@@ -1002,6 +1125,40 @@ mod tests {
             crate::dump::to_json_pretty(restored.module()).unwrap(),
             crate::dump::to_json_pretty(&module).unwrap()
         );
+    }
+
+    #[test]
+    fn scope_descriptors_and_context_mapped_arguments_round_trip() {
+        let module = sample_module();
+        let restored = decode_module(&encode_module(&module)).expect("round trip");
+        let original = &module.functions[0];
+        let decoded = &restored.module().functions[0];
+        assert_eq!(decoded.scopes, original.scopes);
+        assert_eq!(decoded.scopes, sample_scopes());
+        assert_eq!(
+            decoded.mapped_argument_bindings[0].storage,
+            ArgumentBindingStorage::Context { reg: 1, slot: 0 }
+        );
+        assert!(decoded.contains_direct_eval);
+    }
+
+    #[test]
+    fn every_scope_and_slot_kind_tag_round_trips() {
+        for tag in 0..=u8::MAX {
+            if let Some(kind) = scope_kind_from_tag(tag) {
+                assert_eq!(scope_kind_tag(kind), tag);
+            }
+            for payload in [None, Some(false), Some(true)] {
+                if let Some(kind) = slot_kind_from_tag(tag, payload) {
+                    assert_eq!(slot_kind_tag(kind), (tag, payload));
+                    assert_eq!(slot_kind_has_payload(tag), payload.is_some());
+                }
+            }
+        }
+        assert_eq!(scope_kind_from_tag(15), None);
+        assert_eq!(slot_kind_from_tag(3, None), None);
+        assert_eq!(slot_kind_from_tag(0, Some(true)), None);
+        assert_eq!(slot_kind_from_tag(20, None), None);
     }
 
     #[test]

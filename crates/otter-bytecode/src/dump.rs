@@ -22,7 +22,10 @@ pub fn to_json_pretty(module: &BytecodeModule) -> Result<String, serde_json::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Function, Instruction, Op, Operand, SourceKind, SpanEntry};
+    use crate::{
+        EvalCallerChain, EvalCallerScope, Function, Instruction, Op, Operand, ScopeDescriptor,
+        ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanEntry,
+    };
 
     #[test]
     fn dump_carries_bytecode_module() {
@@ -54,5 +57,48 @@ mod tests {
         let json = to_json_pretty(&module).unwrap();
         assert!(json.contains("\"module\": \"x.ts\""));
         assert!(json.contains("\"source_kind\": \"typescript\""));
+    }
+
+    #[test]
+    fn scope_descriptors_dump_and_parse_back() {
+        let scope = ScopeDescriptor {
+            kind: ScopeKind::Params,
+            flags: ScopeFlags {
+                strict: false,
+                var_scope: true,
+                has_extension: true,
+            },
+            slots: vec![
+                SlotDescriptor {
+                    name: "a".to_string(),
+                    kind: SlotKind::Param { checked: true },
+                    exported: false,
+                },
+                SlotDescriptor {
+                    name: "x".to_string(),
+                    kind: SlotKind::Var,
+                    exported: true,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&scope).unwrap();
+        assert_eq!(json["kind"], "params");
+        assert_eq!(json["slots"][0]["kind"]["param"]["checked"], true);
+        assert_eq!(json["slots"][1]["kind"], "var");
+        assert_eq!(
+            serde_json::from_value::<ScopeDescriptor>(json).unwrap(),
+            scope
+        );
+
+        let chain = EvalCallerChain {
+            scopes: vec![EvalCallerScope {
+                descriptor: scope,
+                extension_names: vec!["injected".to_string()],
+            }],
+            var_depth: Some(0),
+        };
+        let round_trip: EvalCallerChain =
+            serde_json::from_str(&serde_json::to_string(&chain).unwrap()).unwrap();
+        assert_eq!(round_trip, chain);
     }
 }

@@ -14,13 +14,17 @@
 //!   safepoints, and control nodes are never commoned.
 //! - Alias sets are conservative: false overlap costs optimization but cannot
 //!   make a heap proof survive an invalidating operation.
+//! - SELF, closure-context and context-parent words are fixed for their
+//!   activation or object and are pure values. Context slots form their own
+//!   class, written only by slot stores, generated binding writes and calls,
+//!   so object and element stores leave captured-binding reads available.
 //!
 //! # See also
 //! - `super::gvn` consumes this table with dominator-scoped value numbers.
 
 use otter_bytecode::opcode_schema::BindingSemantics;
 
-use super::{CallDescriptor, CallEffects, MachineOpcode, SafepointKind};
+use super::{CallDescriptor, CallEffects, ContextField, MachineOpcode, SafepointKind};
 
 /// Mutable runtime state that may invalidate a Machine value or proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,8 +42,11 @@ pub enum MachineAliasClass {
     ElementMetadata,
     /// Indexed element payloads.
     ElementField,
-    /// Declarative/global/upvalue cells and derived-this state.
+    /// Declarative/global binding cells and derived-this state.
     Binding,
+    /// Per-scope context slot words. Parent and closure-context words are
+    /// immutable and belong to no alias class.
+    ContextSlot,
     /// Address-stable traced constant cells rewritten by moving collection.
     ConstantCell,
     /// Nursery frontier and unpublished receiver state.
@@ -49,7 +56,7 @@ pub enum MachineAliasClass {
 }
 
 impl MachineAliasClass {
-    pub(super) const COUNT: usize = 10;
+    pub(super) const COUNT: usize = 11;
 
     const fn bit(self) -> u16 {
         1 << self as u8
@@ -187,6 +194,7 @@ const PROPERTY_FIELD: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::
 const ELEMENT_METADATA: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::ElementMetadata);
 const ELEMENT_FIELD: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::ElementField);
 const BINDING: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::Binding);
+const CONTEXT_SLOT: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::ContextSlot);
 const CONSTANT_CELL: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::ConstantCell);
 const ALLOCATION: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::Allocation);
 const GC_BARRIER: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::GcBarrier);
@@ -200,6 +208,13 @@ impl MachineOpcode {
         match self {
             Self::EntryValue(_)
             | Self::EntryThis
+            // SELF, a closure's context word and a context's parent word are
+            // fixed for the activation and the object's life respectively.
+            | Self::EntryCallee
+            | Self::ContextLoad {
+                field: ContextField::ClosureContext | ContextField::Parent,
+            }
+            | Self::TaggedIsNotHole
             | Self::AllocationHit
             | Self::BaseConstructResult
             | Self::TaggedConstant(_)
@@ -324,19 +339,30 @@ impl MachineOpcode {
             Self::FloatRem | Self::FloatPow => MachineEffects::NEVER,
 
             // GVN reuses a binding guard only inside its own block: its raw
-            // cell addresses must not outlive a safepoint.
-            Self::BindingGuard { .. } => {
-                MachineEffects::read(BINDING.union(SHAPE).union(PROPERTY_METADATA), Guard)
-            }
+            // cell addresses must not outlive a safepoint. A context-slot
+            // guard reads the slot for its hole test.
+            Self::BindingGuard { .. } => MachineEffects::read(
+                BINDING
+                    .union(CONTEXT_SLOT)
+                    .union(SHAPE)
+                    .union(PROPERTY_METADATA),
+                Guard,
+            ),
             Self::BindingHit { semantics, .. } => match semantics {
                 BindingSemantics::Read(_) => {
-                    MachineEffects::read(BINDING.union(PROPERTY_FIELD), Value)
+                    MachineEffects::read(BINDING.union(CONTEXT_SLOT).union(PROPERTY_FIELD), Value)
                 }
                 BindingSemantics::Write(_) | BindingSemantics::Delete(_) => {
-                    MachineEffects::write(BINDING.union(PROPERTY_FIELD))
+                    MachineEffects::write(BINDING.union(CONTEXT_SLOT).union(PROPERTY_FIELD))
                 }
             },
-            Self::BindingWriteBarrier => MachineEffects::write(GC_BARRIER),
+            Self::BindingWriteBarrier | Self::ContextWriteBarrier => {
+                MachineEffects::write(GC_BARRIER)
+            }
+            Self::ContextLoad {
+                field: ContextField::Slot(_),
+            } => MachineEffects::read(CONTEXT_SLOT, Value),
+            Self::ContextStore { .. } => MachineEffects::write(CONTEXT_SLOT),
             Self::StringConstantCellLoad { .. } => MachineEffects::read(CONSTANT_CELL, Value),
 
             Self::ElementView { .. } => MachineEffects::read(SHAPE.union(ELEMENT_METADATA), Guard),
@@ -412,11 +438,14 @@ impl MachineOpcode {
                 throws: true,
                 ..MachineEffects::NEVER
             },
-            Self::OsrEntry { .. } => MachineEffects {
-                writes: MachineAliasSet::ALL,
+            // An OSR frame read leaves the function before any effect when the
+            // interpreter's value is outside the header's representation.
+            Self::OsrValue { .. } => MachineEffects {
+                throws: true,
                 ..MachineEffects::NEVER
             },
             Self::Call(_)
+            | Self::OsrDispatch { .. }
             | Self::LoopPreheader
             | Self::Jump
             | Self::BranchIf(_)
@@ -552,6 +581,76 @@ mod tests {
             assert!(!effects.writes.is_empty(), "{opcode:?}");
             assert_eq!(effects.commoning, MachineCommoning::Never, "{opcode:?}");
         }
+    }
+
+    #[test]
+    fn context_words_split_immutable_chain_reads_from_mutable_slots() {
+        for field in [ContextField::ClosureContext, ContextField::Parent] {
+            assert_eq!(
+                MachineOpcode::ContextLoad { field }.effects(),
+                MachineEffects::PURE_VALUE,
+                "{field:?}"
+            );
+        }
+        assert_eq!(
+            MachineOpcode::EntryCallee.effects(),
+            MachineEffects::PURE_VALUE
+        );
+        assert_eq!(
+            MachineOpcode::TaggedIsNotHole.effects(),
+            MachineEffects::PURE_VALUE
+        );
+        let slot = MachineOpcode::ContextLoad {
+            field: ContextField::Slot(2),
+        }
+        .effects();
+        assert_eq!(slot.reads, CONTEXT_SLOT);
+        assert_eq!(slot.commoning, MachineCommoning::Value);
+        let store = MachineOpcode::ContextStore { slot: 2 }.effects();
+        assert!(store.writes.intersects(slot.reads));
+        assert_eq!(store.commoning, MachineCommoning::Never);
+        let barrier = MachineOpcode::ContextWriteBarrier.effects();
+        assert_eq!(barrier.writes, GC_BARRIER);
+        assert!(!barrier.writes.intersects(slot.reads));
+        // Unrelated object and element stores keep slot loads available.
+        for unrelated in [
+            MachineOpcode::CacheIrStoreField {
+                byte_pc: 0,
+                value_byte: 8,
+            },
+            MachineOpcode::ElementValueStore {
+                byte_pc: 0,
+                access: otter_vm::JitElementAccess::default(),
+            },
+            MachineOpcode::CacheIrPublishShape {
+                byte_pc: 0,
+                shape: 1,
+                new_len: 1,
+                initialize_inline: false,
+            },
+        ] {
+            let effects = unrelated.effects();
+            assert!(!effects.writes.intersects(slot.reads), "{unrelated:?}");
+            assert!(!effects.invalidates_dependency_epoch(), "{unrelated:?}");
+        }
+        // A generated binding write can target a context slot.
+        let binding_write = MachineOpcode::BindingHit {
+            byte_pc: 0,
+            semantics: BindingSemantics::Write(
+                otter_bytecode::opcode_schema::BindingWrite::ContextSlot {
+                    value: 0,
+                    context: 1,
+                    coord: 2,
+                },
+            ),
+            target: super::super::MachineBindingTarget::ContextSlot { depth: 0, slot: 2 },
+        }
+        .effects();
+        assert!(binding_write.writes.intersects(slot.reads));
+        // Every call that may run JavaScript or collect invalidates slots.
+        let reentrant = effects_for_instruction(&MachineOpcode::Call(7), &[]);
+        assert!(reentrant.writes.intersects(slot.reads));
+        assert!(reentrant.invalidates_dependency_epoch());
     }
 
     #[test]

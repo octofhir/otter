@@ -169,9 +169,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
 fn generator_and_parked_frame_roots_register_values() {
     let mut interp = Interpreter::new();
     let function = empty_function();
-    let mut frame = interp
-        .test_frame_for_function_with_heap(&function)
-        .expect("frame");
+    let mut frame = interp.test_frame_for_function(&function).expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::object(object);
     let frame = interp.park_active_frame(frame);
@@ -199,7 +197,7 @@ fn generator_and_parked_frame_roots_register_values() {
     });
 
     let mut parked_frame = interp
-        .test_frame_for_function_with_heap(&function)
+        .test_frame_for_function(&function)
         .expect("parked frame");
     let parked_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
@@ -265,9 +263,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     });
 
     let function = empty_function();
-    let frame = interp
-        .test_frame_for_function_with_heap(&function)
-        .expect("frame");
+    let frame = interp.test_frame_for_function(&function).expect("frame");
     let frame = interp.park_active_frame(frame);
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");

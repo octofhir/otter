@@ -545,7 +545,7 @@ impl Interpreter {
             return self
                 .run_async_gen_resume(context, frame, cold, await_dst, fulfilled, value, owner);
         }
-        // Resolve callee → function_id + upvalues. Mirrors the
+        // Resolve callee → function_id + SELF. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
         // (no caller frame to write back into).
         let mut result_capability = task.result_capability.clone();
@@ -555,8 +555,8 @@ impl Interpreter {
         // The task left the (traced) microtask queue; from here until
         // the callee's own roots take over, these locals are the only
         // owners of the callee/this/argument values. Everything below
-        // allocates before frame roots exist — the upvalue spine, the
-        // `this` box, bound-function unwrapping — and a moving
+        // allocates before frame roots exist — the `this` box,
+        // bound-function unwrapping — and a moving
         // scavenge in any of those would otherwise launder the
         // argument values into foreign heap words. Register a live
         // root over the locals for the whole invocation.
@@ -772,24 +772,17 @@ impl Interpreter {
                 }
             };
         }
-        let (
-            function_id,
-            parent_upvalues,
-            this_for_callee,
-            _new_target_for_callee,
-            _derived_this_cell,
-            _callee_env,
-            _callee_closure,
-        ) = match Self::bytecode_call_target_parts(*current, *effective_this, &self.gc_heap) {
-            Ok(parts) => parts,
-            Err(error) => {
-                return Err(RunError {
-                    error,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-        };
+        let (function_id, this_for_callee, _new_target_for_callee, _callee_closure) =
+            match Self::bytecode_call_target_parts(*current, *effective_this, &self.gc_heap) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    return Err(RunError {
+                        error,
+                        frames: Vec::new(),
+                        detail: self.take_error_detail(),
+                    });
+                }
+            };
         let owner = match context.for_function(function_id) {
             Ok(owner) => owner,
             Err(_) => {
@@ -811,17 +804,6 @@ impl Interpreter {
                 });
             }
         };
-        let upvalues =
-            match Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues) {
-                Ok(u) => u,
-                Err(oom) => {
-                    return Err(RunError {
-                        error: VmError::from(oom),
-                        frames: Vec::new(),
-                        detail: self.take_error_detail(),
-                    });
-                }
-            };
         let this_for_callee = match self.this_for_bytecode_call_runtime_rooted(
             function,
             this_for_callee,
@@ -843,14 +825,13 @@ impl Interpreter {
                 frames: Vec::new(),
                 detail: self.take_error_detail(),
             })?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+        let mut new_frame = Frame::for_code_block(
             function,
             None, // top-level — no return register
-            upvalues,
+            *current,
             this_for_callee,
             window,
         );
-        new_frame.self_value = *current;
         self.bind_bytecode_call_arguments(function, &mut new_frame, std::mem::take(effective_args))
             .map_err(|error| RunError {
                 error,
@@ -991,9 +972,16 @@ impl Interpreter {
         let _window_rollback = self.register_window_rollback();
         let main = context.exec_main();
         let mut stack: ActivationStack = ActivationStack::new();
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
-                .map_err(|oom| (VmError::from(oom), Vec::new()))?;
+        // The script `<main>` closes over no context.
+        let self_value = crate::closure::alloc_closure(
+            &mut self.gc_heap,
+            main.id,
+            Value::undefined(),
+            None,
+            None,
+        )
+        .map(Value::closure)
+        .map_err(|oom| (VmError::from(oom), Vec::new()))?;
         let entry_this = if main.is_module {
             Value::undefined()
         } else {
@@ -1002,8 +990,7 @@ impl Interpreter {
         let window = self
             .alloc_reg_window(main.register_count as usize)
             .map_err(|error| (error, Vec::new()))?;
-        let entry =
-            Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
+        let entry = Frame::for_code_block(main, None, self_value, entry_this, window);
         let entry_is_async = main.is_async;
         stack.push(entry);
         // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the
@@ -1227,7 +1214,7 @@ impl Interpreter {
 /// Live root over [`Interpreter::invoke_microtask`]'s
 /// callee/this/argument locals: the values leave the traced microtask
 /// queue before any callee-side roots exist, and every allocation on
-/// the invocation path (upvalue spine, `this` boxing, bound-arg
+/// the invocation path (`this` boxing, bound-arg
 /// concatenation) can drive a moving scavenge that would otherwise
 /// launder them. Raw pointers because the locals are mutated
 /// (bound-function unwrapping) while registered; the registration is

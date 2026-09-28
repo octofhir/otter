@@ -8,10 +8,14 @@
 //!
 //! # Invariants
 //! - Stores go through the same binding paths as declarations.
+//! - §13.15.2 — when a sloppy direct eval's extension may intercept an
+//!   identifier target, its reference is resolved (`ResolveLookupRef`)
+//!   before the right-hand side runs and stored through (`StoreRef`) after.
 //!
 //! # See also
 //! - `destructuring` and `expr`
 
+use crate::compiler::NameRef;
 use crate::*;
 
 enum PreparedAssignmentTarget {
@@ -25,17 +29,6 @@ enum PreparedAssignmentTarget {
     // receiver via `SetSuperProperty` / `SetSuperElement`.
     SuperProperty { base_reg: u16, name_idx: u32 },
     SuperElement { base_reg: u16, idx_reg: u16 },
-}
-
-/// `Op::TdzError`'s operand carries the binding's slot index purely for
-/// the runtime diagnostic message — it mirrors the read-side TDZ lowering
-/// in `expr::identifier`.
-fn tdz_diag_index(storage: Option<BindingStorage>) -> i32 {
-    match storage {
-        Some(BindingStorage::Register { reg }) => reg as i32,
-        Some(BindingStorage::Upvalue { idx }) => idx as i32,
-        None => 0,
-    }
 }
 
 pub(crate) fn compile_assignment(
@@ -74,7 +67,7 @@ pub(crate) fn compile_assignment(
             // evaluation so a derived-constructor TDZ ReferenceError
             // fires first.
             let this_guard = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            cx.emit_load_this(this_guard, span);
             // §13.3.5.3 — the super base is captured when the
             // reference is made, BEFORE the RHS evaluates.
             let base_reg = crate::class::emit_super_base(cx, span)?;
@@ -217,7 +210,7 @@ pub(crate) fn compile_assignment(
             // of the key expression, so a derived-constructor TDZ
             // ReferenceError fires before any key/RHS side effects.
             let this_guard = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+            cx.emit_load_this(this_guard, span);
             let idx_reg = compile_expr(cx, &member.expression, span)?;
             // §13.3.5.3 — base captured after the key, before the RHS.
             let base_reg = crate::class::emit_super_base(cx, span)?;
@@ -320,7 +313,7 @@ pub(crate) fn compile_assignment(
         assign_object_pattern(cx, o, value_reg, span)?;
         return Ok(value_reg);
     }
-    // `name = value` — local or captured-upvalue store.
+    // `name = value` — a register, context-slot, or global store.
     let (name, direct_identifier) = match &a.left {
         AssignmentTarget::AssignmentTargetIdentifier(id) => (
             id.name.as_str().to_string(),
@@ -349,132 +342,19 @@ pub(crate) fn compile_assignment(
             span,
         ));
     }
-    // §6.2.4.6 PutValue → §9.1.1.1.5 SetMutableBinding: assigning to a
-    // `let` binding before its declaration's initializer ran is a TDZ
-    // access. The lexical pre-pass declares the name (uninitialized) at
-    // block entry, so the miss is observable statically.
-    let local_info = cx.lookup_binding(&name);
-    // §19.2.1.3 — a deletable eval-introduced var must store through
-    // the dynamic eval-environment ops; the static cell would survive
-    // a `delete` of the binding.
-    let eval_var_dynamic = cx.eval_var_dynamic_reference(&name);
-    let binding_uninitialized =
-        matches!(local_info, Some(info) if !info.is_const && !info.initialized);
-    // Capture resolution also recovers declaration mutability. The cell itself
-    // stores only the moving value, so a shadowed post-RHS store carries this
-    // metadata in its schema-owned fallback immediate.
-    let captured = if local_info.is_none() && !eval_var_dynamic {
-        cx.resolve_capture_with_info(&name)
-    } else {
-        None
-    };
-    // §10.2.11 — a named function expression's self-name binding is
-    // immutable: the RHS still evaluates, then strict mode throws
-    // TypeError while sloppy mode silently drops the write. Covers
-    // the local binding. A captured self-name is handled by the typed capture
-    // store below so a nearer eval binding can win.
-    let fn_self_target = local_info.is_some_and(|info| info.fn_self_name);
-    if fn_self_target && compound_op.is_none() {
-        let value = crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?;
-        // §6.2.5.5 PutValue — a class-name binding assigned inside
-        // its own heritage expression is still in the TDZ, which
-        // outranks the immutable-binding TypeError.
-        if binding_uninitialized {
-            let diag_idx = tdz_diag_index(cx.lookup_binding(&name).map(|info| info.storage));
-            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
-            return Ok(value);
-        }
-        if cx.is_strict {
-            return Ok(emit_assignment_type_error(
-                cx,
-                &format!("Assignment to constant variable '{name}'."),
-                span,
-            ));
-        }
-        return Ok(value);
-    }
-    if fn_self_target {
-        if binding_uninitialized {
-            // Compound assignment reads the target first — the TDZ
-            // ReferenceError fires before the RHS evaluates.
-            let diag_idx = tdz_diag_index(cx.lookup_binding(&name).map(|info| info.storage));
-            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
-        }
-        // Compound assignment reads the current value, evaluates the
-        // RHS, then hits the same immutable-store rule.
-        let storage = cx
-            .lookup_binding(&name)
-            .map(|info| info.storage)
-            .or_else(|| {
-                cx.resolve_capture(&name)
-                    .map(|idx| BindingStorage::Upvalue { idx })
-            });
-        let current = cx.alloc_scratch();
-        if let Some(s) = storage {
-            cx.emit_load_storage(current, s, span);
-        }
-        let rhs = compile_expr(cx, &a.right, span)?;
-        let op = compound_op.expect("guarded");
-        let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            op,
-            vec![
-                Operand::Register(dst),
-                Operand::Register(cur_p),
-                Operand::Register(rhs_p),
-            ],
-            span,
-        );
-        if cx.is_strict {
-            return Ok(emit_assignment_type_error(
-                cx,
-                &format!("Assignment to constant variable '{name}'."),
-                span,
-            ));
-        }
-        return Ok(dst);
-    }
-    let storage = match local_info {
-        Some(_) if eval_var_dynamic => None,
-        Some(info) if info.is_const => {
-            // §13.15.2 PutValue on an immutable binding is a runtime
-            // TypeError, not an early error: the RHS still evaluates
-            // for its side effects before the throw.
-            let _ = compile_expr(cx, &a.right, span)?;
-            return Ok(emit_assignment_type_error(
-                cx,
-                &format!("Assignment to constant variable '{name}'."),
-                span,
-            ));
-        }
-        Some(info) => Some(info.storage),
-        // §10.2.4.1 PutValue fallback — either a cross-function capture or an
-        // unresolved global. A capture retains its declaration metadata so the
-        // post-RHS shadowed store can distinguish mutable, immutable-throw, and
-        // immutable-silent fallbacks without a second runtime authority.
-        None => captured.map(|(idx, _, _)| BindingStorage::Upvalue { idx }),
-    };
+    // §13.15.2 steps 1.a–1.b — the target reference resolves first.
+    let reference = cx.resolve_ref(&name);
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
-    // §13.15.2 steps 1c-1d — the target reference resolves before the RHS.
-    // For a capture whose name a direct eval may shadow, snapshot the
-    // eval-binding sequence now: the compound read and the final store use
-    // the pre-RHS environment even when the RHS's eval declares the name.
-    let eval_snapshot = captured
-        .filter(|(_, _, eval_depth)| *eval_depth != 0)
-        .map(|_| {
-            let snap = cx.alloc_scratch();
-            cx.emit(Op::EvalBindingSeq, [Operand::Register(snap)], span);
-            snap
-        });
-    let dynamic = storage.is_none() && (eval_var_dynamic || cx.any_enclosing_leaking_direct_eval());
+    // An eval extension may intercept the name: pin the reference's base
+    // before the RHS runs, so a binding the RHS's eval creates is not the
+    // store target (§13.15.2, §9.1.2.1).
+    let eval_ref = cx.emit_resolve_ref(&name, &reference, span);
     // §6.2.5.6 — a strict assignment to an unresolvable identifier
     // throws off the reference resolved BEFORE the RHS runs: snapshot
     // the global binding's existence now so a RHS side effect that
     // creates the property cannot legitimize the store.
-    let strict_global_probe = if storage.is_none()
-        && !dynamic
+    let strict_global_probe = if matches!(reference, NameRef::Global(None))
         && cx.is_strict
         && with_ref.is_none()
         && compound_op.is_none()
@@ -513,39 +393,9 @@ pub(crate) fn compile_assignment(
                 with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
                 cx.patch_branch_to_here(fallback);
             }
-            match storage {
-                // §13.15.2 compound assignment reads the target via
-                // GetValue first, so a TDZ access throws here — before
-                // the RHS is evaluated for its side effects.
-                Some(_) if binding_uninitialized => {
-                    let diag_idx = tdz_diag_index(storage);
-                    cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
-                }
-                Some(_) if captured.is_some() => {
-                    let (index, _, eval_depth) = captured.expect("captured storage");
-                    cx.emit_captured_binding_load_snap(
-                        current,
-                        &name,
-                        index,
-                        eval_depth,
-                        eval_snapshot,
-                        span,
-                    );
-                }
-                Some(s) => cx.emit_load_storage(current, s, span),
-                None => {
-                    let name_idx = cx.intern_string_constant(&name);
-                    cx.emit(
-                        if dynamic {
-                            Op::LoadDynamic
-                        } else {
-                            Op::LoadGlobalOrThrow
-                        },
-                        [Operand::Register(current), Operand::ConstIndex(name_idx)],
-                        span,
-                    );
-                }
-            }
+            // §13.15.2 compound assignment reads the target via GetValue
+            // first, so a TDZ access throws before the RHS evaluates.
+            cx.emit_name_load(current, &name, &reference, false, span);
             if let Some(done) = with_done {
                 cx.patch_branch_to_here(done);
             }
@@ -577,76 +427,25 @@ pub(crate) fn compile_assignment(
         with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
         cx.patch_branch_to_here(fallback);
     }
-    match storage {
-        // §6.2.4.6 PutValue on a `let` binding still in its TDZ throws
-        // ReferenceError — after the RHS evaluated for its side effects.
-        Some(_) if binding_uninitialized => {
-            let diag_idx = tdz_diag_index(storage);
-            cx.emit(Op::TdzError, [Operand::Imm32(diag_idx)], span);
-        }
-        Some(s) => {
-            if let Some((index, info, eval_depth)) = captured {
-                cx.emit_captured_binding_store_snap(
-                    value,
-                    &name,
-                    index,
-                    info,
-                    eval_depth,
-                    eval_snapshot,
-                    span,
-                );
-            } else {
-                cx.emit_store_storage(value, s, span);
-            }
-            cx.mark_initialized(&name);
-            cx.emit_module_export_mirror(&name, value, span);
-        }
-        None => {
-            if dynamic {
-                let name_idx = cx.intern_string_constant(&name);
-                let strict = i32::from(cx.is_strict);
-                cx.emit(
-                    Op::StoreDynamic,
-                    [
-                        Operand::Register(value),
-                        Operand::ConstIndex(name_idx),
-                        Operand::Imm32(strict),
-                    ],
-                    span,
-                );
-                if let Some(done) = with_store_done {
-                    cx.patch_branch_to_here(done);
-                }
-                return Ok(value);
-            }
-            // §9.1.1.4 global SetMutableBinding — declarative record
-            // (script lexicals) first, then the object record;
-            // strict stores re-check the binding still exists.
+    match (eval_ref, strict_global_probe) {
+        (Some(ref_reg), _) => cx.emit_store_ref(value, ref_reg, &name, &reference, span),
+        (None, Some(exists)) => {
+            // §9.1.1.4 global SetMutableBinding; the strict store re-checks
+            // the binding the pre-RHS snapshot saw.
             let name_idx = cx.intern_string_constant(&name);
-            if let Some(exists) = strict_global_probe {
-                cx.emit(
-                    Op::StoreGlobalChecked,
-                    [
-                        Operand::Register(value),
-                        Operand::ConstIndex(name_idx),
-                        Operand::Register(exists),
-                    ],
-                    span,
-                );
-            } else {
-                let strict = i32::from(cx.is_strict);
-                cx.emit(
-                    Op::StoreGlobalBinding,
-                    [
-                        Operand::Register(value),
-                        Operand::ConstIndex(name_idx),
-                        Operand::Imm32(strict),
-                    ],
-                    span,
-                );
-            }
+            cx.emit(
+                Op::StoreGlobalChecked,
+                [
+                    Operand::Register(value),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(exists),
+                ],
+                span,
+            );
         }
+        (None, None) => cx.emit_name_assign(value, &name, &reference, span),
     }
+    cx.emit_module_export_mirror(&name, value, span);
     if let Some(done) = with_store_done {
         cx.patch_branch_to_here(done);
     }
@@ -670,9 +469,10 @@ pub(crate) fn compile_logical_assignment(
             /// IdentifierReference target — a parenthesized cover
             /// (`(x) ||= fn`) must not name the function.
             direct_identifier: bool,
-            /// Pre-RHS eval-binding snapshot for a capture a direct eval
-            /// may shadow (§13.15.2 — the reference resolves once).
-            eval_snapshot: Option<u16>,
+            reference: NameRef,
+            /// Reference pinned before the RHS when an eval extension
+            /// may intercept the name (§13.15.2).
+            eval_ref: Option<u16>,
         },
         Prepared(PreparedAssignmentTarget),
     }
@@ -680,61 +480,35 @@ pub(crate) fn compile_logical_assignment(
         AssignmentTarget::AssignmentTargetIdentifier(id) => {
             let name = id.name.as_str().to_string();
             let load = cx.alloc_scratch();
-            let mut eval_snapshot = None;
-            if let Some(info) = cx.lookup_binding(&name) {
+            let reference = cx.resolve_ref(&name);
+            // §13.15.2 — the reference resolves once, before the RHS.
+            let eval_ref = cx.emit_resolve_ref(&name, &reference, span);
+            match reference {
                 // §13.15.2 step 2 — `GetValue(lref)` runs before the
-                // short-circuit test, so reading a `let`/`const`/`class`
-                // binding still in its TDZ raises ReferenceError.
-                if info.initialized {
-                    cx.emit_load_storage(load, info.storage, span);
-                } else {
-                    let diag_idx = match info.storage {
-                        BindingStorage::Register { reg } => reg,
-                        BindingStorage::Upvalue { idx } => idx,
+                // short-circuit test, so a TDZ binding raises here.
+                NameRef::Binding(_) | NameRef::Global(Some(_)) => {
+                    cx.emit_name_load(load, &name, &reference, false, span);
+                }
+                NameRef::Global(None) => {
+                    let name_idx = cx.intern_string_constant(&name);
+                    let op = if cx.is_strict {
+                        Op::LoadGlobalOrThrow
+                    } else {
+                        Op::LoadGlobalOrUndefined
                     };
-                    cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
+                    cx.emit(
+                        op,
+                        [Operand::Register(load), Operand::ConstIndex(name_idx)],
+                        span,
+                    );
                 }
-            } else if let Some((idx, _, eval_depth)) = cx.resolve_capture_with_info(&name) {
-                if eval_depth != 0 {
-                    let snap = cx.alloc_scratch();
-                    cx.emit(Op::EvalBindingSeq, [Operand::Register(snap)], span);
-                    eval_snapshot = Some(snap);
-                }
-                cx.emit_captured_binding_load_snap(
-                    load,
-                    &name,
-                    idx,
-                    eval_depth,
-                    eval_snapshot,
-                    span,
-                );
-            } else if cx.any_enclosing_leaking_direct_eval() {
-                let name_idx = cx.intern_string_constant(&name);
-                cx.emit(
-                    Op::LoadDynamic,
-                    [Operand::Register(load), Operand::ConstIndex(name_idx)],
-                    span,
-                );
-            } else if cx.is_strict {
-                let name_idx = cx.intern_string_constant(&name);
-                cx.emit(
-                    Op::LoadGlobalOrThrow,
-                    [Operand::Register(load), Operand::ConstIndex(name_idx)],
-                    span,
-                );
-            } else {
-                let name_idx = cx.intern_string_constant(&name);
-                cx.emit(
-                    Op::LoadGlobalOrUndefined,
-                    [Operand::Register(load), Operand::ConstIndex(name_idx)],
-                    span,
-                );
             }
             (
                 LogicalTarget::Ident {
                     name,
                     direct_identifier: id.span.start == a.span.start,
-                    eval_snapshot,
+                    reference,
+                    eval_ref,
                 },
                 load,
             )
@@ -754,7 +528,7 @@ pub(crate) fn compile_logical_assignment(
             // the store goes through the receiver (§6.2.5.5 step 6.b).
             if matches!(m.object, Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(m.property.name.as_str());
                 let load = compile_super_member_load(cx, m.property.name.as_str(), span)?;
@@ -794,7 +568,7 @@ pub(crate) fn compile_logical_assignment(
             if matches!(m.object, Expression::Super(_)) {
                 let home_reg = load_synthetic_capture(cx, super_home_binding_name(cx), span)?;
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let idx_reg = compile_expr(cx, &m.expression, span)?;
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 let load = cx.alloc_scratch();
@@ -963,44 +737,15 @@ pub(crate) fn compile_logical_assignment(
     match target {
         LogicalTarget::Ident {
             name,
-            eval_snapshot,
+            reference,
+            eval_ref,
             ..
         } => {
-            // §13.15.2 PutValue on a function-expression self-name
-            // binding is immutable: the RHS has already evaluated, then
-            // strict mode throws while sloppy mode silently drops the
-            // write. (TDZ was handled by the initial read above; const
-            // bindings are rejected inside `assign_to_target`.)
-            // Captured self-name fallbacks stay in the typed shadowed store:
-            // a post-RHS eval binding may be the actual mutable target.
-            let fn_self_target = cx
-                .lookup_binding(&name)
-                .is_some_and(|info| info.fn_self_name);
-            if fn_self_target {
-                if cx.is_strict {
-                    emit_assignment_type_error(
-                        cx,
-                        &format!("Assignment to constant variable '{name}'."),
-                        span,
-                    );
-                }
-            } else if let (Some(snapshot), Some((index, info, eval_depth))) =
-                (eval_snapshot, cx.resolve_capture_with_info(&name))
-            {
-                // The reference resolved before the RHS: bindings the RHS's
-                // direct eval introduced are invisible to this store.
-                cx.emit_captured_binding_store_snap(
-                    new_value,
-                    &name,
-                    index,
-                    info,
-                    eval_depth,
-                    Some(snapshot),
-                    span,
-                );
-            } else {
-                assign_to_target(cx, &a.left, new_value, span)?;
+            match eval_ref {
+                Some(ref_reg) => cx.emit_store_ref(new_value, ref_reg, &name, &reference, span),
+                None => cx.emit_name_assign(new_value, &name, &reference, span),
             }
+            cx.emit_module_export_mirror(&name, new_value, span);
         }
         LogicalTarget::Prepared(prepared) => {
             assign_prepared_target(cx, prepared, new_value, span)?;
@@ -1056,7 +801,7 @@ pub(crate) fn assign_to_target(
             // identical to the plain `super.X = V` lowering above.
             if matches!(member.object, Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 cx.emit(
@@ -1091,7 +836,7 @@ pub(crate) fn assign_to_target(
             // `SetSuperElement`, mirroring the `super[K] = V` path.
             if matches!(member.object, Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let idx_reg = compile_expr(cx, &member.expression, span)?;
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 cx.emit(
@@ -1158,7 +903,7 @@ fn prepare_assignment_target(
             }
             if matches!(member.object, Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 let name_idx = cx.intern_string_constant(member.property.name.as_str());
                 return Ok(Some(PreparedAssignmentTarget::SuperProperty {
@@ -1176,7 +921,7 @@ fn prepare_assignment_target(
         AssignmentTarget::ComputedMemberExpression(member) => {
             if matches!(member.object, Expression::Super(_)) {
                 let this_guard = cx.alloc_scratch();
-                cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+                cx.emit_load_this(this_guard, span);
                 let idx_reg = compile_expr(cx, &member.expression, span)?;
                 let base_reg = crate::class::emit_super_base(cx, span)?;
                 return Ok(Some(PreparedAssignmentTarget::SuperElement {
@@ -1660,44 +1405,32 @@ pub(crate) fn store_identifier_checked(
     if let Some(info) = cx.lookup_binding(name)
         && !info.initialized
     {
-        let diag_idx = match info.storage {
-            BindingStorage::Register { reg } => reg,
-            BindingStorage::Upvalue { idx } => idx,
-        };
-        cx.emit(Op::TdzError, [Operand::Imm32(i32::from(diag_idx))], span);
+        cx.emit(
+            Op::TdzError,
+            [Operand::Imm32(info.storage.diagnostic_index())],
+            span,
+        );
         return Ok(());
     }
     store_identifier(cx, name, value_reg, span)
 }
 
+/// Store `value_reg` into the binding (or the global environment) for
+/// `name`. An own binding with no intervening eval extension is written
+/// directly — this path also initializes declaration leaves and formal
+/// parameters; anything else is an ordinary PutValue.
 pub(crate) fn store_identifier(
     cx: &mut Compiler,
     name: &str,
     value_reg: u16,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
-    // `store_identifier` is shared between binding initialization and
-    // destructuring/logical assignment leaves. Own bindings are statically
-    // authoritative; cross-function captures retain their declaration
-    // metadata and may be shadowed by a live eval environment.
-    // §19.2.1.3 — a deletable eval-introduced var stores through the
-    // eval-environment record (falling back to the sloppy global
-    // write once the binding was deleted).
-    if cx.eval_var_dynamic_reference(name) {
-        let name_idx = cx.intern_string_constant(name);
-        let strict = i32::from(cx.is_strict);
-        cx.emit(
-            Op::StoreDynamic,
-            [
-                Operand::Register(value_reg),
-                Operand::ConstIndex(name_idx),
-                Operand::Imm32(strict),
-            ],
-            span,
-        );
-        return Ok(());
-    }
-    if let Some(info) = cx.lookup_binding(name) {
+    let reference = cx.resolve_ref(name);
+    if let NameRef::Binding(resolved) = &reference
+        && resolved.access == crate::compiler::Access::Own
+        && resolved.lookup.is_none()
+    {
+        let info = resolved.info;
         if info.fn_self_name {
             if cx.is_strict {
                 emit_assignment_type_error(
@@ -1721,40 +1454,8 @@ pub(crate) fn store_identifier(
         cx.emit_module_export_mirror(name, value_reg, span);
         return Ok(());
     }
-    if let Some((index, info, eval_depth)) = cx.resolve_capture_with_info(name) {
-        cx.emit_captured_binding_store(value_reg, name, index, info, eval_depth, span);
-        return Ok(());
-    }
-    // §10.2.4.2 PutValue — a live eval chain may resolve the name before the
-    // global environment. StoreDynamic owns that complete fallback.
-    if cx.any_enclosing_leaking_direct_eval() {
-        let name_idx = cx.intern_string_constant(name);
-        let strict = i32::from(cx.is_strict);
-        cx.emit(
-            Op::StoreDynamic,
-            [
-                Operand::Register(value_reg),
-                Operand::ConstIndex(name_idx),
-                Operand::Imm32(strict),
-            ],
-            span,
-        );
-    } else {
-        // §9.1.1.4 global SetMutableBinding — the declarative record
-        // (script lexicals, `const` → TypeError, TDZ → ReferenceError)
-        // shadows the object record; strict writes to a missing binding throw.
-        let name_idx = cx.intern_string_constant(name);
-        let strict = i32::from(cx.is_strict);
-        cx.emit(
-            Op::StoreGlobalBinding,
-            [
-                Operand::Register(value_reg),
-                Operand::ConstIndex(name_idx),
-                Operand::Imm32(strict),
-            ],
-            span,
-        );
-    }
+    cx.emit_name_assign(value_reg, name, &reference, span);
+    cx.emit_module_export_mirror(name, value_reg, span);
     Ok(())
 }
 

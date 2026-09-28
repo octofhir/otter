@@ -130,7 +130,6 @@ pub(super) fn emit_spread_call_op(
             transitions.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
             transitions.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
             transitions.entry(abi::STUB_JIT_COPY_SPREAD_ARGUMENTS),
-            transitions.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
             0,
             code_map,
             bail,

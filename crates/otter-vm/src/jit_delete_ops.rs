@@ -1,9 +1,9 @@
 //! Compiled `delete` transitions.
 //!
 //! # Contents
-//! - `DeleteProperty`, `DeleteElement`, and `DeleteDynamic` completion through
-//!   the VM's Proxy-aware delete drivers, fast paths, and unqualified-delete
-//!   helper.
+//! - `DeleteProperty` and `DeleteElement` completion through the VM's
+//!   Proxy-aware delete drivers and fast paths. Unqualified `delete name`
+//!   runs through the `Lookup*` binding family.
 //!
 //! # Invariants
 //! - Each transition mirrors the interpreter dispatch exactly: the same
@@ -15,7 +15,6 @@
 //!
 //! # See also
 //! - [`crate::Interpreter::drive_delete_property_proxy`]
-//! - [`crate::Interpreter::run_delete_dynamic_reg`]
 
 use otter_bytecode::{Op, Operand};
 
@@ -27,8 +26,7 @@ use crate::{
 impl Interpreter {
     /// Complete one `delete` opcode for a published compiled frame. For
     /// `DeleteProperty` `arg1`/`arg2` are the object register and constant name
-    /// index; for `DeleteElement` they are the object and key registers; for
-    /// `DeleteDynamic` `arg1` is the constant name index.
+    /// index; for `DeleteElement` they are the object and key registers.
     pub(crate) fn jit_runtime_delete_op(
         &mut self,
         context: &ExecutionContext,
@@ -115,9 +113,6 @@ impl Interpreter {
                         strict,
                     )?;
                 }
-            }
-            value if value == Op::DeleteDynamic as u8 => {
-                self.run_delete_dynamic_active_reg(context, frame, dst, arg1 as u32)?;
             }
             _ => return Err(VmError::InvalidOperand),
         }

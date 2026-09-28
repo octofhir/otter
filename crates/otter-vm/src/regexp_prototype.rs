@@ -2387,8 +2387,7 @@ mod tests {
                 scratch: 0,
                 param_count: 0,
                 length: 0,
-                own_upvalue_count: 0,
-                inherited_upvalue_count: 0,
+                scopes: Vec::new(),
                 is_strict: false,
                 is_arrow: false,
                 is_method: false,
@@ -2405,8 +2404,6 @@ mod tests {
                 source_text_range: None,
                 source_text_span: None,
                 module_url: String::new(),
-                direct_eval_bindings: Vec::new(),
-                eval_sites: Vec::new(),
                 contains_direct_eval: false,
                 code: vec![Instruction {
                     pc: 0,

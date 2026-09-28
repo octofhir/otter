@@ -65,34 +65,64 @@ fn host_lookup_opacity_survives_prototype_changes_for_every_allocator() {
     }
 }
 
+/// A parameter-scope context holding `values` in its slots.
+fn parameter_context(heap: &mut GcHeap, values: &[Value]) -> crate::context::ContextHandle {
+    let context = crate::context::alloc_context_with_roots(
+        heap,
+        crate::context::ContextShape {
+            scope_function_id: 0,
+            scope_index: 0,
+            slot_count: values.len() as u16,
+        },
+        Value::undefined(),
+        |_| false,
+        &mut |_| {},
+    )
+    .expect("parameter context");
+    for (slot, value) in values.iter().enumerate() {
+        assert!(crate::context::write_slot(
+            heap,
+            context,
+            slot as u16,
+            *value
+        ));
+    }
+    context
+}
+
 #[test]
 fn mapped_argument_lookup_opacity_survives_prototype_changes() {
     let mut heap = GcHeap::new().expect("heap");
     let object = alloc_object_old_for_fixture(&mut heap).expect("arguments");
     let prototype = alloc_object_old_for_fixture(&mut heap).expect("prototype");
-    let cell = crate::alloc_upvalue(&mut heap, Value::number_i32(1)).expect("mapped cell");
-    let retained_cell =
-        crate::alloc_upvalue(&mut heap, Value::number_i32(2)).expect("retained mapped cell");
+    let context = parameter_context(&mut heap, &[Value::number_i32(1), Value::number_i32(2)]);
     assert!(!opaque(object, &heap));
     install_mapped_arguments(
         object,
         &mut heap,
-        vec![
-            MappedArgumentEntry {
-                key: "0".into(),
-                cell,
-            },
-            MappedArgumentEntry {
-                key: "1".into(),
-                cell: retained_cell,
-            },
-        ],
+        MappedArguments {
+            context,
+            entries: vec![
+                MappedArgumentEntry {
+                    key: "0".into(),
+                    slot: 0,
+                },
+                MappedArgumentEntry {
+                    key: "1".into(),
+                    slot: 1,
+                },
+            ],
+        },
     );
     assert_prototype_changes_preserve_opacity(object, prototype, &mut heap, true);
     heap.with_payload(object, |body| remove_mapped_argument(body, "0"));
     assert_eq!(
         heap.read_payload(object, |body| mapped_argument_cell(body, "1")),
-        Some(retained_cell),
+        Some((context, 1)),
+    );
+    assert_eq!(
+        heap.read_payload(object, |body| mapped_argument_cell(body, "0")),
+        None,
     );
     assert_prototype_changes_preserve_opacity(object, prototype, &mut heap, true);
 }
@@ -192,15 +222,17 @@ fn own_data_hits_preserve_mapped_argument_values() {
     let hit = lookup_own_atom(object, interpreter.gc_heap(), key)
         .hit
         .expect("own slot");
-    let cell = crate::alloc_upvalue(interpreter.gc_heap_mut(), Value::number_i32(41))
-        .expect("mapped cell");
+    let context = parameter_context(interpreter.gc_heap_mut(), &[Value::number_i32(41)]);
     install_mapped_arguments(
         object,
         interpreter.gc_heap_mut(),
-        vec![MappedArgumentEntry {
-            key: "0".into(),
-            cell,
-        }],
+        MappedArguments {
+            context,
+            entries: vec![MappedArgumentEntry {
+                key: "0".into(),
+                slot: 0,
+            }],
+        },
     );
     assert!(interpreter.gc_heap().read_payload(object, |body| {
         body.shape == hit.shape && body.chain_link_opaque

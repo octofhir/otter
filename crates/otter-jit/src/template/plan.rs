@@ -21,7 +21,13 @@
 //!   materialize them without consulting the constant pool.
 //! - Binding and global-declaration families are selected only by the opcode
 //!   schema. Their runtime operations carry boxed SSA values; immutable site
-//!   metadata is never copied into a raw dispatcher payload.
+//!   metadata is never copied into a raw dispatcher payload. Checked
+//!   context-slot and lookup accesses are binding-family operations whose
+//!   context register is one of those values.
+//! - Unchecked context-slot accesses, SELF context reads, and context
+//!   allocation have no binding row: they are plain template operations with
+//!   their packed coordinate decoded here, and allocation owns a full-window
+//!   safepoint.
 //!
 //! # See also
 //! - [`super::arm64`] — the first machine-code consumer of these operations.
@@ -214,29 +220,71 @@ pub(crate) enum TemplateOp {
     /// `r<dst>` = this-binding read from the entry context; a derived-ctor
     /// hole takes an exact side exit.
     LoadThis { dst: u16 },
-    /// `r<dst>` = the running function's SELF closure bits from the entry
-    /// context (named-function self binding).
+    /// `r<dst>` = the running function's SELF closure bits from the native
+    /// frame (`Op::LoadSelf`).
     LoadSelfClosure { dst: u16 },
+    /// `r<dst>` = SELF's closure context, or `undefined` when SELF is a bare
+    /// function value that closes over no context (`Op::LoadClosureContext`).
+    LoadClosureContext { dst: u16 },
+    /// Unchecked `r<dst> = r<context>.parent^depth.slots[slot]`
+    /// (`Op::LoadContextSlot`). The verifier proves the chain shape; the read
+    /// never throws.
+    LoadContextSlot {
+        dst: u16,
+        context: u16,
+        depth: u16,
+        slot: u16,
+    },
+    /// Unchecked, write-barriered `r<context>.parent^depth.slots[slot] =
+    /// r<src>` (`Op::StoreContextSlot`).
+    StoreContextSlot {
+        src: u16,
+        context: u16,
+        depth: u16,
+        slot: u16,
+    },
+    /// `r<dst>` = a fresh context of this function's scope `scope` under
+    /// `r<parent>`, allocated through the VM-owned rooted allocating ABI at
+    /// `safepoint`. A refused allocation exits before effects at the
+    /// original opcode.
+    CreateContext {
+        dst: u16,
+        parent: u16,
+        scope: u32,
+        safepoint: SafepointId,
+    },
+    /// `r<dst>` = a per-iteration copy of `r<src>` (§14.7.4.4), allocated like
+    /// [`Self::CreateContext`].
+    CopyContext {
+        dst: u16,
+        src: u16,
+        safepoint: SafepointId,
+    },
     /// Exact derived-constructor superclass lookup from its class wrapper.
     ClassSuperConstructor { dst: u16, class: u16 },
     /// `r<dst>` = materialized function object for `constants[constant]`.
     MakeFunction { dst: u16, constant: u32 },
-    /// `r<dst>` = closure over `function` capturing `parents` upvalues.
+    /// `r<dst>` = closure over `function` closing over the context held in
+    /// register `context`.
     MakeClosure {
         dst: u16,
         function: u32,
-        parents: TemplateTail,
+        context: u16,
     },
     /// Materialize a regex literal from the constant pool.
     LoadRegExp { dst: u16, constant: u32 },
-    /// One schema-owned binding access. Names, strictness, captured-cell
-    /// indices, and missing-binding policy remain in the published bytecode
-    /// site; only boxed SSA values cross the committed runtime boundary.
+    /// One schema-owned binding access. Names, strictness, context
+    /// coordinates, and missing-binding policy remain in the published
+    /// bytecode site; only boxed SSA values (including the context register)
+    /// cross the committed runtime boundary.
     BindingValue {
         semantics: BindingSemantics,
         result: Option<u16>,
         value0: Option<u16>,
         value1: Option<u16>,
+        /// Slot coordinate of a checked context-slot access; its hit path
+        /// completes inline and only a TDZ hole reaches the committed call.
+        context_coord: Option<otter_bytecode::ContextCoord>,
     },
     /// One schema-owned global declaration/initialization operation. This is
     /// deliberately separate from ordinary binding access even though both
@@ -266,8 +314,6 @@ pub(crate) enum TemplateOp {
     /// `Op::NewObjectLiteral`: the evaluated values in property order; the
     /// published instruction names the keys.
     NewObjectLiteral { dst: u16, elements: TemplateTail },
-    /// Refresh the captured binding cell at `index` (per-iteration bindings).
-    FreshUpvalue { index: i32 },
     /// `object[key] = value` as a data property definition.
     DefineDataProperty { object: u16, key: u16, value: u16 },
     /// `DefineOwnProperty(target, key, descriptor)`.
@@ -562,6 +608,16 @@ pub(crate) enum TemplateOp {
     Return { src: u16 },
     /// Return `undefined` as the completion value.
     ReturnUndefined,
+    /// §10.2.2 derived-constructor completion: an `undefined` value with a
+    /// bound `r<this_raw>` returns that receiver. An object or primitive
+    /// value, or a still-unbound receiver, exits before effects at this
+    /// opcode so the interpreter owns the override and both throws.
+    ReturnDerived {
+        value: u16,
+        context: u16,
+        depth: u16,
+        slot: u16,
+    },
     /// Exact side exit at an opcode outside the compiled subset: the stamped
     /// PC names the uncommitted instruction and the interpreter resumes
     /// there. Code containing one is only sound to enter at a loop header
@@ -593,7 +649,6 @@ pub(crate) struct TemplatePlan {
     pub(crate) instructions: Vec<TemplateInstr>,
     pub(crate) register_count: u16,
     pub(crate) register_operands: Box<[u16]>,
-    pub(crate) index_operands: Box<[u32]>,
     /// Steps of every [`TemplateOp::FusedNumericChain`], addressed by tail.
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) chain_steps: Box<[FusedChainStep]>,
@@ -639,17 +694,14 @@ impl TemplatePlan {
         let mut out = String::from("; otter template plan\n");
         writeln!(
             out,
-            "; registers={} register-operands={} index-operands={} safepoints={} osr-only={}",
+            "; registers={} register-operands={} safepoints={} osr-only={}",
             self.register_count,
             self.register_operands.len(),
-            self.index_operands.len(),
             self.safepoint_records.len(),
             self.osr_only
         )
         .expect("writing to String cannot fail");
         writeln!(out, "; register-operands={:?}", self.register_operands)
-            .expect("writing to String cannot fail");
-        writeln!(out, "; index-operands={:?}", self.index_operands)
             .expect("writing to String cannot fail");
         for (index, instruction) in self.instructions.iter().enumerate() {
             writeln!(
@@ -700,10 +752,6 @@ impl TemplatePlan {
         unpacked[..usize::from(argc)].to_vec()
     }
 
-    pub(crate) fn index_tail(&self, tail: TemplateTail) -> &[u32] {
-        &self.index_operands[tail.start..tail.start + tail.len]
-    }
-
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub(crate) fn chain_step_tail(&self, tail: TemplateTail) -> &[FusedChainStep] {
         &self.chain_steps[tail.start..tail.start + tail.len]
@@ -720,7 +768,6 @@ impl TemplatePlan {
         let lowering = BaselinePlan::build(view)?;
         let mut instructions = Vec::with_capacity(lowering.instructions.len());
         let mut register_operands: Vec<u16> = Vec::new();
-        let mut index_operands: Vec<u32> = Vec::new();
         let mut osr_only = false;
         // §14.15.3 — a `return` inside a `try` whose region owns a
         // `finally` must run that finally before the frame completes.
@@ -827,6 +874,7 @@ impl TemplatePlan {
                         result: operands.result,
                         value0: operands.values[0],
                         value1: operands.values[1],
+                        context_coord: operands.context_coord,
                     },
                 });
                 continue;
@@ -961,9 +1009,55 @@ impl TemplatePlan {
                             .operation,
                     }
                 }
-                Op::MakeFunction | Op::MakeClosure if meta.make_self => {
-                    TemplateOp::LoadSelfClosure {
-                        dst: lowered.destination_operands()?.dst,
+                Op::LoadSelf => TemplateOp::LoadSelfClosure {
+                    dst: lowered.destination_operands()?.dst,
+                },
+                Op::LoadClosureContext => TemplateOp::LoadClosureContext {
+                    dst: lowered.destination_operands()?.dst,
+                },
+                Op::LoadContextSlot => {
+                    let operands = lowered.context_slot_operands()?;
+                    TemplateOp::LoadContextSlot {
+                        dst: operands.value,
+                        context: operands.context,
+                        depth: operands.coord.depth,
+                        slot: operands.coord.slot,
+                    }
+                }
+                Op::StoreContextSlot => {
+                    let operands = lowered.context_slot_operands()?;
+                    TemplateOp::StoreContextSlot {
+                        src: operands.value,
+                        context: operands.context,
+                        depth: operands.coord.depth,
+                        slot: operands.coord.slot,
+                    }
+                }
+                Op::CreateContext => {
+                    let operands = lowered.create_context_operands()?;
+                    TemplateOp::CreateContext {
+                        dst: operands.dst,
+                        parent: operands.parent,
+                        scope: operands.scope,
+                        safepoint: lowering
+                            .context_alloc_safepoints
+                            .get(&lowered.byte_pc)
+                            .copied()
+                            .ok_or(Unsupported::OperandShape(
+                                "CreateContext without a safepoint",
+                            ))?,
+                    }
+                }
+                Op::CopyContext => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::CopyContext {
+                        dst: operands.dst,
+                        src: operands.src,
+                        safepoint: lowering
+                            .context_alloc_safepoints
+                            .get(&lowered.byte_pc)
+                            .copied()
+                            .ok_or(Unsupported::OperandShape("CopyContext without a safepoint"))?,
                     }
                 }
                 Op::MakeFunction => {
@@ -975,16 +1069,10 @@ impl TemplatePlan {
                 }
                 Op::MakeClosure => {
                     let operands = lowered.make_closure_operands()?;
-                    let slice = lowering.index_tail(operands.parents)?;
-                    let start = index_operands.len();
-                    index_operands.extend_from_slice(slice);
                     TemplateOp::MakeClosure {
                         dst: operands.dst,
                         function: operands.function,
-                        parents: TemplateTail {
-                            start,
-                            len: slice.len(),
-                        },
+                        context: operands.context,
                     }
                 }
                 Op::LoadThis => TemplateOp::LoadThis {
@@ -1037,9 +1125,6 @@ impl TemplatePlan {
                         },
                     }
                 }
-                Op::FreshUpvalue => TemplateOp::FreshUpvalue {
-                    index: lowered.immediate_operands()?.value,
-                },
                 Op::DefineDataProperty => {
                     let operands = lowered.triple_operands()?;
                     TemplateOp::DefineDataProperty {
@@ -1536,9 +1621,11 @@ impl TemplatePlan {
                     let operands = lowered.eval_operands()?;
                     TemplateOp::ClassValueOp {
                         opcode: Op::Eval as u8,
-                        arg0: u64::from(operands.dst) | (u64::from(operands.src) << 16),
+                        arg0: u64::from(operands.dst)
+                            | (u64::from(operands.src) << 16)
+                            | (u64::from(operands.context) << 32),
                         arg1: operands.flags as u32 as u64,
-                        arg2: operands.site as u32 as u64,
+                        arg2: 0,
                     }
                 }
                 Op::IsEvalIntrinsic | Op::ToNumber => {
@@ -1779,7 +1866,7 @@ impl TemplatePlan {
                         hint: operands.hint,
                     }
                 }
-                Op::Return | Op::ReturnValue | Op::ReturnUndefined
+                Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived
                     if finally_protected
                         .iter()
                         .any(|(enter, end)| pc > *enter && pc <= *end) =>
@@ -1791,6 +1878,15 @@ impl TemplatePlan {
                     src: lowered.source_operands()?.src,
                 },
                 Op::ReturnUndefined => TemplateOp::ReturnUndefined,
+                Op::ReturnDerived => {
+                    let operands = lowered.return_derived_operands()?;
+                    TemplateOp::ReturnDerived {
+                        value: operands.value,
+                        context: operands.context,
+                        depth: operands.depth,
+                        slot: operands.slot,
+                    }
+                }
                 // Opcode outside the subset: lower to an exact side exit at
                 // this PC instead of failing the whole compile, so a hot,
                 // fully-supported loop still tiers up via OSR. The entry path
@@ -1811,7 +1907,6 @@ impl TemplatePlan {
             instructions,
             register_count: view.code_block.register_count,
             register_operands: register_operands.into_boxed_slice(),
-            index_operands: index_operands.into_boxed_slice(),
             chain_steps: chain_steps.into_boxed_slice(),
             chain_leaves: chain_leaves.into_boxed_slice(),
             load_property_count: lowering.load_property_count,
@@ -2096,20 +2191,21 @@ mod tests {
                 ],
             ),
             (
-                Op::StoreShadowedUpvalueChecked,
+                Op::StoreLookupSlot,
                 vec![
                     Operand::Register(1),
+                    Operand::Register(5),
                     Operand::ConstIndex(2),
-                    Operand::Imm32(4),
+                    Operand::Imm32(otter_bytecode::ContextCoord::new(1, 4).unwrap().to_imm32()),
                     Operand::Imm32(0),
                 ],
             ),
             (
-                Op::DeleteShadowedUpvalue,
+                Op::DeleteLookupSlot,
                 vec![
                     Operand::Register(0),
+                    Operand::Register(5),
                     Operand::ConstIndex(2),
-                    Operand::Imm32(4),
                     Operand::Imm32(1),
                 ],
             ),
@@ -2129,6 +2225,7 @@ mod tests {
                 result: Some(0),
                 value0: None,
                 value1: None,
+                context_coord: None,
             }
         ));
         assert!(matches!(
@@ -2138,24 +2235,27 @@ mod tests {
                 result: None,
                 value0: Some(1),
                 value1: Some(3),
+                context_coord: None,
             }
         ));
         assert!(matches!(
             plan.instructions[2].op,
             TemplateOp::BindingValue {
-                semantics: BindingSemantics::Write(BindingWrite::ShadowedUpvalue { .. }),
+                semantics: BindingSemantics::Write(BindingWrite::LookupSlot { .. }),
                 result: None,
                 value0: Some(1),
-                value1: None,
+                value1: Some(5),
+                context_coord: None,
             }
         ));
         assert!(matches!(
             plan.instructions[3].op,
             TemplateOp::BindingValue {
-                semantics: BindingSemantics::Delete(BindingDelete::ShadowedUpvalue { .. }),
+                semantics: BindingSemantics::Delete(BindingDelete::LookupSlot { .. }),
                 result: Some(0),
-                value0: None,
+                value0: Some(5),
                 value1: None,
+                context_coord: None,
             }
         ));
         assert!(matches!(
@@ -2166,6 +2266,159 @@ mod tests {
                 value1: None,
             }
         ));
+    }
+
+    #[test]
+    fn context_operations_compile_without_osr_fallback() {
+        use otter_bytecode::ContextCoord;
+        use otter_bytecode::opcode_schema::{BindingRead, BindingWrite};
+
+        let coord = ContextCoord::new(1, 3).unwrap().to_imm32();
+        let v = view(&[
+            (Op::LoadClosureContext, vec![Operand::Register(0)]),
+            (
+                Op::CreateContext,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(2),
+                ],
+            ),
+            (
+                Op::LoadContextSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(1),
+                    Operand::Imm32(coord),
+                ],
+            ),
+            (
+                Op::StoreContextSlot,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(1),
+                    Operand::Imm32(coord),
+                ],
+            ),
+            (
+                Op::LoadContextSlotChecked,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Imm32(coord),
+                ],
+            ),
+            (
+                Op::StoreContextSlotChecked,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Imm32(coord),
+                ],
+            ),
+            (
+                Op::CopyContext,
+                vec![Operand::Register(4), Operand::Register(1)],
+            ),
+            (
+                Op::MakeClosure,
+                vec![
+                    Operand::Register(5),
+                    Operand::ConstIndex(0),
+                    Operand::Register(4),
+                ],
+            ),
+            (Op::LoadSelf, vec![Operand::Register(6)]),
+            (
+                Op::ReturnDerived,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(3),
+                    Operand::Imm32(otter_bytecode::ContextCoord { depth: 1, slot: 2 }.to_imm32()),
+                ],
+            ),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("context plan");
+        assert!(!plan.osr_only);
+        let ops: Vec<_> = plan.instructions.iter().map(|instr| instr.op).collect();
+        assert_eq!(ops[0], TemplateOp::LoadClosureContext { dst: 0 });
+        let TemplateOp::CreateContext {
+            dst: 1,
+            parent: 0,
+            scope: 2,
+            safepoint: create_safepoint,
+        } = ops[1]
+        else {
+            panic!("expected CreateContext, got {:?}", ops[1]);
+        };
+        assert_eq!(
+            ops[2],
+            TemplateOp::LoadContextSlot {
+                dst: 2,
+                context: 1,
+                depth: 1,
+                slot: 3,
+            }
+        );
+        assert_eq!(
+            ops[3],
+            TemplateOp::StoreContextSlot {
+                src: 2,
+                context: 1,
+                depth: 1,
+                slot: 3,
+            }
+        );
+        assert!(matches!(
+            ops[4],
+            TemplateOp::BindingValue {
+                semantics: BindingSemantics::Read(BindingRead::ContextSlot { .. }),
+                result: Some(3),
+                value0: Some(1),
+                value1: None,
+                context_coord: Some(_),
+            }
+        ));
+        assert!(matches!(
+            ops[5],
+            TemplateOp::BindingValue {
+                semantics: BindingSemantics::Write(BindingWrite::ContextSlot { .. }),
+                result: None,
+                value0: Some(3),
+                value1: Some(1),
+                context_coord: Some(_),
+            }
+        ));
+        let TemplateOp::CopyContext {
+            dst: 4,
+            src: 1,
+            safepoint: copy_safepoint,
+        } = ops[6]
+        else {
+            panic!("expected CopyContext, got {:?}", ops[6]);
+        };
+        assert_ne!(create_safepoint, copy_safepoint);
+        for id in [create_safepoint, copy_safepoint] {
+            assert!(plan.safepoint_records.iter().any(|record| record.id == id));
+        }
+        assert_eq!(
+            ops[7],
+            TemplateOp::MakeClosure {
+                dst: 5,
+                function: 0,
+                context: 4,
+            }
+        );
+        assert_eq!(ops[8], TemplateOp::LoadSelfClosure { dst: 6 });
+        assert_eq!(
+            ops[9],
+            TemplateOp::ReturnDerived {
+                value: 5,
+                context: 3,
+                depth: 1,
+                slot: 2,
+            }
+        );
     }
 
     /// A `Sub`/`Mul` run whose intermediate is dead fuses; the intermediate's

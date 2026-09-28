@@ -5,7 +5,8 @@
 //! - One rooted full-completion call after the apply lookup has committed.
 //!
 //! # Invariants
-//! - Register aliases come from explicit current values, never stale entry slots.
+//! - Register aliases and the formals context come from explicit current
+//!   packet values, never stale frame slots.
 //! - Input anchors survive arguments-object allocation and observable getters.
 //! - A separate leaf admission handles pre-effect caller materialization exits;
 //!   this boundary returns only a completed value or an exception/error.
@@ -77,6 +78,13 @@ impl Interpreter {
                         };
                         arguments.push(value);
                     }
+                    let register_words = function
+                        .forwarded_argument_bindings()
+                        .filter(|(_, storage)| {
+                            matches!(storage, ArgumentBindingStorage::Register { .. })
+                        })
+                        .count();
+                    let context_word = base + 3 + register_words;
                     let mut register_word = base + 3;
                     for (index, storage) in function.forwarded_argument_bindings() {
                         let value = match storage {
@@ -85,14 +93,16 @@ impl Interpreter {
                                 register_word += 1;
                                 value
                             }
-                            ArgumentBindingStorage::Upvalue { idx } => {
+                            ArgumentBindingStorage::Context { slot, .. } => {
                                 if usize::from(index) >= count {
                                     continue;
                                 }
-                                crate::upvalue::read_upvalue(
-                                    &self.gc_heap,
-                                    source.upvalue(u32::from(idx))?,
-                                )
+                                let context = self
+                                    .iteration_anchor(context_word)
+                                    .as_context()
+                                    .ok_or(VmError::InvalidOperand)?;
+                                crate::context::read_slot(&self.gc_heap, context, slot)
+                                    .ok_or(VmError::InvalidOperand)?
                             }
                         };
                         if let Some(slot) = arguments.get_mut(usize::from(index)) {

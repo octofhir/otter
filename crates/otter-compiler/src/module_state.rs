@@ -61,13 +61,13 @@ pub(crate) fn import_attribute_type(
 
 /// One pre-resolved import-record binding: maps an importer-side
 /// alias (`import { a as alias } from "./other.ts"`) to the
-/// import-record upvalue index plus the original source-side name
-/// the property load reads.
+/// import record plus the original source-side name the property
+/// load reads.
 #[derive(Debug, Clone)]
 pub(crate) struct ImportBinding {
-    /// Own-upvalue index of the `import_record_<n>` JsObject inside
-    /// the running `<module-init>` frame.
-    pub(crate) record_uv_idx: u16,
+    /// Import record number; its object lives in the module-scope slot
+    /// named by [`crate::compiler::import_record_binding`].
+    pub(crate) record: u16,
     /// Source-module name of the binding (e.g., the `a` in
     /// `import { a as alias } from "./other.ts"`). For default
     /// imports this is `"default"`. For namespace imports the
@@ -83,7 +83,7 @@ pub(crate) struct ImportBinding {
     /// from.
     pub(crate) request: ImportRequest,
     /// `true` for `import defer * as ns` — the alias binds to the
-    /// *deferred* namespace cell (lazy evaluation) rather than the
+    /// *deferred* namespace slot (lazy evaluation) rather than the
     /// eager Module Namespace Exotic Object.
     pub(crate) is_deferred: bool,
 }
@@ -93,14 +93,8 @@ pub(crate) struct ImportBinding {
 /// fragment.
 #[derive(Debug, Default)]
 pub(crate) struct ModuleState {
-    /// Own-upvalue index of the `module_env` JsObject (param 0,
-    /// hoisted into a cell at the top of the body so closures can
-    /// capture it).
-    pub(crate) module_env_uv: u16,
-    /// Own-upvalue index of the `import_meta` JsObject (param 1).
-    pub(crate) import_meta_uv: u16,
-    /// Per-request upvalue index of the import-record JsObject.
-    /// Populated by the import pre-pass at the start of the body.
+    /// Per-request import record number. Populated by the import
+    /// pre-pass; the record object lives in a module-scope slot.
     pub(crate) import_records: HashMap<ImportRequest, u16>,
     /// Importer-side alias → import-record binding info.
     pub(crate) imported_names: HashMap<String, ImportBinding>,
@@ -122,12 +116,12 @@ pub(crate) struct ModuleState {
     /// fragment's `module_resolutions` table.
     pub(crate) pre_resolved_imports: HashMap<ImportRequest, String>,
     /// Requests imported via `import defer * as ns from "x"` →
-    /// dedicated upvalue index of the *deferred* namespace cell. Kept
+    /// dedicated record number of the *deferred* namespace. Kept
     /// separate from `import_records` so an eager `import * as a` and a
     /// deferred `import defer * as b` of the same module bind to
     /// distinct objects (§16.2.1 deferred namespaces are distinct from
     /// eager ones). Two deferred imports of the same module share one
-    /// cell, so their namespaces are identical.
+    /// record, so their namespaces are identical.
     pub(crate) deferred_import_records: HashMap<ImportRequest, u16>,
 }
 
@@ -167,20 +161,13 @@ pub(crate) struct ModuleBuilder {
     pub(crate) next_private_namespace: u32,
 }
 
-/// alongside the synthetic upvalue name the inner function should
-/// resolve via `resolve_capture` to land at the same record cell.
-pub(crate) fn find_module_import_binding(
-    cx: &Compiler,
-    name: &str,
-) -> Option<(ImportBinding, String)> {
+/// The import binding `name` names in the enclosing module, if any.
+pub(crate) fn find_module_import_binding(cx: &Compiler, name: &str) -> Option<ImportBinding> {
     for frame in cx.stack.iter().rev() {
         if let Some(state) = &frame.module_state
             && let Some(binding) = state.imported_names.get(name)
         {
-            return Some((
-                binding.clone(),
-                import_record_synthetic_name(binding.record_uv_idx),
-            ));
+            return Some(binding.clone());
         }
     }
     None

@@ -1835,7 +1835,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
     functions[0].locals = 0;
     functions[0].scratch = entry_body.scratch;
     functions[0].param_count = 0;
-    functions[0].own_upvalue_count = 0;
+    functions[0].scopes = Vec::new();
     // A graph that contains a top-level-await module evaluates through an
     // async `<entry>` that awaits each module-init; mark it async so the
     // dispatch loop parks/resumes it via the microtask queue.
@@ -1858,7 +1858,7 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 /// [`Operand::ConstIndex`] operand whose opcode/position pair
 /// actually indexes the constant pool, per
 /// [`Op::is_const_pool_operand`]. Other [`Operand::ConstIndex`]
-/// uses (`argc`, `upvalue_count`, method-id enums, typed-array
+/// uses (`argc`, method-id enums, typed-array
 /// kind enums, …) are intentionally left untouched.
 fn rewrite_const_indices(code: &FunctionCode, offset: u32) -> FunctionCode {
     let mut rewritten = FunctionCodeBuilder::new();

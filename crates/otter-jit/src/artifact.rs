@@ -213,8 +213,6 @@ pub(crate) struct DirectCallArtifact {
     /// Exact total reservation, or null for a dynamic argument window.
     pub(crate) reserved_stack_bytes: Option<u32>,
     pub(crate) callee_register_count: u16,
-    pub(crate) own_upvalue_count: u16,
-    pub(crate) inherited_upvalue_count: u16,
 }
 
 /// Exact heap facts re-read by one guarded monomorphic method edge.
@@ -975,8 +973,6 @@ mod tests {
                 linkage_bytes: Some(112),
                 reserved_stack_bytes: Some(272),
                 callee_register_count: 6,
-                own_upvalue_count: 2,
-                inherited_upvalue_count: 1,
             },
         ));
 
@@ -997,8 +993,6 @@ mod tests {
         assert_eq!(region["directCall"]["linkageBytes"], 112);
         assert_eq!(region["directCall"]["reservedStackBytes"], 272);
         assert_eq!(region["directCall"]["calleeRegisterCount"], 6);
-        assert_eq!(region["directCall"]["ownUpvalueCount"], 2);
-        assert_eq!(region["directCall"]["inheritedUpvalueCount"], 1);
     }
 
     #[test]

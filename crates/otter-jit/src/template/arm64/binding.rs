@@ -1,7 +1,10 @@
 //! Schema-owned binding and global-declaration emission for Template AArch64.
 //!
 //! # Contents
-//! - Direct stable-cell, captured-cell, and guarded global-object hits.
+//! - Direct stable global-lexical-cell and guarded global-object hits.
+//! - Checked context-slot accesses complete inline unless the slot is a TDZ
+//!   `hole`; lookup and eval-extension accesses complete through the
+//!   committed cold boundary. The context register is one of its boxed inputs.
 //! - One fixed boxed-value committed cold boundary per semantic family.
 //! - Family-level guard/hit/cold/join artifact regions.
 //!
@@ -19,11 +22,13 @@
 //! - `crate::entry::runtime_ops::reentry` — fixed committed entry functions.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use otter_bytecode::ContextCoord;
 use otter_bytecode::opcode_schema::{
-    BindingRead, BindingSemantics, BindingWrite, BindingWriteCheck, GlobalDeclarationSemantics,
+    BindingRead, BindingSemantics, BindingWrite, GlobalDeclarationSemantics,
 };
 use otter_vm::{JitCompileSnapshot, jit::BindingHitProof, native_abi as abi};
 
+use super::context::{CheckedContextAccess, emit_checked_context_slot};
 use super::transitions::TransitionTable;
 use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
@@ -32,8 +37,8 @@ use super::values::{
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::artifact::{CodeMapCapture, CodeRegion};
 use crate::entry::{
-    GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_UPVALUE_BASE_OFFSET, THREAD_OFFSET, Unsupported,
-    VALUE_HOLE, VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
+    GLOBAL_THIS_OFFSET_PTR_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_TRUE,
+    VALUE_UNDEFINED, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
 };
 
 fn record_region(
@@ -46,13 +51,6 @@ fn record_region(
     if let Some(capture) = capture.as_deref_mut() {
         capture.record(CodeRegion::structural_at_byte_pc(kind, start, end, byte_pc));
     }
-}
-
-fn instruction_imm32(view: &JitCompileSnapshot, byte_pc: u32, operand: u8) -> Option<i32> {
-    view.instructions
-        .iter()
-        .find(|instruction| instruction.byte_pc == byte_pc)
-        .and_then(|instruction| instruction.imm32(&view.code_block, usize::from(operand)))
 }
 
 fn emit_global_object_guard(
@@ -140,6 +138,7 @@ pub(super) fn emit_binding_value(
     result: Option<u16>,
     value0: Option<u16>,
     value1: Option<u16>,
+    context_coord: Option<ContextCoord>,
     byte_pc: u32,
     mut code_map: Option<&mut CodeMapCapture>,
     throw_value: DynamicLabel,
@@ -153,6 +152,38 @@ pub(super) fn emit_binding_value(
     let mut cold_reachable = true;
 
     match semantics {
+        BindingSemantics::Read(BindingRead::ContextSlot { .. })
+        | BindingSemantics::Write(BindingWrite::ContextSlot { .. }) => {
+            let coord =
+                context_coord.ok_or(Unsupported::OperandShape("checked context coordinate"))?;
+            let (access, context) = match semantics {
+                BindingSemantics::Read(_) => (
+                    CheckedContextAccess::Load {
+                        dst: result.ok_or(Unsupported::OperandShape("context read result"))?,
+                    },
+                    value0,
+                ),
+                _ => (
+                    CheckedContextAccess::Store {
+                        src: value0.ok_or(Unsupported::OperandShape("context write value"))?,
+                    },
+                    value1,
+                ),
+            };
+            let context = context.ok_or(Unsupported::OperandShape("checked context register"))?;
+            guard_end = emit_checked_context_slot(
+                ops,
+                relocations,
+                view,
+                access,
+                context,
+                coord.depth,
+                coord.slot,
+                miss,
+                done,
+            )?;
+            hit_end = ops.offset().0;
+        }
         BindingSemantics::Read(BindingRead::GlobalThis { .. }) => {
             let dst = result.ok_or(Unsupported::OperandShape("globalThis read result"))?;
             cold_reachable = false;
@@ -202,7 +233,7 @@ pub(super) fn emit_binding_value(
                             ) {
                                 dynasm!(ops
                                     ; .arch aarch64
-                                    ; ldr x9, [x13, view.upvalue_value_byte]
+                                    ; ldr x9, [x13, view.global_lexical_value_byte]
                                 );
                                 emit_load_u64(ops, 11, VALUE_HOLE);
                                 dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
@@ -254,81 +285,6 @@ pub(super) fn emit_binding_value(
                 }
             }
         }
-        BindingSemantics::Read(BindingRead::Upvalue { index, .. }) => {
-            let dst = result.ok_or(Unsupported::OperandShape("upvalue read result"))?;
-            if let Some(index) = instruction_imm32(view, byte_pc, index)
-                && index >= 0
-                && view.cage_base != 0
-            {
-                let spine_offset = (index as u32) * 4;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x9, [x21, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                    ; cbz x9, =>miss
-                    ; ldr w9, [x9, spine_offset]
-                    ; cbz w9, =>miss
-                );
-                emit_load_symbol_u64(
-                    ops,
-                    relocations,
-                    13,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; add x13, x13, x9
-                    ; ldr x9, [x13, view.upvalue_value_byte]
-                );
-                emit_load_u64(ops, 11, VALUE_HOLE);
-                dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
-                guard_end = ops.offset().0;
-                emit_store_reg(ops, 9, dst)?;
-                dynasm!(ops ; .arch aarch64 ; b =>done);
-                hit_end = ops.offset().0;
-            }
-        }
-        BindingSemantics::Write(BindingWrite::Upvalue { index, check, .. }) => {
-            let source = value0.ok_or(Unsupported::OperandShape("upvalue write value"))?;
-            if let Some(index) = instruction_imm32(view, byte_pc, index)
-                && index >= 0
-                && view.cage_base != 0
-            {
-                let spine_offset = (index as u32) * 4;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x9, [x21, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-                    ; cbz x9, =>miss
-                    ; ldr w9, [x9, spine_offset]
-                    ; cbz w9, =>miss
-                );
-                emit_load_symbol_u64(
-                    ops,
-                    relocations,
-                    13,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                dynasm!(ops ; .arch aarch64 ; add x13, x13, x9);
-                if check == BindingWriteCheck::Checked {
-                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
-                    emit_load_u64(ops, 11, VALUE_HOLE);
-                    dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
-                }
-                guard_end = ops.offset().0;
-                emit_cell_store(
-                    ops,
-                    relocations,
-                    view,
-                    13,
-                    13,
-                    view.upvalue_value_byte,
-                    source,
-                    done,
-                )?;
-                hit_end = ops.offset().0;
-            }
-        }
         BindingSemantics::Write(
             BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. },
         ) => {
@@ -359,7 +315,7 @@ pub(super) fn emit_binding_value(
                                     byte_pc,
                                 },
                             );
-                            dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.upvalue_value_byte]);
+                            dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, view.global_lexical_value_byte]);
                             emit_load_u64(ops, 11, VALUE_HOLE);
                             dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>miss);
                             guard_end = ops.offset().0;
@@ -369,7 +325,7 @@ pub(super) fn emit_binding_value(
                                 view,
                                 13,
                                 13,
-                                view.upvalue_value_byte,
+                                view.global_lexical_value_byte,
                                 source,
                                 done,
                             )?;

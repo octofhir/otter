@@ -1,8 +1,8 @@
 //! Representation-neutral access to a live JavaScript activation.
 //!
-//! [`NativeFrame`] plus its published register/upvalue windows is the canonical
+//! [`NativeFrame`] plus its published register window is the canonical
 //! activation shared by interpreter, baseline, and optimizing tiers. Tier
-//! switches mutate only execution metadata and preserve those windows. A
+//! switches mutate only execution metadata and preserve that window. A
 //! materialized [`Frame`] remains the cold interpreter-owned representation.
 //! Runtime semantics should not otherwise know which representation they
 //! received.
@@ -15,23 +15,22 @@
 //!
 //! # Invariants
 //! - Native views are created at one audited `unsafe` boundary. Their register
-//!   and upvalue descriptors must refer to published, initialized storage for
-//!   the whole view lifetime.
+//!   descriptors must refer to published, initialized storage for the whole
+//!   view lifetime.
 //! - A stack-owned frame may publish its actual arguments as a third tagged
 //!   window directly after the register window; it is traced with the
 //!   registers and read only through checked single-slot accessors.
 //! - Native windows stay raw inside the view. Safe operations create no slice
 //!   whose borrow can survive an allocating or reentrant VM call; reads return
 //!   copied handles and writes touch exactly one checked slot.
-//! - Common operations never expose the `Vec`/`Box` layout that owns an
-//!   interpreter frame's upvalue spine.
 //! - Interpreter entry on a native activation is zero-copy: register base,
-//!   upvalue base, SELF, and `this` remain authoritative in [`NativeFrame`].
+//!   SELF, and `this` remain authoritative in [`NativeFrame`].
+//! - An activation's incoming context is its SELF closure's context
+//!   ([`ActiveFrameRef::closure_context`]); frames store no binding storage.
 //! - A mutable native view has exclusive logical ownership of its frame record
 //!   and tagged windows. It deliberately does not manufacture long-lived Rust
 //!   references to register-stack storage: GC and reentrant runtime work may
 //!   revisit that storage through the owning interpreter between operations.
-//!   Upvalue value writes still flow through the GC write-barrier API.
 //! - PC advancement is checked and register access is bounds checked for both
 //!   representations.
 //!
@@ -45,8 +44,7 @@ use std::{fmt, mem, ptr::NonNull};
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    Frame, UpvalueCell, Value, VmError,
-    eval_env::EvalEnvHandle,
+    Frame, Value, VmError,
     native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader},
 };
 
@@ -70,10 +68,6 @@ pub enum ActiveFrameError {
     MissingRegisterWindow,
     /// The register-window base was not aligned for [`Value`].
     MisalignedRegisterWindow,
-    /// A non-empty upvalue spine had no base address.
-    MissingUpvalueSpine,
-    /// The upvalue-spine base was not aligned for [`UpvalueCell`].
-    MisalignedUpvalueSpine,
     /// A 64-bit ABI address cannot be represented by this target's pointer size.
     AddressOutOfRange,
     /// The described allocation range overflows the target address space.
@@ -90,8 +84,6 @@ impl fmt::Display for ActiveFrameError {
             Self::MisalignedNativeFrame => "native frame pointer is misaligned",
             Self::MissingRegisterWindow => "non-empty native register window has no base",
             Self::MisalignedRegisterWindow => "native register window is misaligned",
-            Self::MissingUpvalueSpine => "non-empty native upvalue spine has no base",
-            Self::MisalignedUpvalueSpine => "native upvalue spine is misaligned",
             Self::AddressOutOfRange => "native ABI address is outside the target pointer range",
             Self::WindowOutOfRange => "native ABI window is outside the target address range",
             Self::UnownedIncomingArguments => {
@@ -156,7 +148,6 @@ struct NativeFrameRef {
     frame: NonNull<NativeFrame>,
     registers: NativeWindow<Value>,
     incoming: NativeWindow<Value>,
-    upvalues: NativeWindow<UpvalueCell>,
 }
 
 #[derive(Debug)]
@@ -164,7 +155,6 @@ struct NativeFrameMut {
     frame: NonNull<NativeFrame>,
     registers: NativeWindow<Value>,
     incoming: NativeWindow<Value>,
-    upvalues: NativeWindow<UpvalueCell>,
 }
 
 /// Validate the register window and the actual-argument window that a
@@ -257,7 +247,7 @@ impl<'a> ActiveFrameRef<'a> {
     /// # Safety
     ///
     /// `frame` must remain valid for `'a`. Its non-empty
-    /// register and upvalue descriptors must point to initialized storage that
+    /// register descriptor must point to initialized storage that
     /// remains live for `'a`; their backing allocations must not move. No
     /// semantic writer may race this activation. The boxed value fields must
     /// contain valid [`Value`] bit patterns. The returned view retains only raw
@@ -268,19 +258,12 @@ impl<'a> ActiveFrameRef<'a> {
         // is used only to copy scalar window descriptors.
         let frame_ref = unsafe { &*frame };
         let (registers, incoming) = checked_register_windows(frame_ref)?;
-        let upvalues = checked_window::<UpvalueCell>(
-            frame_ref.upvalue_base,
-            frame_ref.upvalue_count as usize,
-            ActiveFrameError::MissingUpvalueSpine,
-            ActiveFrameError::MisalignedUpvalueSpine,
-        )?;
         let frame = NonNull::new(frame.cast_mut()).expect("validated native frame pointer");
         Ok(Self {
             inner: ActiveFrameRefInner::Native(NativeFrameRef {
                 frame,
                 registers,
                 incoming,
-                upvalues,
             }),
         })
     }
@@ -420,53 +403,12 @@ impl<'a> ActiveFrameRef<'a> {
         }
     }
 
-    /// Direct-eval environment inherited by this activation, if any.
-    #[cfg(test)]
+    /// The context the running closure was created over: SELF's closure
+    /// context, or `undefined` when SELF is not a closure or closes over no
+    /// context.
     #[must_use]
-    pub(crate) fn eval_env(&self) -> Option<EvalEnvHandle> {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => {
-                (!frame.eval_env.is_null()).then_some(frame.eval_env)
-            }
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().eval_env() },
-        }
-    }
-
-    /// Number of captured upvalue handles in this activation.
-    #[must_use]
-    pub fn upvalue_count(&self) -> usize {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.upvalues.len(),
-            ActiveFrameRefInner::Native(native) => native.upvalues.len,
-        }
-    }
-
-    /// Raw base of the initialized upvalue-handle spine.
-    ///
-    /// This exists for native entry construction. Runtime semantics should use
-    /// [`Self::upvalue`] so no borrowed slice survives a VM transition.
-    #[must_use]
-    pub fn upvalue_base_ptr(&self) -> *const UpvalueCell {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.upvalues.as_ptr(),
-            ActiveFrameRefInner::Native(native) => native.upvalues.base.as_ptr().cast_const(),
-        }
-    }
-
-    /// Read one captured upvalue handle.
-    pub fn upvalue(&self, index: u32) -> Result<UpvalueCell, VmError> {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame
-                .upvalues
-                .get(index as usize)
-                .copied()
-                .ok_or(VmError::InvalidOperand),
-            ActiveFrameRefInner::Native(native) => native
-                .upvalues
-                .read(index as usize)
-                .ok_or(VmError::InvalidOperand),
-        }
+    pub fn closure_context(&self, heap: &otter_gc::GcHeap) -> Value {
+        closure_context_of(self.self_value(), heap)
     }
 
     /// Trace and rewrite a native-stack register window.
@@ -497,10 +439,8 @@ impl<'a> ActiveFrameRef<'a> {
     /// Register-arena windows are traced once through their published prefix;
     /// generated stack windows are handled separately by
     /// [`Self::trace_stack_register_slots`]. This method owns SELF, `this`,
-    /// `new.target`, and upvalue handles for a native activation; an interpreter
-    /// frame delegates to its established frame tracer. The native frame's
-    /// nullable eval-environment handle is visited and rewritten here as the
-    /// slot's single tracing authority.
+    /// `new.target`, and the lazy arguments object for a native activation; an
+    /// interpreter frame delegates to its established frame tracer.
     pub(crate) fn trace_non_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => frame.trace_frame_slots(visitor),
@@ -519,22 +459,12 @@ impl<'a> ActiveFrameRef<'a> {
                 } {
                     unsafe { (&mut *bits.cast::<Value>()).trace_value_slot_mut(visitor) };
                 }
-                for index in 0..native.upvalues.len {
-                    // SAFETY: the validated published spine remains live for
-                    // this activation; no Rust slice/reference is retained.
-                    let slot = unsafe { native.upvalues.base.as_ptr().add(index) };
-                    visitor(slot.cast::<RawGc>());
-                }
-                // Both nullable compressed handles are frame-owned root slots.
-                // Rewrite the fields themselves so later generated operations
-                // observe the moved arguments object and eval environment.
+                // The nullable compressed arguments handle is a frame-owned
+                // root slot. Rewrite the field itself so later generated
+                // operations observe the moved arguments object.
                 let arguments = unsafe { std::ptr::addr_of_mut!((*frame).arguments_object) };
                 if !unsafe { (*arguments).is_null() } {
                     visitor(arguments.cast::<RawGc>());
-                }
-                let eval_env = unsafe { std::ptr::addr_of_mut!((*frame).eval_env) };
-                if !unsafe { (*eval_env).is_null() } {
-                    visitor(eval_env.cast::<RawGc>());
                 }
             }
         }
@@ -566,9 +496,9 @@ impl<'a> ActiveFrameMut<'a> {
     /// # Safety
     ///
     /// `frame` must remain valid for `'a`. Its
-    /// register and upvalue descriptors must point to initialized, stable
-    /// storage with exclusive logical mutator ownership for `'a`. No owner may
-    /// reclaim or move either window until the returned view is dropped. Boxed
+    /// register descriptor must point to initialized, stable storage with
+    /// exclusive logical mutator ownership for `'a`. No owner may reclaim or
+    /// move the window until the returned view is dropped. Boxed
     /// fields must contain valid [`Value`] bit patterns. The view retains only
     /// raw descriptors; each method opens at most one short scalar reference so
     /// collector root access never aliases a long-lived Rust borrow.
@@ -578,19 +508,12 @@ impl<'a> ActiveFrameMut<'a> {
         // is used only to copy scalar window descriptors.
         let frame_ref = unsafe { &*frame };
         let (registers, incoming) = checked_register_windows(frame_ref)?;
-        let upvalues = checked_window::<UpvalueCell>(
-            frame_ref.upvalue_base,
-            frame_ref.upvalue_count as usize,
-            ActiveFrameError::MissingUpvalueSpine,
-            ActiveFrameError::MisalignedUpvalueSpine,
-        )?;
         let frame = NonNull::new(frame).expect("validated native frame pointer");
         Ok(Self {
             inner: ActiveFrameMutInner::Native(NativeFrameMut {
                 frame,
                 registers,
                 incoming,
-                upvalues,
             }),
         })
     }
@@ -607,7 +530,6 @@ impl<'a> ActiveFrameMut<'a> {
                     frame: native.frame,
                     registers: native.registers,
                     incoming: native.incoming,
-                    upvalues: native.upvalues,
                 }),
             },
         }
@@ -721,6 +643,19 @@ impl<'a> ActiveFrameMut<'a> {
         }
     }
 
+    /// Address of one tagged register, bounds checked.
+    ///
+    /// The slot is a traced root of the published activation, so a moving
+    /// collection rewrites it in place; allocating kernels read a value they
+    /// need after allocation back through this address.
+    pub(crate) fn register_slot_ptr(&self, register: u16) -> Result<*const Value, VmError> {
+        if usize::from(register) >= self.register_count() {
+            return Err(VmError::InvalidOperand);
+        }
+        // SAFETY: the index is within the published register window.
+        Ok(unsafe { self.register_base_ptr().add(usize::from(register)) }.cast_const())
+    }
+
     /// Read one tagged register.
     pub fn read(&self, register: u16) -> Result<Value, VmError> {
         match &self.inner {
@@ -807,76 +742,16 @@ impl<'a> ActiveFrameMut<'a> {
         }
     }
 
-    /// Direct-eval environment inherited by this activation, if any.
+    /// The context the running closure was created over; see
+    /// [`ActiveFrameRef::closure_context`].
     #[must_use]
-    pub(crate) fn eval_env(&self) -> Option<EvalEnvHandle> {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => {
-                (!frame.eval_env.is_null()).then_some(frame.eval_env)
-            }
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().eval_env() },
-        }
-    }
-
-    /// Number of captured upvalue handles in this activation.
-    #[must_use]
-    pub fn upvalue_count(&self) -> usize {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.upvalues.len(),
-            ActiveFrameMutInner::Native(native) => native.upvalues.len,
-        }
-    }
-
-    /// Raw base of the initialized upvalue-handle spine.
-    ///
-    /// Native entry construction consumes this descriptor. Runtime semantics
-    /// should use [`Self::upvalue`] and [`Self::replace_upvalue`].
-    #[must_use]
-    pub fn upvalue_base_ptr(&self) -> *mut UpvalueCell {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.upvalues.as_ptr().cast_mut(),
-            ActiveFrameMutInner::Native(native) => native.upvalues.base.as_ptr(),
-        }
-    }
-
-    /// Read one captured upvalue handle.
-    pub fn upvalue(&self, index: u32) -> Result<UpvalueCell, VmError> {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame
-                .upvalues
-                .get(index as usize)
-                .copied()
-                .ok_or(VmError::InvalidOperand),
-            ActiveFrameMutInner::Native(native) => native
-                .upvalues
-                .read(index as usize)
-                .ok_or(VmError::InvalidOperand),
-        }
-    }
-
-    /// Replace one activation-local captured-cell handle.
-    pub fn replace_upvalue(&mut self, index: u32, cell: UpvalueCell) -> Result<(), VmError> {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => {
-                let slot = frame
-                    .upvalues
-                    .get_mut(index as usize)
-                    .ok_or(VmError::InvalidOperand)?;
-                *slot = cell;
-                Ok(())
-            }
-            ActiveFrameMutInner::Native(native) => native
-                .upvalues
-                .write(index as usize, cell)
-                .then_some(())
-                .ok_or(VmError::InvalidOperand),
-        }
+    pub fn closure_context(&self, heap: &otter_gc::GcHeap) -> Value {
+        closure_context_of(self.self_value(), heap)
     }
 
     /// Enter interpreter dispatch over this same canonical activation.
     ///
-    /// Native register and upvalue windows are retained verbatim. A
+    /// The native register window is retained verbatim. A
     /// materialized frame is already interpreter-owned and only normalizes its
     /// tier marker.
     pub fn enter_interpreter(&mut self) -> Result<(), VmError> {
@@ -914,6 +789,21 @@ impl<'a> ActiveFrameMut<'a> {
                     .then_some(())
                     .ok_or(VmError::InvalidOperand)
             },
+        }
+    }
+}
+
+/// SELF's closure context: `undefined` for a non-closure SELF, which only a
+/// function whose code never reads its context may run with.
+fn closure_context_of(self_value: Value, heap: &otter_gc::GcHeap) -> Value {
+    match self_value.as_closure(heap) {
+        Some(closure) => closure.context(heap),
+        None => {
+            debug_assert!(
+                self_value.is_function_id(),
+                "SELF is the exact closure or a bare function value"
+            );
+            Value::undefined()
         }
     }
 }
@@ -976,9 +866,7 @@ mod tests {
     fn materialized_frame(slots: &mut [Value]) -> Frame {
         Frame {
             header: header(slots.len() as u16),
-            eval_env: EvalEnvHandle::null(),
             registers: crate::RegisterWindow::attached(slots.as_mut_ptr(), slots.len(), 0),
-            upvalues: Frame::empty_upvalues(),
             self_value: Value::function(7),
             this_value: Value::number_i32(9),
             return_register: None,
@@ -1140,65 +1028,54 @@ mod tests {
     }
 
     #[test]
-    fn native_eval_env_slot_is_visited_and_rewritten_in_place() {
+    fn closure_context_reads_self_on_both_representations() {
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let context = crate::context::alloc_context_with_roots(
+            &mut heap,
+            crate::context::ContextShape {
+                scope_function_id: 7,
+                scope_index: 0,
+                slot_count: 1,
+            },
+            Value::undefined(),
+            |_| false,
+            &mut |_| {},
+        )
+        .expect("context");
+        let closure =
+            crate::closure::alloc_closure(&mut heap, 7, Value::context(context), None, None)
+                .expect("closure");
         let mut slots = [Value::undefined()];
         let mut native = NativeFrame::new(
-            header(slots.len() as u16),
+            header(1),
             slots.as_mut_ptr() as u64,
-            Value::function(7),
+            Value::closure(closure),
             Value::undefined(),
         );
-        // SAFETY: fixture offsets are never dereferenced; they model the
-        // collector's compressed-handle rewrite contract only.
-        let before = unsafe { EvalEnvHandle::from_offset(0x1000) };
-        let after = unsafe { EvalEnvHandle::from_offset(0x2000) };
-        native.set_eval_env(Some(before));
-        // SAFETY: frame and its initialized register window remain live for
-        // the complete trace operation.
+        // SAFETY: the frame and its window remain live for the view.
         let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
-        assert_eq!(active.eval_env(), Some(before));
-        let mut rewrites = 0;
-        active.trace_non_register_slots(&mut |slot| unsafe {
-            if (*slot).0 == before.offset() {
-                slot.write(after.raw());
-                rewrites += 1;
-            }
-        });
-        assert_eq!(rewrites, 1);
-        assert_eq!(native.eval_env(), Some(after));
+        assert_eq!(active.closure_context(&heap), Value::context(context));
+        native.set_self_value(Value::function(7));
+        // SAFETY: as above.
+        let bare = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
+        assert!(bare.closure_context(&heap).is_undefined());
+
+        let mut frame_slots = [Value::undefined()];
+        let mut frame = materialized_frame(&mut frame_slots);
+        frame.self_value = Value::closure(closure);
+        assert_eq!(
+            ActiveFrameRef::materialized(&frame).closure_context(&heap),
+            Value::context(context)
+        );
     }
 
     #[test]
-    fn materialized_eval_env_has_one_root_across_park_and_resume() {
+    fn parked_frames_keep_self_and_registers_across_park_and_resume() {
         let mut slots = [Value::number_i32(5)];
         let mut frame = materialized_frame(&mut slots);
         frame.self_value = Value::function(41);
-        // SAFETY: fixture offsets model collector rewrites and are never
-        // dereferenced as heap addresses.
-        let before = unsafe { EvalEnvHandle::from_offset(0x1000) };
-        let parked_value = unsafe { EvalEnvHandle::from_offset(0x2000) };
-        let after = unsafe { EvalEnvHandle::from_offset(0x3000) };
-        frame.eval_env = before;
-        let active = ActiveFrameRef::materialized(&frame);
-        let mut materialized_rewrites = 0;
-        active.trace_non_register_slots(&mut |slot| unsafe {
-            if (*slot).0 == before.offset() {
-                slot.write(parked_value.raw());
-                materialized_rewrites += 1;
-            }
-        });
-        assert_eq!(materialized_rewrites, 1);
         let (parked, window) = crate::frame_state::ParkedFrameState::copy_from_active(frame);
-        let mut parked_rewrites = 0;
-        parked.trace_slots(&mut |slot| unsafe {
-            if (*slot).0 == parked_value.offset() {
-                slot.write(after.raw());
-                parked_rewrites += 1;
-            }
-        });
-        assert_eq!(parked_rewrites, 1);
         let restored = parked.into_active(window);
-        assert_eq!(restored.eval_env, after);
         assert_eq!(restored.self_value, Value::function(41));
         assert_eq!(restored.registers[0], Value::number_i32(5));
     }

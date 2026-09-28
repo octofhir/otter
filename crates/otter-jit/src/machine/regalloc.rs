@@ -137,6 +137,25 @@ impl AllocatedSequence {
         &self.edits
     }
 
+    /// Edits the exceptional edge of the call at `instruction` runs before it
+    /// branches to the landing pad. The call is immediately followed by its
+    /// block's terminator; the normal path executes the edits after the call
+    /// and around that terminator (live-range splits of values the landing
+    /// pad also receives), so the exceptional path executes the same run.
+    /// Edge moves into the landing pad sit at its head and run there.
+    #[must_use]
+    pub fn exceptional_edge_edits(&self, instruction: MachineInstructionId) -> &[AllocationEdit] {
+        let start = AllocationPoint::After(instruction).program_order();
+        let end = AllocationPoint::After(MachineInstructionId(instruction.0 + 1)).program_order();
+        let first = self
+            .edits
+            .partition_point(|edit| edit.point.program_order() < start);
+        let last = self
+            .edits
+            .partition_point(|edit| edit.point.program_order() <= end);
+        &self.edits[first..last]
+    }
+
     /// Shared exact root/deopt location table.
     #[must_use]
     pub fn metadata(&self) -> &[AllocatedMetadata] {

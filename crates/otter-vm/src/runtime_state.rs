@@ -81,13 +81,10 @@ impl<'a> RuntimeState<'a> {
         for env in interp.host_module_envs_for_trace() {
             env.trace_gc_roots(visitor);
         }
-        // 2b) Persistent module-init upvalue cells (module
-        // environment records shared between link and eval phases).
-        for spine in interp.module_init_upvalues_for_trace() {
-            for slot in spine.iter() {
-                let p = slot as *const crate::UpvalueCell as *mut otter_gc::raw::RawGc;
-                visitor(p);
-            }
+        // 2b) Persistent module-init SELF closures (their contexts are the
+        // module environment records shared between link and eval phases).
+        for closure in interp.module_init_closures_for_trace() {
+            closure.trace_value_slots(visitor);
         }
         // 2b-ter) Template-object realm cache (§13.2.8.4).
         for value in interp.template_objects_for_trace() {

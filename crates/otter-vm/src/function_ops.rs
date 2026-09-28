@@ -4,8 +4,8 @@
 //! preserving the compact executable operand path used by dispatch.
 //!
 //! # Contents
-//! - Distinct function identities without captures for `MakeFunction`.
-//! - Captured-upvalue closure construction for variadic `MakeClosure`.
+//! - Distinct function identities over no context for `MakeFunction`.
+//! - Closure construction over one context for `MakeClosure`.
 //! - Class constructor wrapper construction for `MakeClass`.
 //! - `Function.prototype.bind` metadata and bound-function construction.
 //! - Own callable descriptors, including accessor invocation on property loads.
@@ -14,11 +14,12 @@
 //! # Invariants
 //! - Own callable accessors run with the callable as receiver; data-only
 //!   storage reads must never substitute for descriptor dispatch.
-//! - `MakeFunction` receives already-decoded executable operands.
-//! - `MakeClosure` reads the executable operand slice because its upvalue list
-//!   is variadic. Construction roots its temporary capture slice until the
-//!   one closure allocation owns the initialized inline tail.
-//! - Arrow closures snapshot the enclosing frame's `this` value at construction.
+//! - `MakeFunction` and `MakeClosure` receive already-decoded executable
+//!   operands. A closure keeps exactly the context in its `ctx` register; the
+//!   pending closure body carries it through the allocation, so a collection
+//!   rewrites it before the copy into the cell.
+//! - Arrow closures snapshot the enclosing activation's `this` and
+//!   `new.target` values at construction; both are immutable per activation.
 //! - Function property-descriptor results remain in a handle-arena slot across
 //!   every field write; shape allocation never leaves the builder with a stale
 //!   raw object handle.
@@ -35,13 +36,10 @@ use smallvec::SmallVec;
 
 use crate::{
     ActiveFrameMut, BoundFunction, ClassConstructor, ExecutionContext, Frame, Interpreter,
-    JsObject, JsString, PendingBindFunction, PendingBindStage, UpvalueCell, Value, VmError,
-    VmGetOutcome, VmIntrinsicFunction, VmPropertyKey, abstract_ops, array, function_metadata,
-    object, object_statics,
-    operand_decode::{const_operand, register_operand},
-    read_register,
-    rooting::RootScopeExt,
-    symbol, to_length, write_register,
+    JsObject, JsString, PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome,
+    VmIntrinsicFunction, VmPropertyKey, abstract_ops, array, function_metadata, object,
+    object_statics, operand_decode::register_operand, read_register, rooting::RootScopeExt, symbol,
+    to_length, write_register,
 };
 
 pub(crate) enum BindMetadataGet {
@@ -79,11 +77,7 @@ impl Interpreter {
         self.run_make_function_active_reg(context, &mut active, dst, idx)
     }
 
-    /// Representation-neutral capture-free function construction.
-    ///
-    /// Materialized frames and stack-owned direct callees expose the same
-    /// nullable direct-eval handle through [`ActiveFrameMut`]; construction
-    /// never consults a second closure-tail field or fabricates `None`.
+    /// Representation-neutral construction of a function over no context.
     pub(crate) fn run_make_function_active_reg(
         &mut self,
         context: &ExecutionContext,
@@ -91,67 +85,30 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
-        let function = self.make_function_value(context, frame, idx)?;
+        let function = self.make_function_value(context, idx)?;
         frame.write(dst, function)?;
         frame.advance_pc()?;
         Ok(())
     }
 
-    /// Create the function value one `MakeFunction` site denotes in `frame`.
+    /// Create the function value one `MakeFunction` site denotes.
+    ///
+    /// §10.2 OrdinaryFunctionCreate — every evaluation of a function literal
+    /// produces a DISTINCT function object: siblings minted from the same
+    /// source template keep their own `.prototype` / expando bag, so even a
+    /// function that closes over no context allocates a per-instance closure.
     pub(crate) fn make_function_value(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
         idx: u32,
     ) -> Result<Value, VmError> {
-        let eval_env = frame.eval_env();
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
-        // §9.1 — a capture-free function created in a frame that carries a
-        // direct-eval variable environment still needs the env handle (its
-        // free identifiers resolve dynamically), so it materializes as a
-        // closure with no upvalues. Otherwise a capture-free function keeps
-        // the canonical interned value.
-        if function_id != frame.function_id()
-            && let Some(env) = eval_env
-        {
-            let closure = crate::closure::alloc_closure(
-                &mut self.gc_heap,
-                function_id,
-                &mut [],
-                None,
-                None,
-                None,
-                Some(env),
-            )
-            .map_err(crate::oom_to_vm)?;
-            self.mark_closure_lookup(context, closure);
-            return Ok(Value::closure(closure));
-        }
-        // §10.2 — the named-function SELF binding (`function_id` is the
-        // running function) must resolve to the EXACT instance executing
-        // this frame, not a fresh interned bare value: otherwise
-        // `this instanceof Self` / `Self.prototype` inside the body would
-        // observe a different per-instance `.prototype` than the one the
-        // constructor installed on `this`.
-        if function_id == frame.function_id() {
-            return Ok(frame.self_value());
-        }
-        // §10.2 OrdinaryFunctionCreate — every evaluation of a function
-        // literal produces a DISTINCT function object. A shared interned
-        // `Value::function(fid)` would collapse identity across siblings
-        // minted from the same source template: `Class.create() !==
-        // Class.create()`, and every sibling would share one
-        // `.prototype` / expando bag (prototype.js-style class factories
-        // break). Capture-free functions therefore still allocate a
-        // per-instance closure body with an empty upvalue spine.
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
-            &mut [],
-            None,
-            None,
+            Value::undefined(),
             None,
             None,
         )
@@ -160,40 +117,16 @@ impl Interpreter {
         Ok(Value::closure(closure))
     }
 
-    pub(crate) fn run_make_closure_operands(
-        &mut self,
-        context: &ExecutionContext,
-        frame: &mut Frame,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let idx = const_operand(operands.get(1))?;
-        let count = match operands.get(2) {
-            Some(Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
-        };
-        let mut parent_indices = SmallVec::<[u32; 16]>::with_capacity(count);
-        for i in 0..count {
-            match operands.get(3 + i) {
-                Some(Operand::Imm32(n)) if n >= 0 => parent_indices.push(n as u32),
-                _ => return Err(VmError::InvalidOperand),
-            }
-        }
-        self.run_make_closure_regs(context, frame, dst, idx, &parent_indices)
-    }
-
+    /// `MakeClosure dst, fn, ctx` over a materialized frame.
     pub(crate) fn run_make_closure_regs(
         &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
         function_index: u32,
-        parent_indices: &[u32],
+        context_reg: u16,
     ) -> Result<(), VmError> {
-        let (new_target, bound_derived_this) =
-            self.frame_cold(frame).map_or((None, None), |cold| {
-                (cold.new_target, cold.derived_this_cell)
-            });
+        let new_target = self.frame_cold(frame).and_then(|cold| cold.new_target);
         let mut active = ActiveFrameMut::materialized_with_new_target(
             frame,
             new_target.unwrap_or_else(Value::undefined),
@@ -203,97 +136,63 @@ impl Interpreter {
             &mut active,
             dst,
             function_index,
-            parent_indices,
+            context_reg,
             new_target,
-            bound_derived_this,
         )
     }
 
     /// Representation-neutral closure construction for a published activation.
-    ///
-    /// Native direct callees use this path without materializing an interpreter
-    /// [`Frame`]. Materialized callers pass cold `new.target` / derived-`this`
-    /// state while both representations source the eval environment from
-    /// [`ActiveFrameMut`].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_make_closure_active_regs(
         &mut self,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         function_index: u32,
-        parent_indices: &[u32],
+        context_reg: u16,
         lexical_new_target: Option<Value>,
-        bound_derived_this: Option<UpvalueCell>,
     ) -> Result<(), VmError> {
+        let closure_context = frame.read(context_reg)?;
         let closure = self.make_closure_value(
             context,
             frame,
             function_index,
-            parent_indices,
+            closure_context,
             lexical_new_target,
-            bound_derived_this,
         )?;
         frame.write(dst, closure)?;
         frame.advance_pc()?;
         Ok(())
     }
 
-    /// Create the closure one `MakeClosure` site denotes in `frame`, capturing
-    /// the frame's upvalue cells at `parent_indices`.
+    /// Create the closure one `MakeClosure` site denotes in `frame`, over
+    /// `closure_context` (a context or `undefined`).
     pub(crate) fn make_closure_value(
         &mut self,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         function_index: u32,
-        parent_indices: &[u32],
+        closure_context: Value,
         lexical_new_target: Option<Value>,
-        bound_derived_this: Option<UpvalueCell>,
     ) -> Result<Value, VmError> {
-        let eval_env = frame.eval_env();
         let function_id = context
             .function_id_constant(function_index)
             .ok_or(VmError::InvalidOperand)?;
-        // §10.2 — a named function referencing its own binding inside its
-        // body (`function_id` is the running function) must resolve to the
-        // EXACT instance executing this frame, not a freshly minted one:
-        // a fresh instance owns a distinct per-instance `.prototype`, so
-        // `this instanceof Self` / `Self.prototype` would diverge from the
-        // prototype the constructor installed on `this`.
-        if function_id == frame.function_id() {
-            return Ok(frame.self_value());
-        }
-        let mut cells = SmallVec::<[UpvalueCell; 16]>::with_capacity(parent_indices.len());
-        for &parent_idx in parent_indices {
-            cells.push(frame.upvalue(parent_idx)?);
-        }
-        // Arrow-closure receivers are bound lexically: every later invocation
-        // ignores the call site and uses the enclosing frame's `this`.
-        let bound_this = if context.function_is_arrow(function_id) {
-            Some(frame.this_value())
+        crate::context_ops::context_operand(closure_context)?;
+        // Arrow closures bind `this` and `new.target` lexically: every later
+        // invocation ignores the call site and uses the creating activation's
+        // values.
+        let (bound_this, bound_new_target) = if context.function_is_arrow(function_id) {
+            (Some(frame.this_value()), lexical_new_target)
         } else {
-            None
+            (None, None)
         };
-        let bound_new_target = if context.function_is_arrow(function_id) {
-            lexical_new_target
-        } else {
-            None
-        };
-        let bound_derived_this = context
-            .function_is_arrow(function_id)
-            .then_some(bound_derived_this)
-            .flatten();
-        // §9.1 — closures made in a frame whose function chain
-        // contains a direct eval capture the frame's eval variable
-        // environment so eval-introduced vars stay reachable.
+        // The context and bound values ride in the pending closure body.
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
-            &mut cells,
+            closure_context,
             bound_this,
             bound_new_target,
-            bound_derived_this,
-            eval_env,
         )
         .map_err(crate::oom_to_vm)?;
         self.mark_closure_lookup(context, closure);

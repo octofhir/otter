@@ -1,9 +1,13 @@
-//! Closure upvalue cells — captured-binding storage for closures.
+//! Non-moving single-value cells: global declarative-record bindings and
+//! engine-internal shared flags.
 //!
-//! Each `function* () { … }` / `() => …` body that reads or writes a
-//! variable from an enclosing scope captures one [`UpvalueCell`] per
-//! distinct binding. Cloning the wrapper shares the same heap slot so
-//! every closure plus the outer scope observe each other's writes.
+//! An [`UpvalueCell`] is one GC-allocated `Value` slot in old space whose
+//! address never changes. Script-level `let` / `const` / `class` bindings of
+//! the global Environment Record live in these cells, so a load IC and
+//! generated code can embed the cell offset permanently; the Promise
+//! combinators share one "already called" flag cell between resolving
+//! functions. Function and block scopes do not use cells: their captured
+//! bindings live in context slots ([`crate::context`]).
 //!
 //! # Contents
 //! - [`UpvalueCellBody`] — GC-allocated payload (one [`crate::Value`]).
@@ -12,15 +16,13 @@
 //!   write-barrier-aware mutation helpers.
 //!
 //! # Invariants
+//! - Cells are allocated in old space and never move.
 //! - Writes flow through [`store_upvalue`] so the generational write
 //!   barrier records any new old-to-young reference.
-//! - The body holds exactly one `Value` field; iteration order matches
-//!   spec [[Binding]] semantics by virtue of the binding map built at
-//!   `MakeClosure` time (see [`crate::Op::MakeClosure`]).
 //!
 //! # See also
-//! - <https://tc39.es/ecma262/#sec-newdeclarativeenvironment>
-//! - <https://tc39.es/ecma262/#sec-function-environment-records>
+//! - <https://tc39.es/ecma262/#sec-global-environment-records>
+//! - [`crate::context`] — per-scope binding storage.
 
 use otter_macros::Pelt;
 
@@ -31,26 +33,18 @@ pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 
 /// GC-allocated payload backing every [`UpvalueCell`] handle.
 ///
-/// Holds a single captured `Value`. Mutation flows through
-/// [`store_upvalue`]; reads through [`read_upvalue`]; allocation
-/// through [`alloc_upvalue`].
+/// Holds a single `Value`. Mutation flows through [`store_upvalue`]; reads
+/// through [`read_upvalue`]; allocation through [`alloc_upvalue`].
 ///
 /// # Layout
 ///
-/// One `Value` field. Closure tails and activation windows store four-byte
-/// compressed handles to these shared cells. The cell is the one authoritative
-/// location of a mutable captured binding.
-///
-/// # Spec
-///
-/// Captured-binding semantics — ECMA-262 §9.1.1.1.4
-/// (CreateMutableBinding) + §9.1.1.1.5 (InitializeBinding); the
-/// closure spine that holds these cells is built by `Op::MakeClosure`
-/// per §15.2.5 (FunctionDeclarationInstantiation).
+/// One `Value` field. The global declarative record and its load caches
+/// store four-byte compressed handles to these cells; the cell is the one
+/// authoritative location of the binding.
 #[derive(Clone, Copy, Pelt)]
 #[pelt(tag = UPVALUE_CELL_TYPE_TAG)]
 pub struct UpvalueCellBody {
-    /// Captured `Value`. Stores fire the generational write barrier
+    /// The bound `Value`. Stores fire the generational write barrier
     /// through [`store_upvalue`] for every RHS that carries a GC
     /// handle.
     pub value: Value,
@@ -70,9 +64,8 @@ pub type UpvalueCell = otter_gc::Gc<UpvalueCellBody>;
 /// Allocate a fresh [`UpvalueCell`] pre-populated with `value` on
 /// the GC heap.
 ///
-/// Binding cells are allocated directly in old space. Closure tails and frame
-/// windows trace their slots in place; permanent global lexical proofs also
-/// rely on these cells retaining a stable value address.
+/// Cells are allocated directly in old space: permanent global lexical
+/// proofs rely on each cell retaining a stable value address.
 ///
 /// # Errors
 ///
@@ -87,8 +80,7 @@ pub fn alloc_upvalue(
 
 /// [`alloc_upvalue`] with caller-owned roots exposed to any collection the
 /// allocation triggers (heap-cap emergency full GC). Use when the caller
-/// holds young handles in plain Rust locals across this call — e.g. a frame
-/// under construction that is not yet on any traced stack.
+/// holds young handles in plain Rust locals across this call.
 pub fn alloc_upvalue_with_roots(
     heap: &mut otter_gc::GcHeap,
     value: Value,
@@ -97,7 +89,7 @@ pub fn alloc_upvalue_with_roots(
     heap.alloc_old_with_roots(UpvalueCellBody { value }, external_visit)
 }
 
-/// Read the captured value of `cell`.
+/// Read the value of `cell`.
 #[must_use]
 pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {
     heap.read_payload(cell, |body| body.value)

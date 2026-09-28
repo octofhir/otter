@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Bounded native headers and register windows in the owning Machine frame.
-//! - Exact source PCs, closure spines and moving values from safepoint homes.
+//! - Exact source PCs, SELF closures and moving values from safepoint homes.
 //! - Publication and release through the native activation cursor.
 //!
 //! # Invariants
@@ -135,24 +135,6 @@ pub(super) fn enter(
             load_slot(ops, frame, site, value, 14)?;
             dynasm!(ops ; .arch x64 ; mov [r13 + member as i32], r14);
         }
-
-        let no_spine = ops.new_dynamic_label();
-        load64(ops, 11, NOT_CELL_MASK);
-        dynasm!(ops
-            ; .arch x64
-            ; test r14, r14
-            ; jz =>no_spine
-            ; mov r10, r14
-            ; and r10, r11
-            ; jnz =>no_spine
-            ; cmp BYTE [r14], JS_CLOSURE_BODY_TYPE_TAG as i8
-            ; jne =>no_spine
-            ; mov r10, [r14 + view.closure_call_layout.upvalue_base_byte as i32]
-            ; mov r11d, [r14 + view.closure_call_layout.upvalue_count_byte as i32]
-            ; mov [r13 + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32], r10
-            ; mov [r13 + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], r11d
-            ; =>no_spine
-        );
         for (slot, value) in recipe.slots.iter().enumerate() {
             load_slot(ops, frame, site, *value, 14)?;
             let destination = start

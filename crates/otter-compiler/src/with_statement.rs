@@ -1,25 +1,33 @@
 //! Sloppy `with` statement lowering.
 //!
+//! A `with` statement opens a `With` scope whose one binding holds the
+//! object environment. The binding is a context slot when the body contains
+//! a closure or a direct eval (either can reach the object after the
+//! statement's straight-line code), a register otherwise; every entry into
+//! the statement creates a fresh `With` context. Identifier sites inside
+//! probe the object environments that are lexically inner to the name's
+//! static binding.
+//!
 //! # Contents
-//! - [`compile_with_statement`] installs a temporary object
-//!   environment for identifier lookup.
+//! - [`compile_with_statement`] installs the object environment.
+//! - [`WithEnv`] — one active object environment and its chain position.
+//! - [`emit_with_binding_probe`] / [`emit_with_get_binding_value`] /
+//!   [`emit_with_set_mutable_binding`] — §9.1.1.2 object-record operations.
 //!
 //! # Invariants
 //! - Strict functions and modules still reject `with`.
-//! - The object environment is stored in an own-upvalue cell only
-//!   while doing so cannot shift existing parent-capture slots.
+//! - A direct eval inside a `with` body sees the object through its caller
+//!   chain's `With` scope and rebuilds the same probe order.
 //!
 //! # See also
-//! - `expr::identifier` for dynamic `with` identifier reads.
+//! - `expr::identifier` for identifier reads.
 
+use crate::compiler::ScopeLocation;
 use crate::*;
 
-/// Synthetic binding-name prefix for the object environment a `with`
-/// statement captures. A direct eval nested in the `with` body receives
-/// these cells in its caller scope and rebuilds its own
-/// [`Compiler::active_with_envs`] from them, so the eval body resolves
-/// identifiers against the same object environments (§9.1.1.2.1).
-pub(crate) const WITH_ENV_PREFIX: &str = "__otter_with_env_";
+/// Name of the `With` scope's object binding. Not an identifier, so it
+/// never collides with a source binding.
+pub(crate) const WITH_OBJECT_BINDING: &str = "%with";
 
 pub(crate) struct WithBindingProbe {
     pub(crate) object_reg: u16,
@@ -30,16 +38,10 @@ pub(crate) struct WithBindingProbe {
 /// scope chain so identifier sites can decide whether a static
 /// binding shadows it (§9.1.1.2.1 — the chain is walked innermost
 /// first, mixing declarative scopes and object environments).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct WithEnv {
-    /// Synthetic binding holding the captured scope object.
-    pub(crate) binding: String,
-    /// `cx.stack.len()` when the `with` was lowered (1-based
-    /// function nesting depth).
-    pub(crate) fn_depth: usize,
-    /// `scopes.len()` in the declaring function when the `with` was
-    /// lowered (1-based scope nesting depth).
-    pub(crate) scope_depth: usize,
+    /// The `With` scope holding the object.
+    pub(crate) location: ScopeLocation,
 }
 
 pub(crate) fn compile_with_statement(
@@ -72,50 +74,38 @@ pub(crate) fn compile_with_statement(
         [Operand::Register(object), Operand::Register(object_raw)],
         span,
     );
-    let id = cx.next_with_env_id;
-    cx.next_with_env_id = id.checked_add(1).expect("with env id overflow");
-    let env_name = format!("{WITH_ENV_PREFIX}{id}");
-    let storage = if cx.parent_captures.is_empty() {
-        cx.declare_captured_binding(&env_name, false, span)?
+    cx.enter_scope(otter_bytecode::ScopeKind::With);
+    let reachable = crate::capture::statement_contains_closure_or_eval(&w.body);
+    let storage = if reachable {
+        cx.declare_forced_slot(
+            WITH_OBJECT_BINDING,
+            otter_bytecode::SlotKind::WithObject,
+            span,
+        )
     } else {
-        cx.declare_binding(&env_name, false, span)?
+        cx.declare_binding_with_capture(
+            WITH_OBJECT_BINDING,
+            otter_bytecode::SlotKind::WithObject,
+            span,
+            false,
+        )
+    };
+    let storage = match storage {
+        Ok(storage) => storage,
+        Err(error) => {
+            cx.exit_scope();
+            return Err(error);
+        }
     };
     cx.emit_store_storage(object, storage, span);
-    cx.mark_initialized(&env_name);
+    cx.mark_initialized(WITH_OBJECT_BINDING);
 
-    let fn_depth = cx.stack.len();
-    let scope_depth = cx.scopes.len();
-    cx.active_with_envs.push(WithEnv {
-        binding: env_name,
-        fn_depth,
-        scope_depth,
-    });
+    let location = cx.innermost_location();
+    cx.active_with_envs.push(WithEnv { location });
     let result = compile_statement(cx, &w.body);
     cx.active_with_envs.pop();
+    cx.exit_scope();
     result
-}
-
-/// [`Compiler::binding_position`] expressed in the CALLER's scope
-/// numbering when `cx` is a direct-eval chunk.
-///
-/// An eval chunk flattens every inherited caller binding into its own
-/// function scope, which would sort them all level with the object
-/// environments. Re-project them onto the depth they had in the caller,
-/// and push anything the eval body itself declares below the function
-/// scope past every object environment — such a declaration is
-/// lexically innermost by construction.
-fn caller_aware_binding_position(cx: &Compiler, name: &str) -> Option<(usize, usize)> {
-    let (fn_depth, scope_depth) = cx.binding_position(name)?;
-    if cx.caller_scope_depths.is_empty() || fn_depth != 1 {
-        return Some((fn_depth, scope_depth));
-    }
-    if scope_depth > 1 {
-        return Some((fn_depth, usize::MAX));
-    }
-    Some((
-        fn_depth,
-        cx.caller_scope_depths.get(name).copied().unwrap_or(1),
-    ))
 }
 
 pub(crate) fn emit_with_binding_probe(
@@ -135,15 +125,15 @@ pub(crate) fn emit_with_binding_probe(
     // a function defined in a `with` body therefore shadows the
     // with-object property, while a `var` hoisted *outside* the
     // `with` is shadowed by it.
-    let binding_pos = caller_aware_binding_position(cx, name);
-    let probed: Vec<String> = active_with_envs
+    let binding_pos = cx.binding_position(name);
+    let probed: Vec<WithEnv> = active_with_envs
         .iter()
         .rev()
         .take_while(|env| match binding_pos {
             None => true,
-            Some((bf, bs)) => env.fn_depth > bf || (env.fn_depth == bf && env.scope_depth >= bs),
+            Some(position) => cx.location_rank(env.location) > position,
         })
-        .map(|env| env.binding.clone())
+        .copied()
         .collect();
     if probed.is_empty() {
         return Ok(None);
@@ -155,8 +145,8 @@ pub(crate) fn emit_with_binding_probe(
     cx.emit(Op::LoadFalse, [Operand::Register(found_reg)], span);
     let mut done_patches = Vec::new();
 
-    for env_name in &probed {
-        let env_reg = load_with_env_object(cx, env_name, span)?;
+    for env in &probed {
+        let env_reg = load_with_env_object(cx, env, span)?;
         let key_reg = cx.alloc_scratch();
         let key_idx = cx.intern_string_constant(name);
         cx.emit(
@@ -260,27 +250,14 @@ pub(crate) fn emit_with_binding_probe(
 
 pub(crate) fn load_with_env_object(
     cx: &mut Compiler,
-    env_name: &str,
+    env: &WithEnv,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    if let Some(info) = cx.lookup_binding(env_name) {
-        let dst = cx.alloc_scratch();
-        cx.emit_load_storage(dst, info.storage, span);
-        return Ok(dst);
-    }
-    if let Some(idx) = cx.resolve_capture(env_name) {
-        let dst = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadUpvalue,
-            [Operand::Register(dst), Operand::Imm32(idx as i32)],
+    cx.load_at(env.location, WITH_OBJECT_BINDING, span)
+        .ok_or(CompileError::Unsupported {
+            node: "with environment not reachable from this scope".to_string(),
             span,
-        );
-        return Ok(dst);
-    }
-    Err(CompileError::Unsupported {
-        node: format!("with environment `{env_name}` not capturable"),
-        span,
-    })
+        })
 }
 
 /// §9.1.1.2.6 GetBindingValue through a `with` object environment —

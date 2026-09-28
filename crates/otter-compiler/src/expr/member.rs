@@ -45,7 +45,7 @@ pub(crate) fn compile_static_member(
     // walks `JsObject` properties for objects.
     let span = (m.span.start, m.span.end);
     // `super.x` reads the parent prototype's property — the
-    // runtime walks one hop up `__class_home`'s prototype
+    // runtime walks one hop up `%home`'s prototype
     // chain. Only valid inside a class method.
     if matches!(m.object, Expression::Super(_)) {
         return compile_super_member_load(cx, m.property.name.as_str(), span);
@@ -150,7 +150,7 @@ pub(crate) fn compile_computed_member(
         // derived-constructor TDZ ReferenceError before any side
         // effects in the key expression (e.g. `super[super()]`).
         let this_guard = cx.alloc_scratch();
-        cx.emit(Op::LoadThis, [Operand::Register(this_guard)], span);
+        cx.emit_load_this(this_guard, span);
         let idx = compile_expr(cx, &m.expression, span)?;
         let dst = cx.alloc_scratch();
         cx.emit(

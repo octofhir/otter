@@ -1723,39 +1723,6 @@ impl Interpreter {
         code.run_entry(activation)
     }
 
-    /// Validate a tiny closure-call inline candidate and return its captured
-    /// upvalue-spine base without cloning or publishing a callee frame.
-    ///
-    /// The baseline uses this only for leaf bodies with no allocation/call GC
-    /// points. The pointer comes from [`crate::closure::ClosureCallHeader`]'s
-    /// fixed-width ABI, never from interpreting Rust `Vec` / `Option` layout. It
-    /// is valid only for the dynamic extent of the inlined body: the closure
-    /// stays rooted in the caller frame and its upvalue backing allocation is
-    /// immutable. A closure with runtime-setup flags declines this frameless
-    /// leaf inline; the containing call takes its generated-call guard path or
-    /// exact pre-effect side exit.
-    pub fn jit_inline_closure_upvalues(
-        &mut self,
-        callee: Value,
-        expected_fid: u32,
-    ) -> Option<usize> {
-        self.jit_runtime_stats.runtime_calls =
-            self.jit_runtime_stats.runtime_calls.saturating_add(1);
-        let closure = callee.as_closure(&self.gc_heap)?;
-        if closure.function_id() != expected_fid {
-            return None;
-        }
-        let header = closure.call_header(&self.gc_heap);
-        if header.upvalue_count == 0
-            || header.upvalue_base == 0
-            || header.requires_runtime_setup()
-            || !header.eval_env.is_null()
-        {
-            return None;
-        }
-        usize::try_from(header.upvalue_base).ok()
-    }
-
     /// Complete one full fixed-arity construct in place for a compiled caller
     /// whose fixed-arity construction site fell outside the compiled subset.
     /// Reads the callee and

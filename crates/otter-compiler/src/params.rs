@@ -9,7 +9,8 @@
 //! # Invariants
 //! - Parameter order follows source order and preserves mapped arguments aliases.
 //! - Uncaptured simple formals bind their incoming ABI registers without a
-//!   second local slot or prologue copy.
+//!   second local slot or prologue copy; captured or mapped formals live in
+//!   slots of the parameter scope's context.
 //!
 //! # See also
 //! - `functions` for function body lowering
@@ -152,12 +153,20 @@ fn apply_default_syntax_error_into(
     Ok(())
 }
 
+/// Declare every formal parameter name in the current (parameter) scope
+/// before any initializer runs (§10.2.11 steps 21–26). With parameter
+/// expressions the bindings start in the TDZ, so a slot is hole-initialized
+/// and checked.
 pub(crate) fn predeclare_formal_parameters(
     parent: &mut Compiler,
     params: &oxc_ast::ast::FormalParameters<'_>,
     allow_duplicate_formals: bool,
+    has_param_expressions: bool,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    let kind = otter_bytecode::SlotKind::Param {
+        checked: has_param_expressions,
+    };
     // The last occurrence owns a duplicate simple formal's binding. Mapping
     // that name directly to the last incoming slot gives the specified
     // last-argument value without copying earlier occurrences over it.
@@ -185,11 +194,10 @@ pub(crate) fn predeclare_formal_parameters(
             continue;
         }
         if let Some(&argument_register) = direct_registers.get(&name) {
-            parent.declare_parameter_binding(&name, argument_register, span)?;
+            parent.declare_parameter_binding(&name, argument_register, kind, span)?;
         } else {
-            parent.declare_binding(&name, false, span)?;
+            parent.declare_binding(&name, kind, span)?;
         }
-        parent.mark_param(&name);
     }
     Ok(())
 }
@@ -201,17 +209,13 @@ pub(crate) fn bind_simple_formal_parameter(
     span: (u32, u32),
     allow_duplicate_formals: bool,
 ) -> Result<(), CompileError> {
-    let storage = if let Some(info) = parent.lookup_in_current_scope(name) {
-        info.storage
-    } else if allow_duplicate_formals {
-        match parent.lookup_in_current_scope(name) {
-            Some(info) => info.storage,
-            None => parent.declare_binding(name, false, span)?,
-        }
-    } else {
-        let storage = parent.declare_binding(name, false, span)?;
-        parent.mark_param(name);
-        storage
+    let storage = match parent.lookup_in_current_scope(name) {
+        Some(info) => info.storage,
+        None => parent.declare_binding(
+            name,
+            otter_bytecode::SlotKind::Param { checked: false },
+            span,
+        )?,
     };
     let aliases_incoming_register = matches!(
         storage,
@@ -384,10 +388,13 @@ pub(crate) fn mapped_formal_parameter_bindings(
         let Some(info) = cx.lookup_in_current_scope(name) else {
             continue;
         };
+        let Some(storage) = info.storage.to_argument_storage() else {
+            continue;
+        };
         bindings.push(MappedArgumentBinding {
             argument_index: index as u16,
             formal_name: name.clone(),
-            storage: info.storage.to_argument_storage(),
+            storage,
         });
     }
     bindings.reverse();

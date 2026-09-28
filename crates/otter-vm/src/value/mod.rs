@@ -17,6 +17,10 @@
 //!   [`Value::from_function_gc`] / [`Value::from_other_gc`] on their
 //!   own raw offset. Type discrimination back to the original wrapper
 //!   goes through [`otter_gc::header::GcHeader::type_tag`].
+//! - Engine-internal: [`Value::context`] and [`Value::eval_extension`]
+//!   carry binding contexts and eval extensions through registers. They
+//!   form the internal family ([`ValueKind::Internal`]): never an Object,
+//!   never callable, never primitive, never observed by user code.
 //!
 //! # Inspection surface
 //!
@@ -184,6 +188,9 @@ enum PtrFamily {
     Function,
     /// Misc primitive body: symbol, bigint.
     Other,
+    /// Engine-internal body that only bytecode handles: a binding context
+    /// or an eval extension.
+    Internal,
 }
 
 /// Per-body classification for the `TAG_PTR_OTHER` family.
@@ -219,6 +226,9 @@ pub enum ValueKind {
     PtrFunction,
     /// Misc body reference: symbol, bigint.
     PtrOther,
+    /// Engine-internal body reference: a binding context or an eval
+    /// extension. Never an ECMAScript language value.
+    Internal,
 }
 
 impl Value {
@@ -422,6 +432,21 @@ impl Value {
         Self::from_function_gc(c.raw())
     }
 
+    /// Binding-context value ([`ValueKind::Internal`]).
+    #[inline]
+    #[must_use]
+    pub fn context(context: crate::context::ContextHandle) -> Self {
+        Self::from_cell_offset(context.offset())
+    }
+
+    /// Eval-extension value ([`ValueKind::Internal`]), produced only by
+    /// `ResolveLookupRef` and the context `extension` field.
+    #[inline]
+    #[must_use]
+    pub fn eval_extension(extension: crate::eval_env::EvalExtensionHandle) -> Self {
+        Self::from_cell_offset(extension.offset())
+    }
+
     /// Ordinary object value.
     #[inline]
     #[must_use]
@@ -615,6 +640,22 @@ impl Value {
         Some(JsClosure::from_parts(handle, function_id))
     }
 
+    /// Binding-context handle.
+    #[inline]
+    #[must_use]
+    pub fn as_context(self) -> Option<crate::context::ContextHandle> {
+        self.as_raw_gc()?
+            .checked_cast::<crate::context::ContextBody>()
+    }
+
+    /// Eval-extension handle.
+    #[inline]
+    #[must_use]
+    pub fn as_eval_extension(self) -> Option<crate::eval_env::EvalExtensionHandle> {
+        self.as_raw_gc()?
+            .checked_cast::<crate::eval_env::EvalExtensionBody>()
+    }
+
     /// Ordinary object handle.
     #[inline]
     #[must_use]
@@ -736,6 +777,10 @@ impl Value {
                 || tag == <BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG
             {
                 PtrFamily::Other
+            } else if tag == crate::context::CONTEXT_BODY_TYPE_TAG
+                || tag == crate::eval_env::EVAL_EXTENSION_BODY_TYPE_TAG
+            {
+                PtrFamily::Internal
             } else {
                 PtrFamily::Object
             },
@@ -764,6 +809,7 @@ impl Value {
             Some(PtrFamily::String) => ValueKind::PtrString,
             Some(PtrFamily::Function) => ValueKind::PtrFunction,
             Some(PtrFamily::Other) => ValueKind::PtrOther,
+            Some(PtrFamily::Internal) => ValueKind::Internal,
             // Immediates (null / undefined / bool / hole).
             None => ValueKind::Special,
         }
@@ -1140,6 +1186,9 @@ impl Value {
             // String / Other still need heap-side primitives.
             ValueKind::PtrString => Some("string"),
             ValueKind::PtrOther => None,
+            // Internal bodies never reach user code; answer without
+            // claiming "object".
+            ValueKind::Internal => Some("undefined"),
             _ => None,
         }
     }
@@ -1369,6 +1418,7 @@ impl Value {
                     .unwrap_or_default(),
                 _ => String::new(),
             },
+            ValueKind::Internal => "<internal>".to_string(),
         }
     }
 
@@ -2030,6 +2080,7 @@ impl std::fmt::Debug for Value {
                 write!(f, "Value::PtrFunction(0x{:08x})", cell_offset(self.0))
             }
             ValueKind::PtrOther => write!(f, "Value::PtrOther(0x{:08x})", cell_offset(self.0)),
+            ValueKind::Internal => write!(f, "Value::Internal(0x{:08x})", cell_offset(self.0)),
         }
     }
 }
@@ -2138,14 +2189,12 @@ mod tests {
 
     #[test]
     fn closure_round_trip_via_real_heap() {
-        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
 
         let mut heap = GcHeap::new().expect("heap");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let mut upvalues = [cell];
         let closure =
-            alloc_closure(&mut heap, 99, &mut upvalues, None, None, None, None).expect("alloc");
+            alloc_closure(&mut heap, 99, LegacyValue::undefined(), None, None).expect("alloc");
         let v = Value::closure(closure);
         assert!(v.is_callable());
         assert!(!v.is_function_id());
@@ -2179,16 +2228,15 @@ mod tests {
     #[test]
     fn family_kind_dispatch_separates_object_function_other() {
         use crate::object::alloc_object_with_roots;
-        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let closure =
-            alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("closure");
+            alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("closure");
 
         let vobj = Value::object(obj);
         let vclo = Value::closure(closure);
@@ -2302,13 +2350,13 @@ mod tests {
 
         use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
         use crate::symbol::{WellKnown, alloc_symbol};
-        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
-        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("clo");
+        let closure =
+            alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("clo");
         assert_eq!(Value::closure(closure).typeof_pure(), Some("function"));
         let body = alloc_flat_string_body_with_roots(
             &mut heap,
@@ -2350,14 +2398,14 @@ mod tests {
 
         use crate::object::alloc_object_with_roots;
         use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
-        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("clo");
+        let closure =
+            alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("clo");
         assert_eq!(Value::object(obj).to_boolean_pure(), Some(true));
         assert_eq!(Value::closure(closure).to_boolean_pure(), Some(true));
 
@@ -2375,16 +2423,15 @@ mod tests {
     #[test]
     fn predicates_disambiguate_object_and_function_families() {
         use crate::object::alloc_object_with_roots;
-        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let closure =
-            alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("closure");
+            alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("closure");
 
         let vo = Value::object(obj);
         let vc = Value::closure(closure);
@@ -2439,15 +2486,15 @@ mod tests {
         use crate::bigint::alloc_big_int;
         use crate::object::alloc_object_with_roots;
         use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
-        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
+        use crate::{Value as LegacyValue, alloc_closure};
         use num_bigint::BigInt;
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, &mut [cell], None, None, None, None).expect("clo");
+        let closure =
+            alloc_closure(&mut heap, 1, LegacyValue::undefined(), None, None).expect("clo");
         let body = alloc_flat_string_body_with_roots(
             &mut heap,
             JsStringId::new(1),

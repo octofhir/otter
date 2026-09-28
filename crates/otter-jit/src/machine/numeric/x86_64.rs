@@ -14,10 +14,15 @@
 //! - Indexed layouts belong to Machine operations; scalar loads/stores preserve
 //!   signedness and Float32 rounding without reconstructing JS Values on hits.
 //! - Every generated call observes the System V 16-byte stack alignment.
+//! - Context words load and store at 32-bit displacements from the tagged
+//!   owning value; SELF's closure context tests the cell and closure tag in
+//!   `r11` first. Context allocation uses the shared `AllocValue3` call with
+//!   rooted safepoint homes, and a checked context-slot guard walks the chain
+//!   in `r10` before its hole test.
 
 #![allow(clippy::useless_conversion)]
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 #[path = "x86_64/direct_call.rs"]
 mod direct_call;
@@ -35,11 +40,9 @@ mod number_probe;
 pub(crate) use direct_call::{emit_generated_receiver_allocation, emit_increment_runtime_counter};
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
-use otter_bytecode::opcode_schema::{
-    BindingRead, BindingSemantics, BindingWrite, BindingWriteCheck,
-};
+use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
 use otter_vm::{
-    JitCompileSnapshot, UPVALUE_CELL_TYPE_TAG, Value,
+    JitCompileSnapshot, Value,
     closure::JS_CLOSURE_BODY_TYPE_TAG,
     deopt::DeoptRuntime,
     native_abi::{
@@ -52,9 +55,9 @@ use otter_vm::{
 
 use super::super::{
     AllocatedLocation, AllocatedSequence, AllocationEdit, AllocationPoint, CallDescriptor,
-    CallTarget, DeoptId, ExceptionalEdge, InstructionSequence, MachineBindingTarget,
-    MachineCallGuard, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrInput,
-    MachineOsrType, MachineRepresentation, MachineSafepointSite, MachineSafepointTable,
+    CallTarget, ContextField, DeoptId, ExceptionalEdge, InstructionSequence, MachineBindingTarget,
+    MachineCallGuard, MachineFrameLayout, MachineInstructionId, MachineOpcode, MachineOsrType,
+    MachineRepresentation, MachineSafepointSite, MachineSafepointTable,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -78,7 +81,6 @@ use crate::{
         NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
         NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET,
         NATIVE_STACK_LIMIT_OFFSET, NEW_FROM_SPACE_KIND, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
         PAGE_ALLOCATED_BYTES_OFFSET, PAGE_BUMP_CURSOR_OFFSET, PAGE_SPACE_OFFSET,
         PropertySourceCell, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
@@ -105,7 +107,7 @@ pub(super) struct Emission {
     pub(super) code: CompiledCode,
     pub(super) generated_stack_frame_bytes: u32,
     pub(super) relocations: RelocationCapture,
-    pub(super) osr_entries: BTreeMap<u32, usize>,
+    pub(super) osr_headers: BTreeSet<u32>,
     pub(super) osr_regions: Vec<(u32, usize, usize)>,
     pub(super) structural_regions: Vec<(&'static str, Option<u32>, usize, usize)>,
 }
@@ -115,15 +117,6 @@ struct SavedFrame {
     rbx: bool,
     highest: Option<u8>,
 }
-
-struct OsrSite {
-    instruction: MachineInstructionId,
-    logical_pc: u32,
-    inputs: Vec<MachineOsrInput>,
-    continuation: DynamicLabel,
-}
-
-type OsrEmission = (BTreeMap<u32, usize>, Vec<(u32, usize, usize)>);
 
 impl SavedFrame {
     fn new(allocation: &AllocatedSequence) -> Self {
@@ -161,7 +154,6 @@ pub(super) fn emit(
     _prepare_construct_entry: u64,
     _derived_construct_result_entry: u64,
     _copy_spread_arguments_entry: u64,
-    _initialize_upvalues_entry: u64,
     string_concat_entry: u64,
     _array_construct_entry: u64,
     number_rem_entry: u64,
@@ -203,22 +195,11 @@ pub(super) fn emit(
         .iter()
         .map(|_| ops.new_dynamic_label())
         .collect::<Vec<_>>();
-    let mut osr_sites = Vec::new();
-    for (index, instruction) in sequence.instructions().iter().enumerate() {
-        let MachineOpcode::OsrEntry {
-            logical_pc,
-            ref inputs,
-        } = instruction.opcode
-        else {
-            continue;
-        };
-        osr_sites.push(OsrSite {
-            instruction: MachineInstructionId(index as u32),
-            logical_pc,
-            inputs: inputs.clone(),
-            continuation: ops.new_dynamic_label(),
-        });
-    }
+    // OSR frame reads that miss their header representation leave through
+    // one side exit per read, emitted after the body.
+    let mut osr_bails = Vec::<(DynamicLabel, u32)>::new();
+    let mut osr_headers = BTreeSet::new();
+    let mut osr_regions = Vec::new();
     let has_poll = sequence
         .instructions()
         .iter()
@@ -254,13 +235,46 @@ pub(super) fn emit(
             .instruction_locations(id)
             .ok_or(Unsupported::OperandShape("scalar allocation coverage"))?;
         match instruction.opcode {
-            MachineOpcode::OsrEntry { .. } => {
-                let continuation = osr_sites
-                    .iter()
-                    .find(|site| site.instruction == id)
-                    .ok_or(Unsupported::OperandShape("x86-64 OSR continuation"))?
-                    .continuation;
-                dynasm!(ops ; .arch x64 ; =>continuation);
+            MachineOpcode::OsrDispatch { ref logical_pcs } => {
+                let block = &sequence.blocks()[block_index];
+                let osr = ops.new_dynamic_label();
+                let ordinary = blocks[block.successors[0].0 as usize];
+                let bit = otter_vm::native_abi::NativeFrameFlags::OSR_ENTRY;
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
+                    ; test BYTE [r11 + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], bit as i8
+                    ; jnz =>osr
+                    ; jmp =>ordinary
+                    ; =>osr
+                    // The dispatch consumes the entry bit: the OSR block leaves
+                    // an ordinary optimizing frame behind it.
+                    ; and BYTE [r11 + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], !bit as i8
+                    ; mov r11d, DWORD [r11 + NATIVE_FRAME_PC_OFFSET as i32]
+                );
+                for (&logical_pc, successor) in logical_pcs.iter().zip(&block.successors[1..]) {
+                    let target = blocks[successor.0 as usize];
+                    let pc = i32::try_from(logical_pc)
+                        .map_err(|_| Unsupported::OperandShape("x86-64 OSR header PC"))?;
+                    dynasm!(ops ; .arch x64 ; cmp r11d, pc ; je =>target);
+                    if !osr_headers.insert(logical_pc) {
+                        return Err(Unsupported::OperandShape("duplicate x86-64 OSR header"));
+                    }
+                }
+                // No other header can carry the entry bit.
+                dynasm!(ops ; .arch x64 ; jmp =>fatal);
+                continue;
+            }
+            MachineOpcode::OsrValue {
+                logical_pc,
+                frame_register,
+                value_type,
+            } => {
+                let start = ops.offset().0;
+                let bail = ops.new_dynamic_label();
+                osr_value(&mut ops, frame, frame_register, value_type, loc[0], bail)?;
+                osr_bails.push((bail, logical_pc));
+                osr_regions.push((logical_pc, start, ops.offset().0));
             }
             MachineOpcode::LoopPreheader => {}
             MachineOpcode::EntryValue(parameter) => {
@@ -280,6 +294,61 @@ pub(super) fn emit(
                     ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
                     ; mov Rq(dst), [r11 + NATIVE_FRAME_THIS_OFFSET as i32]
                 );
+            }
+            MachineOpcode::EntryCallee => {
+                let dst = ireg(loc[0])?;
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
+                    ; mov Rq(dst), [r11 + NATIVE_FRAME_SELF_OFFSET as i32]
+                );
+            }
+            MachineOpcode::ContextLoad { field } => {
+                // The early input may share the late output's register:
+                // every path reads the input before its one output write.
+                let src = ireg(loc[0])?;
+                let dst = ireg(loc[1])?;
+                match field {
+                    ContextField::ClosureContext => {
+                        let not_closure = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        let context = context_word(view.closure_call_layout.context_byte)?;
+                        load64(&mut ops, 11, NOT_CELL_MASK);
+                        dynasm!(ops
+                            ; .arch x64
+                            ; test Rq(src), r11
+                            ; jnz =>not_closure
+                            ; cmp BYTE [Rq(src)], JS_CLOSURE_BODY_TYPE_TAG as i8
+                            ; jne =>not_closure
+                            ; mov Rq(dst), [Rq(src) + context]
+                            ; jmp =>done
+                            ; =>not_closure
+                        );
+                        load64(&mut ops, dst, VALUE_UNDEFINED);
+                        dynasm!(ops ; .arch x64 ; =>done);
+                    }
+                    ContextField::Parent => {
+                        let parent = context_word(view.context_layout.parent_byte)?;
+                        dynasm!(ops ; .arch x64 ; mov Rq(dst), [Rq(src) + parent]);
+                    }
+                    ContextField::Slot(slot) => {
+                        let offset = context_slot_offset(view, slot)?;
+                        dynasm!(ops ; .arch x64 ; mov Rq(dst), [Rq(src) + offset]);
+                    }
+                }
+            }
+            MachineOpcode::ContextStore { slot } => {
+                let context = ireg(loc[0])?;
+                let value = ireg(loc[1])?;
+                let offset = context_slot_offset(view, slot)?;
+                dynasm!(ops ; .arch x64 ; mov [Rq(context) + offset], Rq(value));
+            }
+            MachineOpcode::TaggedIsNotHole => {
+                let src = ireg(loc[0])?;
+                let dst = ireg(loc[1])?;
+                load64(&mut ops, 11, Value::hole().to_bits());
+                dynasm!(ops ; .arch x64 ; cmp Rq(src), r11);
+                bool_from_flags(&mut ops, dst, Cond::Ne);
             }
             MachineOpcode::TryBindDerivedThis { byte_pc } => {
                 let start = ops.offset().0;
@@ -375,7 +444,9 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::BindingWriteBarrier => {
+            // A binding owner is a raw cell address and a context owner is
+            // the context value; both are the header address.
+            MachineOpcode::BindingWriteBarrier | MachineOpcode::ContextWriteBarrier => {
                 if loc.len() != 2 {
                     return Err(Unsupported::OperandShape("x86-64 binding write barrier"));
                 }
@@ -402,23 +473,12 @@ pub(super) fn emit(
                 structural_regions.push(("machineBindingJoin", Some(byte_pc), offset, offset));
             }
             MachineOpcode::GuardCallTarget {
-                guard:
-                    MachineCallGuard::Method {
-                        ref guard,
-                        rejects_eval_env,
-                    },
+                guard: MachineCallGuard::Method { ref guard },
             } => {
                 let start = ops.offset().0;
                 let miss = deopt(instruction.deopt_id(), &deopts)?;
                 load_integer(&mut ops, frame, loc[0], 9)?;
-                emit_inline_method_guard(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    guard,
-                    !rejects_eval_env,
-                    miss,
-                )?;
+                emit_inline_method_guard(&mut ops, &mut relocations, view, guard, miss)?;
                 store_integer(&mut ops, frame, loc[1], 9)?;
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
@@ -427,23 +487,18 @@ pub(super) fn emit(
                     MachineCallGuard::Plain {
                         function_id,
                         this_mode,
-                        rejects_eval_env,
                     },
             } => {
                 let start = ops.offset().0;
                 let miss = deopt(instruction.deopt_id(), &deopts)?;
                 load_integer(&mut ops, frame, loc[0], 9)?;
-                emit_inline_identity(&mut ops, view, function_id, rejects_eval_env, miss);
+                emit_inline_identity(&mut ops, view, function_id, miss);
                 emit_inline_this(&mut ops, &mut relocations, view, this_mode, miss)?;
                 store_integer(&mut ops, frame, loc[1], 9)?;
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
             MachineOpcode::GuardCallTarget {
-                guard:
-                    MachineCallGuard::Construct {
-                        function_id,
-                        rejects_eval_env,
-                    },
+                guard: MachineCallGuard::Construct { function_id },
             } => {
                 let start = ops.offset().0;
                 let miss = deopt(instruction.deopt_id(), &deopts)?;
@@ -463,7 +518,7 @@ pub(super) fn emit(
                     ; mov r9, [r9 + view.class_constructor_layout.callable_byte as i32]
                     ; =>callable
                 );
-                emit_inline_identity(&mut ops, view, function_id, rejects_eval_env, miss);
+                emit_inline_identity(&mut ops, view, function_id, miss);
                 store_integer(&mut ops, frame, loc[1], 9)?;
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
@@ -2190,7 +2245,7 @@ pub(super) fn emit(
                             id,
                             descriptor,
                             loc,
-                            allocation.edits(),
+                            allocation,
                             safepoints,
                             &blocks,
                             throw_value,
@@ -2361,12 +2416,9 @@ pub(super) fn emit(
                                 .get(result_index)
                                 .ok_or(Unsupported::OperandShape("x86-64 direct-call result"))?;
                             store_integer(&mut ops, frame, result, 0)?;
-                            edits(
-                                &mut ops,
-                                allocation.edits(),
-                                AllocationPoint::After(id),
-                                frame,
-                            )?;
+                            // The normal path's moves after the call and around
+                            // the block terminator run on the exceptional edge too.
+                            edit_run(&mut ops, allocation.exceptional_edge_edits(id), frame)?;
                             let target = blocks.get(target.0 as usize).copied().ok_or(
                                 Unsupported::OperandShape("x86-64 direct-call landing pad"),
                             )?;
@@ -2577,6 +2629,44 @@ pub(super) fn emit(
                     }
                     continue;
                 }
+                if target == otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC
+                    || target == otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC
+                {
+                    if loc.len() < 4
+                        || ireg(loc[0])? != 2
+                        || ireg(loc[1])? != 1
+                        || ireg(loc[2])? != 8
+                        || ireg(loc[3])? != 0
+                    {
+                        return Err(Unsupported::OperandShape("x86-64 context allocation ABI"));
+                    }
+                    let entry = otter_vm::runtime_stubs::alloc_value_stub_by_id(target.id)
+                        .and_then(|stub| stub.entry_addr())
+                        .ok_or(Unsupported::OperandShape("x86-64 context allocation entry"))?;
+                    let site = safepoints
+                        .site(id)
+                        .filter(|site| instruction.safepoint == Some(site.id))
+                        .ok_or(Unsupported::OperandShape("x86-64 allocating safepoint"))?;
+                    let exit = deopt(instruction.deopt_id(), &deopts)?;
+                    allocating_call(
+                        &mut ops,
+                        &mut relocations,
+                        frame,
+                        site,
+                        entry as u64,
+                        target,
+                        exit,
+                    )?;
+                    if !terminal {
+                        edits(
+                            &mut ops,
+                            allocation.edits(),
+                            AllocationPoint::After(id),
+                            frame,
+                        )?;
+                    }
+                    continue;
+                }
                 if target == otter_vm::native_abi::STUB_STRING_CONCAT_ALLOC {
                     if loc.len() < 4
                         || ireg(loc[0])? != 2
@@ -2671,9 +2761,21 @@ pub(super) fn emit(
         &deopts,
         shared_deopt,
     )?;
-    let (osr_entries, osr_regions) = emit_osr_entries(
-        &mut ops, sequence, allocation, frame, saved, has_poll, &osr_sites,
-    )?;
+    for (bail, logical_pc) in osr_bails {
+        dynasm!(ops
+            ; .arch x64
+            ; =>bail
+            ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; mov DWORD [r11 + NATIVE_FRAME_PC_OFFSET as i32], logical_pc as i32
+        );
+        load64(
+            &mut ops,
+            0,
+            SideExit::new(logical_pc, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits(),
+        );
+        dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::SideExit as i32);
+        epilogue(&mut ops, frame, saved);
+    }
     let buffer = crate::entry::finalize_assembler(ops)?;
     Ok(Emission {
         code: CompiledCode::new(buffer, AssemblyOffset(0)),
@@ -2696,7 +2798,7 @@ pub(super) fn emit(
                 },
             ),
         relocations,
-        osr_entries,
+        osr_headers,
         osr_regions,
         structural_regions,
     })
@@ -2802,7 +2904,16 @@ fn edits(
     point: AllocationPoint,
     frame: MachineFrameLayout,
 ) -> Result<(), Unsupported> {
-    for edit in super::super::regalloc::edits_at(edits, point) {
+    edit_run(ops, super::super::regalloc::edits_at(edits, point), frame)
+}
+
+/// Emit one contiguous run of allocation edits in program order.
+fn edit_run(
+    ops: &mut Assembler,
+    run: &[AllocationEdit],
+    frame: MachineFrameLayout,
+) -> Result<(), Unsupported> {
+    for edit in run {
         if edit.from == edit.to {
             continue;
         }
@@ -3325,11 +3436,21 @@ fn binding_guard(
     }
     match target {
         MachineBindingTarget::Cold => dynasm!(ops ; .arch x64 ; jmp =>miss),
-        // The inliner splices closure-upvalue reads only for aarch64.
-        MachineBindingTarget::ClosureUpvalue { .. } => {
-            return Err(Unsupported::OperandShape(
-                "x86 closure upvalue binding target",
-            ));
+        MachineBindingTarget::ContextSlot { depth, slot } => {
+            // The context is the last boxed input: after the stored value
+            // for a write, alone for a read.
+            let context = *locations
+                .last()
+                .ok_or(Unsupported::OperandShape("x86-64 context binding input"))?;
+            load_integer(ops, frame, context, 10)?;
+            let parent = context_word(view.context_layout.parent_byte)?;
+            for _ in 0..depth {
+                dynasm!(ops ; .arch x64 ; mov r10, [r10 + parent]);
+            }
+            let offset = context_slot_offset(view, slot)?;
+            dynasm!(ops ; .arch x64 ; lea r9, [r10 + offset] ; mov r11, [r9]);
+            load64(ops, 8, Value::hole().to_bits());
+            dynasm!(ops ; .arch x64 ; cmp r11, r8 ; je =>miss);
         }
         MachineBindingTarget::GlobalThis => {
             dynasm!(ops
@@ -3349,39 +3470,6 @@ fn binding_guard(
                 RelocationTarget::GcCageBase,
             );
             dynasm!(ops ; .arch x64 ; add r10, r11);
-        }
-        MachineBindingTarget::Upvalue { index } => {
-            let index = i32::try_from(index)
-                .map_err(|_| Unsupported::OperandShape("x86-64 upvalue index"))?;
-            let spine_offset = index
-                .checked_mul(4)
-                .ok_or(Unsupported::OperandShape("x86-64 upvalue spine offset"))?;
-            dynasm!(ops
-                ; .arch x64
-                ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
-                ; cmp DWORD [r11 + NATIVE_FRAME_UPVALUE_COUNT_OFFSET as i32], index
-                ; jbe =>miss
-                ; mov r10, [r11 + NATIVE_FRAME_UPVALUE_BASE_OFFSET as i32]
-                ; test r10, r10
-                ; jz =>miss
-                ; mov r10d, [r10 + spine_offset]
-                ; test r10d, r10d
-                ; jz =>miss
-            );
-            symbolic(
-                ops,
-                relocations,
-                9,
-                view.cage_base as u64,
-                RelocationTarget::GcCageBase,
-            );
-            dynasm!(ops
-                ; .arch x64
-                ; add r10, r9
-                ; cmp BYTE [r10], UPVALUE_CELL_TYPE_TAG as i8
-                ; jne =>miss
-                ; lea r9, [r10 + view.upvalue_value_byte as i32]
-            );
         }
         MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalLexical {
             cell_offset,
@@ -3403,7 +3491,7 @@ fn binding_guard(
                     byte_pc,
                 },
             );
-            dynasm!(ops ; .arch x64 ; lea r9, [r10 + view.upvalue_value_byte as i32]);
+            dynasm!(ops ; .arch x64 ; lea r9, [r10 + view.global_lexical_value_byte as i32]);
         }
         MachineBindingTarget::Global(otter_vm::jit::BindingHitProof::GlobalObject {
             shape,
@@ -3511,14 +3599,14 @@ fn binding_hit(
                 BindingRead::Exists { .. } => {
                     load64(ops, 11, Value::boolean(true).to_bits());
                 }
-                BindingRead::Global { .. } | BindingRead::Upvalue { .. } => {
+                BindingRead::Global { .. } | BindingRead::ContextSlot { .. } => {
                     load_integer(ops, frame, locations[1], 11)?;
                     dynasm!(ops ; .arch x64 ; mov r11, [r11]);
                 }
-                BindingRead::Dynamic { .. }
-                | BindingRead::ShadowedUpvalue { .. }
-                | BindingRead::EvalBindingSeq { .. } => {
-                    return Err(Unsupported::OperandShape("x86-64 dynamic binding hit"));
+                BindingRead::LookupSlot { .. }
+                | BindingRead::LookupGlobal { .. }
+                | BindingRead::ResolveRef { .. } => {
+                    return Err(Unsupported::OperandShape("x86-64 context binding hit"));
                 }
             }
             store_integer(ops, frame, locations[2], 11)?;
@@ -3534,17 +3622,31 @@ fn binding_hit(
     }
 }
 
+/// Displacement of one aligned context or closure word.
+fn context_word(offset: u32) -> Result<i32, Unsupported> {
+    offset
+        .is_multiple_of(8)
+        .then(|| i32::try_from(offset).ok())
+        .flatten()
+        .ok_or(Unsupported::OperandShape("x86-64 context word offset"))
+}
+
+/// Displacement of context slot `slot` from the context's header address.
+fn context_slot_offset(view: &JitCompileSnapshot, slot: u16) -> Result<i32, Unsupported> {
+    view.context_layout
+        .slots_byte
+        .checked_add(u32::from(slot) * 8)
+        .ok_or(Unsupported::OperandShape("x86-64 context slot offset"))
+        .and_then(context_word)
+}
+
 fn binding_requires_live_cell(semantics: BindingSemantics) -> bool {
     matches!(
         semantics,
-        BindingSemantics::Read(BindingRead::Global { .. } | BindingRead::Upvalue { .. })
+        BindingSemantics::Read(BindingRead::Global { .. })
             | BindingSemantics::Write(
                 BindingWrite::Global { .. } | BindingWrite::GlobalChecked { .. }
             )
-            | BindingSemantics::Write(BindingWrite::Upvalue {
-                check: BindingWriteCheck::Checked,
-                ..
-            })
     )
 }
 
@@ -3666,7 +3768,7 @@ fn committed_value_call(
     id: MachineInstructionId,
     descriptor: &CallDescriptor,
     locations: &[AllocatedLocation],
-    allocation_edits: &[AllocationEdit],
+    allocation: &AllocatedSequence,
     safepoints: &MachineSafepointTable,
     block_labels: &[DynamicLabel],
     throw_value: DynamicLabel,
@@ -3761,7 +3863,9 @@ fn committed_value_call(
     match descriptor.exceptional {
         ExceptionalEdge::LandingPad(target) => {
             store_integer(ops, frame, result_location, 11)?;
-            edits(ops, allocation_edits, AllocationPoint::After(id), frame)?;
+            // The normal path's moves after the call and around the block
+            // terminator run on the exceptional edge too.
+            edit_run(ops, allocation.exceptional_edge_edits(id), frame)?;
             let target =
                 block_labels
                     .get(target.0 as usize)
@@ -4206,95 +4310,22 @@ fn emit_deopts(
     Ok(())
 }
 
-fn emit_osr_entries(
-    ops: &mut Assembler,
-    sequence: &InstructionSequence,
-    allocation: &AllocatedSequence,
-    frame: MachineFrameLayout,
-    saved: SavedFrame,
-    has_poll: bool,
-    sites: &[OsrSite],
-) -> Result<OsrEmission, Unsupported> {
-    let mut entries = BTreeMap::new();
-    let mut regions = Vec::with_capacity(sites.len());
-    for site in sites {
-        let start = ops.offset().0;
-        let reject = ops.new_dynamic_label();
-        prologue(ops, frame, saved);
-        if has_poll {
-            dynasm!(ops ; .arch x64 ; mov ebp, crate::GENERATED_POLL_BATCH as i32);
-        }
-        let locations = allocation
-            .instruction_locations(site.instruction)
-            .ok_or(Unsupported::OperandShape("x86-64 OSR allocation"))?;
-        let instruction = &sequence.instructions()[site.instruction.0 as usize];
-        if site.inputs.len() != locations.len() || locations.len() != instruction.operands.len() {
-            return Err(Unsupported::OperandShape("x86-64 OSR arity"));
-        }
-        for ((input, &location), operand) in
-            site.inputs.iter().zip(locations).zip(&instruction.operands)
-        {
-            osr_value(
-                ops,
-                frame,
-                *input,
-                sequence.representations()[operand.value.0 as usize],
-                location,
-                reject,
-            )?;
-        }
-        let continuation = site.continuation;
-        dynasm!(ops ; .arch x64 ; jmp =>continuation ; =>reject);
-        dynasm!(ops
-            ; .arch x64
-            ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
-            ; mov DWORD [r11 + NATIVE_FRAME_PC_OFFSET as i32], site.logical_pc as i32
-        );
-        load64(
-            ops,
-            0,
-            SideExit::new(
-                site.logical_pc,
-                ExitReason::TypeMismatch,
-                ExitAction::Recompile,
-            )
-            .to_bits(),
-        );
-        dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::SideExit as i32);
-        epilogue(ops, frame, saved);
-        let end = ops.offset().0;
-        if entries.insert(site.logical_pc, start).is_some() {
-            return Err(Unsupported::OperandShape("duplicate x86-64 OSR logical PC"));
-        }
-        regions.push((site.logical_pc, start, end));
-    }
-    Ok((entries, regions))
-}
-
+/// Read interpreter frame register `frame_register` into `location` as
+/// `value_type`, jumping to `reject` when the tagged value lies outside it.
 fn osr_value(
     ops: &mut Assembler,
     frame: MachineFrameLayout,
-    input: MachineOsrInput,
-    representation: MachineRepresentation,
+    frame_register: u16,
+    value_type: MachineOsrType,
     location: AllocatedLocation,
     reject: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let expected = match input.value_type {
-        MachineOsrType::Tagged => MachineRepresentation::Tagged,
-        MachineOsrType::Int32 => MachineRepresentation::Int32,
-        MachineOsrType::Uint32 => MachineRepresentation::Uint32,
-        MachineOsrType::Float64 => MachineRepresentation::Float64,
-        MachineOsrType::Boolean => MachineRepresentation::Boolean,
-    };
-    if representation != expected {
-        return Err(Unsupported::OperandShape("x86-64 OSR representation"));
-    }
-    load_osr_source(ops, input.frame_register);
-    match input.value_type {
+    load_osr_source(ops, frame_register);
+    match value_type {
         MachineOsrType::Tagged => store_osr_integer(ops, frame, location, 11),
         MachineOsrType::Int32 => {
             guard_int32(ops, 11, reject);
-            load_osr_source(ops, input.frame_register);
+            load_osr_source(ops, frame_register);
             store_osr_integer(ops, frame, location, 11)
         }
         MachineOsrType::Float64 => {
@@ -4465,7 +4496,6 @@ fn emit_inline_identity(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     function_id: u32,
-    rejects_eval_env: bool,
     miss: DynamicLabel,
 ) {
     let guarded = ops.new_dynamic_label();
@@ -4500,13 +4530,6 @@ fn emit_inline_identity(
         );
         dynasm!(ops ; .arch x64 ; test r8d, r11d ; jnz =>miss);
     }
-    if rejects_eval_env {
-        dynasm!(ops
-            ; .arch x64
-            ; cmp DWORD [r9 + view.closure_call_layout.eval_env_byte as i32], 0
-            ; jne =>miss
-        );
-    }
     dynasm!(ops
         ; .arch x64
         ; cmp DWORD [r9 + view.closure_call_layout.function_id_byte as i32], function_id as i32
@@ -4520,7 +4543,6 @@ fn emit_inline_method_guard(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     guard: &otter_vm::jit::JitMethodGuard,
-    allow_eval_env: bool,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     if view.cage_base == 0 {
@@ -4601,13 +4623,6 @@ fn emit_inline_method_guard(
         ; test r8d, r11d
         ; jnz =>miss
     );
-    if !allow_eval_env {
-        dynasm!(ops
-            ; .arch x64
-            ; cmp DWORD [r9 + view.closure_call_layout.eval_env_byte as i32], 0
-            ; jne =>miss
-        );
-    }
     dynasm!(ops
         ; .arch x64
         ; cmp DWORD [r9 + view.closure_call_layout.function_id_byte as i32], guard.method_fid as i32

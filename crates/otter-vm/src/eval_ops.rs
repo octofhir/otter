@@ -19,9 +19,14 @@
 //! - Strict-mode eval inherits the caller function strictness.
 //! - Direct eval re-enters above an activation floor on the caller's stack;
 //!   caller frames remain traced and cannot be consumed by nested dispatch.
-//! - One traced eval-environment chain owns every runtime-introduced binding.
-//!   Compiler snapshots are unique, nearest-wins, and name-sorted; after any
-//!   allocation the live cell is resolved again from that chain.
+//! - Direct eval compiles against the caller's context chain
+//!   ([`otter_bytecode::EvalCallerChain`]) and runs its `<main>` as a SELF
+//!   closure over the caller's innermost context, read back from its traced
+//!   register after compilation and linking. Bindings a sloppy eval creates
+//!   land in the var-scope context's eval extension through the body's own
+//!   `DeclareEvalVar`; the runtime adopts nothing.
+//! - Every other compiled `<main>` (indirect eval, host scripts, `Function`,
+//!   the CommonJS wrapper) runs as a SELF closure over no context.
 //!
 //! # See also
 //! - [`crate::code_space`]
@@ -33,24 +38,10 @@ use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
-    AsyncFrameState, EvalCallerBinding, EvalCompileOptions, ExecutionContext, Frame, Interpreter,
-    Value, VmError, abstract_ops, operand_decode::register_operand, promise_dispatch,
-    read_register, write_register,
+    AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, Value, VmError,
+    abstract_ops, operand_decode::register_operand, promise_dispatch, read_register,
+    write_register,
 };
-
-/// Where one caller-scope cell for a direct eval comes from. Cells
-/// are re-read from the caller frame *after* every GC-allocating
-/// step (compile, link, spine building) because young-generation
-/// collections move upvalue cells; only the frame's traced slots
-/// stay current.
-enum CallerCellSource {
-    /// Slot in the caller frame's upvalue array (compile-time
-    /// promoted function-scope binding).
-    Upvalue(u16),
-    /// Name in the caller frame's traced eval-environment chain. The live cell
-    /// is re-resolved after compilation and upvalue allocation.
-    EvalEnv(String),
-}
 
 /// §20.2.1.1.1 CreateDynamicFunction `kind` parameter: which function
 /// goal symbol the synthesised source compiles under.
@@ -78,19 +69,8 @@ impl DynamicFunctionKind {
 }
 
 impl Interpreter {
-    /// Issue the next eval-binding creation sequence number.
-    pub(crate) fn next_eval_binding_seq(&mut self) -> u64 {
-        let seq = self.eval_binding_seq;
-        self.eval_binding_seq += 1;
-        seq
-    }
-
-    /// Current eval-binding sequence: bindings created from here on carry
-    /// numbers at or above this value.
-    pub(crate) fn current_eval_binding_seq(&self) -> u64 {
-        self.eval_binding_seq
-    }
-
+    /// `Eval dst, src, ctx, flags` — §19.2.1.1 PerformEval with
+    /// `direct = true`.
     pub(crate) fn run_eval_operands(
         &mut self,
         context: &ExecutionContext,
@@ -99,18 +79,14 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let src_reg = register_operand(operands.get(1))?;
-        let flags = match operands.get(2) {
+        let ctx_reg = register_operand(operands.get(2))?;
+        let flags = match operands.get(3) {
             Some(Operand::Imm32(bits)) => bits,
-            _ => 0,
-        };
-        let site = match operands.get(3) {
-            Some(Operand::Imm32(bits)) => bits as usize,
-            _ => usize::MAX,
+            _ => return Err(VmError::InvalidOperand),
         };
         let forbid_var_arguments = flags & 1 != 0;
-        let in_param_init = flags & 2 != 0;
         let new_target_allowed = flags & 4 != 0;
-        let new_target_suppressed = flags & 8 != 0;
+        let in_class_field_initializer = flags & 8 != 0;
         let super_property_allowed = flags & 16 != 0;
         let super_call_allowed = flags & 32 != 0;
         let top_idx = stack.len() - 1;
@@ -124,64 +100,30 @@ impl Interpreter {
                 return Ok(());
             }
         }
-        let force_strict = context.function_is_strict(stack[top_idx].function_id);
-        // §19.2.1.3 EvalDeclarationInstantiation — a direct eval
-        // inside a function receives the caller variable environment.
-        // The compiler promoted every caller function-scope binding
-        // into a cell and recorded the name → slot table; earlier
-        // evals may have extended the frame with more named cells.
-        // §19.2.1.1 `inFunction` — the compiler's flag, not table
-        // emptiness: a synthesized constructor may carry no bindings
-        // yet still host a field-initializer eval.
-        let in_function_caller = context
-            .exec_function(stack[top_idx].function_id)
-            .is_some_and(|function| function.contains_direct_eval);
-        // A script-top-level eval keeps the global variable
-        // environment, but the per-site block-binding refinements
-        // still apply: §19.2.1.1 gives the body the caller's lexical
-        // environment as heritage, so a `for (let …)` / block `let`
-        // cell around the call site is visible inside the body.
-        let (caller_scope, cell_sources) =
-            self.collect_caller_scope(context, &stack[top_idx], in_param_init, site);
-        let result = if !in_function_caller && cell_sources.is_empty() {
-            // Script-top-level direct eval: the caller variable
-            // environment *is* the global environment, which the
-            // compiled chunk reaches through the global mirror.
-            self.run_eval(
-                stack,
-                &value,
-                EvalCompileOptions {
-                    force_strict,
-                    forbid_var_arguments,
-                    caller_scope: None,
-                    global_var_env: false,
-                    script_goal: false,
-                    new_target_allowed,
-                    in_class_field_initializer: new_target_suppressed,
-                    super_property_allowed,
-                    super_call_allowed,
-                    function_constructor: false,
-                },
-            )?
-        } else {
+        let result = if value.as_string(&self.gc_heap).is_some() {
+            let force_strict = context.function_is_strict(stack[top_idx].function_id);
+            let caller_context = *read_register(&stack[top_idx], ctx_reg)?;
+            let caller_chain = self.eval_caller_chain(context, caller_context)?;
             self.run_direct_eval(
                 &value,
                 EvalCompileOptions {
                     force_strict,
                     forbid_var_arguments,
-                    caller_scope: Some(caller_scope),
-                    global_var_env: !in_function_caller,
+                    caller_chain: Some(caller_chain),
                     script_goal: false,
                     new_target_allowed,
-                    in_class_field_initializer: new_target_suppressed,
+                    in_class_field_initializer,
                     super_property_allowed,
                     super_call_allowed,
                     function_constructor: false,
                 },
-                &cell_sources,
-                new_target_suppressed,
+                ctx_reg,
+                in_class_field_initializer,
                 stack,
             )?
+        } else {
+            // §19.2.1.1 step 2 — a non-String operand is the result.
+            value
         };
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
@@ -189,128 +131,27 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Build the caller-scope binding list (compiler-facing names)
-    /// and the matching cell-source list (runtime cell origins) for
-    /// a direct eval running on `frame`. Entry `i` of both lists
-    /// describes upvalue slot `i` of the compiled eval `<main>`.
-    fn collect_caller_scope(
-        &self,
-        context: &ExecutionContext,
-        frame: &Frame,
-        in_param_init: bool,
-        site: usize,
-    ) -> (Vec<EvalCallerBinding>, Vec<CallerCellSource>) {
-        let mut by_name: std::collections::BTreeMap<String, (EvalCallerBinding, CallerCellSource)> =
-            std::collections::BTreeMap::new();
-        if let Some(function) = context.exec_function(frame.function_id) {
-            for binding in function.direct_eval_bindings.iter() {
-                // §10.2.11 — while parameter initializers run, only
-                // the function environment exists: formal parameters,
-                // captured passthroughs from enclosing scopes, and
-                // the self-name binding. Body lexical AND body
-                // var/function bindings don't exist yet; an eval
-                // there neither sees them nor collides with them
-                // (its own `var` adopts a fresh funcEnv binding).
-                if in_param_init
-                    && (binding.lexical
-                        || (!binding.param && !binding.captured && !binding.fn_self_name))
-                {
-                    continue;
-                }
-                let name = binding.name.to_string();
-                by_name.insert(
-                    name.clone(),
-                    (
-                        EvalCallerBinding {
-                            name,
-                            lexical: binding.lexical,
-                            captured: binding.captured,
-                            is_const: binding.is_const,
-                            fn_self_name: binding.fn_self_name,
-                            inner: false,
-                            deletable: binding.deletable,
-                            scope_depth: binding.scope_depth,
-                        },
-                        CallerCellSource::Upvalue(binding.upvalue),
-                    ),
-                );
-            }
-        }
-        if let Some(env) = (!frame.eval_env.is_null()).then_some(frame.eval_env) {
-            for snapshot in crate::eval_env::eval_env_snapshot_chain(&self.gc_heap, env) {
-                debug_assert_eq!(snapshot.current, snapshot.depth == 0);
-                // A current static binding is already the authoritative cell
-                // for this variable environment. A dynamic record does,
-                // however, shadow a passthrough capture from an outer static
-                // scope (the reason LoadShadowedUpvalue exists).
-                let replace = match by_name.get(&snapshot.name) {
-                    Some((binding, _)) => binding.captured,
-                    None => true,
-                };
-                if replace {
-                    let name = snapshot.name;
-                    by_name.insert(
-                        name.clone(),
-                        (
-                            EvalCallerBinding {
-                                name: name.clone(),
-                                lexical: false,
-                                captured: !snapshot.current,
-                                is_const: false,
-                                fn_self_name: false,
-                                inner: false,
-                                deletable: true,
-                                scope_depth: 1,
-                            },
-                            CallerCellSource::EvalEnv(name),
-                        ),
-                    );
-                }
-            }
-        }
-        // Per-site block-scope refinements shadow both the
-        // function-scope baseline and any eval-environment record —
-        // they sit lexically closer to the eval than either.
-        if let Some(entries) = context
-            .exec_function(frame.function_id)
-            .and_then(|function| function.eval_sites.get(site))
-        {
-            for binding in entries {
-                let name = binding.name.to_string();
-                by_name.insert(
-                    name.clone(),
-                    (
-                        EvalCallerBinding {
-                            name,
-                            lexical: binding.lexical,
-                            captured: binding.captured,
-                            is_const: binding.is_const,
-                            fn_self_name: binding.fn_self_name,
-                            inner: true,
-                            deletable: binding.deletable,
-                            scope_depth: binding.scope_depth,
-                        },
-                        CallerCellSource::Upvalue(binding.upvalue),
-                    ),
-                );
-            }
-        }
-        by_name.into_values().unzip()
+    /// The SELF closure a compiled `<main>` runs as, over `context` (the
+    /// caller's innermost context for a direct eval, `undefined` otherwise).
+    fn main_self_closure(&mut self, main_id: u32, context: Value) -> Result<Value, VmError> {
+        // The context rides in the pending closure body.
+        let closure =
+            crate::closure::alloc_closure(&mut self.gc_heap, main_id, context, None, None)
+                .map_err(crate::oom_to_vm)?;
+        Ok(Value::closure(closure))
     }
 
-    /// Execute a direct eval whose caller variable environment is a
-    /// function environment (§19.2.1.1 PerformEval with
-    /// `direct = true`). The compiled chunk's leading upvalue slots
-    /// alias the caller's binding cells; new var-scoped bindings the
-    /// body introduces are adopted into the current eval-environment record
-    /// before the body runs (hoisting), and `this` is inherited from the
-    /// caller. Sloppy eval reuses the caller record; strict eval executes with
-    /// a fresh child record and never leaks its declarations into the caller.
+    /// Execute a direct eval (§19.2.1.1 PerformEval with `direct = true`).
+    ///
+    /// The body was compiled against the caller's context chain; its
+    /// `<main>` runs as a closure over the caller's innermost context with
+    /// the caller's `this` and `new.target`. Declarations reach the caller's
+    /// scopes through the body's own context operations.
     fn run_direct_eval(
         &mut self,
         value: &Value,
         options: EvalCompileOptions,
-        cell_sources: &[CallerCellSource],
+        ctx_reg: u16,
         new_target_suppressed: bool,
         stack: &mut ActivationStack,
     ) -> Result<Value, VmError> {
@@ -321,113 +162,16 @@ impl Interpreter {
         };
         let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
         let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
-        // Normal call entry creates this record for every function containing a
-        // direct-eval site. Keep a fallback for synthetic/test entry frames so
-        // the direct-eval boundary itself still establishes one sole authority.
-        if stack[top_idx].eval_env.is_null() {
-            let mut frame_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                stack[top_idx].trace_frame_slots(visitor);
-            };
-            let env = crate::eval_env::alloc_eval_env_with_roots(
-                &mut self.gc_heap,
-                None,
-                &mut frame_roots,
-            )
-            .map_err(crate::oom_to_vm)?;
-            stack[top_idx].eval_env = env;
-        }
-        // §19.2.1.3 — only the caller's OWN variable-environment
-        // names block adoption; a passthrough CAPTURE of the same
-        // name still receives a fresh caller binding, and so does a
-        // block-scope INNER binding (the eval's `var` lands in the
-        // variable environment underneath it — §B.3.5).
-        let caller_scope_names: std::collections::HashSet<String> = options
-            .caller_scope
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|binding| !binding.captured && !binding.inner)
-            .map(|binding| binding.name.clone())
-            .collect();
         let module = self.compile_escaped_source(&source, options)?;
         let context = self
             .link_evictable_module(module)
             .map_err(|_| VmError::InvalidOperand)?;
         let main = context.exec_main();
-        // A strict direct eval owns a private current record whose parent is
-        // the caller record. Root that unpublished handle while the fresh
-        // upvalue spine allocates; sloppy eval simply reuses the traced caller
-        // record and re-reads it after allocation.
-        let mut strict_eval_env = if main.is_strict {
-            let parent = (!stack[top_idx].eval_env.is_null()).then_some(stack[top_idx].eval_env);
-            let mut frame_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                stack[top_idx].trace_frame_slots(visitor);
-            };
-            Some(
-                crate::eval_env::alloc_eval_env_with_roots(
-                    &mut self.gc_heap,
-                    parent,
-                    &mut frame_roots,
-                )
-                .map_err(crate::oom_to_vm)?,
-            )
-        } else {
-            None
-        };
-        let mut env_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            if let Some(env) = &mut strict_eval_env {
-                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut otter_gc::raw::RawGc);
-            }
-        };
-        let mut upvalues = Frame::build_upvalues_for_exec_with_roots(
-            &mut self.gc_heap,
-            main,
-            Frame::empty_upvalues(),
-            &mut env_roots,
-        )?;
-        // Splice the caller's cells into the reserved leading slots
-        // and adopt the chunk's new var-binding cells into the caller
-        // frame. No GC allocation happens from here until the spine
-        // is rooted on the entry frame — the cells read below are
-        // only current while nothing moves the heap.
-        {
-            let caller = &stack[top_idx];
-            let caller_env = (!caller.eval_env.is_null()).then_some(caller.eval_env);
-            for (i, cell_source) in cell_sources.iter().enumerate() {
-                let cell = match cell_source {
-                    CallerCellSource::Upvalue(idx) => caller
-                        .upvalues
-                        .get(*idx as usize)
-                        .copied()
-                        .ok_or(VmError::InvalidOperand)?,
-                    CallerCellSource::EvalEnv(name) => caller_env
-                        .and_then(|env| {
-                            crate::eval_env::eval_env_lookup_chain(&self.gc_heap, env, name)
-                        })
-                        .ok_or(VmError::InvalidOperand)?,
-                };
-                *upvalues.get_mut(i).ok_or(VmError::InvalidOperand)? = cell;
-            }
-        }
-        // §19.2.1.3 step 16.b — the body's *new* var-scoped bindings
-        // become caller-environment bindings before the body runs,
-        // matching var hoisting semantics. The chunk's table also
-        // lists caller-scope re-binds and its own lexicals (for
-        // nested evals); both are excluded from adoption.
-        let adopted: Vec<(String, crate::UpvalueCell)> = main
-            .direct_eval_bindings
-            .iter()
-            .filter(|binding| {
-                !binding.lexical
-                    && !binding.captured
-                    && !caller_scope_names.contains(binding.name.as_ref())
-            })
-            .filter_map(|binding| {
-                upvalues
-                    .get(binding.upvalue as usize)
-                    .map(|cell| (binding.name.to_string(), *cell))
-            })
-            .collect();
+        // Linking can collect: the caller context is read back from its
+        // traced register only now.
+        let caller_context = *read_register(&stack[top_idx], ctx_reg)?;
+        crate::context_ops::context_operand(caller_context)?;
+        let self_value = self.main_self_closure(main.id, caller_context)?;
         let entry_this = stack[top_idx].this_value;
         // §13.3.3 — `new.target` in the eval body reads the caller
         // frame's value (direct eval is contained in function code).
@@ -438,32 +182,8 @@ impl Interpreter {
             self.frame_cold(&stack[top_idx])
                 .and_then(|cold| cold.new_target)
         };
-        let entry_eval_env = strict_eval_env
-            .or_else(|| (!stack[top_idx].eval_env.is_null()).then_some(stack[top_idx].eval_env))
-            .ok_or(VmError::InvalidOperand)?;
-        // §19.2.1.3 step 16.b — insert each newly hoisted binding exactly
-        // once into the current variable-environment record. Sloppy eval uses
-        // the caller's current record; strict eval uses its fresh private
-        // child, so an adopted binding can never leak across that boundary.
-        for (name, cell) in adopted {
-            let seq = self.next_eval_binding_seq();
-            // §19.2.1.3 step 16.b — an already-present binding (a
-            // prior eval's adoption of the same name past an inner
-            // catch/block shadow) is kept, value and all; only a
-            // genuinely new name inserts.
-            crate::eval_env::eval_env_insert_current(
-                &mut self.gc_heap,
-                entry_eval_env,
-                name,
-                cell,
-                seq,
-            );
-        }
-        let main = context.exec_main();
         let window = self.alloc_reg_window(main.register_count as usize)?;
-        let mut entry =
-            Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
-        entry.eval_env = entry_eval_env;
+        let mut entry = Frame::for_code_block(main, None, self_value, entry_this, window);
         if caller_new_target.is_some() {
             self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
         }
@@ -571,8 +291,7 @@ impl Interpreter {
             .link_evictable_module(module)
             .map_err(|_| VmError::InvalidOperand)?;
         let main = context.exec_main();
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
+        let self_value = self.main_self_closure(main.id, Value::undefined())?;
         // §19.2.1.3 — eval code evaluated at global scope (direct at
         // the top level or indirect) binds `this` to globalThis even
         // when the eval source itself is strict; only module code gets
@@ -583,8 +302,7 @@ impl Interpreter {
             Value::object(self.global_this)
         };
         let window = self.alloc_reg_window(main.register_count as usize)?;
-        let entry =
-            Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
+        let entry = Frame::for_code_block(main, None, self_value, entry_this, window);
         let entry_is_async = main.is_async;
         let floor = stack.floor();
         stack.push(entry);
@@ -723,18 +441,17 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
         // completion).
-        let main = context.main();
-        let total = main
-            .param_count
-            .saturating_add(main.locals)
-            .saturating_add(main.scratch) as usize;
-        let window = self.alloc_reg_window(total)?;
+        let main = context.exec_main();
+        let self_value = self.main_self_closure(main.id, Value::undefined())?;
+        let window = self.alloc_reg_window(main.register_count as usize)?;
         let floor = stack.floor();
-        stack.push(Frame::for_function_with_heap(
+        stack.push(Frame::for_code_block(
             main,
-            &mut self.gc_heap,
+            None,
+            self_value,
+            Value::undefined(),
             window,
-        )?);
+        ));
         let result = self.dispatch_loop_above_rooted(&context, stack, floor);
         self.release_frames_above(stack, floor);
         result
@@ -789,18 +506,17 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion).
-        let main = context.main();
-        let total = main
-            .param_count
-            .saturating_add(main.locals)
-            .saturating_add(main.scratch) as usize;
-        let window = self.alloc_reg_window(total)?;
+        let main = context.exec_main();
+        let self_value = self.main_self_closure(main.id, Value::undefined())?;
+        let window = self.alloc_reg_window(main.register_count as usize)?;
         let floor = stack.floor();
-        stack.push(Frame::for_function_with_heap(
+        stack.push(Frame::for_code_block(
             main,
-            &mut self.gc_heap,
+            None,
+            self_value,
+            Value::undefined(),
             window,
-        )?);
+        ));
         let result = self.dispatch_loop_above_rooted(&context, stack, floor);
         self.release_frames_above(stack, floor);
         result
@@ -957,7 +673,7 @@ mod tests {
 
     fn direct_options() -> EvalCompileOptions {
         EvalCompileOptions {
-            caller_scope: Some(Vec::new()),
+            caller_chain: Some(otter_bytecode::EvalCallerChain::default()),
             ..EvalCompileOptions::default()
         }
     }
@@ -969,9 +685,10 @@ mod tests {
             Ok(eval_module(source))
         })));
 
+        // Register 1 holds the caller's (absent) context.
         let caller_function = Function {
             id: 777,
-            locals: 1,
+            locals: 2,
             ..Function::default()
         };
         let mut caller = interp
@@ -988,7 +705,7 @@ mod tests {
             let ok = source_value(interp, "ok");
             assert_eq!(
                 interp
-                    .run_direct_eval(&ok, direct_options(), &[], false, stack)
+                    .run_direct_eval(&ok, direct_options(), 1, false, stack)
                     .expect("direct eval succeeds"),
                 Value::number_i32(42)
             );
@@ -996,7 +713,7 @@ mod tests {
 
             let thrown_source = source_value(interp, "throw");
             let thrown = interp
-                .run_direct_eval(&thrown_source, direct_options(), &[], false, stack)
+                .run_direct_eval(&thrown_source, direct_options(), 1, false, stack)
                 .expect_err("eval throw escapes its activation floor");
             assert!(matches!(thrown, VmError::Uncaught));
             assert_eq!(
@@ -1007,7 +724,7 @@ mod tests {
 
             let invalid = source_value(interp, "invalid");
             let error = interp
-                .run_direct_eval(&invalid, direct_options(), &[], false, stack)
+                .run_direct_eval(&invalid, direct_options(), 1, false, stack)
                 .expect_err("invalid bytecode leaves cleanup to the eval boundary");
             assert!(matches!(error, VmError::InvalidOperand));
             assert_caller_only(interp, stack);
@@ -1024,6 +741,6 @@ mod tests {
         assert_eq!(caller.function_id, 777);
         assert_eq!(caller.pc, 19);
         assert_eq!(caller.registers[0], Value::number_i32(7));
-        assert_eq!(interp.register_stack.checkpoint(), 1);
+        assert_eq!(interp.register_stack.checkpoint(), 2);
     }
 }

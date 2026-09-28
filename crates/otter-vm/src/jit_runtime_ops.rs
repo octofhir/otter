@@ -179,16 +179,6 @@ impl Interpreter {
         })
     }
 
-    /// Store a captured binding after enforcing its TDZ check.
-    pub fn jit_runtime_store_upvalue_checked(
-        &mut self,
-        frame: &mut ActiveFrameMut<'_>,
-        src: u16,
-        idx: i32,
-    ) -> Result<(), VmError> {
-        self.frame_store_upvalue_checked(frame, src, idx)
-    }
-
     /// Define one object-literal data property from decoded registers.
     pub fn jit_runtime_define_data_property(
         &mut self,
@@ -202,13 +192,36 @@ impl Interpreter {
         self.run_define_data_property_active(stack, context, frame, object, key, value)
     }
 
-    /// Replace one loop-captured upvalue cell with a fresh TDZ cell.
-    pub fn jit_runtime_fresh_upvalue(
+    /// `CreateContext dst, parent, scope` over the published activation.
+    ///
+    /// # Errors
+    /// Propagates allocation failure and `InvalidOperand` for an operand the
+    /// verifier would reject.
+    pub fn jit_runtime_create_context(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        parent: u16,
+        scope_index: u32,
+    ) -> Result<(), VmError> {
+        let resolved = context
+            .for_function(frame.function_id())
+            .map_err(|_| VmError::InvalidOperand)?;
+        self.frame_create_context(&resolved, frame, dst, parent, scope_index)
+    }
+
+    /// `CopyContext dst, src` over the published activation.
+    ///
+    /// # Errors
+    /// Propagates allocation failure and `InvalidOperand`.
+    pub fn jit_runtime_copy_context(
         &mut self,
         frame: &mut ActiveFrameMut<'_>,
-        idx: i32,
+        dst: u16,
+        src: u16,
     ) -> Result<(), VmError> {
-        self.frame_fresh_upvalue(frame, idx)
+        self.frame_copy_context(frame, dst, src)
     }
 
     /// Load one realm builtin error constructor from a decoded constant index.
@@ -260,9 +273,9 @@ impl Interpreter {
 
     /// Allocate a closure directly from the published native frame.
     ///
-    /// The canonical native SELF/`this`/upvalue windows and traced eval-env
-    /// slot contain the complete source state; no interpreter [`Frame`]
-    /// adapter is required.
+    /// The closure closes over the context in `context_reg`; the canonical
+    /// native `this` / `new.target` supply an arrow's lexical copies. No
+    /// interpreter [`Frame`] adapter is required.
     pub fn jit_runtime_make_closure(
         &mut self,
         context: &ExecutionContext,
@@ -270,7 +283,7 @@ impl Interpreter {
         function_id: u32,
         dst: u16,
         function_index: u32,
-        parent_indices: &[u32],
+        context_reg: u16,
     ) -> Result<(), VmError> {
         if frame.function_id() != function_id {
             return Err(VmError::InvalidOperand);
@@ -289,9 +302,8 @@ impl Interpreter {
             frame,
             dst,
             function_index,
-            parent_indices,
+            context_reg,
             lexical_new_target,
-            None,
         );
         frame.set_pc(saved_pc);
         result

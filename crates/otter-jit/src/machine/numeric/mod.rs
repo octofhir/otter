@@ -33,10 +33,16 @@
 //! - Constructor field programs are owned by the source HIR node and selected
 //!   against its innermost frame, independently of the caller snapshot.
 //! - Machine locations, edits, and frame size come only from regalloc2 output.
-//! - Reducible loop headers outside active exception regions publish one
-//!   representation-checked OSR trampoline that fills only live block
-//!   parameters and never mutates the VM window. A protected header remains in
-//!   the Machine body but cannot be entered without its materialized handler
+//! - A compile for loop OSR names one header (V8 compiles per OSR offset,
+//!   SpiderMonkey per `osrPc`). That header, when reducible and outside active
+//!   exception regions, gets an OSR block: an extra predecessor of the header
+//!   reached from the entry dispatch, that defines every header parameter from
+//!   the interpreter frame with a representation check (SpiderMonkey's OSR
+//!   entry block, V8's OSR values). The allocator places every value, and a
+//!   rejected value leaves before any effect without mutating the VM window.
+//!   An entry compile has no dispatch and no OSR block, so neither its calls
+//!   nor its allocation pay for loop entry. A protected header remains in the
+//!   Machine body but cannot be entered without its materialized handler
 //!   stack.
 //! - Empty arithmetic feedback keeps tagged inputs and selects guarded Number
 //!   operations; it never becomes an unconditional exit. Heterogeneous phi
@@ -59,12 +65,21 @@
 //!   from their non-reentrant generated commit. A proven non-cell value omits
 //!   the value barrier; the transition-shape barrier retains its leaf clobbers.
 //! - Every schema-owned binding read, write, and delete expands before
-//!   allocation into explicit guard/hit/cold/status/join control. Stable
-//!   captured cells and prepared global lexical/object slots read or write on
-//!   the generated sibling; writes perform the generated barrier. A missing
-//!   layout proof, TDZ, const violation, accessor/Proxy path, or unresolved name
-//!   enters one rooted committed cold call and never deoptimizes or replays.
-//!   Dynamic and eval-shadowed bindings deliberately keep only that cold path.
+//!   allocation into explicit guard/hit/cold/status/join control. Prepared
+//!   global lexical/object slots and committed checked context slots read or
+//!   write on the generated sibling; writes perform the generated barrier. A
+//!   missing layout proof, TDZ, const violation, accessor/Proxy path, or
+//!   unresolved name enters one rooted committed cold call and never
+//!   deoptimizes or replays. Lookup and eval-extension bindings deliberately
+//!   keep only that cold path, with the context register as a boxed input.
+//! - Context reads select one `ContextLoad` per word (SELF's closure context,
+//!   each parent hop, the slot) over the tagged owning value; immutable words
+//!   are pure and commoned or hoisted, slot reads carry the `ContextSlot`
+//!   alias class. A slot store is followed by its `ContextWriteBarrier`
+//!   unless the stored value is a boxed scalar or a non-cell constant. A
+//!   speculated TDZ check is a `TaggedIsNotHole` proof and one exact
+//!   `GuardCondition`. Context allocation is a non-reentrant `AllocValue3`
+//!   call at a rooted safepoint whose refusal exits before any effect.
 //! - Eagerly prepared string literals lower to one symbolic stable-cell
 //!   relocation and tagged load. No moving string handle, safepoint, deopt
 //!   state, or runtime-fill boundary survives selection.
@@ -134,7 +149,7 @@ use otter_vm::{
         ExitAction, ExitReason, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
         STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
         STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT, STUB_JIT_INITIALIZE_UPVALUES,
+        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
         STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
         STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
     },
@@ -144,10 +159,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use self::hir::NumericElementAccess;
 use self::hir::{
-    NumericBindingTarget, NumericColdCallKind, NumericDirectCallArguments, NumericDirectCallKind,
-    NumericDirectCallTarget, NumericFramePoint, NumericFrameStatePurpose, NumericFunction,
-    NumericLoopEntryPlan, NumericNativeCallTarget, NumericNode, NumericTerminator, NumericType,
-    NumericValue,
+    NumericBindingTarget, NumericColdCallKind, NumericContextAllocation,
+    NumericDirectCallArguments, NumericDirectCallKind, NumericDirectCallTarget, NumericFramePoint,
+    NumericFrameStatePurpose, NumericFunction, NumericLoopEntryPlan, NumericNativeCallTarget,
+    NumericNode, NumericTerminator, NumericType, NumericValue,
 };
 use self::semantics::CommittedValueOperation;
 #[cfg(test)]
@@ -157,9 +172,9 @@ use super::{
     DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBindingTarget, MachineBlock, MachineBlockData, MachineCallGuard,
     MachineExit, MachineInstruction, MachineInstructionId, MachineOpcode, MachineOperand,
-    MachineOsrInput, MachineOsrType, MachineRepresentation, MachineValue, PhysicalRegister,
-    SafepointId, SafepointKind, TargetCapability, TargetClobberSet, TargetSpec,
-    binding_guard_clobbers, binding_hit_clobbers, binding_write_barrier_clobbers,
+    MachineOsrType, MachineRepresentation, MachineValue, PhysicalRegister, SafepointId,
+    SafepointKind, TargetCapability, TargetClobberSet, TargetSpec, binding_guard_clobbers,
+    binding_hit_clobbers, binding_write_barrier_clobbers, context_access_clobbers,
     lower_deopt_table, lower_safepoints,
 };
 use crate::{
@@ -331,6 +346,7 @@ pub(crate) fn try_compile(
     transitions: &TransitionTable,
     capture_events: bool,
     artifact_request: Option<ArtifactRequest>,
+    osr_pc: Option<u32>,
 ) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
     let mut hir = NumericFunction::build(view).map_err(|decline| match decline {
         hir::HirDecline::Structural(constraint) => Unsupported::OperandShape(constraint),
@@ -342,12 +358,13 @@ pub(crate) fn try_compile(
     let partial_escape = partial_escape::optimize(&mut hir);
     truncation::optimize(&mut hir);
     let loop_entries = hir.plan_loop_entries();
-    let sequence = select_with_loop_entries(target_spec, &hir, &loop_entries).map_err(|error| {
-        Unsupported::MachineVerification {
-            stage: "scalar HIR to Machine IR selection",
-            error: format!("{error:?}"),
-        }
-    })?;
+    let sequence =
+        select_with_loop_entries(target_spec, &hir, &loop_entries, osr_pc).map_err(|error| {
+            Unsupported::MachineVerification {
+                stage: "scalar HIR to Machine IR selection",
+                error: format!("{error:?}"),
+            }
+        })?;
     let (sequence, optimization_stats) =
         sequence
             .optimize(target_spec)
@@ -488,7 +505,6 @@ pub(crate) fn try_compile(
         transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
         transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
         transitions.entry(STUB_JIT_COPY_SPREAD_ARGUMENTS),
-        transitions.entry(STUB_JIT_INITIALIZE_UPVALUES),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -520,7 +536,7 @@ pub(crate) fn try_compile(
         code: emitted_code,
         generated_stack_frame_bytes,
         relocations,
-        osr_entries,
+        osr_headers,
         osr_regions,
         structural_regions,
     } = emission;
@@ -579,7 +595,7 @@ pub(crate) fn try_compile(
         Some(generated_stack_frame_bytes),
         deopt_runtime,
         safepoints,
-        osr_entries,
+        osr_headers,
         Box::default(),
         load_ic_cells,
         store_ic_cells,
@@ -616,6 +632,7 @@ fn select_with_loop_entries(
     target_spec: &TargetSpec,
     hir: &NumericFunction,
     loop_entries: &NumericLoopEntryPlan,
+    osr_pc: Option<u32>,
 ) -> Result<InstructionSequence, super::VerificationError> {
     let mut representations = hir
         .nodes
@@ -647,7 +664,7 @@ fn select_with_loop_entries(
         });
     }
 
-    let selection_cfg = SelectionCfg::build(hir, loop_entries);
+    let selection_cfg = SelectionCfg::build(hir, loop_entries, osr_pc);
     let mut binding_values = BTreeMap::new();
     for (&block, selected) in &selection_cfg.bindings {
         let (node, target, _) = binding_site(hir, block)
@@ -719,6 +736,83 @@ fn select_with_loop_entries(
         let first = MachineInstructionId(instructions.len() as u32);
         let block_index = match *selected {
             SelectedBlock::Original(block_index) => block_index,
+            SelectedBlock::OsrDispatch => {
+                let mut dispatch = MachineInstruction::plain(
+                    MachineOpcode::OsrDispatch {
+                        logical_pcs: selection_cfg
+                            .osr_blocks
+                            .iter()
+                            .map(|&(header, _)| hir.blocks[header].logical_pc)
+                            .collect(),
+                    },
+                    Vec::new(),
+                );
+                dispatch.control = ControlFlow::Branch;
+                instructions.push(dispatch);
+                let successors = std::iter::once(selection_cfg.ordinary_entry())
+                    .chain(selection_cfg.osr_blocks.iter().map(|&(_, block)| block))
+                    .collect::<Vec<_>>();
+                blocks.push(MachineBlockData {
+                    first,
+                    end: MachineInstructionId(instructions.len() as u32),
+                    predecessors: Vec::new(),
+                    successor_arguments: vec![Vec::new(); successors.len()],
+                    successors,
+                    parameters: Vec::new(),
+                });
+                continue;
+            }
+            SelectedBlock::OsrBlock(header) => {
+                let header_block = &hir.blocks[header];
+                debug_assert_eq!(
+                    header_block.parameters.len(),
+                    header_block.parameter_registers.len()
+                );
+                let mut arguments = Vec::with_capacity(header_block.parameters.len());
+                for (&parameter, &frame_register) in header_block
+                    .parameters
+                    .iter()
+                    .zip(&header_block.parameter_registers)
+                {
+                    let (value_type, representation) = match hir.nodes[parameter.0].value_type() {
+                        NumericType::Tagged => {
+                            (MachineOsrType::Tagged, MachineRepresentation::Tagged)
+                        }
+                        NumericType::Int32 => (MachineOsrType::Int32, MachineRepresentation::Int32),
+                        NumericType::Uint32 => {
+                            (MachineOsrType::Uint32, MachineRepresentation::Uint32)
+                        }
+                        NumericType::Number => {
+                            (MachineOsrType::Float64, MachineRepresentation::Float64)
+                        }
+                        NumericType::Boolean => {
+                            (MachineOsrType::Boolean, MachineRepresentation::Boolean)
+                        }
+                    };
+                    let value = push_value(&mut representations, representation);
+                    instructions.push(MachineInstruction::plain(
+                        MachineOpcode::OsrValue {
+                            logical_pc: header_block.logical_pc,
+                            frame_register,
+                            value_type,
+                        },
+                        vec![MachineOperand::register_output(value)],
+                    ));
+                    arguments.push(value);
+                }
+                let mut jump = MachineInstruction::plain(MachineOpcode::Jump, Vec::new());
+                jump.control = ControlFlow::Branch;
+                instructions.push(jump);
+                blocks.push(MachineBlockData {
+                    first,
+                    end: MachineInstructionId(instructions.len() as u32),
+                    predecessors: vec![selection_cfg.osr_dispatch.expect("OSR dispatch")],
+                    successors: vec![selection_cfg.originals[header]],
+                    parameters: Vec::new(),
+                    successor_arguments: vec![arguments],
+                });
+                continue;
+            }
             SelectedBlock::EntryPrologue => {
                 for (parameter, &tagged) in tagged_parameters.iter().enumerate() {
                     let Some(tagged) = tagged else {
@@ -1038,42 +1132,6 @@ fn select_with_loop_entries(
                 ));
             }
         }
-        if block.osr_entry_allowed
-            && block
-                .predecessors
-                .iter()
-                .any(|&predecessor| predecessor >= block_index)
-        {
-            debug_assert_eq!(block.parameters.len(), block.parameter_registers.len());
-            let inputs = block
-                .parameters
-                .iter()
-                .zip(&block.parameter_registers)
-                .map(|(&parameter, &frame_register)| MachineOsrInput {
-                    frame_register,
-                    value_type: match hir.nodes[parameter.0].value_type() {
-                        NumericType::Tagged => MachineOsrType::Tagged,
-                        NumericType::Int32 => MachineOsrType::Int32,
-                        NumericType::Uint32 => MachineOsrType::Uint32,
-                        NumericType::Number => MachineOsrType::Float64,
-                        NumericType::Boolean => MachineOsrType::Boolean,
-                    },
-                })
-                .collect();
-            instructions.push(MachineInstruction::plain(
-                MachineOpcode::OsrEntry {
-                    logical_pc: block.logical_pc,
-                    inputs,
-                },
-                block
-                    .parameters
-                    .iter()
-                    .map(|&parameter| {
-                        MachineOperand::location_input(machine_value(&values, parameter))
-                    })
-                    .collect(),
-            ));
-        }
         let mut selected_binding_guard = false;
         for &node_value in &block.nodes {
             let result = values[node_value.0];
@@ -1082,7 +1140,6 @@ fn select_with_loop_entries(
                 source,
                 function_id,
                 this_mode,
-                rejects_eval_env,
             } = node
             {
                 let guarded = push_value(&mut representations, MachineRepresentation::Tagged);
@@ -1091,7 +1148,6 @@ fn select_with_loop_entries(
                         guard: MachineCallGuard::Plain {
                             function_id,
                             this_mode,
-                            rejects_eval_env,
                         },
                     },
                     vec![
@@ -1171,6 +1227,80 @@ fn select_with_loop_entries(
                 )?;
                 continue;
             }
+            if let NumericNode::ContextHoleGuard { value, .. } = node {
+                let condition = push_value(&mut representations, MachineRepresentation::Boolean);
+                let mut test = MachineInstruction::plain(
+                    MachineOpcode::TaggedIsNotHole,
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, value)),
+                        MachineOperand::register_output(condition),
+                    ],
+                );
+                test.clobbers = context_access_clobbers(target_spec);
+                instructions.push(test);
+                let point = NumericFramePoint::Node(node_value);
+                let mut exit = MachineInstruction::plain(
+                    MachineOpcode::GuardCondition,
+                    vec![MachineOperand::register_input(condition)],
+                );
+                exit.clobbers = target_spec
+                    .clobbers(TargetClobberSet::StatusScratch)
+                    .to_vec();
+                attach_frame_state(
+                    hir,
+                    &values,
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &mut exit,
+                );
+                instructions.push(exit);
+                continue;
+            }
+            if let NumericNode::ContextSlotStore {
+                context,
+                slot,
+                value,
+            } = node
+            {
+                // A boxed scalar or a non-cell constant never needs the
+                // barrier; every possible cell does, whatever the context's
+                // generation (tenured contexts exist).
+                let non_cell = hir.nodes[value.0].value_type() != NumericType::Tagged
+                    || matches!(
+                        hir.nodes[value.0],
+                        NumericNode::TaggedConstant(bits)
+                            if !otter_vm::value::tag::is_cell_bits(bits)
+                    );
+                let context = machine_value(&values, context);
+                let value = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    value,
+                );
+                let mut store = MachineInstruction::plain(
+                    MachineOpcode::ContextStore { slot },
+                    vec![
+                        MachineOperand::register_input(context),
+                        MachineOperand::register_input(value),
+                    ],
+                );
+                store.clobbers = context_access_clobbers(target_spec);
+                instructions.push(store);
+                if !non_cell {
+                    let mut barrier = MachineInstruction::plain(
+                        MachineOpcode::ContextWriteBarrier,
+                        vec![
+                            MachineOperand::location_input(context),
+                            MachineOperand::location_input(value),
+                        ],
+                    );
+                    barrier.clobbers = binding_write_barrier_clobbers(target_spec);
+                    instructions.push(barrier);
+                }
+                continue;
+            }
             if let NumericNode::ElementUnseenExit { .. } = node {
                 let never = push_value(&mut representations, MachineRepresentation::Boolean);
                 instructions.push(MachineInstruction::plain(
@@ -1207,24 +1337,15 @@ fn select_with_loop_entries(
                 byte_pc,
             } = node
             {
-                let closure = match target {
-                    NumericBindingTarget::ClosureUpvalue { closure, .. } => Some(closure),
-                    _ => None,
-                };
                 let target = machine_binding_target(target);
                 let condition = push_value(&mut representations, MachineRepresentation::Boolean);
                 let owner = push_value(&mut representations, MachineRepresentation::Int64);
                 let storage = push_value(&mut representations, MachineRepresentation::Int64);
-                let mut guard_operands = vec![
+                let guard_operands = vec![
                     MachineOperand::register_output(condition),
                     MachineOperand::register_output(owner),
                     MachineOperand::register_output(storage),
                 ];
-                if let Some(closure) = closure {
-                    guard_operands.push(MachineOperand::location_input(machine_value(
-                        &values, closure,
-                    )));
-                }
                 let mut guard = MachineInstruction::plain(
                     MachineOpcode::BindingGuard {
                         byte_pc,
@@ -1802,11 +1923,7 @@ fn select_with_loop_entries(
                         vec![MachineOperand::register_input(tagged), output],
                     )
                 }
-                NumericNode::InlineMethodGuard {
-                    source,
-                    target,
-                    rejects_eval_env,
-                } => {
+                NumericNode::InlineMethodGuard { source, target } => {
                     let invalid = || {
                         super::VerificationError::OpcodeSignatureMismatch(MachineInstructionId(
                             instructions.len() as u32,
@@ -1829,7 +1946,6 @@ fn select_with_loop_entries(
                         MachineOpcode::GuardCallTarget {
                             guard: MachineCallGuard::Method {
                                 guard: Box::new(program.clone()),
-                                rejects_eval_env,
                             },
                         },
                         vec![
@@ -1848,14 +1964,10 @@ fn select_with_loop_entries(
                 NumericNode::InlineConstructGuard {
                     source,
                     function_id,
-                    rejects_eval_env,
                 } => {
                     let mut guard = MachineInstruction::plain(
                         MachineOpcode::GuardCallTarget {
-                            guard: MachineCallGuard::Construct {
-                                function_id,
-                                rejects_eval_env,
-                            },
+                            guard: MachineCallGuard::Construct { function_id },
                         },
                         vec![
                             MachineOperand::register_input(machine_value(&values, source)),
@@ -1983,6 +2095,101 @@ fn select_with_loop_entries(
                     MachineOpcode::EntryThis,
                     vec![MachineOperand::register_output(result)],
                 ),
+                NumericNode::Callee => {
+                    let mut callee = MachineInstruction::plain(
+                        MachineOpcode::EntryCallee,
+                        vec![MachineOperand::register_output(result)],
+                    );
+                    callee.clobbers = context_access_clobbers(target_spec);
+                    callee
+                }
+                NumericNode::ClosureContext(source)
+                | NumericNode::ContextParent(source)
+                | NumericNode::ContextSlotLoad {
+                    context: source, ..
+                } => {
+                    let field = match node {
+                        NumericNode::ClosureContext(_) => super::ContextField::ClosureContext,
+                        NumericNode::ContextParent(_) => super::ContextField::Parent,
+                        NumericNode::ContextSlotLoad { slot, .. } => {
+                            super::ContextField::Slot(slot)
+                        }
+                        _ => unreachable!("matched context word read"),
+                    };
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::ContextLoad { field },
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, source)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    load.clobbers = context_access_clobbers(target_spec);
+                    load
+                }
+                NumericNode::ContextHoleGuard { .. } | NumericNode::ContextSlotStore { .. } => {
+                    unreachable!("context guards and stores select before ordinary nodes")
+                }
+                NumericNode::ContextAllocation { kind, input, .. } => {
+                    let input = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        input,
+                    );
+                    // `CreateContext` names its scope as int32 words; a copy
+                    // pads the fixed three-word ABI with `undefined`.
+                    let words = match kind {
+                        NumericContextAllocation::Create { function_id, scope } => {
+                            let (Ok(function_id), Ok(scope)) =
+                                (i32::try_from(function_id), i32::try_from(scope))
+                            else {
+                                return Err(super::VerificationError::InvalidValue(result));
+                            };
+                            [
+                                otter_vm::Value::number_i32(function_id),
+                                otter_vm::Value::number_i32(scope),
+                            ]
+                        }
+                        NumericContextAllocation::Copy => {
+                            [otter_vm::Value::undefined(), otter_vm::Value::undefined()]
+                        }
+                    };
+                    let mut operands = vec![MachineOperand::fixed_register_input(
+                        input,
+                        target_spec.integer_argument(2).expect("target argument 2"),
+                    )];
+                    for (index, word) in words.into_iter().enumerate() {
+                        let argument = target_spec
+                            .integer_argument(3 + index)
+                            .expect("target context allocation argument");
+                        let constant =
+                            push_value(&mut representations, MachineRepresentation::Tagged);
+                        instructions.push(MachineInstruction::plain(
+                            MachineOpcode::TaggedConstant(word.to_bits()),
+                            vec![MachineOperand::fixed_register_output(constant, argument)],
+                        ));
+                        operands.push(MachineOperand::fixed_register_input(constant, argument));
+                    }
+                    operands.push(MachineOperand::fixed_register_output(
+                        result,
+                        target_spec.integer_result(),
+                    ));
+                    let descriptor_index = intern_call_descriptor(
+                        &mut call_descriptors,
+                        context_allocation_call_descriptor(target_spec, kind),
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        operands,
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call.safepoint = Some(super::SafepointId(next_safepoint));
+                    next_safepoint = next_safepoint
+                        .checked_add(1)
+                        .expect("bounded scalar function safepoint count");
+                    call
+                }
                 NumericNode::ClassSuperConstructor(source) => {
                     let source = tagged_call_argument(
                         hir,
@@ -3002,6 +3209,17 @@ fn select_with_loop_entries(
         ));
     }
 
+    // The dispatch enters the ordinary entry, and each OSR block enters its
+    // loop header, alongside the header's HIR predecessors.
+    if let Some(dispatch) = selection_cfg.osr_dispatch {
+        let ordinary = selection_cfg.ordinary_entry().0 as usize;
+        blocks[ordinary].predecessors.insert(0, dispatch);
+    }
+    for &(header, osr_block) in &selection_cfg.osr_blocks {
+        let predecessors = &mut blocks[selection_cfg.originals[header].0 as usize].predecessors;
+        predecessors.push(osr_block);
+        predecessors.sort_unstable();
+    }
     super::committed_probe::expand(
         target_spec,
         &mut representations,
@@ -3018,7 +3236,7 @@ fn select_with_loop_entries(
     );
     InstructionSequence::new_selected(
         target_spec,
-        selection_cfg.prologue.unwrap_or(selection_cfg.originals[0]),
+        selection_cfg.entry(),
         representations,
         call_descriptors,
         machine_frame_states(hir),
@@ -3030,11 +3248,10 @@ fn select_with_loop_entries(
 fn machine_binding_target(target: NumericBindingTarget) -> MachineBindingTarget {
     match target {
         NumericBindingTarget::GlobalThis => MachineBindingTarget::GlobalThis,
-        NumericBindingTarget::Upvalue { index } => MachineBindingTarget::Upvalue { index },
-        NumericBindingTarget::ClosureUpvalue { index, .. } => {
-            MachineBindingTarget::ClosureUpvalue { index }
-        }
         NumericBindingTarget::Global(proof) => MachineBindingTarget::Global(proof),
+        NumericBindingTarget::ContextSlot { depth, slot } => {
+            MachineBindingTarget::ContextSlot { depth, slot }
+        }
     }
 }
 
@@ -3351,7 +3568,20 @@ fn select_binding_join_block(
 
 #[cfg(test)]
 fn select(hir: &NumericFunction) -> Result<InstructionSequence, super::VerificationError> {
-    select_with_loop_entries(&TargetSpec::aarch64(), hir, &hir.plan_loop_entries())
+    select_with_loop_entries(&TargetSpec::aarch64(), hir, &hir.plan_loop_entries(), None)
+}
+
+#[cfg(test)]
+fn select_osr(
+    hir: &NumericFunction,
+    osr_pc: u32,
+) -> Result<InstructionSequence, super::VerificationError> {
+    select_with_loop_entries(
+        &TargetSpec::aarch64(),
+        hir,
+        &hir.plan_loop_entries(),
+        Some(osr_pc),
+    )
 }
 
 fn intern_leaf_boolean_call_descriptor(
@@ -4040,6 +4270,31 @@ fn array_construct_call_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
     }
 }
 
+/// Non-reentrant context allocation through the VM's `AllocValue3` entry.
+/// Only the fresh context is written; the safepoint alone ends every memory
+/// proof, as for any collection.
+fn context_allocation_call_descriptor(
+    target_spec: &TargetSpec,
+    kind: NumericContextAllocation,
+) -> CallDescriptor {
+    let mut clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
+    clobbers.retain(|register| *register != target_spec.integer_result());
+    CallDescriptor {
+        target: CallTarget::RuntimeStub(match kind {
+            NumericContextAllocation::Create { .. } => {
+                otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC
+            }
+            NumericContextAllocation::Copy => otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC,
+        }),
+        arguments: vec![MachineRepresentation::Tagged; 3],
+        results: vec![MachineRepresentation::Tagged],
+        effects: CallEffects::READS_HEAP,
+        clobbers,
+        exceptional: ExceptionalEdge::None,
+        safepoint: SafepointKind::Gc,
+    }
+}
+
 fn caught_throw_acknowledgement_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
     CallDescriptor {
         target: CallTarget::RuntimeStub(STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW),
@@ -4313,20 +4568,22 @@ fn frame_state_exits(
             }
             // A generated call deopts only for a failed callee identity
             // proof; recursion, stack, or target-publication limits resume
-            // the call canonically.
-            NumericNode::DirectCall { .. } => &[
+            // the call canonically. A native call's committed miss is the
+            // same generated method linkage.
+            NumericNode::DirectCall { .. } | NumericNode::NativeCall { .. } => &[
                 (ExitReason::IdentityGuard, ExitAction::Recompile),
                 (ExitReason::RuntimeTransition, ExitAction::Resume),
             ],
             NumericNode::InlineConstructGuard { .. }
             | NumericNode::InlineCallGuard { .. }
             | NumericNode::InlineMethodGuard { .. }
-            | NumericNode::NativeCall { .. }
             | NumericNode::ColdCallExit { .. }
             | NumericNode::NativeLeaf { .. } => {
                 &[(ExitReason::IdentityGuard, ExitAction::Recompile)]
             }
-            NumericNode::ConstructReceiver { .. } | NumericNode::ArrayConstruct { .. } => {
+            NumericNode::ConstructReceiver { .. }
+            | NumericNode::ArrayConstruct { .. }
+            | NumericNode::ContextAllocation { .. } => {
                 &[(ExitReason::AllocationMiss, ExitAction::Resume)]
             }
             NumericNode::ConstructorFieldStore { .. } | NumericNode::PropertyShapeLoad { .. } => {
@@ -4334,7 +4591,8 @@ fn frame_state_exits(
             }
             NumericNode::ElementGuardedLoad { .. }
             | NumericNode::ElementGuardedStore { .. }
-            | NumericNode::BindingGuardedRead { .. } => {
+            | NumericNode::BindingGuardedRead { .. }
+            | NumericNode::ContextHoleGuard { .. } => {
                 &[(ExitReason::TypeMismatch, ExitAction::Recompile)]
             }
             NumericNode::ElementUnseenExit { .. } => {
@@ -4412,6 +4670,12 @@ fn machine_frame_states(hir: &NumericFunction) -> Vec<super::MachineFrameState> 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedBlock {
+    /// The entry of a function with OSR-capable loop headers: it dispatches
+    /// to the ordinary entry or to one header's OSR block.
+    OsrDispatch,
+    /// The OSR block of HIR loop header `.0`: it defines every header
+    /// parameter from the interpreter frame and enters the header with them.
+    OsrBlock(usize),
     /// The function entry when HIR block 0 is also a loop header: it reads
     /// the frame's entry values once and enters the header with them.
     EntryPrologue,
@@ -4456,6 +4720,9 @@ struct BindingSelectedBlocks {
 
 struct SelectionCfg {
     order: Vec<SelectedBlock>,
+    osr_dispatch: Option<MachineBlock>,
+    /// `(HIR loop header, its OSR block)` in header order.
+    osr_blocks: Vec<(usize, MachineBlock)>,
     prologue: Option<MachineBlock>,
     originals: Vec<MachineBlock>,
     split_edges: BTreeMap<(usize, usize), MachineBlock>,
@@ -4466,7 +4733,11 @@ struct SelectionCfg {
 }
 
 impl SelectionCfg {
-    fn build(hir: &NumericFunction, loop_entries: &NumericLoopEntryPlan) -> Self {
+    fn build(
+        hir: &NumericFunction,
+        loop_entries: &NumericLoopEntryPlan,
+        osr_pc: Option<u32>,
+    ) -> Self {
         let mut order = Vec::with_capacity(hir.blocks.len());
         let mut originals = vec![MachineBlock(u32::MAX); hir.blocks.len()];
         let mut split_edges = BTreeMap::new();
@@ -4474,9 +4745,28 @@ impl SelectionCfg {
         let mut properties = BTreeMap::new();
         let mut elements = BTreeMap::new();
         let mut native_calls = BTreeMap::new();
-        let prologue = (!hir.entry_arguments.is_empty()).then(|| {
-            order.push(SelectedBlock::EntryPrologue);
+        let osr_headers = hir
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, block)| {
+                Some(block.logical_pc) == osr_pc
+                    && block.osr_entry_allowed
+                    && block
+                        .predecessors
+                        .iter()
+                        .any(|&predecessor| predecessor >= *index)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let osr_dispatch = (!osr_headers.is_empty()).then(|| {
+            order.push(SelectedBlock::OsrDispatch);
             MachineBlock(0)
+        });
+        let prologue = (!hir.entry_arguments.is_empty()).then(|| {
+            let block = MachineBlock(order.len() as u32);
+            order.push(SelectedBlock::EntryPrologue);
+            block
         });
         for (successor, original) in originals.iter_mut().enumerate() {
             for (predecessor, edge) in incoming_edges(hir, successor) {
@@ -4600,8 +4890,18 @@ impl SelectionCfg {
                 },
             );
         }
+        let osr_blocks = osr_headers
+            .into_iter()
+            .map(|header| {
+                let block = MachineBlock(order.len() as u32);
+                order.push(SelectedBlock::OsrBlock(header));
+                (header, block)
+            })
+            .collect();
         Self {
             order,
+            osr_dispatch,
+            osr_blocks,
             prologue,
             originals,
             split_edges,
@@ -4610,6 +4910,18 @@ impl SelectionCfg {
             elements,
             native_calls,
         }
+    }
+
+    /// The machine sequence's entry block.
+    fn entry(&self) -> MachineBlock {
+        self.osr_dispatch
+            .or(self.prologue)
+            .unwrap_or(self.originals[0])
+    }
+
+    /// The block the ordinary function entry reaches first.
+    fn ordinary_entry(&self) -> MachineBlock {
+        self.prologue.unwrap_or(self.originals[0])
     }
 
     /// Machine block that HIR edge `edge` of `block` enters: its split-edge
@@ -4947,7 +5259,7 @@ mod tests {
             operand_values: vec![],
         };
         let sequence =
-            select_with_loop_entries(&TargetSpec::aarch64(), &hir, &hir.plan_loop_entries())
+            select_with_loop_entries(&TargetSpec::aarch64(), &hir, &hir.plan_loop_entries(), None)
                 .unwrap();
         let allocation = sequence.allocate(&TargetSpec::aarch64()).unwrap();
         let layout = crate::machine::MachineFrameLayout::new(&allocation, 0, 16, 16).unwrap();
@@ -4997,8 +5309,8 @@ mod tests {
     use super::*;
     use crate::entry::{JitCtx, JitEntry};
     use crate::machine::{
-        AllocatedLocation, OperandConstraint, OperandPurpose, OperandTiming, SafepointId,
-        VerificationError, lower_deopt_table,
+        AllocatedLocation, OperandConstraint, OperandPurpose, SafepointId, VerificationError,
+        lower_deopt_table,
     };
 
     const POLL_BATCH: i32 = crate::GENERATED_POLL_BATCH as i32;
@@ -5173,8 +5485,6 @@ mod tests {
                 generated_stack_frame_bytes: Some(0),
                 param_count: 1,
                 register_count: 2,
-                own_upvalue_count: 0,
-                inherited_upvalue_count: 0,
                 needs_incoming_arguments: false,
             },
             receiver_allocation: None,
@@ -7436,20 +7746,38 @@ mod tests {
         artifact_request: Option<ArtifactRequest>,
     ) -> NativeCompileOutput<OptimizedCode> {
         let transitions = TransitionTable::resolve();
-        compile_output_with_transitions(view, &transitions, artifact_request)
+        compile_output_with_transitions(view, &transitions, artifact_request, None)
+    }
+
+    /// Compile `view` for loop OSR at the header whose logical PC is `osr_pc`.
+    fn compile_osr_output(
+        view: &JitCompileSnapshot,
+        osr_pc: u32,
+    ) -> NativeCompileOutput<OptimizedCode> {
+        let transitions = TransitionTable::resolve();
+        compile_output_with_transitions(view, &transitions, None, Some(osr_pc))
     }
 
     fn compile_output_with_transitions(
         view: &JitCompileSnapshot,
         transitions: &TransitionTable,
         artifact_request: Option<ArtifactRequest>,
+        osr_pc: Option<u32>,
     ) -> NativeCompileOutput<OptimizedCode> {
         #[cfg(target_arch = "aarch64")]
         let target = TargetSpec::aarch64();
         #[cfg(target_arch = "x86_64")]
         let target = TargetSpec::x86_64();
-        try_compile(&target, view, 7001, transitions, false, artifact_request)
-            .expect("numeric Machine IR code generation")
+        try_compile(
+            &target,
+            view,
+            7001,
+            transitions,
+            false,
+            artifact_request,
+            osr_pc,
+        )
+        .expect("numeric Machine IR code generation")
     }
 
     fn execute(
@@ -7487,7 +7815,7 @@ mod tests {
         let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let mut frame = vec![Value::undefined().to_bits(); code.metadata().register_count as usize];
         frame[..args.len()].copy_from_slice(args);
-        execute_at(code, entry, frame, initial_pc, interrupt, fuel)
+        execute_at(code, entry, frame, initial_pc, interrupt, fuel, false)
     }
 
     fn execute_osr_with_poll_cells(
@@ -7497,14 +7825,31 @@ mod tests {
         interrupt: *const u8,
         fuel: &mut u64,
     ) -> (NativeResultPair, Vec<u64>, u32) {
-        // SAFETY: the code object owns the recorded trampoline throughout the call.
-        let entry = unsafe {
-            code.osr_entry_ptr_for_test(logical_pc)
-                .expect("numeric OSR entry")
-        };
-        // SAFETY: the trampoline uses the same shared `JitEntry` ABI as main entry.
-        let entry: JitEntry = unsafe { std::mem::transmute(entry) };
-        execute_at(code, entry, frame, logical_pc, interrupt, fuel)
+        assert!(
+            code.has_osr_header_for_test(logical_pc),
+            "numeric OSR header {logical_pc}"
+        );
+        // An OSR entry enters the function's start; its dispatch reads the
+        // frame's OSR bit and PC.
+        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+        execute_at(code, entry, frame, logical_pc, interrupt, fuel, true)
+    }
+
+    /// `(frame register, representation)` of every OSR frame read that
+    /// enters the loop header at `logical_pc`, in block order.
+    fn osr_values(sequence: &InstructionSequence, logical_pc: u32) -> Vec<(u16, MachineOsrType)> {
+        sequence
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction.opcode {
+                MachineOpcode::OsrValue {
+                    logical_pc: pc,
+                    frame_register,
+                    value_type,
+                } if pc == logical_pc => Some((frame_register, value_type)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn execute_at(
@@ -7514,6 +7859,7 @@ mod tests {
         initial_pc: u32,
         interrupt: *const u8,
         fuel: &mut u64,
+        osr_entry: bool,
     ) -> (NativeResultPair, Vec<u64>, u32) {
         let register_count = code.metadata().register_count;
         let (result, frame, pc, _) = execute_at_with_register_count(
@@ -7525,6 +7871,7 @@ mod tests {
             Value::undefined(),
             interrupt,
             fuel,
+            osr_entry,
         );
         (result, frame, pc)
     }
@@ -7538,6 +7885,7 @@ mod tests {
         this_value: Value,
         interrupt: *const u8,
         fuel: &mut u64,
+        osr_entry: bool,
     ) -> (NativeResultPair, Vec<u64>, u32, u16) {
         let heap = otter_gc::GcHeap::new().expect("execution-test heap");
         execute_at_with_heap(
@@ -7550,6 +7898,7 @@ mod tests {
             std::ptr::from_ref(&heap),
             interrupt,
             fuel,
+            osr_entry,
         )
     }
 
@@ -7564,6 +7913,7 @@ mod tests {
         heap: *const otter_gc::GcHeap,
         interrupt: *const u8,
         fuel: &mut u64,
+        osr_entry: bool,
     ) -> (NativeResultPair, Vec<u64>, u32, u16) {
         assert_eq!(frame.len(), code.metadata().register_count as usize);
         let metadata = code.metadata();
@@ -7573,7 +7923,11 @@ mod tests {
                 pc: initial_pc,
                 register_count: initialized_register_count,
                 kind: NativeFrameKind::Optimizing,
-                flags: NativeFrameFlags::empty(),
+                flags: if osr_entry {
+                    NativeFrameFlags::from_bits(NativeFrameFlags::OSR_ENTRY)
+                } else {
+                    NativeFrameFlags::empty()
+                },
             },
             frame.as_mut_ptr() as u64,
             Value::undefined(),
@@ -7987,7 +8341,7 @@ mod tests {
                 )
             },
         );
-        let view = JitCompileSnapshot::without_feedback(
+        let mut view = JitCompileSnapshot::without_feedback(
             196,
             1,
             2,
@@ -7996,6 +8350,10 @@ mod tests {
                 terminator,
             ],
         );
+        // An earlier exit keeps a checked context access on its committed
+        // CFG instead of the speculated straight-line hole guard.
+        view.optimized_exit_reasons
+            .insert(0, BTreeSet::from([ExitReason::TypeMismatch]));
         NumericFunction::build(&view).unwrap_or_else(|_| {
             panic!("schema binding {:?} must build cold Machine HIR", schema.op)
         })
@@ -8045,15 +8403,9 @@ mod tests {
                 ),
                 JitTestInstruction::new(Op::LoadTrue, 1, 8, vec![Operand::Register(1)]),
                 JitTestInstruction::new(
-                    Op::StoreUpvalueChecked,
+                    Op::StoreGlobalBinding,
                     2,
                     16,
-                    vec![Operand::Register(0), Operand::Imm32(0)],
-                ),
-                JitTestInstruction::new(
-                    Op::StoreGlobalBinding,
-                    3,
-                    24,
                     vec![
                         Operand::Register(0),
                         Operand::ConstIndex(0),
@@ -8062,27 +8414,27 @@ mod tests {
                 ),
                 JitTestInstruction::new(
                     Op::StoreGlobalChecked,
-                    4,
-                    32,
+                    3,
+                    24,
                     vec![
                         Operand::Register(0),
                         Operand::ConstIndex(1),
                         Operand::Register(1),
                     ],
                 ),
-                JitTestInstruction::new(Op::ReturnUndefined, 5, 40, Vec::new()),
+                JitTestInstruction::new(Op::ReturnUndefined, 4, 32, Vec::new()),
             ],
         );
         view.cage_base = 0x1000;
         view.binding_hit_proofs.insert(
-            24,
+            16,
             BindingHitProof::GlobalLexical {
                 cell_offset: 0x120,
                 writable: true,
             },
         );
         view.binding_hit_proofs.insert(
-            32,
+            24,
             BindingHitProof::GlobalObject {
                 shape: 11,
                 dictionary: false,
@@ -8983,7 +9335,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(write_hits.len(), 3);
+        assert_eq!(write_hits.len(), 2);
         assert!(
             write_hits
                 .iter()
@@ -9057,14 +9409,28 @@ mod tests {
             covered += 1;
             let semantics = schema.binding.expect("filtered binding schema");
             let hir = schema_binding_hir(schema);
+            // A checked context slot keeps its generated sibling; every other
+            // family without a baked proof is cold-only.
+            let (hir_target, machine_target) = match semantics {
+                otter_bytecode::opcode_schema::BindingSemantics::Read(
+                    otter_bytecode::opcode_schema::BindingRead::ContextSlot { .. },
+                )
+                | otter_bytecode::opcode_schema::BindingSemantics::Write(
+                    otter_bytecode::opcode_schema::BindingWrite::ContextSlot { .. },
+                ) => (
+                    Some(NumericBindingTarget::ContextSlot { depth: 0, slot: 0 }),
+                    MachineBindingTarget::ContextSlot { depth: 0, slot: 0 },
+                ),
+                _ => (None, MachineBindingTarget::Cold),
+            };
             assert!(hir.nodes.iter().any(|node| matches!(
                 node,
                 NumericNode::Binding {
                     semantics: copied,
-                    target: None,
+                    target,
                     byte_pc: 24,
                     ..
-                } if *copied == semantics
+                } if *copied == semantics && *target == hir_target
             )));
 
             let sequence =
@@ -9077,19 +9443,28 @@ mod tests {
                         instruction.opcode,
                         MachineOpcode::BindingGuard {
                             semantics: copied,
-                            target: MachineBindingTarget::Cold,
+                            target,
                             byte_pc: 24,
-                        } if copied == semantics
+                        } if copied == semantics && target == machine_target
                     ))
                     .count(),
                 1,
                 "{:?}",
                 schema.op
             );
-            assert!(sequence.instructions().iter().all(|instruction| !matches!(
-                instruction.opcode,
-                MachineOpcode::BindingHit { .. }
-            )));
+            assert_eq!(
+                sequence
+                    .instructions()
+                    .iter()
+                    .filter(|instruction| matches!(
+                        instruction.opcode,
+                        MachineOpcode::BindingHit { .. }
+                    ))
+                    .count(),
+                usize::from(hir_target.is_some()),
+                "{:?}",
+                schema.op
+            );
             let calls = sequence
                 .instructions()
                 .iter()
@@ -9120,6 +9495,704 @@ mod tests {
                 .unwrap_or_else(|error| panic!("allocate {:?}: {error:?}", schema.op));
         }
         assert!(covered > 0, "opcode schema must expose the binding family");
+    }
+
+    fn context_coord(depth: u16, slot: u16) -> Operand {
+        Operand::Imm32(
+            otter_bytecode::ContextCoord::new(depth, slot)
+                .expect("addressable slot")
+                .to_imm32(),
+        )
+    }
+
+    /// Two captured reads through one chain, a slot store, and a reload.
+    fn context_chain_view() -> JitCompileSnapshot {
+        numeric_view(
+            1,
+            4,
+            vec![
+                (
+                    Op::LoadContextSlotChecked,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        context_coord(2, 3),
+                    ],
+                ),
+                (
+                    Op::LoadContextSlot,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        context_coord(2, 4),
+                    ],
+                ),
+                (
+                    Op::StoreContextSlot,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        context_coord(2, 3),
+                    ],
+                ),
+                (
+                    Op::LoadContextSlot,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        context_coord(2, 3),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        )
+    }
+
+    /// A context body at the VM layout offsets, addressed like a heap value:
+    /// the word is the header address.
+    struct FakeContext(Box<[u64]>);
+
+    impl FakeContext {
+        fn new(parent: u64, slots: &[u64]) -> Self {
+            let layout = otter_vm::jit::JitContextLayout::current();
+            let first = layout.slots_byte as usize / 8;
+            let mut words = vec![0_u64; first + slots.len()].into_boxed_slice();
+            words[layout.parent_byte as usize / 8] = parent;
+            words[layout.extension_byte as usize / 8] = Value::undefined().to_bits();
+            words[first..].copy_from_slice(slots);
+            Self(words)
+        }
+
+        fn value(&self) -> u64 {
+            self.0.as_ptr() as u64
+        }
+
+        fn slot(&self, slot: usize) -> u64 {
+            let layout = otter_vm::jit::JitContextLayout::current();
+            self.0[layout.slots_byte as usize / 8 + slot]
+        }
+
+        fn set_slot(&mut self, slot: usize, value: u64) {
+            let layout = otter_vm::jit::JitContextLayout::current();
+            self.0[layout.slots_byte as usize / 8 + slot] = value;
+        }
+    }
+
+    fn count_opcodes(
+        sequence: &InstructionSequence,
+        predicate: impl Fn(&MachineOpcode) -> bool,
+    ) -> usize {
+        sequence
+            .instructions()
+            .iter()
+            .filter(|instruction| predicate(&instruction.opcode))
+            .count()
+    }
+
+    #[test]
+    fn context_chain_reads_share_parent_hops_and_slot_stores_invalidate_slot_loads() {
+        let hir = NumericFunction::build(&context_chain_view()).expect("context chain HIR");
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let selected = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
+                .expect("context chain Machine IR");
+            // Four accesses each expand two parent hops before value numbering.
+            assert_eq!(
+                count_opcodes(&selected, |opcode| *opcode
+                    == MachineOpcode::ContextLoad {
+                        field: super::super::ContextField::Parent
+                    }),
+                8
+            );
+            let (sequence, stats) = selected.optimize(&target).expect("context chain GVN");
+            assert!(stats.eliminated_instructions >= 6, "{stats:?}");
+            // Parent words are immutable: one shared two-hop chain remains.
+            assert_eq!(
+                count_opcodes(&sequence, |opcode| *opcode
+                    == MachineOpcode::ContextLoad {
+                        field: super::super::ContextField::Parent
+                    }),
+                2
+            );
+            // The store invalidates the slot read before it; the reload stays.
+            assert_eq!(
+                count_opcodes(&sequence, |opcode| *opcode
+                    == MachineOpcode::ContextLoad {
+                        field: super::super::ContextField::Slot(3)
+                    }),
+                2
+            );
+            assert_eq!(
+                count_opcodes(&sequence, |opcode| *opcode
+                    == MachineOpcode::ContextLoad {
+                        field: super::super::ContextField::Slot(4)
+                    }),
+                1
+            );
+            // The tagged store keeps its barrier immediately after it.
+            let store = sequence
+                .instructions()
+                .iter()
+                .position(|instruction| {
+                    instruction.opcode == MachineOpcode::ContextStore { slot: 3 }
+                })
+                .expect("context slot store");
+            assert_eq!(
+                sequence.instructions()[store + 1].opcode,
+                MachineOpcode::ContextWriteBarrier
+            );
+            assert_eq!(
+                sequence.instructions()[store + 1].clobbers,
+                target.clobbers(TargetClobberSet::BindingWriteBarrier)
+            );
+            // The speculated TDZ check is an exact pre-effect exit.
+            let guard = sequence
+                .instructions()
+                .iter()
+                .find(|instruction| {
+                    instruction.opcode == MachineOpcode::GuardCondition
+                        && instruction
+                            .exits
+                            .iter()
+                            .any(|exit| exit.reason == ExitReason::TypeMismatch)
+                })
+                .expect("hole guard exit");
+            assert!(guard.safepoint.is_none());
+            assert_eq!(
+                count_opcodes(&sequence, |opcode| *opcode
+                    == MachineOpcode::TaggedIsNotHole),
+                1
+            );
+            sequence
+                .allocate(&target)
+                .expect("context chain allocation");
+        }
+    }
+
+    #[test]
+    fn scalar_context_stores_omit_the_barrier_and_the_verifier_requires_it_otherwise() {
+        let view = numeric_view(
+            1,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(7)]),
+                (
+                    Op::StoreContextSlot,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        context_coord(0, 0),
+                    ],
+                ),
+                (
+                    Op::StoreContextSlot,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(0),
+                        context_coord(0, 1),
+                    ],
+                ),
+                (Op::ReturnUndefined, vec![]),
+            ],
+        );
+        let sequence = select(&NumericFunction::build(&view).expect("store HIR")).expect("stores");
+        assert_eq!(
+            count_opcodes(&sequence, |opcode| matches!(
+                opcode,
+                MachineOpcode::ContextStore { .. }
+            )),
+            2
+        );
+        assert_eq!(
+            count_opcodes(&sequence, |opcode| *opcode
+                == MachineOpcode::ContextWriteBarrier),
+            1,
+            "only the possibly-cell store owns a barrier"
+        );
+        let barrier = sequence
+            .instructions()
+            .iter()
+            .position(|instruction| instruction.opcode == MachineOpcode::ContextWriteBarrier)
+            .expect("barrier");
+        assert_eq!(
+            sequence.instructions()[barrier - 1].opcode,
+            MachineOpcode::ContextStore { slot: 1 }
+        );
+        let mut unbarriered = sequence.clone();
+        let removed = unbarriered.instructions.remove(barrier);
+        assert_eq!(removed.opcode, MachineOpcode::ContextWriteBarrier);
+        for block in &mut unbarriered.blocks {
+            if block.end.0 as usize > barrier {
+                block.end.0 -= 1;
+                if block.first.0 as usize > barrier {
+                    block.first.0 -= 1;
+                }
+            }
+        }
+        assert!(matches!(
+            unbarriered.verify(&TargetSpec::aarch64()),
+            Err(VerificationError::OpcodeSignatureMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn context_allocations_are_rooted_calls_with_exact_allocation_exits() {
+        let view = numeric_view(
+            1,
+            3,
+            vec![
+                (
+                    Op::CreateContext,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::Imm32(2),
+                    ],
+                ),
+                (
+                    Op::CopyContext,
+                    vec![Operand::Register(2), Operand::Register(1)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let hir = NumericFunction::build(&view).expect("allocation HIR");
+        for target in [TargetSpec::aarch64(), TargetSpec::x86_64()] {
+            let sequence = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
+                .expect("allocation Machine IR");
+            let calls = sequence
+                .instructions()
+                .iter()
+                .filter_map(|instruction| {
+                    let MachineOpcode::Call(descriptor) = instruction.opcode else {
+                        return None;
+                    };
+                    Some((instruction, &sequence.call_descriptors[descriptor as usize]))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2);
+            for ((instruction, descriptor), stub) in calls.iter().zip([
+                otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC,
+                otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC,
+            ]) {
+                assert_eq!(descriptor.target, CallTarget::RuntimeStub(stub));
+                assert_eq!(descriptor.safepoint, SafepointKind::Gc);
+                assert!(!descriptor.effects.contains(CallEffects::REENTRANT));
+                assert!(instruction.safepoint.is_some());
+                assert_eq!(
+                    instruction
+                        .exits
+                        .iter()
+                        .map(|exit| (exit.reason, exit.action))
+                        .collect::<Vec<_>>(),
+                    [(ExitReason::AllocationMiss, ExitAction::Resume)]
+                );
+                assert_eq!(
+                    instruction.operands[..4]
+                        .iter()
+                        .map(|operand| operand.constraint)
+                        .collect::<Vec<_>>(),
+                    [
+                        OperandConstraint::Fixed(target.integer_argument(2).expect("arg 2")),
+                        OperandConstraint::Fixed(target.integer_argument(3).expect("arg 3")),
+                        OperandConstraint::Fixed(target.integer_argument(4).expect("arg 4")),
+                        OperandConstraint::Fixed(target.integer_result()),
+                    ]
+                );
+            }
+            // The created context is live across the copy: the copy roots it.
+            let copy = calls[1].0;
+            assert!(
+                copy.operands
+                    .iter()
+                    .any(|operand| operand.purpose == OperandPurpose::TaggedRoot
+                        || operand.purpose == OperandPurpose::FrameState)
+            );
+            sequence
+                .allocate(&target)
+                .expect("allocation calls allocate");
+        }
+    }
+
+    #[test]
+    fn loop_invariant_context_hops_move_to_the_preheader() {
+        let view = numeric_view(
+            2,
+            6,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(4)],
+                ),
+                (
+                    Op::LoadContextSlot,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(0),
+                        context_coord(2, 0),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-5)]),
+                (Op::ReturnValue, vec![Operand::Register(5)]),
+            ],
+        );
+        let hir = NumericFunction::build(&view).expect("context loop HIR");
+        let target = TargetSpec::aarch64();
+        let selected = select_with_loop_entries(&target, &hir, &hir.plan_loop_entries(), None)
+            .expect("context loop Machine IR");
+        let (sequence, stats) = selected.optimize(&target).expect("context loop LICM");
+        assert!(stats.hoisted_instructions >= 2, "{stats:?}");
+        let block_of = |predicate: &dyn Fn(&MachineOpcode) -> bool| {
+            let index = sequence
+                .instructions()
+                .iter()
+                .position(|instruction| predicate(&instruction.opcode))
+                .expect("instruction");
+            sequence
+                .blocks()
+                .iter()
+                .position(|block| (block.first.0..block.end.0).contains(&(index as u32)))
+                .expect("owning block")
+        };
+        let body = block_of(&|opcode| {
+            *opcode
+                == MachineOpcode::ContextLoad {
+                    field: super::super::ContextField::Slot(0),
+                }
+        });
+        let hop = block_of(&|opcode| {
+            *opcode
+                == MachineOpcode::ContextLoad {
+                    field: super::super::ContextField::Parent,
+                }
+        });
+        assert_ne!(hop, body, "immutable parent hops leave the loop body");
+        sequence.allocate(&target).expect("context loop allocation");
+        let code = compile_output(&view, None).code;
+        let far = FakeContext::new(Value::undefined().to_bits(), &[tag::box_int32(5)]);
+        let middle = FakeContext::new(far.value(), &[]);
+        let near = FakeContext::new(middle.value(), &[]);
+        let (result, _, _) = execute(&code, &[near.value(), tag::box_int32(3)], 0);
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(5));
+    }
+
+    fn execute_with_self(
+        code: &OptimizedCode,
+        args: &[u64],
+        self_bits: u64,
+    ) -> (NativeResultPair, u32) {
+        let metadata = code.metadata();
+        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+        let mut frame = vec![Value::undefined().to_bits(); metadata.register_count as usize];
+        frame[..args.len()].copy_from_slice(args);
+        let heap = otter_gc::GcHeap::new().expect("execution-test heap");
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let mut native_frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: metadata.function_id,
+                pc: 0,
+                register_count: metadata.register_count,
+                kind: NativeFrameKind::Optimizing,
+                flags: NativeFrameFlags::empty(),
+            },
+            frame.as_mut_ptr() as u64,
+            Value::undefined(),
+            Value::undefined(),
+        );
+        native_frame.self_value_bits = self_bits;
+        let mut thread = VmThread::empty();
+        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
+        thread.current_code_object_id = metadata.code_object_id;
+        thread.interrupt_cell = std::ptr::addr_of!(interrupt) as u64;
+        thread.gc_heap = std::ptr::from_ref(&heap) as u64;
+        thread.backedge_fuel_cell = std::ptr::from_mut(&mut fuel) as u64;
+        let mut error = None;
+        let mut machine_roots = 0;
+        let mut ctx = JitCtx {
+            thread: std::ptr::addr_of_mut!(thread),
+            native_frame: std::ptr::addr_of_mut!(native_frame),
+            error: &mut error,
+            activation_base: std::ptr::null_mut(),
+            activation_top_ptr: std::ptr::null_mut(),
+            activation_limit: 0,
+            machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
+            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            runtime_stats: std::ptr::null_mut(),
+            global_this_offset: std::ptr::null(),
+            native_stack_limit: 0,
+            generated_feedback_clean: 1,
+        };
+        let result = entry(&mut ctx);
+        (result, native_frame.header.pc)
+    }
+
+    #[test]
+    fn executes_context_chain_reads_stores_and_the_hole_exit() {
+        let code = compile_output(&context_chain_view(), None).code;
+        let far = FakeContext::new(
+            Value::undefined().to_bits(),
+            &[0, 0, 0, tag::box_int32(42), tag::box_int32(7)],
+        );
+        let middle = FakeContext::new(far.value(), &[]);
+        let near = FakeContext::new(middle.value(), &[]);
+        let (result, _, _) = execute(&code, &[near.value()], 0);
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(7));
+        assert_eq!(
+            far.slot(3),
+            tag::box_int32(7),
+            "the store reached the far slot"
+        );
+
+        let mut uninitialized = far;
+        uninitialized.set_slot(3, Value::hole().to_bits());
+        let middle = FakeContext::new(uninitialized.value(), &[]);
+        let near = FakeContext::new(middle.value(), &[]);
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        let (result, frame, pc) = execute_with_poll_cells(
+            &code,
+            &[near.value()],
+            0,
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+        assert_eq!(
+            result.validate(NativeResultDomain::Compiled),
+            Some(NativeResultStatus::SideExit)
+        );
+        assert_eq!(pc, 0, "the hole exits before the checked read");
+        assert_eq!(frame[0], near.value());
+        assert_eq!(
+            uninitialized.slot(3),
+            Value::hole().to_bits(),
+            "no effect ran before the exit"
+        );
+    }
+
+    #[test]
+    fn executes_committed_checked_context_slots_on_the_generated_hit() {
+        let mut view = numeric_view(
+            1,
+            3,
+            vec![
+                (
+                    Op::LoadContextSlotChecked,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        context_coord(1, 0),
+                    ],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(11)],
+                ),
+                (
+                    Op::StoreContextSlotChecked,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        context_coord(1, 1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        for pc in [0, 2] {
+            view.optimized_exit_reasons
+                .insert(pc, BTreeSet::from([ExitReason::TypeMismatch]));
+        }
+        let hir = NumericFunction::build(&view).expect("committed checked HIR");
+        let sequence = select(&hir).expect("committed checked Machine IR");
+        assert_eq!(
+            count_opcodes(&sequence, |opcode| matches!(
+                opcode,
+                MachineOpcode::BindingGuard {
+                    target: MachineBindingTarget::ContextSlot { depth: 1, .. },
+                    ..
+                }
+            )),
+            2
+        );
+        assert_eq!(
+            count_opcodes(&sequence, |opcode| *opcode
+                == MachineOpcode::BindingWriteBarrier),
+            1
+        );
+        let code = compile_output(&view, None).code;
+        let far = FakeContext::new(
+            Value::undefined().to_bits(),
+            &[tag::box_int32(21), tag::box_int32(0)],
+        );
+        let near = FakeContext::new(far.value(), &[]);
+        let (result, _, _) = execute(&code, &[near.value()], 0);
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(21));
+        assert_eq!(far.slot(1), tag::box_int32(11));
+    }
+
+    #[test]
+    fn native_call_committed_linkage_carries_a_resumable_transition_exit() {
+        use hir::{NumericBlock, NumericFrameSlot, NumericFrameState, NumericValue};
+        let value = NumericValue;
+        let hir = NumericFunction {
+            function_id: 1,
+            nodes: vec![
+                NumericNode::TaggedConstant(Value::undefined().to_bits()),
+                NumericNode::NativeCall {
+                    receiver: value(0),
+                    target: NumericNativeCallTarget::Resolved {
+                        callee: value(0),
+                        call: otter_vm::JitStaticNativeCall {
+                            builtin_native_ref: 1,
+                            leaf_stub_id: otter_vm::native_abi::STUB_STRICT_EQ_LEAF.id,
+                            argument_count: 0,
+                        },
+                    },
+                    hit: native_call_cfg::HitKind::Leaf,
+                    argument_start: 0,
+                    logical_pc: 0,
+                    byte_pc: 0,
+                },
+            ],
+            property_sites: BTreeMap::new(),
+            element_sites: BTreeMap::new(),
+            constructor_field_sites: BTreeMap::new(),
+            blocks: vec![NumericBlock {
+                logical_pc: 0,
+                osr_entry_allowed: false,
+                predecessors: Vec::new(),
+                successors: Vec::new(),
+                parameters: Vec::new(),
+                parameter_registers: Vec::new(),
+                successor_arguments: Vec::new(),
+                nodes: vec![value(0), value(1)],
+                terminator: NumericTerminator::Return(value(1)),
+            }],
+            frame_states: vec![NumericFrameState {
+                point: NumericFramePoint::Node(value(1)),
+                frames: Box::new([otter_vm::deopt::DeoptFrame {
+                    function_id: 1,
+                    byte_pc: 0,
+                    entry: None,
+                    slots: Box::new([NumericFrameSlot::Value(value(0))]),
+                }]),
+                virtual_objects: Box::default(),
+            }],
+            direct_call_targets: Vec::new(),
+            operand_values: Vec::new(),
+            parameter_count: 0,
+            register_count: 1,
+            arithmetic_op_count: 0,
+            entry_arguments: Vec::new(),
+            prologue_nodes: Vec::new(),
+        };
+        let mut next = 0;
+        let exits = frame_state_exits(&hir, &hir.frame_states[0], &mut next);
+        // The committed miss is generated method linkage: only a failed
+        // identity recompiles; a linkage rejection resumes the call.
+        assert_eq!(
+            exits
+                .iter()
+                .map(|exit| (exit.reason, exit.action))
+                .collect::<Vec<_>>(),
+            [
+                (ExitReason::IdentityGuard, ExitAction::Recompile),
+                (ExitReason::RuntimeTransition, ExitAction::Resume),
+            ]
+        );
+    }
+
+    #[test]
+    fn caught_throw_landing_pads_survive_block_merging() {
+        for hir in [committed_value_selection_hir(true), binding_catch_hir()] {
+            let sequence = select(&hir).expect("caught-throw Machine CFG");
+            let (optimized, _) = sequence
+                .optimize(&TargetSpec::aarch64())
+                .expect("block merging keeps each landing pad a one-successor block");
+            for descriptor in optimized.call_descriptors() {
+                if let ExceptionalEdge::LandingPad(block) = descriptor.exceptional {
+                    assert_eq!(optimized.blocks()[block.0 as usize].successors.len(), 1);
+                }
+            }
+            optimized
+                .allocate(&TargetSpec::aarch64())
+                .expect("caught-throw allocation");
+        }
+    }
+
+    #[test]
+    fn executes_closure_context_and_self_reads() {
+        let mut view = numeric_view(
+            0,
+            3,
+            vec![
+                (Op::LoadClosureContext, vec![Operand::Register(0)]),
+                (
+                    Op::LoadContextSlot,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        context_coord(0, 1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        view.closure_call_layout.context_byte = 16;
+        let code = compile_output(&view, None).code;
+        let context = FakeContext::new(Value::undefined().to_bits(), &[0, tag::box_int32(99)]);
+        let mut closure = [0_u64; 4];
+        closure[0] = u64::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG);
+        closure[2] = context.value();
+        let (result, _) = execute_with_self(&code, &[], closure.as_ptr() as u64);
+        assert_eq!(compiled_payload_bits(result), tag::box_int32(99));
+
+        let mut bare = numeric_view(
+            0,
+            1,
+            vec![
+                (Op::LoadClosureContext, vec![Operand::Register(0)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        bare.closure_call_layout.context_byte = 16;
+        let code = compile_output(&bare, None).code;
+        let (result, _) = execute_with_self(&code, &[], tag::box_function_id(5));
+        assert_eq!(
+            compiled_payload_bits(result),
+            Value::undefined().to_bits(),
+            "a bare function value has no context"
+        );
+
+        let self_view = numeric_view(
+            0,
+            1,
+            vec![
+                (Op::LoadSelf, vec![Operand::Register(0)]),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        let code = compile_output(&self_view, None).code;
+        let (result, _) = execute_with_self(&code, &[], closure.as_ptr() as u64);
+        assert_eq!(compiled_payload_bits(result), closure.as_ptr() as u64);
     }
 
     #[test]
@@ -9944,6 +11017,7 @@ mod tests {
             Value::null(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
+            false,
         );
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10010,24 +11084,10 @@ mod tests {
     fn tagged_values_survive_loop_phis_osr_and_backedge_deopt() {
         let view = tagged_loop_view();
         let hir = NumericFunction::build(&view).expect("tagged loop HIR");
-        let sequence = select(&hir).expect("tagged loop Machine IR");
-        let osr_inputs = sequence
-            .instructions()
-            .iter()
-            .find_map(|instruction| match &instruction.opcode {
-                MachineOpcode::OsrEntry {
-                    logical_pc: 2,
-                    inputs,
-                } => Some(inputs.as_slice()),
-                _ => None,
-            })
-            .expect("tagged loop OSR marker");
-        assert!(osr_inputs.contains(&MachineOsrInput {
-            frame_register: 0,
-            value_type: MachineOsrType::Tagged,
-        }));
+        let sequence = select_osr(&hir, 2).expect("tagged loop Machine IR");
+        assert!(osr_values(&sequence, 2).contains(&(0, MachineOsrType::Tagged)));
 
-        let code = compile_output(&view, None).code;
+        let code = compile_osr_output(&view, 2).code;
         let (normal, _, _) = execute(&code, &[Value::null().to_bits(), tag::box_int32(4)], 0);
         assert_eq!(
             normal.validate(NativeResultDomain::Compiled),
@@ -10232,6 +11292,7 @@ mod tests {
             std::ptr::null(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
+            false,
         );
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10376,6 +11437,7 @@ mod tests {
             std::ptr::null(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
+            false,
         );
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10653,6 +11715,7 @@ mod tests {
             Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
+            false,
         );
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10671,6 +11734,7 @@ mod tests {
             Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
+            false,
         );
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10696,6 +11760,7 @@ mod tests {
             Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
+            false,
         );
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10765,7 +11830,7 @@ mod tests {
             .allocate(&TargetSpec::aarch64())
             .expect("typed parameter loop allocation");
 
-        let code = compile_output(&view, None).code;
+        let code = compile_osr_output(&view, 2).code;
         let (result, _, _) = execute(&code, &[tag::box_int32(10), tag::box_int32(3)], 0);
         assert_eq!(
             result.validate(NativeResultDomain::Compiled),
@@ -10773,7 +11838,7 @@ mod tests {
         );
         assert_eq!(compiled_payload_bits(result), tag::box_int32(30));
         // SAFETY: the code object remains alive for the pointer lookup.
-        assert!(unsafe { code.osr_entry_ptr_for_test(2) }.is_some());
+        assert!(code.has_osr_header_for_test(2));
     }
 
     #[test]
@@ -11065,6 +12130,8 @@ mod tests {
             .blocks()
             .iter()
             .enumerate()
+            // Ordinary entry edge and backedge: an entry compile has no OSR
+            // block.
             .find(|(_, block)| block.predecessors.len() == 2 && !block.parameters.is_empty())
             .expect("loop header block parameters");
         assert_eq!(header.parameters.len(), 2);
@@ -11108,37 +12175,11 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node, NumericNode::IntegerAddImmediate(_, 1)))
         );
-        let sequence = select(&hir).expect("branch-phi Machine IR");
-        let (osr_logical_pc, osr_inputs, osr_operands) = sequence
-            .instructions()
-            .iter()
-            .find_map(|instruction| match &instruction.opcode {
-                MachineOpcode::OsrEntry { logical_pc, inputs } => Some((
-                    *logical_pc,
-                    inputs.as_slice(),
-                    instruction.operands.as_slice(),
-                )),
-                _ => None,
-            })
-            .expect("branch-phi OSR marker");
-        assert_eq!(osr_logical_pc, 3);
+        let sequence = select_osr(&hir, 3).expect("branch-phi Machine IR");
         assert_eq!(
-            osr_inputs,
-            [
-                MachineOsrInput {
-                    frame_register: 0,
-                    value_type: MachineOsrType::Int32,
-                },
-                MachineOsrInput {
-                    frame_register: 1,
-                    value_type: MachineOsrType::Int32,
-                },
-            ]
+            osr_values(&sequence, 3),
+            [(0, MachineOsrType::Int32), (1, MachineOsrType::Int32)]
         );
-        assert_eq!(osr_operands.len(), osr_inputs.len());
-        assert!(osr_operands.iter().all(|operand| {
-            operand.constraint == OperandConstraint::Any && operand.timing == OperandTiming::Late
-        }));
         let polls = sequence
             .blocks()
             .iter()
@@ -11273,8 +12314,9 @@ mod tests {
                     module: "benchmarks/scripts/branch-phi.js".to_string(),
                 },
                 tier: JitDebugTier::Optimizing,
-                entry: JitDebugTarget::Entry,
+                entry: JitDebugTarget::Osr { pc: 3 },
             }),
+            Some(3),
         )
         .expect("production optimizing selector compiles exact branch-phi");
         let artifact = exact.artifact.expect("exact branch-phi artifact");
@@ -11286,7 +12328,7 @@ mod tests {
         )
         .expect("UTF-8 optimized IR");
         assert!(optimized_ir.starts_with("; backend=otter-machine-ir scalar-function\n"));
-        assert!(optimized_ir.contains("OsrEntry { logical_pc: 3"));
+        assert!(optimized_ir.contains("OsrDispatch { logical_pcs: [3] }"));
         let code_map = std::str::from_utf8(
             artifact
                 .file(JitArtifactFileName::CodeMap)
@@ -11342,6 +12384,7 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
+            None,
         )
         .expect("production optimizing selector compiles countdown loop");
         let optimized_ir = std::str::from_utf8(
@@ -11417,6 +12460,7 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
+            None,
         )
         .expect("production optimizing selector compiles bitwise loop");
         let optimized_ir = std::str::from_utf8(
@@ -11863,6 +12907,7 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
+            None,
         )
         .expect("production selector compiles integer-scalar loop");
         let optimized_ir = std::str::from_utf8(
@@ -11955,6 +13000,7 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
+            None,
         )
         .expect("production selector compiles float leaf loop");
         let optimized_ir = std::str::from_utf8(
@@ -12052,6 +13098,7 @@ mod tests {
                 tier: JitDebugTier::Optimizing,
                 entry: JitDebugTarget::Entry,
             }),
+            None,
         )
         .expect("production selector compiles float bitwise loop");
         let optimized_ir = std::str::from_utf8(
@@ -12258,24 +13305,34 @@ mod tests {
             entry_arguments: Vec::new(),
             prologue_nodes: Vec::new(),
         };
-        let sequence = select(&hir).expect("nested-loop Machine body");
-        let osr_pcs = sequence
-            .instructions()
-            .iter()
-            .filter_map(|instruction| match instruction.opcode {
-                MachineOpcode::OsrEntry { logical_pc, .. } => Some(logical_pc),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(osr_pcs, [1]);
-        sequence
+        let dispatch = |sequence: &InstructionSequence| {
+            sequence
+                .instructions()
+                .iter()
+                .find_map(|instruction| match &instruction.opcode {
+                    MachineOpcode::OsrDispatch { logical_pcs } => Some(logical_pcs.clone()),
+                    _ => None,
+                })
+        };
+        let outer = select_osr(&hir, 1).expect("nested-loop Machine body");
+        assert_eq!(dispatch(&outer), Some(vec![1]));
+        outer
             .verify(&TargetSpec::aarch64())
             .expect("nested-loop Machine verification");
+        let inner = select_osr(&hir, 2).expect("protected-header Machine body");
+        assert_eq!(
+            dispatch(&inner),
+            None,
+            "a protected header is never entered"
+        );
+        inner
+            .verify(&TargetSpec::aarch64())
+            .expect("protected-header Machine verification");
     }
 
     #[test]
     fn numeric_osr_enters_exact_header_and_rejects_without_vm_mutation() {
-        let code = compile_output(&branch_phi_loop_view_with(0, 0, 5, 1), None).code;
+        let code = compile_osr_output(&branch_phi_loop_view_with(0, 0, 5, 1), 3).code;
         let mut frame = vec![Value::undefined().to_bits(); 12];
         frame[0] = tag::box_int32(2);
         frame[1] = tag::box_int32(1);
@@ -12311,7 +13368,7 @@ mod tests {
 
     #[test]
     fn numeric_osr_deopts_overflow_and_interrupts_before_phi_moves() {
-        let overflow = compile_output(&branch_phi_loop_view_with(i32::MAX, 0, 1, 1), None).code;
+        let overflow = compile_osr_output(&branch_phi_loop_view_with(i32::MAX, 0, 1, 1), 3).code;
         let mut frame = vec![Value::undefined().to_bits(); 12];
         frame[0] = tag::box_int32(i32::MAX);
         frame[1] = tag::box_int32(0);
@@ -12334,7 +13391,7 @@ mod tests {
         assert_eq!(frame[2], tag::box_int32(2));
 
         let loop_limit = POLL_BATCH + 4;
-        let code = compile_output(&branch_phi_loop_view_with(0, 0, loop_limit, 1), None).code;
+        let code = compile_osr_output(&branch_phi_loop_view_with(0, 0, loop_limit, 1), 3).code;
         let mut frame = vec![Value::undefined().to_bits(); 12];
         frame[0] = tag::box_int32(2);
         frame[1] = tag::box_int32(1);
@@ -12360,40 +13417,17 @@ mod tests {
     fn numeric_osr_materializes_float_uint32_and_boolean_headers() {
         let float_view = float_bitwise_loop_view();
         let float_hir = NumericFunction::build(&float_view).expect("float OSR HIR");
-        let float_sequence = select(&float_hir).expect("float OSR Machine IR");
-        let float_inputs = float_sequence
-            .instructions()
-            .iter()
-            .find_map(|instruction| match &instruction.opcode {
-                MachineOpcode::OsrEntry {
-                    logical_pc: 4,
-                    inputs,
-                } => Some(inputs.as_slice()),
-                _ => None,
-            })
-            .expect("float OSR marker");
+        let float_sequence = select_osr(&float_hir, 4).expect("float OSR Machine IR");
         assert_eq!(
-            float_inputs,
+            osr_values(&float_sequence, 4),
             [
-                MachineOsrInput {
-                    frame_register: 0,
-                    value_type: MachineOsrType::Float64,
-                },
-                MachineOsrInput {
-                    frame_register: 1,
-                    value_type: MachineOsrType::Int32,
-                },
-                MachineOsrInput {
-                    frame_register: 2,
-                    value_type: MachineOsrType::Int32,
-                },
-                MachineOsrInput {
-                    frame_register: 3,
-                    value_type: MachineOsrType::Int32,
-                },
+                (0, MachineOsrType::Float64),
+                (1, MachineOsrType::Int32),
+                (2, MachineOsrType::Int32),
+                (3, MachineOsrType::Int32),
             ]
         );
-        let float_code = compile_output(&float_view, None).code;
+        let float_code = compile_osr_output(&float_view, 4).code;
         let mut float_frame = vec![Value::undefined().to_bits(); 12];
         float_frame[0] = boxed_f64(4_294_967_299.25);
         float_frame[1] = tag::box_int32(0);
@@ -12417,22 +13451,11 @@ mod tests {
 
         let view = mixed_osr_loop_view();
         let hir = NumericFunction::build(&view).expect("mixed OSR numeric HIR");
-        let sequence = select(&hir).expect("mixed OSR Machine IR");
-        let inputs = sequence
-            .instructions()
-            .iter()
-            .find_map(|instruction| match &instruction.opcode {
-                MachineOpcode::OsrEntry {
-                    logical_pc: 6,
-                    inputs,
-                } => Some(inputs.as_slice()),
-                _ => None,
-            })
-            .expect("mixed OSR marker");
+        let sequence = select_osr(&hir, 6).expect("mixed OSR Machine IR");
         assert_eq!(
-            inputs
-                .iter()
-                .map(|input| input.value_type)
+            osr_values(&sequence, 6)
+                .into_iter()
+                .map(|(_, value_type)| value_type)
                 .collect::<Vec<_>>(),
             [
                 MachineOsrType::Uint32,
@@ -12442,7 +13465,7 @@ mod tests {
             ]
         );
 
-        let code = compile_output(&view, None).code;
+        let code = compile_osr_output(&view, 6).code;
         let mut frame = vec![Value::undefined().to_bits(); 10];
         frame[0] = boxed_f64(f64::from(u32::MAX));
         frame[1] = Value::boolean(true).to_bits();
@@ -12482,26 +13505,32 @@ mod tests {
         const HEADER_PC: u32 = LIVE_VALUES as u32 + 3;
         let view = osr_spill_pressure_loop_view();
         let hir = NumericFunction::build(&view).expect("OSR spill-pressure HIR");
-        let sequence = select(&hir).expect("OSR spill-pressure Machine IR");
-        let marker = sequence
-            .instructions()
-            .iter()
-            .position(|instruction| matches!(instruction.opcode, MachineOpcode::OsrEntry { .. }))
-            .map(|index| MachineInstructionId(index as u32))
-            .expect("OSR spill-pressure marker");
+        let sequence = select_osr(&hir, HEADER_PC).expect("OSR spill-pressure Machine IR");
         let allocation = sequence
             .allocate(&TargetSpec::aarch64())
             .expect("OSR spill-pressure allocation");
         assert!(
-            allocation
-                .instruction_locations(marker)
-                .expect("OSR marker locations")
+            sequence
+                .instructions()
                 .iter()
-                .any(|location| matches!(location, AllocatedLocation::Stack(_))),
-            "OSR pressure fixture must exercise direct spill materialization"
+                .enumerate()
+                .filter(|(_, instruction)| matches!(
+                    instruction.opcode,
+                    MachineOpcode::OsrValue { .. }
+                ))
+                .count()
+                > LIVE_VALUES,
+            "every live header value is read from the frame"
+        );
+        assert!(
+            allocation
+                .edits()
+                .iter()
+                .any(|edit| matches!(edit.to, AllocatedLocation::Stack(_))),
+            "OSR pressure fixture must spill header values"
         );
 
-        let code = compile_output(&view, None).code;
+        let code = compile_osr_output(&view, HEADER_PC).code;
         let mut frame = vec![Value::undefined().to_bits(); LIVE_VALUES + 5];
         for (register, slot) in frame.iter_mut().enumerate().take(LIVE_VALUES) {
             *slot = tag::box_int32(register as i32 + 1);
@@ -12544,6 +13573,7 @@ mod tests {
         let code = compile_output_with_transitions(
             &branch_phi_loop_view_with(0, 0, loop_limit, 1),
             &transitions,
+            None,
             None,
         )
         .code;

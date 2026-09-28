@@ -585,6 +585,12 @@ impl Interpreter {
     /// early feedback snapshot is not cached as a permanent entry-tier miss;
     /// the current header falls back to template OSR and future entry feedback
     /// may still make the function optimizable.
+    ///
+    /// Optimized code enters at most the one header it was compiled for. When
+    /// the current code cannot enter `osr_pc`, this header's back-edge crossed
+    /// its tier threshold while the function kept running below the optimized
+    /// tier, so the function is recompiled for it (SpiderMonkey's `osrPc`
+    /// mismatch recompile). The replacement serves function entries as well.
     pub(crate) fn resolve_optimized_osr_code(
         &mut self,
         context: &ExecutionContext,
@@ -599,10 +605,12 @@ impl Interpreter {
             return None;
         }
         if let Some(Some(code)) = self.jit_optimized_code.get(&fid) {
-            return self
-                .jit_code_registry
-                .is_current_for_entry(code.as_ref())
-                .then(|| code.clone());
+            if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
+                return None;
+            }
+            if code.enters_optimized_osr_header(osr_pc) {
+                return Some(code.clone());
+            }
         }
         // A declined body is retried at a back-edge only when its feedback epoch
         // has advanced since the last failed attempt: the optimizer's whole-body
@@ -1813,8 +1821,9 @@ impl Interpreter {
     /// Fixed/spread ordinary-call candidates remain monomorphic. Forwarded
     /// arguments admit the bounded ordinary target population; method calls may
     /// contain a bounded, most-frequent-first polymorphic chain. Every generated
-    /// target is a synchronous bytecode function with an exact bounded upvalue
-    /// spine and one current non-OSR installed entry. Generated linkage binds
+    /// target is a synchronous bytecode function with one current non-OSR
+    /// installed entry; it reaches its context through its SELF closure.
+    /// Generated linkage binds
     /// both strict/lexical and unbound sloppy-global `this`; an explicitly bound
     /// sloppy closure misses before entry. The emitter applies the final
     /// pure-leaf / size / arity test to the separate monomorphic inline tables.
@@ -2326,11 +2335,10 @@ impl Interpreter {
     /// Bake one compiler-generated method call independently of leaf inlining.
     ///
     /// Each bounded mono/poly feedback target reaches this helper independently.
-    /// The target must be an ordinary synchronous function with exact fresh and
-    /// inherited upvalue counts and one entry-capable native generation.
-    /// Recursive entry resolves through the same stable generation cell as
-    /// every other generated call. Inherited closure captures are consumed
-    /// directly.
+    /// The target must be an ordinary synchronous function with one
+    /// entry-capable native generation. Recursive entry resolves through the
+    /// same stable generation cell as every other generated call. The callee
+    /// reaches its context through the exact SELF closure.
     fn bake_one_direct_method(
         &mut self,
         context: &ExecutionContext,

@@ -9,7 +9,8 @@
 //!   are consumed before any allocation; the caller retains authoritative roots.
 //! - The fixed control prefix is identical to bounded direct linkage. Its size
 //!   slot releases both the dynamic callee frame and metadata scratch.
-//! - Every root is initialized before capture allocation and frame publication.
+//! - Every root is initialized before frame publication. The frame carries no
+//!   binding storage; the callee reads its context through SELF.
 //! - Shared completion owns return, exception, deopt and rejection cleanup.
 //!
 //! # See also
@@ -25,8 +26,6 @@ const PLAN_ENTRY: u32 = std::mem::offset_of!(JitDirectCallPlan, entry_cell) as u
 const PLAN_THIS: u32 = std::mem::offset_of!(JitDirectCallPlan, this_mode) as u32;
 const PLAN_PARAMS: u32 = std::mem::offset_of!(JitDirectCallPlan, param_count) as u32;
 const PLAN_REGISTERS: u32 = std::mem::offset_of!(JitDirectCallPlan, register_count) as u32;
-const PLAN_OWN: u32 = std::mem::offset_of!(JitDirectCallPlan, own_upvalue_count) as u32;
-const PLAN_INHERITED: u32 = std::mem::offset_of!(JitDirectCallPlan, inherited_upvalue_count) as u32;
 const PLAN_ACTUALS: u32 = std::mem::offset_of!(JitDirectCallPlan, needs_incoming_arguments) as u32;
 
 #[allow(clippy::too_many_arguments)]
@@ -99,12 +98,7 @@ where
         ; tbnz x0, #63, =>scratch_miss
         ; mov w8, w0
         ; mov x17, sp
-        ; ldrh w9, [x17, PLAN_OWN]
-        ; ldrh w10, [x17, PLAN_INHERITED]
-        ; add x9, x9, x10
-        ; lsl x9, x9, #2
-        ; add x9, x9, layout.upvalue_base + 7
-        ; and x9, x9, 0xffff_ffff_ffff_fff8u64
+        ; movz x9, layout.register_base
         ; ldrh w10, [x17, PLAN_REGISTERS]
         ; add x16, x9, x10, lsl #3
         ; ldrb w11, [x17, PLAN_ACTUALS]
@@ -157,33 +151,18 @@ where
         ; ldr x12, [x17, PLAN_BYTES + 8]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
     );
-    let direct_function = ops.new_dynamic_label();
+    // A bare function value carries no bound receiver; the plan admitted a
+    // cell only as a closure, whose flags name an arrow's lexical `this`.
     let closure_ready = ops.new_dynamic_label();
-    emit_cell_test(ops, 9, 10, CellTest::IsNotCell, direct_function);
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x10, [x9, view.closure_call_layout.upvalue_base_byte]
-        ; ldr w11, [x9, view.closure_call_layout.upvalue_count_byte]
-        ; ldr w15, [x9, view.closure_call_layout.eval_env_byte]
-        ; ldr w13, [x9, view.closure_call_layout.flags_byte]
-    );
-    let no_bound_this = ops.new_dynamic_label();
+    emit_cell_test(ops, 9, 10, CellTest::IsNotCell, closure_ready);
+    dynasm!(ops ; .arch aarch64 ; ldr w13, [x9, view.closure_call_layout.flags_byte]);
     emit_load_u64(ops, 14, u64::from(view.closure_call_layout.bound_this_flag));
     dynasm!(ops
         ; .arch aarch64
         ; tst w13, w14
-        ; b.eq =>no_bound_this
+        ; b.eq =>closure_ready
         ; ldr x12, [x9, view.closure_call_layout.bound_this_byte]
-        ; =>no_bound_this
-        ; b =>closure_ready
-        ; =>direct_function
-        ; mov x10, xzr
-        ; mov w11, wzr
-        ; mov w15, wzr
         ; =>closure_ready
-        ; str x10, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-        ; str w11, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-        ; str w15, [sp, abi::NATIVE_FRAME_EVAL_ENV_OFFSET]
     );
     let this_ready = ops.new_dynamic_label();
     let global_this = ops.new_dynamic_label();
@@ -230,38 +209,6 @@ where
         ; subs w13, w13, #1
         ; b.ne =>initialize
         ; =>initialized
-        ; ldrh w2, [x17, PLAN_OWN]
-    );
-    let captures_ready = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz w2, =>captures_ready
-        ; ldrh w3, [x17, PLAN_INHERITED]
-        ; add x13, sp, layout.upvalue_base
-        ; str x13, [sp, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
-        ; str wzr, [sp, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
-        ; mov x0, X(context_register)
-        ; mov x1, sp
-    );
-    emit_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_INITIALIZE_UPVALUES),
-        abi::STUB_JIT_INITIALIZE_UPVALUES,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x1, abi::NativeResultStatus::Success as u32
-        ; b.eq =>captures_ready
-        ; cmp x1, abi::NativeResultStatus::SideExit as u32
-        ; b.eq =>uncommitted_rejected
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>prepare_error
-        ; b =>prepare_fatal
-        ; =>captures_ready
-        ; ldr x17, [sp, layout.caller_code_object_id]
         ; ldrh w2, [x17, PLAN_PARAMS]
         ; mov x0, X(context_register)
         ; mov x1, sp

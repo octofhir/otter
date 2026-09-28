@@ -2027,6 +2027,7 @@ fn emit_compare(
         let lhs_non_number = ops.new_dynamic_label();
         let strict_false = ops.new_dynamic_label();
         let cell_path = ops.new_dynamic_label();
+        let distinct_cells = ops.new_dynamic_label();
         let leaf_call = ops.new_dynamic_label();
         emit_load_u64(ops, 11, NUMBER_TAG);
         dynasm!(ops
@@ -2064,11 +2065,14 @@ fn emit_compare(
         } else {
             dynasm!(ops ; .arch x64 ; jne =>true_case ; jmp =>false_case);
         }
+        // A cell differs from an immediate, and two cells of different
+        // kinds, or of a kind compared by identity, differ. Only two strings
+        // or two BigInts ask the leaf probe. `r11` still holds NOT_CELL_MASK.
         dynasm!(ops
             ; .arch x64
             ; =>cell_path
             ; cmp rax, r8
-            ; jne =>leaf_call
+            ; jne =>distinct_cells
         );
         if kind == CompareKind::Eq {
             dynasm!(ops ; .arch x64 ; jmp =>true_case);
@@ -2077,6 +2081,19 @@ fn emit_compare(
         }
         dynasm!(ops
             ; .arch x64
+            ; =>distinct_cells
+            ; test rax, r11
+            ; jnz =>strict_false
+            ; test r8, r11
+            ; jnz =>strict_false
+            ; movzx r10d, BYTE [rax]
+            ; movzx r11d, BYTE [r8]
+            ; cmp r10d, r11d
+            ; jne =>strict_false
+            ; cmp r10d, i32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
+            ; je =>leaf_call
+            ; cmp r10d, i32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
+            ; jne =>strict_false
             ; =>leaf_call
             ; mov rsi, rax
             ; mov rdx, r8

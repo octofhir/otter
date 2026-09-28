@@ -13,7 +13,7 @@
 //!   template and the optimizing tier.
 //! - An element store whose join enters a split loop-entry edge selects
 //!   Machine IR instead of declining.
-//! - A generated constructor with fresh capture cells between element
+//! - A generated constructor that allocates its own context between element
 //!   accesses, covering allocator-root refresh, direct-call linkage state, and
 //!   a direct Machine IR read of the captured constructor binding.
 //!
@@ -28,8 +28,8 @@
 //! - A fixed typed view is wholly out of bounds when its original extent no
 //!   longer fits its live backing buffer, even when the selected index remains
 //!   inside the buffer's retained prefix.
-//! - A hot captured-binding read uses a bytecode-attributed Machine region and
-//!   never retains the generic `jit_load_upvalue_value` runtime transition.
+//! - A hot captured-binding read of a slot without a TDZ check is a direct
+//!   context slot load behind the closure's context word.
 //!
 //! # See also
 //! - `crates/otter-jit/src/machine/numeric` owns element HIR, selection, and
@@ -323,16 +323,16 @@ fn assert_machine_element_artifact(
         shape,
         MachineArtifactShape::PackedDoubleElementsAroundConstructCapture
     ) {
-        let upvalue_loads = regions
-            .iter()
-            .filter(|region| region["kind"] == "machineBindingHit")
-            .collect::<Vec<_>>();
+        let optimized_ir = String::from_utf8_lossy(
+            bundle
+                .file(JitArtifactFileName::OptimizedIr)
+                .expect("Machine element optimized IR")
+                .contents(),
+        );
         assert!(
-            !upvalue_loads.is_empty()
-                && upvalue_loads
-                    .iter()
-                    .all(|region| region["bytePc"].as_u64().is_some()),
-            "{function_name} must expose bytecode-attributed direct upvalue reads: {code_map}"
+            optimized_ir.contains("ContextLoad { field: ClosureContext")
+                && optimized_ir.contains("ContextLoad { field: Slot("),
+            "{function_name} must read its captured constructor as a direct context slot load: {optimized_ir}"
         );
         assert_construct_capture_artifact(bundle, function_name);
     }
@@ -359,13 +359,12 @@ fn assert_construct_capture_artifact(bundle: &JitArtifactBundle, function_name: 
             panic!("{function_name} must retain its generated direct base construct")
         });
     assert_eq!(
-        direct_construct["target"]["directCall"]["ownUpvalueCount"], 1,
-        "the direct constructor must initialize its one fresh capture cell: {direct_construct}"
+        direct_construct["target"]["directCall"]["argumentMode"], "fixed",
+        "the direct constructor must take the fixed-argument construct edge: {direct_construct}"
     );
     for runtime_stub in [
         "jit_try_prepare_base_construct",
         "jit_prepare_base_construct",
-        "jit_initialize_upvalues",
     ] {
         assert!(
             relocations.iter().any(|relocation| {
@@ -375,13 +374,6 @@ fn assert_construct_capture_artifact(bundle: &JitArtifactBundle, function_name: 
             "{function_name} must retain {runtime_stub}: {relocations:?}"
         );
     }
-    assert!(
-        relocations.iter().all(|relocation| {
-            relocation["target"]["kind"] != "runtimeStub"
-                || relocation["target"]["name"] != "jit_load_upvalue_value"
-        }),
-        "{function_name} must load captured bindings directly: {relocations:?}"
-    );
 }
 
 fn run_fixture(

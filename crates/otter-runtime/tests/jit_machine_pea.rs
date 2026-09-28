@@ -10,10 +10,17 @@
 //! - Virtual identity is never externally observable before one materialization.
 //! - A deopt, throw, safepoint, capture, or external call receives a real object.
 //! - The pass reports eliminated allocations without an emitter-local shortcut.
+//! - The corpus warms its functions from one script loop, which the optimizing
+//!   tier OSR-compiles and inlines into; the escape fixtures are warmed again
+//!   from short scripts ([`short_warm`]) so they compile through their own
+//!   entries.
 
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime, SourceInput,
 };
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 const SOURCE: &str = include_str!("../../otter-difftest/corpus/machine_step9_pea.js");
 const MODULE: &str = "jit-machine-step9-pea.js";
@@ -30,10 +37,17 @@ fn run(selection: JitSelection) -> (String, Vec<String>) {
         .run_script(SourceInput::from_javascript(SOURCE), MODULE)
         .expect("Step 9 widening corpus");
     let completion = result.completion_string().to_owned();
+    let warm = short_warm::warm(
+        &mut runtime,
+        "localArray(i, 2); escapeToCall(i, i + 1); capture(i);",
+        3000,
+        "jit-machine-step9-pea-warm.js",
+    );
     let ir = result
         .jit_artifacts()
         .into_iter()
         .flat_map(|batch| batch.bundles())
+        .chain(warm.bundles())
         .filter(|bundle| {
             bundle.manifest().module() == MODULE
                 && bundle.manifest().tier() == JitDebugTier::Optimizing

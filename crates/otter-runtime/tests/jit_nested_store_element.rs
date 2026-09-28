@@ -6,15 +6,15 @@
 //! - Array growth and typed-array value coercion through the same callee.
 //!
 //! # Invariants
-//! - Loop OSR is disabled: the store executes in a frameless whole-function
-//!   direct callee rather than a materialized interpreter activation.
+//! - The store executes in a frameless whole-function direct callee rather
+//!   than a materialized interpreter activation; only the allocating setter's
+//!   own loop may enter compiled code through loop OSR.
 //! - Every supported `[[Set]]` path completes in place without deoptimization.
 //! - Interpreter and production-tier observable results remain identical.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 struct FinalStats {
-    osr_attempts: u64,
     generated_calls: u64,
     property_stubs: u64,
     optimized_deopts: u64,
@@ -162,7 +162,6 @@ fn run(selection: JitSelection) -> (String, FinalStats) {
     (
         completion,
         FinalStats {
-            osr_attempts: after.jit_osr_attempts - before.jit_osr_attempts,
             generated_calls: after.jit_generated_calls - before.jit_generated_calls,
             property_stubs: after.jit_runtime_property_stubs - before.jit_runtime_property_stubs,
             optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
@@ -180,7 +179,6 @@ fn frameless_store_element_completes_object_array_and_typed_array_set() {
         oracle,
         "[[41,42.5,17,9,23],1,41,64,2,9,false,42.5,17,1,9,1,23,\"TypeError\"]"
     );
-    assert_eq!(stats.osr_attempts, 0);
     assert!(
         stats.generated_calls > 0,
         "final stores must cross a compiled caller-to-callee boundary"

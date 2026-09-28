@@ -127,7 +127,10 @@ JSON.stringify([last, result, log.join(""), caught]);
         "mix",
         r#"[["72",5,14,3.5,1,49,false,false,true,true],[11,7,18,4.5,1,81,false,false,true,true],"LRLRLRLRLRLRLRLRLRLR","boom"]"#,
     );
-    assert!(run.stats.jit_optimized_deopts <= 1, "{:?}", run.stats);
+    // At most one exact exit in `mix` when object operands first reach its
+    // numeric sites, plus one in the OSR-compiled script body when it first
+    // calls the never-called `tagged`.
+    assert!(run.stats.jit_optimized_deopts <= 2, "{:?}", run.stats);
 }
 
 #[test]

@@ -1,17 +1,19 @@
-//! Production template-tier nullish-branch and shadowed-upvalue coverage.
+//! Production template-tier nullish-branch and eval-extension lookup
+//! coverage.
 //!
 //! # Contents
 //! - `??` null/undefined branching from loop OSR.
-//! - A direct-eval `var` shadowing an outer captured binding.
+//! - A direct-eval `var` shadowing an outer captured binding through the
+//!   callee's eval extension (`LoadLookupSlot`).
 //! - An observable getter proving the nullish condition is evaluated once.
 //!
 //! # Invariants
-//! - `JumpIfNullish` stays inline while `LoadShadowedUpvalue` completes through
-//!   the shared reentrant VM helper.
+//! - `JumpIfNullish` stays inline while `LoadLookupSlot` completes through
+//!   the shared reentrant binding transition.
 //! - Template execution matches the interpreter oracle exactly.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_control_op`
+//! - `otter_vm::context_ops` — the `Lookup*` kernels.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -74,6 +76,6 @@ fn control_ops_match_oracle_with_single_getter_evaluation() {
     assert!(osr_attempts > 0, "fixture must enter at a loop OSR header");
     assert!(
         reentrant > 0,
-        "LoadShadowedUpvalue must use the shared reentrant transition"
+        "LoadLookupSlot must use the shared reentrant transition"
     );
 }

@@ -19,6 +19,9 @@
 //!   landing pad through explicit committed status control without deopt.
 //!
 //! # Invariants
+//! - The mixed boundary function is warmed from short scripts
+//!   ([`short_warm`]), so it compiles through its own entries instead of being
+//!   inlined into an OSR-compiled script body.
 //! - A cold named-property site stays in the complete Machine body and calls
 //!   the fixed boxed-value boundary exactly once per source operation. A
 //!   published body never learns semantic proof data after compilation.
@@ -44,9 +47,12 @@
 use std::collections::BTreeSet;
 
 use otter_runtime::{
-    JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTier,
-    JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
+    JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
+    RuntimeExecutionStats, SourceInput,
 };
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
 const MIXED_MODULE: &str = "jit-machine-generic-properties-setup.js";
@@ -134,16 +140,12 @@ function machineGenericPropertyBoundary(hot, takeCold, source, target, next) {
 }
 
 globalThis.__machineGenericPropertyHot = { hot: 0 };
-for (let warm = 0; warm < 5000; warm++) {
-  machineGenericPropertyBoundary(
-    __machineGenericPropertyHot,
-    false,
-    undefined,
-    undefined,
-    undefined
-  );
-}
 "#;
+
+/// 5000 hot-only warm calls; later probes read `hot.hot` from 5001 on.
+const MIXED_WARM: &str = "machineGenericPropertyBoundary(\
+     __machineGenericPropertyHot, false, undefined, undefined, undefined);";
+const MIXED_WARM_CALLS: usize = 5000;
 
 const HOT_ONLY: &str = r#"
 machineGenericPropertyBoundary(
@@ -637,6 +639,18 @@ fn completion(runtime: &mut Runtime, source: &str, module: &str) -> String {
         .to_owned()
 }
 
+/// Define the mixed boundary function and warm it from short scripts, so it
+/// compiles through its own entries.
+fn setup_mixed(runtime: &mut Runtime) -> short_warm::WarmRuns {
+    completion(runtime, MIXED_SETUP, MIXED_MODULE);
+    short_warm::warm(
+        runtime,
+        MIXED_WARM,
+        MIXED_WARM_CALLS,
+        "jit-machine-generic-properties-warm.js",
+    )
+}
+
 fn run_with_delta(runtime: &mut Runtime, source: &str, module: &str) -> (String, CounterDelta) {
     let before = runtime.execution_stats();
     let result = completion(runtime, source, module);
@@ -654,10 +668,8 @@ fn artifact_json(bundle: &JitArtifactBundle, file: JitArtifactFileName) -> serde
     .unwrap_or_else(|error| panic!("invalid {file:?} JSON: {error}"))
 }
 
-fn mixed_machine_bundle(artifacts: &JitArtifactBatch) -> &JitArtifactBundle {
-    artifacts
-        .bundles()
-        .iter()
+fn mixed_machine_bundle(warm: &short_warm::WarmRuns) -> &JitArtifactBundle {
+    warm.bundles()
         .find(|bundle| {
             let manifest = bundle.manifest();
             manifest.module() == MIXED_MODULE
@@ -668,9 +680,8 @@ fn mixed_machine_bundle(artifacts: &JitArtifactBatch) -> &JitArtifactBundle {
                     .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
         })
         .unwrap_or_else(|| {
-            let manifests = artifacts
+            let manifests = warm
                 .bundles()
-                .iter()
                 .map(|bundle| {
                     let manifest = bundle.manifest();
                     format!(
@@ -685,8 +696,8 @@ fn mixed_machine_bundle(artifacts: &JitArtifactBatch) -> &JitArtifactBundle {
         })
 }
 
-fn assert_mixed_machine_artifact(artifacts: &JitArtifactBatch) {
-    let bundle = mixed_machine_bundle(artifacts);
+fn assert_mixed_machine_artifact(warm: &short_warm::WarmRuns) {
+    let bundle = mixed_machine_bundle(warm);
     let code_map = artifact_json(bundle, JitArtifactFileName::CodeMap);
     let regions = code_map["regions"].as_array().expect("code-map regions");
     let mut property_byte_pcs = BTreeSet::new();
@@ -890,15 +901,9 @@ fn cache_ir_boolean_plumbing_preserves_live_tagged_payloads() {
 #[test]
 fn post_compile_property_misses_remain_committed_without_learning_proof_data() {
     let mut runtime = runtime(true);
-    let setup = runtime
-        .run_script(SourceInput::from_javascript(MIXED_SETUP), MIXED_MODULE)
-        .expect("mixed generic-property setup");
-    assert_mixed_machine_artifact(
-        setup
-            .jit_artifacts()
-            .expect("mixed generic-property artifacts"),
-    );
-    drop(setup);
+    let warm = setup_mixed(&mut runtime);
+    assert_mixed_machine_artifact(&warm);
+    drop(warm);
 
     let (_, hot_delta) = run_with_delta(
         &mut runtime,
@@ -995,7 +1000,7 @@ fn post_compile_property_misses_remain_committed_without_learning_proof_data() {
 #[test]
 fn post_compile_default_prototype_adds_stay_on_the_committed_boundary() {
     let mut runtime = runtime(false);
-    completion(&mut runtime, MIXED_SETUP, MIXED_MODULE);
+    setup_mixed(&mut runtime);
 
     let (first, first_delta) = run_with_delta(
         &mut runtime,
@@ -1097,7 +1102,7 @@ JSON.stringify([inheritedResult, __snapshotInherited.added, Object.keys(__snapsh
 #[test]
 fn accessor_and_proxy_effects_execute_once_and_preserve_moving_roots() {
     let mut runtime = runtime(false);
-    completion(&mut runtime, MIXED_SETUP, MIXED_MODULE);
+    setup_mixed(&mut runtime);
 
     let (accessor, accessor_delta) = run_with_delta(
         &mut runtime,

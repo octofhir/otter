@@ -4,8 +4,10 @@
 //! - Direct generated calls combining scalar queries and allocating value loads.
 //! - Dynamic class heritage and computed function naming in a generated callee.
 //! - Observable `ToPropertyKey` success and throw paths with exact effect counts.
-//! - Plain, method, and construct linkage with fresh plus inherited upvalues.
-//! - Exact direct-call artifact spine counts and abrupt side-exit behavior.
+//! - Plain, method, and construct linkage into callees that allocate their own
+//!   context under an inherited closure context.
+//! - Direct-call artifacts for every linkage family and abrupt side-exit
+//!   behavior.
 //!
 //! # Invariants
 //! - Supported operations complete against the published native frame without
@@ -174,7 +176,7 @@ fn observable_coercion_commits_or_throws_without_replay() {
     }
 }
 
-const UPVALUE_CALL_FAMILIES: &str = r#"
+const CONTEXT_CALL_FAMILIES: &str = r#"
 function makePlain(offset) {
   return function plain(value) {
     let captured = value;
@@ -219,11 +221,11 @@ run(1000);
 "#;
 
 #[test]
-fn generated_plain_method_and_construct_calls_own_stack_upvalue_spines() {
-    let (oracle, _) = run(UPVALUE_CALL_FAMILIES, JitSelection::InterpreterOnly);
+fn generated_plain_method_and_construct_calls_create_callee_contexts() {
+    let (oracle, _) = run(CONTEXT_CALL_FAMILIES, JitSelection::InterpreterOnly);
     assert_eq!(oracle, "1504500");
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let (compiled, stats) = run(UPVALUE_CALL_FAMILIES, selection);
+        let (compiled, stats) = run(CONTEXT_CALL_FAMILIES, selection);
         assert_eq!(compiled, oracle);
         assert!(
             stats.jit_generated_calls > 1000,
@@ -237,17 +239,17 @@ fn generated_plain_method_and_construct_calls_own_stack_upvalue_spines() {
             stats.jit_generated_template_deopts, 0,
             "{selection:?}: {stats:?}"
         );
-        if selection == JitSelection::Template {
-            // The hot plain/method/construct families stay native; only the
-            // cold top-level `run(1000)` call and native `String(checksum)`
-            // may cross the generic boundary.
-            assert!(
-                stats.jit_to_rust_call_transitions <= 2,
-                "the template caller must keep every hot call family native: {stats:?}"
-            );
+        if selection != JitSelection::Template {
+            continue;
         }
-
-        let (event_completion, events) = run_with_events(UPVALUE_CALL_FAMILIES, selection);
+        // The hot plain/method/construct families stay native; only the
+        // cold top-level `run(1000)` call and native `String(checksum)` may
+        // cross the generic boundary.
+        assert!(
+            stats.jit_to_rust_call_transitions <= 2,
+            "the template caller must keep every hot call family native: {stats:?}"
+        );
+        let (event_completion, events) = run_with_events(CONTEXT_CALL_FAMILIES, selection);
         assert_eq!(event_completion, oracle);
         for expected in [
             JitDirectCallKind::Plain,
@@ -270,7 +272,7 @@ fn generated_plain_method_and_construct_calls_own_stack_upvalue_spines() {
 }
 
 #[test]
-fn direct_call_artifacts_publish_exact_upvalue_spine_contracts() {
+fn direct_call_artifacts_link_every_family_to_context_allocating_callees() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::Template)
         .jit_debug(JitDebugRequest::artifacts())
@@ -278,14 +280,32 @@ fn direct_call_artifacts_publish_exact_upvalue_spine_contracts() {
         .expect("artifact runtime");
     let completion = runtime
         .run_script(
-            SourceInput::from_javascript(UPVALUE_CALL_FAMILIES),
-            "jit-upvalue-call-family-artifacts.js",
+            SourceInput::from_javascript(CONTEXT_CALL_FAMILIES),
+            "jit-context-call-family-artifacts.js",
         )
         .expect("artifact completion");
     assert_eq!(completion.completion_string(), "1504500");
     let artifacts = completion.jit_artifacts().expect("artifact batch");
     let mut generated_kinds = std::collections::BTreeSet::new();
+    let mut context_allocating_callees = std::collections::BTreeSet::new();
     for bundle in artifacts.bundles() {
+        if let Some(file) = bundle.file(JitArtifactFileName::Relocations) {
+            let relocations: serde_json::Value =
+                serde_json::from_slice(file.contents()).expect("valid relocation JSON");
+            let allocates_context =
+                relocations["relocations"]
+                    .as_array()
+                    .is_some_and(|relocations| {
+                        relocations.iter().any(|relocation| {
+                            relocation["target"]["kind"] == "runtimeStub"
+                                && relocation["target"]["name"] == "create_context_alloc"
+                        })
+                    });
+            let name = bundle.manifest().function_name();
+            if allocates_context && matches!(name, "plain" | "method" | "Box") {
+                context_allocating_callees.insert(name.to_owned());
+            }
+        }
         let Some(file) = bundle.file(JitArtifactFileName::CodeMap) else {
             continue;
         };
@@ -294,11 +314,7 @@ fn direct_call_artifacts_publish_exact_upvalue_spine_contracts() {
         let Some(regions) = map["regions"].as_array() else {
             continue;
         };
-        for direct in regions
-            .iter()
-            .filter_map(|region| region.get("directCall"))
-            .filter(|direct| direct["ownUpvalueCount"] == 1 && direct["inheritedUpvalueCount"] == 1)
-        {
+        for direct in regions.iter().filter_map(|region| region.get("directCall")) {
             if let Some(kind) = direct["callKind"].as_str() {
                 generated_kinds.insert(kind.to_owned());
             }
@@ -310,11 +326,21 @@ fn direct_call_artifacts_publish_exact_upvalue_spine_contracts() {
             .into_iter()
             .map(str::to_owned)
             .collect(),
-        "every generated outer edge must expose its exact fresh/inherited spine"
+        "every call family must publish a generated direct-call edge"
+    );
+    // Each callee allocates the context of its captured `let` itself; the
+    // caller's edge carries no capture state.
+    assert_eq!(
+        context_allocating_callees,
+        ["Box", "method", "plain"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        "every callee must allocate its own context"
     );
 }
 
-const UPVALUE_THROW_FAMILIES: &str = r#"
+const CONTEXT_THROW_FAMILIES: &str = r#"
 let effects = 0;
 function makePlain(offset) {
   return function plain(value) {
@@ -357,11 +383,11 @@ JSON.stringify([effects, caught]);
 "#;
 
 #[test]
-fn upvalue_spine_abrupt_paths_commit_once_across_generated_side_exits() {
-    let (oracle, _) = run(UPVALUE_THROW_FAMILIES, JitSelection::InterpreterOnly);
+fn context_abrupt_paths_commit_once_across_generated_side_exits() {
+    let (oracle, _) = run(CONTEXT_THROW_FAMILIES, JitSelection::InterpreterOnly);
     assert_eq!(oracle, "[3,3]");
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let (compiled, stats) = run(UPVALUE_THROW_FAMILIES, selection);
+        let (compiled, stats) = run(CONTEXT_THROW_FAMILIES, selection);
         assert_eq!(compiled, oracle);
         assert!(stats.jit_generated_calls > 1000, "{selection:?}: {stats:?}");
         // A callee throw unwinds through the throw-routing transition straight

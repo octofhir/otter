@@ -11,6 +11,9 @@
 //!   and reuse of the same optimized body.
 //!
 //! # Invariants
+//! - Fixtures whose function owns no loop are warmed from short scripts
+//!   ([`short_warm`]), so the function compiles through its own entries
+//!   instead of being inlined into an OSR-compiled script body.
 //! - Every hot function publishes through the scalar Machine IR backend and
 //!   attributes every property region to its source bytecode PC.
 //! - A settled monomorphic own-data load lowers to a shape proof, one exact
@@ -28,9 +31,12 @@
 //!   AArch64 emission.
 
 use otter_runtime::{
-    JitArtifactBatch, JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
+    JitArtifactBundle, JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
     SourceInput,
 };
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
 
@@ -85,11 +91,10 @@ function machinePolymorphicProperty(record, value) {
 
 globalThis.__machinePropertyShapeA = makeMachinePropertyShapeA(1);
 globalThis.__machinePropertyShapeB = makeMachinePropertyShapeB(2);
-for (let warm = 0; warm < 5000; warm++) {
-  machinePolymorphicProperty(__machinePropertyShapeA, warm);
-  machinePolymorphicProperty(__machinePropertyShapeB, (warm & 1) === 0);
-}
 "#;
+
+const POLYMORPHIC_WARM: &str = "machinePolymorphicProperty(__machinePropertyShapeA, i); \
+     machinePolymorphicProperty(__machinePropertyShapeB, (i & 1) === 0);";
 
 const POLYMORPHIC_FINAL: &str = r#"
 globalThis.__machinePropertyFinalA = makeMachinePropertyShapeA(10);
@@ -182,10 +187,9 @@ function machineColdPropertyBranch(record, takeCold, value) {
 }
 
 globalThis.__machineColdPropertyWarm = makeMachineColdPropertyRecord(0);
-for (let warm = 0; warm < 5000; warm++) {
-  machineColdPropertyBranch(__machineColdPropertyWarm, false, 0);
-}
 "#;
+
+const COLD_BRANCH_WARM: &str = "machineColdPropertyBranch(__machineColdPropertyWarm, false, 0);";
 
 const COLD_BRANCH_FINAL: &str = r#"
 globalThis.__machineColdPropertyFinal = makeMachineColdPropertyRecord(5);
@@ -326,7 +330,7 @@ struct Sites {
 }
 
 fn assert_machine_property_artifact(
-    artifacts: &JitArtifactBatch,
+    bundles: &[&JitArtifactBundle],
     module: &str,
     function_name: &str,
     sites: Sites,
@@ -337,9 +341,9 @@ fn assert_machine_property_artifact(
         cold_loads,
         stores,
     } = sites;
-    let bundle = artifacts
-        .bundles()
+    let bundle = bundles
         .iter()
+        .copied()
         .find(|bundle| {
             let manifest = bundle.manifest();
             manifest.module() == module
@@ -350,8 +354,7 @@ fn assert_machine_property_artifact(
                     .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
         })
         .unwrap_or_else(|| {
-            let manifests = artifacts
-                .bundles()
+            let manifests = bundles
                 .iter()
                 .map(|bundle| {
                     let manifest = bundle.manifest();
@@ -507,6 +510,7 @@ fn run_fixture(
     selection: JitSelection,
     setup: &'static str,
     setup_module: &'static str,
+    warm: Option<&'static str>,
     function_name: &'static str,
     sites: Sites,
     final_source: &'static str,
@@ -516,16 +520,25 @@ fn run_fixture(
     let setup_result = runtime
         .run_script(SourceInput::from_javascript(setup), setup_module)
         .unwrap_or_else(|error| panic!("Machine property setup {setup_module}: {error:?}"));
+    let warm = warm.map(|statement| {
+        short_warm::warm(
+            &mut runtime,
+            statement,
+            3000,
+            "jit-machine-properties-warm.js",
+        )
+    });
     if matches!(selection, JitSelection::ProductionTiered) {
-        assert_machine_property_artifact(
-            setup_result
-                .jit_artifacts()
-                .expect("enabled Machine property artifact batch"),
-            setup_module,
-            function_name,
-            sites,
-        );
+        let bundles = setup_result
+            .jit_artifacts()
+            .expect("enabled Machine property artifact batch")
+            .bundles()
+            .iter()
+            .chain(warm.iter().flat_map(short_warm::WarmRuns::bundles))
+            .collect::<Vec<_>>();
+        assert_machine_property_artifact(&bundles, setup_module, function_name, sites);
     }
+    drop(warm);
     drop(setup_result);
 
     let before = runtime.execution_stats();
@@ -556,9 +569,12 @@ fn run_barrier_fixture(selection: JitSelection) -> BarrierRun {
         .expect("Machine property barrier setup");
     if matches!(selection, JitSelection::ProductionTiered) {
         assert_machine_property_artifact(
-            setup
+            &setup
                 .jit_artifacts()
-                .expect("enabled Machine property barrier artifacts"),
+                .expect("enabled Machine property barrier artifacts")
+                .bundles()
+                .iter()
+                .collect::<Vec<_>>(),
             "jit-machine-properties-barrier-setup.js",
             "machinePropertyBarrier",
             Sites {
@@ -630,6 +646,7 @@ fn monomorphic_numeric_rmw_uses_machine_properties_without_deopt() {
         JitSelection::InterpreterOnly,
         MONOMORPHIC_SETUP,
         "jit-machine-properties-rmw-setup.js",
+        None,
         "machinePropertyRmw",
         Sites {
             cache_ir_loads: 0,
@@ -644,6 +661,7 @@ fn monomorphic_numeric_rmw_uses_machine_properties_without_deopt() {
         JitSelection::ProductionTiered,
         MONOMORPHIC_SETUP,
         "jit-machine-properties-rmw-setup.js",
+        None,
         "machinePropertyRmw",
         Sites {
             cache_ir_loads: 0,
@@ -681,6 +699,7 @@ fn two_shape_load_store_and_boolean_existing_slot_stay_generated() {
         JitSelection::InterpreterOnly,
         POLYMORPHIC_SETUP,
         "jit-machine-properties-polymorphic-setup.js",
+        Some(POLYMORPHIC_WARM),
         "machinePolymorphicProperty",
         Sites {
             cache_ir_loads: 1,
@@ -695,6 +714,7 @@ fn two_shape_load_store_and_boolean_existing_slot_stay_generated() {
         JitSelection::ProductionTiered,
         POLYMORPHIC_SETUP,
         "jit-machine-properties-polymorphic-setup.js",
+        Some(POLYMORPHIC_WARM),
         "machinePolymorphicProperty",
         Sites {
             cache_ir_loads: 1,
@@ -732,6 +752,7 @@ fn accessor_miss_completes_in_place_and_runs_getter_and_setter_once() {
         JitSelection::InterpreterOnly,
         ACCESSOR_SETUP,
         "jit-machine-properties-accessor-setup.js",
+        None,
         "machineAccessorProperty",
         Sites {
             cache_ir_loads: 1,
@@ -746,6 +767,7 @@ fn accessor_miss_completes_in_place_and_runs_getter_and_setter_once() {
         JitSelection::ProductionTiered,
         ACCESSOR_SETUP,
         "jit-machine-properties-accessor-setup.js",
+        None,
         "machineAccessorProperty",
         Sites {
             cache_ir_loads: 1,
@@ -783,6 +805,7 @@ fn never_taken_unprofiled_property_branch_completes_once_without_deopt() {
         JitSelection::InterpreterOnly,
         COLD_BRANCH_SETUP,
         "jit-machine-properties-cold-setup.js",
+        Some(COLD_BRANCH_WARM),
         "machineColdPropertyBranch",
         Sites {
             cache_ir_loads: 0,
@@ -797,6 +820,7 @@ fn never_taken_unprofiled_property_branch_completes_once_without_deopt() {
         JitSelection::ProductionTiered,
         COLD_BRANCH_SETUP,
         "jit-machine-properties-cold-setup.js",
+        Some(COLD_BRANCH_WARM),
         "machineColdPropertyBranch",
         Sites {
             cache_ir_loads: 0,
@@ -834,6 +858,7 @@ fn array_string_and_ordinary_object_length_share_one_machine_site() {
         JitSelection::InterpreterOnly,
         LENGTH_SETUP,
         "jit-machine-properties-length-setup.js",
+        None,
         "machinePropertyLength",
         Sites {
             cache_ir_loads: 1,
@@ -848,6 +873,7 @@ fn array_string_and_ordinary_object_length_share_one_machine_site() {
         JitSelection::ProductionTiered,
         LENGTH_SETUP,
         "jit-machine-properties-length-setup.js",
+        None,
         "machinePropertyLength",
         Sites {
             cache_ir_loads: 1,
@@ -885,6 +911,7 @@ fn string_length_beyond_int32_completes_in_place_without_wrapping() {
         JitSelection::InterpreterOnly,
         LENGTH_SETUP,
         "jit-machine-properties-long-string-setup.js",
+        None,
         "machinePropertyLength",
         Sites {
             cache_ir_loads: 1,
@@ -899,6 +926,7 @@ fn string_length_beyond_int32_completes_in_place_without_wrapping() {
         JitSelection::ProductionTiered,
         LENGTH_SETUP,
         "jit-machine-properties-long-string-setup.js",
+        None,
         "machinePropertyLength",
         Sites {
             cache_ir_loads: 1,

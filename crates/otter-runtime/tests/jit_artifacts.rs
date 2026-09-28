@@ -678,6 +678,10 @@ for (let warm = 0; warm < 64; warm++) {
   sumMany(1, 2, 3, 4, 5, 6, 7);
 }
 
+// Seven construct arguments exceed the packed register lanes, so the
+// generic construct reads them from a template operand slice.
+function Wide(a, b, c, d, e, f, g) { this.sum = a + b + c + d + e + f + g; }
+
 function hot(limit) {
   const bias = 2;
   const addBias = value => value + bias;
@@ -689,6 +693,7 @@ function hot(limit) {
     total += entries.get("key");
     total += addBias(i);
     total += sumMany(1, 2, 3, 4, 5, 6, 7);
+    total += new Wide(1, 2, 3, 4, 5, 6, 7).sum;
   }
   return total;
 }

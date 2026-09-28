@@ -5,10 +5,16 @@
 //! - Caller effects, callee coercion and return continuation exactly once.
 //!
 //! # Invariants
+//! - Warm-up calls come from short scripts ([`short_warm`]), so the caller
+//!   compiles through its own entries instead of being inlined into an
+//!   OSR-compiled script body.
 //! - A source inlining claim requires emitted IR and real optimizing entries.
 //! - A body exit reconstructs the callee and the caller after its call.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 #[test]
 fn scalar_inline_body_and_deopt_preserve_call_continuation() {
@@ -17,29 +23,36 @@ fn scalar_inline_body_and_deopt_preserve_call_continuation() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .unwrap();
-    let warm = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(
                 r#"
 function leaf(x) { return x + 3; }
 function caller(x, mark) { mark.n++; var y = leaf(x); return y + 10; }
 var mark = {n:0};
-for(var i=0;i<70000;i++) caller(2,mark);
 "#,
             ),
             "inline-warm.js",
         )
         .unwrap();
+    let warm = short_warm::warm(
+        &mut runtime,
+        "caller(2, mark);",
+        3000,
+        "inline-warm-calls.js",
+    );
     let bundle = warm
-        .jit_artifacts()
-        .unwrap()
         .bundles()
-        .iter()
         .find(|bundle| {
             bundle.manifest().function_name() == "caller"
                 && bundle.file(JitArtifactFileName::OptimizedIr).is_some()
         })
-        .unwrap_or_else(|| panic!("caller must optimize: {:?}", warm.jit_debug_report()));
+        .unwrap_or_else(|| {
+            panic!(
+                "caller must optimize: {:?}",
+                warm.events().collect::<Vec<_>>()
+            )
+        });
     let ir = String::from_utf8_lossy(
         bundle
             .file(JitArtifactFileName::OptimizedIr)
@@ -95,19 +108,15 @@ JSON.stringify([value, mark.n-countBefore, conversions]);
         "a real body exit must reconstruct the leaf activation"
     );
     assert!(
-        warm.jit_debug_report()
-            .unwrap()
-            .events()
-            .iter()
-            .any(|event| matches!(
-                event,
-                otter_runtime::JitDebugEvent::InlineLowered {
-                    parent_function_id: 2,
-                    callee_function_id: 1,
-                    outcome: otter_vm::JitInlineLoweringOutcome::Inlined,
-                    ..
-                }
-            )),
+        warm.events().any(|event| matches!(
+            event,
+            otter_runtime::JitDebugEvent::InlineLowered {
+                parent_function_id: 2,
+                callee_function_id: 1,
+                outcome: otter_vm::JitInlineLoweringOutcome::Inlined,
+                ..
+            }
+        )),
         "successful Machine compilation must report the actual splice"
     );
 }
@@ -119,23 +128,20 @@ fn branching_inline_returns_and_identity_miss() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .unwrap();
-    let warm = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(
                 r#"
 function choose(x) { if (x < 0) return x - 3; return x * 2; }
 function caller(x) { return choose(x) + choose(-x); }
-for(var i=0;i<70000;i++) caller(2);
 "#,
             ),
             "inline-branch-warm.js",
         )
         .unwrap();
+    let warm = short_warm::warm(&mut runtime, "caller(2);", 3000, "inline-branch-calls.js");
     let bundle = warm
-        .jit_artifacts()
-        .unwrap()
         .bundles()
-        .iter()
         .find(|bundle| {
             bundle.manifest().function_name() == "caller"
                 && bundle.file(JitArtifactFileName::OptimizedIr).is_some()
@@ -283,23 +289,20 @@ fn inline_arrow_restores_exact_closure_and_lexical_this() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .unwrap();
-    let warm = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(
                 r#"
 var leaf=(function(){'use strict';return (x)=>this+x;}).call(7);
 function caller(x){ return leaf(x); }
-for(var i=0;i<70000;i++) caller(2);
 "#,
             ),
             "inline-arrow-warm.js",
         )
         .unwrap();
+    let warm = short_warm::warm(&mut runtime, "caller(2);", 3000, "inline-arrow-calls.js");
     let bundle = warm
-        .jit_artifacts()
-        .unwrap()
         .bundles()
-        .iter()
         .find(|bundle| {
             bundle.manifest().function_name() == "caller"
                 && bundle.file(JitArtifactFileName::OptimizedIr).is_some()

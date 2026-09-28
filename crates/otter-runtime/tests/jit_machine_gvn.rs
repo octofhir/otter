@@ -8,6 +8,9 @@
 //!   to one dominating instruction.
 //!
 //! # Invariants
+//! - The corpus warms its functions from one script loop, which the optimizing
+//!   tier OSR-compiles and inlines into; `duplicateDecode` is warmed again from
+//!   short scripts ([`short_warm`]) so it compiles through its own entries.
 //! - Observable reads are never reused across an invalidating effect.
 //! - The optimized body publishes an explicit non-zero GVN/guard count.
 //! - The surviving scalar value is used twice; there is no second lowering or
@@ -16,6 +19,9 @@
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime, SourceInput,
 };
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 const SOURCE: &str = include_str!("../../otter-difftest/corpus/machine_step7_effects.js");
 const MODULE: &str = "jit-machine-step7-effects.js";
@@ -32,23 +38,28 @@ fn run(selection: JitSelection) -> (String, Option<String>) {
         .run_script(SourceInput::from_javascript(SOURCE), MODULE)
         .expect("Step 7 widening corpus");
     let completion = result.completion_string().to_owned();
-    let ir = result.jit_artifacts().and_then(|batch| {
-        batch.bundles().iter().find_map(|bundle| {
-            let manifest = bundle.manifest();
-            (manifest.module() == MODULE
-                && manifest.function_name() == "duplicateDecode"
-                && manifest.tier() == JitDebugTier::Optimizing)
-                .then(|| {
-                    String::from_utf8(
-                        bundle
-                            .file(JitArtifactFileName::OptimizedIr)
-                            .expect("duplicateDecode optimized IR")
-                            .contents()
-                            .to_vec(),
-                    )
-                    .expect("UTF-8 optimized IR")
-                })
-        })
+    drop(result);
+    let warm = short_warm::warm(
+        &mut runtime,
+        "duplicateDecode(warmRecord);",
+        3000,
+        "jit-machine-step7-duplicate-decode.js",
+    );
+    let ir = warm.bundles().find_map(|bundle| {
+        let manifest = bundle.manifest();
+        (manifest.module() == MODULE
+            && manifest.function_name() == "duplicateDecode"
+            && manifest.tier() == JitDebugTier::Optimizing)
+            .then(|| {
+                String::from_utf8(
+                    bundle
+                        .file(JitArtifactFileName::OptimizedIr)
+                        .expect("duplicateDecode optimized IR")
+                        .contents()
+                        .to_vec(),
+                )
+                .expect("UTF-8 optimized IR")
+            })
     });
     (completion, ir)
 }

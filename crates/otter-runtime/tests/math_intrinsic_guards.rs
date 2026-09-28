@@ -598,7 +598,7 @@ for (let warm = 0; warm < 4010; warm++) invokeMappedMath(mappedMath.receiver);
             ),
             "7"
         );
-        // Updating the captured parameter changes its UpvalueCell without
+        // Updating the captured parameter changes its context slot without
         // changing the arguments object's shape or its original slot value.
         math_completion(
             &mut runtime,

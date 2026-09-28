@@ -8,8 +8,14 @@
 //! # Invariants
 //! - Tests require optimizing artifacts, not merely interpreter-equivalent output.
 //! - Error construction and message effects occur once across native boundaries.
+//! - The throw fixture is warmed from short scripts ([`short_warm`]), so each
+//!   function compiles through its own entries instead of being inlined into
+//!   an OSR-compiled script body.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 #[test]
 fn machine_error_allocation_preserves_native_callers_and_message_effects() {
@@ -122,18 +128,26 @@ fn machine_throw_preserves_values_and_local_catch_edges() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .unwrap();
-    let warm = runtime.run_script(SourceInput::from_javascript(r#"
+    runtime.run_script(SourceInput::from_javascript(r#"
 function throwValue(flag, value) { if (flag) throw value; return value; }
 function catchValue(flag, value) { try { return throwValue(flag, value); } catch (caught) { return caught; } }
 function localThrow(flag, value) { try { if (flag) throw value; return value; } catch (caught) { return caught; } }
 function nativeThrowCaller(flag, value) { return throwValue(flag, value); }
 var throwWarm = 0;
-for (var throwWarmI = 0; throwWarmI < 70000; throwWarmI++) {
-  throwWarm += catchValue(false, 1) + localThrow(false, 1) + nativeThrowCaller(false, 1);
-}
-throwWarm;
 "#), "machine-throw-warm.js").expect("throw warmup");
-    assert_eq!(warm.completion_string(), "210000");
+    let warm = short_warm::warm(
+        &mut runtime,
+        "throwWarm += catchValue(false, 1) + localThrow(false, 1) + nativeThrowCaller(false, 1);",
+        5000,
+        "machine-throw-warm-calls.js",
+    );
+    let warmed = runtime
+        .run_script(
+            SourceInput::from_javascript("throwWarm;"),
+            "machine-throw-warm-total.js",
+        )
+        .expect("throw warmup total");
+    assert_eq!(warmed.completion_string(), "15000");
     for name in [
         "throwValue",
         "catchValue",
@@ -141,14 +155,10 @@ throwWarm;
         "nativeThrowCaller",
     ] {
         assert!(
-            warm.jit_artifacts()
-                .unwrap()
-                .bundles()
-                .iter()
-                .any(|b| b.manifest().function_name() == name
-                    && b.file(JitArtifactFileName::OptimizedIr).is_some()),
+            warm.bundles().any(|b| b.manifest().function_name() == name
+                && b.file(JitArtifactFileName::OptimizedIr).is_some()),
             "{name} must compile: {:?}",
-            warm.jit_debug_report()
+            warm.events().collect::<Vec<_>>()
         );
     }
     let before = runtime.execution_stats();

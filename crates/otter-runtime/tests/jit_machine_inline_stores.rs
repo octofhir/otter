@@ -5,10 +5,16 @@
 //! - Moving values and exact exits after a committed field initialization.
 //!
 //! # Invariants
+//! - Warm-up calls come from short scripts ([`short_warm`]), so the tested
+//!   function compiles through its own entries instead of being inlined into
+//!   an OSR-compiled script body.
 //! - Initializer calls disappear from caller Machine IR.
 //! - Setter effects commit once with callee source frames still published.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 #[test]
 fn inline_initializer_stores_commit_once() {
@@ -17,7 +23,7 @@ fn inline_initializer_stores_commit_once() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .unwrap();
-    let warm = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(
                 r#"
@@ -27,22 +33,29 @@ var payload={value:37},o={x:null,bias:1.25},mark={before:0,after:0};
 // Two shapes of `o` keep the store and the `bias` read CacheIR probes with
 // committed cold siblings, so an installed setter returns to this body.
 var o2={w:0,x:null,bias:1.25};
-for(var i=0;i<70000;i++)caller((i&1)?o2:o,payload,mark);
 "#,
             ),
             "inline-store-warm.js",
         )
         .unwrap();
+    let warm = short_warm::warm(
+        &mut runtime,
+        "caller((i & 1) ? o2 : o, payload, mark);",
+        3000,
+        "inline-store-calls.js",
+    );
     let bundle = warm
-        .jit_artifacts()
-        .unwrap()
         .bundles()
-        .iter()
         .find(|bundle| {
             bundle.manifest().function_name() == "caller"
                 && bundle.file(JitArtifactFileName::OptimizedIr).is_some()
         })
-        .unwrap_or_else(|| panic!("caller must optimize: {:?}", warm.jit_debug_report()));
+        .unwrap_or_else(|| {
+            panic!(
+                "caller must optimize: {:?}",
+                warm.events().collect::<Vec<_>>()
+            )
+        });
     let ir = String::from_utf8_lossy(
         bundle
             .file(JitArtifactFileName::OptimizedIr)

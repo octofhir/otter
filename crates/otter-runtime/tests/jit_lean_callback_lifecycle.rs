@@ -16,8 +16,13 @@
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 const SOURCE: &str = r#"
+// Enough straight-line arithmetic that compiling the callback pays for
+// itself within the warm-up's callback entries.
 function addOne(value) {
-  return value + 1;
+  let next = value + 1;
+  next = next * 1; next = next + 0; next = next * 1; next = next + 0;
+  next = next * 1; next = next + 0; next = next * 1; next = next + 0;
+  return next;
 }
 
 const ints = [1, 2, 3, 4];

@@ -855,6 +855,25 @@ pub(crate) fn set_prototype_native(name: &str) -> Option<crate::native_function:
 /// while flattening is swallowed because the collection op itself will
 /// surface the real allocation failure.
 #[inline]
+fn flatten_key_argument(ctx: &mut NativeCtx<'_>, args: &[Value]) {
+    if let Some(key) = args.first() {
+        flatten_string_key(ctx, key);
+    }
+}
+
+/// Argument `index` read after an allocation. The collector rewrites the
+/// rooted argument slots in place through raw pointers, so the read must not
+/// be served from a load the compiler made before the allocation.
+#[inline]
+fn argument_after_allocation(args: &[Value], index: usize) -> Value {
+    args.get(index).map_or(Value::undefined(), |slot| {
+        // SAFETY: `slot` is an initialized `Value` in the live argument
+        // window; a volatile read only forces a fresh load of it.
+        unsafe { std::ptr::read_volatile(slot) }
+    })
+}
+
+#[inline]
 fn flatten_string_key(ctx: &mut NativeCtx<'_>, key: &Value) {
     if let Some(s) = key.as_string(ctx.heap()) {
         let _ = s.flatten_in_place(ctx.heap_mut());
@@ -862,33 +881,41 @@ fn flatten_string_key(ctx: &mut NativeCtx<'_>, key: &Value) {
 }
 
 pub(crate) fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let m = receiver_map(ctx, "Map.prototype.get")?;
-    let key = args.first().cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &key);
+    let key = argument_after_allocation(args, 0);
     Ok(collections::map_get(m, ctx.heap(), &key).unwrap_or(Value::undefined()))
 }
 
 pub(crate) fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let mut m = receiver_map(ctx, "Map.prototype.set")?;
-    let key = args.first().cloned().unwrap_or(Value::undefined());
-    let value = args.get(1).cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &key);
+    let key = argument_after_allocation(args, 0);
+    let value = argument_after_allocation(args, 1);
     ctx.map_set(&mut m, key, value)
         .map_err(|_| oom("Map.prototype.set"))?;
     Ok(Value::map(m))
 }
 
 pub(crate) fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let m = receiver_map(ctx, "Map.prototype.has")?;
-    let key = args.first().cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &key);
+    let key = argument_after_allocation(args, 0);
     Ok(Value::boolean(collections::map_has(m, ctx.heap(), &key)))
 }
 
 fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let m = receiver_map(ctx, "Map.prototype.delete")?;
-    let key = args.first().cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &key);
+    let key = argument_after_allocation(args, 0);
     Ok(Value::boolean(collections::map_delete(
         m,
         ctx.heap_mut(),
@@ -1098,25 +1125,31 @@ fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 // ---------------------------------------------------------------
 
 fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let mut s = receiver_set(ctx, "Set.prototype.add")?;
-    let v = args.first().cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &v);
+    let v = argument_after_allocation(args, 0);
     ctx.set_add(&mut s, v)
         .map_err(|_| oom("Set.prototype.add"))?;
     Ok(Value::set(s))
 }
 
 pub(crate) fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let s = receiver_set(ctx, "Set.prototype.has")?;
-    let v = args.first().cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &v);
+    let v = argument_after_allocation(args, 0);
     Ok(Value::boolean(collections::set_has(s, ctx.heap(), &v)))
 }
 
 fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Flattening allocates: flatten through the rooted argument slot first,
+    // then read the receiver and the arguments.
+    flatten_key_argument(ctx, args);
     let s = receiver_set(ctx, "Set.prototype.delete")?;
-    let v = args.first().cloned().unwrap_or(Value::undefined());
-    flatten_string_key(ctx, &v);
+    let v = argument_after_allocation(args, 0);
     Ok(Value::boolean(collections::set_delete(
         s,
         ctx.heap_mut(),

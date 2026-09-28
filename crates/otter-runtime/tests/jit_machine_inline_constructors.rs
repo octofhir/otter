@@ -5,10 +5,16 @@
 //! - Object/primitive return selection and exact post-allocation exits.
 //!
 //! # Invariants
+//! - Warm-up calls come from short scripts ([`short_warm`]), so the tested
+//!   function compiles through its own entries instead of being inlined into
+//!   an OSR-compiled script body.
 //! - Artifacts prove actual receiver probes and inlined field operations.
 //! - Numeric exits retain the allocated receiver and new.target without replay.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 #[test]
 fn inline_base_constructor_allocates_and_resumes_once() {
@@ -21,23 +27,26 @@ fn inline_base_constructor_allocates_and_resumes_once() {
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .build()
             .unwrap();
-        let warm = runtime
+        runtime
             .run_script(
                 SourceInput::from_javascript(format!(
                     "{declaration}\n{}",
                     r#"
 function make(x,replacement){return new C(x,replacement);}
-var payload={count:0,saved:null,value:1.25};for(var i=0;i<70000;i++)make(payload,5);
+var payload={count:0,saved:null,value:1.25};
 "#
                 )),
                 "inline-construct-warm.js",
             )
             .unwrap();
+        let warm = short_warm::warm(
+            &mut runtime,
+            "make(payload, 5);",
+            3000,
+            "inline-construct-calls.js",
+        );
         let irs = warm
-            .jit_artifacts()
-            .unwrap()
             .bundles()
-            .iter()
             .filter(|b| b.manifest().function_name() == "make")
             .filter_map(|b| b.file(JitArtifactFileName::OptimizedIr))
             .map(|f| String::from_utf8_lossy(f.contents()).into_owned())
@@ -51,7 +60,7 @@ var payload={count:0,saved:null,value:1.25};for(var i=0;i<70000;i++)make(payload
                     && ir.contains("BaseConstructResult")
                     && ir.contains("PropertyStoreDispatch {")),
             "factory must splice constructor allocation and fields: {irs:#?}; {:?}",
-            warm.jit_debug_report()
+            warm.events().collect::<Vec<_>>()
         );
         let before = runtime.execution_stats();
         let steady = runtime

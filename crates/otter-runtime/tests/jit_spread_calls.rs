@@ -20,7 +20,9 @@
 //! # See also
 //! - `otter_vm::Interpreter::jit_runtime_spread_call_op`
 
-use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
+use otter_runtime::{
+    JitDebugEvent, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
+};
 
 const SOURCE: &str = r#"
 let getterEffects = 0;
@@ -113,33 +115,53 @@ function stackOwnedCaller(rounds) {
 String(stackOwnedCaller(5000));
 "#;
 
-fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats) {
+fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats, Vec<JitDebugEvent>) {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
+        .jit_debug(JitDebugRequest::events())
         .build()
         .expect("stack-owned spread runtime");
-    let completion = runtime
+    let result = runtime
         .run_script(
             SourceInput::from_javascript(STACK_OWNED_ARRAY_SPREAD),
             "jit-stack-owned-array-spread.js",
         )
-        .expect("stack-owned spread completion")
-        .completion_string()
-        .to_owned();
-    (completion, runtime.execution_stats())
+        .expect("stack-owned spread completion");
+    let events = result
+        .jit_debug_report()
+        .expect("events enabled")
+        .events()
+        .to_vec();
+    (
+        result.completion_string().to_owned(),
+        runtime.execution_stats(),
+        events,
+    )
 }
 
 #[test]
 fn generated_spread_wrapper_completes_without_entry_deopt() {
-    let (completion, stats) = run_stack_owned_array_spread();
+    let (completion, stats, events) = run_stack_owned_array_spread();
     assert_eq!(completion, "12507500");
     assert!(
         stats.jit_generated_template_returns > 1000,
         "the generated wrapper must complete natively: {stats:?}"
     );
-    assert_eq!(
-        stats.jit_generated_template_deopts, 0,
-        "default Array spread must not side-exit at iterator collection"
+    // An interrupt exit hands the running wrapper to the tier-up policy; any
+    // other exit would be a side exit at iterator collection.
+    let side_exits = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                JitDebugEvent::GeneratedCallDeopt { exit_reason, .. }
+                    if *exit_reason != otter_vm::native_abi::ExitReason::Interrupt
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        side_exits.is_empty(),
+        "default Array spread must not side-exit at iterator collection: {side_exits:?}"
     );
 }
 

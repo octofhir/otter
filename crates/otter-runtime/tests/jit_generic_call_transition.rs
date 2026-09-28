@@ -3,8 +3,8 @@
 //! # Contents
 //! - A hot function whose plain call site alternates between two closures,
 //!   so no monomorphic direct-call plan exists.
-//! - A plain call and a receiver call with six arguments, wider than the
-//!   four-lane direct packing.
+//! - A plain call and a receiver call with six arguments, which take generated
+//!   direct edges through the wide argument linkage.
 //! - A template callee entered only through generated direct calls whose body
 //!   calls natives without a declared leaf (`Math.floor`, `Math.max`).
 //!
@@ -99,11 +99,12 @@ fn calls_without_a_generated_edge_match_the_interpreter_on_every_tier() {
 fn calls_without_a_generated_edge_complete_in_place() {
     let (_, transitions, osr_attempts) = run(JitSelection::Template);
     assert!(osr_attempts > 0, "the loops must enter compiled code");
-    // Both loops run thousands of iterations inside compiled bodies; each
-    // unplanned call crosses the in-place transition once instead of leaving
-    // the body, so the transition count tracks the call count.
+    // The polymorphic loop runs over a thousand iterations inside compiled
+    // bodies; each unplanned call crosses the in-place transition once
+    // instead of leaving the body, so the transition count tracks the call
+    // count.
     assert!(
-        transitions >= 2000,
+        transitions >= 1000,
         "unplanned calls must complete through the in-place transition: {transitions}"
     );
 }

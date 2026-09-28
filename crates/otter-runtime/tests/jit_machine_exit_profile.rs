@@ -95,10 +95,24 @@ fn an_overflowing_int32_site_exits_once_per_budget_and_then_stays_float() {
         "the function must keep an optimizing generation: {stats:?}; events={diagnostic_events:?}"
     );
     // The first generated entry generation can exit once on overflow.
-    // Widening must prevent any later callee generation from repeating it;
-    // caller identity invalidation is an independent exit profile.
+    // Widening must prevent any later callee generation from repeating it.
+    // Interrupt exits hand a running callee to the tier-up policy and caller
+    // identity invalidation is an independent exit profile; neither is a
+    // failed speculation.
+    let overflow_exits = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                JitDebugEvent::GeneratedCallDeopt {
+                    exit_reason: otter_vm::native_abi::ExitReason::Int32Overflow,
+                    ..
+                }
+            )
+        })
+        .count();
     assert!(
-        stats.jit_generated_call_deopts <= 1,
+        overflow_exits <= 1,
         "the rebuilt generation must not repeat the exited speculation: {stats:?}; events={diagnostic_events:?}"
     );
 }

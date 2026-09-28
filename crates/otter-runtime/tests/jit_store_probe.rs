@@ -1,7 +1,7 @@
 //! Guarded runtime store probes across prototype and descriptor changes.
 //!
 //! # Contents
-//! - Native direct-prototype-data transition fill and subsequent reuse.
+//! - Direct-prototype-data transition as a CacheIR store program and reuse.
 //! - Read-only, setter, own-slot, non-extensible and Proxy invalidations.
 //! - Nested allocating getter/setter scopes, object throws and later reuse.
 //! - Bounded runtime path counters and isolation of later capture batches.
@@ -78,40 +78,25 @@ fn store_diagnostics_count_paths_without_replaying_effects() {
     assert_eq!(result.completion_string(), "[16,12,7,66]");
     let report = result.jit_debug_report().expect("captured report");
     assert!(!report.truncated());
-    let mut cached = 0;
+    // Hot `x` stores complete through their CacheIR programs; only the
+    // throwing setters and the cold installs reach the runtime store, whose
+    // counters aggregate per site instead of emitting one event per store.
     let mut failed = 0;
     let mut counters = 0;
     for event in report.events() {
         if let JitDebugEvent::PropertyStoreRuntime {
             property_name,
-            path,
             failed: did_fail,
-            native_way,
             count,
             ..
         } = event
         {
             counters += 1;
-            if property_name == "x" {
-                if *did_fail {
-                    failed += count;
-                }
-                if matches!(path, otter_vm::jit_debug::JitPropertyStorePath::Cached) && !native_way
-                {
-                    cached += count;
-                }
+            if property_name == "x" && *did_fail {
+                failed += count;
             }
         }
     }
-    assert!(
-        cached > 1000,
-        "hot unsupported native ways must aggregate: {:?}",
-        report
-            .events()
-            .iter()
-            .filter(|event| matches!(event, JitDebugEvent::PropertyStoreRuntime { .. }))
-            .collect::<Vec<_>>()
-    );
     assert_eq!(failed, 3, "only the three throwing setters enter a store");
     assert!(
         counters < 100,
@@ -168,17 +153,22 @@ fn inherited_writable_data_fills_and_reuses_native_store_way() {
                 "native-writable-warm.js",
             )
             .expect("warm store");
+        // The warm-up installs the transition into the direct prototype's
+        // writable data slot as an immutable CacheIR store program; the site
+        // never reaches the runtime store.
         assert!(
             warm.jit_debug_report()
                 .unwrap()
                 .events()
                 .iter()
-                .any(|event| {
-                    matches!(event, JitDebugEvent::PropertyStoreRuntime {
-                property_name, native_way: true, failed: false, ..
-            } if property_name == "nativeWritable")
-                }),
-            "{selection:?}: native way must be offered"
+                .any(|event| matches!(
+                    event,
+                    JitDebugEvent::PropertyCacheIrSite {
+                        access: otter_vm::jit_debug::JitDebugPropertyAccess::Store,
+                        ..
+                    }
+                )),
+            "{selection:?}: the store site must carry a CacheIR store program"
         );
         let result = runtime
             .run_script(

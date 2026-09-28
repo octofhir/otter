@@ -6,10 +6,16 @@
 //! - Own/prototype identity changes and canonical lookup/call on guard misses.
 //!
 //! # Invariants
+//! - Warm-up calls come from short scripts ([`short_warm`]), so the caller
+//!   compiles through its own entries instead of being inlined into an
+//!   OSR-compiled script body.
 //! - An inlining claim requires emitted body IR and real optimizing entries.
 //! - A cold property operation commits once and returns to the same Machine body.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 #[test]
 fn method_inline_body_commits_getter_and_throw_once() {
@@ -18,7 +24,7 @@ fn method_inline_body_commits_getter_and_throw_once() {
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .unwrap();
-    let warm = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(
                 r#"
@@ -35,22 +41,29 @@ Object.setPrototypeOf(a,proto);
 // Two shapes of `b` keep its reads CacheIR probes with committed cold
 // siblings, so a later getter reenters and returns to this Machine body.
 var b2 = {w:0,x:4,y:5,z:6};
-for (var i=0;i<70000;i++) caller(a,(i&1)?b2:b,mark);
 "#,
             ),
             "inline-property-warm.js",
         )
         .unwrap();
+    let warm = short_warm::warm(
+        &mut runtime,
+        "caller(a, (i & 1) ? b2 : b, mark);",
+        3000,
+        "inline-property-calls.js",
+    );
     let bundle = warm
-        .jit_artifacts()
-        .unwrap()
         .bundles()
-        .iter()
         .find(|bundle| {
             bundle.manifest().function_name() == "caller"
                 && bundle.file(JitArtifactFileName::OptimizedIr).is_some()
         })
-        .unwrap_or_else(|| panic!("caller must optimize: {:?}", warm.jit_debug_report()));
+        .unwrap_or_else(|| {
+            panic!(
+                "caller must optimize: {:?}",
+                warm.events().collect::<Vec<_>>()
+            )
+        });
     let ir = String::from_utf8_lossy(
         bundle
             .file(JitArtifactFileName::OptimizedIr)
@@ -206,7 +219,7 @@ fn method_inline_identity_misses_resume_lookup_and_call_once() {
         } else {
             "Object.setPrototypeOf(a,proto);"
         };
-        let warm = runtime
+        runtime
             .run_script(
                 SourceInput::from_javascript(format!(
                     r#"
@@ -215,17 +228,19 @@ var proto={{dot:dot}}, a={{x:1.25,y:2,z:3}}, b={{x:4,y:5,z:6}};
 var mark={{before:0,after:0}},lookups=0;
 {install}
 function caller(a,b,mark) {{mark.before++;var value=a.dot(b);mark.after++;return value;}}
-for(var i=0;i<70000;i++) caller(a,b,mark);
 "#
                 )),
                 "method-identity-warm.js",
             )
             .unwrap();
+        let warm = short_warm::warm(
+            &mut runtime,
+            "caller(a, b, mark);",
+            3000,
+            "method-identity-calls.js",
+        );
         let ir = warm
-            .jit_artifacts()
-            .unwrap()
             .bundles()
-            .iter()
             .find(|bundle| {
                 bundle.manifest().function_name() == "caller"
                     && bundle.file(JitArtifactFileName::OptimizedIr).is_some()

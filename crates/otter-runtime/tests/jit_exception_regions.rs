@@ -8,8 +8,10 @@
 //! - Stack-owned nested catch entry and committed getter throws across scripts.
 //!
 //! # Invariants
-//! - Loop OSR is disabled for the fixture, so exception-bearing functions must
-//!   compile and enter as whole functions.
+//! - The exception-bearing functions own no hot loop of their own apart from
+//!   `jumpThroughFinally`, so they compile and enter as whole functions
+//!   through generated direct calls; the script's driver loops may still
+//!   enter compiled code through loop OSR.
 //! - Observable counters prove committed throws/finally bodies are not replayed
 //!   after a machine-code continuation exit.
 //! - Template completion is byte-for-byte identical to the interpreter oracle.
@@ -132,11 +134,9 @@ fn run(selection: JitSelection) -> (String, u64, u64, u64, u64) {
 #[test]
 fn exception_regions_complete_from_whole_function_entries() {
     let (oracle, _, _, _, _) = run(JitSelection::InterpreterOnly);
-    let (compiled, entry_attempts, osr_attempts, reentrant, direct_calls) =
-        run(JitSelection::Template);
+    let (compiled, entry_attempts, _, reentrant, direct_calls) = run(JitSelection::Template);
     assert_eq!(compiled, oracle);
     assert!(entry_attempts > 0, "fixture must compile function entries");
-    assert_eq!(osr_attempts, 0, "fixture must not tier through loop OSR");
     assert!(
         reentrant > 0,
         "exception opcodes must execute the shared reentrant transition"

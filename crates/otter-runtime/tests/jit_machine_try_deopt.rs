@@ -11,11 +11,17 @@
 //! - The throwing addition and catch body execute once; no generated edge
 //!   invents an exception value owned by the interpreter.
 //! - Loop-header OSR inside an active exception region remains disabled.
+//! - The Int32 fixture is warmed from short scripts ([`short_warm`]), so it
+//!   compiles through its own entries instead of being inlined into an
+//!   OSR-compiled script body.
 
 use otter_runtime::{
     JitArtifactFileName, JitDebugRequest, JitDebugTarget, JitDebugTier, JitSelection, Runtime,
     SourceInput,
 };
+
+#[path = "support/short_warm.rs"]
+mod short_warm;
 
 const MODULE: &str = "jit-machine-try-deopt-setup.js";
 const MACHINE_IR_HEADER: &[u8] = b"; backend=otter-machine-ir scalar-function\n";
@@ -30,11 +36,9 @@ function machineCatchExactDeopt(value) {
     return error.name;
   }
 }
-
-for (let warm = 0; warm < 5000; warm++) {
-  machineCatchExactDeopt(warm & 7);
-}
 "#;
+
+const WARM: &str = "machineCatchExactDeopt(i & 7);";
 
 const PROBE: &str = r#"
 const __machineTryBefore = __machineTryCatchCount;
@@ -103,17 +107,21 @@ fn completion(runtime: &mut Runtime, source: &str, module: &str) -> String {
 fn exact_numeric_deopt_rebuilds_the_active_catch_before_resume() {
     let mut oracle = runtime(JitSelection::InterpreterOnly, false);
     completion(&mut oracle, SETUP, "jit-machine-try-deopt-oracle-setup.js");
+    short_warm::warm(
+        &mut oracle,
+        WARM,
+        5000,
+        "jit-machine-try-deopt-oracle-warm.js",
+    );
     let expected = completion(&mut oracle, PROBE, "jit-machine-try-deopt-oracle-probe.js");
     assert_eq!(expected, r#"["TypeError",1,8]"#);
 
     let mut compiled = runtime(JitSelection::ProductionTiered, true);
-    let setup = compiled
+    compiled
         .run_script(SourceInput::from_javascript(SETUP), MODULE)
         .expect("try-deopt compiled setup");
-    let artifacts = setup
-        .jit_artifacts()
-        .expect("enabled try-deopt artifact batch");
-    assert!(artifacts.bundles().iter().any(|bundle| {
+    let warm = short_warm::warm(&mut compiled, WARM, 5000, "jit-machine-try-deopt-warm.js");
+    assert!(warm.bundles().any(|bundle| {
         let manifest = bundle.manifest();
         manifest.module() == MODULE
             && manifest.function_name() == "machineCatchExactDeopt"
@@ -123,7 +131,7 @@ fn exact_numeric_deopt_rebuilds_the_active_catch_before_resume() {
                 .file(JitArtifactFileName::OptimizedIr)
                 .is_some_and(|file| file.contents().starts_with(MACHINE_IR_HEADER))
     }));
-    drop(setup);
+    drop(warm);
 
     let before = compiled.execution_stats();
     let actual = completion(

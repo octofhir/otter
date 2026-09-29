@@ -10,7 +10,7 @@ recursive call is ~150 instructions from argument setup to post-return
   `NativeFrame` (`template/arm64.rs:2011-2022`). Template x86: r15 ctx, r14
   NativeFrame, r13 register base.
 - Machine arm64: x19 `JitCtx`, x17 register base loaded in the prologue
-  (`machine/numeric/arm64.rs:5031-5068`). Machine x86: r15 ctx.
+  (`machine/numeric/arm64.rs:5216-5253`). Machine x86: r15 ctx.
 - Shared arm64 linkage `arm64/direct_call.rs::emit_direct_call_with_access`
   serves both tiers through `context_register` (Template 20, Machine 19).
 
@@ -31,7 +31,7 @@ recursive call is ~150 instructions from argument setup to post-return
 | 0x34 u32 | arguments_object | zeroed; materializers | arguments, GC, deopt |
 
 ## Thread state
-- `JitCtx` (120 B, per outer entry on the Rust stack): 0x00 thread, 0x08
+- `JitCtx` (104 B, per outer entry on the Rust stack): 0x00 thread, 0x08
   native_frame (swapped per call), 0x10 error slot, 0x18 activation array
   base, 0x20 activation top ptr, 0x28 activation limit, 0x30 global_this
   offset ptr, 0x38 native stack limit, 0x40 generated_feedback_clean (zeroed
@@ -85,5 +85,6 @@ missing there.
 2. `HAS_SAFEPOINTS` has no reader; `kind` one reader.
 3. Safepoint identity is dynamic (published per call); nothing keyed by
    return address.
-4. Machine callee windows are traced for the whole call although only deopt
-   writes them.
+4. Machine callee windows are traced for the whole call; deopt writes them,
+   and so does a Forward call publishing the caller's formals context
+   (`emit_publish_forwarded_formals_context`).

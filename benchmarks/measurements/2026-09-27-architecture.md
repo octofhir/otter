@@ -867,6 +867,121 @@ fair JS-JIT comparison is `node --no-validate-asm` (35.1G), a 4.4x gap.
   ~10%.
 - ast_ctor: closures owning a property bag have no IC (`_super.call`).
 
+## 15. Call/frame contract
+
+Inputs: `research-2026-09-29/call-frame-contract.md` (layout) and
+`research-2026-09-29/call-frame-consumers.md` (every reader and writer of
+frames, activation records, root records, `JitCtx` and statuses).
+
+### What one generated call costs now
+Machine `fib` → `fib` on arm64 (`hotasm`, 4020 samples, all in the one
+code object). The caller-side sequence is ~130 executed instructions and
+the callee adds ~25:
+
+| Part | instr | Why it exists |
+|---|---:|---|
+| `JitMachineRootRecord` push + pop, root copies to homes and back | 17 + 2R..4R | GC finds Machine roots only through a linked record |
+| activation-array limit check, push, pop | ~18 | GC, stack traces, deopt and retirement find frames only in the array |
+| `ctx.native_frame`, `VmThread.current_frame`/`current_code_object_id` swap and restore, caller id save | ~12 | callee prologue, stubs and alloc safepoints find "the current frame" through them |
+| sloppy `this` → global object | ~7 | receiver converted by the caller for every sloppy callee, used or not |
+| entry cell `ldar`, frame-bytes and native-stack checks | ~14 | callee frame is sized and bounds-checked by the caller |
+| header, `register_base`, `argument_count`, `self/this/new_target` | ~12 | eager frame record (deopt, GC, `arguments`) |
+| window fill with `undefined` | 4 + ⌈L/2⌉ | GC traces the whole window of every frame; Machine callees only write it on deopt |
+| caller-side tier counter + `feedback_clean` | 7 | tier-up is decided by callers |
+| status dispatch (x1) before and after cleanup | ~8 | every return carries Success/SideExit/Throw/Fatal |
+| callee: `ldr ctx.native_frame`, `ldr register_base`, argument loads from memory, SELF → context | ~8 | callee finds its frame through ctx; arguments passed in memory |
+
+No part dominates; they exist because the frame is *published* (to an array,
+to a root chain, to two "current" cells) instead of being *found*.
+
+### How the reference engines do it
+- **V8.** A JS frame is `[args, receiver][return pc][caller fp][context][JSFunction][argc]`
+  (`StandardFrameConstants`); arguments/target/new.target/argc arrive in
+  registers and on the stack; the callee builds its own frame and runs the
+  stack check (the same compare serves interrupts). Nothing is published per
+  call: runtime calls go through CEntry, which stores `c_entry_fp`, and
+  `StackFrameIterator` walks fp from there, mapping each return pc to its
+  code (`InnerPointerToCodeCache`) and `SafepointTable` entry (tagged stack
+  slots at that return address; every register is caller-saved at calls, so
+  roots live in spill slots). Exceptions: the runtime returns the exception
+  sentinel, CEntry unwinds through `Isolate::UnwindAndFindHandler`; JS→JS
+  returns carry no status. Lazy deopt patches return addresses to per-call
+  lazy-deopt exits. Tiering: the feedback cell's interrupt budget is
+  decremented in the callee (return and back-edges).
+- **JSC.** `CallFrame` = `{callerFrame, returnPC, CodeBlock, Callee,
+  ArgumentCount (tag half = CallSiteIndex), this, args…}`. Before calling an
+  operation, JIT code stores `CallSiteIndex` into the frame and the frame into
+  `vm.topCallFrame`; JS→JS calls publish nothing else. Exceptions are checked
+  after operations only (`exceptionCheck`), then `genericUnwind` walks frames
+  with the CallSiteIndex. Tier-up counters sit in the callee (prologue and
+  loops). Jettisoned code keeps running until an invalidation point.
+- **SpiderMonkey.** `JitFrameLayout = {returnAddress, descriptor(type|size),
+  calleeToken, numActualArgs, this, args}`; `JSJitFrameIter` walks from the
+  activation's `packedExitFP`; `SafepointIndex` per return displacement names
+  GC slots and spilled registers; invalidation patches on-stack return
+  addresses (`OsiIndex`); `HandleException` unwinds frames; JIT→JIT calls do
+  not test a status (`callVM` tests the VM function's bool).
+
+Common shape: (1) a frame is a fixed record at a fixed place relative to the
+callee's entry sp, linked to its caller; (2) the *call site* identifies the
+caller's safepoint/position (return pc or stored call-site index), so no per
+call root publication exists; (3) "current frame" is stored only when
+entering the runtime; (4) the callee owns its tier budget, stack check and
+receiver conversion; (5) JS→JS returns carry only the value.
+
+### Target contract
+1. **Frame record** `NativeFrame` (72 B) at the callee's entry `sp`:
+   `function_id, pc, register_count, kind, flags, code_object_id` (the
+   generation running the frame), `register_base, this, new_target, self,
+   argument_count, arguments_object, caller` (the calling frame's record),
+   `depth` (generated frames below it, for the logical JS depth), `call_site`
+   (the Machine safepoint index of the caller's in-progress call).
+   Return address at `F-8`, caller fp at `F-16` in both tiers and both ISAs;
+   every generated prologue starts with the fp/lr pair and sets fp.
+2. **Frame chain instead of publication.** `F.caller` links frames; the
+   innermost frame of an entry is `JitCtx.native_frame`; an entry frame's
+   `caller` is the innermost frame of the enclosing entry, so one chain runs
+   through every nesting level. The interpreter holds only the address of the
+   innermost entry's cell. GC, stack snapshots, deopt caller checks and code
+   retirement walk the chain; there is no activation array.
+3. **Roots by call site.** A Machine frame stores its safepoint index in
+   `call_site` before any call (JSC `CallSiteIndex`); GC resolves
+   `(code_object_id, call_site)` to the safepoint record and the root area at
+   a static offset below `F`. No `JitMachineRootRecord`.
+4. **Current frame only at transitions.** Stubs and allocating calls get the
+   frame from `ctx.native_frame`; the thread carries no per-call copy and the
+   generation comes from the frame.
+5. **Callee owns its entry.** Tier budget decremented in the Template
+   prologue and back-edges (Machine code carries none); sloppy receivers
+   converted where `this` is read; Machine callees publish only the parameter
+   prefix of the window (deopt widens and fills it).
+6. **Value-only JS→JS returns.** Throw becomes a pending exception unwound
+   along the chain to the nearest handler or entry; a callee deopt finishes
+   the callee in the interpreter from the callee's own exit and returns its
+   value; statuses remain only on runtime-stub returns.
+7. **Inline frames from data.** Spliced parents are described by the call
+   site's safepoint recipe, never physically published, so residual calls in
+   spliced bodies cost nothing extra (the §14 non-lever becomes a lever).
+
+### Stages (each gated and measured in wall time and instructions)
+- **C1 frame chain.** `caller`/`depth`/`code_object_id` in the record; the
+  linkage writes them instead of pushing the activation array, swapping the
+  thread's current frame and saving the caller id; GC, snapshots,
+  `generated_caller_matches`, inline activations, retirement and logical
+  depth walk the chain. Array, `jit_arena_activation_indices`,
+  `VmThread.current_frame/current_code_object_id` deleted.
+- **C2 roots by call site.** `call_site` stamp replaces root-record
+  push/pop; GC, alloc-stub rooting and inline-frame decode resolve through
+  the frame; `MACHINE_ROOT_RECORD_SIZE` bias deleted.
+- **C3 callee-owned entry.** Lazy sloppy `this`, prefix-only windows for
+  Machine callees, callee-side tier budget, `generated_feedback_clean`
+  deleted.
+- **C4 frame pointer.** Poll countdown off x29/rbp; every generated
+  prologue sets fp; callee derives `F` from its entry sp (no `ctx` load).
+- **C5 value-only returns.** Unwinder over the chain; callee-local deopt
+  completion; status checks leave JS→JS call sites.
+- **C6 inline frames from data.** Residual calls in spliced bodies.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

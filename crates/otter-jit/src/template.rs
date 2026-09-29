@@ -853,15 +853,22 @@ mod tests {
         expect_binary_int(Op::Shr, box_i32(-8), box_i32(1), -4);
         expect_binary_f64(Op::Ushr, box_i32(-1), box_i32(0), 4_294_967_295.0);
         expect_binary_f64(Op::Ushr, box_f64(-1.0), box_i32(0), 4_294_967_295.0);
-        // Non-finite doubles saturate fcvtzs → exact side exit.
-        assert!(matches!(
-            run_binary(Op::BitwiseOr, box_f64(f64::INFINITY), box_i32(0)),
-            Exit::Bailed(_)
-        ));
-        assert!(matches!(
-            run_binary(Op::BitwiseOr, box_f64(f64::NAN), box_i32(0)),
-            Exit::Bailed(_)
-        ));
+        // FJCVTZS converts non-finite doubles to 0 in place; without it they
+        // would saturate fcvtzs and side-exit for exact coercion.
+        #[cfg(target_arch = "aarch64")]
+        let fjcvtzs = crate::arm64::has_javascript_conversion();
+        #[cfg(not(target_arch = "aarch64"))]
+        let fjcvtzs = false;
+        for special in [f64::INFINITY, f64::NAN] {
+            if fjcvtzs {
+                expect_binary_int(Op::BitwiseOr, box_f64(special), box_i32(0), 0);
+            } else {
+                assert!(matches!(
+                    run_binary(Op::BitwiseOr, box_f64(special), box_i32(0)),
+                    Exit::Bailed(_)
+                ));
+            }
+        }
     }
 
     #[test]

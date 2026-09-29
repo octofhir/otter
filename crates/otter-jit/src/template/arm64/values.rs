@@ -262,9 +262,10 @@ pub(crate) fn emit_box_number_with_scratch(
 ///
 /// Int32-tagged values are unboxed directly. Any finite double is truncated
 /// toward zero and reduced modulo 2^32 — the full ECMAScript `ToInt32`, not
-/// just the already-in-range case. Only NaN / infinity / `|x| >= 2^63`
-/// (which would saturate the 64-bit `fcvtzs`) and non-number tags branch to
-/// `bail` for exact coercion. Clobbers x14/x15, d0–d2.
+/// just the already-in-range case. With `FJCVTZS` every double converts in
+/// place; otherwise NaN / infinity / `|x| >= 2^63` (which would saturate the
+/// 64-bit `fcvtzs`) branch to `bail`, as do non-number tags, for exact
+/// coercion. Clobbers x14/x15, d0–d2.
 pub(super) fn emit_to_int32_fast(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: DynamicLabel) {
     emit_to_int32_common(ops, src_x, dst_w, bail);
 }
@@ -298,6 +299,16 @@ fn emit_to_int32_common(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: Dynamic
         ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
         ; sub x14, X(src_x), x14      // unbox double
         ; fmov d0, x14
+    );
+    // `FJCVTZS` is the whole ECMAScript ToInt32 of any double, NaN and the
+    // infinities included.
+    if crate::arm64::has_javascript_conversion() {
+        crate::arm64::emit_fjcvtzs(ops, 0, dst_w);
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return;
+    }
+    dynasm!(ops
+        ; .arch aarch64
         ; fcmp d0, d0
         ; b.vs =>bail
     );

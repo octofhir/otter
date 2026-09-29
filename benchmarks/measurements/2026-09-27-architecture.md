@@ -799,6 +799,74 @@ Fixed work (`benchmarks/results/arch-2026-09-27/e1b/ctx-carve`,
   `prototype`) has no IC; `_super.call` resolves `call` by spelling on
   every call (`eq_str` over the shape chain).
 
+## 14. Element accesses, Word32 truncation, JSCVT
+
+Commits `bb18373a` (Number probe decodes undefined/null/Booleans),
+`b4413eb1` (deopt-direct element accesses, dense proofs, truncation,
+identities) and `b8b96e6d` (FJCVTZS).
+
+- **Number probe.** A committed generic operator missed on any non-Number
+  operand; asm.js-style `x | 0` over `undefined` (a read past a typed
+  array, a missing argument) re-entered the VM per operation. Every probe
+  operator applies ToNumeric to such an operand, so the probe decodes
+  `undefined`, `null`, `false`, `true` to NaN, +0, 0, 1 in place.
+- **Checked element operations.** A speculative access threaded Boolean
+  hit flags through `ElementAddress`, `ElementValueLoad`/`Guard` and a
+  `GuardCondition` (~25 instructions for a typed-array read). V8's
+  `CheckTypedArrayBounds` + `LoadTypedArrayElement` is ~5.
+  `ElementCheckedLoad` / `ElementCheckedAddress` own the access's single
+  deoptimization and prove hit, bounds and slot in place; the index is
+  extended to 64 bits so one unsigned compare also rejects a negative
+  int32, and every proof branches with a ±1 MiB conditional branch.
+- **Dense proofs.** An in-heap view materialized a raw element base, so it
+  could not cross the loop backedge's safepoint. `ElementProof` carries the
+  representation proof and length only (no address): LICM hoists it out of
+  loops that cannot reenter or write element metadata and GVN reuses it
+  across collections; the checked operation loads the base from the rooted
+  receiver after the hit check (V8's elements-field load).
+- **Word32 truncation.** An overflow-checked int32 `+`/`-` whose every
+  reader truncates (bitwise ops, shifts, other such sums) and that no frame
+  state names becomes wrapping (V8 representation selection). GVN folds
+  `x|0`, `x^0`, `x&-1`, shifts by zero (V8 MachineOperatorReducer).
+- **FJCVTZS.** ARMv8.3 JSCVT computes ToInt32 in one instruction (V8
+  selects it under `JSCVT`); both tiers use it when the CPU reports it.
+
+| Workload | before §14 | after | Node (JIT) |
+|---|---:|---:|---:|
+| zlib-fixed | 233.8G | 154.7G (−33.8%) | 23.1G (asm.js→wasm), **35.1G** `--no-validate-asm` |
+| crypto-fixed | 16.95G | 13.73G (−19.0%) | 2.9G |
+| earley-boyer | 112.3G | 111.5G | 18.7G |
+| ts-fixed | 174.2G | 173.4G | 21G |
+
+zlib is asm.js (`"use asm"`): Node validates it and runs it as wasm. The
+fair JS-JIT comparison is `node --no-validate-asm` (35.1G), a 4.4x gap.
+
+### Measured non-levers (numbers, no commit)
+- **Residual calls inside spliced bodies** (allowing any monomorphic plain
+  / method / explicit-receiver call, publishing the spliced parents around
+  the linkage): inlined sites 80 → 88 in earley, but earley +0.3%, crypto
+  +2.6%, ts −1.0%. Physical parent publication copies the spliced window
+  per residual call; it only pays with stack-walk-described inline frames
+  (V8 deopt data at the return address).
+- **Hoisting/commoning typed views and context-slot reads across calls**
+  (unsafe upper bound): zlib −3.7% only.
+- **Caller-side tier counting removed** (upper bound): fib −1.6%.
+- **Inline budget in instructions** (V8's 460/920 bytes ≈ 100/200 Otter
+  instructions; Otter wordcode averages ~10 B/instruction): no gain
+  (earley +0.1%, crypto +1.2%). Hot rejections are loops/throw CFG and
+  residual calls, not size.
+- **Runtime keyed loads in ts**: ~3M per run, 60% megamorphic string keys
+  on shaped hash-table objects (keyword/identifier tables) — ≈1–2% of ts.
+
+### Where the gaps are now
+- Call path: ~200 instructions per generated call (fib: 437 per
+  invocation vs V8's 114). No single part dominates (tier counting 1.6%,
+  window fill, root records, activation publication, status dispatch each
+  a few percent) — the fp-walkable frame contract (§5 slice 3) is the lever.
+- earley: `instanceof` target proof ≈13% of the hot functions; scavenges
+  ~10%.
+- ast_ctor: closures owning a property bag have no IC (`_super.call`).
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

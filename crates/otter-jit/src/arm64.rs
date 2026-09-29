@@ -27,6 +27,23 @@ mod direct_call;
 pub(crate) mod inline_guard;
 mod method_guard;
 
+/// Whether this CPU implements the ARMv8.3 JavaScript conversion
+/// (`FJCVTZS`), which computes ECMAScript ToInt32 of a double in one
+/// instruction. V8 selects the same instruction under `JSCVT`.
+pub(crate) fn has_javascript_conversion() -> bool {
+    std::arch::is_aarch64_feature_detected!("jsconv")
+}
+
+/// `W(destination) = ToInt32(D(source))` through `FJCVTZS`: NaN and the
+/// infinities give zero, every finite value its low 32 bits modulo 2^32.
+/// Writing the W register clears the upper half. Requires
+/// [`has_javascript_conversion`].
+pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destination: u8) {
+    use dynasmrt::DynasmApi;
+    debug_assert!(source < 32 && destination < 32);
+    ops.push_u32(0x1E7E_0000 | (u32::from(source) << 5) | u32::from(destination));
+}
+
 /// Backedges between shared interrupt/fuel-cell probes in generated code.
 ///
 /// `x29` holds the activation-local countdown in optimizing and scalar Machine

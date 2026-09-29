@@ -308,6 +308,10 @@ fn emit_float_leaf_binary(
 /// otherwise (Infinity and NaN included), negated modulo 2^32 for a negative
 /// input. Clobbers `x16` and `x17`.
 fn emit_float_to_int32(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destination: u8) {
+    if crate::arm64::has_javascript_conversion() {
+        crate::arm64::emit_fjcvtzs(ops, source, destination);
+        return;
+    }
     dynasm!(ops
         ; .arch aarch64
         ; fcvtzs X(destination), D(source)

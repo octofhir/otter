@@ -488,7 +488,23 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        match self.callable_bind_metadata_get(context, &target, "name")? {
+        // Reading `name` can materialize a string: every value the bind
+        // carries rides an anchor across it and is read back afterwards.
+        let anchor = self.push_iteration_anchor(target) - 1;
+        self.push_iteration_anchor(bound_this);
+        self.push_iteration_anchor(target_length);
+        for arg in &bound_args {
+            self.push_iteration_anchor(*arg);
+        }
+        let name = self.callable_bind_metadata_get(context, &target, "name");
+        let target = self.iteration_anchor(anchor);
+        let bound_this = self.iteration_anchor(anchor + 1);
+        let target_length = self.iteration_anchor(anchor + 2);
+        let bound_args: SmallVec<[Value; 4]> = (0..bound_args.len())
+            .map(|index| self.iteration_anchor(anchor + 3 + index))
+            .collect();
+        self.pop_iteration_anchors_to(anchor);
+        match name? {
             BindMetadataGet::Value(target_name) => {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_bind_function = None;
@@ -2017,11 +2033,14 @@ impl Interpreter {
                 // allocate; the args slice can be an untraced copy on the
                 // operands-dispatch path, so the receiver rides an anchor slot.
                 let target_slot = self.push_iteration_anchor(target) - 1;
+                let desc_slot = self
+                    .push_iteration_anchor(args.get(2).copied().unwrap_or_else(Value::undefined))
+                    - 1;
                 let outcome = (|this: &mut Self| -> Result<Option<Value>, VmError> {
                     let key = Self::coerce_vm_property_key(args.get(1), &this.gc_heap)?;
-                    let desc_obj = args
-                        .get(2)
-                        .and_then(|v| v.as_object())
+                    let desc_obj = this
+                        .iteration_anchor(desc_slot)
+                        .as_object()
                         .ok_or(VmError::TypeMismatch)?;
                     let descriptor =
                         object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)?;
@@ -2040,6 +2059,15 @@ impl Interpreter {
                                 return Err(VmError::TypeMismatch);
                             }
                             let mut bag = this.function_user_bag(stack, owner, function_id, &[])?;
+                            // Creating the bag allocates, which can move the
+                            // descriptor's values: coerce it again from the
+                            // anchored descriptor object.
+                            let desc_obj = this
+                                .iteration_anchor(desc_slot)
+                                .as_object()
+                                .ok_or(VmError::TypeMismatch)?;
+                            let descriptor =
+                                object_statics::coerce_to_descriptor(&desc_obj, &this.gc_heap)?;
                             crate::object::define_own_symbol_property_partial(
                                 &mut bag,
                                 &mut this.gc_heap,
@@ -2593,102 +2621,106 @@ impl Interpreter {
             return Ok(Value::undefined());
         }
 
-        let function_root = Value::function(function_id);
-        let constructor_value = receiver.unwrap_or(function_root);
-        let bag = self.function_user_bag(
-            stack,
-            owner,
-            function_id,
-            &[&function_root, &constructor_value],
-        )?;
-        if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
-            return Ok(existing);
-        }
-
-        let bag_root = Value::object(bag);
-        let mut proto = self.alloc_stack_rooted_object_with_extra_roots(
-            stack,
-            &[&function_root, &constructor_value, &bag_root],
-        )?;
-        if let Some(object_proto) = self.realm_intrinsics.object_prototype().or_else(|| {
-            crate::object::get(self.global_this, &self.gc_heap, "Object")
-                .and_then(|v| v.as_object())
-                .and_then(|object_ctor| {
-                    crate::object::get(object_ctor, &self.gc_heap, "prototype")
-                        .and_then(|v| v.as_object())
-                })
-        }) {
-            crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
-        }
-        if context
-            .function(function_id)
-            .is_some_and(|function| function.is_generator)
-        {
-            let is_async = context
-                .function(function_id)
-                .is_some_and(|function| function.is_async_generator);
-            if let Some(shared) = self.shared_generator_object_prototype(is_async) {
-                // §27.5.1 / §27.6.1 — generator-function `.prototype`
-                // objects inherit from the one shared
-                // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
-                object::set_prototype(proto, &mut self.gc_heap, Some(shared));
-            } else {
-                let proto_value = Value::object(proto);
-                let parent = self.alloc_stack_rooted_object_with_extra_roots(
-                    stack,
-                    &[&function_root, &bag_root, &proto_value],
-                )?;
-                self.finish_generator_function_prototype(context, function_id, proto, parent)?;
-            }
-        }
-        // Install `prototype` on the function's property bag first. It is a
-        // non-moving define, and routing it before the constructor install means
-        // the bag's `prototype` slot already tracks `proto` (the collector
-        // forwards live GC slots) when the shape-advancing constructor define
-        // below may relocate the heap.
-        // `bag` is a bare local from before the `proto` allocation, which can
-        // scavenge and relocate it; re-fetch the live handle from its rooted
-        // `bag_root` before the define, or it dereferences a moved-from shape cell.
-        let bag = bag_root
-            .as_object()
-            .expect("function bag survives stack rooting");
-        let prototype_desc =
-            object::PropertyDescriptor::data(Value::object(proto), true, false, false);
-        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
-        // §27.5.1 — a generator function's `.prototype` object has NO own
-        // properties (no back-pointing `constructor`); ordinary functions get
-        // the §10.2.5 MakeConstructor pair. Route the `constructor` install
-        // through the hidden-class-advancing define rather than the
-        // dictionary-mode `object::define_own_property` (which nulls the shape),
-        // so the prototype keeps a fast shape: prototype-style method
-        // definitions (`Foo.prototype.m = ...`) then land in shape slots and
-        // instance method calls stay inline/direct-call guardable instead of
-        // forcing every dispatch through generic method lookup and call
-        // machinery. The define
-        // allocates a hidden-class child and can move the heap, so the bare
-        // `proto` / `bag` locals may be stale afterward.
-        if !context
-            .function(function_id)
-            .is_some_and(|function| function.is_generator)
-        {
-            let constructor_desc = object::PartialPropertyDescriptor {
-                value: Some(constructor_value),
-                writable: Some(true),
-                enumerable: Some(false),
-                configurable: Some(true),
-                ..Default::default()
+        // Every allocation below may move the closure, its bag and the new
+        // prototype, so each lives in a handle and is re-read after every
+        // step instead of riding in a Rust local.
+        self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+            let function_root = Value::function(function_id);
+            let constructor_handle = interp.scoped_value(scope, receiver.unwrap_or(function_root));
+            let owner_handle = owner.map(|owner| interp.scoped_value(scope, Value::closure(owner)));
+            let owner_now = |interp: &Self| {
+                owner_handle
+                    .and_then(|handle| interp.escape_scoped(handle).as_closure(&interp.gc_heap))
             };
+            let bag = interp.function_user_bag(stack, owner_now(interp), function_id, &[])?;
+            if let Some(existing) = crate::object::get(bag, &interp.gc_heap, "prototype") {
+                return Ok(existing);
+            }
+            let bag_handle = interp.scoped_value(scope, Value::object(bag));
+            let proto = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+            let proto_handle = interp.scoped_value(scope, Value::object(proto));
+            let proto_now = |interp: &Self| {
+                interp
+                    .escape_scoped(proto_handle)
+                    .as_object()
+                    .expect("prototype handle holds an object")
+            };
+            if let Some(object_proto) = interp.realm_intrinsics.object_prototype().or_else(|| {
+                crate::object::get(interp.global_this, &interp.gc_heap, "Object")
+                    .and_then(|v| v.as_object())
+                    .and_then(|object_ctor| {
+                        crate::object::get(object_ctor, &interp.gc_heap, "prototype")
+                            .and_then(|v| v.as_object())
+                    })
+            }) {
+                crate::object::set_prototype(
+                    proto_now(interp),
+                    &mut interp.gc_heap,
+                    Some(object_proto),
+                );
+            }
+            let is_generator = context
+                .function(function_id)
+                .is_some_and(|function| function.is_generator);
+            if is_generator {
+                let is_async = context
+                    .function(function_id)
+                    .is_some_and(|function| function.is_async_generator);
+                if let Some(shared) = interp.shared_generator_object_prototype(is_async) {
+                    // §27.5.1 / §27.6.1 — generator-function `.prototype`
+                    // objects inherit from the one shared
+                    // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
+                    object::set_prototype(proto_now(interp), &mut interp.gc_heap, Some(shared));
+                } else {
+                    let parent = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+                    let proto = proto_now(interp);
+                    interp.finish_generator_function_prototype(
+                        context,
+                        function_id,
+                        proto,
+                        parent,
+                    )?;
+                }
+            }
+            // Install `prototype` on the function's property bag first, so the
+            // bag's slot tracks the prototype before the shape-advancing
+            // constructor define below can move the heap.
+            let bag = interp
+                .escape_scoped(bag_handle)
+                .as_object()
+                .expect("function bag handle holds an object");
+            let prototype_desc = object::PropertyDescriptor::data(
+                Value::object(proto_now(interp)),
+                true,
+                false,
+                false,
+            );
             let _ =
-                self.define_own_property_partial(&mut proto, "constructor", constructor_desc)?;
-        }
-        // Re-acquire the (possibly relocated) prototype through the function's
-        // bag, which the collector forwarded; the bare `proto` handle may be
-        // stale after the shape allocation above.
-        let proto_value = self
-            .callable_bag_read(owner, function_id)
-            .and_then(|bag| crate::object::get_own(bag, &self.gc_heap, "prototype"))
-            .unwrap_or_else(|| Value::object(proto));
-        Ok(proto_value)
+                object::define_own_property(bag, &mut interp.gc_heap, "prototype", prototype_desc);
+            // §27.5.1 — a generator function's `.prototype` object has NO own
+            // properties (no back-pointing `constructor`); ordinary functions
+            // get the §10.2.5 MakeConstructor pair. The install goes through
+            // the hidden-class-advancing define rather than the dictionary-mode
+            // `object::define_own_property` (which nulls the shape), so the
+            // prototype keeps a fast shape and prototype-style method
+            // definitions land in shape slots.
+            if !is_generator {
+                let constructor_desc = object::PartialPropertyDescriptor {
+                    value: Some(interp.escape_scoped(constructor_handle)),
+                    writable: Some(true),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                };
+                let mut proto = proto_now(interp);
+                let _ = interp.define_own_property_partial(
+                    &mut proto,
+                    "constructor",
+                    constructor_desc,
+                )?;
+            }
+            Ok(interp.escape_scoped(proto_handle))
+        })
     }
 
     fn finish_generator_function_prototype(

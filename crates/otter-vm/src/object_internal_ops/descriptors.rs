@@ -353,18 +353,26 @@ impl Interpreter {
                 .string_name()
                 .expect("non-symbol key has string spelling");
             if key == "prototype" {
-                let _ = self.function_property_get_with_receiver(
-                    stack,
-                    context,
-                    owner,
-                    function_id,
-                    Some(target),
-                    "prototype",
-                )?;
-                let Some(bag) = self.callable_bag_read(owner, function_id) else {
-                    return Ok(None);
-                };
-                return Ok(object::get_own_descriptor(bag, &self.gc_heap, key));
+                // Materializing the implicit prototype allocates and can move
+                // the closure: read its bag through the closure's new home.
+                return self.with_handle_scope(|interp, scope| {
+                    let target_handle = interp.scoped_value(scope, target);
+                    let _ = interp.function_property_get_with_receiver(
+                        stack,
+                        context,
+                        owner,
+                        function_id,
+                        Some(target),
+                        "prototype",
+                    )?;
+                    let owner = interp
+                        .escape_scoped(target_handle)
+                        .as_closure(&interp.gc_heap);
+                    let Some(bag) = interp.callable_bag_read(owner, function_id) else {
+                        return Ok(None);
+                    };
+                    Ok(object::get_own_descriptor(bag, &interp.gc_heap, key))
+                });
             }
             return self.ordinary_function_own_property_descriptor(
                 Some(context),

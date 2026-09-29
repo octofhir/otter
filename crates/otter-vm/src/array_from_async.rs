@@ -61,20 +61,28 @@ impl Interpreter {
         let mapfn = args.get(1).copied().unwrap_or_else(Value::undefined);
         let this_arg = args.get(2).copied().unwrap_or_else(Value::undefined);
 
-        let capability = crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_stack_rooted(self, stack, &[&items, &mapfn, &this_arg], &[])?;
-        // Everything below allocates repeatedly (property stores grow
-        // shapes, handlers and capabilities are fresh objects), so every
-        // value that must survive rides the traced anchor stack and is
-        // re-read after each step — raw locals go stale under a moving
-        // collection.
-        let base = self.push_iteration_anchor(capability.promise) - 1;
-        let resolve_slot = self.push_iteration_anchor(capability.resolve) - 1;
-        let reject_slot = self.push_iteration_anchor(capability.reject) - 1;
+        // Everything below allocates repeatedly (the capability, property
+        // stores that grow shapes, fresh handlers), so every value that must
+        // survive rides the traced anchor stack from the start and is re-read
+        // after each step — raw locals go stale under a moving collection.
         let items_slot = self.push_iteration_anchor(items) - 1;
         let mapfn_slot = self.push_iteration_anchor(mapfn) - 1;
         let this_arg_slot = self.push_iteration_anchor(this_arg) - 1;
         let this_value_slot = self.push_iteration_anchor(this_value) - 1;
+        let capability =
+            match crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .capability_stack_rooted(self, stack, &[], &[])
+            {
+                Ok(capability) => capability,
+                Err(error) => {
+                    self.pop_iteration_anchors_to(items_slot);
+                    return Err(error.into());
+                }
+            };
+        let base = items_slot;
+        let promise_slot = self.push_iteration_anchor(capability.promise) - 1;
+        let resolve_slot = self.push_iteration_anchor(capability.resolve) - 1;
+        let reject_slot = self.push_iteration_anchor(capability.reject) - 1;
         let result = (|| -> Result<Value, VmError> {
             let state_obj = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
             let st = self.push_iteration_anchor(Value::object(state_obj)) - 1;
@@ -96,7 +104,7 @@ impl Interpreter {
                 Ok(()) => {}
                 Err(err) => self.collect_settle_error(stack, context, st, err),
             }
-            Ok(self.iteration_anchor(base))
+            Ok(self.iteration_anchor(promise_slot))
         })();
         self.pop_iteration_anchors_to(base);
         result

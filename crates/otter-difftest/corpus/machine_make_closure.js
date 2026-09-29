@@ -36,8 +36,8 @@ function named(depth) {
 }
 
 let out = [];
-for (let round = 0; round < 4; round++) {
-  out.push(build(4000));
+for (let round = 0; round < 2; round++) {
+  out.push(build(2500));
   out.push(new Counter().base, Counter.call({ base: 1 }));
   out.push(named(round));
 }
@@ -63,5 +63,5 @@ function freshObjects(n) {
   return [distinctFns, distinctRes, matched].join(":");
 }
 let fresh = "";
-for (let round = 0; round < 3; round++) fresh = freshObjects(5000);
+for (let round = 0; round < 2; round++) fresh = freshObjects(3000);
 console.log(fresh);

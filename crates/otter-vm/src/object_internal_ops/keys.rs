@@ -11,9 +11,10 @@
 
 use super::*;
 use crate::activation_stack::ActivationStack;
+use crate::handles::HandleScope;
 use crate::{
     ExecutionContext, Interpreter, Local, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, array, function_metadata, object, proxy, symbol, to_length,
+    abstract_ops, array, function_metadata, object, symbol, to_length,
 };
 use smallvec::SmallVec;
 use std::collections::BTreeSet;
@@ -403,20 +404,30 @@ impl Interpreter {
                         .into(),
                 ));
             }
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
-            return match self.invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)? {
-                crate::object_internal_ops::ProxyTrap::Trapped(trap_result) => {
-                    let trap_keys = self.create_list_from_array_like_property_keys(
-                        stack,
-                        context,
-                        trap_result,
-                    )?;
-                    self.validate_proxy_own_keys(stack, context, &proxy, trap_keys)
-                }
-                crate::object_internal_ops::ProxyTrap::NoTrap {
-                    target: fallthrough_target,
-                } => self.own_property_keys_value(stack, context, &fallthrough_target),
-            };
+            // The trap, the result's element getters, and the target's own
+            // key reads all allocate: the proxy and every key ride handles.
+            return self.with_handle_scope(|interp, scope| {
+                let proxy_handle = interp.scoped_value(scope, Value::proxy(proxy));
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&interp.gc_heap)];
+                let trap_result = match interp
+                    .invoke_proxy_trap(stack, context, &proxy, "ownKeys", trap_args)?
+                {
+                    crate::object_internal_ops::ProxyTrap::Trapped(trap_result) => trap_result,
+                    crate::object_internal_ops::ProxyTrap::NoTrap {
+                        target: fallthrough_target,
+                    } => {
+                        return interp.own_property_keys_value(stack, context, &fallthrough_target);
+                    }
+                };
+                let trap_keys = interp.create_list_from_array_like_property_keys(
+                    stack,
+                    context,
+                    scope,
+                    trap_result,
+                )?;
+                interp.validate_proxy_own_keys(stack, context, scope, proxy_handle, &trap_keys)
+            });
         }
         // §10.4.5.11 TypedArray [[OwnPropertyKeys]] — integer indices
         // in ascending order, then expando string keys in insertion
@@ -728,17 +739,22 @@ impl Interpreter {
     /// §7.3.18 CreateListFromArrayLike with elementTypes set to
     /// «String, Symbol» — used by Proxy `ownKeys` trap result
     /// validation per §10.5.11 step 8.
-    pub(crate) fn create_list_from_array_like_property_keys(
+    pub(crate) fn create_list_from_array_like_property_keys<'s>(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
+        scope: &'s HandleScope,
         list_value: Value,
-    ) -> Result<Vec<Value>, VmError> {
+    ) -> Result<Vec<Local<'s>>, VmError> {
         if !(list_value.is_object() || list_value.is_array() || list_value.is_proxy()) {
             return Err(
                 self.err_type(("Proxy ownKeys trap result is not an Object".to_string()).into())
             );
         }
+        // Every element read can run a getter; the list and each element
+        // are parked before the next one.
+        let list = self.scoped_value(scope, list_value);
+        let list_value = self.escape_scoped(list);
         let len_value = match self.ordinary_get_value(
             stack,
             context,
@@ -750,18 +766,21 @@ impl Interpreter {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
                 let args: SmallVec<[Value; 8]> = SmallVec::new();
+                let list_value = self.escape_scoped(list);
                 self.run_callable_sync_rooted(stack, context, &getter, list_value, args)?
             }
         };
         let len = to_length(&len_value, &self.gc_heap)?;
-        let mut out: Vec<Value> = Vec::with_capacity(len);
+        let mut out: Vec<Local<'s>> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
+            let list_value = self.escape_scoped(list);
             let element =
                 match self.ordinary_get_value(stack, context, list_value, list_value, &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        let list_value = self.escape_scoped(list);
                         self.run_callable_sync_rooted(stack, context, &getter, list_value, args)?
                     }
                 };
@@ -771,35 +790,42 @@ impl Interpreter {
                         .into(),
                 ));
             }
-            out.push(element);
+            out.push(self.scoped_value(scope, element));
         }
         Ok(out)
     }
 
     /// §10.5.11 steps 9–17 — validate a Proxy `ownKeys` trap result
     /// against the target's own keys.
-    pub(crate) fn validate_proxy_own_keys(
+    ///
+    /// The target's extensibility, key list, and descriptor reads allocate
+    /// (and run traps when the target is itself a proxy), so the trap keys,
+    /// the target, and the target's keys are all read from handles after
+    /// the last of them.
+    pub(crate) fn validate_proxy_own_keys<'s>(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        proxy: &proxy::JsProxy,
-        trap_result: Vec<Value>,
+        scope: &'s HandleScope,
+        proxy: Local<'s>,
+        trap_keys: &[Local<'s>],
     ) -> Result<Vec<Value>, VmError> {
         // Step 9 — reject duplicates. String keys hash into a set
         // (the spec requires linear behaviour here — see V8's
         // ownKeys-linear regression); symbol keys are compared
         // pairwise, which stays cheap because real handler results
         // carry at most a handful of symbols.
-        let trap_strs: Vec<Option<String>> = trap_result
+        let trap_strs: Vec<Option<String>> = trap_keys
             .iter()
-            .map(|v| {
-                v.as_string(&self.gc_heap)
+            .map(|key| {
+                self.escape_scoped(*key)
+                    .as_string(&self.gc_heap)
                     .map(|s| s.to_lossy_string(&self.gc_heap))
             })
             .collect();
         {
             let mut seen: std::collections::HashSet<&str> =
-                std::collections::HashSet::with_capacity(trap_result.len());
+                std::collections::HashSet::with_capacity(trap_keys.len());
             let mut symbol_indices: Vec<usize> = Vec::new();
             for (i, snap) in trap_strs.iter().enumerate() {
                 match snap {
@@ -818,8 +844,8 @@ impl Interpreter {
             for a in 0..symbol_indices.len() {
                 for b in (a + 1)..symbol_indices.len() {
                     if same_property_key(
-                        &trap_result[symbol_indices[a]],
-                        &trap_result[symbol_indices[b]],
+                        &self.escape_scoped(trap_keys[symbol_indices[a]]),
+                        &self.escape_scoped(trap_keys[symbol_indices[b]]),
                         &self.gc_heap,
                     ) {
                         return Err(self.err_type(
@@ -830,13 +856,33 @@ impl Interpreter {
                 }
             }
         }
-        let target_value = proxy.target(&self.gc_heap);
+        let current_keys = |interp: &Self| -> Vec<Value> {
+            trap_keys
+                .iter()
+                .map(|key| interp.escape_scoped(*key))
+                .collect()
+        };
+        let target = {
+            let proxy = self
+                .escape_scoped(proxy)
+                .as_proxy()
+                .ok_or(VmError::InvalidOperand)?;
+            let target = proxy.target(&self.gc_heap);
+            self.scoped_value(scope, target)
+        };
+        let target_value = self.escape_scoped(target);
         let extensible_target = self.is_extensible_value(stack, context, &target_value)?;
-        let target_keys = self.own_property_keys_value(stack, context, &target_value)?;
-        let mut target_configurable: Vec<Value> = Vec::new();
-        let mut target_nonconfigurable: Vec<Value> = Vec::new();
-        for key in &target_keys {
-            let vm_key = property_key_from_value(key, &self.gc_heap)?;
+        let target_value = self.escape_scoped(target);
+        let target_keys: Vec<Local<'s>> = self
+            .own_property_keys_value(stack, context, &target_value)?
+            .into_iter()
+            .map(|key| self.scoped_value(scope, key))
+            .collect();
+        let mut target_configurable: Vec<Local<'s>> = Vec::new();
+        let mut target_nonconfigurable: Vec<Local<'s>> = Vec::new();
+        for key in target_keys {
+            let vm_key = property_key_from_value(&self.escape_scoped(key), &self.gc_heap)?;
+            let target_value = self.escape_scoped(target);
             let desc = self.ordinary_get_own_property_descriptor_value(
                 stack,
                 context,
@@ -845,10 +891,11 @@ impl Interpreter {
                 0,
             )?;
             match desc {
-                Some(d) if !d.configurable() => target_nonconfigurable.push(*key),
-                _ => target_configurable.push(*key),
+                Some(d) if !d.configurable() => target_nonconfigurable.push(key),
+                _ => target_configurable.push(key),
             }
         }
+        let trap_result = current_keys(self);
         if extensible_target && target_nonconfigurable.is_empty() {
             return Ok(trap_result);
         }
@@ -889,7 +936,8 @@ impl Interpreter {
             false
         };
         for key in &target_nonconfigurable {
-            if !consume(key, &mut consumed, &mut remaining, &self.gc_heap) {
+            let key = self.escape_scoped(*key);
+            if !consume(&key, &mut consumed, &mut remaining, &self.gc_heap) {
                 return Err(self.err_type(
                     ("Proxy ownKeys trap result omits a non-configurable target own key"
                         .to_string())
@@ -901,7 +949,8 @@ impl Interpreter {
             return Ok(trap_result);
         }
         for key in &target_configurable {
-            if !consume(key, &mut consumed, &mut remaining, &self.gc_heap) {
+            let key = self.escape_scoped(*key);
+            if !consume(&key, &mut consumed, &mut remaining, &self.gc_heap) {
                 return Err(self.err_type((
                         "Proxy ownKeys trap result omits a target own key while target is non-extensible"
                             .to_string()).into()));

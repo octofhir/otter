@@ -193,10 +193,16 @@ pub(super) fn ordinary_set_symbol_data_property(
     // payload borrow, because creating it allocates — which may also move
     // `obj` and the pending value's referent.
     let mut obj = obj;
-    let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        value.trace_value_slots(visitor);
-    };
-    super::reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
+    let mut value = value;
+    {
+        // The collector rewrites the pending value through this exclusive
+        // borrow; the stores below read it back after the borrow ends.
+        let value_slot = &mut value;
+        let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            value_slot.trace_value_slot_mut(visitor);
+        };
+        super::reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
+    }
     let barrier_value = value;
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {

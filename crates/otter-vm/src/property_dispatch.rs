@@ -214,6 +214,25 @@ impl Interpreter {
         self.load_from_constructor_prototype(stack, context, "String", receiver, name)
     }
 
+    /// [`Self::function_user_bag_with_stack_roots`] for a store whose
+    /// receiver and value live in the frame's registers: the closure is read
+    /// from its register now, because the checks before a bag is needed can
+    /// allocate and move it, and the register slots root both across the bag
+    /// allocation.
+    pub(crate) fn function_user_bag_for_register(
+        &mut self,
+        stack: &ActivationStack,
+        top_idx: usize,
+        obj_reg: u16,
+        value_reg: u16,
+        function_id: u32,
+    ) -> Result<JsObject, VmError> {
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let value = *read_register(&stack[top_idx], value_reg)?;
+        let owner = receiver.as_closure(&self.gc_heap);
+        self.function_user_bag_with_stack_roots(stack, owner, function_id, &[&receiver, &value])
+    }
+
     fn function_user_bag_with_stack_roots(
         &mut self,
         stack: &ActivationStack,
@@ -225,8 +244,17 @@ impl Interpreter {
             if let Some(bag) = c.own_props(&self.gc_heap) {
                 return Ok(bag);
             }
-            let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
-            c.set_own_props(&mut self.gc_heap, bag);
+            // The bag allocation can move the closure: root it with the
+            // caller's values and attach the bag to its current location.
+            let owner_value = Value::closure(c);
+            let mut roots: smallvec::SmallVec<[&Value; 4]> = value_roots.iter().copied().collect();
+            roots.push(&owner_value);
+            let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, &roots)?;
+            // SAFETY: an initialized `Value` local the collector rewrote.
+            let owner_now = unsafe { std::ptr::read_volatile(&owner_value) }
+                .as_closure(&self.gc_heap)
+                .ok_or(VmError::TypeMismatch)?;
+            owner_now.set_own_props(&mut self.gc_heap, bag);
             return Ok(bag);
         }
         match self.function_user_props.get(&function_id).copied() {

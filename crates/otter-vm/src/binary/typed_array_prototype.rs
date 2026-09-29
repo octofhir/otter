@@ -842,8 +842,10 @@ fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
-        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, None)?,
+        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, false)?,
     }
+    // A comparator may have moved the receiver; re-read it.
+    let t = receiver(ctx)?;
     build_new_typed_array(ctx, t.kind(), &snapshot)
 }
 
@@ -864,8 +866,10 @@ fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
-        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, Some(t))?,
+        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, true)?,
     }
+    // A comparator may have moved the receiver; re-read it.
+    let t = receiver(ctx)?;
     if t.buffer(ctx.heap()).is_detached(ctx.heap()) {
         return Ok(Value::typed_array(t));
     }
@@ -878,11 +882,16 @@ fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 /// §23.2.3.29 SortCompare with a user comparator — stable bottom-up
 /// merge that tolerates inconsistent comparators (no Ord panic),
 /// propagating abrupt completions and mapping NaN results to 0.
+///
+/// The comparator and every element ride the traced anchor stack: each
+/// comparator call runs user code whose allocations move them (a closure
+/// comparator, BigInt elements), so the merge permutes indices into the
+/// anchors and reads values from there at every comparison.
 fn sort_with_comparefn(
     ctx: &mut NativeCtx<'_>,
     items: &mut Vec<Value>,
     cmp: &Value,
-    detach_watch: Option<JsTypedArray>,
+    detach_watch: bool,
 ) -> Result<(), NativeError> {
     let exec_ctx = ctx
         .execution_context()
@@ -892,57 +901,78 @@ fn sort_with_comparefn(
             reason: "missing execution context".to_string(),
         })?;
     let n = items.len();
-    let mut buf: Vec<Value> = items.clone();
-    let mut width = 1usize;
-    while width < n {
-        let mut lo = 0usize;
-        while lo < n {
-            let mid = usize::min(lo + width, n);
-            let hi = usize::min(lo + 2 * width, n);
-            let (mut i, mut j, mut k) = (lo, mid, lo);
-            while i < mid && j < hi {
-                let raw = ctx.call(*cmp, Value::undefined(), &[items[i], items[j]])?;
-                let v = ctx
-                    .with_turn_parts(|interp, stack| {
-                        interp
-                            .coerce_to_number(stack, &exec_ctx, &raw)
-                            .map_err(|e| {
-                                crate::native_function::vm_to_native_error(
-                                    interp,
-                                    e,
-                                    "TypedArray.prototype.sort",
-                                )
-                            })
-                    })?
-                    .as_f64();
-                if detach_watch.is_some_and(|t| t.buffer(ctx.heap()).is_detached(ctx.heap())) {
-                    return Ok(());
-                }
-                if v > 0.0 {
-                    buf[k] = items[j];
-                    j += 1;
-                } else {
-                    buf[k] = items[i];
-                    i += 1;
-                }
-                k += 1;
-            }
-            while i < mid {
-                buf[k] = items[i];
-                i += 1;
-                k += 1;
-            }
-            while j < hi {
-                buf[k] = items[j];
-                j += 1;
-                k += 1;
-            }
-            lo = hi;
-        }
-        std::mem::swap(items, &mut buf);
-        width *= 2;
+    let base = ctx.cx.interp.push_iteration_anchor(*cmp) - 1;
+    for item in items.iter() {
+        ctx.cx.interp.push_iteration_anchor(*item);
     }
-    Ok(())
+    let element =
+        |ctx: &NativeCtx<'_>, index: usize| ctx.cx.interp.iteration_anchor(base + 1 + index);
+    let merged = (|| -> Result<Option<Vec<usize>>, NativeError> {
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut buf: Vec<usize> = order.clone();
+        let mut width = 1usize;
+        while width < n {
+            let mut lo = 0usize;
+            while lo < n {
+                let mid = usize::min(lo + width, n);
+                let hi = usize::min(lo + 2 * width, n);
+                let (mut i, mut j, mut k) = (lo, mid, lo);
+                while i < mid && j < hi {
+                    let comparator = ctx.cx.interp.iteration_anchor(base);
+                    let pair = [element(ctx, order[i]), element(ctx, order[j])];
+                    let raw = ctx.call(comparator, Value::undefined(), &pair)?;
+                    let v = ctx
+                        .with_turn_parts(|interp, stack| {
+                            interp
+                                .coerce_to_number(stack, &exec_ctx, &raw)
+                                .map_err(|e| {
+                                    crate::native_function::vm_to_native_error(
+                                        interp,
+                                        e,
+                                        "TypedArray.prototype.sort",
+                                    )
+                                })
+                        })?
+                        .as_f64();
+                    if detach_watch && receiver(ctx)?.buffer(ctx.heap()).is_detached(ctx.heap()) {
+                        return Ok(None);
+                    }
+                    if v > 0.0 {
+                        buf[k] = order[j];
+                        j += 1;
+                    } else {
+                        buf[k] = order[i];
+                        i += 1;
+                    }
+                    k += 1;
+                }
+                while i < mid {
+                    buf[k] = order[i];
+                    i += 1;
+                    k += 1;
+                }
+                while j < hi {
+                    buf[k] = order[j];
+                    j += 1;
+                    k += 1;
+                }
+                lo = hi;
+            }
+            std::mem::swap(&mut order, &mut buf);
+            width *= 2;
+        }
+        Ok(Some(order))
+    })();
+    let result = match merged {
+        Ok(Some(order)) => {
+            *items = order.into_iter().map(|index| element(ctx, index)).collect();
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    result
 }
 
 fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

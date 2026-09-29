@@ -113,7 +113,7 @@ mod capability_executor_state {
         args: &[Value],
         captures: &[Value],
     ) -> Result<Value, NativeError> {
-        let mut state = captures[0]
+        let state = captures[0]
             .as_object()
             .expect("capability executor state is an object");
         let heap = ctx.heap_mut();
@@ -131,13 +131,20 @@ mod capability_executor_state {
         }
         let resolve = args.first().cloned().unwrap_or(Value::undefined());
         let reject = args.get(1).cloned().unwrap_or(Value::undefined());
-        if !resolve.is_undefined() {
-            crate::object::set(&mut state, heap, RESOLVE, resolve);
-        }
-        if !reject.is_undefined() {
-            crate::object::set(&mut state, heap, REJECT, reject);
-        }
-        Ok(Value::undefined())
+        // Each store can grow the state's storage and move young values, so
+        // the state and both functions ride scope handles across them.
+        ctx.scope(|mut scope| {
+            let state = scope.value(Value::object(state));
+            let resolve = scope.value(resolve);
+            let reject = scope.value(reject);
+            if !scope.is_undefined(resolve) {
+                scope.set(state, RESOLVE, resolve)?;
+            }
+            if !scope.is_undefined(reject) {
+                scope.set(state, REJECT, reject)?;
+            }
+            Ok(Value::undefined())
+        })
     }
 }
 
@@ -808,11 +815,23 @@ where
 /// body closure captured at build time are plain Rust copies that go
 /// stale on the first moving collection — reading them is the
 /// Promise-combinator use-after-move family.
+/// The capability an element function captured, read from the traced
+/// captures slab. The collector rewrites the slab in place when it moves the
+/// capability's cells, so callers read it after their last allocation.
 fn capability_from_captures(captures: &[Value], template: &PromiseCapability) -> PromiseCapability {
+    // SAFETY: each index is in bounds of the live slab; the volatile reads
+    // keep a pre-allocation load of the shared slice from being reused.
+    let read = |index: usize, fallback: Value| {
+        if index < captures.len() {
+            unsafe { std::ptr::read_volatile(captures.as_ptr().add(index)) }
+        } else {
+            fallback
+        }
+    };
     PromiseCapability {
-        promise: captures.first().copied().unwrap_or(template.promise),
-        resolve: captures.get(1).copied().unwrap_or(template.resolve),
-        reject: captures.get(2).copied().unwrap_or(template.reject),
+        promise: read(0, template.promise),
+        resolve: read(1, template.resolve),
+        reject: read(2, template.reject),
         context: template.context.clone(),
     }
 }
@@ -1551,7 +1570,14 @@ fn reject_capability_error(
     cap: &mut PromiseCapability,
     err: NativeError,
 ) -> Result<Value, NativeError> {
-    let reason = native_error_rejection_value_preserving_throw(interp, err);
+    // Materializing the reason allocates; the capability rides handles
+    // across it so a moved reject function is re-read before the call.
+    let reason = interp.with_handle_scope(|interp, scope| {
+        let handles = CapabilityHandles::park(interp, scope, cap);
+        let reason = native_error_rejection_value_preserving_throw(interp, err);
+        handles.refresh(interp, cap);
+        reason
+    });
     call_capability_reject(interp, stack, cap, reason)?;
     Ok(cap.promise)
 }
@@ -1922,6 +1948,8 @@ fn static_try_generic(
                 let reason = interp
                     .take_pending_uncaught_throw()
                     .unwrap_or_else(|| rejection_value_for(interp, &other));
+                // Rendering the reason allocates; re-read the capability.
+                let mut cap = cap_handles.current(interp, Some(exec.clone()));
                 call_capability_reject(interp, stack, &mut cap, reason)?;
             }
         }
@@ -2115,16 +2143,9 @@ fn static_all_keyed_generic(
             // IfAbruptRejectPromise — a throwing capability resolve (or an
             // abrupt result build) rejects the capability instead of
             // escaping the combinator.
-            if let Err(error) = resolve_keyed_slots_runtime(
-                interp,
-                stack,
-                &mut cap,
-                values_raw,
-                keys_raw,
-                name,
-                &[],
-                &[],
-            ) {
+            if let Err(error) =
+                resolve_keyed_slots_runtime(interp, stack, &mut cap, values_raw, keys_raw, name)
+            {
                 let mut cap = cap_handles.current(interp, context.clone());
                 return reject_capability_error(interp, stack, &mut cap, error);
             }
@@ -2201,10 +2222,14 @@ fn keyed_element_function(
             };
             let values = capture_array(captures[3]);
             if fill_slot(&slots, ctx.heap_mut(), values, index, value) {
-                let cap = capability_from_captures(captures, &cap);
                 let values = capture_array(captures[3]);
                 let keys = capture_array(captures[4]);
-                resolve_keyed_slots_native(ctx, &cap, values, keys, name)?;
+                let result = ctx
+                    .with_turn_parts(|interp, _| create_keyed_result(interp, name, values, keys))?;
+                // The result build moved the young capability functions; the
+                // traced captures slab holds them.
+                let cap = capability_from_captures(captures, &cap);
+                call_capability_resolve_native(ctx, &cap, result)?;
             }
             Ok(Value::undefined())
         },
@@ -2258,90 +2283,73 @@ fn resolve_keyed_slots_runtime(
     values: Value,
     keys: Value,
     name: &'static str,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
 ) -> Result<(), NativeError> {
-    let keys = collect_keys(interp.gc_heap(), capture_array(keys));
-    let values = collect_values(interp.gc_heap(), capture_array(values));
-    let result =
-        create_keyed_result_runtime(interp, name, &keys, &values, value_roots, slice_roots)?;
+    // The result build allocates; the capability rides handles across it.
+    let result = interp.with_handle_scope(|interp, scope| {
+        let handles = CapabilityHandles::park(interp, scope, cap);
+        let result = create_keyed_result(interp, name, capture_array(values), capture_array(keys));
+        handles.refresh(interp, cap);
+        result
+    })?;
     call_capability_resolve(interp, stack, cap, result)
 }
 
-fn resolve_keyed_slots_native(
-    ctx: &mut NativeCtx<'_>,
-    cap: &PromiseCapability,
-    values: crate::array::JsArray,
-    keys: crate::array::JsArray,
-    name: &'static str,
-) -> Result<(), NativeError> {
-    let keys = collect_keys(ctx.heap(), keys);
-    let values = collect_values(ctx.heap(), values);
-    let result = create_keyed_result_native(ctx, name, &keys, &values)?;
-    call_capability_resolve_native(ctx, cap, result)
-}
-
-fn create_keyed_result_runtime(
+/// The await-dictionary result: `OrdinaryObjectCreate(null)` with one data
+/// property per settled key, in key order.
+fn create_keyed_result(
     interp: &mut Interpreter,
     name: &'static str,
-    keys: &[Value],
-    values: &[Value],
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    values: crate::array::JsArray,
+    keys: crate::array::JsArray,
 ) -> Result<Value, NativeError> {
-    let mut all_slice_roots = Vec::with_capacity(slice_roots.len() + 2);
-    all_slice_roots.extend_from_slice(slice_roots);
-    all_slice_roots.push(keys);
-    all_slice_roots.push(values);
-    let obj = interp
-        .alloc_runtime_rooted_object_with_roots(value_roots, all_slice_roots.as_slice())
-        .map_err(|_| oom_native(name))?;
-    // The await-dictionary result is OrdinaryObjectCreate(null).
-    crate::object::set_prototype(obj, interp.gc_heap_mut(), None);
-    define_keyed_result_properties(obj, interp.gc_heap_mut(), keys, values, name)?;
-    Ok(Value::object(obj))
-}
-
-fn create_keyed_result_native(
-    ctx: &mut NativeCtx<'_>,
-    name: &'static str,
-    keys: &[Value],
-    values: &[Value],
-) -> Result<Value, NativeError> {
-    let obj = ctx
-        .alloc_object_with_roots(&[], &[keys, values])
-        .map_err(|_| oom_native(name))?;
-    // The await-dictionary result is OrdinaryObjectCreate(null).
-    crate::object::set_prototype(obj, ctx.heap_mut(), None);
-    define_keyed_result_properties(obj, ctx.heap_mut(), keys, values, name)?;
-    Ok(Value::object(obj))
-}
-
-fn define_keyed_result_properties(
-    obj: crate::object::JsObject,
-    heap: &mut otter_gc::GcHeap,
-    keys: &[Value],
-    values: &[Value],
-    name: &'static str,
-) -> Result<(), NativeError> {
-    for (key, value) in keys.iter().zip(values.iter()) {
-        let desc = crate::object::PropertyDescriptor::data(*value, true, true, true);
-        let ok = if let Some(s) = key.as_string(heap) {
-            let key = s.to_lossy_string(heap);
-            crate::object::define_own_property(obj, heap, &key, desc)
-        } else if let Some(sym) = key.as_symbol(heap) {
-            crate::object::define_own_symbol_property(obj, heap, sym, desc)
-        } else {
-            true
-        };
-        if !ok {
-            return Err(NativeError::TypeError {
-                name,
-                reason: "failed to define keyed result property".to_string(),
-            });
+    let keys = collect_keys(interp.gc_heap(), keys);
+    let values = collect_values(interp.gc_heap(), values);
+    interp.with_handle_scope(|interp, scope| {
+        // Every pair is parked before the first allocation, and each define
+        // re-reads the receiver and its pair: a define that grows the
+        // object's storage moves young cells.
+        let pairs: Vec<_> = keys
+            .into_iter()
+            .zip(values)
+            .map(|(key, value)| {
+                (
+                    interp.scoped_value(scope, key),
+                    interp.scoped_value(scope, value),
+                )
+            })
+            .collect();
+        let object = interp.scoped_object(scope).map_err(|_| oom_native(name))?;
+        let raw = interp
+            .escape_scoped(object)
+            .as_object()
+            .expect("keyed result is an object");
+        crate::object::set_prototype(raw, interp.gc_heap_mut(), None);
+        for (key, value) in pairs {
+            let key = interp.escape_scoped(key);
+            let value = interp.escape_scoped(value);
+            let raw = interp
+                .escape_scoped(object)
+                .as_object()
+                .expect("keyed result is an object");
+            let heap = interp.gc_heap_mut();
+            let desc = crate::object::PropertyDescriptor::data(value, true, true, true);
+            let ok = if let Some(s) = key.as_string(heap) {
+                let key = s.to_lossy_string(heap);
+                crate::object::define_own_property(raw, heap, &key, desc)
+            } else if let Some(sym) = key.as_symbol(heap) {
+                crate::object::define_own_symbol_property(raw, heap, sym, desc)
+            } else {
+                true
+            };
+            if !ok {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "failed to define keyed result property".to_string(),
+                });
+            }
         }
-    }
-    Ok(())
+        Ok(interp.escape_scoped(object))
+    })
 }
 
 fn static_all_generic(
@@ -2444,16 +2452,18 @@ fn static_all_generic(
                         values_raw
                     ],
                     move |ctx, args, captures| {
-                        let cap = capability_from_captures(captures, &cap_for_fulfill);
                         let values = capture_array(captures[3]);
                         let v = args.first().cloned().unwrap_or(Value::undefined());
                         if fill_slot(&slots_for_fulfill, ctx.heap_mut(), values, i, v) {
                             let collected = collect_values(ctx.heap(), values);
                             let arr = ctx.array_from_elements_with_roots(
                                 collected.iter().cloned(),
-                                &[&cap.promise, &cap.resolve, &cap.reject],
+                                &[],
                                 &[collected.as_slice()],
                             )?;
+                            // The array build moved the young capability
+                            // functions; the traced captures slab holds them.
+                            let cap = capability_from_captures(captures, &cap_for_fulfill);
                             call_capability_resolve_native(ctx, &cap, Value::array(arr))?;
                         }
                         Ok(Value::undefined())
@@ -2810,12 +2820,13 @@ fn make_aggregate_error_native_rooted(
     ctx.scope(|scope| {
         let mut cx = crate::marshal::MarshalCx::new(scope);
         let proto = cx.park(proto);
+        // Park every reason before the first allocation moves them.
+        let errors: Vec<_> = errors.into_iter().map(|error| cx.park(error)).collect();
         let errors_array = {
             let array = cx
                 .array(errors.len())
                 .map_err(|err| err.into_native("Promise.any"))?;
-            for (index, error) in errors.iter().enumerate() {
-                let element = cx.park(*error);
+            for (index, element) in errors.into_iter().enumerate() {
                 cx.set_index(array, index, element)
                     .map_err(|err| err.into_native("Promise.any"))?;
             }
@@ -2979,7 +2990,6 @@ fn static_any_generic(
                         errors_raw
                     ],
                     move |ctx, args, captures| {
-                        let cap = capability_from_captures(captures, &cap_for_call);
                         let errors_arr = capture_array(captures[3]);
                         let reason = args.first().cloned().unwrap_or(Value::undefined());
                         if fill_slot(&errors_for_call, ctx.heap_mut(), errors_arr, i, reason) {
@@ -2989,6 +2999,9 @@ fn static_any_generic(
                                 &registry_for_call,
                                 collected,
                             )?;
+                            // The error build moved the young capability
+                            // functions; the traced captures slab holds them.
+                            let cap = capability_from_captures(captures, &cap_for_call);
                             call_capability_reject_native(ctx, &cap, agg)?;
                         }
                         Ok(Value::undefined())
@@ -3412,12 +3425,15 @@ fn resolve_native_body(
             let then = match then {
                 Ok(then) => scope.value(then),
                 Err(err) => {
+                    let reason = native_error_rejection_value_preserving_throw(
+                        scope.context().interp_mut(),
+                        err,
+                    );
                     let promise = scope
                         .raw(promise)
                         .as_promise()
                         .expect("resolver promise remains rooted on getter throw");
                     let interp = scope.context().interp_mut();
-                    let reason = native_error_rejection_value_preserving_throw(interp, err);
                     let jobs = promise.reject(interp.gc_heap_mut(), reason);
                     drain_jobs(interp, jobs);
                     return Ok(Value::undefined());
@@ -3574,11 +3590,11 @@ pub(crate) fn resolve_promise_from_interpreter(
             let then = match then {
                 Ok(then) => then,
                 Err(err) => {
+                    let reason = native_error_rejection_value_preserving_throw(interp, err);
                     let promise_handle = interp
                         .escape_scoped(promise)
                         .as_promise()
                         .expect("async resolver promise remains rooted");
-                    let reason = native_error_rejection_value_preserving_throw(interp, err);
                     let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
                     drain_jobs(interp, jobs);
                     return Ok(());
@@ -3761,6 +3777,12 @@ fn make_resolve_thenable_job_runtime_rooted(
                         .take_pending_uncaught_throw()
                         .unwrap_or_else(|| rejection_value_for(interp, &err))
                 });
+                // The call and the reason both allocate; the traced captures
+                // slab holds the moved reject function.
+                // SAFETY: `captures` is the live slab the collector rewrites
+                // in place; the volatile read keeps the pre-call load from
+                // being reused.
+                let on_reject = unsafe { std::ptr::read_volatile(&captures[3]) };
                 let _ = ctx.with_turn_parts(|interp, stack| {
                     interp.run_callable_sync_rooted(
                         stack,

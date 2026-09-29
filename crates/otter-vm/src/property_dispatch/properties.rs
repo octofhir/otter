@@ -870,12 +870,8 @@ impl Interpreter {
                 // non-configurable}. Assigning before the slot
                 // materializes must install those attributes, not the
                 // generic {enumerable, configurable} create-on-set.
-                let bag = self.function_user_bag_with_stack_roots(
-                    stack,
-                    owner,
-                    fid,
-                    &[&receiver, &value],
-                )?;
+                let bag = self.function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)?;
+                let value = *read_register(&stack[top_idx], src)?;
                 let desc = object::PropertyDescriptor::data(value, true, false, false);
                 crate::object::define_own_property(bag, &mut self.gc_heap, name, desc);
                 stack[top_idx].advance_pc()?;
@@ -899,12 +895,8 @@ impl Interpreter {
                     Some(_) => {
                         // Own writable metadata (made writable via
                         // defineProperty): overwrite in place.
-                        let bag = self.function_user_bag_with_stack_roots(
-                            stack,
-                            owner,
-                            fid,
-                            &[&receiver, &value],
-                        )?;
+                        let bag =
+                            self.function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)?;
                         Some(bag)
                     }
                     None => match self
@@ -928,11 +920,8 @@ impl Interpreter {
                             None
                         }
                         MetadataProtoSet::Create => {
-                            let bag = self.function_user_bag_with_stack_roots(
-                                stack,
-                                owner,
-                                fid,
-                                &[&receiver, &value],
+                            let bag = self.function_user_bag_for_register(
+                                stack, top_idx, obj_reg, src, fid,
                             )?;
                             if let Some(metadata_key) =
                                 function_metadata::ordinary_function_metadata_key(name)
@@ -973,22 +962,13 @@ impl Interpreter {
                         None
                     }
                     MetadataProtoSet::Create => {
-                        let bag = self.function_user_bag_with_stack_roots(
-                            stack,
-                            owner,
-                            fid,
-                            &[&receiver, &value],
-                        )?;
+                        let bag =
+                            self.function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)?;
                         Some(bag)
                     }
                 }
             } else {
-                let bag = self.function_user_bag_with_stack_roots(
-                    stack,
-                    owner,
-                    fid,
-                    &[&receiver, &value],
-                )?;
+                let bag = self.function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)?;
                 Some(bag)
             }
         } else if let Some(native) = receiver.as_native_function() {

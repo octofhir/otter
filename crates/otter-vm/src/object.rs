@@ -3747,13 +3747,18 @@ pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &s
 
 /// [`body_offset_of`] for an atomized key: a shaped object answers with one
 /// `u32` compare per shape-chain link and never touches a heap string.
-/// Dictionary storage keys by spelling, so it still hashes the name.
+/// Dictionary storage keys by spelling, so it still hashes the name. A key
+/// whose spelling was never interned ([`crate::property_atom::AtomId::NONE`],
+/// the root shape's own marker) names no shaped property.
 pub(super) fn body_offset_of_atom(
     heap: &otter_gc::GcHeap,
     body: &ObjectBody,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<u16> {
     if !body.shape.is_null() {
+        if key.atom().id() == crate::property_atom::AtomId::NONE {
+            return None;
+        }
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
         return shape_body::shape_offset_of_atom(heap, body.shape, key.atom().id())
             .and_then(|offset| u16::try_from(offset).ok());

@@ -238,13 +238,27 @@ impl Interpreter {
         match key {
             VmPropertyKey::Atom(key) => object::lookup_own_atom(obj, &self.gc_heap, *key).lookup,
             VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(obj, &self.gc_heap, *sym),
-            _ => object::lookup_own(
-                obj,
-                &self.gc_heap,
-                key.string_name()
-                    .expect("non-symbol key has string spelling"),
-            ),
+            VmPropertyKey::String(name) => {
+                object::lookup_own_atom(obj, &self.gc_heap, self.atomized_key(name)).lookup
+            }
+            VmPropertyKey::OwnedString(name) => {
+                object::lookup_own_atom(obj, &self.gc_heap, self.atomized_key(name)).lookup
+            }
         }
+    }
+
+    /// A runtime spelling as an atomized key: shape walks compare its interned
+    /// id instead of string contents at every link. A spelling nothing has
+    /// interned carries [`crate::property_atom::AtomId::NONE`], which no shape
+    /// key has, while dictionary storage still matches it by spelling.
+    pub(crate) fn atomized_key<'a>(
+        &self,
+        name: &'a str,
+    ) -> crate::property_atom::AtomizedPropertyKey<'a> {
+        crate::property_atom::AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(self.names.lookup(name)),
+            name,
+        )
     }
 
     pub(crate) fn string_object_exotic_get(

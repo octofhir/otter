@@ -125,14 +125,19 @@ impl Interpreter {
             );
         }
         let value = if let Some(obj) = recv.as_object() {
+            let name;
             let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 VmPropertyKey::Symbol(sym)
-            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                VmPropertyKey::OwnedString(key.to_lossy_string(&self.gc_heap))
-            } else if let Some(n) = idx_value.as_number() {
-                VmPropertyKey::OwnedString(n.to_display_string())
             } else {
-                return Err(VmError::TypeMismatch);
+                name = if let Some(key) = idx_value.as_string(&self.gc_heap) {
+                    key.to_lossy_string(&self.gc_heap)
+                } else if let Some(n) = idx_value.as_number() {
+                    n.to_display_string()
+                } else {
+                    return Err(VmError::TypeMismatch);
+                };
+                // Atomized once for the whole prototype walk.
+                VmPropertyKey::Atom(self.atomized_key(&name))
             };
             match self.ordinary_get_value(stack, context, Value::object(obj), recv, &key, 0)? {
                 VmGetOutcome::Value(value) => value,

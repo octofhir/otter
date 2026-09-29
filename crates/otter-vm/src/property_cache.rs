@@ -389,6 +389,11 @@ impl crate::Interpreter {
         obj: JsObject,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<cache_ir::ResolvedDataSlot> {
+        // Every spelling nothing interned shares the one `NONE` atom, so it
+        // can never key a shared cache entry.
+        if key.atom().id() == AtomId::NONE {
+            return cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key);
+        }
         match self.property_cache.probe(obj, &self.gc_heap, key) {
             PropertyProbe::Resolved(resolved) => return Some(resolved),
             PropertyProbe::Unresolvable => return None,

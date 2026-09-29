@@ -705,6 +705,33 @@ fixed work is unchanged (±0.3%, `benchmarks/results/arch-2026-09-27/e1b-l2b0`).
 This is the precondition for L2b-1: a shape that holds its prototype can
 now die with it.
 
+### L2b-1 / L2c plan (specified, not started)
+
+With shapes collectable, the remaining stages are:
+1. **Prototype in the shape.** `ShapeBody` gains a traced `prototype`
+   value; every object gets a shape — dictionary-mode objects share a
+   per-prototype dictionary shape (V8 dictionary maps, SpiderMonkey
+   dictionary shapes), so "dictionary" becomes a shape flag instead of the
+   null handle (~25 Rust and 11 generated checks). Per-prototype roots are
+   cached on the prototype (V8 `PrototypeInfo::ObjectCreateMap`): in the
+   sidecar of an ordinary prototype, in the rare record of a closure, and
+   uncached (a fresh, collectable root) for rarer prototype kinds.
+   `setPrototypeOf` becomes a prototype transition; the 73
+   allocate-then-set-prototype sites allocate at the right root; the
+   constructor, arguments and literal shape caches key on the prototype.
+2. **Guards.** The 29 generated `jit_proto` reads load the prototype from
+   the (non-moving) shape; a chain link costs one load from a constant
+   shape address plus the link's shape compare, and `instanceof` compares
+   `shape.prototype` with the constructor's prototype.
+3. **L2c.** With `jit_proto` gone, the slab and the sidecar merge behind
+   one backing handle (V8 `properties_or_hash`, JSC butterfly): an 8-byte
+   body, a two-field object in 32 bytes (JSC's `JSFinalObject` prefix).
+
+Expected: earley −3…5% (instanceof and chain guards, 20% fewer object
+bytes), ts −2…3%. The call/frame contract (fib 4.3x, every workload's call
+path ≈150 instructions against V8's ≈20) is the larger lever and goes
+first.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

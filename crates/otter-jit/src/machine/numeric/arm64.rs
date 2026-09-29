@@ -110,12 +110,12 @@ use otter_vm::{
     native_abi::{
         ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
         RuntimeStubResultAbi, RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC,
-        STUB_COPY_CONTEXT_ALLOC, STUB_CREATE_CONTEXT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE, STUB_JIT_CALL_METHOD_VALUE,
-        STUB_JIT_CALL_WITH_THIS_VALUE, STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY,
-        STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF,
-        STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
+        STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE,
+        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY,
+        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_STRICT_EQ_LEAF,
+        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
     },
 };
 
@@ -2079,6 +2079,41 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::ClosureAllocationProbe {
+                byte_pc,
+                with_context,
+            } => {
+                let start = ops.offset().0;
+                let input = usize::from(with_context);
+                // x15 lies outside the allocation file; the carve clobbers
+                // the allocatable x9-x14.
+                if with_context {
+                    let context = integer_register(locations[0])?;
+                    dynasm!(ops ; .arch aarch64 ; mov x15, X(context));
+                } else {
+                    emit_load_u64(&mut ops, 15, VALUE_UNDEFINED);
+                }
+                let result = integer_register(locations[input])?;
+                let hit = integer_register(locations[input + 1])?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if let Some(&plan) = view.closure_allocations.get(&byte_pc) {
+                    dynasm!(ops ; .arch aarch64 ; ldr x10, [x19, NATIVE_FRAME_OFFSET]);
+                    crate::arm64::allocation::emit_closure(&mut ops, view, plan, 19, 10, miss);
+                    dynasm!(ops ; .arch aarch64 ; mov X(result), x16 ; movz W(hit), 1 ; b =>done);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; b =>miss);
+                }
+                dynasm!(ops ; .arch aarch64 ; =>miss);
+                emit_load_u64(&mut ops, result, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch aarch64 ; movz W(hit), 0 ; =>done);
+                structural_regions.push((
+                    "machineClosureAllocationProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::ArgumentsReadProbe { byte_pc, element } => {
                 let start = ops.offset().0;
                 let key = if element {
@@ -2912,10 +2947,7 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::CacheIrPublishShape {
-                byte_pc,
-                shape,
-            } => {
+            MachineOpcode::CacheIrPublishShape { byte_pc, shape } => {
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
                 emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
@@ -4161,10 +4193,7 @@ fn emit_with_reach(
                             }
                             (*target, string_concat_entry, 3, true)
                         }
-                        CallTarget::RuntimeStub(target)
-                            if *target == STUB_CREATE_CONTEXT_ALLOC
-                                || *target == STUB_COPY_CONTEXT_ALLOC =>
-                        {
+                        CallTarget::ContextAllocation { target, .. } => {
                             if locations.len() < 4
                                 || integer_register(locations[0])? != 2
                                 || integer_register(locations[1])? != 3
@@ -4220,6 +4249,8 @@ fn emit_with_reach(
                         let done = ops.new_dynamic_label();
                         emit_typeof_test_fast_path(&mut ops, view, done);
                         Some(done)
+                    } else if let CallTarget::ContextAllocation { scope, .. } = descriptor.target {
+                        emit_context_carve(&mut ops, view, scope)
                     } else {
                         None
                     };
@@ -5417,6 +5448,28 @@ fn emit_frame_str_d(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset
 /// with the boxed `Op::TestTypeOf` immediate in `x2`, leaving the boolean in
 /// `w0` and branching to `done`; heap-dependent cells fall through to the
 /// leaf call. Clobbers `x16`, `x17`.
+/// Carve a context allocation's result into `x0` from the linear
+/// allocation buffer ahead of its allocating call, with the parent or copy
+/// source in `x2`. Returns the join label after the call when a carve was
+/// emitted; its miss falls through into the call with `x2`–`x4` intact.
+fn emit_context_carve(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    view: &JitCompileSnapshot,
+    scope: Option<(u32, u32)>,
+) -> Option<DynamicLabel> {
+    let slow = ops.new_dynamic_label();
+    match scope {
+        Some(key) => {
+            let plan = view.context_allocations.get(&key)?;
+            crate::arm64::allocation::emit_create_context(ops, view, plan, 19, 2, slow);
+        }
+        None => crate::arm64::allocation::emit_copy_context(ops, view, 19, 2, slow),
+    }
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
+    Some(done)
+}
+
 fn emit_typeof_test_fast_path(
     ops: &mut dynasmrt::aarch64::Assembler,
     view: &JitCompileSnapshot,

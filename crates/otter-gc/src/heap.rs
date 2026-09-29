@@ -168,41 +168,35 @@ pub struct HeapStats {
 
 /// Narrow nursery window published to audited generated-code allocators.
 ///
-/// This is not a general heap-mutation API. A consumer may carve only one
-/// already-registered fixed-size body from [`Self::lab`] — bump `top` only
-/// when the whole cell fits below `limit` — and must update the type
-/// counters exactly once. The buffer is empty whenever a collector
-/// handshake is required, so a miss is the only policy signal.
+/// This is not a general heap-mutation API. A consumer may carve only
+/// already-registered fixed-size bodies from [`Self::lab`] — bump `top` only
+/// when the whole cell fits below `limit` — and must update its type's row
+/// of [`Self::type_stats`] exactly once per cell. The buffer is empty
+/// whenever a collector handshake is required, so a miss is the only policy
+/// signal.
 #[doc(hidden)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MachineAllocationWindow {
     /// The heap's linear allocation buffer, or the permanently empty one.
     pub lab: *mut LinearAllocationArea,
-    /// Per-type live-byte counter.
-    pub type_live_bytes: *mut usize,
-    /// Per-type monotone allocation-count counter.
-    pub type_alloc_count: *mut u64,
-    /// Per-type monotone allocated-byte counter.
-    pub type_alloc_bytes: *mut u64,
+    /// Base of the per-type-tag statistics rows ([`crate::stats::TypeStats`],
+    /// indexed by type tag).
+    pub type_stats: *mut crate::stats::TypeStats,
 }
 
 /// Buffer a disabled window points at. Every bump misses, so generated code
 /// never writes it.
 static EMPTY_LAB: LinearAllocationArea = LinearAllocationArea::EMPTY;
 
-/// Per-type counter sink for a disabled window; never written.
-static EMPTY_COUNTER: u64 = 0;
-
 impl MachineAllocationWindow {
-    /// A window that forces the caller through its rooted cold path.
+    /// A window that forces the caller through its rooted cold path. Its
+    /// buffer never admits a cell, so its statistics base is never written.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
             lab: std::ptr::addr_of!(EMPTY_LAB).cast_mut(),
-            type_live_bytes: std::ptr::addr_of!(EMPTY_COUNTER).cast_mut().cast(),
-            type_alloc_count: std::ptr::addr_of!(EMPTY_COUNTER).cast_mut(),
-            type_alloc_bytes: std::ptr::addr_of!(EMPTY_COUNTER).cast_mut(),
+            type_stats: std::ptr::null_mut(),
         }
     }
 }
@@ -1250,24 +1244,19 @@ impl GcHeap {
         self.tenure_all = tenure_all;
     }
 
-    /// Publish the nursery window generated code allocates one body type from.
+    /// Publish the nursery window generated code allocates bodies from.
     ///
     /// The window names the heap's linear allocation buffer, which is empty
     /// whenever heap caps, stress collection, incremental marking or
     /// bootstrap tenuring need the ordinary rooted path, so generated code
-    /// tests nothing but the bump. The buffer address is stable for the
-    /// heap's lifetime.
+    /// tests nothing but the bump. The buffer and statistics addresses are
+    /// stable for the heap's lifetime. Callers register every body type the
+    /// generated code carves ([`Self::register_traceable`]).
     #[doc(hidden)]
-    pub fn machine_allocation_window<T: Traceable>(&mut self) -> MachineAllocationWindow {
-        if self.trace_table.get(T::TYPE_TAG).is_none() {
-            self.trace_table.register::<T>();
-        }
-        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
+    pub fn machine_allocation_window(&mut self) -> MachineAllocationWindow {
         MachineAllocationWindow {
             lab: std::ptr::addr_of_mut!(self.lab),
-            type_live_bytes: std::ptr::addr_of_mut!(row.live_bytes),
-            type_alloc_count: std::ptr::addr_of_mut!(row.alloc_count_total),
-            type_alloc_bytes: std::ptr::addr_of_mut!(row.alloc_bytes_total),
+            type_stats: self.gc_stats.by_type.as_mut_ptr(),
         }
     }
 

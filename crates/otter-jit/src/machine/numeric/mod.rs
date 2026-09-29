@@ -2340,6 +2340,16 @@ fn select_with_loop_entries(
                         CommittedValueOperation::Scalar(
                             otter_vm::native_abi::ScalarValueOp::BindThisValue,
                         ) => Some(super::committed_probe::ProbeKind::DerivedThis),
+                        CommittedValueOperation::Scalar(
+                            otter_vm::native_abi::ScalarValueOp::MakeClosure,
+                        ) => Some(super::committed_probe::ProbeKind::Closure {
+                            with_context: true,
+                        }),
+                        CommittedValueOperation::Scalar(
+                            otter_vm::native_abi::ScalarValueOp::MakeFunction,
+                        ) => Some(super::committed_probe::ProbeKind::Closure {
+                            with_context: false,
+                        }),
                         CommittedValueOperation::ObjectProtocol(
                             otter_vm::native_abi::ObjectProtocolValueOp::LooseEqual,
                         ) => Some(super::committed_probe::ProbeKind::LooseEquality { equal: true }),
@@ -4127,10 +4137,7 @@ fn select_cache_ir_property_programs(
                     instructions.push(guard);
                     active = next;
                 }
-                otter_vm::JitCacheIrOp::PublishShape {
-                    object,
-                    shape,
-                } => {
+                otter_vm::JitCacheIrOp::PublishShape { object, shape } => {
                     let object = cache_ir_object(&objects, object, instructions.len())?;
                     let Some((stored_object, owner, hit)) = committed_store.take() else {
                         return Err(cache_ir_signature_error(instructions.len()));
@@ -4309,9 +4316,9 @@ fn array_construct_call_descriptor(target_spec: &TargetSpec) -> CallDescriptor {
     }
 }
 
-/// Non-reentrant context allocation through the VM's `AllocValue3` entry.
-/// Only the fresh context is written; the safepoint alone ends every memory
-/// proof, as for any collection.
+/// Non-reentrant context allocation: an inline buffer carve, else the VM's
+/// `AllocValue3` entry. Only the fresh context is written; the safepoint
+/// alone ends every memory proof, as for any collection.
 fn context_allocation_call_descriptor(
     target_spec: &TargetSpec,
     kind: NumericContextAllocation,
@@ -4319,12 +4326,18 @@ fn context_allocation_call_descriptor(
     let mut clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
     clobbers.retain(|register| *register != target_spec.integer_result());
     CallDescriptor {
-        target: CallTarget::RuntimeStub(match kind {
-            NumericContextAllocation::Create { .. } => {
-                otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC
+        target: match kind {
+            NumericContextAllocation::Create { function_id, scope } => {
+                CallTarget::ContextAllocation {
+                    target: otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC,
+                    scope: Some((function_id, scope)),
+                }
             }
-            NumericContextAllocation::Copy => otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC,
-        }),
+            NumericContextAllocation::Copy => CallTarget::ContextAllocation {
+                target: otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC,
+                scope: None,
+            },
+        },
         arguments: vec![MachineRepresentation::Tagged; 3],
         results: vec![MachineRepresentation::Tagged],
         effects: CallEffects::READS_HEAP,
@@ -7989,7 +8002,7 @@ mod tests {
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
             machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
-            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
@@ -9809,7 +9822,10 @@ mod tests {
                 otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC,
                 otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC,
             ]) {
-                assert_eq!(descriptor.target, CallTarget::RuntimeStub(stub));
+                assert!(matches!(
+                    descriptor.target,
+                    CallTarget::ContextAllocation { target, .. } if target == stub
+                ));
                 assert_eq!(descriptor.safepoint, SafepointKind::Gc);
                 assert!(!descriptor.effects.contains(CallEffects::REENTRANT));
                 assert!(instruction.safepoint.is_some());
@@ -9969,7 +9985,7 @@ mod tests {
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
             machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
-            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,

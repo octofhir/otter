@@ -70,23 +70,20 @@ use crate::{
         ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-        CANONICAL_NAN_HI16, CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_GENERATED_DEOPTS_OFFSET,
-        CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
-        CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET, DOUBLE_OFFSET_HI16,
-        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, MACHINE_ROOT_RECORD_BASE_OFFSET,
-        MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET, MACHINE_ROOT_RECORD_COUNT_OFFSET,
-        MACHINE_ROOT_RECORD_PREVIOUS_OFFSET, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET,
-        MACHINE_ROOT_RECORD_SIZE, MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
-        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
-        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
-        LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NUMBER_TAG_HI16,
-        OBJECT_BODY_TYPE_TAG,
+        ALLOC_WINDOW_LAB_OFFSET, CANONICAL_NAN_HI16, CODE_ENTRY_CODE_OBJECT_ID_OFFSET,
+        CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
+        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
+        DOUBLE_OFFSET_HI16, FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
+        MACHINE_ROOT_RECORD_BASE_OFFSET, MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET,
+        MACHINE_ROOT_RECORD_COUNT_OFFSET, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET,
+        MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET, MACHINE_ROOT_RECORD_SIZE,
+        MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
+        NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
         PropertySourceCell, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
-        RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_LAB_OFFSET,
-        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
-        RECEIVER_ALLOC_TYPE_COUNT_OFFSET, RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
+        RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
         RUNTIME_STATS_OFFSET, THREAD_OFFSET, TransitionTable, VALUE_UNDEFINED,
         VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
         VM_THREAD_CODE_OBJECT_ID_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
@@ -797,6 +794,39 @@ pub(super) fn emit(
                 );
                 structural_regions.push((
                     "machineInstanceofProbe",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::ClosureAllocationProbe {
+                byte_pc,
+                with_context,
+            } => {
+                let start = ops.offset().0;
+                let input = usize::from(with_context);
+                if with_context {
+                    let context = ireg(loc[0])?;
+                    dynasm!(ops ; .arch x64 ; mov rdx, Rq(context));
+                } else {
+                    load64(&mut ops, 2, VALUE_UNDEFINED);
+                }
+                let result = ireg(loc[input])?;
+                let hit = ireg(loc[input + 1])?;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if let Some(&plan) = view.closure_allocations.get(&byte_pc) {
+                    dynasm!(ops ; .arch x64 ; mov rcx, [r15 + NATIVE_FRAME_OFFSET as i32]);
+                    crate::x86_64::allocation::emit_closure(&mut ops, view, plan, 1, miss);
+                    dynasm!(ops ; .arch x64 ; mov Rq(result), rax ; mov Rd(hit), 1 ; jmp =>done);
+                } else {
+                    dynasm!(ops ; .arch x64 ; jmp =>miss);
+                }
+                dynasm!(ops ; .arch x64 ; =>miss);
+                load64(&mut ops, result, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch x64 ; xor Rd(hit), Rd(hit) ; =>done);
+                structural_regions.push((
+                    "machineClosureAllocationProbe",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
@@ -1572,10 +1602,7 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::CacheIrPublishShape {
-                byte_pc,
-                shape,
-            } => {
+            MachineOpcode::CacheIrPublishShape { byte_pc, shape } => {
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
                 load_integer(&mut ops, frame, loc[1], 10)?;
@@ -2550,6 +2577,61 @@ pub(super) fn emit(
                     }
                     continue;
                 }
+                if let CallTarget::ContextAllocation { target, scope } = descriptor.target {
+                    if loc.len() < 4
+                        || ireg(loc[0])? != 2
+                        || ireg(loc[1])? != 1
+                        || ireg(loc[2])? != 8
+                        || ireg(loc[3])? != 0
+                    {
+                        return Err(Unsupported::OperandShape("x86-64 context allocation ABI"));
+                    }
+                    let entry = otter_vm::runtime_stubs::alloc_value_stub_by_id(target.id)
+                        .and_then(|stub| stub.entry_addr())
+                        .ok_or(Unsupported::OperandShape("x86-64 context allocation entry"))?;
+                    let site = safepoints
+                        .site(id)
+                        .filter(|site| instruction.safepoint == Some(site.id))
+                        .ok_or(Unsupported::OperandShape("x86-64 allocating safepoint"))?;
+                    let exit = deopt(instruction.deopt_id(), &deopts)?;
+                    // The carve leaves `rdx`, `rcx` and `r8` intact for the
+                    // allocating call its miss falls into.
+                    let slow = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    let carved = match scope {
+                        Some(key) => view.context_allocations.get(&key).map(|plan| {
+                            crate::x86_64::allocation::emit_create_context(
+                                &mut ops, view, plan, slow,
+                            );
+                        }),
+                        None => {
+                            crate::x86_64::allocation::emit_copy_context(&mut ops, view, slow);
+                            Some(())
+                        }
+                    };
+                    if carved.is_some() {
+                        dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
+                    }
+                    allocating_call(
+                        &mut ops,
+                        &mut relocations,
+                        frame,
+                        site,
+                        entry as u64,
+                        target,
+                        exit,
+                    )?;
+                    dynasm!(ops ; .arch x64 ; =>done);
+                    if !terminal {
+                        edits(
+                            &mut ops,
+                            allocation.edits(),
+                            AllocationPoint::After(id),
+                            frame,
+                        )?;
+                    }
+                    continue;
+                }
                 let CallTarget::RuntimeStub(target) = descriptor.target else {
                     return Err(Unsupported::OperandShape("x86-64 scalar call target"));
                 };
@@ -2614,44 +2696,6 @@ pub(super) fn emit(
                         target,
                     );
                     dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jne =>fatal);
-                    if !terminal {
-                        edits(
-                            &mut ops,
-                            allocation.edits(),
-                            AllocationPoint::After(id),
-                            frame,
-                        )?;
-                    }
-                    continue;
-                }
-                if target == otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC
-                    || target == otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC
-                {
-                    if loc.len() < 4
-                        || ireg(loc[0])? != 2
-                        || ireg(loc[1])? != 1
-                        || ireg(loc[2])? != 8
-                        || ireg(loc[3])? != 0
-                    {
-                        return Err(Unsupported::OperandShape("x86-64 context allocation ABI"));
-                    }
-                    let entry = otter_vm::runtime_stubs::alloc_value_stub_by_id(target.id)
-                        .and_then(|stub| stub.entry_addr())
-                        .ok_or(Unsupported::OperandShape("x86-64 context allocation entry"))?;
-                    let site = safepoints
-                        .site(id)
-                        .filter(|site| instruction.safepoint == Some(site.id))
-                        .ok_or(Unsupported::OperandShape("x86-64 allocating safepoint"))?;
-                    let exit = deopt(instruction.deopt_id(), &deopts)?;
-                    allocating_call(
-                        &mut ops,
-                        &mut relocations,
-                        frame,
-                        site,
-                        entry as u64,
-                        target,
-                        exit,
-                    )?;
                     if !terminal {
                         edits(
                             &mut ops,
@@ -3644,7 +3688,13 @@ fn binding_guard(
                     ; test r10d, r10d
                     ; jz =>miss
                 );
-                symbolic(ops, relocations, 9, view.cage_base as u64, RelocationTarget::GcCageBase);
+                symbolic(
+                    ops,
+                    relocations,
+                    9,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
                 load64(ops, 8, shape);
                 dynasm!(ops
                     ; .arch x64

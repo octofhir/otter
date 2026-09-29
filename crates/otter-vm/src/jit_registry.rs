@@ -586,7 +586,11 @@ impl JitCodeRegistry {
         for registered in self.codes.values() {
             for shape in &*registered.shapes {
                 // Shapes never move, so the slot is never rewritten.
-                visitor(std::ptr::from_ref(shape).cast_mut().cast::<otter_gc::raw::RawGc>());
+                visitor(
+                    std::ptr::from_ref(shape)
+                        .cast_mut()
+                        .cast::<otter_gc::raw::RawGc>(),
+                );
             }
         }
     }

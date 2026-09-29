@@ -369,8 +369,7 @@ impl CodeBlock {
                 prototype_slot_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_SLOT_OFFSET as u32,
                 learned_instance_fields_byte: gc_header_bytes
-                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET
-                        as u32,
+                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET as u32,
                 last_instance_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET as u32,
             },
@@ -490,6 +489,8 @@ impl CodeBlock {
             property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
+            context_allocations: rustc_hash::FxHashMap::default(),
+            closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
@@ -1496,8 +1497,7 @@ mod tests {
                 prototype_slot_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_SLOT_OFFSET as u32,
                 learned_instance_fields_byte: gc_header_bytes
-                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET
-                        as u32,
+                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET as u32,
                 last_instance_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET as u32,
             }

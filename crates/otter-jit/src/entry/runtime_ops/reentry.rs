@@ -1294,7 +1294,7 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
     let context = unsafe { &*activation.context_ptr() };
     // SAFETY: the window names the heap's buffer or the static empty one;
     // both outlive this call.
-    let before_limit = unsafe { (*ctx.receiver_alloc.lab).limit };
+    let before_limit = unsafe { (*ctx.alloc_window.lab).limit };
     let before_cycles = vm.jit_gc_cycle_counts();
     if planned_allocation != 0 && !ctx.runtime_stats.is_null() {
         // SAFETY: `enter_compiled` publishes the interpreter-owned counter
@@ -1314,7 +1314,7 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
         otter_vm::Value::from_bits(callee_bits),
         otter_vm::Value::from_bits(new_target_bits),
     );
-    ctx.receiver_alloc = vm.jit_receiver_allocation_window();
+    ctx.alloc_window = vm.jit_allocation_window();
     if planned_allocation != 0 && !ctx.runtime_stats.is_null() {
         // SAFETY: same stable counter record as above.
         let stats = unsafe { &mut *ctx.runtime_stats };
@@ -1323,7 +1323,7 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
                 stats.receiver_alloc_gc_transitions.saturating_add(1);
         }
         // SAFETY: as above.
-        if unsafe { (*ctx.receiver_alloc.lab).limit } != before_limit {
+        if unsafe { (*ctx.alloc_window.lab).limit } != before_limit {
             stats.receiver_alloc_refills = stats.receiver_alloc_refills.saturating_add(1);
         }
         if matches!(result, Err(VmError::OutOfMemory { .. })) {
@@ -1647,7 +1647,7 @@ mod tests {
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
             machine_roots_ptr: std::ptr::null_mut(),
-            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,

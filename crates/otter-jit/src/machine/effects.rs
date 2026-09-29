@@ -342,6 +342,8 @@ impl MachineOpcode {
                 Guard,
             ),
 
+            // Reads an arrow's lexical `this` / `new.target` from the frame.
+            Self::ClosureAllocationProbe { .. } => MachineEffects::allocation(BINDING),
             Self::AllocateObject { .. } => {
                 MachineEffects::allocation(SHAPE.union(PROTOTYPE).union(ALLOCATION))
             }

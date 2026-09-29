@@ -20,6 +20,7 @@
 //! - `otter_vm::call_ops` — canonical rooted receiver preparation.
 
 use super::*;
+use crate::x86_64::allocation::emit_count_allocation;
 
 pub(crate) fn emit_increment_runtime_counter(ops: &mut Assembler, offset: u32) {
     dynasm!(ops
@@ -258,7 +259,7 @@ fn emit_receiver_candidate(
     let cell_bytes = receiver_cell_bytes(view, plan);
     dynasm!(ops
         ; .arch x64
-        ; mov rcx, [r15 + RECEIVER_ALLOC_LAB_OFFSET as i32]
+        ; mov rcx, [r15 + ALLOC_WINDOW_LAB_OFFSET as i32]
         ; mov rax, [rcx + LAB_TOP_OFFSET as i32]
         ; lea r11, [rax + cell_bytes as i32]
         ; cmp r11, [rcx + LAB_LIMIT_OFFSET as i32]
@@ -312,20 +313,9 @@ fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot) {
         ; lea r11, [rax + r10]
         ; mov [rcx + LAB_TOP_OFFSET as i32], r11
     );
-    for pointer_offset in [
-        RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
-        RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
-    ] {
-        dynasm!(ops
-            ; .arch x64
-            ; mov r11, [r15 + pointer_offset as i32]
-            ; add [r11], r10
-        );
-    }
+    emit_count_allocation(ops, OBJECT_BODY_TYPE_TAG as u8, 10, 11);
     dynasm!(ops
         ; .arch x64
-        ; mov r11, [r15 + RECEIVER_ALLOC_TYPE_COUNT_OFFSET as i32]
-        ; add QWORD [r11], 1
         ; cmp BYTE [rdx], JS_CLOSURE_BODY_TYPE_TAG as i8
         ; jne =>observation_done
         ; mov [rdx + view.closure_call_layout.last_instance_byte as i32], eax

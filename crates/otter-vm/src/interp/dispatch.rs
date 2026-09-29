@@ -1635,7 +1635,11 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let kind = read_register(frame, src)?.typeof_kind_with_heap(&self.gc_heap);
-                    write_register(frame, dst, Value::boolean((kind == test.kind) != test.negate))?;
+                    write_register(
+                        frame,
+                        dst,
+                        Value::boolean((kind == test.kind) != test.negate),
+                    )?;
                     frame.advance_pc()?;
                     continue;
                 }

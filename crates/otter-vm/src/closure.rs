@@ -198,6 +198,11 @@ pub(crate) fn ordinary_named_lookup_guard() -> crate::jit::JitBodyGuard {
     }
 }
 
+/// [`ClosureCallHeader::flags`] word of a fresh closure whose function kind
+/// has the ordinary `%Function.prototype%` lookup.
+pub(crate) const CLOSURE_FLAGS_ORDINARY_LOOKUP: u32 =
+    (CLOSURE_LOOKUP_ORDINARY as u32) << CLOSURE_NAMED_LOOKUP_SHIFT;
+
 /// Named-lookup bit: an own-property bag exists.
 pub const CLOSURE_LOOKUP_OWN_PROPS: u8 = 1 << 1;
 /// Named-lookup bit: a `[[Prototype]]` override is installed.

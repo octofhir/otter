@@ -732,6 +732,73 @@ bytes), ts −2…3%. The call/frame contract (fib 4.3x, every workload's call
 path ≈150 instructions against V8's ≈20) is the larger lever and goes
 first.
 
+## 13. Inline context and closure allocation
+
+`CreateContext`, `CopyContext`, `MakeClosure` and `MakeFunction` called
+the VM in both tiers: an `AllocValue3` stub per context (a full-window
+safepoint, root publication, the Rust allocator) and a committed runtime
+call per closure (published frame, `function_kind_prototype_for`,
+`alloc_closure`, `mark_closure_lookup`). earley-boyer creates ~20M
+contexts and a closure per `sc_*` helper call.
+
+- **V8** Maglev/TurboFan lower `CreateFunctionContext` and
+  `FastNewClosure` to an inline bump of the new-space linear allocation
+  area (`AllocateRaw` + field stores from the known `ScopeInfo` / the
+  feedback cell's shared info); the builtin is only the refill path.
+- **JSC** DFG/FTL `CreateActivation` and `NewFunction` allocate from the
+  `LocalAllocator` with the `SymbolTable`/`FunctionExecutable` baked in.
+- **SpiderMonkey** Warp `NewCallObject` / `LambdaArrow` allocate inline
+  from the nursery with a template object's shape.
+
+Otter now does the same on the buffer from section 11:
+- The compile snapshot carries a plan per scope (`JitContextAllocationPlan`:
+  cell size, complete header word, the body word with function id, scope
+  index and slot count, each slot's initial `hole`/`undefined`) and per
+  function-creation site (`JitClosureAllocationPlan`: the call-header word
+  with the ordinary named-lookup bit, and whether the site binds an arrow's
+  `this`/`new.target`). Generator and async functions get no plan; their
+  kind prototype is not the ordinary lookup.
+- One shared emitter per architecture (`arm64::allocation`,
+  `x86_64::allocation`) serves both tiers: bump probe, every word written,
+  cursor published, then the per-type statistics row the Rust allocator
+  keeps. `CopyContext` reads the slot count from the source cell and copies
+  the words; a scope with an eval extension or more than 32 words takes the
+  call. The Machine tier reaches the carve through a
+  `CallTarget::ContextAllocation` call whose emitter carves before the
+  allocating call, and through a `ClosureAllocationProbe` committed probe
+  whose miss is the unchanged committed call.
+- The heap empties the buffer whenever marking, GC stress, tenuring or a cap
+  needs the rooted path, so the bump is the only test; fresh young cells
+  need no write barrier.
+
+Fixed work (`benchmarks/results/arch-2026-09-27/e1b/ctx-carve`,
+`.../closure-carve`; stdout identical):
+
+| Workload | before | contexts | + closures |
+|---|---:|---:|---:|
+| earley-boyer | 128.2G | 117.5G | 112.3G (−12.4%) |
+| ts-fixed | 174.7G | 173.7G | 174.2G |
+| crypto-fixed | 16.9G | 17.0G | 16.95G |
+| zlib-fixed | 233.8G | 233.7G | 233.8G |
+| fib / mega / ast_ctor | 3.64 / 10.0 / 21.8G | same | same |
+
+### Where the time goes next (samples, release, this tree)
+- **earley**: JIT 80%, scavenges ~10%. The `instanceof` probe is ~8% of JIT
+  samples: its target proof (closure → rare record → own-property bag →
+  symbol table → bag shape → prototype slot) is a dozen dependent loads per
+  test. V8 folds a constant target's `prototype` through a code dependency;
+  Otter has no dependency invalidation, so the proof is re-derived each
+  time.
+- **zlib**: JIT 57%; ~11% is `&`/`|` with a non-Number operand going through
+  the committed runtime operator (ToNumeric with a handle scope per call),
+  ~11% is Machine compilation (regalloc, HIR, GVN, verification).
+- **ts**: JIT 37%; generic calls re-enter compiled code through the Rust
+  call path (`run_callable_sync_rooted`, `bind`, argument vectors), and
+  keyed/string lookups hash or compare spellings.
+- **ast_ctor**: a closure that owns a property bag (an assigned
+  `prototype`) has no IC; `_super.call` resolves `call` by spelling on
+  every call (`eq_str` over the shape chain).
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

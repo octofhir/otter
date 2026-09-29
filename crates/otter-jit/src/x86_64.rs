@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - [`emit_runtime_forward`] — runtime-selected generated argument forwarding.
+//! - [`allocation`] — nursery carves shared by both tiers.
 //!
 //! # Invariants
 //! - Shared emitters consume the target-neutral VM descriptors and native-frame
@@ -14,6 +15,7 @@
 //! - `crate::arm64::direct_call::runtime_forward` — peer target implementation.
 //! - `otter_vm::runtime_activation::forward_arguments` — admission and copy rules.
 
+pub(crate) mod allocation;
 mod runtime_forward;
 
 pub(crate) use runtime_forward::emit_runtime_forward;

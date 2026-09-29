@@ -396,15 +396,26 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch x64 ; cmp rax, r11 ; je =>runtime_transition);
                 emit_store_reg(&mut ops, 0, dst);
             }
-            TemplateOp::MakeFunction { dst, constant } => emit_make_function(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                dst,
-                constant,
-                threw,
-                fatal,
-            ),
+            TemplateOp::MakeFunction { dst, constant } => {
+                let done = ops.new_dynamic_label();
+                if let Some(&plan) = view.closure_allocations.get(&instruction.byte_pc) {
+                    let slow = ops.new_dynamic_label();
+                    emit_load_u64(&mut ops, 2, VALUE_UNDEFINED);
+                    crate::x86_64::allocation::emit_closure(&mut ops, view, plan, 14, slow);
+                    emit_store_reg(&mut ops, 0, dst);
+                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
+                }
+                emit_make_function(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    dst,
+                    constant,
+                    threw,
+                    fatal,
+                );
+                dynasm!(ops ; .arch x64 ; =>done);
+            }
             TemplateOp::NewObject { dst } => emit_value_packet_transition(
                 &mut ops,
                 &mut relocations,
@@ -829,17 +840,28 @@ pub(super) fn compile(
                 dst,
                 function,
                 context,
-            } => emit_make_closure(
-                &mut ops,
-                &mut relocations,
-                transitions,
-                view.code_block.id,
-                dst,
-                function,
-                context,
-                threw,
-                fatal,
-            ),
+            } => {
+                let done = ops.new_dynamic_label();
+                if let Some(&plan) = view.closure_allocations.get(&instruction.byte_pc) {
+                    let slow = ops.new_dynamic_label();
+                    emit_load_reg(&mut ops, 2, context);
+                    crate::x86_64::allocation::emit_closure(&mut ops, view, plan, 14, slow);
+                    emit_store_reg(&mut ops, 0, dst);
+                    dynasm!(ops ; .arch x64 ; jmp =>done ; =>slow);
+                }
+                emit_make_closure(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    view.code_block.id,
+                    dst,
+                    function,
+                    context,
+                    threw,
+                    fatal,
+                );
+                dynasm!(ops ; .arch x64 ; =>done);
+            }
             TemplateOp::BindingValue {
                 semantics,
                 result,
@@ -3040,10 +3062,7 @@ fn emit_existing_property_store(
                         dynasm!(ops ; .arch x64 ; jmp =>done);
                     }
                 }
-                otter_vm::JitCacheIrOp::PublishShape {
-                    object: 0,
-                    shape,
-                } if terminal => {
+                otter_vm::JitCacheIrOp::PublishShape { object: 0, shape } if terminal => {
                     let Some(otter_vm::JitCacheIrOp::StoreField {
                         object: 0,
                         value_byte,

@@ -318,10 +318,9 @@ impl Interpreter {
         std::ptr::addr_of!(self.gc_heap).cast::<std::ffi::c_void>()
     }
 
-    /// Current safepoint-free nursery window for generated ordinary objects.
-    pub fn jit_receiver_allocation_window(&mut self) -> otter_gc::MachineAllocationWindow {
-        self.gc_heap
-            .machine_allocation_window::<crate::object::ObjectBody>()
+    /// The safepoint-free nursery window generated code allocates from.
+    pub fn jit_allocation_window(&mut self) -> otter_gc::MachineAllocationWindow {
+        self.gc_heap.machine_allocation_window()
     }
 
     /// Stable address of the aggregate JIT counter record for generated code.

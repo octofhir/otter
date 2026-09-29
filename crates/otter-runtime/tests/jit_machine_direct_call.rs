@@ -19,9 +19,9 @@
 //! - Generated linkage must be observed on the native hit path.
 //! - An already-started callee is resumed after deopt and never replayed.
 //! - Every throw restores the caller publication before later native reuse.
-//! - Reentrant root records form a live nested chain until the deepest call
+//! - Reentrant call sites keep every frame's roots live until the deepest call
 //!   returns, allowing the collector to rewrite allocator-owned value homes;
-//!   post-call full GC observes an empty chain and the caller remains reusable.
+//!   post-call full GC observes no stale call site and the caller remains reusable.
 //!
 //! # See also
 //! - `crates/otter-jit/src/machine/numeric` for call selection and emission.
@@ -1544,7 +1544,7 @@ fn nested_machine_calls_rewrite_live_roots_during_gc() {
     );
     runtime
         .force_gc()
-        .expect("completed Machine calls must leave no stale root record");
+        .expect("completed Machine calls must leave only live call-site roots");
     let reused = runtime
         .run_script(
             SourceInput::from_javascript(r#"outer(middle, allocator, "again:", 0);"#),
@@ -1699,7 +1699,7 @@ fn method_receiver_remains_rooted_during_moving_gc() {
     assert!(runtime.heap_stats().minor_gc_cycles > gc_before);
     runtime
         .force_gc()
-        .expect("completed method call must unlink its Machine root record");
+        .expect("completed method call must leave only live call-site roots");
     let reused = runtime
         .run_script(
             SourceInput::from_javascript("methodGcCaller(methodGcReceiver, 0);"),

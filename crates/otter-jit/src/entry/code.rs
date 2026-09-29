@@ -76,7 +76,6 @@ pub(crate) unsafe fn enter_compiled(
         };
         // SAFETY: same contract; the interpreter outlives every compiled
         // activation.
-        let machine_roots_ptr = unsafe { (*vm).jit_machine_roots_addr() };
         let generated_depth_limit =
             u64::from(unsafe { (*vm).jit_generated_depth_limit(interpreter_frames) });
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
@@ -140,7 +139,6 @@ pub(crate) unsafe fn enter_compiled(
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
             generated_depth_limit,
-            machine_roots_ptr,
             alloc_window,
             runtime_stats,
             global_this_offset,

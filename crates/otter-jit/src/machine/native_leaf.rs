@@ -16,7 +16,7 @@
 //!   `Op::Call` leaves retain exact pre-call deoptimization on misses. Method
 //!   and resolved `CallWithThis` probes select their committed cold sibling;
 //!   resolved calls retain the already-loaded callee without repeating lookup.
-//! - A leaf probe call publishes no safepoint, frame or root record; its
+//! - A leaf probe call publishes no safepoint, frame or call site; its
 //!   tagged operands stay in argument registers across the call only because
 //!   the entry cannot move them.
 //! - The target specification owns the callee, argument, result, and clobber

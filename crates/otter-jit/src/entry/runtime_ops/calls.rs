@@ -42,6 +42,9 @@ pub(crate) extern "C" fn jit_deopt_stack_call_stub(
     let Some(callee_frame) = (unsafe { callee_frame.as_mut() }) else {
         return compiled_fatal(ctx, VmError::InvalidOperand);
     };
+    // The callee's machine stack, and with it any root homes its last call
+    // site named, is gone; the published record keeps only its window.
+    callee_frame.call_site = otter_vm::native_abi::NO_SAFEPOINT;
     let Some(callee_side_exit) = otter_vm::native_abi::SideExit::from_bits(callee_side_exit) else {
         return compiled_fatal(ctx, VmError::InvalidOperand);
     };
@@ -121,7 +124,6 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
-            machine_roots_ptr: std::ptr::null_mut(),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };

@@ -4,15 +4,16 @@
 //! Register allocation/reclaim on the contiguous register stack, ActivationStack
 //! draw/return, cold-frame attach/detach, frame pop/unwind
 //! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), the native frame
-//! chain (entry cells, Rust publication, depth, tracing), linked Machine IR
-//! safepoint roots, and the raw pointers compiled code uses to address the reg
-//! window.
+//! chain (entry cells, Rust publication, depth, tracing), optimized frames'
+//! call-site root homes, and the raw pointers compiled code uses to address
+//! the reg window.
 //!
 //! # Invariants
 //! The reg stack is a GC root region: windows must be zeroed on alloc
 //! and truncated on reclaim so stale slots never masquerade as values.
-//! Stack-owned native frames and Machine root records remain published for the
-//! complete dynamic extent of every allocating or reentrant compiled call.
+//! Stack-owned native frames remain published for the complete dynamic extent
+//! of every allocating or reentrant compiled call; an optimized frame's
+//! `call_site` names the safepoint of the call it is making.
 //! Frames are published and unpublished innermost first; each links to its
 //! caller, so the chain from the innermost frame is the complete live set.
 #![allow(unused_imports)]
@@ -319,16 +320,10 @@ impl Interpreter {
             .saturating_sub(self.jit_materialized_generated_calls.len() as u32)
     }
 
-    /// Address of the linked Machine IR allocator-root chain head.
-    pub fn jit_machine_roots_addr(&mut self) -> *mut u64 {
-        &mut self.jit_machine_roots
-    }
-
     /// Trace every published native frame. Register-arena windows are traced
     /// once by [`Self::trace_reg_stack`]; generated-code stack windows are
     /// absent from that arena and are traced through their frame here.
     pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        let mut frames = 0usize;
         for native in self.jit_native_frames() {
             // SAFETY: published frames and their windows stay live until
             // unpublished.
@@ -342,29 +337,27 @@ impl Interpreter {
                 frame.trace_stack_register_slots(visitor);
             }
             frame.trace_non_register_slots(visitor);
-            frames += 1;
-        }
-        let mut record = self.jit_machine_roots;
-        let mut depth = 0usize;
-        while record != 0 {
-            assert!(
-                depth < frames,
-                "every Machine IR root record belongs to a published native frame"
-            );
-            // SAFETY: generated publication keeps every record and root window
-            // live until it atomically restores the previous chain head.
-            let roots = unsafe { &*(record as *const crate::jit::JitMachineRootRecord) };
-            debug_assert_ne!(roots.code_object_id, 0);
-            debug_assert_ne!(roots.safepoint_id, crate::native_abi::NO_SAFEPOINT);
-            debug_assert!(roots.root_count == 0 || !roots.root_base.is_null());
-            for index in 0..usize::from(roots.root_count) {
-                // SAFETY: the record publishes initialized mutable Value homes
-                // for its complete linked lifetime.
-                let value = unsafe { roots.root_base.add(index).cast::<crate::Value>() };
-                unsafe { (&mut *value).trace_value_slot_mut(visitor) };
+            // SAFETY: as above; only scalar fields are read here.
+            let record = unsafe { &*native };
+            if record.call_site == native_abi::NO_SAFEPOINT {
+                continue;
             }
-            record = roots.previous;
-            depth += 1;
+            let safepoint = self
+                .jit_code_registry
+                .safepoint_record(u64::from(record.code_object_id), record.call_site)
+                .expect("an optimized frame's call site names a live safepoint");
+            debug_assert_ne!(record.machine_roots, 0);
+            for location in &safepoint.tagged_locations {
+                debug_assert_eq!(location.kind, native_abi::TaggedLocationKind::SpillSlot);
+                // SAFETY: the frame's prologue published its root-home base,
+                // and the call named by `call_site` saved every listed home
+                // before it could collect; the homes live until the frame
+                // returns.
+                let home = unsafe {
+                    (record.machine_roots as *mut crate::Value).add(usize::from(location.index))
+                };
+                unsafe { (&mut *home).trace_value_slot_mut(visitor) };
+            }
         }
     }
 

@@ -7993,13 +7993,11 @@ mod tests {
         thread.gc_heap = heap as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
         let mut error = None;
-        let mut machine_roots = 0;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
             generated_depth_limit: u64::MAX,
-            machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),
@@ -9974,13 +9972,11 @@ mod tests {
         thread.gc_heap = std::ptr::from_ref(&heap) as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(&mut fuel) as u64;
         let mut error = None;
-        let mut machine_roots = 0;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
             generated_depth_limit: u64::MAX,
-            machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),

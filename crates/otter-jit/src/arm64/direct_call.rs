@@ -98,10 +98,10 @@ use crate::{
         NATIVE_FRAME_DEPTH_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
         NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
         NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET,
-        OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
-        RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
-        RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
-        VM_THREAD_CODE_REGISTRY_OFFSET, reg_offset,
+        NO_CALL_SITE_WORD, OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET,
+        RECEIVER_ALLOC_GENERATED_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
+        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported,
+        VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_CODE_REGISTRY_OFFSET, reg_offset,
     },
 };
 
@@ -225,8 +225,10 @@ fn emit_link_callee_frame(ops: &mut Assembler, context_register: u8) {
         ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
         ; ldr w10, [x13, NATIVE_FRAME_DEPTH_OFFSET]
         ; add w10, w10, #1
+        // The depth word also clears the callee's call site.
+        ; orr x10, x10, NO_CALL_SITE_WORD
         ; str x13, [sp, NATIVE_FRAME_CALLER_OFFSET]
-        ; str w10, [sp, NATIVE_FRAME_DEPTH_OFFSET]
+        ; str x10, [sp, NATIVE_FRAME_DEPTH_OFFSET]
         ; mov x15, sp
         ; str x15, [X(context_register), NATIVE_FRAME_OFFSET]
     );
@@ -1411,8 +1413,9 @@ where
         }
         // Resolve the target and prepare a base receiver before reading the
         // spread array again: either path may clobber allocator registers, and
-        // receiver preparation may move the array. The Machine root record is
-        // the sole owner of that live value across both transitions.
+        // receiver preparation may move the array. The caller's call-site
+        // root home is the sole owner of that live value across both
+        // transitions.
         refresh_roots(ops, layout.frame_bytes)?;
         dynasm!(ops ; .arch aarch64 ; ldr x25, [sp, layout.target_cell]);
         load(ops, arguments, 1, layout.frame_bytes)?;

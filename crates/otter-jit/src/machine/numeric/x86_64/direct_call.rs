@@ -168,7 +168,7 @@ pub(super) fn emit(
             );
         }
         save_roots(ops, frame, site)?;
-        publish_roots(ops, frame, site)?;
+        stamp_call_site(ops, site);
         dynasm!(ops
             ; .arch x64
             ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
@@ -206,8 +206,7 @@ pub(super) fn emit(
                     .find(|root| root.value == value)
                     .ok_or(Unsupported::OperandShape("x86-64 forward source root"))?;
                 let offset = bias
-                    .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                    .and_then(|offset| offset.checked_add(root_offset(frame, root.save_slot).ok()?))
+                    .checked_add(root_offset(frame, root.save_slot)?)
                     .and_then(|offset| i32::try_from(offset).ok())
                     .ok_or(Unsupported::OperandShape("x86-64 forward source offset"))?;
                 dynasm!(ops ; .arch x64 ; mov Rq(target), [rsp + offset]);
@@ -219,10 +218,7 @@ pub(super) fn emit(
                     .ok_or(Unsupported::OperandShape("x86-64 forward result location"))?;
                 store_integer(ops, frame, location, source)
             },
-            |ops| {
-                clear_roots_preserving_r11(ops);
-                reload_roots_preserving_r11(ops, frame, site)
-            },
+            |ops| reload_roots_preserving_r11(ops, frame, site),
             |ops, register, base| {
                 let index = view
                     .code_block
@@ -244,9 +240,8 @@ pub(super) fn emit(
                     .iter()
                     .find(|root| root.value == value)
                     .ok_or(Unsupported::OperandShape("x86-64 forward binding root"))?;
-                let offset = MACHINE_ROOT_RECORD_SIZE
-                    .checked_add(root_offset(frame, root.save_slot)?)
-                    .and_then(|offset| i32::try_from(offset).ok())
+                let offset = i32::try_from(root_offset(frame, root.save_slot)?)
+                    .ok()
                     .ok_or(Unsupported::OperandShape("x86-64 forward binding offset"))?;
                 dynasm!(ops ; .arch x64 ; mov r11, [Rq(base) + offset]);
                 Ok(())
@@ -254,7 +249,7 @@ pub(super) fn emit(
         )?;
         dynasm!(ops ; .arch x64 ; =>canonical);
         save_roots(ops, frame, site)?;
-        publish_roots(ops, frame, site)?;
+        stamp_call_site(ops, site);
         return emit_generic_value_call(
             ops,
             relocations,
@@ -379,7 +374,7 @@ pub(super) fn emit(
             ));
         }
         save_roots(ops, frame, site)?;
-        publish_roots(ops, frame, site)?;
+        stamp_call_site(ops, site);
         let start = ops.offset().0;
         emit_generic_value_call(
             ops,
@@ -425,7 +420,7 @@ pub(super) fn emit(
             ));
         }
         save_roots(ops, frame, site)?;
-        publish_roots(ops, frame, site)?;
+        stamp_call_site(ops, site);
         return emit_generic_construct(
             ops,
             relocations,
@@ -471,7 +466,7 @@ pub(super) fn emit(
 
     if !roots_published {
         save_roots(ops, frame, site)?;
-        publish_roots(ops, frame, site)?;
+        stamp_call_site(ops, site);
     }
     dynasm!(ops
         ; .arch x64
@@ -720,6 +715,7 @@ pub(super) fn emit(
         ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
         ; add r9d, 1
         ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
+        ; mov DWORD [rsp + NATIVE_FRAME_CALL_SITE_OFFSET as i32], -1
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
     );
     crate::entry::x86_64_tiering::emit_entry(ops);
@@ -854,10 +850,8 @@ pub(super) fn emit(
 
     dynasm!(ops ; .arch x64 ; =>guard_fail);
     if derived || super_construct {
-        clear_roots(ops);
         reload_roots(ops, frame, site)?;
         dynasm!(ops ; .arch x64 ; jmp =>deopt ; =>unpublished_fail ; add rsp, layout.frame_bytes as i32);
-        clear_roots(ops);
         reload_roots(ops, frame, site)?;
         dynasm!(ops ; .arch x64 ; jmp =>deopt ; =>generic_construct);
     } else {
@@ -981,7 +975,7 @@ fn emit_generated_value_call(
 
     if !roots_published {
         save_roots(ops, frame, site)?;
-        publish_roots(ops, frame, site)?;
+        stamp_call_site(ops, site);
     }
 
     let guard_fail = ops.new_dynamic_label();
@@ -1165,6 +1159,7 @@ fn emit_generated_value_call(
         ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
         ; add r9d, 1
         ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
+        ; mov DWORD [rsp + NATIVE_FRAME_CALL_SITE_OFFSET as i32], -1
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
     );
     crate::entry::x86_64_tiering::emit_entry(ops);
@@ -1295,7 +1290,6 @@ fn emit_generic_value_call(
         );
         let admitted = ops.new_dynamic_label();
         dynasm!(ops ; .arch x64 ; call r11 ; test rax, rax ; jnz =>admitted);
-        clear_roots(ops);
         reload_roots(ops, frame, site)?;
         dynasm!(ops ; .arch x64 ; jmp =>bail ; =>admitted);
     }
@@ -1308,8 +1302,7 @@ fn emit_generic_value_call(
             .find(|root| root.value == value)
             .ok_or(Unsupported::OperandShape("x86-64 generic direct-call root"))?;
         let source = packet_bytes
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .and_then(|offset| offset.checked_add(root_offset(frame, root.save_slot).ok()?))
+            .checked_add(root_offset(frame, root.save_slot)?)
             .and_then(|offset| i32::try_from(offset).ok())
             .ok_or(Unsupported::OperandShape(
                 "x86-64 generic direct-call root offset",
@@ -1357,19 +1350,10 @@ fn emit_generic_value_call(
         ; .arch x64
         ; call r11
         ; add rsp, packet_bytes as i32
-        ; mov [rsp + MACHINE_ROOT_RECORD_BASE_OFFSET as i32], rax
-        ; mov [rsp + MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET as i32], rdx
     );
-    clear_roots(ops);
-    reload_roots(ops, frame, site)?;
-    let parked_payload = i32::try_from(MACHINE_ROOT_RECORD_BASE_OFFSET).unwrap()
-        - i32::try_from(MACHINE_ROOT_RECORD_SIZE).unwrap();
-    let parked_status = i32::try_from(MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET).unwrap()
-        - i32::try_from(MACHINE_ROOT_RECORD_SIZE).unwrap();
+    reload_roots_parking_pair(ops, frame, site)?;
     dynasm!(ops
         ; .arch x64
-        ; mov rax, [rsp + parked_payload]
-        ; mov rdx, [rsp + parked_status]
         ; test rdx, rdx
         ; je >generic_returned
         ; cmp edx, NativeResultStatus::Throw as i32
@@ -1625,8 +1609,7 @@ fn load_root_with_linkage(
         .ok_or(Unsupported::OperandShape("x86-64 direct-call root"))?;
     let offset = layout
         .frame_bytes
-        .checked_add(MACHINE_ROOT_RECORD_SIZE)
-        .and_then(|offset| offset.checked_add(root_offset(frame, root.save_slot).ok()?))
+        .checked_add(root_offset(frame, root.save_slot)?)
         .and_then(|offset| i32::try_from(offset).ok())
         .ok_or(Unsupported::OperandShape("x86-64 direct-call root offset"))?;
     dynasm!(ops ; .arch x64 ; mov Rq(destination), [rsp + offset]);
@@ -1642,8 +1625,7 @@ fn store_root_with_linkage(
 ) -> Result<(), Unsupported> {
     let offset = layout
         .frame_bytes
-        .checked_add(MACHINE_ROOT_RECORD_SIZE)
-        .and_then(|offset| offset.checked_add(root_offset(frame, save_slot).ok()?))
+        .checked_add(root_offset(frame, save_slot)?)
         .and_then(|offset| i32::try_from(offset).ok())
         .ok_or(Unsupported::OperandShape(
             "x86-64 direct-call receiver root offset",
@@ -1716,17 +1698,13 @@ fn finish_published_pair(
     fatal: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let record_base = layout.frame_bytes + MACHINE_ROOT_RECORD_BASE_OFFSET;
-    let record_status = layout.frame_bytes + MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET;
     dynasm!(ops
         ; .arch x64
         ; mov rax, [rsp + layout.result_word as i32]
         ; mov rdx, [rsp + layout.status_word as i32]
-        ; mov [rsp + record_base as i32], rax
-        ; mov [rsp + record_status as i32], rdx
         ; add rsp, layout.frame_bytes as i32
     );
-    clear_reload_parked_pair(ops, frame, site)?;
+    reload_roots_parking_pair(ops, frame, site)?;
     let returned = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
@@ -1742,24 +1720,16 @@ fn finish_published_pair(
     Ok(())
 }
 
-fn clear_reload_parked_pair(
+/// Reload the call site's roots with the result pair (rax/rdx) parked in the
+/// red zone below `rsp`; the reload is plain moves and cannot disturb it.
+fn reload_roots_parking_pair(
     ops: &mut Assembler,
     frame: MachineFrameLayout,
     site: &MachineSafepointSite,
 ) -> Result<(), Unsupported> {
-    dynasm!(ops
-        ; .arch x64
-        ; mov r11, [r15 + MACHINE_ROOTS_PTR_OFFSET as i32]
-        ; mov rax, [rsp + MACHINE_ROOT_RECORD_PREVIOUS_OFFSET as i32]
-        ; mov [r11], rax
-        ; add rsp, MACHINE_ROOT_RECORD_SIZE as i32
-    );
+    dynasm!(ops ; .arch x64 ; mov [rsp - 16], rax ; mov [rsp - 8], rdx);
     reload_roots(ops, frame, site)?;
-    let payload = i32::try_from(MACHINE_ROOT_RECORD_BASE_OFFSET).unwrap()
-        - i32::try_from(MACHINE_ROOT_RECORD_SIZE).unwrap();
-    let status = i32::try_from(MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET).unwrap()
-        - i32::try_from(MACHINE_ROOT_RECORD_SIZE).unwrap();
-    dynasm!(ops ; .arch x64 ; mov rax, [rsp + payload] ; mov rdx, [rsp + status]);
+    dynasm!(ops ; .arch x64 ; mov rax, [rsp - 16] ; mov rdx, [rsp - 8]);
     Ok(())
 }
 
@@ -1770,7 +1740,6 @@ fn release_unpublished(
     layout: StackLayout,
 ) -> Result<(), Unsupported> {
     dynasm!(ops ; .arch x64 ; add rsp, layout.frame_bytes as i32);
-    clear_roots(ops);
     reload_roots(ops, frame, site)
 }
 
@@ -1780,13 +1749,6 @@ fn park_unpublished_payload(
     site: &MachineSafepointSite,
     layout: StackLayout,
 ) -> Result<(), Unsupported> {
-    let record_base = layout.frame_bytes + MACHINE_ROOT_RECORD_BASE_OFFSET;
-    let record_status = layout.frame_bytes + MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET;
-    dynasm!(ops
-        ; .arch x64
-        ; mov [rsp + record_base as i32], rax
-        ; mov [rsp + record_status as i32], rdx
-        ; add rsp, layout.frame_bytes as i32
-    );
-    clear_reload_parked_pair(ops, frame, site)
+    dynasm!(ops ; .arch x64 ; add rsp, layout.frame_bytes as i32);
+    reload_roots_parking_pair(ops, frame, site)
 }

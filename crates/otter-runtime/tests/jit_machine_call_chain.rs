@@ -869,7 +869,7 @@ fn method_candidates_two_through_four_keep_receiver_and_arguments_rooted() {
 
     compiled
         .force_gc()
-        .expect("completed method candidates must unlink their root records");
+        .expect("completed method candidates must leave only live call-site roots");
     let reused = completion(
         &mut compiled,
         "machineMethodChainGc(__machineChainGcReceiver0, { value: 9 }, 0);",

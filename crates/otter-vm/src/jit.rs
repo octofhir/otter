@@ -1381,32 +1381,6 @@ pub struct JitDirectMethod {
     pub callee: JitDirectCallee,
 }
 
-/// One stack-owned Machine IR root publication linked into the interpreter's
-/// active native-root chain.
-#[repr(C, align(8))]
-#[derive(Clone, Copy, Debug)]
-pub struct JitMachineRootRecord {
-    /// Previous record address, or zero at the outermost Machine safepoint.
-    pub previous: u64,
-    /// Base of compact initialized tagged root homes.
-    pub root_base: *mut u64,
-    /// Code generation whose safepoint table owns the homes.
-    pub code_object_id: u64,
-    /// Number of initialized tagged homes.
-    pub root_count: u16,
-    /// Reserved padding kept zero by generated publishers.
-    pub reserved: u16,
-    /// Dense code-object-local safepoint identity.
-    pub safepoint_id: crate::native_abi::SafepointId,
-}
-
-const _: [(); 32] = [(); std::mem::size_of::<JitMachineRootRecord>()];
-const _: [(); 0] = [(); std::mem::offset_of!(JitMachineRootRecord, previous)];
-const _: [(); 8] = [(); std::mem::offset_of!(JitMachineRootRecord, root_base)];
-const _: [(); 16] = [(); std::mem::offset_of!(JitMachineRootRecord, code_object_id)];
-const _: [(); 24] = [(); std::mem::offset_of!(JitMachineRootRecord, root_count)];
-const _: [(); 28] = [(); std::mem::offset_of!(JitMachineRootRecord, safepoint_id)];
-
 /// Current static offsets needed by native Array guards.
 ///
 /// Dense element storage remains behind runtime stubs because Rust container

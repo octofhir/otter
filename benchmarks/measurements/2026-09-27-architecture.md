@@ -1010,6 +1010,39 @@ Stdout identical; difftest 85/85; Test262 `language/` 24,077/0,
 (`derived_class_fields_super_shapes` differs from Node in the interpreter
 without stress: the known derived-field timing gap).
 
+### C2 landed: roots by call site
+The record grows to 80 bytes: `call_site` shares the depth word (linkage
+writes `depth | NO_SAFEPOINT << 32` in one store) and `machine_roots` is
+the optimized frame's root-home base, written once by its prologue. Before
+every collecting call Machine code saves its roots to their homes (as
+before) and stores the safepoint id in its own record: two instructions
+where the `JitMachineRootRecord` push/pop took 17 and a `sub sp`. The
+collector walks the frame chain and resolves `(code_object_id,
+call_site)` to the safepoint's homes; inline recipe decode and the
+generated caller check read the same pair from the frame. The record type,
+the interpreter's root-chain head, `JitCtx::machine_roots_ptr` and the
+32-byte stack bias baked into every in-call root and scratch offset are
+gone; x86-64 parks a result pair in the red zone instead of the popped
+record. A stamp may outlive its call: the homes it names were written by
+that call and every later collection traces them, so they stay valid until
+the frame's stack dies; a callee that side-exits to the stack-call
+deoptimizer has its call site cleared first, because its machine stack is
+gone while the record stays published.
+
+| Workload | instr after C1 | after C2 | wall after C1 | after C2 |
+|---|---:|---:|---:|---:|
+| fib | 3.38G | 3.21G (−5.1%; −12.0% vs start) | 0.212s | 0.199s |
+| earley-boyer | 108.6G | 106.6G (−1.8%; −4.3%) | 6.53s | 6.42s |
+| crypto | 13.68G | 13.53G (−1.1%) | 0.811s | 0.805s |
+| ts-fixed | 172.0G | 171.1G (−0.5%; −1.5%) | 17.48s | 17.27s |
+| ast_ctor | 21.58G | 21.45G (−0.6%) | 1.41s | 1.40s |
+| zlib / mega_method | 154.4 / 10.0G | same | 9.36 / 0.48s | same |
+
+Stdout identical; difftest 85/85; Test262 `language/` 24,077/0,
+`built-ins/` 23,520 + the two `RGI_Emoji` failures; GC stress 1–16, three
+tiers, 21 corpora (1,008 runs) clean; `jit_machine_direct_call` and
+`jit_call_lifecycle` pass.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

@@ -55,7 +55,6 @@ impl Interpreter {
         }
         debug_assert_eq!(self.sync_reentry_depth, 0);
         debug_assert!(!self.jit_has_native_frames());
-        debug_assert_eq!(self.jit_machine_roots, 0);
 
         self.code_eviction_stats.census_passes =
             self.code_eviction_stats.census_passes.saturating_add(1);

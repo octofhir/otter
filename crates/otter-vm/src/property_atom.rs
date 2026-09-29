@@ -114,6 +114,21 @@ impl NameInterner {
         AtomId(id)
     }
 
+    /// `name`'s atom id when some shape, chunk or cache has interned it, or
+    /// [`AtomId::NONE`] for a spelling never interned. Nothing is minted:
+    /// every shape key is interned when its transition is built, so a
+    /// never-interned spelling names no shaped property, and a lookup keyed
+    /// by [`AtomId::NONE`] still finds dictionary-mode properties by spelling.
+    #[must_use]
+    pub(crate) fn lookup(&self, name: &str) -> AtomId {
+        self.inner
+            .lock()
+            .expect("name interner")
+            .ids
+            .get(name)
+            .map_or(AtomId::NONE, |id| AtomId(*id))
+    }
+
     /// The whole table in id order, for the isolate snapshot: index
     /// equals the atom's id, so replaying the list through [`Self::intern`]
     /// on a fresh isolate re-mints identical ids.

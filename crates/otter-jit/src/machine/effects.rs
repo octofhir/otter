@@ -200,18 +200,19 @@ const ALLOCATION: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::Allo
 const GC_BARRIER: MachineAliasSet = MachineAliasSet::one(MachineAliasClass::GcBarrier);
 
 impl MachineOpcode {
-    /// Whether this is an element view whose base is a typed array's off-heap
-    /// storage. A moving collection never changes such a base or its length;
-    /// only JavaScript reentry (detach, resize, transfer) or a write of the
-    /// receiver's shape or element metadata can, so the view's proof outlives
-    /// safepoints and allocations that end every in-heap address.
+    /// Whether this element proof holds no in-heap address: a view whose base
+    /// is a typed array's off-heap storage, or a dense receiver proof. A
+    /// moving collection never changes such a base, a length or a receiver's
+    /// representation; only JavaScript reentry (detach, resize, transfer) or
+    /// a write of the receiver's shape or element metadata can, so the proof
+    /// outlives safepoints and allocations that end every in-heap address.
     #[must_use]
-    pub fn is_off_heap_element_view(&self) -> bool {
+    pub fn is_collection_stable_element_proof(&self) -> bool {
         matches!(
             self,
             Self::ElementView { access, .. }
                 if matches!(access.base, otter_vm::JitElementBase::ThroughLocalBuffer { .. })
-        )
+        ) || matches!(self, Self::ElementProof { .. })
     }
 
     /// Return the opcode-local effect row. Descriptor-backed call effects are
@@ -381,9 +382,13 @@ impl MachineOpcode {
             Self::ContextStore { .. } => MachineEffects::write(CONTEXT_SLOT),
             Self::StringConstantCellLoad { .. } => MachineEffects::read(CONSTANT_CELL, Value),
 
-            Self::ElementView { .. } => MachineEffects::read(SHAPE.union(ELEMENT_METADATA), Guard),
+            Self::ElementView { .. } | Self::ElementProof { .. } => {
+                MachineEffects::read(SHAPE.union(ELEMENT_METADATA), Guard)
+            }
             Self::ElementValueLoad { .. } => MachineEffects::read(ELEMENT_FIELD, Value),
             Self::ElementValueGuard { .. } => MachineEffects::read(ELEMENT_FIELD, Guard),
+            Self::ElementCheckedLoad { .. } => MachineEffects::read(ELEMENT_FIELD, Value),
+            Self::ElementCheckedAddress { .. } => MachineEffects::read(ELEMENT_FIELD, Guard),
             Self::ElementValueStore { .. } => MachineEffects::write(ELEMENT_FIELD),
             Self::PropertySource { .. } => MachineEffects::NEVER,
             Self::CacheIrGuardShape { .. }

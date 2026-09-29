@@ -3052,6 +3052,32 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
+            MachineOpcode::ElementProof { byte_pc, access } => {
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let start = ops.offset().0;
+                emit_element_view(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    &access,
+                    19,
+                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
+                    miss,
+                )?;
+                emit_store_allocated_integer(&mut ops, frame, locations[1], 14, 0)?;
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                structural_regions.push((
+                    "machineElementProof",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
             MachineOpcode::ElementAddress { byte_pc, access } => {
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
@@ -3173,6 +3199,123 @@ fn emit_with_reach(
                 emit_store_allocated_integer(&mut ops, frame, locations[3], 10, 0)?;
                 structural_regions.push((
                     "machineElementValueGuard",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::ElementCheckedLoad { byte_pc, access }
+            | MachineOpcode::ElementCheckedAddress { byte_pc, access } => {
+                let start = ops.offset().0;
+                let load = matches!(instruction.opcode, MachineOpcode::ElementCheckedLoad { .. });
+                let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
+                // Every proof branches straight to the exit with a conditional
+                // branch (±1 MiB); nothing reaches for a test-bit branch.
+                emit_load_allocated_integer(&mut ops, frame, locations[3], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz x9, =>deopt);
+                // A dense access reads its receiver's live element base only
+                // once the proof holds; the base never outlives this operation.
+                if let otter_vm::JitElementBase::InBody { byte } = access.base {
+                    emit_load_allocated_tagged(&mut ops, frame, locations[0], 16, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; ldr x16, [x16, byte]);
+                } else {
+                    emit_load_allocated_integer(&mut ops, frame, locations[0], 16, 0)?;
+                }
+                emit_load_allocated_integer(&mut ops, frame, locations[1], 14, 0)?;
+                // The index enters x15 extended to 64 bits so one unsigned
+                // compare against the length also rejects a negative int32.
+                match sequence.representations()[instruction.operands[2].value.0 as usize] {
+                    MachineRepresentation::Float64 => {
+                        let source = float_register(locations[2])?;
+                        dynasm!(ops ; .arch aarch64
+                            ; fcvtzu w15, D(source)
+                            ; ucvtf d31, w15
+                            ; fcmp d31, D(source)
+                            ; b.ne =>deopt
+                        );
+                    }
+                    MachineRepresentation::Tagged => {
+                        emit_load_allocated_integer(&mut ops, frame, locations[2], 15, 0)?;
+                        dynasm!(ops ; .arch aarch64
+                            ; lsr x11, x15, #48
+                            ; movz x12, NUMBER_TAG_HI16
+                            ; cmp x11, x12
+                            ; b.ne =>deopt
+                            ; sxtw x15, w15
+                        );
+                    }
+                    MachineRepresentation::Int32 => {
+                        emit_load_allocated_integer(&mut ops, frame, locations[2], 15, 0)?;
+                        dynasm!(ops ; .arch aarch64 ; sxtw x15, w15);
+                    }
+                    MachineRepresentation::Uint32 => {
+                        emit_load_allocated_integer(&mut ops, frame, locations[2], 15, 0)?;
+                        dynasm!(ops ; .arch aarch64 ; mov w15, w15);
+                    }
+                    _ => return Err(Unsupported::OperandShape("element index representation")),
+                }
+                match access.length_width {
+                    otter_vm::jit::JitGuardWidth::Byte | otter_vm::jit::JitGuardWidth::Word32 => {
+                        dynasm!(ops ; .arch aarch64 ; cmp x15, w14, uxtw ; b.hs =>deopt);
+                    }
+                    otter_vm::jit::JitGuardWidth::Word64 => {
+                        dynasm!(ops ; .arch aarch64 ; cmp x15, x14 ; b.hs =>deopt);
+                    }
+                }
+                let shift = u32::from(access.element.stride_shift());
+                dynasm!(ops ; .arch aarch64 ; add x16, x16, x15, lsl shift);
+                if load {
+                    let representation =
+                        sequence.representations()[instruction.operands[4].value.0 as usize];
+                    if representation == MachineRepresentation::Tagged {
+                        emit_element_read(&mut ops, access.element, deopt);
+                        emit_store_allocated_tagged(&mut ops, frame, locations[4], 9, 0)?;
+                    } else if representation == MachineRepresentation::Float64 {
+                        let destination = float_register(locations[4])?;
+                        if access.element == otter_vm::JitElementRepr::Float32 {
+                            dynasm!(ops ; .arch aarch64 ; ldr S(destination), [x16] ; fcvt D(destination), S(destination));
+                        } else {
+                            dynasm!(ops ; .arch aarch64 ; ldr D(destination), [x16]);
+                        }
+                    } else {
+                        use otter_vm::JitElementRepr as E;
+                        match access.element {
+                            E::Int8 => dynasm!(ops ; .arch aarch64 ; ldrsb w9, [x16]),
+                            E::Uint8 | E::Uint8Clamped => {
+                                dynasm!(ops ; .arch aarch64 ; ldrb w9, [x16])
+                            }
+                            E::Int16 => dynasm!(ops ; .arch aarch64 ; ldrsh w9, [x16]),
+                            E::Uint16 => dynasm!(ops ; .arch aarch64 ; ldrh w9, [x16]),
+                            E::Int32 | E::Uint32 => dynasm!(ops ; .arch aarch64 ; ldr w9, [x16]),
+                            _ => {
+                                return Err(Unsupported::OperandShape(
+                                    "scalar element load representation",
+                                ));
+                            }
+                        }
+                        emit_store_allocated_integer(&mut ops, frame, locations[4], 9, 0)?;
+                    }
+                } else {
+                    // A boxed store needs a present slot; scalar operands
+                    // already satisfy the verified storage contract, so only
+                    // a tagged value owes a representation guard.
+                    if access.element == otter_vm::JitElementRepr::Boxed {
+                        emit_element_read(&mut ops, access.element, deopt);
+                    }
+                    if sequence.representations()[instruction.operands[4].value.0 as usize]
+                        == MachineRepresentation::Tagged
+                    {
+                        emit_load_allocated_tagged(&mut ops, frame, locations[4], 9, 0)?;
+                        emit_element_write_guard(&mut ops, access.element, deopt);
+                    }
+                    emit_store_allocated_integer(&mut ops, frame, locations[5], 16, 0)?;
+                }
+                structural_regions.push((
+                    if load {
+                        "machineElementCheckedLoad"
+                    } else {
+                        "machineElementCheckedAddress"
+                    },
                     Some(byte_pc),
                     start,
                     ops.offset().0,

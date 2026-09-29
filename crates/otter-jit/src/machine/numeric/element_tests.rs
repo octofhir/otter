@@ -80,7 +80,7 @@ fn layout_equivalence_replaces_source_pc_identity() {
                     .iter()
                     .filter(|instruction| matches!(
                         instruction.opcode,
-                        MachineOpcode::ElementView { .. }
+                        MachineOpcode::ElementView { .. } | MachineOpcode::ElementProof { .. }
                     ))
                     .count(),
                 expected

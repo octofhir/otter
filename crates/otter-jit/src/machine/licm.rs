@@ -266,10 +266,11 @@ fn invariant_instructions(
                 // Binding and in-heap element-view proofs yield raw heap
                 // addresses: keep them inside one iteration even in a
                 // non-reentrant loop. A typed-array view's base is off-heap
-                // storage that a collection never moves; only JavaScript
-                // reentry (detach, resize, transfer) can change its proof, so
-                // it moves out of any loop that cannot reenter.
-                let off_heap_view = instruction.opcode.is_off_heap_element_view();
+                // storage that a collection never moves, and a dense proof
+                // holds no address; only JavaScript reentry (detach, resize,
+                // transfer) or a metadata write can change such a proof, so
+                // it moves out of any loop that cannot reenter or write it.
+                let off_heap_view = instruction.opcode.is_collection_stable_element_proof();
                 if (matches!(
                     instruction.opcode,
                     MachineOpcode::BindingGuard { .. } | MachineOpcode::ElementView { .. }

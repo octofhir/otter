@@ -7,8 +7,9 @@
 //!
 //! # Invariants
 //! - No allocation, VM transition, deopt or user code occurs in the probe.
-//!   A cell, immediate, `%`, `**`, a shift, or a bitwise operator over a
-//!   double misses to the committed cold sibling.
+//!   A cell, an internal immediate, `%`, `**`, a shift, or a bitwise
+//!   operator over a double misses to the committed cold sibling;
+//!   `undefined`, `null` and the Booleans decode to their ToNumber value.
 //! - Both inputs are fully read before either output is defined, so outputs
 //!   may share registers with inputs.
 //! - The Int32 path defers overflow, a zero product and division to the
@@ -41,8 +42,8 @@ pub(super) fn emit(
     let double = ops.new_dynamic_label();
     integer(ops, operator, inputs, outputs, double, done);
     dynasm!(ops ; .arch x64 ; =>double);
-    decode_number(ops, left, 14, miss);
-    decode_right(ops, right, miss);
+    decode_operand(ops, left, 14, miss);
+    decode_operand(ops, right, 15, miss);
     match operator {
         BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div => {
             match operator {
@@ -170,6 +171,37 @@ fn integer(
         }
     }
     dynasm!(ops ; .arch x64 ; mov Rd(hit), 1 ; jmp =>done);
+}
+
+/// Decode the probe operand `source` into `Rx(target)` (xmm14 for the left
+/// operand, xmm15 for the right one, decoded second), or branch to `miss`.
+///
+/// `undefined`, `null` and the Booleans decode to their ToNumber value (NaN,
+/// +0, 0 or 1). Every probe operator applies ToNumeric to such an operand
+/// (an addition only concatenates strings, and none of these is one), so
+/// this is the committed operator's own coercion; cells miss.
+fn decode_operand(ops: &mut Assembler, source: u8, target: u8, miss: DynamicLabel) {
+    let not_number = ops.new_dynamic_label();
+    let decoded = ops.new_dynamic_label();
+    if target == 15 {
+        decode_right(ops, source, not_number);
+    } else {
+        decode_number(ops, source, target, not_number);
+    }
+    dynasm!(ops ; .arch x64 ; jmp =>decoded ; =>not_number);
+    for (value, number) in [
+        (Value::undefined(), f64::NAN),
+        (Value::null(), 0.0),
+        (Value::boolean(false), 0.0),
+        (Value::boolean(true), 1.0),
+    ] {
+        let next = ops.new_dynamic_label();
+        load64(ops, 11, value.to_bits());
+        dynasm!(ops ; .arch x64 ; cmp Rq(source), r11 ; jne =>next);
+        load64(ops, 11, number.to_bits());
+        dynasm!(ops ; .arch x64 ; movq Rx(target), r11 ; jmp =>decoded ; =>next);
+    }
+    dynasm!(ops ; .arch x64 ; jmp =>miss ; =>decoded);
 }
 
 /// Decode the tagged Number in `source` into xmm15, or branch to `miss`.

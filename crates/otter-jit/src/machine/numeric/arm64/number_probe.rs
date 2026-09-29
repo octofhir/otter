@@ -7,7 +7,9 @@
 //!
 //! # Invariants
 //! - No allocation, VM transition, deopt or user code occurs in the probe.
-//!   A cell, immediate, `%` or `**` misses to the committed cold sibling.
+//!   A cell, an internal immediate, `%` or `**` misses to the committed cold
+//!   sibling; `undefined`, `null` and the Booleans decode to their ToNumber
+//!   value.
 //! - Bitwise operators convert double operands with the inline ToInt32.
 //! - Both inputs are fully read before either output is defined, so outputs
 //!   may share registers with inputs.
@@ -202,23 +204,43 @@ fn bitwise(ops: &mut Assembler, operator: BinaryOperator, left: u8, right: u8, r
     );
 }
 
-/// Decode the tagged Number in `source` into `D(target)`, or branch to `miss`.
+/// Decode the Number `source` into `D(target)`, or branch to `miss`.
+///
+/// `undefined`, `null` and the Booleans decode to their ToNumber value (NaN,
+/// +0, 0 or 1). Every probe operator applies ToNumeric to such an operand
+/// (an addition only concatenates strings, and none of these is one), so
+/// this is the committed operator's own coercion; cells miss.
 fn decode(ops: &mut Assembler, source: u8, target: u8, miss: DynamicLabel) {
     let integer = ops.new_dynamic_label();
     let decoded = ops.new_dynamic_label();
+    let immediate = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; movz x16, NUMBER_TAG_HI16, lsl #48
         ; and x15, X(source), x16
         ; cmp x15, x16
         ; b.eq =>integer
-        ; cbz x15, =>miss
+        ; cbz x15, =>immediate
         ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
         ; sub x15, X(source), x16
         ; fmov D(target), x15
         ; b =>decoded
         ; =>integer
         ; scvtf D(target), W(source)
-        ; =>decoded
+        ; b =>decoded
+        ; =>immediate
     );
+    for (value, number) in [
+        (Value::undefined(), f64::NAN),
+        (Value::null(), 0.0),
+        (Value::boolean(false), 0.0),
+        (Value::boolean(true), 1.0),
+    ] {
+        let next = ops.new_dynamic_label();
+        emit_load_u64(ops, 15, value.to_bits());
+        dynasm!(ops ; .arch aarch64 ; cmp X(source), x15 ; b.ne =>next);
+        emit_load_u64(ops, 15, number.to_bits());
+        dynasm!(ops ; .arch aarch64 ; fmov D(target), x15 ; b =>decoded ; =>next);
+    }
+    dynasm!(ops ; .arch aarch64 ; b =>miss ; =>decoded);
 }

@@ -1043,6 +1043,36 @@ Stdout identical; difftest 85/85; Test262 `language/` 24,077/0,
 tiers, 21 corpora (1,008 runs) clean; `jit_machine_direct_call` and
 `jit_call_lifecycle` pass.
 
+### C3 (part): callee-owned window and receiver, success-first status
+- **Prefix windows for optimizing callees.** Generated callers of an
+  optimizing generation publish only its parameter prefix even when it has
+  safepoints: locals live in allocator homes rooted by call site, and every
+  exit widens the window first. Excluded: functions that materialize
+  `arguments` (the actual window follows the complete register window) and
+  forwarding callers (they write the formals context into a local
+  register). The registry's old "no safepoints" install condition dated from
+  whole-window safepoints; with it in place the first attempt silently
+  refused to install such code and every call fell back to the generic
+  stub (fib 3.2G → 31.8G) — caught by fixed-work, not by the gates.
+  Inline publication bounds return registers by the function's complete
+  window.
+- **Unobserved `this`.** A sloppy callee whose body has no `LoadThis`,
+  no closure creation (an arrow captures `this`) and no direct eval gets
+  `StrictOrLexical` linkage: `undefined` instead of the global object.
+- **Success first.** Success is status zero: one `cbnz` after the call and
+  one after cleanup replace the SideExit-first compare chains (both ISAs).
+
+| Workload | instr after C2 | after | wall after C2 | after |
+|---|---:|---:|---:|---:|
+| fib | 3.21G | 2.99G (−6.8%; −17.9% vs start) | 0.199s | 0.188s |
+| earley-boyer | 106.6G | 104.8G (−1.7%; −6.0%) | 6.42s | 6.20s |
+| ts-fixed | 171.1G | 170.8G (−0.2%; −1.7%) | 17.27s | 17.08s |
+| crypto / ast_ctor | 13.53 / 21.45G | 13.49 / 21.43G | 0.805 / 1.40s | 0.798 / 1.40s |
+
+Callee-side tier budget is not done: optimizing-callee entry counts feed
+the generated-call statistics and bytecode-call accounting, so dropping
+them changes observable counters, not only speed.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

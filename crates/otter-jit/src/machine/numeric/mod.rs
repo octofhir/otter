@@ -411,7 +411,22 @@ pub(crate) fn try_compile(
         }
     })?;
     inline_reentry::prepare_safepoints(view, &sequence, &mut machine_safepoints)?;
-    let parameter_prefix_entry = machine_safepoints.is_empty()
+    // Generated callers may publish only the parameter prefix: Machine code
+    // keeps locals in allocator homes, collecting calls root them at their
+    // call site, and every exit widens the window before the VM reads it.
+    // An actual-argument window sits after the complete register window, and
+    // a forwarding call writes its formals context into a local register, so
+    // either needs the whole window published.
+    let parameter_prefix_entry = !view.code_block.needs_arguments()
+        && !sequence.call_descriptors().iter().any(|descriptor| {
+            matches!(
+                descriptor.target,
+                CallTarget::Direct {
+                    kind: DirectCallKind::Forward,
+                    ..
+                }
+            )
+        })
         && !hir
             .frame_states
             .iter()
@@ -11556,7 +11571,8 @@ mod tests {
         }));
 
         let code = compile_output(&view, None).code;
-        assert!(!code.metadata().parameter_prefix_entry);
+        // Call-site roots keep the locals out of the published window.
+        assert!(code.metadata().parameter_prefix_entry);
         assert_eq!(JitFunctionCode::safepoint_count(&code), 2);
         assert_eq!(
             code.deopt_table()

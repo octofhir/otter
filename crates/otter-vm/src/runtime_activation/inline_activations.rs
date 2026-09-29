@@ -94,7 +94,19 @@ impl RuntimeCall<'_> {
         let mut natives = Vec::with_capacity(frames.len());
         // SAFETY: RuntimeCall retains this validated, already-published caller.
         let parent = unsafe { self.frame.as_ref() };
-        let mut parent_registers = usize::from(parent.header.register_count);
+        // An optimized parent may publish only its parameter prefix; its
+        // return registers are bounded by the function's complete window.
+        let mut parent_registers = usize::from(
+            context
+                .for_function(parent.header.function_id)
+                .ok()
+                .and_then(|owner| {
+                    owner
+                        .exec_function(parent.header.function_id)
+                        .map(|function| function.register_count)
+                })
+                .ok_or(VmError::InvalidOperand)?,
+        );
         let code_object_id = parent.code_object_id;
         for recipe in frames.iter_mut() {
             let entry = recipe.entry.as_ref().ok_or(VmError::InvalidOperand)?;

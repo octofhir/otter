@@ -437,10 +437,10 @@ where
 
     dynasm!(ops
         ; .arch x64
+        ; test edx, edx
+        ; je =>result_ready
         ; cmp edx, abi::NativeResultStatus::SideExit as i32
         ; je =>started_side_exit
-        ; cmp edx, abi::NativeResultStatus::Success as i32
-        ; je =>result_ready
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>started_throw
         ; jmp =>started_fatal

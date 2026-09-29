@@ -28,9 +28,10 @@
 //!   callee closure (or bare function value), so the callee reaches its
 //!   captured bindings through `LoadClosureContext`; the function-id guard
 //!   fixes the closure's context-chain shape.
-//!   Safepoint-free scalar generations may
-//!   publish only their parameter prefix; every cold exit expands it before
-//!   VM reentry. Moving GC therefore sees exactly the initialized window.
+//!   Optimizing generations may publish only their parameter prefix: their
+//!   locals live in allocator homes rooted per call site, and every cold exit
+//!   expands the window before VM reentry. Moving GC therefore sees exactly
+//!   the initialized window.
 //! - A spread call copies only the target's declared parameter prefix from the
 //!   compiler-created dense array, after receiver preparation and before frame
 //!   publication. Eligibility excludes rest and

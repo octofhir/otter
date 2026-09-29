@@ -725,10 +725,10 @@ pub(super) fn emit(
         ; mov r11, [rsp + layout.status_word as i32]
         ; mov rdi, r15
         ; call r11
+        ; test edx, edx
+        ; je >normal_return
         ; cmp edx, NativeResultStatus::SideExit as i32
         ; je =>started_side_exit
-        ; cmp edx, NativeResultStatus::Success as i32
-        ; je >normal_return
         ; cmp edx, NativeResultStatus::Throw as i32
         ; je =>started_throw
         ; cmp edx, NativeResultStatus::Fatal as i32
@@ -1169,10 +1169,10 @@ fn emit_generated_value_call(
         ; mov r11, [rsp + layout.status_word as i32]
         ; mov rdi, r15
         ; call r11
+        ; test edx, edx
+        ; je =>result_ready
         ; cmp edx, NativeResultStatus::SideExit as i32
         ; je =>started_side_exit
-        ; cmp edx, NativeResultStatus::Success as i32
-        ; je =>result_ready
         ; cmp edx, NativeResultStatus::Throw as i32
         ; je =>started_throw
         ; jmp =>started_fatal

@@ -1093,8 +1093,9 @@ pub enum JitDirectCallKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JitDirectCallThisMode {
-    /// Strict functions receive `undefined`; arrows retain their lexical
-    /// binding from the guarded closure metadata.
+    /// Strict functions, and sloppy functions that never observe `this`,
+    /// receive `undefined`; arrows retain their lexical binding from the
+    /// guarded closure metadata.
     StrictOrLexical,
     /// A sloppy callee binds `this` by OrdinaryCallBindThis in generated code:
     /// a plain `Op::Call` and a nullish explicit receiver bind the active

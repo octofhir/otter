@@ -54,32 +54,17 @@ where
     Restore: FnMut(&mut Assembler) -> Result<(), Unsupported>,
     Record: FnMut(&'static str, usize, usize),
 {
-    let callee_returned = ops.new_dynamic_label();
+    let callee_abrupt = ops.new_dynamic_label();
     let callee_bailed = ops.new_dynamic_label();
     let callee_threw = ops.new_dynamic_label();
     let result_ready = ops.new_dynamic_label();
     let cleanup = ops.new_dynamic_label();
-    let returned = ops.new_dynamic_label();
     let cleanup_abrupt = ops.new_dynamic_label();
     let return_start = ops.offset().0;
     let invalid_callee_result = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x1, abi::NativeResultStatus::SideExit as u32
-        ; b.eq =>callee_bailed
-        ; cmp x1, abi::NativeResultStatus::Success as u32
-        ; b.eq =>callee_returned
-        ; cmp x1, abi::NativeResultStatus::Throw as u32
-        ; b.eq =>callee_threw
-        ; cmp x1, abi::NativeResultStatus::Fatal as u32
-        ; b.eq =>result_ready
-        ; b =>invalid_callee_result
-        ; =>callee_threw
-    );
-    emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
-    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>invalid_callee_result);
-    emit_fatal_pair(ops);
-    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>callee_returned);
+    // Success is zero and the only hot status; every other one is cold.
+    const _: () = assert!(abi::NativeResultStatus::Success as u32 == 0);
+    dynasm!(ops ; .arch aarch64 ; cbnz x1, =>callee_abrupt);
     if form.prepared_receiver().is_some() {
         let result_start = ops.offset().0;
         let object = ops.new_dynamic_label();
@@ -158,6 +143,22 @@ where
     }
     dynasm!(ops
         ; .arch aarch64
+        ; b =>cleanup
+        ; =>callee_abrupt
+        ; cmp x1, abi::NativeResultStatus::SideExit as u32
+        ; b.eq =>callee_bailed
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>callee_threw
+        ; cmp x1, abi::NativeResultStatus::Fatal as u32
+        ; b.eq =>result_ready
+        ; b =>invalid_callee_result
+        ; =>callee_threw
+    );
+    emit_increment_feedback_u64(ops, CODE_ENTRY_GENERATED_THROWS_OFFSET);
+    dynasm!(ops ; .arch aarch64 ; b =>result_ready ; =>invalid_callee_result);
+    emit_fatal_pair(ops);
+    dynasm!(ops
+        ; .arch aarch64
         ; b =>result_ready
         ; =>callee_bailed
         ; mov x7, x0
@@ -234,11 +235,8 @@ where
     emit_release_linkage(ops, &layout);
     dynasm!(ops
         ; .arch aarch64
-        ; cmp x1, abi::NativeResultStatus::Success as u32
-        ; b.eq =>returned
-        ; b =>cleanup_abrupt
+        ; cbnz x1, =>cleanup_abrupt
     );
-    dynasm!(ops ; .arch aarch64 ; =>returned);
     restore_roots(ops)?;
     store(ops, dst, 0, 0)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>cleanup_abrupt);

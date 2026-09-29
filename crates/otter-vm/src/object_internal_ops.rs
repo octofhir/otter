@@ -1024,21 +1024,29 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
-            let owner = target.as_closure(&self.gc_heap);
-            let keys = self.ordinary_function_own_property_keys(context, owner, function_id);
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                if let Some(desc) = self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    owner,
-                    function_id,
-                    &key,
-                )? && desc.enumerable()
-                {
-                    out.push(key);
+            // Virtual `name`/`length` descriptors materialize values, which
+            // allocates: the closure is re-read for every key.
+            return self.with_handle_scope(|interp, scope| {
+                let target_handle = interp.scoped_value(scope, target);
+                let owner = target.as_closure(&interp.gc_heap);
+                let keys = interp.ordinary_function_own_property_keys(context, owner, function_id);
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let owner = interp
+                        .escape_scoped(target_handle)
+                        .as_closure(&interp.gc_heap);
+                    if let Some(desc) = interp.ordinary_function_own_property_descriptor(
+                        Some(context),
+                        owner,
+                        function_id,
+                        &key,
+                    )? && desc.enumerable()
+                    {
+                        out.push(key);
+                    }
                 }
-            }
-            return Ok(out);
+                Ok(out)
+            });
         }
         if let Some(native) = target.as_native_function() {
             return Ok(native

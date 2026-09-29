@@ -380,8 +380,8 @@ impl Interpreter {
                 .map(|c| c.cached_function_id)
         });
         if let Some(function_id) = fid {
-            let owner = target.as_closure(&self.gc_heap);
             if let VmPropertyKey::Symbol(sym) = key {
+                let owner = target.as_closure(&self.gc_heap);
                 let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
                     this.function_user_bag(stack, owner, function_id, &[])
                 })?;
@@ -402,34 +402,52 @@ impl Interpreter {
             // `None` and the non-configurable invariant check is skipped,
             // wrongly letting `defineProperty(fn, "prototype", {set})` (a
             // data→accessor change) or a `configurable:true` flip succeed.
-            if k == "prototype" {
-                let _ = self.function_property_get_with_receiver(
+            // Materializing `prototype` and reading virtual metadata both
+            // allocate, so the closure and the descriptor's values are
+            // re-read after each step.
+            return self.with_handle_scope(|interp, scope| {
+                let target_handle = interp.scoped_value(scope, *target);
+                let owner_now = |interp: &Self| {
+                    interp
+                        .escape_scoped(target_handle)
+                        .as_closure(&interp.gc_heap)
+                };
+                let (_, descriptor) = interp.with_descriptor_anchored(descriptor, |interp| {
+                    if k == "prototype" {
+                        let _ = interp.function_property_get_with_receiver(
+                            stack,
+                            context,
+                            owner_now(interp),
+                            function_id,
+                            None,
+                            "prototype",
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                let (current, descriptor) =
+                    interp.with_descriptor_anchored(descriptor, |interp| {
+                        interp.ordinary_function_own_property_descriptor(
+                            Some(context),
+                            owner_now(interp),
+                            function_id,
+                            k,
+                        )
+                    })?;
+                let completed = match current {
+                    Some(current) => descriptor.complete_against_current(&current),
+                    None => descriptor.complete_for_new_property(),
+                };
+                interp.ordinary_function_define_own_property(
                     stack,
-                    context,
-                    owner,
+                    Some(context),
+                    owner_now(interp),
                     function_id,
+                    k,
                     None,
-                    "prototype",
-                )?;
-            }
-            let completed = match self.ordinary_function_own_property_descriptor(
-                Some(context),
-                owner,
-                function_id,
-                k,
-            )? {
-                Some(current) => descriptor.complete_against_current(&current),
-                None => descriptor.complete_for_new_property(),
-            };
-            return self.ordinary_function_define_own_property(
-                stack,
-                Some(context),
-                owner,
-                function_id,
-                k,
-                None,
-                completed,
-            );
+                    completed,
+                )
+            });
         }
         if let Some(regexp) = target.as_regexp() {
             if key.string_name().is_some_and(|key| key == "lastIndex") {
@@ -606,6 +624,9 @@ impl Interpreter {
                 // fires exactly twice and a non-integer / negative / overflow
                 // length raises `RangeError` ahead of the configurable /
                 // enumerable / writable checks.
+                // Both coercions can run user code that moves the array: it
+                // rides an anchor and is re-read after them.
+                let array_slot = self.push_iteration_anchor(Value::array(arr)) - 1;
                 let new_len = if let Some(v) = descriptor.value {
                     // Both coercions can run user code; the candidate value
                     // rides an anchor slot so the second read is not stale.
@@ -624,10 +645,19 @@ impl Interpreter {
                         Ok(new_len as usize)
                     })(self);
                     self.pop_iteration_anchors_to(v_slot);
-                    Some(outcome?)
+                    match outcome {
+                        Ok(new_len) => Some(new_len),
+                        Err(error) => {
+                            self.pop_iteration_anchors_to(array_slot);
+                            return Err(error);
+                        }
+                    }
                 } else {
                     None
                 };
+                let array_value = self.iteration_anchor(array_slot);
+                self.pop_iteration_anchors_to(array_slot);
+                let arr = array_value.as_array().ok_or(VmError::TypeMismatch)?;
                 // OrdinaryDefineOwnProperty validation against length's fixed
                 // shape — a non-configurable, non-enumerable data property.
                 if descriptor.is_accessor()

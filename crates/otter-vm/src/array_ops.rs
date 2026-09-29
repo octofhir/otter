@@ -280,6 +280,9 @@ impl Interpreter {
                     interp.push_iteration_anchor(interp.escape_scoped(items_handle)) - 1;
                 interp.push_iteration_anchor(interp.escape_scoped(map_fn_handle));
                 interp.push_iteration_anchor(interp.escape_scoped(this_arg_handle));
+                // Constructing the target allocates: the iterator method rides
+                // an anchor across it.
+                interp.push_iteration_anchor(iterator_method);
                 let result = (|interp: &mut Self| -> Result<Value, VmError> {
                     let constructor = interp.escape_scoped(constructor_handle);
                     let target = interp.array_from_make_target(
@@ -291,6 +294,7 @@ impl Interpreter {
                     )?;
                     let target_anchor = interp.push_iteration_anchor(target) - 1;
                     let items = interp.iteration_anchor(anchor_base);
+                    let iterator_method = interp.iteration_anchor(anchor_base + 3);
                     // §23.1.2.1 step 5.a — GetIteratorFromMethod with the
                     // `usingIterator` GetMethod already performed above;
                     // re-reading @@iterator would be a second observable

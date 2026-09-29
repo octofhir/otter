@@ -586,7 +586,7 @@ pub fn alloc_closure_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
     let body = JsClosureBody::new(function_id, context, bound_this, bound_new_target);
-    let handle = heap.alloc_old_with_roots(body, external_visit)?;
+    let handle = heap.alloc_with_roots(body, external_visit)?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
 

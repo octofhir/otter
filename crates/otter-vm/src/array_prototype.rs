@@ -4281,8 +4281,6 @@ pub(crate) fn array_callback_native_dispatch(
             reason: "Array.prototype method called on null or undefined".to_string(),
         });
     }
-    let callback = args.first().cloned().unwrap_or(Value::undefined());
-    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let context = ctx
         .execution_context()
         .cloned()
@@ -4303,6 +4301,29 @@ pub(crate) fn array_callback_native_dispatch(
                 crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
             })?
         };
+        // Boxing a primitive receiver, the observable `length` read, and
+        // `array_species_create` below all allocate and may scavenge,
+        // relocating the receiver / callback / thisArg. An ad-hoc value-root
+        // slice is not enough here: the collector rewrites such a root
+        // through a shared reference, which a register-resident copy of the
+        // stack local can outlive (the compiler is entitled to assume the
+        // locals are unchanged). Park the handles on the traced
+        // iteration-anchor stack instead and read the relocated values back —
+        // the same discipline the construct paths use. The argument slice is
+        // itself a traced root, so the callback and thisArg are read from it
+        // only now, after the boxing allocation.
+        let argument = |index: usize| {
+            if index < args.len() {
+                // SAFETY: in bounds; the volatile read keeps an earlier load
+                // of the traced argument slice from being reused.
+                unsafe { std::ptr::read_volatile(args.as_ptr().add(index)) }
+            } else {
+                Value::undefined()
+            }
+        };
+        let species_anchor = interp.push_iteration_anchor(receiver) - 1;
+        interp.push_iteration_anchor(argument(0));
+        interp.push_iteration_anchor(argument(1));
         // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O), read once via
         // `[[Get]]` (observes a `get length()`). The walk below is LIVE:
         // each index is re-checked with `HasProperty(O, k)` / `Get(O, k)`
@@ -4310,28 +4331,27 @@ pub(crate) fn array_callback_native_dispatch(
         // observed in spec order and a Function / exotic receiver's indexed
         // properties are seen (the previous one-shot snapshot saw neither).
         let len_result = length_of_array_like(interp, stack, &context, &receiver);
-        let len = len_result.map_err(|err| {
-            crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
-        })?;
+        let len = match len_result {
+            Ok(len) => len,
+            Err(err) => {
+                interp.pop_iteration_anchors_to(species_anchor);
+                return Err(crate::native_function::vm_to_native_error(
+                    interp,
+                    err,
+                    "Array.prototype callback",
+                ));
+            }
+        };
         // §23.1.3.* step 3 — `if IsCallable(callbackfn) is false, throw a
         // TypeError`, ordered after `ToObject` + `LengthOfArrayLike`.
-        if !interp.is_callable_runtime(&callback) {
+        if !interp.is_callable_runtime(&interp.iteration_anchor(species_anchor + 1)) {
+            interp.pop_iteration_anchors_to(species_anchor);
             return Err(NativeError::TypeError {
                 name: "Array.prototype callback",
                 reason: "callback is not a function".to_string(),
             });
         }
-        // `array_species_create` below allocates the output array and may
-        // scavenge, relocating the receiver / callback / thisArg. An ad-hoc
-        // value-root slice is not enough here: the collector rewrites such a
-        // root through a shared reference, which a register-resident copy of
-        // the stack local can outlive (the compiler is entitled to assume the
-        // locals are unchanged). Park the handles on the traced
-        // iteration-anchor stack instead and read the relocated values back —
-        // the same discipline the construct paths use.
-        let species_anchor = interp.push_iteration_anchor(receiver) - 1;
-        interp.push_iteration_anchor(callback);
-        interp.push_iteration_anchor(this_arg);
+        let receiver = interp.iteration_anchor(species_anchor);
         let mut output_target = match kind {
             ArrayCallbackKind::Map | ArrayCallbackKind::Filter | ArrayCallbackKind::FlatMap => {
                 let species_len = if kind == ArrayCallbackKind::Map {

@@ -1394,12 +1394,45 @@ impl Interpreter {
         })
     }
 
+    /// Push a bytecode activation for `callee_closure` (or the bare
+    /// function). The closure is young and every step before the frame is
+    /// on the stack may allocate, so it rides an iteration anchor for the
+    /// whole call and SELF is read from that anchor.
     #[allow(clippy::too_many_arguments)]
     fn push_bytecode_call_frame(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee_closure: Option<crate::closure::JsClosure>,
+        function_id: u32,
+        this_for_callee: Value,
+        new_target_for_callee: Option<Value>,
+        effective_args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let callee_anchor = self.push_iteration_anchor(
+            callee_closure.map_or_else(|| Value::function(function_id), Value::closure),
+        ) - 1;
+        let result = self.push_anchored_bytecode_call_frame(
+            stack,
+            context,
+            callee_anchor,
+            function_id,
+            this_for_callee,
+            new_target_for_callee,
+            effective_args,
+            dst,
+        );
+        self.pop_iteration_anchors_to(callee_anchor);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_anchored_bytecode_call_frame(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        callee_anchor: usize,
         function_id: u32,
         this_for_callee: Value,
         new_target_for_callee: Option<Value>,
@@ -1446,10 +1479,9 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        // SELF is the exact closure (old space, stable) or the bare function.
-        let self_value = callee_closure
-            .map(Value::closure)
-            .unwrap_or_else(|| Value::function(function_id));
+        // SELF is the exact closure or the bare function, read from its
+        // anchor after the promise and `this` allocations above.
+        let self_value = self.iteration_anchor(callee_anchor);
         // Frame construction allocates no GC memory: the locals stay current.
         let window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
@@ -1509,7 +1541,7 @@ impl Interpreter {
                 self.resolve_generator_prototype(
                     stack,
                     context,
-                    callee_closure,
+                    callee_anchor,
                     generator_function_id,
                     generator_anchor,
                 )?;
@@ -1574,14 +1606,18 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        owner: Option<crate::closure::JsClosure>,
+        callee_anchor: usize,
         function_id: u32,
         generator_anchor: usize,
     ) -> Result<(), VmError> {
-        // `owner` is the invoked closure instance: `fn.prototype`
+        // The owner is the invoked closure instance: `fn.prototype`
         // materializes per closure, so resolving through the template
         // bag would hand the generator a parallel prototype object that
-        // fails `Object.getPrototypeOf(gen) === fn.prototype`.
+        // fails `Object.getPrototypeOf(gen) === fn.prototype`. It is read
+        // from its anchor because the prologue before this point allocates.
+        let owner = self
+            .iteration_anchor(callee_anchor)
+            .as_closure(&self.gc_heap);
         let proto = self.function_property_get(stack, context, owner, function_id, "prototype")?;
         let gen_handle = self
             .iteration_anchor(generator_anchor)
@@ -1611,7 +1647,7 @@ impl Interpreter {
         mut frame: Frame,
         is_async_generator: bool,
         generator_function_id: u32,
-        callee_closure: Option<crate::closure::JsClosure>,
+        callee_anchor: usize,
     ) -> Result<(), VmError> {
         {
             frame.return_register = None;
@@ -1646,7 +1682,7 @@ impl Interpreter {
                 self.resolve_generator_prototype(
                     stack,
                     context,
-                    callee_closure,
+                    callee_anchor,
                     generator_function_id,
                     generator_anchor,
                 )?;
@@ -1673,7 +1709,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let current = *callee;
         let effective_this = this_value;
-        let (function_id, this_for_callee, new_target_for_callee, callee_closure) =
+        let (function_id, this_for_callee, new_target_for_callee, _) =
             match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
                 Ok(parts) => parts,
                 Err(_) if current.as_class_constructor().is_some() => {
@@ -1698,6 +1734,41 @@ impl Interpreter {
             });
         }
         let top_idx = stack.len() - 1;
+        // The callee is young: it rides an anchor across the promise and
+        // generator allocations below and SELF is read back from it.
+        let callee_anchor = self.push_iteration_anchor(current) - 1;
+        let result = self.push_anchored_window_call_frame(
+            stack,
+            context,
+            function,
+            callee_anchor,
+            this_for_callee,
+            new_target_for_callee,
+            operands,
+            first_arg_operand,
+            argc,
+            dst,
+            top_idx,
+        );
+        self.pop_iteration_anchors_to(callee_anchor);
+        result.map(|()| true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_anchored_window_call_frame(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function: &crate::CodeBlock,
+        callee_anchor: usize,
+        this_for_callee: Value,
+        new_target_for_callee: Option<Value>,
+        operands: ArgumentOperands<'_>,
+        first_arg_operand: usize,
+        argc: usize,
+        dst: u16,
+        top_idx: usize,
+    ) -> Result<(), VmError> {
         let (return_register, async_state) = if function.is_async && !function.is_generator {
             let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, stack, &[&this_for_callee], &[])?;
@@ -1707,6 +1778,7 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
+        let current = self.iteration_anchor(callee_anchor);
         // SELF is canonical hot frame state for both interpreter and native
         // activations: the exact invoked closure, whose context the body
         // reaches through `LoadClosureContext`.
@@ -1733,12 +1805,12 @@ impl Interpreter {
                 frame,
                 function.is_async_generator,
                 function.id,
-                callee_closure,
+                callee_anchor,
             )?;
         } else {
             stack.push(frame);
         }
-        Ok(true)
+        Ok(())
     }
 
     fn try_invoke_native_call_from_window(

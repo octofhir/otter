@@ -535,6 +535,19 @@ impl Interpreter {
         }
     }
 
+    /// The callback a `map` / `filter` / `flatMap` helper holds, read from
+    /// its state cell after the step's last allocation. The state cell is
+    /// allocated old and never moves; the callback is an ordinary movable
+    /// value, so a snapshot copy taken before the source's `next` ran is
+    /// stale by the time the helper calls it.
+    fn iterator_helper_callback(&self, iter: IteratorHandle, fallback: Value) -> Value {
+        self.gc_heap.read_payload(iter, |state| match state {
+            IteratorState::Map { mapper, .. } | IteratorState::FlatMap { mapper, .. } => *mapper,
+            IteratorState::Filter { predicate, .. } => *predicate,
+            _ => fallback,
+        })
+    }
+
     /// Synchronously advance an iterator one step, with full
     /// interpreter access so user-iterator `next()` calls and
     /// helper-wrapper callbacks can run inline. Mirrors the
@@ -848,6 +861,12 @@ impl Interpreter {
                 if !self.is_callable_runtime(&next_fn) {
                     return Err(VmError::TypeMismatch);
                 }
+                // A `next` getter can have moved the iterator object; the
+                // state cell is old and traced, so read it from there.
+                let iter_value = self.gc_heap.read_payload(*iter, |state| match state {
+                    IteratorState::User { iterator, .. } => *iterator,
+                    _ => iter_value,
+                });
                 let result = self.run_callable_sync_rooted(
                     stack,
                     context,
@@ -866,9 +885,18 @@ impl Interpreter {
                 // its getters and an abrupt completion propagates rather
                 // than silently reading `undefined` (which would never
                 // terminate a `done`-less iterator).
-                let done = self
-                    .iter_result_get(stack, context, result, "done")?
-                    .to_boolean(&self.gc_heap);
+                // A `done` getter allocates; the result object rides the
+                // anchor stack to the `value` read.
+                let result_slot = self.push_iteration_anchor(result) - 1;
+                let done = match self.iter_result_get(stack, context, result, "done") {
+                    Ok(done) => done.to_boolean(&self.gc_heap),
+                    Err(err) => {
+                        self.pop_iteration_anchors_to(result_slot);
+                        return Err(err);
+                    }
+                };
+                let result = self.iteration_anchor(result_slot);
+                self.pop_iteration_anchors_to(result_slot);
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
@@ -938,6 +966,7 @@ impl Interpreter {
                         *running = true;
                     }
                 });
+                let mapper = self.iterator_helper_callback(*iter, mapper);
                 let mapped = match self.run_callable_sync_rooted(
                     stack,
                     context,
@@ -993,13 +1022,20 @@ impl Interpreter {
                             *running = true;
                         }
                     });
-                    let kept = match self.run_callable_sync_rooted(
+                    let predicate = self.iterator_helper_callback(*iter, predicate);
+                    // The kept value is yielded after the predicate ran and
+                    // possibly moved it.
+                    let value_slot = self.push_iteration_anchor(v) - 1;
+                    let called = self.run_callable_sync_rooted(
                         stack,
                         context,
                         &predicate,
                         Value::undefined(),
                         smallvec::smallvec![v, counter_value],
-                    ) {
+                    );
+                    let v = self.iteration_anchor(value_slot);
+                    self.pop_iteration_anchors_to(value_slot);
+                    let kept = match called {
                         Ok(kept) => {
                             self.gc_heap.with_payload(*iter, |state| {
                                 if let IteratorState::Filter { running, .. } = state {
@@ -1171,6 +1207,7 @@ impl Interpreter {
                         *running = true;
                     }
                 });
+                let mapper = self.iterator_helper_callback(*iter, mapper);
                 let mapped = match self.run_callable_sync_rooted(
                     stack,
                     context,

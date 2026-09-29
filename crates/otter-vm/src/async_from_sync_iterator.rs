@@ -50,8 +50,15 @@ impl Interpreter {
         // parked in the handle arena and re-read after each allocating
         // sub-call: a stack-local `Value` "updated in place" through a
         // shared reference is not a root the optimizer has to honor.
-        let next_method = self.iterator_member(stack, context, sync_iterator, "next")?;
+        // Reading `next` runs a getter, so the iterator is parked before it.
         let base = self.json_root_push(sync_iterator);
+        let next_method = match self.iterator_member(stack, context, sync_iterator, "next") {
+            Ok(next_method) => next_method,
+            Err(error) => {
+                self.json_root_pop_to(base);
+                return Err(error);
+            }
+        };
         let next_root = self.json_root_push(next_method);
         let result = (|| {
             let sync_iterator = self.json_root_get(base);
@@ -144,9 +151,26 @@ impl Interpreter {
         sync_iterator: Value,
         close_on_rejection: bool,
     ) -> Result<Value, VmError> {
-        let done = self.iterator_member(stack, context, result, "done")?;
+        // The `done` and `value` reads run getters and PromiseResolve runs
+        // `then` lookups: the result and the iterator are parked for them.
+        let entry = self.json_root_push(result);
+        self.json_root_push(sync_iterator);
+        let outcome =
+            self.async_from_sync_continuation_parked(stack, context, entry, close_on_rejection);
+        self.json_root_pop_to(entry);
+        outcome
+    }
+
+    fn async_from_sync_continuation_parked(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        entry: usize,
+        close_on_rejection: bool,
+    ) -> Result<Value, VmError> {
+        let done = self.iterator_member(stack, context, self.json_root_get(entry), "done")?;
         let done = done.to_boolean(&self.gc_heap);
-        let value = self.iterator_member(stack, context, result, "value")?;
+        let value = self.iterator_member(stack, context, self.json_root_get(entry), "value")?;
 
         // PromiseResolve(%Promise%, value): a thenable is adopted, anything
         // else settles at once.
@@ -165,6 +189,7 @@ impl Interpreter {
             Err(error) => {
                 if close_on_rejection && !done {
                     let thrown = self.take_pending_uncaught_throw();
+                    let sync_iterator = self.json_root_get(entry + 1);
                     self.iterator_close_discarding_completion(stack, context, &sync_iterator);
                     if let Some(thrown) = thrown {
                         self.set_pending_uncaught_throw(thrown);
@@ -174,7 +199,7 @@ impl Interpreter {
             }
         };
         let base = self.json_root_push(inner_value);
-        let sync_root = self.json_root_push(sync_iterator);
+        let sync_root = entry + 1;
         let result = (|| {
             let on_fulfilled =
                 crate::native_function::native_value_with_captures_unchecked_with_roots(
@@ -451,6 +476,39 @@ fn step(
     close_on_rejection: bool,
     missing: impl FnOnce(&mut NativeCtx<'_>, Option<Value>) -> Option<Result<Value, NativeError>>,
 ) -> Result<Value, NativeError> {
+    // The member read and the method call run JavaScript, which allocates:
+    // the iterator and the argument ride anchors for the whole step and are
+    // read back at each use.
+    let anchor = ctx.with_turn_parts(|interp, _| {
+        let anchor = interp.push_iteration_anchor(sync_iterator) - 1;
+        interp.push_iteration_anchor(argument.unwrap_or_else(Value::undefined));
+        anchor
+    });
+    let outcome = step_anchored(
+        ctx,
+        anchor,
+        argument.is_some(),
+        name,
+        cached_method,
+        close_on_rejection,
+        missing,
+    );
+    ctx.with_turn_parts(|interp, _| interp.pop_iteration_anchors_to(anchor));
+    outcome
+}
+
+fn step_anchored(
+    ctx: &mut NativeCtx<'_>,
+    anchor: usize,
+    has_argument: bool,
+    name: &'static str,
+    cached_method: Option<Value>,
+    close_on_rejection: bool,
+    missing: impl FnOnce(&mut NativeCtx<'_>, Option<Value>) -> Option<Result<Value, NativeError>>,
+) -> Result<Value, NativeError> {
+    let anchored = |ctx: &mut NativeCtx<'_>, index: usize| {
+        ctx.with_turn_parts(|interp, _| interp.iteration_anchor(index))
+    };
     let context = ctx
         .execution_context()
         .cloned()
@@ -463,6 +521,7 @@ fn step(
         // (GetIteratorDirect); no per-step property read.
         Some(method) => Ok(method),
         None => ctx.with_turn_parts(|interp, stack| {
+            let sync_iterator = interp.iteration_anchor(anchor);
             interp.iterator_member(stack, &context, sync_iterator, name)
         }),
     };
@@ -471,6 +530,7 @@ fn step(
         Err(err) => return rejected_promise(ctx, &context, err, name),
     };
     if method.is_nullish() {
+        let argument = has_argument.then(|| anchored(ctx, anchor + 1));
         return match missing(ctx, argument) {
             Some(answer) => answer,
             None => {
@@ -480,11 +540,12 @@ fn step(
         };
     }
 
-    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-    if let Some(argument) = argument {
-        args.push(argument);
-    }
     let result = ctx.with_turn_parts(|interp, stack| {
+        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+        if has_argument {
+            args.push(interp.iteration_anchor(anchor + 1));
+        }
+        let sync_iterator = interp.iteration_anchor(anchor);
         interp.run_callable_sync_rooted(stack, &context, &method, sync_iterator, args)
     });
     let result = match result {
@@ -496,6 +557,7 @@ fn step(
         return reject_with(ctx, &context, reason, name);
     }
     let outcome = ctx.with_turn_parts(|interp, stack| {
+        let sync_iterator = interp.iteration_anchor(anchor);
         interp.async_from_sync_continuation(
             stack,
             &context,

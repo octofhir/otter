@@ -10,8 +10,9 @@
 //! binding its body reaches is a hop from there.
 //!
 //! # Contents
-//! - [`ContextBody`] — the GC body: scope identity, parent, eval extension,
-//!   and the trailing slot array.
+//! - [`ContextBody`] — the GC body: scope identity and parent, then the
+//!   trailing slot array and, for a scope that can receive one, the eval
+//!   extension word after the last slot.
 //! - [`ContextHandle`] — its compressed handle.
 //! - Byte offsets of every field, published to generated code through
 //!   [`crate::jit::JitContextLayout`].
@@ -20,15 +21,17 @@
 //!   `Lookup*` operations.
 //!
 //! # Invariants
-//! - `parent` holds a context value or `undefined`; `extension` holds an
-//!   `EvalExtensionBody` value or `undefined`. Both are
-//!   full 8-byte `Value` words, so generated code dereferences them with one
-//!   load and no cage-base arithmetic.
+//! - `parent` holds a context value or `undefined`; the extension word, which
+//!   only a scope whose descriptor has `has_extension` (V8's `extension`
+//!   slot, present only for sloppy-eval scopes) carries, holds an
+//!   `EvalExtensionBody` value or `undefined`. Both are full 8-byte `Value`
+//!   words, so generated code dereferences them with one load and no
+//!   cage-base arithmetic. Slot offsets never depend on the extension.
 //! - The body and its whole slot array are initialized before the cell can be
 //!   observed by any collection: allocation goes through
 //!   [`otter_gc::GcHeap::alloc_trailing_with_roots_initialized`], whose
 //!   initializer runs at the final address before any safepoint. A pending
-//!   (stack-resident) body traces only `parent` and `extension`.
+//!   (stack-resident) body traces only `parent`.
 //! - Contexts are allocated young, or old under bootstrap tenuring. Every
 //!   store into a slot or the extension field after allocation records the
 //!   write barrier; no store elides it, because a context may sit in old
@@ -65,16 +68,19 @@ pub struct ContextBody {
     /// Global VM function id of the function whose `CodeBlock::scopes` holds
     /// this context's descriptor.
     pub(crate) scope_function_id: u32,
-    /// Index of the descriptor in that function's scope table.
+    /// Index of the descriptor in that function's scope table, with
+    /// [`CONTEXT_HAS_EXTENSION`] set when the cell carries the eval-extension
+    /// word after its slots.
     pub(crate) scope_index: u16,
     /// Number of trailing slots.
     pub(crate) slot_count: u16,
     /// Enclosing context, or `undefined` for the outermost.
     pub(crate) parent: Value,
-    /// Eval extension, or `undefined` while no sloppy direct eval has added a
-    /// binding to this scope.
-    pub(crate) extension: Value,
 }
+
+/// [`ContextBody::scope_index`] bit marking a context with an eval-extension
+/// word. Scope tables never reach this index.
+pub(crate) const CONTEXT_HAS_EXTENSION: u16 = 1 << 15;
 
 /// Compressed handle to a [`ContextBody`].
 pub type ContextHandle = otter_gc::Gc<ContextBody>;
@@ -88,8 +94,6 @@ pub const CONTEXT_BODY_SCOPE_INDEX_OFFSET: usize = std::mem::offset_of!(ContextB
 pub const CONTEXT_BODY_SLOT_COUNT_OFFSET: usize = std::mem::offset_of!(ContextBody, slot_count);
 /// Byte offset of `parent` in the payload.
 pub const CONTEXT_BODY_PARENT_OFFSET: usize = std::mem::offset_of!(ContextBody, parent);
-/// Byte offset of `extension` in the payload.
-pub const CONTEXT_BODY_EXTENSION_OFFSET: usize = std::mem::offset_of!(ContextBody, extension);
 /// Byte offset of slot 0 in the payload; slot `i` is `8 * i` further.
 pub const CONTEXT_BODY_SLOTS_OFFSET: usize = std::mem::size_of::<ContextBody>();
 
@@ -97,8 +101,7 @@ const _: [(); 0] = [(); CONTEXT_BODY_SCOPE_FUNCTION_ID_OFFSET];
 const _: [(); 4] = [(); CONTEXT_BODY_SCOPE_INDEX_OFFSET];
 const _: [(); 6] = [(); CONTEXT_BODY_SLOT_COUNT_OFFSET];
 const _: [(); 8] = [(); CONTEXT_BODY_PARENT_OFFSET];
-const _: [(); 16] = [(); CONTEXT_BODY_EXTENSION_OFFSET];
-const _: [(); 24] = [(); CONTEXT_BODY_SLOTS_OFFSET];
+const _: [(); 16] = [(); CONTEXT_BODY_SLOTS_OFFSET];
 const _: [(); 8] = [(); std::mem::align_of::<ContextBody>()];
 
 impl otter_gc::SafeTraceable for ContextBody {
@@ -106,9 +109,8 @@ impl otter_gc::SafeTraceable for ContextBody {
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.parent.trace_value_slot_mut(visitor);
-        self.extension.trace_value_slot_mut(visitor);
         let base = self.slots_ptr();
-        for index in 0..self.slot_count as usize {
+        for index in 0..self.traced_word_count() {
             // SAFETY: an allocated context owns exactly `slot_count`
             // initialized slots after the fixed body; the visitor rewrites
             // the slot in place.
@@ -116,11 +118,10 @@ impl otter_gc::SafeTraceable for ContextBody {
         }
     }
 
-    /// A pending body on the allocator's stack has no slot array yet; only
-    /// its parent and extension words exist.
+    /// A pending body on the allocator's stack has no slot array or
+    /// extension word yet; only its parent exists.
     fn trace_pending_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.parent.trace_value_slot_mut(visitor);
-        self.extension.trace_value_slot_mut(visitor);
     }
 }
 
@@ -138,6 +139,14 @@ impl ContextBody {
         unsafe { std::slice::from_raw_parts(self.slots_ptr(), self.slot_count as usize) }
     }
 
+    /// Set the extension word of a freshly allocated cell to `undefined`.
+    fn initialize_extension_word(&mut self) {
+        if self.has_extension_word() {
+            // SAFETY: the cell owns the extension word after its slots.
+            unsafe { *self.slots_ptr().add(self.slot_count as usize) = Value::undefined() };
+        }
+    }
+
     fn slots_mut(&mut self) -> &mut [Value] {
         // SAFETY: as `slots`; the exclusive borrow covers the whole cell.
         unsafe { std::slice::from_raw_parts_mut(self.slots_ptr(), self.slot_count as usize) }
@@ -148,9 +157,36 @@ impl ContextBody {
         self.parent.as_context()
     }
 
+    /// Whether the cell carries the eval-extension word.
+    pub(crate) fn has_extension_word(&self) -> bool {
+        self.scope_index & CONTEXT_HAS_EXTENSION != 0
+    }
+
+    /// Descriptor index in the owning function's scope table.
+    pub(crate) fn scope_index(&self) -> u16 {
+        self.scope_index & !CONTEXT_HAS_EXTENSION
+    }
+
+    /// Slots plus the extension word, when present.
+    fn traced_word_count(&self) -> usize {
+        self.slot_count as usize + usize::from(self.has_extension_word())
+    }
+
+    /// The eval-extension word, `undefined` while no sloppy direct eval has
+    /// added one (and always for a scope that cannot receive one).
+    fn extension_word(&self) -> Value {
+        if self.has_extension_word() {
+            // SAFETY: a context with the extension bit owns one more word
+            // after its `slot_count` slots, initialized at allocation.
+            unsafe { *self.slots_ptr().add(self.slot_count as usize) }
+        } else {
+            Value::undefined()
+        }
+    }
+
     /// Eval extension handle, if a sloppy direct eval has added one.
     pub(crate) fn extension_handle(&self) -> Option<EvalExtensionHandle> {
-        self.extension.as_eval_extension()
+        self.extension_word().as_eval_extension()
     }
 
     /// Report the descriptor's owning function and every function id the
@@ -158,7 +194,7 @@ impl ContextBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         visitor(self.scope_function_id);
         crate::code_liveness::visit_value(&self.parent, visitor);
-        crate::code_liveness::visit_value(&self.extension, visitor);
+        crate::code_liveness::visit_value(&self.extension_word(), visitor);
         for value in self.slots() {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -174,6 +210,24 @@ pub(crate) struct ContextShape {
     pub(crate) scope_index: u16,
     /// Number of slots.
     pub(crate) slot_count: u16,
+    /// The scope's descriptor has `has_extension`: the cell reserves the
+    /// eval-extension word after its slots.
+    pub(crate) has_extension: bool,
+}
+
+impl ContextShape {
+    fn scope_index_word(self) -> u16 {
+        debug_assert!(self.scope_index & CONTEXT_HAS_EXTENSION == 0);
+        if self.has_extension {
+            self.scope_index | CONTEXT_HAS_EXTENSION
+        } else {
+            self.scope_index
+        }
+    }
+
+    fn trailing_bytes(self) -> usize {
+        (self.slot_count as usize + usize::from(self.has_extension)) * std::mem::size_of::<Value>()
+    }
 }
 
 /// Allocate a context of `shape` under `parent`, starting slot `i` as the
@@ -195,14 +249,13 @@ pub(crate) fn alloc_context_with_roots(
     debug_assert!(parent.is_undefined() || parent.as_context().is_some());
     let body = ContextBody {
         scope_function_id: shape.scope_function_id,
-        scope_index: shape.scope_index,
+        scope_index: shape.scope_index_word(),
         slot_count: shape.slot_count,
         parent,
-        extension: Value::undefined(),
     };
     heap.alloc_trailing_with_roots_initialized(
         body,
-        shape.slot_count as usize * std::mem::size_of::<Value>(),
+        shape.trailing_bytes(),
         external_visit,
         |body| {
             for (index, slot) in body.slots_mut().iter_mut().enumerate() {
@@ -212,6 +265,7 @@ pub(crate) fn alloc_context_with_roots(
                     Value::undefined()
                 };
             }
+            body.initialize_extension_word();
         },
     )
 }
@@ -241,28 +295,28 @@ pub(crate) unsafe fn copy_context_with_roots(
         .expect("CopyContext source holds a context");
     let (shape, parent) = heap.read_payload(handle, |body| {
         debug_assert!(
-            body.extension.is_undefined(),
+            body.extension_word().is_undefined(),
             "a scope with an eval extension is never copied"
         );
         (
             ContextShape {
                 scope_function_id: body.scope_function_id,
-                scope_index: body.scope_index,
+                scope_index: body.scope_index(),
                 slot_count: body.slot_count,
+                has_extension: body.has_extension_word(),
             },
             body.parent,
         )
     });
     let body = ContextBody {
         scope_function_id: shape.scope_function_id,
-        scope_index: shape.scope_index,
+        scope_index: shape.scope_index_word(),
         slot_count: shape.slot_count,
         parent,
-        extension: Value::undefined(),
     };
     heap.alloc_trailing_with_roots_initialized(
         body,
-        shape.slot_count as usize * std::mem::size_of::<Value>(),
+        shape.trailing_bytes(),
         external_visit,
         |body| {
             // SAFETY: the source slot is traced, so it names the source's
@@ -275,6 +329,7 @@ pub(crate) unsafe fn copy_context_with_roots(
             // the new cell is disjoint from it.
             let from = unsafe { &*payload };
             body.slots_mut().copy_from_slice(from.slots());
+            body.initialize_extension_word();
         },
     )
 }
@@ -294,7 +349,7 @@ fn context_payload_ptr(handle: ContextHandle) -> *const ContextBody {
 /// `(scope_function_id, scope_index)` of `context`.
 #[must_use]
 pub(crate) fn scope_identity(heap: &GcHeap, context: ContextHandle) -> (u32, u16) {
-    heap.read_payload(context, |body| (body.scope_function_id, body.scope_index))
+    heap.read_payload(context, |body| (body.scope_function_id, body.scope_index()))
 }
 
 /// Parent of `context`, `None` for the outermost.
@@ -356,7 +411,14 @@ pub(crate) fn set_extension(
     extension: EvalExtensionHandle,
 ) {
     let value = Value::eval_extension(extension);
-    heap.with_payload(context, |body| body.extension = value);
+    heap.with_payload(context, |body| {
+        assert!(
+            body.has_extension_word(),
+            "an eval extension is installed only on a scope that reserves it"
+        );
+        // SAFETY: the cell owns the extension word after its slots.
+        unsafe { *body.slots_ptr().add(body.slot_count as usize) = value };
+    });
     heap.record_write(context, &value);
 }
 
@@ -399,15 +461,15 @@ mod tests {
             scope_function_id: 3,
             scope_index: 1,
             slot_count,
+            has_extension: true,
         }
     }
 
     #[test]
     fn layout_matches_the_published_offsets() {
-        assert_eq!(std::mem::size_of::<ContextBody>(), 24);
+        assert_eq!(std::mem::size_of::<ContextBody>(), 16);
         assert_eq!(CONTEXT_BODY_PARENT_OFFSET, 8);
-        assert_eq!(CONTEXT_BODY_EXTENSION_OFFSET, 16);
-        assert_eq!(CONTEXT_BODY_SLOTS_OFFSET, 24);
+        assert_eq!(CONTEXT_BODY_SLOTS_OFFSET, 16);
         assert_eq!(
             <ContextBody as otter_gc::SafeTraceable>::TYPE_TAG,
             CONTEXT_BODY_TYPE_TAG

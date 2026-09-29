@@ -73,6 +73,7 @@ fn parameter_context(heap: &mut GcHeap, values: &[Value]) -> crate::context::Con
             scope_function_id: 0,
             scope_index: 0,
             slot_count: values.len() as u16,
+            has_extension: false,
         },
         Value::undefined(),
         |_| false,

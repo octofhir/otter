@@ -363,14 +363,16 @@ impl CodeBlock {
                 bound_this_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS,
                 bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
                 runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
+                rare_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_RARE_OFFSET as u32,
                 own_props_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_OWN_PROPS_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_OWN_PROPS_OFFSET as u32,
                 prototype_shape_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_PROTOTYPE_SHAPE_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_SHAPE_OFFSET as u32,
                 prototype_slot_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_PROTOTYPE_SLOT_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_SLOT_OFFSET as u32,
                 learned_instance_fields_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_LEARNED_INSTANCE_FIELDS_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET
+                        as u32,
                 last_instance_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET as u32,
             },
@@ -1488,14 +1490,16 @@ mod tests {
                 bound_this_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS,
                 bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
                 runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
+                rare_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_RARE_OFFSET as u32,
                 own_props_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_OWN_PROPS_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_OWN_PROPS_OFFSET as u32,
                 prototype_shape_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_PROTOTYPE_SHAPE_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_SHAPE_OFFSET as u32,
                 prototype_slot_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_PROTOTYPE_SLOT_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_SLOT_OFFSET as u32,
                 learned_instance_fields_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_LEARNED_INSTANCE_FIELDS_OFFSET as u32,
+                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET
+                        as u32,
                 last_instance_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET as u32,
             }

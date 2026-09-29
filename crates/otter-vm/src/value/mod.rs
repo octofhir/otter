@@ -1312,6 +1312,14 @@ impl Value {
         self.typeof_string()
     }
 
+    /// The `typeof` kind when the VM heap is available; see
+    /// [`Self::typeof_string_with_heap`].
+    #[must_use]
+    pub fn typeof_kind_with_heap(self, heap: &otter_gc::GcHeap) -> otter_bytecode::TypeOfKind {
+        otter_bytecode::TypeOfKind::from_name(self.typeof_string_with_heap(heap))
+            .expect("typeof yields one of its eight spellings")
+    }
+
     /// Convenience: shared empty-string constant. Allocates only on
     /// first call per heap.
     ///

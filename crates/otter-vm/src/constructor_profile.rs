@@ -75,7 +75,7 @@ pub(crate) struct ConstructorProfileSample {
 /// No entry participates in tracing or survives movement/sweep.
 pub(crate) struct PendingConstructorSample {
     pub(crate) key: (u32, u32),
-    pub(crate) closure: Option<otter_gc::Gc<crate::closure::JsClosureBody>>,
+    pub(crate) closure: Option<crate::closure::JsClosure>,
 }
 
 impl Interpreter {
@@ -118,17 +118,13 @@ impl Interpreter {
             .as_class_constructor()
             .map(|class| class.ctor(&self.gc_heap))
             .unwrap_or(new_target);
-        let closure = callable
-            .as_closure(&self.gc_heap)
-            .map(|closure| closure.handle);
+        let closure = callable.as_closure(&self.gc_heap);
         let learned = match closure {
-            Some(handle) => {
-                let (learned, last) = self.gc_heap.read_payload(handle, |body| {
-                    (
-                        body.construct.learned_instance_fields.get(),
-                        body.construct.observed_receiver(),
-                    )
-                });
+            Some(closure) => {
+                let learned = closure.learned_instance_fields(&self.gc_heap);
+                let last = self
+                    .gc_heap
+                    .read_payload(closure.handle, |body| body.observed_receiver());
                 ConstructorInstanceProfile::learned_from(usize::from(learned), last, &self.gc_heap)
             }
             None => self
@@ -157,26 +153,23 @@ impl Interpreter {
             .as_class_constructor()
             .map(|class| class.ctor(&self.gc_heap))
             .unwrap_or(new_target);
-        let closure = callable
-            .as_closure(&self.gc_heap)
-            .map(|closure| closure.handle);
-        if let Some(handle) = closure {
-            self.gc_heap.with_payload(handle, |body| {
-                body.construct.learned_instance_fields.set(
-                    body.construct
-                        .learned_instance_fields
-                        .get()
-                        .max(u16::try_from(learned).unwrap_or(u16::MAX)),
-                );
-                if body.construct.last_instance.replace(receiver).is_null() {
-                    self.pending_constructor_samples
-                        .borrow_mut()
-                        .push(PendingConstructorSample {
-                            key,
-                            closure: Some(handle),
-                        });
-                }
-            });
+        let closure = callable.as_closure(&self.gc_heap);
+        if let Some(closure) = closure {
+            closure.raise_learned_instance_fields(
+                &self.gc_heap,
+                u16::try_from(learned).unwrap_or(u16::MAX),
+            );
+            let observed_before = self
+                .gc_heap
+                .read_payload(closure.handle, |body| body.replace_receiver(receiver));
+            if !observed_before {
+                self.pending_constructor_samples
+                    .borrow_mut()
+                    .push(PendingConstructorSample {
+                        key,
+                        closure: Some(closure),
+                    });
+            }
         }
         let profile = self.constructor_instance_profiles.entry(key).or_default();
         let crossed_inline_capacity =
@@ -203,15 +196,12 @@ impl Interpreter {
         for sample in self.pending_constructor_samples.borrow_mut().drain(..) {
             let profile = self.constructor_instance_profiles.get(&sample.key);
             let learned = if let Some(closure) = sample.closure {
-                heap.read_payload(closure, |body| {
-                    let learned = ConstructorInstanceProfile::learned_from(
-                        usize::from(body.construct.learned_instance_fields.get()),
-                        body.construct.take_receiver(),
-                        heap,
-                    );
-                    body.construct.learned_instance_fields.set(learned as u16);
-                    learned
-                })
+                let prior = closure.learned_instance_fields(heap);
+                let last = heap.read_payload(closure.handle, |body| body.take_receiver());
+                let learned =
+                    ConstructorInstanceProfile::learned_from(usize::from(prior), last, heap);
+                closure.set_learned_instance_fields(heap, learned as u16);
+                learned
             } else {
                 let Some(profile) = profile else {
                     continue;

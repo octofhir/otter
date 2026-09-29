@@ -3006,6 +3006,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
         crate::bound_function::BoundFunctionBody,
         crate::class_constructor::ClassConstructorBody,
         crate::closure::JsClosureBody,
+        crate::closure_construct::ClosureRareBody,
         crate::collections::MapBody,
         crate::collections::table::OrderedTableBody<crate::collections::MapEntry>,
         crate::collections::SetBody,

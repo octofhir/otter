@@ -822,6 +822,19 @@ pub const STUB_TO_BOOLEAN_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::NativePair,
     NativeResultDomain::Probe,
 );
+/// Leaf `typeof x === kind` test over one raw operand word and an
+/// `Op::TestTypeOf` immediate: never throws, never allocates; total for
+/// every value, so it never misses on a live isolate.
+pub const STUB_TYPEOF_TEST_LEAF: RuntimeStubDescriptor = descriptor(
+    99,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
 /// Leaf numeric remainder over two raw operand words already known to be
 /// numbers: full f64 remainder semantics (sign of the dividend, NaN for a
 /// zero divisor), boxed without allocation.
@@ -1851,6 +1864,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         96 => "jit_forward_call_plan",
         97 => "jit_forward_source_ready",
         98 => "jit_new_object_literal",
+        99 => "typeof_test_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1955,6 +1969,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_FORWARD_CALL_PLAN,
     STUB_JIT_FORWARD_SOURCE_READY,
     STUB_JIT_NEW_OBJECT_LITERAL,
+    STUB_TYPEOF_TEST_LEAF,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -961,7 +961,8 @@ impl BaselinePlan {
                 | Op::BitwiseAndImm
                 | Op::LessThanImm
                 | Op::EqualImm
-                | Op::NotEqualImm => LoweredOperands::Increment(IncrementOperands {
+                | Op::NotEqualImm
+                | Op::TestTypeOf => LoweredOperands::Increment(IncrementOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                     delta: imm32(operands, 2)?,

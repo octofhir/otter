@@ -494,6 +494,17 @@ fn compile_with_reach(
                     &mut numeric_slow_paths,
                 )?;
             }
+            TemplateOp::TestTypeOf { dst, src, test } => {
+                arith::emit_test_typeof(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    dst,
+                    src,
+                    test,
+                    type_mismatch_exit,
+                )?;
+            }
             TemplateOp::LooseCompare {
                 dst,
                 lhs,
@@ -1982,6 +1993,7 @@ fn branch_condition_is_canonical_boolean(
         match plan.instructions[index].op {
             TemplateOp::Compare { dst, .. }
             | TemplateOp::LooseCompare { dst, .. }
+            | TemplateOp::TestTypeOf { dst, .. }
             | TemplateOp::Truthiness { dst, .. }
                 if dst == condition =>
             {

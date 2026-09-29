@@ -1292,7 +1292,9 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    let before_page = ctx.receiver_alloc.page_header;
+    // SAFETY: the window names the heap's buffer or the static empty one;
+    // both outlive this call.
+    let before_limit = unsafe { (*ctx.receiver_alloc.lab).limit };
     let before_cycles = vm.jit_gc_cycle_counts();
     if planned_allocation != 0 && !ctx.runtime_stats.is_null() {
         // SAFETY: `enter_compiled` publishes the interpreter-owned counter
@@ -1320,7 +1322,8 @@ pub(crate) extern "C" fn jit_try_prepare_base_construct_stub(
             stats.receiver_alloc_gc_transitions =
                 stats.receiver_alloc_gc_transitions.saturating_add(1);
         }
-        if ctx.receiver_alloc.page_header != before_page {
+        // SAFETY: as above.
+        if unsafe { (*ctx.receiver_alloc.lab).limit } != before_limit {
             stats.receiver_alloc_refills = stats.receiver_alloc_refills.saturating_add(1);
         }
         if matches!(result, Err(VmError::OutOfMemory { .. })) {

@@ -148,6 +148,7 @@ impl Interpreter {
             scope_index,
             slot_count: u16::try_from(descriptor.slots.len())
                 .map_err(|_| VmError::InvalidOperand)?,
+            has_extension: descriptor.flags.has_extension,
         };
         // `parent` rides in the pending body, so a collection here rewrites it.
         let handle = context::alloc_context_with_roots(

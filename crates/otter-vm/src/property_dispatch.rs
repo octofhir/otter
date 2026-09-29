@@ -244,9 +244,11 @@ impl Interpreter {
             if let Some(bag) = c.own_props(&self.gc_heap) {
                 return Ok(bag);
             }
-            // The bag allocation can move the closure: root it with the
-            // caller's values and attach the bag to its current location.
-            let owner_value = Value::closure(c);
+            // The rare-record and bag allocations can move the closure: root
+            // it with the caller's values and attach the bag to its current
+            // location.
+            let mut owner_value = Value::closure(c);
+            self.ensure_closure_rare(Some(stack), &mut owner_value, value_roots)?;
             let mut roots: smallvec::SmallVec<[&Value; 4]> = value_roots.iter().copied().collect();
             roots.push(&owner_value);
             let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, &roots)?;

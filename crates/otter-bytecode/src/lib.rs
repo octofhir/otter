@@ -968,6 +968,12 @@ pub enum Op {
     /// `"object"`, `"boolean"`, `"number"`, `"bigint"`, `"string"`,
     /// `"symbol"`, `"function"` per ECMA-262 §13.5.3.
     TypeOf,
+    /// `r<dst> = (typeof r<src> === <kind>)`, or its negation. Operands:
+    /// `Register(dst), Register(src), Imm32(test)`, where `test` is a
+    /// [`TypeOfTest`] encoding. The compiler fuses `typeof x ===`/`!==`/
+    /// `==`/`!=` against one of the eight `typeof` result spellings into
+    /// this test, so no result string is produced (V8's `TestTypeOf`).
+    TestTypeOf,
     /// `r<dst> = delete r<obj>[r<idx>]` (boolean result). Operands:
     /// `dst, obj, idx`. Indexed counterpart of
     /// [`Op::DeleteProperty`]; symbol- and string-keyed objects
@@ -1659,6 +1665,7 @@ impl Op {
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
             Op::TypeOf => "TYPEOF",
+            Op::TestTypeOf => "TEST_TYPEOF",
             Op::DeleteElement => "DELETE_ELEMENT",
             Op::NewCollection => "NEW_COLLECTION",
             Op::NewWeakRef => "NEW_WEAK_REF",
@@ -2673,5 +2680,115 @@ impl Constant {
             } => (std::mem::size_of_val::<[u16]>(pattern_utf16) as u64)
                 .saturating_add(flags.len() as u64),
         }
+    }
+}
+
+/// One `typeof` result an [`Op::TestTypeOf`] compares against.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-typeof-operator>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TypeOfKind {
+    /// `"undefined"` — also the Annex B `[[IsHTMLDDA]]` object.
+    Undefined = 0,
+    /// `"object"` — `null` and every non-callable object.
+    Object = 1,
+    /// `"boolean"`.
+    Boolean = 2,
+    /// `"number"`.
+    Number = 3,
+    /// `"bigint"`.
+    BigInt = 4,
+    /// `"string"`.
+    String = 5,
+    /// `"symbol"`.
+    Symbol = 6,
+    /// `"function"` — every object with a `[[Call]]`.
+    Function = 7,
+}
+
+impl TypeOfKind {
+    /// The kind whose `typeof` spelling is `name`, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "undefined" => Self::Undefined,
+            "object" => Self::Object,
+            "boolean" => Self::Boolean,
+            "number" => Self::Number,
+            "bigint" => Self::BigInt,
+            "string" => Self::String,
+            "symbol" => Self::Symbol,
+            "function" => Self::Function,
+            _ => return None,
+        })
+    }
+
+    /// The kind whose `typeof` spelling is `name`, as UTF-16 code units.
+    #[must_use]
+    pub fn from_units(units: &[u16]) -> Option<Self> {
+        let text = String::from_utf16(units).ok()?;
+        Self::from_name(&text)
+    }
+
+    /// The `typeof` spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Undefined => "undefined",
+            Self::Object => "object",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::BigInt => "bigint",
+            Self::String => "string",
+            Self::Symbol => "symbol",
+            Self::Function => "function",
+        }
+    }
+
+    /// Every kind, in encoding order.
+    pub const ALL: [Self; 8] = [
+        Self::Undefined,
+        Self::Object,
+        Self::Boolean,
+        Self::Number,
+        Self::BigInt,
+        Self::String,
+        Self::Symbol,
+        Self::Function,
+    ];
+}
+
+/// The [`Op::TestTypeOf`] immediate: a [`TypeOfKind`] and whether the result
+/// is negated (`!==` / `!=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeOfTest {
+    /// Kind the operand's `typeof` is compared with.
+    pub kind: TypeOfKind,
+    /// `true` for `!==` / `!=`.
+    pub negate: bool,
+}
+
+impl TypeOfTest {
+    const NEGATE_BIT: i32 = 1 << 8;
+
+    /// The immediate operand word.
+    #[must_use]
+    pub const fn encode(self) -> i32 {
+        (self.kind as i32) | if self.negate { Self::NEGATE_BIT } else { 0 }
+    }
+
+    /// Decode an immediate operand word.
+    #[must_use]
+    pub fn decode(word: i32) -> Option<Self> {
+        let kind = *TypeOfKind::ALL.get(usize::try_from(word & 0xff).ok()?)?;
+        if word & !(0xff | Self::NEGATE_BIT) != 0 {
+            return None;
+        }
+        Some(Self {
+            kind,
+            negate: word & Self::NEGATE_BIT != 0,
+        })
     }
 }

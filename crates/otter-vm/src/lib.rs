@@ -1466,6 +1466,10 @@ pub struct Interpreter {
     /// `Intl.NumberFormat.call(obj)` on an instance-shaped receiver).
     /// Traced as a GC root once created.
     intl_fallback_symbol: Option<crate::symbol::JsSymbol>,
+    /// The eight `typeof` result strings, created on first use and shared
+    /// by every `typeof` so the operator never allocates (V8 keeps them as
+    /// read-only roots). Traced as GC roots once created.
+    typeof_strings: [Option<crate::JsString>; 8],
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].
@@ -1766,6 +1770,25 @@ impl Interpreter {
         let symbol = crate::symbol::JsSymbol::new(&mut self.gc_heap, Some(description))?;
         self.intl_fallback_symbol = Some(symbol);
         Ok(symbol)
+    }
+
+    /// The shared `typeof` result string for `kind`.
+    pub(crate) fn typeof_string_value(
+        &mut self,
+        kind: otter_bytecode::TypeOfKind,
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let slot = kind as usize;
+        if let Some(string) = self.typeof_strings[slot] {
+            return Ok(Value::string(string));
+        }
+        let string = crate::JsString::from_str(kind.name(), &mut self.gc_heap)?;
+        self.typeof_strings[slot] = Some(string);
+        Ok(Value::string(string))
+    }
+
+    /// Trace accessor for the shared `typeof` result strings.
+    pub(crate) fn typeof_strings_for_trace(&self) -> impl Iterator<Item = &crate::JsString> {
+        self.typeof_strings.iter().flatten()
     }
 
     /// Trace accessor for the lazily-created legacy Intl fallback symbol.

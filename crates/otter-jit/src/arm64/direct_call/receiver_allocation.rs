@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Class-wrapper and ordinary-closure prototype resolution before effects.
-//! - Existing nursery reservation and complete object initialization program.
+//! - Linear-allocation-buffer bump probe and complete object initialization.
 //! - Explicit publication/accounting after every pre-effect proof succeeds.
 //! - SSA probe completion with separately counted pre-effect misses.
 //!
@@ -12,8 +12,11 @@
 //! - Descriptor/shape guards load the live own prototype slot, never a cached
 //!   prototype value. Every uncertain case reaches rooted canonical preparation.
 //! - Header, slots and prototype are initialized before publishing the bump.
-//! - The candidate helper mutates only bytes beyond the live bump cursor; the
-//!   publication helper is the first operation that makes the cell observable.
+//! - The candidate helper mutates only bytes at or beyond the buffer's `top`;
+//!   the publication helper is the first operation that makes the cell
+//!   observable.
+//! - The heap empties its buffer whenever marking, stress, tenuring or a heap
+//!   cap needs the rooted path, so the bump is the only collector test.
 //!
 //! # See also
 //! - `otter_vm::closure_construct` — canonical state and weak observation lifetime.
@@ -113,15 +116,20 @@ fn emit_receiver_candidate(
     // The closure owns an internal ordinary property table, not an arbitrary
     // JS receiver. An empty sidecar retained by dictionary migration is legal;
     // matching shape and unmodified slot attributes remain authoritative.
+    // The learned size, the bag and the prototype slot proof live in the
+    // closure's rare record (`x17`); a closure without one was never
+    // prepared as a constructor.
     dynasm!(ops ; .arch aarch64
+        ; ldr w17, [x2, view.closure_call_layout.rare_byte]
+        ; cbz w17, =>guard_miss ; add x17, x12, x17
         ; ldr w11, [x2, view.closure_call_layout.last_instance_byte]
         ; cbz w11, =>guard_miss ; add x13, x12, x11
         ; ldrh w11, [x13, view.object_slab_len_byte]
-        ; ldrh w14, [x2, view.closure_call_layout.learned_instance_fields_byte]
+        ; ldrh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
         ; cmp w11, w14 ; csel w14, w11, w14, hi
         ; cmp w14, u32::from(plan.inline_capacity) ; b.hi =>guard_miss
-        ; strh w14, [x2, view.closure_call_layout.learned_instance_fields_byte]
-        ; ldr w11, [x2, view.closure_call_layout.own_props_byte]
+        ; strh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
+        ; ldr w11, [x17, view.closure_call_layout.own_props_byte]
         ; cbz w11, =>guard_miss ; add x13, x12, x11
         ; ldrb w14, [x13] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>guard_miss
     );
@@ -129,9 +137,9 @@ fn emit_receiver_candidate(
     let bag_inline = ops.new_dynamic_label();
     let bag_base = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
-        ; ldr w14, [x2, view.closure_call_layout.prototype_shape_byte] ; cbz w14, =>guard_miss
+        ; ldr w14, [x17, view.closure_call_layout.prototype_shape_byte] ; cbz w14, =>guard_miss
         ; ldr w15, [x13, view.object_shape_byte] ; cmp w14, w15 ; b.ne =>guard_miss
-        ; ldr w14, [x2, view.closure_call_layout.prototype_slot_byte]
+        ; ldr w14, [x17, view.closure_call_layout.prototype_slot_byte]
         ; ldrh w15, [x13, view.object_slab_len_byte] ; cmp w14, w15 ; b.hs =>guard_miss
         // The bag's slot base: in-object until it spills, then its slab's
         // words (`x12` holds the cage base).
@@ -184,37 +192,17 @@ fn emit_receiver_candidate(
         dynasm!(ops ; .arch aarch64 ; cbnz w14, =>guard_miss);
     }
 
-    // Only a live NewFrom page and a complete fixed cell fit may mutate the
-    // nursery. Collector handshakes deliberately publish a null/stale window.
+    // Only a complete cell fit below the buffer limit may mutate the nursery.
+    // `x13` keeps the buffer for publication; the candidate lives at `top`.
     let cell_bytes = receiver_cell_bytes(view, plan);
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x10, [X(context_register), THREAD_OFFSET]
-        ; ldr x10, [x10, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-        ; ldrb w10, [x10]
-        ; cbnz w10, =>space_miss
-        ; ldr x13, [X(context_register), RECEIVER_ALLOC_PAGE_OFFSET]
-        ; cbz x13, =>space_miss
-        ; ldrb w14, [x13, PAGE_SPACE_OFFSET]
-        ; cmp w14, NEW_FROM_SPACE_KIND
-        ; b.ne =>space_miss
-        ; ldr x14, [x13, PAGE_BUMP_CURSOR_OFFSET]
-        ; add x15, x14, cell_bytes
-    );
-    emit_load_u64(ops, 11, u64::from(GC_PAGE_SIZE));
-    dynasm!(ops
-        ; .arch aarch64
-        ; cmp x15, x11
+        ; ldr x13, [X(context_register), RECEIVER_ALLOC_LAB_OFFSET]
+        ; ldr x16, [x13, LAB_TOP_OFFSET]
+        ; ldr x14, [x13, LAB_LIMIT_OFFSET]
+        ; add x15, x16, cell_bytes
+        ; cmp x15, x14
         ; b.hi =>space_miss
-        ; add x16, x13, x14
-        ; ldr x10, [X(context_register), RECEIVER_ALLOC_TRACKED_BYTES_OFFSET]
-        ; cbz x10, >cap_ready
-        ; ldr x9, [x10]
-        ; add x9, x9, cell_bytes
-        ; ldr x11, [X(context_register), RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET]
-        ; cmp x9, x11
-        ; b.hi =>space_miss
-        ; cap_ready:
     );
 
     // Initialize the header and the whole fixed body before publishing the
@@ -266,31 +254,22 @@ fn receiver_cell_bytes(
     view.object_fixed_cell_bytes + 8 * u32::from(plan.inline_capacity)
 }
 
-/// Publish one completely initialized candidate from `x0` on page `x1`.
+/// Publish one completely initialized candidate from `x0` in buffer `x1`.
 ///
-/// This operation cannot miss: every capacity, collector and heap-limit proof
-/// was completed by `emit_receiver_candidate`, and generated Machine code has
-/// no safepoint or reentry between candidate creation and this effect. The
-/// cell size is read back from the candidate's header, which the candidate
-/// wrote from its plan. Clobbers `x9`, `x10`, `x13`–`x17`.
+/// This operation cannot miss: the buffer bump was proven by
+/// `emit_receiver_candidate`, the heap charged the buffer to any cap when it
+/// was carved, and generated Machine code has no safepoint or reentry between
+/// candidate creation and this effect. The cell size is read back from the
+/// candidate's header, which the candidate wrote from its plan. Clobbers
+/// `x13`–`x17`.
 fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot, context_register: u8) {
     dynasm!(ops
         ; .arch aarch64
         ; mov x16, x0
         ; mov x13, x1
         ; ldr w17, [x16, GC_HEADER_SIZE_BYTE]
-        ; sub x14, x16, x13
-        ; add x15, x14, x17
-        ; str x15, [x13, PAGE_BUMP_CURSOR_OFFSET]
-        ; ldr x14, [x13, PAGE_ALLOCATED_BYTES_OFFSET]
-        ; add x14, x14, x17
-        ; str x14, [x13, PAGE_ALLOCATED_BYTES_OFFSET]
-        ; ldr x10, [X(context_register), RECEIVER_ALLOC_TRACKED_BYTES_OFFSET]
-        ; cbz x10, >cap_committed
-        ; ldr x9, [x10]
-        ; add x9, x9, x17
-        ; str x9, [x10]
-        ; cap_committed:
+        ; add x15, x16, x17
+        ; str x15, [x13, LAB_TOP_OFFSET]
     );
     for (pointer_offset, by_size) in [
         (RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET, true),
@@ -325,8 +304,8 @@ const GC_HEADER_SIZE_BYTE: u32 = otter_vm::jit::JIT_GC_HEADER_SIZE_BYTES_OFFSET;
 /// Complete the allocation half of a Machine receiver probe.
 ///
 /// `x2` is the new.target input. A hit returns the initialized unpublished cell
-/// in `x0` and its page in `x1`; either pre-effect miss returns undefined in
-/// `x0` and zero in `x1`.
+/// in `x0` and its allocation buffer in `x1`; either pre-effect miss returns
+/// undefined in `x0` and zero in `x1`.
 pub(crate) fn emit_receiver_candidate_probe(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

@@ -1380,6 +1380,48 @@ impl Interpreter {
         None
     }
 
+    /// Give the closure in `closure` its rare record if it has none.
+    ///
+    /// The allocation roots the frame stack (or, without one, the runtime
+    /// roots), the closure slot and `value_roots`; the caller reads each of
+    /// them back relocated.
+    pub(crate) fn ensure_closure_rare(
+        &mut self,
+        stack: Option<&ActivationStack>,
+        closure: &mut Value,
+        value_roots: &[&Value],
+    ) -> Result<(), VmError> {
+        let owner = closure
+            .as_closure(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        if owner.rare(&self.gc_heap).is_some() {
+            return Ok(());
+        }
+        let _runtime_roots_guard = stack.is_none().then(|| self.scope_runtime_roots_guard());
+        let stack_roots = stack
+            .map(|stack| self.collect_allocation_roots(stack))
+            .unwrap_or_default();
+        let closure_slot: *mut Value = closure;
+        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &stack_roots {
+                visitor(slot);
+            }
+            // SAFETY: the caller's slot outlives the allocation.
+            unsafe { (*closure_slot).trace_value_slot_mut(visitor) };
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+        };
+        let rare =
+            crate::closure_construct::alloc_closure_rare_with_roots(&mut self.gc_heap, &mut visit)?;
+        // SAFETY: an initialized slot the collector rewrote in place.
+        let owner = unsafe { std::ptr::read_volatile(closure_slot) }
+            .as_closure(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        owner.install_rare(&mut self.gc_heap, rare);
+        Ok(())
+    }
+
     pub(crate) fn function_user_bag(
         &mut self,
         stack: &mut ActivationStack,
@@ -1402,6 +1444,8 @@ impl Interpreter {
                 if let Some(bag) = closure.own_props(&interp.gc_heap) {
                     return Ok(bag);
                 }
+                let mut closure_value = Value::closure(closure);
+                interp.ensure_closure_rare(Some(stack), &mut closure_value, &[])?;
                 let bag = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
                 let closure = interp
                     .escape_scoped(owner)

@@ -63,7 +63,12 @@ pub(super) fn emit(
             ; and eax, !i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
             ; cmp eax, i32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
             ; jne =>miss
-            // `prototype` lives in the bag once observed.
+            // `prototype` lives in the bag once observed. The bag and its
+            // slot proof live in the rare record (`r11` from here).
+            ; mov r11d, [r11 + layout.rare_byte as i32]
+            ; test r11d, r11d
+            ; jz =>miss
+            ; add r11, r9
             ; mov r8d, [r11 + layout.own_props_byte as i32]
             ; test r8d, r8d
             ; jz =>miss

@@ -485,6 +485,83 @@ fixed offset).
    2-field object in 32 bytes, a prototype-chain guard becomes one shape
    compare per link.
 
+### Closure body
+
+A closure was an 88-byte cell: call header (function id, flags, 8-byte
+context), bound `this` and `new.target` words on every closure, the
+constructor record (own-property bag, prototype slot proof, learned size,
+last receiver), three flag bytes and a 16-byte `[[Prototype]]` override.
+
+- **V8** `JSFunction` holds map, properties, elements, `shared` (the
+  `SharedFunctionInfo`: code, name, length), `context`, `feedback_cell` and
+  `code`; `prototype_or_initial_map` lives in the function, everything rarer
+  in `FunctionRareData` hung off the feedback cell only when needed.
+- **JSC** `JSFunction` is the cell header, `m_executable` and `m_scope`;
+  `FunctionRareData` (allocation profile, prototype cache, reified
+  name/length state) is allocated on first construct or property reification.
+- **SpiderMonkey** `JSFunction` is a `NativeObject` with fixed slots for
+  flags/nargs, the environment, the script and the atom; bound and lexical
+  state live in the environment chain, not the function.
+
+Otter adopts the JSC shape: a 24-byte body (function id, flags — with the
+per-instance `name`/`length` deletion, non-extensible and named-lookup bits
+folded in —, the context word, one 4-byte handle to an out-of-line
+`ClosureRareBody`, and the last-receiver observation) plus trailing bound
+`this` / `new.target` words present only on arrows that capture them. The
+rare record (own-property bag, prototype slot proof, learned instance size,
+`[[Prototype]]` override) is allocated the first time a closure gets an
+own property or a prototype override. A plain closure is a 32-byte cell.
+
+## 11. Allocation fast path: a linear allocation buffer
+
+Every young allocation used to run the whole policy per object: the GC
+stress test, the growth-ratio major-GC test, heap-cap accounting (with the
+runtime's default cap, a call that drained external releases and
+recomputed the projection), then a page walk in `NewSpace::alloc`.
+Generated receiver allocation repeated the page window checks inline: the
+marking flag, the page's space kind, the cursor against the page size, and
+the cap word.
+
+- **V8** keeps a `LinearAllocationArea {top, limit}` per space; generated
+  code bumps `top` through two external references and calls the runtime
+  only when `top + size > limit`. Refill (`EnsureAllocation`) runs the
+  allocation observers, the GC trigger and black allocation; while marking
+  the area is shrunk so allocation reaches the slow path.
+- **JSC** hands each `LocalAllocator` a bump interval from a block's free
+  list; `allocate` is a compare and an add, and every policy (the eden GC
+  trigger, `didAllocate` accounting) lives on the refill path.
+- **SpiderMonkey** nursery allocation is `position + size <= currentEnd`
+  inline in JIT code; chunk switching and the minor-GC trigger are the slow
+  path.
+
+Otter now matches that contract. `GcHeap` leads with a
+`LinearAllocationArea` taken from the tail of the current from-space page;
+the Rust fast path is one add, one compare and one store before the header
+write, and generated receiver allocation loads `top`/`limit` through the
+window pointer — the marking, space-kind and cap tests are gone because
+the heap empties the buffer whenever they would fail (marking, GC stress,
+bootstrap tenuring). A heap cap charges the whole buffer when it is carved
+(shrunk to what the cap admits) and refunds the unused tail at retire.
+Collections retire the buffer first; heap walks publish its `top` into the
+page before reading it.
+
+Fixed work against L1 (`benchmarks/results/arch-2026-09-27/e1b-lab`; also
+includes `TestTypeOf`, the 32-byte closure and the extension-less context,
+commit `055dbbc4`; stdout identical):
+
+| Workload | L1 | now | Δ | RSS |
+|---|---:|---:|---:|---|
+| ts-fixed | 176.4G | 175.2G | −0.7% | 522 → 557 MB |
+| zlib-fixed | 234.0G | 234.0G | 0 | 724 → 716 MB |
+| crypto-fixed | 16.94G | 16.71G | −1.4% | 49 → 49 MB |
+| fib | 3.65G | 3.64G | −0.2% | 55 → 55 MB |
+| mega_method | 10.01G | 10.00G | −0.1% | 56 → 55 MB |
+| ast_ctor | 22.31G | 21.99G | −1.4% | 87 → 88 MB |
+| earley-boyer | 141.8G | 131.7G | −7.1% | 124 → 124 MB |
+
+The buffer is also the substrate generated context and closure allocation
+needs: both can now be carved inline with the same three instructions.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

@@ -1391,6 +1391,7 @@ opcode_schema! {
     (Op::BindThisContextSlot, 0xC3),
     (Op::ReturnDerived, 0xC4),
     (Op::StoreVarScope, 0xC5),
+    (Op::TestTypeOf, 0xC6),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1743,7 +1744,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::CollectRest | Op::LoadArgumentsLength => OperandShape::Fixed(WRITE),
         Op::CollectArguments => OperandShape::Fixed(WRITE_READ),
         Op::LoadArgumentsElement => OperandShape::Fixed(WRITE_READ),
-        Op::Increment => OperandShape::Fixed(WRITE_READ_IMM),
+        Op::Increment | Op::TestTypeOf => OperandShape::Fixed(WRITE_READ_IMM),
         Op::Eval => OperandShape::Fixed(EVAL),
         Op::DefineGlobalVar => OperandShape::Fixed(CONST_READ),
         Op::NewCollection | Op::NewBuiltinError => OperandShape::Fixed(&[W, CONST, R]),

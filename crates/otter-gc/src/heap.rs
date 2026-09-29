@@ -7,7 +7,10 @@
 //! - [`RootSlotVisitor`] — caller-supplied root source closure for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
 //! - [`MachineAllocationWindow`] — the audited nursery/accounting view exposed
-//!   to generated-code allocators.
+//!   to generated-code allocators: the heap's linear allocation buffer plus
+//!   the per-type counters.
+//! - Linear-allocation-buffer refill, retire and publication (see
+//!   [`crate::lab`]).
 //! - Ephemeron registry and split mark/sweep hooks used by weak
 //!   collections in the VM.
 //! - Weak-reference/finalization registry bookkeeping used by VM
@@ -32,9 +35,10 @@
 //! - Pages live forever inside the heap or are returned to the
 //!   cage on full-GC sweep. Pages are never leaked across heap
 //!   drops.
-//! - A machine allocation window names only the active young from-space page,
-//!   is disabled during marking, GC stress, or a pending major collection, and
-//!   is refreshed after every rooted cold allocation transition.
+//! - Young allocation bumps the linear allocation buffer first. The buffer
+//!   is retired before every collection, heap walk publication and direct
+//!   nursery bump, and is refilled only when a plain young cell is legal, so
+//!   the bump itself needs no policy test.
 //! - Weak collection tables are registered as type-erased raw
 //!   handles. Every full collection runs the embedder's
 //!   [`PostMarkProcessor`] exactly once between strong marking and sweep
@@ -61,6 +65,7 @@ use crate::extra_roots::{ExtraRoots, ExtraRootsGuard};
 use crate::finalize::WeakFinalizationRegistry;
 use crate::frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard};
 use crate::handle::{GlobalHandleTable, HandleStack};
+use crate::lab::LinearAllocationArea;
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
 
@@ -164,42 +169,53 @@ pub struct HeapStats {
 /// Narrow nursery window published to audited generated-code allocators.
 ///
 /// This is not a general heap-mutation API. A consumer may carve only one
-/// already-registered fixed-size body, must update the pointed page and type
-/// counters exactly once, and must reject the window unless the page still
-/// belongs to [`crate::page::SpaceKind::NewFrom`]. All conditions requiring a
-/// collector handshake are represented by a disabled (null-page) window.
+/// already-registered fixed-size body from [`Self::lab`] — bump `top` only
+/// when the whole cell fits below `limit` — and must update the type
+/// counters exactly once. The buffer is empty whenever a collector
+/// handshake is required, so a miss is the only policy signal.
 #[doc(hidden)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MachineAllocationWindow {
-    /// Current nursery page header, or null when generated allocation is not
-    /// permitted without a safepoint.
-    pub page_header: *mut crate::page::PageHeader,
+    /// The heap's linear allocation buffer, or the permanently empty one.
+    pub lab: *mut LinearAllocationArea,
     /// Per-type live-byte counter.
     pub type_live_bytes: *mut usize,
     /// Per-type monotone allocation-count counter.
     pub type_alloc_count: *mut u64,
     /// Per-type monotone allocated-byte counter.
     pub type_alloc_bytes: *mut u64,
-    /// Heap-cap accounting word, or null when cap accounting is disabled.
-    pub tracked_bytes: *mut u64,
-    /// Current heap cap (`0` when disabled).
-    pub max_heap_bytes: u64,
 }
+
+/// Buffer a disabled window points at. Every bump misses, so generated code
+/// never writes it.
+static EMPTY_LAB: LinearAllocationArea = LinearAllocationArea::EMPTY;
+
+/// Per-type counter sink for a disabled window; never written.
+static EMPTY_COUNTER: u64 = 0;
 
 impl MachineAllocationWindow {
     /// A window that forces the caller through its rooted cold path.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
-            page_header: std::ptr::null_mut(),
-            type_live_bytes: std::ptr::null_mut(),
-            type_alloc_count: std::ptr::null_mut(),
-            type_alloc_bytes: std::ptr::null_mut(),
-            tracked_bytes: std::ptr::null_mut(),
-            max_heap_bytes: 0,
+            lab: std::ptr::addr_of!(EMPTY_LAB).cast_mut(),
+            type_live_bytes: std::ptr::addr_of!(EMPTY_COUNTER).cast_mut().cast(),
+            type_alloc_count: std::ptr::addr_of!(EMPTY_COUNTER).cast_mut(),
+            type_alloc_bytes: std::ptr::addr_of!(EMPTY_COUNTER).cast_mut(),
         }
     }
+}
+
+/// Why a linear-allocation-buffer refill produced no window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabRefill {
+    /// The buffer now holds room for the requested cell.
+    Ready,
+    /// Plain young allocation is not legal now, or the cap refuses the tail.
+    Declined,
+    /// Every from-space page is full and the semispace cannot grow.
+    NurseryFull,
 }
 
 /// Orchestrator. Owned by the runtime; passed by `&mut` to every
@@ -211,6 +227,20 @@ impl MachineAllocationWindow {
 /// avoiding a second cache miss in the steady-state allocation
 /// loop.
 pub struct GcHeap {
+    /// Mutator nursery bump window. Leads the struct: the allocation fast
+    /// path reads nothing else from the heap.
+    lab: LinearAllocationArea,
+    /// Base address of the page [`Self::lab`] was carved from; `0` while
+    /// the buffer is empty.
+    lab_page: usize,
+    /// Buffer start at refill; the page cursor and byte count lag `top`
+    /// by exactly what the buffer handed out since then.
+    lab_start: usize,
+    /// Page `allocated_bytes` at refill.
+    lab_page_allocated: usize,
+    /// Cap bytes charged for the whole buffer at refill; the unused tail is
+    /// refunded at retire. `0` without a cap.
+    lab_charged: u64,
     /// Configured per-heap soft cap (`0` = disabled). Front-of-
     /// struct so the alloc fast-path's "is the cap enabled?"
     /// check shares a cache line with [`Self::new_space`].
@@ -449,6 +479,11 @@ impl GcHeap {
             Err(_) => (0, false),
         };
         Ok(Self {
+            lab: LinearAllocationArea::EMPTY,
+            lab_page: 0,
+            lab_start: 0,
+            lab_page_allocated: 0,
+            lab_charged: 0,
             new_space,
             tenure_all: false,
             old_space: OldSpace::new(),
@@ -583,8 +618,15 @@ impl GcHeap {
         if self.max_heap_bytes == 0 {
             return self.tracked_bytes;
         }
+        // The buffer's unused tail is charged but not yet handed out.
+        let unused_lab = if self.lab_charged == 0 {
+            0
+        } else {
+            self.lab.remaining() as u64
+        };
         self.tracked_bytes
             .saturating_sub(self.pending_shared_external_releases())
+            .saturating_sub(unused_lab)
     }
 
     fn drain_shared_external_releases(&mut self) {
@@ -912,6 +954,7 @@ impl GcHeap {
     /// post-collect retained-page slack as well as live objects;
     /// strict liveness arrives with task 86's incremental sweep.
     fn live_bytes_total(&self) -> u64 {
+        self.sync_lab();
         let new = self.new_space.allocated_bytes() as u64;
         let old = self.old_space.allocated_bytes() as u64;
         let los = self.large_space.allocated_bytes() as u64;
@@ -1155,6 +1198,7 @@ impl GcHeap {
 
     /// Stats snapshot.
     pub fn stats(&self) -> HeapStats {
+        self.sync_lab();
         let mut s = self.stats;
         s.new_allocated_bytes = self.new_space.allocated_bytes();
         s.old_allocated_bytes = self.old_space.allocated_bytes();
@@ -1201,44 +1245,150 @@ impl GcHeap {
     /// collection: allocating them young makes the first scavenges copy the
     /// whole set and every later one trace it again, for objects that were
     /// never going to die.
-    pub const fn set_tenure_all(&mut self, tenure_all: bool) {
+    pub fn set_tenure_all(&mut self, tenure_all: bool) {
+        self.retire_lab();
         self.tenure_all = tenure_all;
     }
 
-    /// Publish the current safepoint-free nursery window for one body type.
+    /// Publish the nursery window generated code allocates one body type from.
     ///
-    /// Heap caps, stress collection, incremental marking, bootstrap tenuring,
-    /// and a due major collection all retain the ordinary rooted allocation
-    /// path. The page pointer is stable as an address but its space kind is
-    /// not; generated code must revalidate `NewFrom` on every use.
+    /// The window names the heap's linear allocation buffer, which is empty
+    /// whenever heap caps, stress collection, incremental marking or
+    /// bootstrap tenuring need the ordinary rooted path, so generated code
+    /// tests nothing but the bump. The buffer address is stable for the
+    /// heap's lifetime.
     #[doc(hidden)]
     pub fn machine_allocation_window<T: Traceable>(&mut self) -> MachineAllocationWindow {
-        if self.tenure_all
-            || (self.stress_collection_armed())
-            || self.major_gc_due()
-            || self.marking.is_marking()
-        {
-            return MachineAllocationWindow::disabled();
+        if self.trace_table.get(T::TYPE_TAG).is_none() {
+            self.trace_table.register::<T>();
         }
-        if self.max_heap_bytes != 0 {
-            self.drain_shared_external_releases();
-        }
-        let Some(page) = self.new_space.machine_active_page() else {
-            return MachineAllocationWindow::disabled();
-        };
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         MachineAllocationWindow {
-            page_header: page.header_mut(),
+            lab: std::ptr::addr_of_mut!(self.lab),
             type_live_bytes: std::ptr::addr_of_mut!(row.live_bytes),
             type_alloc_count: std::ptr::addr_of_mut!(row.alloc_count_total),
             type_alloc_bytes: std::ptr::addr_of_mut!(row.alloc_bytes_total),
-            tracked_bytes: if self.max_heap_bytes == 0 {
-                std::ptr::null_mut()
-            } else {
-                std::ptr::addr_of_mut!(self.tracked_bytes)
-            },
-            max_heap_bytes: self.max_heap_bytes,
         }
+    }
+
+    /// Whether a refilled buffer may serve plain young cells now: not while
+    /// marking (new cells are born black), under GC stress (every
+    /// allocation reaches the stress counter) or during bootstrap tenuring.
+    fn lab_allowed(&self) -> bool {
+        !self.tenure_all && self.gc_stress_stride == 0 && !self.marking.is_marking()
+    }
+
+    /// Publish the buffer's progress into its page, so a page walk sees
+    /// every cell handed out so far. Idempotent; the buffer stays live.
+    fn sync_lab(&self) {
+        if self.lab_page == 0 {
+            return;
+        }
+        let header = self.lab_page as *mut crate::page::PageHeader;
+        // SAFETY: `lab_page` is the base of a live from-space page this heap
+        // owns; the single mutator is the only writer of its header.
+        unsafe {
+            (*header).bump_cursor = self.lab.top - self.lab_page;
+            (*header).allocated_bytes = self.lab_page_allocated + (self.lab.top - self.lab_start);
+        }
+    }
+
+    /// Publish the buffer into its page and drop it, refunding the unused
+    /// tail to the heap cap.
+    fn retire_lab(&mut self) {
+        if self.lab_page == 0 {
+            return;
+        }
+        self.sync_lab();
+        if self.lab_charged != 0 {
+            self.tracked_bytes = self
+                .tracked_bytes
+                .saturating_sub(self.lab.remaining() as u64);
+            self.lab_charged = 0;
+        }
+        self.lab = LinearAllocationArea::EMPTY;
+        self.lab_page = 0;
+        self.lab_start = 0;
+        self.lab_page_allocated = 0;
+    }
+
+    /// Retire the buffer and carve a fresh one with room for `aligned`
+    /// bytes from the nursery. Never collects.
+    fn refill_lab(&mut self, aligned: usize) -> LabRefill {
+        self.retire_lab();
+        if !self.lab_allowed() {
+            return LabRefill::Declined;
+        }
+        let Some((page, start, mut limit)) = self.new_space.take_tail(aligned) else {
+            return LabRefill::NurseryFull;
+        };
+        if self.max_heap_bytes != 0 {
+            // Charge the whole window now so a bump never accounts; near the
+            // cap the window shrinks to what the cap still admits.
+            self.drain_shared_external_releases();
+            let available = self.max_heap_bytes.saturating_sub(self.tracked_bytes);
+            let extent = ((limit - start) as u64).min(available) as usize & !(CELL_SIZE - 1);
+            if extent < aligned {
+                return LabRefill::Declined;
+            }
+            limit = start + extent;
+            self.tracked_bytes += extent as u64;
+            self.lab_charged = extent as u64;
+        }
+        // SAFETY: `page` is the base of a live from-space page.
+        self.lab_page_allocated =
+            unsafe { (*(page as *const crate::page::PageHeader)).allocated_bytes };
+        self.lab_page = page;
+        self.lab_start = start;
+        self.lab = LinearAllocationArea { top: start, limit };
+        LabRefill::Ready
+    }
+
+    /// Write a young cell carved from the linear allocation buffer at
+    /// `address` and return its handle.
+    #[inline(always)]
+    fn publish_lab_cell<T: Traceable>(
+        &mut self,
+        address: usize,
+        aligned: usize,
+        value: T,
+        extra_bytes: usize,
+        initialize: impl FnOnce(&mut T),
+    ) -> Gc<T> {
+        debug_assert!(!self.marking.is_marking());
+        // The cage base is 4 GiB-aligned: the low half of the address is
+        // the cage offset.
+        let offset = address as u32;
+        debug_assert_eq!(address - cage_base() as usize, offset as usize);
+        // SAFETY: the buffer handed out `aligned` bytes inside a live
+        // from-space page; header and payload are fully written before the
+        // handle is published, with no safepoint in between.
+        unsafe {
+            let header_ptr = cage_base().add(offset as usize).cast::<GcHeader>();
+            let payload_ptr = header_ptr
+                .cast::<u8>()
+                .add(std::mem::size_of::<GcHeader>())
+                .cast::<T>();
+            std::ptr::write(header_ptr, GcHeader::new_young(T::TYPE_TAG, aligned as u32));
+            std::ptr::write(payload_ptr, value);
+            if extra_bytes != 0 {
+                let tail = payload_ptr.cast::<u8>().add(std::mem::size_of::<T>());
+                std::ptr::write_bytes(
+                    tail,
+                    0,
+                    aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
+                );
+            }
+            initialize(&mut *payload_ptr);
+        }
+        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
+        row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        row.alloc_bytes_total = row
+            .alloc_bytes_total
+            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
+        // SAFETY: offset is the cage offset of a freshly written `T` payload.
+        unsafe { Gc::from_offset(offset) }
     }
 
     /// Try to allocate a `T` in young space without running any collection.
@@ -1293,72 +1443,21 @@ impl GcHeap {
         if aligned > LARGE_OBJECT_THRESHOLD {
             return Err(value);
         }
-        // A tenuring phase owns where its objects land, and this path only
-        // ever bump-allocates young. Hand the payload back so the caller
-        // reaches `alloc_with_roots`, which routes to old space — otherwise a
-        // bootstrap would scatter part of its permanent graph across the
-        // nursery purely by which allocation helper a call site happened to
-        // use. The test is one branch on a flag that is false for the whole
-        // mutator lifetime.
-        if self.tenure_all {
-            return Err(value);
-        }
-        if self.stress_collection_armed() {
-            return Err(value);
-        }
-        if self.major_gc_due() {
-            return Err(value);
-        }
-        if self.max_heap_bytes != 0 {
-            self.drain_shared_external_releases();
-            let projected = self.tracked_bytes.saturating_add(aligned as u64);
-            if projected > self.max_heap_bytes {
-                return Err(value);
-            }
-            self.tracked_bytes = projected;
-        }
-        let offset = match self.new_space.alloc(aligned) {
-            Some(offset) => offset,
+        let address = match self.lab.bump(aligned) {
+            Some(address) => address,
             None => {
-                if self.max_heap_bytes != 0 {
-                    self.tracked_bytes = self.tracked_bytes.saturating_sub(aligned as u64);
+                // The refill declines under tenuring, stress, marking and a
+                // full cap; a due major collection keeps the rooted path.
+                if self.major_gc_due() || self.refill_lab(aligned) != LabRefill::Ready {
+                    return Err(value);
                 }
-                return Err(value);
+                let Some(address) = self.lab.bump(aligned) else {
+                    unreachable!("a refilled buffer holds the cell it was sized for");
+                };
+                address
             }
         };
-        let is_marking = self.marking.is_marking();
-        // SAFETY: offset is a fresh in-cage allocation returned by new-space.
-        let header_ptr = unsafe { cage_base().add(offset as usize) as *mut GcHeader };
-        let payload_ptr =
-            unsafe { cage_base().add(offset as usize + std::mem::size_of::<GcHeader>()) as *mut T };
-        // SAFETY: header/payload are inside a freshly carved nursery cell. They
-        // are fully initialised before the handle is published.
-        unsafe {
-            let header = if is_marking {
-                GcHeader::new_young_black(T::TYPE_TAG, aligned as u32)
-            } else {
-                GcHeader::new_young(T::TYPE_TAG, aligned as u32)
-            };
-            std::ptr::write(header_ptr, header);
-            std::ptr::write(payload_ptr, value);
-            if extra_bytes != 0 {
-                let tail = (payload_ptr as *mut u8).add(std::mem::size_of::<T>());
-                std::ptr::write_bytes(
-                    tail,
-                    0,
-                    aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
-                );
-            }
-            initialize(&mut *payload_ptr);
-        }
-        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
-        row.live_bytes = row.live_bytes.wrapping_add(aligned);
-        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
-        row.alloc_bytes_total = row
-            .alloc_bytes_total
-            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
-        // SAFETY: offset is the cage offset of a freshly allocated `T` payload.
-        Ok(unsafe { Gc::from_offset(offset) })
+        Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, initialize))
     }
 
     /// Allocate a `T` while exposing caller-owned root slots to any
@@ -1442,20 +1541,11 @@ impl GcHeap {
     #[inline]
     fn alloc_trailing_with_roots_inner<T: Traceable>(
         &mut self,
-        mut value: T,
+        value: T,
         extra_bytes: usize,
         external_visit: &mut RootSlotVisitor<'_>,
         initialize: impl FnOnce(&mut T),
     ) -> Result<Gc<T>, OutOfMemory> {
-        if self.tenure_all {
-            return self.alloc_old_with_roots_inner(
-                value,
-                true,
-                extra_bytes,
-                external_visit,
-                initialize,
-            );
-        }
         // A cell payload sits one `GcHeader` past an
         // `OBJECT_ALIGNMENT`-aligned cell start, so it is at most
         // `OBJECT_ALIGNMENT`-aligned. A body needing more (e.g. an
@@ -1477,12 +1567,39 @@ impl GcHeap {
             aligned <= u32::MAX as usize,
             "object size exceeds u32 limit"
         );
+        // The buffer is non-empty only when a plain young cell is legal, so
+        // the bump is the whole policy test; heap cap, stress, marking,
+        // tenuring and major-GC triggers run when the slow path refills it.
+        if aligned <= LARGE_OBJECT_THRESHOLD
+            && let Some(address) = self.lab.bump(aligned)
+        {
+            return Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, initialize));
+        }
+        self.alloc_trailing_slow(value, aligned, extra_bytes, external_visit, initialize)
+    }
 
-        // Cap check — runs before any slot is carved (architecture
-        // §2.1 caveat). When the cap is disabled (`max_heap_bytes
-        // == 0`), the hot path adds one load + branch and skips
-        // accounting entirely; the cap-enabled path is outlined
-        // under [`Self::account_or_collect_with_roots`].
+    /// Allocation path behind an empty or exhausted buffer: bootstrap
+    /// tenuring, stress and major collections, buffer refill, and the
+    /// per-object placements (marking, heap-cap limit, nursery overflow,
+    /// large bodies).
+    #[inline(never)]
+    fn alloc_trailing_slow<T: Traceable>(
+        &mut self,
+        mut value: T,
+        aligned: usize,
+        extra_bytes: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, OutOfMemory> {
+        if self.tenure_all {
+            return self.alloc_old_with_roots_inner(
+                value,
+                true,
+                extra_bytes,
+                external_visit,
+                initialize,
+            );
+        }
         let pending_value = std::ptr::addr_of_mut!(value);
         let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -1522,6 +1639,26 @@ impl GcHeap {
         // against page-level exhaustion. O(1) page-count check.
         self.maybe_major_gc(&mut allocation_roots)?;
 
+        let young = aligned <= LARGE_OBJECT_THRESHOLD;
+        let mut scavenged = false;
+        if young {
+            let mut refill = self.refill_lab(aligned);
+            if refill == LabRefill::NurseryFull && self.always_allocate_depth == 0 {
+                self.collect_minor_internal(&mut allocation_roots)?;
+                scavenged = true;
+                refill = self.refill_lab(aligned);
+            }
+            if refill == LabRefill::Ready {
+                let Some(address) = self.lab.bump(aligned) else {
+                    unreachable!("a refilled buffer holds the cell it was sized for");
+                };
+                return Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, initialize));
+            }
+        }
+
+        // Per-object placement. The buffer is retired here, so a direct
+        // nursery bump cannot overlap it. Cap check — runs before any slot
+        // is carved (architecture §2.1 caveat).
         if self.max_heap_bytes != 0 {
             self.account_or_collect_with_roots(aligned as u64, &mut allocation_roots)?;
         }
@@ -1533,14 +1670,14 @@ impl GcHeap {
         // below). Its header must then be born old, not young, or the
         // scavenger would try to evacuate an object sitting on an
         // old-space page.
-        let mut placed_in_old = aligned > LARGE_OBJECT_THRESHOLD;
-        let offset = if aligned > LARGE_OBJECT_THRESHOLD {
+        let mut placed_in_old = !young;
+        let offset = if !young {
             self.large_space.alloc(aligned)?
         } else {
             // Try young-gen first; if full, scavenge then retry.
             match self.new_space.alloc(aligned) {
                 Some(off) => off,
-                None if self.always_allocate_depth != 0 => {
+                None if self.always_allocate_depth != 0 || scavenged => {
                     placed_in_old = true;
                     self.old_space.alloc(aligned)?
                 }
@@ -1918,6 +2055,7 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        self.retire_lab();
         self.prepare_collection_observations();
         // Combine the caller's external_visit with the heap's
         // own handle-stack and global-handles walk.
@@ -2020,6 +2158,7 @@ impl GcHeap {
     /// in-process counterpart of `OTTER_GC_STRESS`, for tests that drive one
     /// heap without touching the process environment.
     pub fn set_gc_stress(&mut self, stride: u32, full: bool) {
+        self.retire_lab();
         self.gc_stress_stride = stride;
         self.gc_stress_full = full;
         self.gc_stress_counter = 0;
@@ -2362,6 +2501,7 @@ impl GcHeap {
     }
 
     fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
+        self.retire_lab();
         self.prepare_collection_observations();
         self.prune_ephemeron_registry_to_marked();
         self.prune_weak_finalization_registry_to_marked();
@@ -2731,6 +2871,7 @@ impl GcHeap {
     where
         F: FnMut(*mut GcHeader),
     {
+        self.sync_lab();
         // SAFETY: STW pause + valid pages.
         unsafe {
             for page in self.new_space.from_pages() {
@@ -2817,6 +2958,7 @@ impl GcHeap {
     /// from-space, large. Lets [`crate::census`] attribute objects
     /// to a space without opening up the space fields.
     pub(crate) fn census_spaces(&self) -> [(crate::page::SpaceKind, &[crate::page::Page]); 3] {
+        self.sync_lab();
         [
             (crate::page::SpaceKind::Old, self.old_space.pages()),
             (crate::page::SpaceKind::NewFrom, self.new_space.from_pages()),
@@ -2877,6 +3019,7 @@ impl std::fmt::Debug for GcHeap {
 
 impl Drop for GcHeap {
     fn drop(&mut self) {
+        self.retire_lab();
         // Runtime disposal is a terminal STW boundary. Page ownership alone
         // returns cage memory, but Rust payloads may own external resources
         // (host data, strings, buffers, reservation tokens) that must be

@@ -174,6 +174,14 @@ pub(crate) enum TemplateOp {
         rhs: u16,
         kind: CompareKind,
     },
+    /// `r<dst> = (typeof r<src> === kind)` or its negation, from an
+    /// `Op::TestTypeOf` immediate. Decided inline from the value bits and
+    /// the cell's type tag; only heap-dependent cells call the leaf probe.
+    TestTypeOf {
+        dst: u16,
+        src: u16,
+        test: i32,
+    },
     /// Abstract (in)equality over numbers and the null/undefined equivalence
     /// class; every coercive case takes an exact side exit.
     LooseCompare {
@@ -1827,6 +1835,14 @@ impl TemplatePlan {
                         dst: operands.dst,
                         lhs: operands.lhs,
                         rhs: operands.rhs,
+                    }
+                }
+                Op::TestTypeOf => {
+                    let operands = lowered.increment_operands()?;
+                    TemplateOp::TestTypeOf {
+                        dst: operands.dst,
+                        src: operands.src,
+                        test: operands.delta,
                     }
                 }
                 Op::Increment => {

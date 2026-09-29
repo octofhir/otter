@@ -30,7 +30,7 @@
 use otter_bytecode::Op;
 
 use crate::{
-    Interpreter, JsString, Value, VmError, VmPropertyKey, abstract_ops, number::NumberValue,
+    Interpreter, Value, VmError, VmPropertyKey, abstract_ops, number::NumberValue,
     rooting::RootScopeExt,
 };
 
@@ -387,8 +387,8 @@ impl Interpreter {
                 self.coerce_property_key_value(stack, context, value0)?
             }
             ScalarValueOp::TypeOf => {
-                let tag = value0.typeof_string_with_heap(&self.gc_heap);
-                Value::string(JsString::from_str(tag, &mut self.gc_heap)?)
+                let kind = value0.typeof_kind_with_heap(&self.gc_heap);
+                self.typeof_string_value(kind)?
             }
             ScalarValueOp::LoadNewTarget => new_target,
             ScalarValueOp::SameValue => {

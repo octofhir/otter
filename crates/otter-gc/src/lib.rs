@@ -81,6 +81,7 @@ pub mod header;
 pub mod heap;
 pub mod heap_image;
 pub mod host_refs;
+pub mod lab;
 #[doc(hidden)]
 pub mod marking;
 pub mod oom;
@@ -110,6 +111,7 @@ pub use heap::{
     AlwaysAllocateScope, EmptyRoots, GcHeap, HeapStats, MachineAllocationWindow, PostMarkProcessor,
 };
 pub use heap_image::{HeapImage, ImageError, Relocation};
+pub use lab::{LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, LinearAllocationArea};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use root_scope::{ErasedSlotTracer, RootScope};

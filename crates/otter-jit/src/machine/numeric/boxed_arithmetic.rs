@@ -280,6 +280,7 @@ fn visit_inputs(
         | TaggedToInt32(value)
         | ClassSuperConstructor(value)
         | TaggedToBoolean(value)
+        | TaggedTestTypeOf { value, .. }
         | TaggedNullishEqual { value, .. }
         | ArrayConstruct { length: value, .. }
         | WidenInt32(value)

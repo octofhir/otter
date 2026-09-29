@@ -10,13 +10,16 @@
 use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{GcHeap, init_cage_with_size};
 
-/// 200 KiB payload — > LARGE_OBJECT_THRESHOLD so each Big
+/// 200 KiB trailing payload — > LARGE_OBJECT_THRESHOLD so each Big
 /// occupies its own LOS page. 500 instances ≈ 100 MiB total,
 /// well above the default informational cap a 0-cap test
-/// represents.
+/// represents. The payload trails the body so the allocator never moves
+/// it by value.
 struct Big {
-    _payload: [u8; 200 * 1024],
+    _length: u64,
 }
+
+const PAYLOAD_BYTES: usize = 200 * 1024;
 
 impl Traceable for Big {
     const TYPE_TAG: u8 = 0x32;
@@ -34,10 +37,8 @@ fn cap_zero_allows_100mb_of_allocations() {
     let target_bytes: u64 = 100 * 1024 * 1024;
     let mut allocated_bytes: u64 = 0;
     while allocated_bytes < target_bytes {
-        heap.alloc(Big {
-            _payload: [0; 200 * 1024],
-        })
-        .expect("alloc must succeed when cap is disabled");
+        heap.alloc_trailing_with_roots(Big { _length: 0 }, PAYLOAD_BYTES, &mut |_| {})
+            .expect("alloc must succeed when cap is disabled");
         allocated_bytes += 200 * 1024;
     }
     assert!(allocated_bytes >= target_bytes);

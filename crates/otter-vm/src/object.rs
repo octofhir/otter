@@ -1146,6 +1146,16 @@ impl otter_gc::SafeTraceable for ExoticSlots {
         if let Some(data) = self.host_data.as_mut() {
             data.trace_gc_slots(v);
         }
+        // Wrapper internal slots hold heap handles that may be young.
+        if let Some(string) = &self.string_data {
+            string.trace_handle_slot(v);
+        }
+        if let Some(symbol) = &self.symbol_data {
+            symbol.trace_value_slots(v);
+        }
+        if let Some(bigint) = &mut self.bigint_data {
+            bigint.trace_handle_slot(v);
+        }
     }
 }
 
@@ -4503,7 +4513,9 @@ pub fn set_string_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: J
         body.exotic_mut().string_data = Some(value);
         body.set_chain_link_opaque(true);
     });
-    heap.record_write(*obj, &value);
+    // The slot lives in the old-space sidecar: remember the sidecar, not
+    // just the object, or a scavenge strands a young string.
+    record_exotic_write(heap, *obj, &value);
 }
 
 /// Read the `[[StringData]]` internal slot for a String wrapper.
@@ -4529,7 +4541,8 @@ pub fn set_symbol_data(
     heap.with_payload(*obj, |body| {
         body.exotic_mut().symbol_data = Some(value);
     });
-    heap.record_write(*obj, &value);
+    // The slot lives in the old-space sidecar.
+    record_exotic_write(heap, *obj, &value);
 }
 
 /// Read the `[[SymbolData]]` internal slot for a Symbol wrapper.
@@ -4551,6 +4564,8 @@ pub fn set_bigint_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: B
     heap.with_payload(*obj, |body| {
         body.exotic_mut().bigint_data = Some(value);
     });
+    // The slot lives in the old-space sidecar.
+    record_exotic_write(heap, *obj, &Value::big_int(value));
 }
 
 /// Read the `[[BigIntData]]` internal slot for a BigInt wrapper.

@@ -790,9 +790,14 @@ impl Interpreter {
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
             object::set_number_data(&mut obj, &mut self.gc_heap, v);
             obj
-        } else if let Some(v) = value.as_string(&self.gc_heap) {
+        } else if value.as_string(&self.gc_heap).is_some() {
             let proto = self.primitive_wrapper_prototype("String")?;
             let mut obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
+            // `value` rode the allocation as a root; read the moved string
+            // from it.
+            let v = value
+                .as_string(&self.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
             object::set_string_data(&mut obj, &mut self.gc_heap, v);
             obj
         } else if value.is_symbol() {

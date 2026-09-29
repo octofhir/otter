@@ -220,7 +220,6 @@ impl CacheStub {
                         object: 0,
                         shape: to_shape,
                         new_len: transition.slot.checked_add(1)?,
-                        initialize_inline: transition.slot == 0,
                     });
                 }
             }

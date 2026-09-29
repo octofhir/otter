@@ -327,29 +327,23 @@ impl CodeBlock {
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
             object_dictionary_layout_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET as u32,
-            object_values_ptr_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_VALUES_PTR_OFFSET as u32,
             object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32,
             object_slab_handle_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SLAB_HANDLE_OFFSET as u32,
             object_slab_len_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SLAB_LEN_OFFSET as u32,
-            object_inline_slot_cap: crate::object::INLINE_SLOT_CAP as u32,
+            object_inline_capacity_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_INLINE_CAPACITY_OFFSET as u32,
             object_slab_capacity_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::slot_slab::SLOT_SLAB_CAPACITY_OFFSET as u32,
-            object_extensible_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_EXTENSIBLE_OFFSET as u32,
-            object_chain_link_opaque_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET as u32,
-            object_shape_cache_mode_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET as u32,
-            object_shape_cache_fast: crate::object::SHAPE_CACHE_MODE_FAST,
-            object_slot_attrs_overridden_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET as u32,
+            object_slab_words_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::slot_slab::SLOT_SLAB_WORDS_OFFSET as u32,
+            object_flags_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_FLAGS_OFFSET as u32,
             object_exotic_handle_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32,
-            object_cell_bytes: crate::object::OBJECT_BODY_CELL_BYTES as u32,
+            object_fixed_cell_bytes: crate::object::object_cell_bytes(0) as u32,
             gc_barrier: crate::jit::JitGcBarrierLayout {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
@@ -1516,16 +1510,12 @@ mod tests {
         let header = otter_gc::header::HEADER_SIZE as u32;
 
         assert_eq!(
-            snapshot.object_shape_cache_mode_byte,
-            header + crate::object::OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET as u32
+            snapshot.object_flags_byte,
+            header + crate::object::OBJECT_BODY_FLAGS_OFFSET as u32
         );
         assert_eq!(
-            snapshot.object_shape_cache_fast,
-            crate::object::SHAPE_CACHE_MODE_FAST
-        );
-        assert_eq!(
-            snapshot.object_slot_attrs_overridden_byte,
-            header + crate::object::OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET as u32
+            snapshot.object_inline_capacity_byte,
+            header + crate::object::OBJECT_BODY_INLINE_CAPACITY_OFFSET as u32
         );
         assert_eq!(
             snapshot.object_exotic_handle_byte,

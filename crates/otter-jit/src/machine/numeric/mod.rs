@@ -4088,7 +4088,6 @@ fn select_cache_ir_property_programs(
                     object,
                     shape,
                     new_len,
-                    initialize_inline,
                 } => {
                     let object = cache_ir_object(&objects, object, instructions.len())?;
                     let Some((stored_object, owner, hit)) = committed_store.take() else {
@@ -4102,7 +4101,6 @@ fn select_cache_ir_property_programs(
                             byte_pc: source.byte_pc,
                             shape,
                             new_len,
-                            initialize_inline,
                         },
                         vec![
                             MachineOperand::location_input(owner),
@@ -8253,7 +8251,6 @@ mod tests {
                     object: 0,
                     shape: 11,
                     new_len: 2,
-                    initialize_inline: false,
                 },
             ]
             .into_boxed_slice(),
@@ -8689,8 +8686,7 @@ mod tests {
                     transition: Some(transition),
                 }] if transition.child_shape == 11
                     && transition.prototype_shapes.as_ref() == [13]
-                    && transition.new_len == 1
-                    && transition.initialize_inline)
+                    && transition.new_len == 1)
         )));
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::GuardCondition && instruction.frame_state.is_some()

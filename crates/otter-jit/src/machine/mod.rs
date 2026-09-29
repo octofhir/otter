@@ -796,8 +796,6 @@ pub struct PropertyStoreTransition {
     pub child_shape: u32,
     /// Logical slot length after publication.
     pub new_len: u16,
-    /// Whether slot zero initializes the inline values pointer.
-    pub initialize_inline: bool,
 }
 
 /// Target-neutral name of a selected machine operation.
@@ -1305,8 +1303,6 @@ pub enum MachineOpcode {
         shape: u32,
         /// Logical slot length after publication.
         new_len: u16,
-        /// Whether to initialize the inline values pointer for slot zero.
-        initialize_inline: bool,
     },
     /// Apply the post-store generational/incremental barrier. A false incoming
     /// condition is a no-op; no miss or exit is possible after the store.

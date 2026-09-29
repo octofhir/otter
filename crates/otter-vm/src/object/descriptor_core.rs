@@ -54,8 +54,8 @@ pub(super) fn ordinary_set_data_property(
     let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     // An overwrite of an existing slot fits the capacity it already has;
     // only a genuine append needs one more word. Reserving `count + 1`
-    // for overwrites silently spilled every `INLINE_SLOT_CAP`-sized
-    // object out of line on its first slow-path store.
+    // for overwrites silently spilled every object whose in-object slots
+    // were exactly full out of line on its first slow-path store.
     let needed = append_index + usize::from(existing_offset.is_none());
     // The writable/accessor gate reads the slot's attributes through the shape,
     // which `with_payload` cannot walk, so resolve it under a read borrow first.
@@ -100,7 +100,7 @@ pub(super) fn ordinary_set_data_property(
             return true;
         }
 
-        if !body.extensible {
+        if !body.extensible() {
             return false;
         }
         body.replace_dictionary_identity(true);
@@ -169,7 +169,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
             return true;
         }
 
-        if !body.extensible {
+        if !body.extensible() {
             return false;
         }
         body.shape = next_shape;
@@ -218,7 +218,7 @@ pub(super) fn ordinary_set_symbol_data_property(
             return true;
         }
 
-        if !body.extensible {
+        if !body.extensible() {
             return false;
         }
         body.symbol_props_mut()

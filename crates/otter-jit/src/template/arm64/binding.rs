@@ -269,7 +269,7 @@ pub(super) fn emit_binding_value(
                             semantics,
                             BindingSemantics::Read(BindingRead::Global { .. })
                         ) {
-                            emit_slab_base(ops, view, 13, 14);
+                            emit_slab_base(ops, relocations, view, 13, 14);
                             dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
                             guard_end = ops.offset().0;
                             dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, value_byte]);
@@ -349,7 +349,7 @@ pub(super) fn emit_binding_value(
                             miss,
                         );
                         dynasm!(ops ; .arch aarch64 ; mov x12, x13);
-                        emit_slab_base(ops, view, 13, 14);
+                        emit_slab_base(ops, relocations, view, 13, 14);
                         dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
                         guard_end = ops.offset().0;
                         emit_cell_store(ops, relocations, view, 12, 13, value_byte, source, done)?;

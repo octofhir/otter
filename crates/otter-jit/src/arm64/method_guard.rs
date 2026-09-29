@@ -133,7 +133,7 @@ pub(crate) fn emit_method_guard_from_tagged_register(
         dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>bail);
     }
 
-    emit_slab_base(ops, view, 13, 14);
+    emit_slab_base(ops, relocations, view, 13, 14);
     dynasm!(ops
         ; .arch aarch64
         ; cbz x13, =>bail

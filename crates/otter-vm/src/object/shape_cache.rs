@@ -27,21 +27,16 @@
 
 use super::ObjectBody;
 
-/// Internal eligibility mode for hidden-class based IC assumptions.
-#[repr(u8)]
+/// Internal eligibility mode for hidden-class based IC assumptions, stored
+/// as [`super::ObjectFlags::DICTIONARY_COMPATIBLE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeCacheMode {
     /// Object is represented by append-only shape transitions.
-    Fast = 0,
+    Fast,
     /// Object has taken a mutation such as delete that future dictionary mode
     /// may represent without ordinary append-only transitions.
-    DictionaryCompatible = 1,
+    DictionaryCompatible,
 }
-
-/// Machine value proving append-only hidden-class semantics.
-pub(crate) const SHAPE_CACHE_MODE_FAST: u8 = ShapeCacheMode::Fast as u8;
-
-const _: () = assert!(std::mem::size_of::<ShapeCacheMode>() == 1);
 
 /// Reason an object leaves fast-shape IC eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +48,7 @@ pub(crate) enum ShapeCacheInvalidation {
 /// Common IC eligibility predicate for ordinary object receivers/prototypes.
 #[must_use]
 pub(super) fn supports_fast_property_ic(body: &ObjectBody) -> bool {
-    matches!(body.shape_cache_mode, ShapeCacheMode::Fast) && body.string_data().is_none()
+    matches!(body.shape_cache_mode(), ShapeCacheMode::Fast) && body.string_data().is_none()
 }
 
 /// Mark the object as no longer valid for hidden-class IC assumptions.
@@ -63,7 +58,7 @@ pub(super) fn invalidate_fast_shape_assumptions(
 ) {
     match reason {
         ShapeCacheInvalidation::DeleteOwnProperty => {
-            body.shape_cache_mode = ShapeCacheMode::DictionaryCompatible;
+            body.set_shape_cache_mode(ShapeCacheMode::DictionaryCompatible);
         }
     }
 }

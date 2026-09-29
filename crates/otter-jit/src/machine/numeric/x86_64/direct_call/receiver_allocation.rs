@@ -8,8 +8,8 @@
 //!
 //! # Invariants
 //! - Every guard and capacity miss occurs before the nursery bump moves.
-//! - Header, shape, prototype, slots, and values pointer are initialized before
-//!   publication makes the object visible to the collector.
+//! - Header, the whole fixed body, and the initial in-object slots are
+//!   initialized before publication makes the object visible to the collector.
 //! - Closure prototype observations require the VM-owned live weak sample.
 //!
 //! # See also
@@ -149,7 +149,7 @@ fn emit_receiver_candidate(
         ; movzx r11d, WORD [rdx + view.closure_call_layout.learned_instance_fields_byte as i32]
         ; cmp r10d, r11d
         ; cmova r11d, r10d
-        ; cmp r11d, view.object_inline_slot_cap as i32
+        ; cmp r11d, i32::from(plan.inline_capacity)
         ; ja =>guard_miss
         ; mov [rdx + view.closure_call_layout.learned_instance_fields_byte as i32], r11w
         ; mov r10d, [rdx + view.closure_call_layout.own_props_byte as i32]
@@ -158,10 +158,8 @@ fn emit_receiver_candidate(
         ; lea r9, [r8 + r10]
         ; cmp BYTE [r9], OBJECT_BODY_TYPE_TAG as i8
         ; jne =>guard_miss
-        ; cmp BYTE [r9 + view.object_shape_cache_mode_byte as i32], view.object_shape_cache_fast as i8
-        ; jne =>guard_miss
-        ; cmp BYTE [r9 + view.object_slot_attrs_overridden_byte as i32], 0
-        ; jne =>guard_miss
+        ; test BYTE [r9 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK as i8
+        ; jnz =>guard_miss
     );
     dynasm!(ops
         ; .arch x64
@@ -181,11 +179,19 @@ fn emit_receiver_candidate(
         ; cmp r10d, r11d
         ; jae =>guard_miss
     );
+    // The bag's slot base: in-object until it spills, then its slab's
+    // words (`r8` holds the cage base).
     dynasm!(ops
         ; .arch x64
-        ; mov r9, [r9 + view.object_values_ptr_byte as i32]
-        ; test r9, r9
-        ; jz =>guard_miss
+        ; mov r11d, [r9 + view.object_slab_handle_byte as i32]
+        ; test r11d, r11d
+        ; jnz >bag_spilled
+        ; lea r9, [r9 + view.object_inline_values_byte as i32]
+        ; jmp >bag_base
+        ; bag_spilled:
+        ; lea r9, [r8 + r11]
+        ; add r9, view.object_slab_words_byte as i32
+        ; bag_base:
     );
     dynasm!(ops
         ; .arch x64
@@ -236,6 +242,7 @@ fn emit_receiver_candidate(
 
     // The collector withdraws this window during marking or refill. All
     // capacity and heap-limit checks precede writes and bump publication.
+    let cell_bytes = receiver_cell_bytes(view, plan);
     dynasm!(ops
         ; .arch x64
         ; mov r10, [r15 + THREAD_OFFSET as i32]
@@ -248,7 +255,7 @@ fn emit_receiver_candidate(
         ; cmp BYTE [rcx + PAGE_SPACE_OFFSET as i32], NEW_FROM_SPACE_KIND as i8
         ; jne =>space_miss
         ; mov r10, [rcx + PAGE_BUMP_CURSOR_OFFSET as i32]
-        ; lea r11, [r10 + view.object_cell_bytes as i32]
+        ; lea r11, [r10 + cell_bytes as i32]
         ; cmp r11, GC_PAGE_SIZE as i32
         ; ja =>space_miss
         ; lea rax, [rcx + r10]
@@ -256,80 +263,92 @@ fn emit_receiver_candidate(
         ; test r10, r10
         ; jz =>capacity_ready
         ; mov r9, [r10]
-        ; add r9, view.object_cell_bytes as i32
+        ; add r9, cell_bytes as i32
         ; cmp r9, [r15 + RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET as i32]
         ; ja =>space_miss
         ; =>capacity_ready
     );
 
-    for offset in (0..view.object_cell_bytes).step_by(8) {
-        dynasm!(ops ; .arch x64 ; mov QWORD [rax + offset as i32], 0);
-    }
+    // Initialize the header and the whole fixed body before publishing the
+    // bump cursor. The body is four words: shape + null slab, prototype +
+    // null sidecar, dictionary epoch + slot count + flags + in-object
+    // capacity, and the unassigned dictionary id. In-object words past the
+    // initial fields are never read before a store publishes them.
     let header_word = u64::from(OBJECT_BODY_TYPE_TAG)
         | (u64::from(otter_vm::jit::JIT_GC_YOUNG_FLAG) << 8)
-        | (u64::from(view.object_cell_bytes) << 32);
+        | (u64::from(cell_bytes) << 32);
+    let layout_word = (u64::from(plan.initial_field_count) << 32)
+        | (u64::from(otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE) << 48)
+        | (u64::from(plan.inline_capacity) << 56);
     load64(ops, 11, header_word);
+    dynasm!(ops ; .arch x64 ; mov [rax], r11);
+    load64(ops, 11, u64::from(plan.receiver_shape));
     dynasm!(ops
         ; .arch x64
-        ; mov [rax], r11
-        ; mov DWORD [rax + view.object_shape_byte as i32], plan.receiver_shape as i32
-        ; mov [rax + view.jit_proto_byte as i32], esi
-        ; mov BYTE [rax + view.object_extensible_byte as i32], 1
+        ; mov [rax + view.object_shape_byte as i32], r11
+        ; mov [rax + view.jit_proto_byte as i32], rsi
+    );
+    load64(ops, 11, layout_word);
+    dynasm!(ops
+        ; .arch x64
+        ; mov [rax + view.object_dictionary_layout_byte as i32], r11
+        ; mov QWORD [rax + (view.object_dictionary_layout_byte + 8) as i32], 0
     );
     if plan.initial_field_count != 0 {
-        dynasm!(ops
-            ; .arch x64
-            ; lea r11, [rax + view.object_inline_values_byte as i32]
-            ; mov [rax + view.object_values_ptr_byte as i32], r11
-        );
+        load64(ops, 11, VALUE_UNDEFINED);
+        for index in 0..u32::from(plan.initial_field_count) {
+            let offset = view.object_inline_values_byte + index * 8;
+            dynasm!(ops ; .arch x64 ; mov [rax + offset as i32], r11);
+        }
     }
-    load64(ops, 11, VALUE_UNDEFINED);
-    for index in 0..view.object_inline_slot_cap {
-        let offset = view.object_inline_values_byte + index * 8;
-        dynasm!(ops ; .arch x64 ; mov [rax + offset as i32], r11);
-    }
-    dynasm!(ops
-        ; .arch x64
-        ; mov WORD [rax + view.object_slab_len_byte as i32], plan.initial_field_count as i16
-        ; jmp =>ready
-    );
+    dynasm!(ops ; .arch x64 ; jmp =>ready);
+}
+
+/// Cell bytes of the receiver `plan` allocates: the fixed object cell plus
+/// its in-object slots.
+fn receiver_cell_bytes(
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+) -> u32 {
+    view.object_fixed_cell_bytes + 8 * u32::from(plan.inline_capacity)
 }
 
 /// Publish one completely initialized candidate from `rax` on page `rcx`.
 ///
 /// This operation cannot miss: the candidate probe has completed every
 /// collector, capacity, and heap-limit proof without a safepoint or reentry.
+/// The cell size is read back from the candidate's header, which the
+/// candidate wrote from its plan. Clobbers `r10` and `r11`.
 fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot) {
     let observation_done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
-        ; mov r10, rax
-        ; sub r10, rcx
-        ; add r10, view.object_cell_bytes as i32
-        ; mov [rcx + PAGE_BUMP_CURSOR_OFFSET as i32], r10
-        ; add QWORD [rcx + PAGE_ALLOCATED_BYTES_OFFSET as i32], view.object_cell_bytes as i32
+        ; mov r10d, [rax + otter_vm::jit::JIT_GC_HEADER_SIZE_BYTES_OFFSET as i32]
+        ; mov r11, rax
+        ; sub r11, rcx
+        ; add r11, r10
+        ; mov [rcx + PAGE_BUMP_CURSOR_OFFSET as i32], r11
+        ; add [rcx + PAGE_ALLOCATED_BYTES_OFFSET as i32], r10
         ; mov r11, [r15 + RECEIVER_ALLOC_TRACKED_BYTES_OFFSET as i32]
         ; test r11, r11
         ; jz >tracked_done
-        ; add QWORD [r11], view.object_cell_bytes as i32
+        ; add [r11], r10
         ; tracked_done:
     );
-    for (pointer_offset, increment) in [
-        (
-            RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
-            view.object_cell_bytes,
-        ),
-        (RECEIVER_ALLOC_TYPE_COUNT_OFFSET, 1),
-        (RECEIVER_ALLOC_TYPE_BYTES_OFFSET, view.object_cell_bytes),
+    for pointer_offset in [
+        RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
+        RECEIVER_ALLOC_TYPE_BYTES_OFFSET,
     ] {
         dynasm!(ops
             ; .arch x64
             ; mov r11, [r15 + pointer_offset as i32]
-            ; add QWORD [r11], increment as i32
+            ; add [r11], r10
         );
     }
     dynasm!(ops
         ; .arch x64
+        ; mov r11, [r15 + RECEIVER_ALLOC_TYPE_COUNT_OFFSET as i32]
+        ; add QWORD [r11], 1
         ; cmp BYTE [rdx], JS_CLOSURE_BODY_TYPE_TAG as i8
         ; jne =>observation_done
         ; mov [rdx + view.closure_call_layout.last_instance_byte as i32], eax

@@ -420,6 +420,71 @@ two inline slots) and V8 needs 20 (compressed map, properties, elements, two
 fields). The ordinary-object layout is therefore the largest remaining lever
 for allocation-heavy code, ahead of inline context allocation.
 
+## 10. Ordinary-object layout
+
+### How the reference engines lay out an ordinary object
+
+| | Cell prefix before property slots | Where the prototype, extensibility, dictionary-ness live | In-object capacity |
+|---|---|---|---|
+| V8 | `map`, `properties_or_hash`, `elements` (12 bytes compressed) | Map: `prototype`, `bit_field3` (`IsExtensibleBit`, `IsDictionaryMapBit`, `IsPrototypeMapBit`) | Map `instance_size`; constructors start generous and shrink after 7 constructions (`kSlackTrackingCounterStart = 7`), literals get their property count |
+| JSC | 8-byte cell header (StructureID + type/flags bytes) + `m_butterfly` | Structure: prototype, flags; dictionary Structures are per object | `JSFinalObject` inline storage right after the butterfly (`offsetOfInlineStorage() == sizeof(JSObjectWithButterfly)`), capacity from the allocation profile, default 6, max by cell size |
+| SpiderMonkey | `shape`, `slots_`, `elements_` | BaseShape (proto, class, flags) | fixed slots by `AllocKind` |
+| Otter today | 8-byte GC header + 80 bytes: shape, `values_ptr`, slab, 8-byte dictionary id, cache mode, `jit_proto`, three flag bytes, dictionary epoch, 8-byte exotic handle, 3 fixed inline slots, `slab_len` | object body | fixed 3; a fourth property moves every slot to the slab |
+
+Every engine keeps one pointer to out-of-line storage and puts property
+slots directly after a short prefix, sized per allocation site. None keeps a
+cached pointer to the slot base: the hidden class decides at compile time
+whether a slot is in-object (fixed offset) or out-of-line (one load, then a
+fixed offset).
+
+### Target
+
+1. **L1 — capacity-sized in-object slots.** The fixed body shrinks to 32
+   bytes (shape, slab, prototype, 4-byte exotic handle, dictionary epoch, the
+   four flag bytes, dictionary id) followed by `N` trailing slots, `N` chosen
+   per allocation site. The hidden class carries the capacity: one root shape
+   per capacity, inherited by every transition, so slot `i` of shape `S` is
+   in-object at a fixed offset when `i < S.capacity`, otherwise at
+   `slab[i - S.capacity]` (V8's in-object / property-array split instead of
+   Otter's all-or-nothing spill). `values_ptr` and `slab_len` go away; the
+   slot count is the shape's (dictionary objects: their slot table's).
+   Capacity per site: object literals their property count, `{}` 4 (V8's
+   object function initial map), constructor receivers the learned field
+   count (the existing profile, capped at JSC's 64 instead of 3). A 2-field
+   `sc_Pair` goes from 96 to 56 bytes.
+   **Landed.** Slot location stays all-in-object or all-in-slab (so the
+   hidden class does not have to carry the capacity and one constructor's
+   receivers never split across shapes by size); generated code branches on
+   the slab handle and computes the spilled base as cage + handle + word
+   offset instead of loading a cached pointer. The four flag bytes became one
+   bit set, so a shape-state guard is one load and a bit test per flag.
+   Fixed work (stdout identical):
+
+   | Workload | young closures | L1 | Δ | RSS |
+   |---|---:|---:|---:|---|
+   | ts-fixed | 181.4G | 176.4G | −2.8% | 566 → 548 MB |
+   | zlib-fixed | 234.0G | 234.0G | 0 | 725 → 759 MB |
+   | crypto-fixed | 16.70G | 16.94G | +1.4% | 52 → 52 MB |
+   | fib | 3.65G | 3.65G | 0 | 59 → 58 MB |
+   | mega_method | 10.01G | 10.01G | 0 | 59 → 59 MB |
+   | ast_ctor | 27.63G | 22.31G | −19.3% | 130 → 92 MB |
+   | earley-boyer | 153.9G | 141.8G | −7.9% | 133 → 131 MB |
+
+   crypto's objects spill; their slab base now materializes the cage base
+   (four instructions) where it loaded one cached pointer — the case for a
+   pinned cage-base register in the call/frame contract. Moving the
+   receiver's fields in-object also admitted constructors with more than
+   three `this.x` stores to the transition program, which exposed two older
+   unrooted locals across its shape allocations (the prototype in
+   `prepare_constructor_field_transitions`, the construct operands around
+   `observe_class_constructor_field_transitions`).
+2. **L2 — the hidden class owns the rest.** Prototype, extensibility,
+   attribute/opacity state and dictionary identity move into the shape
+   (per-object dictionary shapes as in JSC; `preventExtensions` is a shape
+   transition as in V8), leaving shape + one backing handle + slots: a
+   2-field object in 32 bytes, a prototype-chain guard becomes one shape
+   compare per link.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

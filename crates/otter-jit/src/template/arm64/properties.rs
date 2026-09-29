@@ -10,8 +10,8 @@
 //! - Inline sequences neither allocate nor call, so they carry no safepoint;
 //!   the receiver pointer is recomputed from the rooted frame slot on every
 //!   access and never survives one.
-//! - The slab base derives from the fresh header (inline slab) or the stable
-//!   out-of-line `values_ptr` — never a cached body pointer that the moving
+//! - The slot base derives from the fresh header (in-object slots) or the
+//!   out-of-line slab handle — never a cached body pointer that the moving
 //!   collector could dangle.
 //! - Pointer-valued stores run the generational write barrier; primitive
 //!   stores skip it. Every slot stores the complete runtime `Value` word.

@@ -1262,6 +1262,19 @@ impl GcHeap {
     /// [`Self::alloc_with_roots`] if any guard requires the normal rooted path.
     #[inline]
     pub fn try_alloc_no_collect_or_return<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, T> {
+        self.try_alloc_trailing_no_collect_or_return(value, 0, |_| {})
+    }
+
+    /// [`Self::try_alloc_no_collect_or_return`] for a body followed by
+    /// `extra_bytes` of zeroed trailing storage, which `initialize` fills in
+    /// the final cell before the handle is returned.
+    #[inline]
+    pub fn try_alloc_trailing_no_collect_or_return<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, T> {
         const {
             assert!(
                 std::mem::align_of::<T>() <= crate::OBJECT_ALIGNMENT,
@@ -1271,7 +1284,7 @@ impl GcHeap {
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
         }
-        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>();
+        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>() + extra_bytes;
         let aligned = align_up(total, CELL_SIZE);
         debug_assert!(
             aligned <= u32::MAX as usize,
@@ -1328,6 +1341,15 @@ impl GcHeap {
             };
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
+            if extra_bytes != 0 {
+                let tail = (payload_ptr as *mut u8).add(std::mem::size_of::<T>());
+                std::ptr::write_bytes(
+                    tail,
+                    0,
+                    aligned - std::mem::size_of::<GcHeader>() - std::mem::size_of::<T>(),
+                );
+            }
+            initialize(&mut *payload_ptr);
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
@@ -1676,8 +1698,23 @@ impl GcHeap {
     /// the allocation.
     #[inline]
     pub fn alloc_old_diagnostic<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_old_diagnostic_trailing(value, 0)
+    }
+
+    /// [`Self::alloc_old_diagnostic`] for a body followed by `extra_bytes`
+    /// of zeroed trailing storage.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::alloc_old_diagnostic`].
+    #[inline]
+    pub fn alloc_old_diagnostic_trailing<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+    ) -> Result<Gc<T>, OutOfMemory> {
         let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let out = self.alloc_old_with_roots_inner(value, false, 0, &mut empty, |_| {})?;
+        let out = self.alloc_old_with_roots_inner(value, false, extra_bytes, &mut empty, |_| {})?;
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
             self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);

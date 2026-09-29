@@ -129,7 +129,8 @@ pub(super) fn emit(
         ; mov r10d, [r11 + view.object_slab_handle_byte as i32]
         ; test r10d, r10d
         ; jnz =>spilled
-        ; cmp edx, view.object_inline_slot_cap as i32
+        ; movzx eax, BYTE [r11 + view.object_inline_capacity_byte as i32]
+        ; cmp edx, eax
         ; jae =>miss
         ; lea r8, [r11 + view.object_inline_values_byte as i32]
         ; jmp =>load
@@ -147,9 +148,7 @@ pub(super) fn emit(
         ; add r10, r9
         ; cmp edx, [r10 + view.object_slab_capacity_byte as i32]
         ; jae =>miss
-        ; mov r8, [r11 + view.object_values_ptr_byte as i32]
-        ; test r8, r8
-        ; jz =>miss
+        ; lea r8, [r10 + view.object_slab_words_byte as i32]
         ; =>load
         ; mov r8, [r8 + rdx * 8]
         ; mov r9d, 1
@@ -264,12 +263,11 @@ pub(super) fn emit_store(
         ; add r10, r9
         ; cmp edx, [r10 + view.object_slab_capacity_byte as i32]
         ; jae =>miss
-        ; mov r8, [r11 + view.object_values_ptr_byte as i32]
-        ; test r8, r8
-        ; jz =>miss
+        ; lea r8, [r10 + view.object_slab_words_byte as i32]
         ; jmp =>store
         ; =>inline
-        ; cmp edx, view.object_inline_slot_cap as i32
+        ; movzx eax, BYTE [r11 + view.object_inline_capacity_byte as i32]
+        ; cmp edx, eax
         ; jae =>miss
         ; lea r8, [r11 + view.object_inline_values_byte as i32]
         ; =>store
@@ -461,8 +459,8 @@ fn emit_transition_store(
         ; cmp DWORD [r11 + view.jit_proto_byte as i32], 0
         ; jne =>miss
         ; mov r11, rsi
-        ; cmp BYTE [r11 + view.object_extensible_byte as i32], 0
-        ; je =>miss
+        ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
+        ; jz =>miss
         ; movzx edx, WORD [r8 + cache.slot_byte as i32]
         ; cmp dx, [r11 + view.object_slab_len_byte as i32]
         ; jne =>miss
@@ -483,12 +481,11 @@ fn emit_transition_store(
         ; add rax, r10
         ; cmp edx, [rax + view.object_slab_capacity_byte as i32]
         ; jae =>miss
-        ; mov r8, [r11 + view.object_values_ptr_byte as i32]
-        ; test r8, r8
-        ; jz =>miss
+        ; lea r8, [rax + view.object_slab_words_byte as i32]
         ; jmp =>ready
         ; =>inline
-        ; cmp edx, view.object_inline_slot_cap as i32
+        ; movzx eax, BYTE [r11 + view.object_inline_capacity_byte as i32]
+        ; cmp edx, eax
         ; jae =>miss
         ; lea r8, [r11 + view.object_inline_values_byte as i32]
         ; =>ready
@@ -497,7 +494,6 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; mov [r8 + rdx * 8], r10
-        ; mov [r11 + view.object_values_ptr_byte as i32], r8
         ; inc edx
         ; mov [r11 + view.object_slab_len_byte as i32], dx
         ; mov [r11 + view.object_shape_byte as i32], r9d

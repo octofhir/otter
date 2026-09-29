@@ -19,7 +19,7 @@ struct HostPayload;
 impl HostObjectData for HostPayload {}
 
 fn opaque(object: JsObject, heap: &GcHeap) -> bool {
-    heap.read_payload(object, |body| body.chain_link_opaque)
+    heap.read_payload(object, |body| body.chain_link_opaque())
 }
 
 fn assert_prototype_changes_preserve_opacity(
@@ -164,7 +164,7 @@ fn shaped_own_slot_fixture() -> (crate::Interpreter, JsObject) {
     );
     interpreter.migrate_slow_to_fast(&mut object);
     assert!(interpreter.gc_heap().read_payload(object, |body| {
-        !body.shape.is_null() && !body.slot_attrs_overridden
+        !body.shape.is_null() && !body.slot_attrs_overridden()
     }));
     (interpreter, object)
 }
@@ -186,7 +186,7 @@ fn own_data_hits_allow_symbols_but_reject_descriptor_overrides() {
         PropertyDescriptor::data(Value::number_i32(1), false, false, true),
     ));
     assert!(interpreter.gc_heap().read_payload(object, |body| {
-        !body.exotic.is_null() && !body.chain_link_opaque
+        !body.exotic.is_null() && !body.chain_link_opaque()
     }));
     assert_eq!(
         load_own_data_slot_by_shape(object, interpreter.gc_heap(), hit),
@@ -201,7 +201,7 @@ fn own_data_hits_allow_symbols_but_reject_descriptor_overrides() {
     // The shape-only path must decline; the atom path checks live metadata.
     materialize_slots(object, interpreter.gc_heap_mut());
     assert!(interpreter.gc_heap().read_payload(object, |body| {
-        body.shape == hit.shape && body.slot_attrs_overridden
+        body.shape == hit.shape && body.slot_attrs_overridden()
     }));
     assert_eq!(
         load_own_data_slot_by_shape(object, interpreter.gc_heap(), hit),
@@ -235,7 +235,7 @@ fn own_data_hits_preserve_mapped_argument_values() {
         },
     );
     assert!(interpreter.gc_heap().read_payload(object, |body| {
-        body.shape == hit.shape && body.chain_link_opaque
+        body.shape == hit.shape && body.chain_link_opaque()
     }));
     assert_eq!(
         load_own_data_slot_by_shape(object, interpreter.gc_heap(), hit),

@@ -85,6 +85,8 @@ pub const JIT_NEW_FROM_SPACE_KIND: u32 = otter_gc::page::SpaceKind::NewFrom as u
 pub const JIT_GC_PAGE_SIZE: u32 = otter_gc::page::PAGE_SIZE as u32;
 /// Header flag installed on a generated young object.
 pub const JIT_GC_YOUNG_FLAG: u8 = otter_gc::header::GENERATION_YOUNG_FLAG;
+/// Byte offset of the `u32` cell size inside a GC header.
+pub const JIT_GC_HEADER_SIZE_BYTES_OFFSET: u32 = otter_gc::header::HEADER_SIZE_BYTES_OFFSET as u32;
 
 use crate::{
     CodeBlock, CodeBlockInstruction,
@@ -205,13 +207,33 @@ pub struct JitReceiverAllocationPlan {
     pub receiver_shape: u32,
     /// Number of already-visible undefined slots described by that shape.
     pub initial_field_count: u8,
-    /// Reserved in-body slot capacity for later constructor transitions.
-    pub reserved_capacity: u8,
+    /// In-object slots of the allocated receiver: room for its initial
+    /// fields and every field its constructor is known to add.
+    pub inline_capacity: u8,
     /// Number of live entries in [`Self::prototype_shapes`].
     pub prototype_shape_count: u8,
     /// Complete nearest-first ordinary prototype chain.
     pub prototype_shapes: [u32; JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
 }
+
+/// `[[Extensible]]` bit of an ordinary object's flag byte.
+pub const JIT_OBJECT_FLAG_EXTENSIBLE: u8 = crate::object::ObjectFlags::EXTENSIBLE;
+/// In-place attribute override bit: the shape no longer describes the slots'
+/// attributes.
+pub const JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN: u8 =
+    crate::object::ObjectFlags::SLOT_ATTRS_OVERRIDDEN;
+/// Prototype-chain opacity bit: the shape does not authorize named lookup.
+pub const JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE: u8 = crate::object::ObjectFlags::CHAIN_LINK_OPAQUE;
+/// Dictionary-compatible cache mode bit: a delete retired append-only shape
+/// assumptions.
+pub const JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE: u8 =
+    crate::object::ObjectFlags::DICTIONARY_COMPATIBLE;
+/// Flags a shape-state guard requires clear on a receiver or chain link.
+pub const JIT_OBJECT_SHAPE_STATE_MASK: u8 =
+    JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE | JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE;
+/// Flags an ordinary-lookup guard requires clear.
+pub const JIT_OBJECT_ORDINARY_LOOKUP_MASK: u8 =
+    JIT_OBJECT_SHAPE_STATE_MASK | JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN;
 
 /// One constructor-owned add-property transition executable in generated code.
 ///
@@ -377,69 +399,47 @@ pub struct JitCompileSnapshot {
     /// dictionary slot-layout epoch. Read only after the ordinary shape handle
     /// is null; a match keeps every existing key at its captured slot.
     pub object_dictionary_layout_byte: u32,
-    /// Byte offset from a decompressed object pointer to its cached
-    /// string-keyed value slab pointer (`HEADER_SIZE +
-    /// OBJECT_BODY_VALUES_PTR_OFFSET`). The emitter reads this pointer after a
-    /// shape guard and applies the cached slot-byte offset inside the slab.
-    pub object_values_ptr_byte: u32,
-    /// Byte offset from a decompressed object pointer to its in-body inline slab
-    /// (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`). A small object
-    /// (`slab_len <= `[`object_inline_slot_cap`](Self::object_inline_slot_cap))
-    /// keeps its slots here, in the body itself. The emitter addresses the slab
-    /// as `header + object_inline_values_byte` for such an object instead of
-    /// loading the cached `values_ptr`: the cached pointer aims into the body and
-    /// so is only valid until the moving collector relocates the object, whereas
-    /// the header is recomputed from the (rooted) receiver every access and never
-    /// dangles.
+    /// Byte offset from a decompressed object pointer to its first in-object
+    /// slot (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`). While the slab
+    /// handle is null, string-keyed slot `i` is the word at
+    /// `object_inline_values_byte + 8 * i`.
     pub object_inline_values_byte: u32,
     /// Byte offset from a decompressed object pointer to the out-of-line slab
     /// handle (`HEADER_SIZE + OBJECT_BODY_SLAB_HANDLE_OFFSET`). The emitter
-    /// reads this 4-byte handle to pick the slab base: null means the slots
-    /// live in the in-body inline array, non-null means they moved to the
-    /// out-of-line slab (which `values_ptr` addresses). `slab_len` cannot
-    /// decide this — the capacity model can spill a small object early.
+    /// reads this 4-byte handle to pick the slot base: null means the slots
+    /// live in-object, non-null means they moved to the out-of-line slab.
+    /// `slab_len` cannot decide this — the capacity model can spill a small
+    /// object early.
     pub object_slab_handle_byte: u32,
     /// Byte offset from a decompressed object pointer to the `u16`
     /// [`slab_len`](crate::object) counter (`HEADER_SIZE +
-    /// OBJECT_BODY_SLAB_LEN_OFFSET`). The emitter reads it to pick the inline vs
-    /// out-of-line slab base.
+    /// OBJECT_BODY_SLAB_LEN_OFFSET`).
     pub object_slab_len_byte: u32,
-    /// Inline slab capacity (`INLINE_SLOT_CAP`): a body with this many
-    /// string-keyed slots or fewer holds them inline; a larger one spills to the
-    /// out-of-line `values` vector whose base is a stable heap allocation.
-    pub object_inline_slot_cap: u32,
+    /// Byte offset from a decompressed object pointer to its `u8` in-object
+    /// capacity. An add-transition into an object whose slots are still
+    /// in-object proves the appended slot index is below it.
+    pub object_inline_capacity_byte: u32,
     /// Byte offset from a decompressed out-of-line slab cell pointer to its
     /// `u32` word capacity (`HEADER_SIZE + SLOT_SLAB_CAPACITY_OFFSET`). An
     /// add-transition into a spilled object proves in generated code that the
     /// appended slot index is below this capacity before it publishes; a slot
     /// at or beyond it needs the runtime's slab growth.
     pub object_slab_capacity_byte: u32,
-    /// Byte offset of the ordinary object's one-byte flag that its shape cannot
-    /// authorize named lookup: its `[[Prototype]]` is a Proxy or
-    /// non-object value (the flat mirror at [`Self::jit_proto_byte`] is then
-    /// null without ending the chain) or it is a String wrapper whose keys
-    /// the shape does not describe, or host data may override ordinary lookup
-    /// (including module namespaces and mapped arguments). Shape guards require
-    /// it clear on every receiver and prototype link.
-    pub object_chain_link_opaque_byte: u32,
-    /// Byte offset of the ordinary object's one-byte `[[Extensible]]` Boolean.
-    pub object_extensible_byte: u32,
-    /// Byte offset of the `u8` fast-shape eligibility discriminant. Generated
-    /// property programs compare it with [`Self::object_shape_cache_fast`]
-    /// before trusting an otherwise-equal hidden class.
-    pub object_shape_cache_mode_byte: u32,
-    /// Exact `u8` discriminant for append-only fast-shape semantics.
-    pub object_shape_cache_fast: u8,
-    /// Byte offset of the one-byte Boolean set by in-place descriptor mutations
-    /// such as `freeze` and `defineProperty`. Generated property programs
-    /// require zero.
-    pub object_slot_attrs_overridden_byte: u32,
+    /// Byte offset from a decompressed out-of-line slab cell pointer to its
+    /// first word (`HEADER_SIZE + size_of::<SlotSlabBody>()`).
+    pub object_slab_words_byte: u32,
+    /// Byte offset of the ordinary object's one-byte flag set (see
+    /// [`JIT_OBJECT_FLAG_EXTENSIBLE`] and its siblings). Shape-state guards
+    /// test the bits they require with one load.
+    pub object_flags_byte: u32,
     /// Byte offset of the 4-byte rare-state GC handle. Conservative generated
     /// property programs require a zero handle; programs that prove ordinary
     /// named lookup separately can admit benign sidecars such as symbol keys.
     pub object_exotic_handle_byte: u32,
-    /// Fixed aligned bytes in one ordinary object cell, header included.
-    pub object_cell_bytes: u32,
+    /// Bytes of an ordinary object cell before its in-object slots, header
+    /// included. A receiver with `n` in-object slots occupies
+    /// `object_fixed_cell_bytes + 8 * n` bytes.
+    pub object_fixed_cell_bytes: u32,
     /// Static GC layout for the inline generational write barrier emitted on a
     /// pointer-valued `StoreProperty`. Isolate-independent `#[repr(C)]` / `const`
     /// values; the card-mark is gated on [`cage_base`](Self::cage_base) being
@@ -1011,8 +1011,6 @@ pub enum JitCacheIrOp {
         shape: u32,
         /// Logical value-slab length after the append.
         new_len: u16,
-        /// Whether slot zero requires initializing the inline values pointer.
-        initialize_inline: bool,
     },
 }
 
@@ -1620,19 +1618,15 @@ impl JitCompileSnapshot {
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             object_dictionary_layout_byte: 0,
-            object_values_ptr_byte: 0,
             object_inline_values_byte: 0,
             object_slab_handle_byte: 0,
             object_slab_len_byte: 0,
-            object_inline_slot_cap: 0,
+            object_inline_capacity_byte: 0,
             object_slab_capacity_byte: 0,
-            object_chain_link_opaque_byte: 0,
-            object_extensible_byte: 0,
-            object_shape_cache_mode_byte: 0,
-            object_shape_cache_fast: 0,
-            object_slot_attrs_overridden_byte: 0,
+            object_slab_words_byte: 0,
+            object_flags_byte: 0,
             object_exotic_handle_byte: 0,
-            object_cell_bytes: 0,
+            object_fixed_cell_bytes: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),

@@ -529,7 +529,6 @@ mod tests {
                     object: 0,
                     shape: 21,
                     new_len: 3,
-                    initialize_inline: false,
                 },
             ]
             .into_boxed_slice(),

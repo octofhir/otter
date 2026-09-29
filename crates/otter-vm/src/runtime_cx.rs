@@ -656,6 +656,7 @@ impl<'rt> NativeCtx<'rt> {
         let object = object::alloc_object_with_shape_roots(
             self.heap_mut(),
             shape_root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )?;
         // OrdinaryObjectCreate(%Object.prototype%) — natives building

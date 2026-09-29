@@ -157,7 +157,7 @@ pub(crate) fn capture_store_property_transition(
     .ok()?;
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
-            || !body.extensible
+            || !body.extensible()
             || !transition_kind_matches_receiver_body(body, &kind)
         {
             return None;
@@ -215,7 +215,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
         heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
-            || !body.extensible
+            || !body.extensible()
             || !transition_kind_matches_receiver_body(body, &kind)
         {
             return None;
@@ -278,7 +278,7 @@ pub(crate) fn replay_store_property_transition(
             || current_shape_id != transition.from_shape_id
             || key.atom().id() != transition.atom_id
             || !transition_kind_matches_receiver_body(body, &transition.kind)
-            || !body.extensible
+            || !body.extensible()
         {
             return false;
         }

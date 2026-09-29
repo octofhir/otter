@@ -798,7 +798,6 @@ mod tests {
                     byte_pc: 9,
                     shape: 2,
                     new_len: 1,
-                    initialize_inline: true,
                 },
                 vec![
                     MachineOperand::location_input(owner),

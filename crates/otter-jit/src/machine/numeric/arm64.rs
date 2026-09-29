@@ -156,8 +156,8 @@ use crate::{
         emit_ordinary_lookup_state_guard, emit_shape_state_guard,
     },
     template::arm64::values::{
-        CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_initialize_inline_values_ptr,
-        emit_slab_base, emit_write_barrier_with_context,
+        CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_slab_base,
+        emit_write_barrier_with_context,
     },
 };
 use std::collections::BTreeSet;
@@ -871,7 +871,7 @@ fn emit_binding_guard(
                 emit_load_u64(ops, 11, shape);
                 dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);
             }
-            emit_slab_base(ops, view, 13, 14);
+            emit_slab_base(ops, relocations, view, 13, 14);
             emit_load_u64(ops, 16, u64::from(value_byte));
             dynasm!(ops
                 ; .arch aarch64
@@ -2488,14 +2488,17 @@ fn emit_with_reach(
                 for (case, &label) in cases.iter().zip(&labels) {
                     dynasm!(ops ; .arch aarch64 ; =>label);
                     if case.ordinary {
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; ldrb w14, [x13, view.object_slot_attrs_overridden_byte]
-                            ; cbnz w14, =>miss
+                        crate::template::arm64::ic_probe::emit_object_flags_guard(
+                            &mut ops,
+                            view,
+                            13,
+                            otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN,
+                            miss,
                         );
                     }
                     crate::template::arm64::ic_probe::emit_load_field(
                         &mut ops,
+                        &mut relocations,
                         view,
                         13,
                         case.value_byte,
@@ -2570,7 +2573,12 @@ fn emit_with_reach(
                     miss,
                 )?;
                 crate::template::arm64::ic_probe::emit_load_field(
-                    &mut ops, view, 13, value_byte, miss,
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    13,
+                    value_byte,
+                    miss,
                 );
                 emit_load_u64(&mut ops, 10, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
@@ -2637,7 +2645,7 @@ fn emit_with_reach(
                     RelocationTarget::GcCageBase,
                 );
                 dynasm!(ops ; .arch aarch64 ; add x13, x13, x12);
-                emit_slab_base(&mut ops, view, 13, 14);
+                emit_slab_base(&mut ops, &mut relocations, view, 13, 14);
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, value_byte]);
                 emit_store_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                 structural_regions.push((
@@ -2722,6 +2730,7 @@ fn emit_with_reach(
                         let slot = case.value_byte / 8;
                         let inline_storage = ops.new_dynamic_label();
                         let fits = ops.new_dynamic_label();
+                        emit_load_u64(&mut ops, 16, u64::from(slot));
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr w14, [x12, view.object_slab_handle_byte]
@@ -2734,7 +2743,6 @@ fn emit_with_reach(
                             view.cage_base as u64,
                             RelocationTarget::GcCageBase,
                         );
-                        emit_load_u64(&mut ops, 16, u64::from(slot));
                         dynasm!(ops
                             ; .arch aarch64
                             ; add x13, x13, x14
@@ -2743,15 +2751,12 @@ fn emit_with_reach(
                             ; b.hs =>miss
                             ; b =>fits
                             ; =>inline_storage
-                        );
-                        if slot >= view.object_inline_slot_cap {
-                            dynasm!(ops ; .arch aarch64 ; b =>miss);
-                        }
-                        dynasm!(ops
-                            ; .arch aarch64
+                            ; ldrb w14, [x12, view.object_inline_capacity_byte]
+                            ; cmp w16, w14
+                            ; b.hs =>miss
                             ; =>fits
-                            ; ldrb w14, [x12, view.object_extensible_byte]
-                            ; cbz w14, =>miss
+                            ; ldrb w14, [x12, view.object_flags_byte]
+                            ; tbz w14, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
                             ; ldrh w14, [x12, view.object_slab_len_byte]
                         );
                         emit_load_u64(&mut ops, 16, u64::from(slot));
@@ -2759,16 +2764,11 @@ fn emit_with_reach(
                     }
                     // Every guard passed: store, then publish the transition.
                     dynasm!(ops ; .arch aarch64 ; mov x13, x12);
-                    emit_slab_base(&mut ops, view, 13, 14);
-                    dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                    emit_slab_base(&mut ops, &mut relocations, view, 13, 14);
                     emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                     emit_load_u64(&mut ops, 17, u64::from(case.value_byte));
                     dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
                     if let Some(transition) = &case.transition {
-                        if transition.initialize_inline {
-                            dynasm!(ops ; .arch aarch64 ; mov x13, x12);
-                            emit_initialize_inline_values_ptr(&mut ops, view, 13, 16);
-                        }
                         emit_load_u64(&mut ops, 14, u64::from(transition.new_len));
                         emit_load_u64(&mut ops, 17, u64::from(transition.child_shape));
                         dynasm!(ops
@@ -2819,7 +2819,7 @@ fn emit_with_reach(
                     miss,
                 )?;
                 dynasm!(ops ; .arch aarch64 ; mov x13, x12);
-                emit_slab_base(&mut ops, view, 13, 14);
+                emit_slab_base(&mut ops, &mut relocations, view, 13, 14);
                 dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
                 emit_load_allocated_tagged(&mut ops, frame, locations[1], 9, 0)?;
                 emit_load_u64(&mut ops, 17, u64::from(value_byte));
@@ -2879,11 +2879,12 @@ fn emit_with_reach(
                     ; b =>storage_fits
                     ; =>inline_storage
                     ; lsr w16, w17, #3
-                    ; cmp w16, view.object_inline_slot_cap
+                    ; ldrb w14, [x13, view.object_inline_capacity_byte]
+                    ; cmp w16, w14
                     ; b.hs =>miss
                     ; =>storage_fits
-                    ; ldrb w16, [x13, view.object_extensible_byte]
-                    ; cbz w16, =>miss
+                    ; ldrb w16, [x13, view.object_flags_byte]
+                    ; tbz w16, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
                     ; ldrh w16, [x13, view.object_slab_len_byte]
                     ; lsr w15, w17, #3
                     ; cmp w16, w15
@@ -2905,16 +2906,12 @@ fn emit_with_reach(
                 byte_pc,
                 shape,
                 new_len,
-                initialize_inline,
             } => {
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
                 emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz w9, =>done);
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 13, 0)?;
-                if initialize_inline {
-                    emit_initialize_inline_values_ptr(&mut ops, view, 13, 16);
-                }
                 emit_load_u64(&mut ops, 14, u64::from(new_len));
                 emit_load_u64(&mut ops, 15, u64::from(shape));
                 dynasm!(ops

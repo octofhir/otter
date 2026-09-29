@@ -640,7 +640,6 @@ mod tests {
                 byte_pc: 0,
                 shape: 1,
                 new_len: 1,
-                initialize_inline: false,
             },
         ] {
             let effects = unrelated.effects();

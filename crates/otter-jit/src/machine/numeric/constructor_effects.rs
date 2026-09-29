@@ -51,7 +51,6 @@ pub(super) fn select(
                     prototype_shapes: transition.prototype_shapes.clone().into_boxed_slice(),
                     child_shape: transition.to_shape,
                     new_len: transition.slot + 1,
-                    initialize_inline: transition.slot == 0,
                 }),
             }]),
         },

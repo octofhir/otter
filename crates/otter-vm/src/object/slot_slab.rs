@@ -1,7 +1,7 @@
 //! Out-of-line property storage, allocated inside the GC heap.
 //!
-//! An object keeps its first [`super::INLINE_SLOT_CAP`] string-keyed
-//! slots in the body itself. Past that it needs a growable array, and
+//! An object keeps its string-keyed slots in its in-object slots while they
+//! fit. Past that it needs a growable array, and
 //! where that array lives decides whether the object is self-contained.
 //! A `Vec` would put it in malloc memory the collector does not own: the
 //! object could not be captured into a page image, a restored copy would
@@ -26,10 +26,10 @@
 //! - The trailing array holds exactly `capacity` words and is initialized to
 //!   `Value::undefined()` before the slab becomes observable.
 //! - A slab never shrinks in place and never reallocates itself: growth
-//!   allocates a larger slab and copies, so a live `values_ptr` into the
-//!   old slab is invalidated by exactly one event the object controls.
+//!   allocates a larger slab and copies, and the object switches to it by
+//!   exactly one handle write.
 //! - Words are traced in place, so the collector rewrites the live slot
-//!   rather than a copy — the same contract the inline array has.
+//!   rather than a copy — the same contract the in-object slots have.
 //! - Old space: a backing store lives as long as the object that owns it,
 //!   so a semispace copy of one is pure overhead.
 
@@ -47,6 +47,11 @@ pub type SlotSlabHandle = otter_gc::Gc<SlotSlabBody>;
 /// JIT compile snapshot so generated add-transitions can bound-check a slot
 /// against the live slab without a runtime call.
 pub const SLOT_SLAB_CAPACITY_OFFSET: usize = std::mem::offset_of!(SlotSlabBody, capacity);
+
+/// Payload-relative byte offset of a slab's first word, baked into the JIT
+/// compile snapshot so generated code addresses spilled slots from the
+/// object's compressed slab handle.
+pub const SLOT_SLAB_WORDS_OFFSET: usize = std::mem::size_of::<SlotSlabBody>();
 
 /// Capacity header for an out-of-line property slab. The words follow it
 /// in the same cell.
@@ -78,9 +83,6 @@ impl SlotSlabBody {
     }
 
     /// Base of the trailing word array.
-    ///
-    /// The object body caches this as its `values_ptr` so a slot read is
-    /// one indexed load whether the slab is inline or out of line.
     #[must_use]
     pub fn words_ptr(&self) -> *mut Value {
         // SAFETY: the allocation reserved `trailing_bytes(capacity)`

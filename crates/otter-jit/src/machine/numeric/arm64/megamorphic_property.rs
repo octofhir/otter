@@ -127,11 +127,11 @@ pub(super) fn emit(
         ; ldr w12, [x15, view.object_slab_capacity_byte]
         ; cmp w11, w12
         ; b.hs =>miss
-        ; ldr x15, [x13, view.object_values_ptr_byte]
-        ; cbz x15, =>miss
+        ; add x15, x15, view.object_slab_words_byte
         ; b =>load
         ; =>inline
-        ; cmp w11, view.object_inline_slot_cap
+        ; ldrb w12, [x13, view.object_inline_capacity_byte]
+        ; cmp w11, w12
         ; b.hs =>miss
         ; add x15, x13, view.object_inline_values_byte
         ; =>load
@@ -252,11 +252,11 @@ pub(super) fn emit_store(
         ; ldr w12, [x15, view.object_slab_capacity_byte]
         ; cmp w11, w12
         ; b.hs =>miss
-        ; ldr x15, [x13, view.object_values_ptr_byte]
-        ; cbz x15, =>miss
+        ; add x15, x15, view.object_slab_words_byte
         ; b =>store
         ; =>inline
-        ; cmp w11, view.object_inline_slot_cap
+        ; ldrb w12, [x13, view.object_inline_capacity_byte]
+        ; cmp w11, w12
         ; b.hs =>miss
         ; add x15, x13, view.object_inline_values_byte
         ; =>store
@@ -425,23 +425,23 @@ fn emit_transition_store(
         ; =>chain_done
         ; ldr w10, [x13, view.jit_proto_byte]
         ; cbnz w10, =>miss
-        ; ldrb w10, [x12, view.object_extensible_byte]
-        ; cbz w10, =>miss
+        ; ldrb w10, [x12, view.object_flags_byte]
+        ; tbz w10, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
         ; ldrh w9, [x17, cache.slot_byte]
         ; ldrh w10, [x12, view.object_slab_len_byte]
         ; cmp w9, w10
         ; b.ne =>miss
         ; ldr w10, [x12, view.object_slab_handle_byte]
         ; cbz w10, =>inline
-        ; add x10, x16, x10
-        ; ldr w10, [x10, view.object_slab_capacity_byte]
+        ; add x15, x16, x10
+        ; ldr w10, [x15, view.object_slab_capacity_byte]
         ; cmp w9, w10
         ; b.hs =>miss
-        ; ldr x15, [x12, view.object_values_ptr_byte]
-        ; cbz x15, =>miss
+        ; add x15, x15, view.object_slab_words_byte
         ; b =>ready
         ; =>inline
-        ; cmp w9, view.object_inline_slot_cap
+        ; ldrb w10, [x12, view.object_inline_capacity_byte]
+        ; cmp w9, w10
         ; b.hs =>miss
         ; add x15, x12, view.object_inline_values_byte
         ; =>ready
@@ -450,7 +450,6 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch aarch64
         ; str x10, [x15, x9, lsl #3]
-        ; str x15, [x12, view.object_values_ptr_byte]
         ; add w9, w9, #1
         ; strh w9, [x12, view.object_slab_len_byte]
         ; ldr w10, [x17, cache.target_shape_byte]

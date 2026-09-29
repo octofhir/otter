@@ -97,6 +97,21 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
+        self.alloc_runtime_rooted_object_with_capacity(
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            value_roots,
+            slice_roots,
+        )
+    }
+
+    /// [`Self::alloc_runtime_rooted_object_with_roots`] with room for
+    /// `capacity` in-object slots.
+    pub(crate) fn alloc_runtime_rooted_object_with_capacity(
+        &mut self,
+        capacity: usize,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::object::JsObject, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -112,6 +127,7 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
+            capacity,
             &mut external_visit,
         )
         .map_err(VmError::from)
@@ -142,6 +158,7 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )
     }
@@ -270,6 +287,7 @@ impl Interpreter {
             let object = crate::object::alloc_object_with_shape_roots(
                 &mut interp.gc_heap,
                 shape_root,
+                crate::object::DEFAULT_INLINE_CAPACITY,
                 &mut external_visit,
             )
             .map_err(VmError::from)?;
@@ -522,6 +540,33 @@ impl Interpreter {
         self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &[])
     }
 
+    /// [`Self::alloc_stack_rooted_object_with_extra_roots`] with room for
+    /// `capacity` in-object slots.
+    pub(crate) fn alloc_stack_rooted_object_with_capacity(
+        &mut self,
+        stack: &ActivationStack,
+        extra_roots: &[&Value],
+        capacity: usize,
+    ) -> Result<crate::object::JsObject, VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let shape_root = self.shape_root();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in extra_roots {
+                value.trace_value_slots(visitor);
+            }
+        };
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            capacity,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)
+    }
+
     /// Allocate an ordinary object while forwarding caller-owned mutable
     /// `Value` slots in place.
     ///
@@ -546,6 +591,7 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )
         .map_err(VmError::from)
@@ -588,6 +634,7 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )
         .map_err(VmError::from)
@@ -620,6 +667,7 @@ impl Interpreter {
             let object = crate::object::alloc_object_with_shape_roots(
                 &mut interp.gc_heap,
                 shape_root,
+                crate::object::DEFAULT_INLINE_CAPACITY,
                 &mut external_visit,
             )
             .map_err(VmError::from)?;
@@ -775,6 +823,7 @@ impl Interpreter {
         let obj = match crate::object::try_alloc_object_with_shape_no_collect(
             &mut self.gc_heap,
             shape_root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
         ) {
             Some(obj) => obj,
             None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,

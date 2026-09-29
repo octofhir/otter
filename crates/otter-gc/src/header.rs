@@ -42,6 +42,10 @@ const FLAG_YOUNG: u8 = 0b0000_0100;
 /// the young flag without a Rust call.
 pub const HEADER_FLAGS_BYTE_OFFSET: usize = 1;
 
+/// Byte offset of the `u32` cell size (header included) inside a header,
+/// read by generated code that publishes a cell it sized itself.
+pub const HEADER_SIZE_BYTES_OFFSET: usize = 4;
+
 /// The young-generation flag bit within the [`GcHeader`] flag byte
 /// ([`HEADER_FLAGS_BYTE_OFFSET`]). Exposed so the JIT can emit an inline
 /// generational write barrier (`flags & GENERATION_YOUNG_FLAG`).
@@ -127,6 +131,8 @@ pub struct GcHeader {
     _reserved: u16,
     size_bytes: u32,
 }
+
+const _: () = assert!(std::mem::offset_of!(GcHeader, size_bytes) == HEADER_SIZE_BYTES_OFFSET);
 
 /// Type tag reserved for free-space fillers in old-space pages. A filler
 /// header keeps the page's linear object walk intact over reclaimed

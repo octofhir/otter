@@ -317,76 +317,47 @@ fn emit_to_int32_common(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: Dynamic
     );
 }
 
-/// Compute the value-slab base for a shape-matched receiver into `x13`, which
-/// holds the decompressed `GcHeader` pointer on entry (`x14` is clobbered). A
-/// small object (null out-of-line slab handle) carries its slab inline in the
-/// body, so the base is `header + object_inline_values_byte`, derived fresh
-/// from the receiver's header every access. This deliberately never reads the
-/// cached `values_ptr` for inline slabs: that pointer aims into the body and
-/// dangles the instant the moving collector relocates the object. A spilled
-/// object's slab is a stable out-of-line allocation, so its base loads from
-/// `values_ptr`.
-pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg: u8, scratch: u8) {
-    // Frozen ABI (a `dynasm` immediate must be a compile-time constant): the
-    // inline slab capacity and the header-relative offset of the in-body
-    // inline slab, checked against the values otter-vm baked from the live
-    // `#[repr(C)]` layout so a field reorder trips in tests.
-    const INLINE_VALUES_BYTE: u32 = 64;
-    const SLAB_HANDLE_BYTE: u32 = 24;
-    debug_assert_eq!(INLINE_VALUES_BYTE, view.object_inline_values_byte);
-    debug_assert_eq!(SLAB_HANDLE_BYTE, view.object_slab_handle_byte);
-    assert_eq!((reg, scratch), (13, 14), "fixed-register slab-base form");
-    let values_ptr_off = view.object_values_ptr_byte;
+/// Compute the slot base for a shape-matched object into `X(reg)`, which holds
+/// the decompressed `GcHeader` pointer on entry (`X(scratch)` is clobbered).
+/// While the out-of-line slab handle is null the slots are in-object, so the
+/// base is `header + object_inline_values_byte`, derived from the object's
+/// header every access. A spilled object's base is its slab's word array: the
+/// cage base plus the compressed handle plus the slab's fixed word offset.
+pub(crate) fn emit_slab_base(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    reg: u8,
+    scratch: u8,
+) {
+    assert_ne!(reg, scratch, "slab base needs a distinct scratch register");
     let spilled = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     // Branch on the out-of-line slab HANDLE, not on `slab_len`: the
-    // capacity model can move a `len <= INLINE_SLOT_CAP` object's slots
-    // out of line (an existing-slot slow store reserves ahead), and a
-    // spilled slab that shrinks back stays out of line — a length
-    // compare reads the stale in-body copy in both cases.
+    // capacity model can move a small object's slots out of line early (an
+    // existing-slot slow store reserves ahead), and a spilled slab that
+    // shrinks back stays out of line — a length compare reads the stale
+    // in-object words in both cases.
     dynasm!(ops
         ; .arch aarch64
-        ; ldr w14, [x13, SLAB_HANDLE_BYTE]
-        ; cbnz w14, =>spilled
-        ; add x13, x13, INLINE_VALUES_BYTE
+        ; ldr W(scratch), [X(reg), view.object_slab_handle_byte]
+        ; cbnz W(scratch), =>spilled
+        ; add XSP(reg), XSP(reg), view.object_inline_values_byte
         ; b =>done
         ; =>spilled
-        ; ldr x13, [x13, values_ptr_off]
-        ; =>done
     );
-}
-
-/// Initialize a receiver's cached value-slab base once generated code has
-/// appended its first own slot.
-///
-/// The VM keeps `values_ptr` current for every mutation. An inline object
-/// (null out-of-line slab handle) points it at the in-body array as soon as
-/// slot zero exists, while a spilled object already points at its stable
-/// out-of-line slab — receiver preparation reserves such a slab ahead of a
-/// multi-field transition program, before any `StoreProperty` runs. Only the
-/// inline case may be written here: rewriting a spilled object's base would
-/// aim every later slab-relative store into the body past its three inline
-/// words. `header` holds the receiver's `GcHeader` pointer in `x13`; `x16` is
-/// clobbered.
-pub(crate) fn emit_initialize_inline_values_ptr(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    header: u8,
-    scratch: u8,
-) {
-    assert_eq!(
-        (header, scratch),
-        (13, 16),
-        "fixed-register values-pointer initialization form"
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        reg,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
     );
-    let ready = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; ldr w16, [x13, view.object_slab_handle_byte]
-        ; cbnz w16, =>ready
-        ; add x16, x13, view.object_inline_values_byte
-        ; str x16, [x13, view.object_values_ptr_byte]
-        ; =>ready
+        ; add X(reg), X(reg), X(scratch)
+        ; add XSP(reg), XSP(reg), view.object_slab_words_byte
+        ; =>done
     );
 }
 

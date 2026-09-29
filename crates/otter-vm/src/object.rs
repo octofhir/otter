@@ -75,7 +75,6 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 use std::any::Any;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Value;
@@ -111,7 +110,7 @@ pub(crate) use shape_body::SHAPE_BODY_ID_OFFSET;
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
-pub(crate) use shape_cache::{SHAPE_CACHE_MODE_FAST, ShapeCacheInvalidation, ShapeCacheMode};
+pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
 pub(crate) use shape_transition::capture_store_property_transition;
@@ -737,11 +736,18 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// Per ECMA-262 §10.1, ordinary objects carry a hidden-class
 /// [`Shape`], an aligned slot table, an optional `[[Prototype]]`,
 /// a list of symbol-keyed own properties, and an `[[Extensible]]`
-/// flag. All of those fields live here directly. Mutation flows through
-/// [`otter_gc::GcHeap::with_payload`] (writers) and reads through
-/// [`otter_gc::GcHeap::read_payload`] (readers). Every store of a
-/// `Gc<…>`-bearing field is recorded through
+/// flag. Mutation flows through [`otter_gc::GcHeap::with_payload`]
+/// (writers) and reads through [`otter_gc::GcHeap::read_payload`]
+/// (readers). Every store of a `Gc<…>`-bearing field is recorded through
 /// [`otter_gc::GcHeap::record_write`].
+///
+/// The fixed body is 32 bytes and is followed in the same cell by
+/// [`Self::inline_capacity`] in-object value slots, sized per allocation
+/// site (object literals by their property count, constructor receivers by
+/// the learned field count): the JSC `JSFinalObject` / V8 in-object layout.
+/// String-keyed slot `i` lives in those in-object slots while the object has
+/// no out-of-line slab, and at word `i` of the slab once it has one; the
+/// first store past the in-object capacity moves every slot to the slab.
 ///
 /// # Spec
 ///
@@ -753,43 +759,18 @@ pub struct ObjectBody {
     /// the JIT can read the shape token at a fixed byte offset
     /// ([`OBJECT_BODY_SHAPE_OFFSET`]) for monomorphic guard checks.
     shape: ShapeHandle,
-    /// Cached base pointer for the contiguous string-keyed value slab. The JIT
-    /// reads this field after the shape guard and indexes it by slot byte
-    /// offset, so every own data slot has the same inline path regardless of
-    /// slot number. `null` means the object currently has no string-keyed
-    /// slots.
-    ///
-    /// Frozen ABI: string-keyed slot `i` lives at **forward** index `i`
-    /// (header-relative, single growth direction — no split low/high regions),
-    /// reached uniformly through this base whether inline or spilled. The
-    /// base is an **always-current** invariant — refreshed after every move,
-    /// grow, shrink, or spill ([`Self::refresh_values_ptr`]) and verified at
-    /// every slab access in debug ([`Self::values_ptr_is_current`]).
-    values_ptr: Cell<*mut Value>,
     /// Out-of-line string-keyed own-property values once the object grows
-    /// past [`INLINE_SLOT_CAP`], indexed by shape slot offset. A data slot
+    /// past its in-object capacity, indexed by shape slot offset. A data slot
     /// stores its `[[Value]]` directly; an accessor slot stores a handle to
     /// its [`AccessorCellBody`]. Slot flags and data/accessor kind live in
     /// the shape for ordinary shaped objects, or in materialized metadata
     /// for dictionary/attribute-overridden objects.
     ///
-    /// Null while the slab is inline. The slab is a GC body carrying its
+    /// Null while the slots are in-object. The slab is a GC body carrying its
     /// words in the same cell ([`slot_slab`]), not a `Vec`: an object that
     /// owned malloc storage could not be captured into a page image, and a
     /// restored copy would alias the original buffer.
     slab: slot_slab::SlotSlabHandle,
-    /// Fallback/dictionary identity used only when [`Self::shape`] is null.
-    /// Fast shaped objects keep this as [`ShapeId::UNASSIGNED`] so allocation
-    /// does not need per-object unique metadata; conversion to dictionary mode
-    /// assigns a fresh id before clearing the shape.
-    dictionary_shape_id: ShapeId,
-    /// Whether string-keyed shape assumptions are IC-compatible.
-    ///
-    /// Ordinary shape transitions stay in [`ShapeCacheMode::Fast`].
-    /// Deleting string-keyed own properties marks the object
-    /// [`ShapeCacheMode::DictionaryCompatible`] so future dictionary storage
-    /// can keep the same invalidation contract without installing stale ICs.
-    shape_cache_mode: ShapeCacheMode,
     /// `[[Prototype]]` — the single source of truth for the common Null /
     /// ordinary-object case: a bare [`JsObject`] handle, or
     /// [`otter_gc::Gc::null()`] for a `null` prototype. A non-ordinary
@@ -801,37 +782,13 @@ pub struct ObjectBody {
     /// per-call resolve bridge. Sole writer is [`set_prototype_value`]; traced
     /// as a distinct GC slot.
     jit_proto: JsObject,
-    /// `[[Extensible]]` internal slot. New keys are rejected when
-    /// this is `false`.
-    extensible: bool,
-    /// `true` once an in-place attribute mutation (defineProperty on an
-    /// existing slot, `seal`, `freeze`) has changed a shaped slot's
-    /// flags/kind without transitioning the hidden class. While `false`, a
-    /// shaped object's per-slot attributes are guaranteed to match the shape
-    /// (every shaped slot reached the object via an attribute-recording
-    /// transition), so attribute reads short-circuit to the shape. Once
-    /// `true`, `slots` is the only authoritative attribute source and reads
-    /// fall back to it. Always `false` for dictionary-mode objects (their
-    /// shape is null and reads use `slots` regardless). Lives in the byte of
-    /// padding beside [`Self::extensible`], so it adds no object size.
-    ///
-    /// When `true` (or in dictionary mode) the per-slot metadata is
-    /// *materialized* in [`ExoticSlots::slots`]; the common shaped object
-    /// carries no per-slot metadata at all and derives everything from the
-    /// hidden class.
-    slot_attrs_overridden: bool,
-    /// `true` while this object cannot serve as a guarded link of a
-    /// prototype chain: its `[[Prototype]]` is a Proxy or a non-object value
-    /// held in [`ExoticSlots::proto_override`] (the flat `jit_proto` mirror
-    /// is then null without meaning `null`), or it is a String wrapper whose
-    /// index and `length` keys live outside its shape, or it owns host data
-    /// that can supply namespace properties or mapped argument values outside
-    /// its ordinary slots. Generated shape guards read this byte for every
-    /// chain link, so a shape match proves ordinary key/slot lookup only on
-    /// objects whose shape fully describes it. Symbol properties and native
-    /// call metadata alone do not make a link opaque. Lives in the padding after
-    /// [`Self::slot_attrs_overridden`], so it adds no object size.
-    chain_link_opaque: bool,
+    /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
+    /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
+    /// slots, and the Date/Error/raw-JSON/arguments markers. Null for plain
+    /// objects and class instances (the overwhelming common case), so an
+    /// ordinary object never pays for these ~140 bytes. Allocated on first
+    /// write through [`ObjectBody::exotic_mut`].
+    exotic: ExoticSlot,
     /// Slot-layout epoch of a dictionary-mode object: which key occupies
     /// which slot with which kind and attributes. Unlike
     /// [`Self::dictionary_shape_id`] it survives appending a new key to an
@@ -843,47 +800,188 @@ pub struct ObjectBody {
     /// prototype's method) guard this word, so unrelated globals added after
     /// compilation do not retire them. `0` means "never in dictionary mode";
     /// the counter saturates at `u32::MAX`, a value no proof may capture.
-    /// Lives in the padding before [`Self::exotic`], so it adds no size.
     dictionary_layout: u32,
-    /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
-    /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
-    /// slots, and the Date/Error/raw-JSON/arguments markers. `None` for plain
-    /// objects and class instances (the overwhelming common case), so an
-    /// ordinary object never pays for these ~140 bytes. Allocated on first
-    /// write through [`ObjectBody::exotic_mut`].
-    exotic: ExoticSlot,
-    /// In-body storage for the first [`INLINE_SLOT_CAP`] string-keyed slots, so
-    /// a small object needs no separate slab allocation and keeps its hot slots
-    /// in the same cache line as the shape and `values_ptr` — the
-    /// allocation-locality reason to keep a small inline region at all.
-    /// Active while `slab_len <= INLINE_SLOT_CAP`; growth past the cap migrates
-    /// every slot wholesale into `values` and leaves this array unused.
-    /// `values_ptr` always points at whichever buffer is active, so the slot
-    /// access path and the JIT both index it uniformly.
-    inline_values: [Value; INLINE_SLOT_CAP],
-    /// Count of live string-keyed slots, across `inline_values` or `values`.
+    /// Count of live string-keyed slots, in-object or in the slab.
     slab_len: u16,
+    /// [`ObjectFlags`] bits: `[[Extensible]]`, in-place attribute override,
+    /// prototype-chain opacity and dictionary-compatible cache mode. One byte
+    /// so a generated guard tests every state bit it needs with one load.
+    flags: u8,
+    /// Number of in-object value slots trailing this body. Fixed for the
+    /// object's lifetime; the cell holds exactly this many words after the
+    /// fixed body.
+    inline_capacity: u8,
+    /// Fallback/dictionary identity used only when [`Self::shape`] is null.
+    /// Fast shaped objects keep this as [`ShapeId::UNASSIGNED`] so allocation
+    /// does not need per-object unique metadata; conversion to dictionary mode
+    /// assigns a fresh id before clearing the shape.
+    dictionary_shape_id: ShapeId,
+}
+
+/// Bits of [`ObjectBody::flags`].
+///
+/// A fresh ordinary object carries exactly [`ObjectFlags::EXTENSIBLE`], so
+/// generated receiver allocation writes one constant byte.
+pub(crate) struct ObjectFlags;
+
+impl ObjectFlags {
+    /// `[[Extensible]]` internal slot. New keys are rejected when clear.
+    pub(crate) const EXTENSIBLE: u8 = 1 << 0;
+    /// An in-place attribute mutation (defineProperty on an existing slot,
+    /// `seal`, `freeze`) changed a shaped slot's flags/kind without
+    /// transitioning the hidden class. While clear, a shaped object's
+    /// per-slot attributes are guaranteed to match the shape, so attribute
+    /// reads short-circuit to the shape. Once set, the materialized
+    /// [`ExoticSlots::slots`] are the only authoritative attribute source.
+    /// Always clear for dictionary-mode objects (their shape is null and
+    /// reads use the materialized slots regardless).
+    pub(crate) const SLOT_ATTRS_OVERRIDDEN: u8 = 1 << 1;
+    /// The object cannot serve as a guarded link of a prototype chain: its
+    /// `[[Prototype]]` is a Proxy or a non-object value held in
+    /// [`ExoticSlots::proto_override`] (the flat `jit_proto` mirror is then
+    /// null without meaning `null`), or it is a String wrapper whose index
+    /// and `length` keys live outside its shape, or it owns host data that
+    /// can supply namespace properties or mapped argument values outside its
+    /// ordinary slots. Generated shape guards test this bit for every chain
+    /// link, so a shape match proves ordinary key/slot lookup only on objects
+    /// whose shape fully describes it. Symbol properties and native call
+    /// metadata alone do not make a link opaque.
+    pub(crate) const CHAIN_LINK_OPAQUE: u8 = 1 << 2;
+    /// [`ShapeCacheMode::DictionaryCompatible`]: deleting string-keyed own
+    /// properties marks the object so future dictionary storage keeps the
+    /// same invalidation contract without installing stale ICs.
+    pub(crate) const DICTIONARY_COMPATIBLE: u8 = 1 << 3;
 }
 
 impl ObjectBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         if self.slab.is_null() {
-            for value in &self.inline_values[..self.slab_len as usize] {
+            for value in &self.inline_values()[..self.slab_len as usize] {
                 crate::code_liveness::visit_value(value, visitor);
             }
         }
     }
+
+    /// `[[Extensible]]`.
+    #[inline]
+    pub(crate) fn extensible(&self) -> bool {
+        self.flags & ObjectFlags::EXTENSIBLE != 0
+    }
+
+    #[inline]
+    pub(crate) fn set_extensible(&mut self, extensible: bool) {
+        self.set_flag(ObjectFlags::EXTENSIBLE, extensible);
+    }
+
+    /// See [`ObjectFlags::SLOT_ATTRS_OVERRIDDEN`].
+    #[inline]
+    pub(crate) fn slot_attrs_overridden(&self) -> bool {
+        self.flags & ObjectFlags::SLOT_ATTRS_OVERRIDDEN != 0
+    }
+
+    #[inline]
+    pub(crate) fn set_slot_attrs_overridden(&mut self, overridden: bool) {
+        self.set_flag(ObjectFlags::SLOT_ATTRS_OVERRIDDEN, overridden);
+    }
+
+    /// See [`ObjectFlags::CHAIN_LINK_OPAQUE`].
+    #[inline]
+    pub(crate) fn chain_link_opaque(&self) -> bool {
+        self.flags & ObjectFlags::CHAIN_LINK_OPAQUE != 0
+    }
+
+    #[inline]
+    pub(crate) fn set_chain_link_opaque(&mut self, opaque: bool) {
+        self.set_flag(ObjectFlags::CHAIN_LINK_OPAQUE, opaque);
+    }
+
+    /// Whether string-keyed shape assumptions are IC-compatible.
+    #[inline]
+    pub(crate) fn shape_cache_mode(&self) -> ShapeCacheMode {
+        if self.flags & ObjectFlags::DICTIONARY_COMPATIBLE != 0 {
+            ShapeCacheMode::DictionaryCompatible
+        } else {
+            ShapeCacheMode::Fast
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_shape_cache_mode(&mut self, mode: ShapeCacheMode) {
+        self.set_flag(
+            ObjectFlags::DICTIONARY_COMPATIBLE,
+            mode == ShapeCacheMode::DictionaryCompatible,
+        );
+    }
+
+    #[inline]
+    fn set_flag(&mut self, bit: u8, on: bool) {
+        if on {
+            self.flags |= bit;
+        } else {
+            self.flags &= !bit;
+        }
+    }
+
+    /// Number of in-object value slots in this cell.
+    #[inline]
+    pub(crate) fn inline_capacity(&self) -> usize {
+        usize::from(self.inline_capacity)
+    }
+
+    /// Base of the in-object slots trailing the fixed body.
+    #[inline]
+    fn inline_values_ptr(&self) -> *mut Value {
+        // SAFETY: computes the tail address only; every allocation path
+        // reserves `inline_capacity` words after the fixed body.
+        unsafe { (self as *const Self).add(1).cast_mut().cast::<Value>() }
+    }
+
+    /// The in-object slots, whether or not they hold the live slots.
+    #[inline]
+    fn inline_values(&self) -> &[Value] {
+        // SAFETY: an allocated body owns `inline_capacity` words after the
+        // fixed part; words past `slab_len` hold stale or zero bits that are
+        // never traced or read as slots.
+        unsafe { std::slice::from_raw_parts(self.inline_values_ptr(), self.inline_capacity()) }
+    }
 }
 
-/// In-body inline string-keyed slot capacity. Objects with this many own data
-/// properties or fewer carry their slab in [`ObjectBody::inline_values`]; larger
-/// objects spill the whole slab to the out-of-line `values` vector.
-///
-/// Three direct `Value` words preserve the previous 88-byte hot-object
-/// footprint while covering the common small record. A fourth own property
-/// spills to the GC-managed slab; increasing this cap would charge every empty
-/// object another eight bytes per slot.
-pub(crate) const INLINE_SLOT_CAP: usize = 3;
+/// Largest in-object capacity an allocation site may request (JSC's
+/// `JSFinalObject::maxInlineCapacity` is of the same order). A site that
+/// needs more starts with an out-of-line slab.
+pub(crate) const MAX_INLINE_CAPACITY: usize = 64;
+
+/// In-object capacity of an empty object created without a size hint —
+/// `{}`, `Object.create`, runtime-built records. V8's object function
+/// initial map reserves four in-object properties for the same case.
+pub(crate) const DEFAULT_INLINE_CAPACITY: usize = 4;
+
+/// In-object capacity for an allocation site that knows its property count.
+#[inline]
+pub(crate) fn inline_capacity_for(count: usize) -> usize {
+    count.min(MAX_INLINE_CAPACITY)
+}
+
+/// In-object capacity for a constructor receiver expected to hold `fields`
+/// own properties: exactly that many, or the empty-object default while the
+/// constructor's instance size is still unknown.
+#[inline]
+pub(crate) fn receiver_inline_capacity(fields: usize) -> usize {
+    if fields == 0 {
+        DEFAULT_INLINE_CAPACITY
+    } else {
+        inline_capacity_for(fields)
+    }
+}
+
+/// Cell bytes of an ordinary object with `capacity` in-object slots,
+/// header included.
+#[inline]
+pub(crate) const fn object_cell_bytes(capacity: usize) -> usize {
+    otter_gc::header::HEADER_SIZE
+        + std::mem::size_of::<ObjectBody>()
+        + capacity * std::mem::size_of::<Value>()
+}
 
 /// Rarely-used `ObjectBody` slots, boxed out of the hot object so plain
 /// objects stay small. Every field here is absent on a plain `{}` / class
@@ -895,17 +993,12 @@ pub const EXOTIC_SLOTS_TYPE_TAG: u8 = 0x37;
 /// Handle to an object's rare/exotic sidecar.
 pub type ExoticHandle = otter_gc::Gc<ExoticSlots>;
 
-/// The sidecar handle as [`ObjectBody`] stores it.
-///
-/// Eight bytes aligned to eight, exactly what the `Box` it replaced
-/// occupied, so every offset the frozen JIT ABI pins below stays put and
-/// no backend has to re-bake `INLINE_VALUES_BYTE`. The handle itself is
-/// four bytes; the rest is deliberate slack.
-#[repr(C, align(8))]
+/// The sidecar handle as [`ObjectBody`] stores it: one compressed handle,
+/// zero when the object has no sidecar.
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ExoticSlot {
     handle: ExoticHandle,
-    _pad: u32,
 }
 
 impl ExoticSlot {
@@ -2046,87 +2139,59 @@ pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBo
 pub(crate) const OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, dictionary_layout);
 
-/// Byte offset of the string-keyed value slab pointer within an [`ObjectBody`]
-/// payload. The JIT reads this pointer after its shape guard and then indexes
-/// the contiguous slab by `slot * size_of::<Value>()` (8 bytes). The loaded
-/// word is already the runtime `Value`; no property-slot codec is involved.
-pub(crate) const OBJECT_BODY_VALUES_PTR_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, values_ptr);
-
 /// Byte offset of the flat [`ObjectBody::jit_proto`] mirror within an
 /// [`ObjectBody`] payload. The method-inline guard reads the receiver's
 /// prototype handle here to chase the prototype chain in machine code.
 pub(crate) const OBJECT_BODY_JIT_PROTO_OFFSET: usize = std::mem::offset_of!(ObjectBody, jit_proto);
 
-/// Byte offset of the in-body inline slab [`ObjectBody::inline_values`]. The
-/// JIT bakes the inline `New` store sequence (and an inline read for a small
-/// object whose `slab_len <= INLINE_SLOT_CAP`) against this offset.
-pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, inline_values);
+/// Byte offset of the first in-object slot, right after the fixed body.
+/// While the slab handle is null, string-keyed slot `i` is the word at
+/// `OBJECT_BODY_INLINE_VALUES_OFFSET + 8 * i`.
+pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize = std::mem::size_of::<ObjectBody>();
 
-/// Byte offset of the [`ObjectBody::slab_len`] counter. The JIT reads it to
-/// branch inline-vs-overflow and to bounds-check an inline slot store.
+/// Byte offset of the [`ObjectBody::slab_len`] counter.
 pub(crate) const OBJECT_BODY_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab_len);
 
 /// Byte offset of the out-of-line slab handle. The JIT reads it to branch
-/// inline-vs-overflow: a null handle means the slots live in
-/// [`ObjectBody::inline_values`]. `slab_len` cannot decide this — the
-/// capacity model can move a `len <= INLINE_SLOT_CAP` object's slots out of
-/// line (an existing-slot slow store reserves ahead), and a spilled slab
-/// that shrinks back stays out of line.
+/// in-object vs out-of-line: a null handle means the slots live in-object.
+/// `slab_len` cannot decide this — the capacity model can move an object's
+/// slots out of line before they outgrow the in-object capacity (an
+/// existing-slot slow store reserves ahead), and a spilled slab that shrinks
+/// back stays out of line.
 pub(crate) const OBJECT_BODY_SLAB_HANDLE_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab);
-/// Byte offset of the ordinary `[[Extensible]]` flag.
-pub(crate) const OBJECT_BODY_EXTENSIBLE_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, extensible);
-/// Byte offset of the `u8` fast-shape eligibility discriminant.
-pub(crate) const OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, shape_cache_mode);
-/// Byte offset of the in-place descriptor-override Boolean.
-pub(crate) const OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, slot_attrs_overridden);
+/// Byte offset of the [`ObjectFlags`] byte.
+pub(crate) const OBJECT_BODY_FLAGS_OFFSET: usize = std::mem::offset_of!(ObjectBody, flags);
+/// Byte offset of the in-object capacity byte.
+pub(crate) const OBJECT_BODY_INLINE_CAPACITY_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, inline_capacity);
 /// Byte offset of the 4-byte rare-state GC handle inside [`ExoticSlot`].
 /// A zero word proves the complete sidecar is absent.
-/// Byte offset of the `chain_link_opaque` flag within an ordinary object
-/// body, read by generated prototype-chain guards.
-pub(crate) const OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, chain_link_opaque);
 pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, exotic) + std::mem::offset_of!(ExoticSlot, handle);
-/// Total fixed cell bytes for an ordinary object, including its GC header.
-pub(crate) const OBJECT_BODY_CELL_BYTES: usize = align_object_cell_bytes();
 
-const fn align_object_cell_bytes() -> usize {
-    let bytes = otter_gc::header::HEADER_SIZE + std::mem::size_of::<ObjectBody>();
-    (bytes + otter_gc::OBJECT_ALIGNMENT - 1) & !(otter_gc::OBJECT_ALIGNMENT - 1)
-}
-
-// The JIT bakes these offsets into emitted property loads, the inline `New`
-// store sequence, and the deopt frame-state record, so they are a frozen ABI:
-// pin every one to its EXACT value (not `>=` / `%`) so an accidental field
-// reorder is a compile error rather than a frozen JIT baking garbage. Update
-// these literals deliberately, in lockstep with the JIT, when the body changes.
+// The JIT bakes these offsets into emitted property loads, receiver
+// allocation and prototype-chain guards, so they are a frozen ABI: pin every
+// one to its EXACT value (not `>=` / `%`) so an accidental field reorder is a
+// compile error rather than a frozen JIT baking garbage. Update these literals
+// deliberately, in lockstep with the JIT, when the body changes.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
-const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET == 8);
-const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 36);
-const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 56);
-const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
-const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 16);
-const _: () = assert!(OBJECT_BODY_EXTENSIBLE_OFFSET == 40);
-const _: () = assert!(OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET == 32);
-const _: () = assert!(OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET == 41);
-const _: () = assert!(OBJECT_BODY_CHAIN_LINK_OPAQUE_OFFSET == 42);
-const _: () = assert!(OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET == 44);
-const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 48);
-const _: () = assert!(OBJECT_BODY_CELL_BYTES == 96);
-// The shape guard word must sit at offset 0 (single-compare guard) and the
-// slab base must stay 8-aligned for the JIT's pointer load.
-const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));
+const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 4);
+const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 8);
+const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 12);
+const _: () = assert!(OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET == 16);
+const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 20);
+const _: () = assert!(OBJECT_BODY_FLAGS_OFFSET == 22);
+const _: () = assert!(OBJECT_BODY_INLINE_CAPACITY_OFFSET == 23);
+const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 32);
+// The in-object slots must stay 8-aligned for the JIT's word loads.
+const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
+const _: () = assert!(std::mem::align_of::<ObjectBody>() == 8);
+const _: () = assert!(MAX_INLINE_CAPACITY <= u8::MAX as usize);
 
-// Pin the hot object footprint. Per-slot metadata lives out of line only for
-// dictionary-mode / attribute-overridden objects, while string-keyed values use
-// one contiguous slab addressed from a cached pointer. Three 8-byte inline
-// values keep the complete body at the old 88-byte footprint.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 88);
+// Pin the fixed footprint: shape, slab, prototype, sidecar, dictionary epoch,
+// slot count, flag and capacity bytes, dictionary id. Every in-object slot
+// follows in the same cell.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 32);
 
 impl ObjectBody {
     /// Assign a fresh dictionary structural id for a key-set change.
@@ -2163,11 +2228,11 @@ impl ObjectBody {
         self.slab.is_null()
     }
 
-    /// Words the current slab can hold without growing.
+    /// Words the current slot buffer can hold without growing.
     #[inline]
     fn slab_capacity(&self) -> usize {
         if self.slab.is_null() {
-            INLINE_SLOT_CAP
+            self.inline_capacity()
         } else {
             // SAFETY: a non-null slab handle addresses a live
             // `SlotSlabBody`; reading its capacity field touches only the
@@ -2190,22 +2255,26 @@ impl ObjectBody {
         }
     }
 
+    /// Base of the live slot buffer: the in-object slots while the slab is
+    /// null, the slab's words once the object has spilled.
+    #[inline]
+    fn values_base(&self) -> *mut Value {
+        if self.slab_is_inline() {
+            self.inline_values_ptr()
+        } else {
+            // SAFETY: the handle is non-null, so it addresses a live slab
+            // whose words follow its header.
+            unsafe { (*self.slab_body_ptr()).words_ptr() }
+        }
+    }
+
     /// Read the value word for string-keyed slot `i`.
     #[inline]
     fn slot_word(&self, i: usize) -> Value {
-        debug_assert!(
-            self.values_ptr_is_current(),
-            "stale values_ptr on slab read: body={:p} values_ptr={:p} expected={:p} slab_len={}",
-            self,
-            self.values_ptr.get(),
-            self.expected_values_ptr(),
-            self.slab_len,
-        );
         debug_assert!(i < self.slab_len(), "slab read out of range");
-        // SAFETY: the base is the always-current slab base and `i` is in
-        // range, so this addresses a live word in whichever buffer is
-        // active.
-        unsafe { *self.values_ptr.get().add(i) }
+        // SAFETY: `i` is below the live slot count, which never exceeds the
+        // active buffer's capacity.
+        unsafe { *self.values_base().add(i) }
     }
 
     /// Read the data value for string-keyed slot `i`.
@@ -2217,54 +2286,43 @@ impl ObjectBody {
     /// Write a value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: Value) {
-        debug_assert!(
-            self.values_ptr_is_current(),
-            "stale values_ptr on slab write"
-        );
         debug_assert!(i < self.slab_len(), "slab write out of range");
         // SAFETY: same in-range word as `slot_word`.
-        unsafe { *self.values_ptr.get().add(i) = value };
+        unsafe { *self.values_base().add(i) = value };
     }
 
-    /// Append one slab word, migrating the inline slab to `values` on the
-    /// transition past [`INLINE_SLOT_CAP`].
+    /// Append one slot word into the active buffer. The caller reserved the
+    /// room through [`reserve_slot_capacity`], which moves every slot to a
+    /// slab when the in-object capacity is exhausted.
     #[inline]
     fn push_slab_word(&mut self, value: Value) {
         let len = self.slab_len();
-        // Branch on the actual storage location, not on `len`: a slab that
-        // spilled and then shrank back to `INLINE_SLOT_CAP` via
-        // `remove_slab_word` stays out of line, so a length-based spill
-        // test here would re-copy the inline array over the live overflow
-        // vector and duplicate slots (delete-then-add on a 3+-property
-        // object silently corrupted the slab in release; debug builds
-        // panicked with 'overflow slab already populated').
         debug_assert!(
             len < self.slab_capacity(),
             "slab append past reserved capacity: len={len} capacity={}; \
              the caller must reserve through `reserve_slot_capacity` first",
             self.slab_capacity(),
         );
+        // SAFETY: the append index is inside the reserved capacity of the
+        // active buffer.
+        unsafe { *self.values_base().add(len) = value };
         self.slab_len += 1;
-        self.refresh_values_ptr();
-        // SAFETY: the append index is inside the reserved capacity, and
-        // the base was just refreshed for the new length.
-        unsafe { *self.values_ptr.get().add(len) = value };
     }
 
-    /// Remove the slab word at `i`, shifting later words down. Stays out of line
-    /// once spilled (delete normalizes to dictionary mode, an uncommon path).
+    /// Remove the slot word at `i`, shifting later words down. Stays out of
+    /// line once spilled (delete normalizes to dictionary mode, an uncommon
+    /// path).
     #[inline]
     fn remove_slab_word(&mut self, i: usize) {
         let len = self.slab_len();
         // SAFETY: `i < len <= capacity`; the shift stays inside the live
         // words of whichever buffer is active.
         unsafe {
-            let base = self.values_ptr.get();
+            let base = self.values_base();
             std::ptr::copy(base.add(i + 1), base.add(i), len - i - 1);
             *base.add(len - 1) = Value::default();
         }
         self.slab_len -= 1;
-        self.refresh_values_ptr();
     }
 
     /// Install a larger out-of-line slab, copying the live words across.
@@ -2277,7 +2335,7 @@ impl ObjectBody {
     fn adopt_slab(&mut self, slab: slot_slab::SlotSlabHandle) {
         debug_assert!(!slab.is_null(), "adopting a null slab");
         let live = self.slab_len();
-        let source = self.values_ptr.get();
+        let source = self.values_base();
         // SAFETY: the new slab was allocated with capacity for at least
         // `live` words and does not overlap the current buffer.
         unsafe {
@@ -2290,7 +2348,6 @@ impl ObjectBody {
             }
         }
         self.slab = slab;
-        self.refresh_values_ptr();
     }
 
     /// Append a new string-keyed own slot at flat index `index` (the pre-append
@@ -2337,13 +2394,13 @@ impl ObjectBody {
                 // A previously overridden object keeps reading from its
                 // materialized metadata, so keep that entry current; a
                 // non-overridden object reads the rebuilt shape and stores none.
-                if self.slot_attrs_overridden {
+                if self.slot_attrs_overridden() {
                     self.slots_mut().entries_mut()[i] = meta;
                 }
             }
             None => {
                 if !self.shape.is_null() {
-                    self.slot_attrs_overridden = true;
+                    self.set_slot_attrs_overridden(true);
                 }
                 debug_assert!(
                     self.slots_materialized(),
@@ -2382,7 +2439,7 @@ impl ObjectBody {
     #[inline]
     fn slot_attrs(&self, heap: &otter_gc::GcHeap, i: usize) -> (PropertyFlags, bool) {
         if !self.shape.is_null()
-            && !self.slot_attrs_overridden
+            && !self.slot_attrs_overridden()
             && let Some(attrs) = shape_body::shape_slot_attrs(heap, self.shape, i as u32)
         {
             return attrs;
@@ -2455,53 +2512,6 @@ impl ObjectBody {
         debug_assert_eq!(self.slab_len(), len, "value slab metadata desynced");
         self.remove_slab_word(i);
         self.slots_mut().remove(i);
-    }
-
-    /// Refresh the cached slab base after any operation that may move the slab
-    /// (inline ↔ out-of-line migration, vector realloc, body relocation). Points
-    /// at the active buffer — the in-body inline array for a small object, the
-    /// out-of-line vector once spilled — so slot access and the JIT both index
-    /// `values_ptr` uniformly. An inline slotless object has no stable base and
-    /// keeps this null; a fresh object with reserved out-of-line capacity
-    /// already points at that slab before its first slot is published.
-    ///
-    /// This is the **sole** writer of the always-current `values_ptr` base
-    /// invariant: no code path may leave `values_ptr` aimed at a stale
-    /// buffer once the mutator can observe the body. Every mutation that grows,
-    /// shrinks, spills, or relocates the slab calls this; the relocating
-    /// scavenger calls it from `trace_slots_safe` after the body memcpy. A
-    /// future JIT bakes a single `values_ptr` load as the slab base for every
-    /// own-data slot, so a stale base is a silently-baked wild load — hence
-    /// [`Self::values_ptr_is_current`] verifies it at every slab access in debug.
-    #[inline]
-    fn refresh_values_ptr(&self) {
-        self.values_ptr.set(self.expected_values_ptr().cast_mut());
-    }
-
-    /// Debug verifier for the always-current `values_ptr` base invariant:
-    /// the cached base must equal what [`Self::refresh_values_ptr`] would
-    /// recompute right now. Asserted at every slab access in debug
-    /// (compiled out in release) so any new relocation/grow/shrink path that
-    /// forgets to refresh fails deterministically under `OTTER_GC_STRESS`
-    /// instead of baking a wild JIT load. Reads never run mid-relocation (STW
-    /// pauses the mutator, and `trace_slots_safe` refreshes before yielding),
-    /// so a current pointer here is the steady-state contract, not a race.
-    #[inline]
-    fn values_ptr_is_current(&self) -> bool {
-        self.values_ptr.get().cast_const() == self.expected_values_ptr()
-    }
-
-    #[inline]
-    fn expected_values_ptr(&self) -> *const Value {
-        if !self.slab_is_inline() {
-            // SAFETY: the handle is non-null, so it addresses a live slab
-            // whose words follow its header.
-            unsafe { (*self.slab_body_ptr()).words_ptr().cast_const() }
-        } else if self.slab_len == 0 {
-            std::ptr::null()
-        } else {
-            self.inline_values.as_ptr()
-        }
     }
 
     // --- Lazily-boxed exotic slots -----------------------------------------
@@ -2652,7 +2662,7 @@ impl ObjectBody {
     /// derives attributes from the hidden class and carries none.
     #[inline]
     fn slots_materialized(&self) -> bool {
-        self.shape.is_null() || self.slot_attrs_overridden
+        self.shape.is_null() || self.slot_attrs_overridden()
     }
 
     /// Materialized per-slot metadata as a slice (`&[]` when the shape is the
@@ -2688,7 +2698,7 @@ impl std::fmt::Debug for ObjectBody {
         f.debug_struct("ObjectBody")
             .field("has_shape", &!self.shape.is_null())
             .field("dictionary_len", &self.dict_key_count())
-            .field("shape_cache_mode", &self.shape_cache_mode)
+            .field("shape_cache_mode", &self.shape_cache_mode())
             .field("slot_count", &self.slots().len())
             .field(
                 "has_prototype",
@@ -2713,22 +2723,14 @@ impl std::fmt::Debug for ObjectBody {
             .field("has_string_data", &self.string_data().is_some())
             .field("has_symbol_data", &self.symbol_data().is_some())
             .field("has_date_data", &self.date_data().is_some())
-            .field("extensible", &self.extensible)
+            .field("extensible", &self.extensible())
             .finish()
     }
 }
 
-impl otter_gc::SafeTraceable for ObjectBody {
-    const TYPE_TAG: u8 = OBJECT_BODY_TYPE_TAG;
-
-    /// Walk every outgoing GC reference held by `self`:
-    /// - the `[[Prototype]]` handle (if any);
-    /// - every `Value` inside a data slot or accessor pair;
-    /// - every `Value` inside symbol-keyed own properties.
-    ///
-    /// The GC-managed shape handle is traced directly; dictionary keys are
-    /// owned Rust strings and need no GC tracing.
-    fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
+impl ObjectBody {
+    /// Trace the fixed body's handles: shape, prototype, slab, sidecar.
+    fn trace_fixed_slots(&mut self, v: &mut SlotVisitor<'_>) {
         // No shape-validity assert here: an image restore traces bodies
         // while their handles still carry the capture isolate's offsets,
         // so a trace-entry read of the shape cell would dereference
@@ -2741,15 +2743,14 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // `jit_proto` handle (null == `[[Prototype]]` null); the moving collector
         // forwards it here so a baked inline guard never decompresses a stale
         // offset. Non-ordinary (Value / Proxy) prototypes live in the boxed
-        // `proto_override` and are traced in the exotic block below.
+        // `proto_override` and are traced by the sidecar.
         if !self.jit_proto.is_null() {
             let p = &mut self.jit_proto as *mut JsObject as *mut RawGc;
             v(p);
         }
         // The out-of-line slab is an ordinary GC body: trace the handle so a
         // moving collection rewrites it, and let the slab trace its own
-        // words. Tracing the handle before `refresh_values_ptr` below is
-        // what keeps the cached base pointing at the post-move slab.
+        // words.
         if !self.slab.is_null() {
             debug_assert!(
                 self.slab.offset() >= 0x1000 && self.slab.offset().is_multiple_of(8),
@@ -2759,30 +2760,43 @@ impl otter_gc::SafeTraceable for ObjectBody {
             let p = &mut self.slab as *mut slot_slab::SlotSlabHandle as *mut RawGc;
             v(p);
         }
-        // String-keyed property slots: the value slab holds each slot's data
-        // value, or — for an accessor slot — a handle to its `AccessorCellBody`.
-        // Trace cells in place so the moving scavenger rewrites the live slot,
-        // not a copy; an accessor cell traces its own getter/setter through its
-        // `Traceable` impl.
-        // The relocating scavenger memcpy's this body, which leaves the cached
-        // `values_ptr` aimed at the pre-move inline array. Recompute it from the
-        // post-move body so both the slot path and a baked JIT load read the live
-        // base; the inline slab lives in the body and therefore moves with it.
-        self.refresh_values_ptr();
-        let base = self.values_ptr.get();
-        for i in 0..self.slab_len() {
-            // SAFETY: `base` is the live slab base and `i < slab_len`.
-            let word = unsafe { base.add(i) };
-            // SAFETY: same live in-range value word. `Value` skips immediates
-            // and rewrites the low-word GC offset of cells in place.
-            unsafe { (*word).trace_value_slot_mut(v) };
-        }
         // The exotic sidecar is its own GC body: trace the handle so a
         // moving collection rewrites it, and let the sidecar trace its own
         // slots through its `Traceable` impl.
         if !self.exotic.is_null() {
             v(self.exotic.slot_ptr());
         }
+    }
+}
+
+impl otter_gc::SafeTraceable for ObjectBody {
+    const TYPE_TAG: u8 = OBJECT_BODY_TYPE_TAG;
+
+    /// Walk every outgoing GC reference held by `self`:
+    /// - the shape, `[[Prototype]]`, slab and sidecar handles;
+    /// - every live slot `Value` (a data value, or an accessor slot's
+    ///   [`AccessorCellBody`] handle), in-object or in the slab.
+    ///
+    /// The slab's words are walked through the object as well as by the slab
+    /// body: a remembered old object is re-traced on a scavenge, and the young
+    /// values its slot stores recorded may sit in an old slab the scavenge
+    /// never visits on its own. Once an object has spilled, its in-object
+    /// words are stale and never traced.
+    fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
+        self.trace_fixed_slots(v);
+        let base = self.values_base();
+        for i in 0..self.slab_len() {
+            // SAFETY: `i < slab_len`, a live word of the active buffer.
+            // `Value` skips immediates and rewrites the low-word GC offset of
+            // cells in place.
+            unsafe { (*base.add(i)).trace_value_slot_mut(v) };
+        }
+    }
+
+    /// The pending payload has no in-object tail yet: its slot values are
+    /// the allocation caller's rooted buffer, copied in by the initializer.
+    fn trace_pending_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
+        self.trace_fixed_slots(v);
     }
 }
 
@@ -2833,7 +2847,7 @@ pub(crate) fn reserve_slot_capacity(
     // a logarithmic number of times, never per append.
     let grown = needed
         .max(capacity.saturating_mul(2))
-        .max(INLINE_SLOT_CAP * 2);
+        .max(DEFAULT_INLINE_CAPACITY * 2);
     let object_slot = (object as *mut JsObject).cast::<otter_gc::raw::RawGc>();
     let pending_base = pending.as_mut_ptr();
     let pending_len = pending.len();
@@ -3030,28 +3044,24 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     }
 }
 
-fn empty_object_body() -> ObjectBody {
+fn empty_object_body(capacity: usize) -> ObjectBody {
+    debug_assert!(capacity <= MAX_INLINE_CAPACITY);
     ObjectBody {
         shape: ShapeHandle::null(),
-        values_ptr: Cell::new(std::ptr::null_mut()),
         slab: otter_gc::Gc::null(),
-        inline_values: [Value::default(); INLINE_SLOT_CAP],
-        slab_len: 0,
-        dictionary_shape_id: ShapeId::UNASSIGNED,
-        shape_cache_mode: ShapeCacheMode::Fast,
         jit_proto: otter_gc::Gc::null(),
-        extensible: true,
-        slot_attrs_overridden: false,
-        chain_link_opaque: false,
-        dictionary_layout: 0,
         exotic: ExoticSlot::null(),
+        dictionary_layout: 0,
+        slab_len: 0,
+        flags: ObjectFlags::EXTENSIBLE,
+        inline_capacity: capacity as u8,
+        dictionary_shape_id: ShapeId::UNASSIGNED,
     }
 }
 
-fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
+fn empty_object_body_with_shape(shape: ShapeHandle, capacity: usize) -> ObjectBody {
     debug_assert_object_shape_handle(shape, "object allocation shape");
-    let mut body = empty_object_body();
-    debug_assert_object_shape_handle(shape, "shape-slot store");
+    let mut body = empty_object_body(capacity);
     body.shape = shape;
     body
 }
@@ -3073,10 +3083,37 @@ fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
     }
 }
 
-fn empty_dictionary_object_body() -> ObjectBody {
-    let mut body = empty_object_body();
+fn empty_dictionary_object_body(capacity: usize) -> ObjectBody {
+    let mut body = empty_object_body(capacity);
     body.replace_dictionary_identity(false);
     body
+}
+
+/// Trailing bytes of an object body with `capacity` in-object slots.
+#[inline]
+fn inline_bytes(body: &ObjectBody) -> usize {
+    body.inline_capacity() * std::mem::size_of::<Value>()
+}
+
+/// Allocate an ordinary object body in the young generation (old when the
+/// heap tenures), reserving its in-object slots.
+fn alloc_object_body_with_roots(
+    heap: &mut GcHeap,
+    body: ObjectBody,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let extra = inline_bytes(&body);
+    heap.alloc_trailing_with_roots(body, extra, external_visit)
+}
+
+/// Allocate an ordinary object body directly in old space.
+fn alloc_object_body_old(
+    heap: &mut GcHeap,
+    body: ObjectBody,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let extra = inline_bytes(&body);
+    let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+    heap.alloc_variable_with_roots(body, extra, &mut no_roots)
 }
 
 /// Allocate an old-space object for raw GC fixtures.
@@ -3086,7 +3123,7 @@ fn empty_dictionary_object_body() -> ObjectBody {
 pub(crate) fn alloc_object_old_for_fixture(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_old(empty_dictionary_object_body())
+    alloc_object_body_old(heap, empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY))
 }
 
 /// Allocate an empty object directly in non-moving old space.
@@ -3097,7 +3134,7 @@ pub(crate) fn alloc_object_old_for_fixture(
 /// every minor collection. The empty body holds no GC edges, so no caller
 /// roots are required across the allocation.
 pub(crate) fn alloc_object_old(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_old(empty_dictionary_object_body())
+    alloc_object_body_old(heap, empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY))
 }
 
 /// Allocate a fresh empty object through the young-generation allocation path.
@@ -3110,26 +3147,36 @@ pub(crate) fn alloc_object_with_roots(
     heap: &mut GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(empty_dictionary_object_body(), external_visit)
+    alloc_object_body_with_roots(
+        heap,
+        empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY),
+        external_visit,
+    )
 }
 
-/// Allocate a fresh empty object with the root hidden class installed.
+/// Allocate a fresh empty object with the given hidden class installed and
+/// room for `capacity` in-object slots.
 pub(crate) fn alloc_object_with_shape_roots(
     heap: &mut GcHeap,
     shape: ShapeHandle,
+    capacity: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_with_roots(empty_object_body_with_shape(shape), external_visit)
+    alloc_object_body_with_roots(
+        heap,
+        empty_object_body_with_shape(shape, inline_capacity_for(capacity)),
+        external_visit,
+    )
 }
 
 /// Allocate a fresh shaped object whose complete data-slot prefix is installed
 /// before the object becomes reachable.
 ///
-/// Inline values live directly in the young object body. Wider objects first
-/// allocate an old-space slab with its collector-rewritten values already in
-/// the trailing words, then publish the object that owns that slab. In either
-/// case no empty property is exposed and no later per-property mutator store is
-/// required.
+/// Values that fit the in-object capacity are copied into the young object's
+/// own slots. Wider objects first allocate an old-space slab with its
+/// collector-rewritten values already in the trailing words, then publish the
+/// object that owns that slab. In either case no empty property is exposed and
+/// no later per-property mutator store is required.
 pub(crate) fn alloc_object_with_shape_and_values_roots(
     heap: &mut GcHeap,
     mut shape: ShapeHandle,
@@ -3155,33 +3202,18 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
         }
     };
 
-    let slab = if values.len() > INLINE_SLOT_CAP {
-        let capacity = values.len().max(INLINE_SLOT_CAP * 2);
-        slot_slab::alloc_slot_slab_with_values(heap, capacity, values, &mut visit_owner_roots)?
-    } else {
+    let fits_inline = values.len() <= MAX_INLINE_CAPACITY;
+    let slab = if fits_inline {
         slot_slab::SlotSlabHandle::null()
+    } else {
+        slot_slab::alloc_slot_slab_with_values(heap, values.len(), values, &mut visit_owner_roots)?
     };
 
-    let mut inline_values = [Value::default(); INLINE_SLOT_CAP];
-    if slab.is_null() {
-        inline_values[..values.len()].copy_from_slice(values);
-    }
-    let body = ObjectBody {
-        shape,
-        values_ptr: Cell::new(std::ptr::null_mut()),
-        slab,
-        inline_values,
-        slab_len: u16::try_from(values.len()).expect("object layout exceeds u16 slots"),
-        dictionary_shape_id: ShapeId::UNASSIGNED,
-        shape_cache_mode: ShapeCacheMode::Fast,
-        jit_proto: prototype.unwrap_or_default(),
-        extensible: true,
-        slot_attrs_overridden: false,
-        chain_link_opaque: false,
-        dictionary_layout: 0,
-        exotic: ExoticSlot::null(),
-    };
-    body.refresh_values_ptr();
+    let capacity = if fits_inline { values.len() } else { 0 };
+    let mut body = empty_object_body_with_shape(shape, capacity);
+    body.slab = slab;
+    body.jit_proto = prototype.unwrap_or_default();
+    body.slab_len = u16::try_from(values.len()).expect("object layout exceeds u16 slots");
 
     let slab_slot = (!slab.is_null()).then(|| std::ptr::addr_of!(slab).cast_mut().cast::<RawGc>());
     let values_base = values.as_mut_ptr();
@@ -3197,13 +3229,16 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
             unsafe { (*values_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
-    let object = heap.alloc_with_roots(body, &mut visit)?;
-    // A young allocation is not post-scanned by the allocator because it
-    // needs no remembered-set edges. Its cached inline base was copied from
-    // the pending stack body, though, so retarget it to the final cell before
-    // returning the first observable handle.
-    heap.with_payload(object, |body| body.refresh_values_ptr());
-    Ok(object)
+    let extra = capacity * std::mem::size_of::<Value>();
+    heap.alloc_trailing_with_roots_initialized(body, extra, &mut visit, |body| {
+        if fits_inline {
+            // SAFETY: the rooted buffer was rewritten by any collection the
+            // allocation ran; the cell holds `values_len` in-object words.
+            unsafe {
+                std::ptr::copy_nonoverlapping(values_base, body.inline_values_ptr(), values_len);
+            }
+        }
+    })
 }
 
 /// Initialize a freshly allocated shaped object with the values for every
@@ -3279,20 +3314,25 @@ pub(crate) fn set_fresh_object_shape(obj: JsObject, heap: &mut GcHeap, shape: Sh
     });
 }
 
-/// Try to allocate a fresh shaped object without running a GC safepoint.
+/// Try to allocate a fresh shaped object with `capacity` in-object slots
+/// without running a GC safepoint.
 pub(crate) fn try_alloc_object_with_shape_no_collect(
     heap: &mut GcHeap,
     shape: ShapeHandle,
+    capacity: usize,
 ) -> Option<JsObject> {
-    heap.try_alloc_no_collect(empty_object_body_with_shape(shape))
+    let body = empty_object_body_with_shape(shape, inline_capacity_for(capacity));
+    let extra = inline_bytes(&body);
+    heap.try_alloc_trailing_no_collect_or_return(body, extra, |_| {})
+        .ok()
 }
 
 /// Allocate a fresh empty object for diagnostic delivery after the
 /// heap cap has already fired.
 ///
-/// This uses [`otter_gc::GcHeap::alloc_old_diagnostic`] so the VM can throw a
-/// catchable `RangeError` for an allocation failure instead of immediately
-/// losing the error object to the same cap.
+/// This uses [`otter_gc::GcHeap::alloc_old_diagnostic_trailing`] so the VM
+/// can throw a catchable `RangeError` for an allocation failure instead of
+/// immediately losing the error object to the same cap.
 ///
 /// # Errors
 ///
@@ -3305,7 +3345,9 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
 pub(crate) fn alloc_diagnostic_object(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    heap.alloc_old_diagnostic(empty_dictionary_object_body())
+    let body = empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY);
+    let extra = inline_bytes(&body);
+    heap.alloc_old_diagnostic_trailing(body, extra)
 }
 
 /// Allocate a fresh object backed by Rust-owned host data.
@@ -3330,21 +3372,18 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = heap.alloc_with_roots(
+    let object = alloc_object_body_with_roots(
+        heap,
         ObjectBody {
             shape: ShapeHandle::null(),
-            values_ptr: Cell::new(std::ptr::null_mut()),
             slab: otter_gc::Gc::null(),
-            inline_values: [Value::default(); INLINE_SLOT_CAP],
-            slab_len: 0,
-            dictionary_shape_id: next_shape_id(),
-            shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
-            extensible: true,
-            slot_attrs_overridden: false,
-            chain_link_opaque: true,
-            dictionary_layout: 1,
             exotic: slot,
+            dictionary_layout: 1,
+            slab_len: 0,
+            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
+            inline_capacity: DEFAULT_INLINE_CAPACITY as u8,
+            dictionary_shape_id: next_shape_id(),
         },
         &mut visit,
     )?;
@@ -3374,21 +3413,18 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = heap.alloc_with_roots(
+    let object = alloc_object_body_with_roots(
+        heap,
         ObjectBody {
             shape,
-            values_ptr: Cell::new(std::ptr::null_mut()),
             slab: otter_gc::Gc::null(),
-            inline_values: [Value::default(); INLINE_SLOT_CAP],
-            slab_len: 0,
-            dictionary_shape_id: ShapeId::UNASSIGNED,
-            shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
-            extensible: true,
-            slot_attrs_overridden: false,
-            chain_link_opaque: true,
-            dictionary_layout: 0,
             exotic: slot,
+            dictionary_layout: 0,
+            slab_len: 0,
+            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
+            inline_capacity: DEFAULT_INLINE_CAPACITY as u8,
+            dictionary_shape_id: ShapeId::UNASSIGNED,
         },
         &mut visit,
     )?;
@@ -3419,21 +3455,18 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = heap.alloc_with_roots(
+    let object = alloc_object_body_with_roots(
+        heap,
         ObjectBody {
             shape,
-            values_ptr: Cell::new(std::ptr::null_mut()),
             slab: otter_gc::Gc::null(),
-            inline_values: [Value::default(); INLINE_SLOT_CAP],
-            slab_len: 0,
-            dictionary_shape_id: ShapeId::UNASSIGNED,
-            shape_cache_mode: ShapeCacheMode::Fast,
             jit_proto: otter_gc::Gc::null(),
-            extensible: true,
-            slot_attrs_overridden: false,
-            chain_link_opaque: true,
-            dictionary_layout: 0,
             exotic: slot,
+            dictionary_layout: 0,
+            slab_len: 0,
+            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
+            inline_capacity: DEFAULT_INLINE_CAPACITY as u8,
+            dictionary_shape_id: ShapeId::UNASSIGNED,
         },
         &mut visit,
     )?;
@@ -3540,7 +3573,7 @@ pub(crate) fn install_mapped_arguments(
         return;
     }
     heap.with_payload(obj, |body| {
-        body.chain_link_opaque = true;
+        body.set_chain_link_opaque(true);
         body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
             context,
             entries: entries.into_boxed_slice(),
@@ -4033,9 +4066,9 @@ pub(crate) fn load_own_data_slot_atom(
         // that keeps the release hit off the shape body entirely.
         if shaped
             && hit.is_data
-            && matches!(body.shape_cache_mode, ShapeCacheMode::Fast)
-            && !body.chain_link_opaque
-            && !body.slot_attrs_overridden
+            && matches!(body.shape_cache_mode(), ShapeCacheMode::Fast)
+            && !body.chain_link_opaque()
+            && !body.slot_attrs_overridden()
         {
             debug_assert!(
                 !body.slot_attrs(heap, offset).1,
@@ -4076,9 +4109,9 @@ pub(crate) fn load_own_data_slot_by_shape(
         if body.shape.is_null()
             || body.shape != hit.shape
             || !hit.is_data
-            || !matches!(body.shape_cache_mode, ShapeCacheMode::Fast)
-            || body.chain_link_opaque
-            || body.slot_attrs_overridden
+            || !matches!(body.shape_cache_mode(), ShapeCacheMode::Fast)
+            || body.chain_link_opaque()
+            || body.slot_attrs_overridden()
         {
             return None;
         }
@@ -4122,7 +4155,7 @@ pub(crate) fn store_own_data_slot_atom(
         // matching fast shape fixes every slot's attributes, so neither the
         // chain walk for this slot's attributes nor the bounds need
         // consulting. Dictionary storage and overridden descriptors still do.
-        if !body.shape.is_null() && !body.slot_attrs_overridden {
+        if !body.shape.is_null() && !body.slot_attrs_overridden() {
             return true;
         }
         let key_matches = !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
@@ -4467,7 +4500,7 @@ pub fn set_string_data(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, value: J
         .expect("pending string survives rooting");
     heap.with_payload(*obj, |body| {
         body.exotic_mut().string_data = Some(value);
-        body.chain_link_opaque = true;
+        body.set_chain_link_opaque(true);
     });
     heap.record_write(*obj, &value);
 }
@@ -4902,7 +4935,7 @@ pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::G
 /// - <https://tc39.es/ecma262/#sec-ordinaryisextensible>
 #[must_use]
 pub fn is_extensible(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
-    heap.read_payload(obj, |body| body.extensible)
+    heap.read_payload(obj, |body| body.extensible())
 }
 
 /// `Object.isSealed(o)` — `true` when the object is non-extensible
@@ -4914,7 +4947,7 @@ pub fn is_extensible(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn is_sealed(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(obj, |body| {
-        if body.extensible {
+        if body.extensible() {
             return false;
         }
         if !(0..body_property_count(heap, body)).all(|i| !body.slot_attrs(heap, i).0.configurable())
@@ -4938,7 +4971,7 @@ pub fn is_sealed(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(obj, |body| {
-        if body.extensible {
+        if body.extensible() {
             return false;
         }
         for i in 0..body_property_count(heap, body) {
@@ -5336,12 +5369,14 @@ pub fn set_prototype_value(
     };
     heap.with_payload(obj, |body| {
         body.jit_proto = jit_proto;
-        body.chain_link_opaque = body.string_data().is_some()
-            || body.host_data_ref().is_some()
-            || matches!(
-                new_proto,
-                ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)
-            );
+        body.set_chain_link_opaque(
+            body.string_data().is_some()
+                || body.host_data_ref().is_some()
+                || matches!(
+                    new_proto,
+                    ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)
+                ),
+        );
         match &new_proto {
             // Common case: encoded entirely by `jit_proto`; drop any stale
             // non-ordinary override so the object carries no exotic box for it.
@@ -5674,7 +5709,7 @@ pub fn define_own_property_partial(
             body.set_slot(offset as usize, meta, stored, None);
             true
         } else {
-            if !body.extensible {
+            if !body.extensible() {
                 return false;
             }
             body.replace_dictionary_identity(true);
@@ -5755,7 +5790,7 @@ pub(crate) fn define_own_property_partial_with_shape(
             body.set_slot(offset as usize, meta, stored, Some(next_shape));
             true
         } else {
-            if !body.extensible {
+            if !body.extensible() {
                 return false;
             }
             debug_assert_object_shape_handle(next_shape, "shape-slot store");
@@ -5822,7 +5857,7 @@ pub fn define_own_symbol_property_partial(
                 .1 = merged_for_existing.unwrap();
             true
         } else {
-            if !body.extensible {
+            if !body.extensible() {
                 return false;
             }
             body.symbol_props_mut()
@@ -5950,7 +5985,7 @@ pub fn define_own_property_in_place(
             body.set_slot(offset as usize, meta, stored, None);
             true
         } else {
-            if !body.extensible {
+            if !body.extensible() {
                 return false;
             }
             body.replace_dictionary_identity(true);
@@ -6036,7 +6071,7 @@ pub fn define_own_symbol_property(
                 .1 = merged_for_existing.unwrap();
             true
         } else {
-            if !body.extensible {
+            if !body.extensible() {
                 return false;
             }
             body.symbol_props_mut()
@@ -6283,7 +6318,7 @@ pub fn resolve_symbol_set(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol)
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
 pub fn prevent_extensions(obj: JsObject, heap: &mut otter_gc::GcHeap) {
-    heap.with_payload(obj, |body| body.extensible = false);
+    heap.with_payload(obj, |body| body.set_extensible(false));
 }
 
 /// `Object.seal(o)` core — clears `[[Extensible]]` and toggles
@@ -6297,7 +6332,7 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     // populated vector instead of diverging silently from the hidden class.
     materialize_slots(obj, heap);
     heap.with_payload(obj, |body| {
-        body.extensible = false;
+        body.set_extensible(false);
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
@@ -6334,7 +6369,7 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 /// place.
 pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_shape: ShapeHandle) {
     heap.with_payload(obj, |body| {
-        body.extensible = false;
+        body.set_extensible(false);
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
         body.shape = new_shape;
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
@@ -6374,7 +6409,7 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     // In-place fallback: materialize per-slot metadata first (see [`seal`]).
     materialize_slots(obj, heap);
     heap.with_payload(obj, |body| {
-        body.extensible = false;
+        body.set_extensible(false);
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
@@ -6419,7 +6454,7 @@ pub(crate) fn freeze_with_shape(
     new_shape: ShapeHandle,
 ) {
     heap.with_payload(obj, |body| {
-        body.extensible = false;
+        body.set_extensible(false);
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
         body.shape = new_shape;
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
@@ -6706,7 +6741,7 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
     );
     heap.with_payload(obj, |body| {
         body.shape = shape;
-        body.slot_attrs_overridden = false;
+        body.set_slot_attrs_overridden(false);
         body.dictionary_shape_id = ShapeId::UNASSIGNED;
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
@@ -6843,7 +6878,7 @@ fn materialize_slots_with_pending_values(
             .expect("metas present");
         heap.with_payload(*obj, |body| {
             body.exotic_mut().slots = table;
-            body.slot_attrs_overridden = true;
+            body.set_slot_attrs_overridden(true);
         });
         let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
         heap.record_write(sidecar, &table);
@@ -6917,14 +6952,18 @@ mod tests {
 
     #[test]
     fn jit_semantic_guard_layout_is_frozen() {
-        assert_eq!(std::mem::size_of::<ShapeCacheMode>(), 1);
-        assert_eq!(SHAPE_CACHE_MODE_FAST, 0);
-        assert_eq!(OBJECT_BODY_SHAPE_CACHE_MODE_OFFSET, 32);
-        assert_eq!(OBJECT_BODY_EXTENSIBLE_OFFSET, 40);
-        assert_eq!(OBJECT_BODY_SLOT_ATTRS_OVERRIDDEN_OFFSET, 41);
-        assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 48);
+        assert_eq!(OBJECT_BODY_FLAGS_OFFSET, 22);
+        assert_eq!(OBJECT_BODY_INLINE_CAPACITY_OFFSET, 23);
+        assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 12);
         assert_eq!(std::mem::size_of::<ExoticHandle>(), 4);
-        assert_eq!(std::mem::size_of::<bool>(), 1);
+        let bits = [
+            ObjectFlags::EXTENSIBLE,
+            ObjectFlags::SLOT_ATTRS_OVERRIDDEN,
+            ObjectFlags::CHAIN_LINK_OPAQUE,
+            ObjectFlags::DICTIONARY_COMPATIBLE,
+        ];
+        assert_eq!(bits.iter().fold(0u8, |all, bit| all | bit).count_ones(), 4);
+        assert_eq!(object_cell_bytes(2), 56);
     }
 
     #[test]

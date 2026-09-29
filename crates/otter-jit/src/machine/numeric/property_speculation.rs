@@ -146,7 +146,6 @@ pub(super) fn store_case(
                     object: 0,
                     shape: child_shape,
                     new_len,
-                    initialize_inline,
                 },
             ] = *tail
             else {
@@ -181,7 +180,6 @@ pub(super) fn store_case(
                     prototype_shapes: prototype_shapes.into_boxed_slice(),
                     child_shape,
                     new_len,
-                    initialize_inline,
                 }),
             })
         }

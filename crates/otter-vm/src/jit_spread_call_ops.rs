@@ -277,7 +277,15 @@ impl Interpreter {
                 self.evict_compiled_for_reopt(function_id);
             }
         }
-        self.observe_class_constructor_field_transitions(context, callee)?;
+        let mut callee = callee;
+        let mut new_target = callee;
+        let mut args = args;
+        self.observe_class_constructor_field_transitions_rooted(
+            context,
+            &mut callee,
+            &mut new_target,
+            &mut args,
+        )?;
         self.note_generic_call_target(context, function_id, callee);
         self.run_rooted_construct_values(stack, context, callee, callee, args)
     }

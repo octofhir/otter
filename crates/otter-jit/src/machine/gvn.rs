@@ -715,7 +715,6 @@ mod tests {
                     byte_pc: 11,
                     shape: 8,
                     new_len: 1,
-                    initialize_inline: true,
                 },
                 vec![
                     MachineOperand::location_input(owner),

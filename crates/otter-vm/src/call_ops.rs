@@ -558,9 +558,16 @@ impl Interpreter {
             self.constructor_receiver_reservation(context, function_id, roots)?;
         let simple_shape =
             self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), roots)?;
-        let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        let field_count = simple_shape
+            .map_or(0, |(_, fields)| fields)
+            .max(reserved_field_count);
+        let receiver = self.alloc_runtime_rooted_object_with_capacity(
+            crate::object::receiver_inline_capacity(field_count),
+            &[],
+            &[],
+        )?;
         roots.receiver.set(Value::object(receiver));
-        if let Some((shape, field_count)) = simple_shape {
+        if let Some((shape, initial_fields)) = simple_shape {
             let receiver = roots
                 .receiver
                 .get()
@@ -568,15 +575,15 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
             let mut slots = SmallVec::<[Value; 8]>::new();
-            slots.resize(field_count, Value::undefined());
+            slots.resize(initial_fields, Value::undefined());
             crate::object::initialize_shaped_data_slots_with_capacity(
                 receiver,
                 &mut self.gc_heap,
                 slots.as_slice(),
-                reserved_field_count.max(field_count),
+                field_count,
             );
-        } else if reserved_field_count > crate::object::INLINE_SLOT_CAP {
-            // Fields that fit the in-body words need no slab; reserving one
+        } else if field_count > crate::object::MAX_INLINE_CAPACITY {
+            // Fields that fit the in-object slots need no slab; reserving one
             // would move every slot out of line for nothing.
             let mut receiver = roots
                 .receiver
@@ -627,31 +634,42 @@ impl Interpreter {
         Ok((baked_field_count.max(sample.learned), sample))
     }
 
-    /// Reserve storage on the bare receiver the interpreter's construct fast
-    /// path allocated for a bytecode base constructor.
+    /// Storage a bytecode base constructor's receiver needs on the
+    /// interpreter's construct fast path, read before the receiver exists so
+    /// it is allocated with exactly that many in-object slots.
     ///
     /// The interpreter plans no transition program of its own; it applies the
     /// capacity an earlier generated preparation already baked for this pair
     /// and the instance size learned from the pair's previous receivers, so
     /// fields the body or its callees add land in reserved slots exactly as
-    /// they do for a runtime-prepared receiver. The receiver handle itself is
-    /// the root the slab allocation rewrites.
-    fn reserve_interpreter_construct_receiver(
+    /// they do for a runtime-prepared receiver.
+    fn interpreter_construct_reservation(
         &mut self,
         function_id: u32,
-        stack: &ActivationStack,
-        callee_reg: u16,
-        mut receiver: JsObject,
-    ) -> Result<JsObject, VmError> {
-        let new_target = *read_register(&stack[stack.len() - 1], callee_reg)?;
+        new_target: Value,
+    ) -> (usize, ConstructorProfileSample) {
         let sample = self.sample_constructor_profile(function_id, new_target);
         let baked_field_count = self
             .constructor_field_capacity_cache
             .get(&sample.key)
             .copied()
             .unwrap_or(0);
-        let reserved_field_count = baked_field_count.max(sample.learned);
-        if reserved_field_count > crate::object::INLINE_SLOT_CAP {
+        (baked_field_count.max(sample.learned), sample)
+    }
+
+    /// Finish the interpreter fast path's receiver: move a receiver wider
+    /// than any in-object capacity to a reserved slab, then record it for the
+    /// constructor's instance-size profile. The receiver handle itself is the
+    /// root the slab allocation rewrites.
+    fn finish_interpreter_construct_receiver(
+        &mut self,
+        reserved_field_count: usize,
+        sample: ConstructorProfileSample,
+        stack: &ActivationStack,
+        callee_reg: u16,
+        mut receiver: JsObject,
+    ) -> Result<JsObject, VmError> {
+        if reserved_field_count > crate::object::MAX_INLINE_CAPACITY {
             crate::object::reserve_fresh_object_slot_capacity(
                 &mut receiver,
                 &mut self.gc_heap,
@@ -753,6 +771,32 @@ impl Interpreter {
     /// materialized `New` caller seed the replacement backend before the
     /// canonical construct runs; only receivers that fit the in-body slab are
     /// admitted because this observation does not reserve an out-of-line slab.
+    /// [`Self::observe_class_constructor_field_transitions`] for a construct
+    /// whose operands are raw locals: observing allocates shapes, so the
+    /// callee, `new.target` and arguments ride the traced anchor stack across
+    /// it and are written back relocated.
+    pub(crate) fn observe_class_constructor_field_transitions_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        callee: &mut Value,
+        new_target: &mut Value,
+        args: &mut [Value],
+    ) -> Result<(), VmError> {
+        let anchor = self.push_iteration_anchor(*callee) - 1;
+        self.push_iteration_anchor(*new_target);
+        for &arg in args.iter() {
+            self.push_iteration_anchor(arg);
+        }
+        let observed = self.observe_class_constructor_field_transitions(context, *new_target);
+        *callee = self.iteration_anchor(anchor);
+        *new_target = self.iteration_anchor(anchor + 1);
+        for (index, arg) in args.iter_mut().enumerate() {
+            *arg = self.iteration_anchor(anchor + 2 + index);
+        }
+        self.pop_iteration_anchors_to(anchor);
+        observed
+    }
+
     pub(crate) fn observe_class_constructor_field_transitions(
         &mut self,
         context: &ExecutionContext,
@@ -803,7 +847,7 @@ impl Interpreter {
                 crate::constructor_fast_path::match_constructor_shape_stores(&owner, function)
                     .len();
         }
-        if store_count == 0 || store_count > crate::object::INLINE_SLOT_CAP {
+        if store_count == 0 || store_count > crate::object::MAX_INLINE_CAPACITY {
             return Ok(());
         }
 
@@ -928,6 +972,11 @@ impl Interpreter {
                 .flatten();
             let receiver_is_pre_shaped = simple_init.is_some();
             for store in stores {
+                // Each transition below allocates a shape; the prototype is
+                // read back from its rooted slot every step.
+                let Some(prototype_object) = roots.scratch_0.get().as_object() else {
+                    return Ok(usize::from(slot));
+                };
                 if !seen.insert(store.name.clone())
                     || !matches!(
                         crate::object::lookup(prototype_object, &self.gc_heap, &store.name),
@@ -2405,10 +2454,37 @@ impl Interpreter {
         // value root: the collector rewrites a value root through a shared
         // reference, which a stack local's register copy can outlive, so the
         // relocated prototype is read back from the anchor slot instead.
+        // Size the receiver's in-object slots before it exists: the simple
+        // initializer's field count, the baked transition capacity and the
+        // instance size learned from this constructor pair.
+        let bytecode_base_function_id = current
+            .as_function()
+            .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()))
+            .filter(|&function_id| {
+                context
+                    .exec_function(function_id)
+                    .is_some_and(|function| !function.is_derived_constructor)
+            });
+        let simple_init = if is_direct_class_construct
+            && let Some(function_id) = bytecode_base_function_id
+            && let Some(function) = context.exec_function(function_id)
+        {
+            self.simple_constructor_init(context, function_id, function)
+        } else {
+            None
+        };
+        let reservation = bytecode_base_function_id.map(|function_id| {
+            self.interpreter_construct_reservation(function_id, effective_new_target)
+        });
+        let field_count = simple_init
+            .as_ref()
+            .map_or(0, |init| init.fields.len())
+            .max(reservation.as_ref().map_or(0, |(reserved, _)| *reserved));
         let proto_anchor = self.push_iteration_anchor(proto) - 1;
-        let receiver = self.alloc_stack_rooted_object_with_extra_roots(
+        let receiver = self.alloc_stack_rooted_object_with_capacity(
             stack,
             &[&current, &effective_new_target],
+            crate::object::receiver_inline_capacity(field_count),
         )?;
         let proto = self.iteration_anchor(proto_anchor);
         self.pop_iteration_anchors_to(proto_anchor);
@@ -2423,10 +2499,8 @@ impl Interpreter {
             rooted_callee
         };
         if is_direct_class_construct
-            && let Some(function_id) = current
-                .as_function()
-                .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()))
-            && let Some(function) = context.exec_function(function_id)
+            && let Some(function_id) = bytecode_base_function_id
+            && simple_init.is_some()
         {
             let top_idx = stack.len() - 1;
             let args_window = BytecodeArgumentWindow::from_operands(
@@ -2436,7 +2510,7 @@ impl Interpreter {
                 argc,
             );
             let args = args_window.to_smallvec8()?;
-            let init = self.simple_constructor_init(context, function_id, function);
+            let init = simple_init.clone();
             if self.try_finish_simple_constructor_init(
                 stack,
                 function_id,
@@ -2453,18 +2527,11 @@ impl Interpreter {
         // contract: reserve the baked and learned slot capacity before the
         // frame is built, so the body's own stores and those of its callees
         // land in reserved slots.
-        let bytecode_base_function_id = current
-            .as_function()
-            .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()))
-            .filter(|&function_id| {
-                context
-                    .exec_function(function_id)
-                    .is_some_and(|function| !function.is_derived_constructor)
-            });
-        let receiver = match bytecode_base_function_id {
-            Some(function_id) => {
-                let receiver = self.reserve_interpreter_construct_receiver(
-                    function_id,
+        let receiver = match reservation {
+            Some((reserved_field_count, sample)) => {
+                let receiver = self.finish_interpreter_construct_receiver(
+                    reserved_field_count,
+                    sample,
                     stack,
                     callee_reg,
                     receiver,

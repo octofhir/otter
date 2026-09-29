@@ -92,40 +92,52 @@ pub(crate) fn emit_shape_state_guard(
     header: u8,
     miss: DynamicLabel,
 ) {
-    let scratch = if header == 14 { 11 } else { 14 };
-    let mode_byte = view.object_shape_cache_mode_byte;
-    let fast_mode = u32::from(view.object_shape_cache_fast);
-    let opaque_byte = view.object_chain_link_opaque_byte;
-    dynasm!(ops ; .arch aarch64 ; ldrb W(scratch), [X(header), mode_byte]);
-    if fast_mode == 0 {
-        dynasm!(ops ; .arch aarch64 ; cbnz W(scratch), =>miss);
-    } else {
-        emit_load_u64(ops, 10, u64::from(fast_mode));
-        dynasm!(ops ; .arch aarch64 ; cmp W(scratch), w10 ; b.ne =>miss);
-    }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldrb W(scratch), [X(header), opaque_byte]
-        ; cbnz W(scratch), =>miss
+    emit_object_flags_guard(
+        ops,
+        view,
+        header,
+        otter_vm::jit::JIT_OBJECT_SHAPE_STATE_MASK,
+        miss,
     );
 }
 
 /// Prove shape-derived named lookup remains authoritative without rejecting
-/// benign symbol or native-call sidecars. Clobbers `x10` and `x14` (`x11`
-/// instead of `x14` when that register holds the header).
+/// benign symbol or native-call sidecars. Clobbers `x14` (`x11` instead when
+/// that register holds the header).
 pub(crate) fn emit_ordinary_lookup_state_guard(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     header: u8,
     miss: DynamicLabel,
 ) {
-    emit_shape_state_guard(ops, view, header, miss);
-    let scratch = if header == 14 { 11 } else { 14 };
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldrb W(scratch), [X(header), view.object_slot_attrs_overridden_byte]
-        ; cbnz W(scratch), =>miss
+    emit_object_flags_guard(
+        ops,
+        view,
+        header,
+        otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK,
+        miss,
     );
+}
+
+/// Bit index of [`otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE`] for `tbz`.
+pub(crate) const EXTENSIBLE_BIT: u32 = otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE.trailing_zeros();
+
+/// Branch to `miss` when any bit of `mask` is set in the object's flag byte.
+/// Clobbers `x14` (`x11` instead when that register holds the header).
+pub(crate) fn emit_object_flags_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    mask: u8,
+    miss: DynamicLabel,
+) {
+    let scratch = if header == 14 { 11 } else { 14 };
+    dynasm!(ops ; .arch aarch64 ; ldrb W(scratch), [X(header), view.object_flags_byte]);
+    for bit in 0..8u32 {
+        if mask & (1 << bit) != 0 {
+            dynasm!(ops ; .arch aarch64 ; tbnz W(scratch), bit, =>miss);
+        }
+    }
 }
 
 /// Prove that one prototype-chain link still supports the missing-key proof a
@@ -299,6 +311,7 @@ pub(crate) fn emit_check_shape_identity(
 /// first.
 pub(crate) fn emit_load_field(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
     value_byte: u32,
@@ -307,7 +320,7 @@ pub(crate) fn emit_load_field(
     if header != 13 {
         dynasm!(ops ; .arch aarch64 ; mov x13, X(header));
     }
-    super::values::emit_slab_base(ops, view, 13, 14);
+    super::values::emit_slab_base(ops, relocations, view, 13, 14);
     dynasm!(ops
         ; .arch aarch64
         ; cbz x13, =>miss
@@ -497,7 +510,7 @@ where
                         1 => 15,
                         _ => return Err(Unsupported::OperandShape("CacheIR field object")),
                     };
-                    emit_load_field(ops, view, header, value_byte, next);
+                    emit_load_field(ops, relocations, view, header, value_byte, next);
                     dynasm!(ops ; .arch aarch64 ; b =>done);
                     terminal = true;
                 }
@@ -664,11 +677,12 @@ where
                         ; b =>storage_fits
                         ; =>inline_storage
                         ; lsr w16, w17, #3
-                        ; cmp w16, view.object_inline_slot_cap
+                        ; ldrb w14, [x13, view.object_inline_capacity_byte]
+                        ; cmp w16, w14
                         ; b.hs =>next
                         ; =>storage_fits
-                        ; ldrb w16, [x13, view.object_extensible_byte]
-                        ; cbz w16, =>next
+                        ; ldrb w16, [x13, view.object_flags_byte]
+                        ; tbz w16, EXTENSIBLE_BIT, =>next
                         ; ldrh w16, [x13, view.object_slab_len_byte]
                         ; lsr w15, w17, #3
                         ; cmp w16, w15
@@ -698,11 +712,7 @@ where
                     object: 0,
                     shape,
                     new_len,
-                    initialize_inline,
                 } if terminal => {
-                    if initialize_inline {
-                        super::values::emit_initialize_inline_values_ptr(ops, view, 13, 16);
-                    }
                     emit_load_u64(ops, 14, u64::from(new_len));
                     emit_load_u64(ops, 16, u64::from(shape));
                     dynasm!(ops
@@ -725,7 +735,7 @@ where
         dynasm!(ops ; .arch aarch64 ; =>next);
     }
     dynasm!(ops ; .arch aarch64 ; b =>miss ; =>existing ; mov w16, wzr ; =>matched ; mov x12, x13);
-    super::values::emit_slab_base(ops, view, 13, 14);
+    super::values::emit_slab_base(ops, relocations, view, 13, 14);
     dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
     Ok(())
 }
@@ -1824,7 +1834,7 @@ fn emit_guarded_method_guard_impl(
                     return Err(Unsupported::OperandShape("dictionary method prototype hop"));
                 }
             }
-            super::values::emit_slab_base(ops, view, 13, 14);
+            super::values::emit_slab_base(ops, relocations, view, 13, 14);
             dynasm!(ops
                 ; .arch aarch64
                 ; cbz x13, =>miss
@@ -1977,7 +1987,6 @@ pub(crate) fn emit_prototype_guard(
     miss: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let object_shape_byte = view.object_shape_byte;
-    let object_values_ptr_byte = view.object_values_ptr_byte;
     emit_load_symbol_u64(
         ops,
         relocations,
@@ -2028,11 +2037,7 @@ pub(crate) fn emit_prototype_guard(
             ));
         }
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x15, [x15, object_values_ptr_byte]
-        ; cbz x15, =>miss
-    );
+    super::values::emit_slab_base(ops, relocations, view, 15, 14);
     Ok(())
 }
 

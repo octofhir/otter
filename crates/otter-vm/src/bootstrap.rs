@@ -660,10 +660,8 @@ mod tests {
         // pair where it previously lived in a non-GC box.
         // Property slabs store the complete 8-byte `Value`, so numeric builtin
         // constants do not allocate heap-number boxes. Objects that outgrow
-        // their three inline slots allocate an overflow slab, and that slab is
-        // a GC body rather than a `Vec`. Reducing the inline cap from six to
-        // three adds exactly three bootstrap slab allocations while preserving
-        // the 88-byte hot-object footprint. The count also includes slabs
+        // their in-object slots allocate an overflow slab, and that slab is
+        // a GC body rather than a `Vec`. The count also includes slabs
         // because those allocations are visible to this
         // counter, not because the bootstrap does more work — the malloc
         // they used to be is gone, and every object lost the 20-byte `Vec`

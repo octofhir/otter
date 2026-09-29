@@ -555,7 +555,6 @@ mod tests {
                     object: 0,
                     shape: 202,
                     new_len: 2,
-                    initialize_inline: false,
                 },
             ]
         );

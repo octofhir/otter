@@ -2390,16 +2390,13 @@ impl Interpreter {
         new_target_function_id: u32,
     ) -> Option<jit::JitReceiverAllocationPlan> {
         let key = (base_function_id, new_target_function_id);
-        // A receiver whose learned instance size outgrows the inline words
-        // needs the runtime preparation's reserved slab; an inline allocation
-        // would hand the body storage it immediately has to grow.
-        let class_allocation =
-            !self
-                .constructor_instance_profiles
-                .get(&key)
-                .is_some_and(|profile| {
-                    profile.learned_field_count(&self.gc_heap) > crate::object::INLINE_SLOT_CAP
-                });
+        // A receiver whose learned instance size outgrows every in-object
+        // capacity needs the runtime preparation's reserved slab.
+        let learned = self
+            .constructor_instance_profiles
+            .get(&key)
+            .map_or(0, |profile| profile.learned_field_count(&self.gc_heap));
+        let class_allocation = learned <= crate::object::MAX_INLINE_CAPACITY;
         let capacity = self
             .constructor_field_capacity_cache
             .get(&key)
@@ -2411,12 +2408,13 @@ impl Interpreter {
                 class_allocation,
                 receiver_shape: self.shape_root().offset(),
                 initial_field_count: 0,
-                reserved_capacity: 0,
+                inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(learned))
+                    .ok()?,
                 prototype_shape_count: 0,
                 prototype_shapes: [0; jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
             });
         };
-        if capacity > crate::object::INLINE_SLOT_CAP {
+        if capacity > crate::object::MAX_INLINE_CAPACITY {
             return None;
         }
         let prototype_ids = self.constructor_prototype_shape_cache.get(&key)?;
@@ -2443,7 +2441,10 @@ impl Interpreter {
             class_allocation,
             receiver_shape,
             initial_field_count,
-            reserved_capacity: u8::try_from(capacity).ok()?,
+            inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(
+                capacity.max(learned),
+            ))
+            .ok()?,
             prototype_shape_count: u8::try_from(prototype_ids.len()).ok()?,
             prototype_shapes,
         })

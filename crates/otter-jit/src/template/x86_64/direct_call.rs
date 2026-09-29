@@ -1327,7 +1327,7 @@ fn emit_method_guard(
             ; jne =>miss
         );
     }
-    emit_template_slab_base(ops, view, 11, 8, miss);
+    emit_template_slab_base(ops, relocations, view, 11, 8, 10);
     dynasm!(ops ; .arch x64 ; mov r9, [r8 + guard.method_value_byte as i32]);
     Ok(())
 }

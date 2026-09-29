@@ -670,7 +670,7 @@ fn try_emit_inline_numeric_method(
         // already succeeded above. Materialize its slab once for every sealed
         // receiver-property load in the straight-line inline body.
         dynasm!(ops ; .arch aarch64 ; mov x13, x16);
-        emit_slab_base(ops, view, 13, 14);
+        emit_slab_base(ops, relocations, view, 13, 14);
         dynasm!(ops
             ; .arch aarch64
             ; cbz x13, =>guard_miss

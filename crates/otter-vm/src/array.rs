@@ -63,7 +63,7 @@ pub type JsArray = otter_gc::Gc<ArrayBody>;
 /// must be recomputed from the slab handle after every visit, so a
 /// relocation — a snapshot restore in particular — leaves compiled
 /// fast paths reading the slab's current address rather than the
-/// captured one. Same contract as `ObjectBody::values_ptr`.
+/// captured one.
 #[derive(Debug)]
 pub struct ArrayBody {
     /// Dense element storage in its own GC cell. Null while the array has no

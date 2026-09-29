@@ -1799,8 +1799,14 @@ impl Interpreter {
             // SAFETY: compiler-emitted argument indices into the caller window.
             args.push(unsafe { *caller_regs.add(arg as usize) });
         }
-        let new_target = inherited_new_target.unwrap_or(callee);
-        self.observe_class_constructor_field_transitions(context, new_target)?;
+        let mut callee = callee;
+        let mut new_target = inherited_new_target.unwrap_or(callee);
+        self.observe_class_constructor_field_transitions_rooted(
+            context,
+            &mut callee,
+            &mut new_target,
+            &mut args,
+        )?;
         let result = self.run_construct_sync_rooted(stack, context, &callee, new_target, args)?;
         // SAFETY: `dst_reg` is a compiler-emitted index into the caller
         // window; the window slab is pinned, so the pointer survived the

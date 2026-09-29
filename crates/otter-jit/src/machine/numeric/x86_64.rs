@@ -977,13 +977,14 @@ pub(super) fn emit(
                 for (case, &label) in cases.iter().zip(&labels) {
                     dynasm!(ops ; .arch x64 ; =>label);
                     if case.ordinary {
-                        dynasm!(ops
-                            ; .arch x64
-                            ; cmp BYTE [r11 + view.object_slot_attrs_overridden_byte as i32], 0
-                            ; jne =>miss
+                        object_flags_guard(
+                            &mut ops,
+                            view,
+                            otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN,
+                            miss,
                         );
                     }
-                    slab_base(&mut ops, view, miss);
+                    slab_base(&mut ops, &mut relocations, view);
                     dynasm!(ops
                         ; .arch x64
                         ; mov r8, [r8 + case.value_byte as i32]
@@ -1225,7 +1226,7 @@ pub(super) fn emit(
                 load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
-                slab_base(&mut ops, view, miss);
+                slab_base(&mut ops, &mut relocations, view);
                 dynasm!(ops
                     ; .arch x64
                     ; mov r8, [r8 + value_byte as i32]
@@ -1306,7 +1307,18 @@ pub(super) fn emit(
                     ; lea r8, [r11 + view.object_inline_values_byte as i32]
                     ; jmp =>done
                     ; =>spilled
-                    ; mov r8, [r11 + view.object_values_ptr_byte as i32]
+                );
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    8,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch x64
+                    ; add r8, r10
+                    ; add r8, view.object_slab_words_byte as i32
                     ; =>done
                     ; mov r8, [r8 + value_byte as i32]
                 );
@@ -1417,34 +1429,21 @@ pub(super) fn emit(
                             ; jmp =>fits
                             ; =>inline_storage
                         );
-                        if slot >= view.object_inline_slot_cap {
-                            dynasm!(ops ; .arch x64 ; jmp =>miss);
-                        }
+                        inline_capacity_guard(&mut ops, view, slot, miss);
                         dynasm!(ops
                             ; .arch x64
                             ; =>fits
-                            ; cmp BYTE [r11 + view.object_extensible_byte as i32], 0
-                            ; je =>miss
+                            ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
+                            ; jz =>miss
                             ; movzx r9d, WORD [r11 + view.object_slab_len_byte as i32]
                             ; cmp r9d, slot as i32
                             ; jne =>miss
                         );
                     }
-                    slab_base(&mut ops, view, miss);
+                    slab_base(&mut ops, &mut relocations, view);
                     load_integer(&mut ops, frame, loc[1], 10)?;
                     dynasm!(ops ; .arch x64 ; mov [r8 + case.value_byte as i32], r10);
                     if let Some(transition) = &case.transition {
-                        if transition.initialize_inline {
-                            let ready = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; .arch x64
-                                ; cmp DWORD [r11 + view.object_slab_handle_byte as i32], 0
-                                ; jne =>ready
-                                ; lea r10, [r11 + view.object_inline_values_byte as i32]
-                                ; mov [r11 + view.object_values_ptr_byte as i32], r10
-                                ; =>ready
-                            );
-                        }
                         dynasm!(ops
                             ; .arch x64
                             ; mov WORD [r11 + view.object_slab_len_byte as i32], transition.new_len as i16
@@ -1481,7 +1480,7 @@ pub(super) fn emit(
                 load_integer(&mut ops, frame, loc[2], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
-                slab_base(&mut ops, view, miss);
+                slab_base(&mut ops, &mut relocations, view);
                 load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops
                     ; .arch x64
@@ -1541,11 +1540,12 @@ pub(super) fn emit(
                     ; jmp =>storage_fits
                     ; =>inline
                     ; shr r10d, 3
-                    ; cmp r10d, view.object_inline_slot_cap as i32
+                    ; movzx r9d, BYTE [r11 + view.object_inline_capacity_byte as i32]
+                    ; cmp r10d, r9d
                     ; jae =>miss
                     ; =>storage_fits
-                    ; cmp BYTE [r11 + view.object_extensible_byte as i32], 0
-                    ; je =>miss
+                    ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
+                    ; jz =>miss
                     ; movzx r9d, WORD [r11 + view.object_slab_len_byte as i32]
                     ; cmp r9d, r10d
                     ; jne =>miss
@@ -1567,24 +1567,12 @@ pub(super) fn emit(
                 byte_pc,
                 shape,
                 new_len,
-                initialize_inline,
             } => {
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
                 load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>done);
                 load_integer(&mut ops, frame, loc[0], 11)?;
-                if initialize_inline {
-                    let ready = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; .arch x64
-                        ; cmp DWORD [r11 + view.object_slab_handle_byte as i32], 0
-                        ; jne =>ready
-                        ; lea r10, [r11 + view.object_inline_values_byte as i32]
-                        ; mov [r11 + view.object_values_ptr_byte as i32], r10
-                        ; =>ready
-                    );
-                }
                 dynasm!(ops
                     ; .arch x64
                     ; mov WORD [r11 + view.object_slab_len_byte as i32], new_len as i16
@@ -3654,7 +3642,7 @@ fn binding_guard(
                     ; jne =>miss
                 );
             }
-            slab_base(ops, view, miss);
+            slab_base(ops, relocations, view);
             dynasm!(ops
                 ; .arch x64
                 ; mov r10, r11
@@ -4690,7 +4678,7 @@ fn emit_inline_method_guard(
             ; jne =>miss
         );
     }
-    slab_base(ops, view, miss);
+    slab_base(ops, relocations, view);
     dynasm!(ops ; .arch x64 ; mov r9, [r8 + guard.method_value_byte as i32]);
 
     let guarded = ops.new_dynamic_label();
@@ -4937,36 +4925,56 @@ fn object_header(
 }
 
 fn shape_state_guard(ops: &mut Assembler, view: &JitCompileSnapshot, miss: DynamicLabel) {
-    dynasm!(ops
-        ; .arch x64
-        ; movzx r10d, BYTE [r11 + view.object_shape_cache_mode_byte as i32]
-    );
-    if view.object_shape_cache_fast == 0 {
-        dynasm!(ops ; .arch x64 ; test r10d, r10d ; jnz =>miss);
-    } else {
-        dynasm!(ops
-            ; .arch x64
-            ; cmp r10d, view.object_shape_cache_fast as i32
-            ; jne =>miss
-        );
-    }
-    dynasm!(ops
-        ; .arch x64
-        ; cmp BYTE [r11 + view.object_chain_link_opaque_byte as i32], 0
-        ; jne =>miss
-    );
+    object_flags_guard(ops, view, otter_vm::jit::JIT_OBJECT_SHAPE_STATE_MASK, miss);
 }
 
 fn ordinary_lookup_state_guard(ops: &mut Assembler, view: &JitCompileSnapshot, miss: DynamicLabel) {
-    shape_state_guard(ops, view, miss);
-    dynasm!(ops
-        ; .arch x64
-        ; cmp BYTE [r11 + view.object_slot_attrs_overridden_byte as i32], 0
-        ; jne =>miss
+    object_flags_guard(
+        ops,
+        view,
+        otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK,
+        miss,
     );
 }
 
-fn slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, miss: DynamicLabel) {
+/// Branch to `miss` unless in-object slot `slot` exists in the object whose
+/// header is in `r11` (its `u8` in-object capacity is above `slot`).
+fn inline_capacity_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    slot: u32,
+    miss: DynamicLabel,
+) {
+    if slot > u32::from(u8::MAX) {
+        dynasm!(ops ; .arch x64 ; jmp =>miss);
+        return;
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; cmp BYTE [r11 + view.object_inline_capacity_byte as i32], slot as u8 as i8
+        ; jbe =>miss
+    );
+}
+
+/// Branch to `miss` when any bit of `mask` is set in the flag byte of the
+/// object whose header is in `r11`.
+fn object_flags_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    mask: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; test BYTE [r11 + view.object_flags_byte as i32], mask as i8
+        ; jnz =>miss
+    );
+}
+
+/// Slot base of the object whose header is in `r11`, into `r8` (`r10` is
+/// clobbered): its in-object slots while the slab handle is null, otherwise
+/// the slab's words — cage base plus handle plus the fixed word offset.
+fn slab_base(ops: &mut Assembler, relocations: &mut RelocationCapture, view: &JitCompileSnapshot) {
     let spilled = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -4977,9 +4985,18 @@ fn slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, miss: DynamicLabel)
         ; lea r8, [r11 + view.object_inline_values_byte as i32]
         ; jmp =>done
         ; =>spilled
-        ; mov r8, [r11 + view.object_values_ptr_byte as i32]
-        ; test r8, r8
-        ; jz =>miss
+    );
+    symbolic(
+        ops,
+        relocations,
+        8,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; add r8, r10
+        ; add r8, view.object_slab_words_byte as i32
         ; =>done
     );
 }

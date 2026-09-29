@@ -490,8 +490,13 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         }
         let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         proto_root = Value::object(
-            object::alloc_object_with_shape_roots(heap, shape_root, &mut no_extra_roots)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?,
+            object::alloc_object_with_shape_roots(
+                heap,
+                shape_root,
+                crate::object::DEFAULT_INLINE_CAPACITY,
+                &mut no_extra_roots,
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
         );
         let proto = proto_root
             .as_object()
@@ -538,8 +543,13 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     // `@@toStringTag` of its own.
     wrap_root = Value::object({
         let mut visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-        let proto = object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let proto = object::alloc_object_with_shape_roots(
+            heap,
+            shape_root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            &mut visit,
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let parent = parent_value
             .as_object()
             .expect("Iterator.prototype stays rooted during bootstrap");

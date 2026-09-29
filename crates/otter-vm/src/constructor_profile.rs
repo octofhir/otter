@@ -179,9 +179,8 @@ impl Interpreter {
             });
         }
         let profile = self.constructor_instance_profiles.entry(key).or_default();
-        let crossed_inline_capacity = profile.needs_invalidation.replace(false)
-            || (profile.learned.get() <= crate::object::INLINE_SLOT_CAP
-                && learned > crate::object::INLINE_SLOT_CAP);
+        let crossed_inline_capacity =
+            profile.needs_invalidation.replace(false) || learned > profile.learned.get();
         profile.learned.set(profile.learned.get().max(learned));
         if closure.is_none() && profile.last_receiver.replace(Some(receiver)).is_none() {
             self.pending_constructor_samples
@@ -189,10 +188,10 @@ impl Interpreter {
                 .push(PendingConstructorSample { key, closure: None });
         }
         if crossed_inline_capacity {
-            // Callers compiled against an inline allocation plan for this
-            // template would keep handing out receivers without the slab the
-            // body needs; retire them so they re-bake against the runtime
-            // preparation.
+            // Callers compiled against an allocation plan for this template
+            // would keep handing out receivers with fewer in-object slots than
+            // the body now fills; retire them so they re-bake with the larger
+            // capacity.
             self.invalidate_jit_function(key.0);
         }
     }
@@ -226,9 +225,7 @@ impl Interpreter {
             let Some(profile) = profile else {
                 continue;
             };
-            if profile.learned.get() <= crate::object::INLINE_SLOT_CAP
-                && learned > crate::object::INLINE_SLOT_CAP
-            {
+            if learned > profile.learned.get() {
                 profile.needs_invalidation.set(true);
             }
             profile.learned.set(profile.learned.get().max(learned));

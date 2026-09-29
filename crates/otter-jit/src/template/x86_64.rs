@@ -2816,10 +2816,12 @@ fn emit_existing_property_load(
                         // The live ordinary lookup flags, not sidecar absence,
                         // determine whether their shape slots remain valid.
                         emit_template_shape_state_guard(ops, view, header, next);
-                        dynasm!(ops
-                            ; .arch x64
-                            ; cmp BYTE [Rq(header) + view.object_slot_attrs_overridden_byte as i32], 0
-                            ; jne =>next
+                        emit_template_flags_guard(
+                            ops,
+                            view,
+                            header,
+                            otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN,
+                            next,
                         );
                         emit_template_shape_identity_guard(ops, view, header, shape, next);
                     } else {
@@ -2845,7 +2847,7 @@ fn emit_existing_property_load(
                 } => emit_template_prototype(ops, relocations, view, 10, false, next),
                 otter_vm::JitCacheIrOp::LoadField { object, value_byte } => {
                     let header = if object == 0 { 10 } else { 8 };
-                    emit_template_slab_base(ops, view, header, 11, next);
+                    emit_template_slab_base(ops, relocations, view, header, 11, 9);
                     dynasm!(ops
                         ; .arch x64
                         ; mov rax, [r11 + value_byte as i32]
@@ -2960,11 +2962,12 @@ fn emit_existing_property_store(
                         ; jmp =>storage_fits
                         ; =>inline
                         ; shr r11d, 3
-                        ; cmp r11d, view.object_inline_slot_cap as i32
+                        ; movzx r9d, BYTE [r10 + view.object_inline_capacity_byte as i32]
+                        ; cmp r11d, r9d
                         ; jae =>next
                         ; =>storage_fits
-                        ; cmp BYTE [r10 + view.object_extensible_byte as i32], 0
-                        ; je =>next
+                        ; test BYTE [r10 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
+                        ; jz =>next
                         ; movzx r9d, WORD [r10 + view.object_slab_len_byte as i32]
                         ; cmp r9d, r11d
                         ; jne =>next
@@ -2974,7 +2977,7 @@ fn emit_existing_property_store(
                     object: 0,
                     value_byte,
                 } => {
-                    emit_template_slab_base(ops, view, 10, 11, next);
+                    emit_template_slab_base(ops, relocations, view, 10, 11, 9);
                     emit_load_reg(ops, 2, value);
                     terminal = true;
                     if !matches!(
@@ -2990,7 +2993,6 @@ fn emit_existing_property_store(
                     object: 0,
                     shape,
                     new_len,
-                    initialize_inline,
                 } if terminal => {
                     let Some(otter_vm::JitCacheIrOp::StoreField {
                         object: 0,
@@ -3003,17 +3005,6 @@ fn emit_existing_property_store(
                         terminal = false;
                         break;
                     };
-                    if initialize_inline {
-                        let initialized = ops.new_dynamic_label();
-                        dynasm!(ops
-                            ; .arch x64
-                            ; cmp DWORD [r10 + view.object_slab_handle_byte as i32], 0
-                            ; jne =>initialized
-                            ; lea r8, [r10 + view.object_inline_values_byte as i32]
-                            ; mov [r10 + view.object_values_ptr_byte as i32], r8
-                            ; =>initialized
-                        );
-                    }
                     dynasm!(ops
                         ; .arch x64
                         ; mov WORD [r10 + view.object_slab_len_byte as i32], new_len as i16
@@ -3092,14 +3083,33 @@ fn emit_template_fast_state_guard(
     header: u8,
     miss: DynamicLabel,
 ) {
+    emit_template_flags_guard(
+        ops,
+        view,
+        header,
+        otter_vm::jit::JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE
+            | otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN,
+        miss,
+    );
     dynasm!(ops
         ; .arch x64
-        ; cmp BYTE [Rq(header) + view.object_shape_cache_mode_byte as i32], view.object_shape_cache_fast as i8
-        ; jne =>miss
-        ; cmp BYTE [Rq(header) + view.object_slot_attrs_overridden_byte as i32], 0
-        ; jne =>miss
         ; cmp DWORD [Rq(header) + view.object_exotic_handle_byte as i32], 0
         ; jne =>miss
+    );
+}
+
+/// Branch to `miss` when any bit of `mask` is set in the object's flag byte.
+fn emit_template_flags_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    header: u8,
+    mask: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; test BYTE [Rq(header) + view.object_flags_byte as i32], mask as i8
+        ; jnz =>miss
     );
 }
 
@@ -3120,12 +3130,12 @@ fn emit_template_shape_state_guard(
     header: u8,
     miss: DynamicLabel,
 ) {
-    dynasm!(ops
-        ; .arch x64
-        ; cmp BYTE [Rq(header) + view.object_shape_cache_mode_byte as i32], view.object_shape_cache_fast as i8
-        ; jne =>miss
-        ; cmp BYTE [Rq(header) + view.object_chain_link_opaque_byte as i32], 0
-        ; jne =>miss
+    emit_template_flags_guard(
+        ops,
+        view,
+        header,
+        otter_vm::jit::JIT_OBJECT_SHAPE_STATE_MASK,
+        miss,
     );
 }
 
@@ -3177,24 +3187,44 @@ fn emit_template_prototype(
     }
 }
 
-fn emit_template_slab_base(
+/// Compute the slot base of the object whose `GcHeader` pointer is in
+/// `header` into `destination` (`scratch` is clobbered). While the
+/// out-of-line slab handle is null the slots are in-object at
+/// `header + object_inline_values_byte`; a spilled object's slots are its
+/// slab's words: cage base plus the compressed handle plus the slab's fixed
+/// word offset.
+pub(crate) fn emit_template_slab_base(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
     destination: u8,
-    miss: DynamicLabel,
+    scratch: u8,
 ) {
+    debug_assert_ne!(destination, scratch);
+    debug_assert_ne!(header, scratch);
     let ready = ops.new_dynamic_label();
+    let external = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
-        ; cmp DWORD [Rq(header) + view.object_slab_handle_byte as i32], 0
-        ; jne >external
+        ; mov Rd(scratch), [Rq(header) + view.object_slab_handle_byte as i32]
+        ; test Rd(scratch), Rd(scratch)
+        ; jnz =>external
         ; lea Rq(destination), [Rq(header) + view.object_inline_values_byte as i32]
         ; jmp =>ready
-        ; external:
-        ; mov Rq(destination), [Rq(header) + view.object_values_ptr_byte as i32]
-        ; test Rq(destination), Rq(destination)
-        ; jz =>miss
+        ; =>external
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        destination,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; add Rq(destination), Rq(scratch)
+        ; add Rq(destination), view.object_slab_words_byte as i32
         ; =>ready
     );
 }

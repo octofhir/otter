@@ -29,6 +29,10 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::{JitCompileSnapshot, Value};
 
+/// Bit index of the chain-link opacity flag for `tbnz`.
+const CHAIN_LINK_OPAQUE_BIT: u32 =
+    otter_vm::jit::JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE.trailing_zeros();
+
 /// Prototype links the probe follows before handing the walk to the VM.
 pub(super) const MAX_CHAIN: u32 = 32;
 
@@ -95,8 +99,16 @@ pub(super) fn emit(
             ; ldrh w9, [x10, view.object_slab_len_byte]
             ; cmp w12, w9
             ; b.hs =>miss
-            ; ldr x13, [x10, view.object_values_ptr_byte]
-            ; cbz x13, =>miss
+            // The bag's slot base: in-object until it spills, then its
+            // slab's words (`x11` holds the cage base).
+            ; ldr w13, [x10, view.object_slab_handle_byte]
+            ; cbz w13, >bag_inline
+            ; add x13, x11, x13
+            ; add x13, x13, view.object_slab_words_byte
+            ; b >bag_ready
+            ; bag_inline:
+            ; add x13, x10, view.object_inline_values_byte
+            ; bag_ready:
             ; ldr x12, [x13, x12, lsl #3]
         );
         // The prototype must be an ordinary object; anything else throws.
@@ -126,8 +138,8 @@ pub(super) fn emit(
             ; =>walk
             ; movz w14, MAX_CHAIN
             ; =>step
-            ; ldrb w9, [x13, view.object_chain_link_opaque_byte]
-            ; cbnz w9, =>miss
+            ; ldrb w9, [x13, view.object_flags_byte]
+            ; tbnz w9, CHAIN_LINK_OPAQUE_BIT, =>miss
             ; ldr w9, [x13, view.jit_proto_byte]
             ; cbz w9, =>no
             ; add x13, x11, x9

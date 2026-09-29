@@ -140,8 +140,13 @@ impl FunctionKindPrototypes {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                 };
-                object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?
+                object::alloc_object_with_shape_roots(
+                    heap,
+                    shape_root,
+                    crate::object::DEFAULT_INLINE_CAPACITY,
+                    &mut visit,
+                )
+                .map_err(|_| JsSurfaceError::OutOfMemory)?
             });
             let proto = proto_root
                 .as_object()
@@ -180,8 +185,13 @@ impl FunctionKindPrototypes {
                     function_proto_value.trace_value_slots(visitor);
                     proto_root.trace_value_slots(visitor);
                 };
-                object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?
+                object::alloc_object_with_shape_roots(
+                    heap,
+                    shape_root,
+                    crate::object::DEFAULT_INLINE_CAPACITY,
+                    &mut visit,
+                )
+                .map_err(|_| JsSurfaceError::OutOfMemory)?
             });
             let mut ctor = ctor_root
                 .as_object()
@@ -456,6 +466,7 @@ impl Interpreter {
                 object::alloc_object_with_shape_roots(
                     &mut self.gc_heap,
                     self.shape_runtime.root(),
+                    crate::object::DEFAULT_INLINE_CAPACITY,
                     &mut visit,
                 )
             }) else {
@@ -558,6 +569,7 @@ impl Interpreter {
             object::alloc_object_with_shape_roots(
                 &mut self.gc_heap,
                 self.shape_runtime.root(),
+                crate::object::DEFAULT_INLINE_CAPACITY,
                 &mut visit,
             )
             .ok()?

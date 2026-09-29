@@ -85,9 +85,17 @@ pub(super) fn emit(
             ; movzx ecx, WORD [r8 + view.object_slab_len_byte as i32]
             ; cmp eax, ecx
             ; jae =>miss
-            ; mov rcx, [r8 + view.object_values_ptr_byte as i32]
-            ; test rcx, rcx
-            ; jz =>miss
+            // The bag's slot base: in-object until it spills, then its
+            // slab's words (`r9` holds the cage base).
+            ; mov ecx, [r8 + view.object_slab_handle_byte as i32]
+            ; test ecx, ecx
+            ; jnz >bag_spilled
+            ; lea rcx, [r8 + view.object_inline_values_byte as i32]
+            ; jmp >bag_base
+            ; bag_spilled:
+            ; add rcx, r9
+            ; add rcx, view.object_slab_words_byte as i32
+            ; bag_base:
             ; mov rdx, [rcx + rax * 8]
         );
         // The prototype must be an ordinary object; anything else throws.
@@ -123,8 +131,8 @@ pub(super) fn emit(
             ; =>walk
             ; mov ecx, MAX_CHAIN
             ; =>step
-            ; cmp BYTE [r10 + view.object_chain_link_opaque_byte as i32], 0
-            ; jne =>miss
+            ; test BYTE [r10 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE as i8
+            ; jnz =>miss
             ; mov eax, [r10 + view.jit_proto_byte as i32]
             ; test eax, eax
             ; jz =>no

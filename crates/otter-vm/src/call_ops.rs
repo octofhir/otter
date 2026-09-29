@@ -732,7 +732,7 @@ impl Interpreter {
     /// The dynamic callable has already passed the generated identity guard.
     /// This owns the observable `new.target.prototype` lookup and
     /// `OrdinaryCreateFromConstructor` allocation, but does not start the
-    /// constructor body. The caller's Machine root record keeps its arguments
+    /// constructor body. The caller's call-site root homes keep its arguments
     /// live while this local root provider protects the callable, prototype,
     /// and freshly allocated receiver across reentrant accessors and moving GC.
     pub fn jit_prepare_base_construct_receiver(

@@ -50,23 +50,27 @@ impl Interpreter {
         if owner == function_id {
             return true;
         }
-        // SAFETY: generated linkage retains the caller root record until after
-        // this non-reentrant check. The callee has already left its Machine body.
-        let Some(roots) = (unsafe {
-            (self.jit_machine_roots as *const crate::jit::JitMachineRootRecord).as_ref()
-        }) else {
-            return false;
-        };
-        if roots.code_object_id != code_object_id {
-            return false;
-        }
-        let Some(record) = self
-            .jit_code_registry
-            .safepoint_record(code_object_id, roots.safepoint_id)
+        // The physical caller is the first frame above the callee that names
+        // a call site; published inline parents between them name none.
+        // SAFETY: generated linkage keeps the whole chain published until
+        // after this non-reentrant check.
+        let Some(call_site) = self
+            .jit_native_frames()
+            .skip(1)
+            .map(|frame| unsafe { &*frame })
+            .find(|frame| frame.call_site != crate::native_abi::NO_SAFEPOINT)
+            .filter(|frame| u64::from(frame.code_object_id) == code_object_id)
+            .map(|frame| frame.call_site)
         else {
             return false;
         };
-        if !record.inline_frames_published || record.id != roots.safepoint_id {
+        let Some(record) = self
+            .jit_code_registry
+            .safepoint_record(code_object_id, call_site)
+        else {
+            return false;
+        };
+        if !record.inline_frames_published || record.id != call_site {
             return false;
         }
         let Some(source) = record.inline_frames.last() else {

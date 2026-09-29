@@ -352,7 +352,6 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
-            machine_roots_ptr: std::ptr::null_mut(),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
@@ -409,7 +408,6 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
-            machine_roots_ptr: std::ptr::null_mut(),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };

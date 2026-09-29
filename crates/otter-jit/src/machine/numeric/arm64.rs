@@ -16,7 +16,8 @@
 //! - Allocating calls copy late-use tagged roots into the layout's native save
 //!   area before constructing the VM allocation packet. Direct base constructs
 //!   probe non-reentrant receiver allocation before an observable fallback;
-//!   reentrant direct calls link the same homes through the VM-owned root chain.
+//!   reentrant calls name their safepoint in the frame record, whose
+//!   prologue-published `machine_roots` base locates the same homes.
 //!   Both reload every collector-rewritten value before success, throw, or
 //!   exact deoptimization.
 //! - A failed entry Number guard writes logical PC zero. Mid-function tagged
@@ -138,10 +139,7 @@ use crate::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET,
-        MACHINE_ROOT_RECORD_BASE_OFFSET, MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET,
-        MACHINE_ROOT_RECORD_COUNT_OFFSET, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET,
-        MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET, MACHINE_ROOT_RECORD_SIZE,
-        MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_MACHINE_ROOTS_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
         NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
         NUMBER_TAG_HI16, PropertySourceCell, THREAD_OFFSET, TransitionTable, VALUE_HOLE,
@@ -464,7 +462,7 @@ fn emit_committed_runtime_call(
     // exception has been handed to the propagation router. No status from
     // either entry can request deoptimization or replay.
     emit_save_safepoint_roots(ops, frame, site)?;
-    emit_publish_machine_roots(ops, frame, site)?;
+    emit_stamp_call_site(ops, site);
     if literal {
         emit_value_span_arguments(ops, sequence, frame, site, arguments.iter().copied())?;
     } else {
@@ -478,7 +476,7 @@ fn emit_committed_runtime_call(
                 value,
                 u8::try_from(index + 1)
                     .map_err(|_| Unsupported::OperandShape("scalar committed runtime argument"))?,
-                MACHINE_ROOT_RECORD_SIZE,
+                0,
             )?;
         }
     }
@@ -515,7 +513,6 @@ fn emit_committed_runtime_call(
     );
     match descriptor.exceptional {
         ExceptionalEdge::LandingPad(target) => {
-            emit_clear_machine_roots(ops);
             emit_reload_safepoint_roots(ops, frame, site)?;
             let target =
                 block_labels
@@ -527,7 +524,6 @@ fn emit_committed_runtime_call(
             emit_landing_pad_transfer(ops, frame, result_location, 17, allocation, id, target)?;
         }
         ExceptionalEdge::Propagate => {
-            emit_clear_machine_roots(ops);
             emit_reload_safepoint_roots(ops, frame, site)?;
             dynasm!(ops ; .arch aarch64 ; mov x0, x17 ; b =>throw_value);
         }
@@ -543,10 +539,8 @@ fn emit_committed_runtime_call(
         }
     }
     dynasm!(ops ; .arch aarch64 ; =>fatal);
-    emit_clear_machine_roots(ops);
     emit_reload_safepoint_roots(ops, frame, site)?;
     dynasm!(ops ; .arch aarch64 ; b =>fatal_exit ; =>completed);
-    emit_clear_machine_roots(ops);
     emit_reload_safepoint_roots(ops, frame, site)?;
     emit_store_allocated_tagged(ops, frame, result_location, 17, 0)?;
     Ok(byte_pc)
@@ -640,18 +634,12 @@ fn emit_committed_pair_call(
         ))?;
 
     emit_save_safepoint_roots(ops, frame, site)?;
-    emit_publish_machine_roots(ops, frame, site)?;
+    emit_stamp_call_site(ops, site);
     emit_load_u64(ops, 1, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; mov x2, x1);
     for (index, value) in arguments.iter().copied().enumerate() {
         if named_property && index + 1 == semantic_arity {
-            emit_load_allocated_tagged(
-                ops,
-                frame,
-                locations[index],
-                (index + 1) as u8,
-                MACHINE_ROOT_RECORD_SIZE,
-            )?;
+            emit_load_allocated_tagged(ops, frame, locations[index], (index + 1) as u8, 0)?;
             continue;
         }
         emit_load_safepoint_root(
@@ -661,7 +649,7 @@ fn emit_committed_pair_call(
             value,
             u8::try_from(index + 1)
                 .map_err(|_| Unsupported::OperandShape("scalar committed pair runtime argument"))?,
-            MACHINE_ROOT_RECORD_SIZE,
+            0,
         )?;
     }
     emit_load_u64(ops, 15, u64::from(logical_pc));
@@ -686,7 +674,6 @@ fn emit_committed_pair_call(
         ; mov x17, x0
         ; mov x15, x1
     );
-    emit_clear_machine_roots(ops);
     emit_reload_safepoint_roots(ops, frame, site)?;
     emit_store_allocated_tagged(ops, frame, payload_location, 17, 0)?;
     emit_store_allocated_tagged(ops, frame, status_location, 15, 0)?;
@@ -3582,7 +3569,7 @@ fn emit_with_reach(
                         )?;
                     }
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
-                    emit_publish_machine_roots(&mut ops, frame, site)?;
+                    emit_stamp_call_site(&mut ops, site);
                     let packet = super::value_packet_frame(sequence)?;
                     let inline_start = packet
                         .raw_start
@@ -3694,7 +3681,7 @@ fn emit_with_reach(
                                     site,
                                     receiver.value,
                                     9,
-                                    MACHINE_ROOT_RECORD_SIZE,
+                                    0,
                                 )?;
                                 emit_method_guard_from_tagged_register(
                                     &mut ops,
@@ -3786,9 +3773,6 @@ fn emit_with_reach(
                                 {
                                     let offset = root_offset(frame, root.save_slot)?
                                         .checked_add(sp_bias)
-                                        .and_then(|offset| {
-                                            offset.checked_add(MACHINE_ROOT_RECORD_SIZE)
-                                        })
                                         .ok_or(Unsupported::OperandShape(
                                             "scalar direct call canonical root offset",
                                         ))?;
@@ -3796,15 +3780,7 @@ fn emit_with_reach(
                                     return Ok(());
                                 }
                                 let location = locations[usize::from(source)];
-                                emit_load_allocated_tagged(
-                                    ops,
-                                    frame,
-                                    location,
-                                    target,
-                                    sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
-                                        Unsupported::OperandShape("scalar direct call stack bias"),
-                                    )?,
-                                )
+                                emit_load_allocated_tagged(ops, frame, location, target, sp_bias)
                             },
                             |ops, destination, source, sp_bias| {
                                 let location = *locations.get(usize::from(destination)).ok_or(
@@ -3817,7 +3793,6 @@ fn emit_with_reach(
                                 // survives the activation-root descriptor cleanup.
                                 dynasm!(ops ; .arch aarch64 ; mov x17, x0);
                                 inline_calls::leave(ops, frame, instruction, inline_start)?;
-                                emit_clear_machine_roots(ops);
                                 emit_reload_safepoint_roots(ops, frame, site)?;
                                 dynasm!(ops ; .arch aarch64 ; mov x0, x17);
                                 Ok(())
@@ -3841,25 +3816,12 @@ fn emit_with_reach(
                                     .checked_add(sp_bias)
                                     .ok_or(Unsupported::OperandShape(
                                         "scalar construct linkage root offset",
-                                    ))?
-                                    .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                                    .ok_or(Unsupported::OperandShape(
-                                        "scalar construct receiver root offset",
                                     ))?;
                                 emit_frame_str_x(ops, source, offset);
                                 Ok(())
                             },
                             |ops, sp_bias| {
-                                emit_reload_safepoint_roots_with_bias(
-                                    ops,
-                                    frame,
-                                    site,
-                                    sp_bias.checked_add(MACHINE_ROOT_RECORD_SIZE).ok_or(
-                                        Unsupported::OperandShape(
-                                            "scalar construct root reload bias",
-                                        ),
-                                    )?,
-                                )
+                                emit_reload_safepoint_roots_with_bias(ops, frame, site, sp_bias)
                             },
                             |_, _, _| {
                                 Err(Unsupported::OperandShape(
@@ -3904,7 +3866,7 @@ fn emit_with_reach(
                                 ; =>call_with_this_guard_miss
                             );
                             emit_save_safepoint_roots(&mut ops, frame, site)?;
-                            emit_publish_machine_roots(&mut ops, frame, site)?;
+                            emit_stamp_call_site(&mut ops, site);
                             dynasm!(ops ; .arch aarch64 ; =>generic_ready);
                         }
                         if *kind == DirectCallKind::Forward {
@@ -3972,7 +3934,6 @@ fn emit_with_reach(
                                 ; mov x17, x0
                                 ; mov x15, x1
                             );
-                            emit_clear_machine_roots(&mut ops);
                             emit_reload_safepoint_roots(&mut ops, frame, site)?;
                             let generic_threw = ops.new_dynamic_label();
                             dynasm!(ops
@@ -4006,7 +3967,6 @@ fn emit_with_reach(
                         } else {
                             // Spread packets need canonical iterator expansion
                             // and remain exact pre-effect exits.
-                            emit_clear_machine_roots(&mut ops);
                             emit_reload_safepoint_roots(&mut ops, frame, site)?;
                             dynasm!(ops ; .arch aarch64 ; b =>deopt);
                         }
@@ -4014,7 +3974,6 @@ fn emit_with_reach(
                     // Inline-frame publication fails only at the activation
                     // bound: a resource limit, not a failed proof.
                     dynasm!(ops ; .arch aarch64 ; b =>direct_bail ; =>publication_fail);
-                    emit_clear_machine_roots(&mut ops);
                     emit_reload_safepoint_roots(&mut ops, frame, site)?;
                     dynasm!(ops ; .arch aarch64 ; b =>transition);
                     dynasm!(ops
@@ -4649,17 +4608,7 @@ fn emit_with_reach(
     } else {
         DEOPT_DUMP_BYTES
     };
-    let committed_runtime_cold_bytes = if sequence.call_descriptors().iter().any(|descriptor| {
-        matches!(
-            &descriptor.target,
-            CallTarget::CommittedRuntime { .. } | CallTarget::LiteralAllocation { .. }
-        )
-    }) {
-        MACHINE_ROOT_RECORD_SIZE
-    } else {
-        0
-    };
-    let cold_dump_bytes = deopt_cold_bytes.max(committed_runtime_cold_bytes);
+    let cold_dump_bytes = deopt_cold_bytes;
     let generated_stack_frame_bytes =
         frame
             .frame_bytes()
@@ -4846,63 +4795,13 @@ fn emit_reload_safepoint_roots_with_bias(
     Ok(())
 }
 
-fn emit_publish_machine_roots(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    frame: MachineFrameLayout,
-    site: &MachineSafepointSite,
-) -> Result<(), Unsupported> {
-    emit_publish_machine_roots_with_bias(ops, frame, site, 0)
-}
-
-fn emit_publish_machine_roots_with_bias(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    frame: MachineFrameLayout,
-    site: &MachineSafepointSite,
-    outer_sp_bias: u32,
-) -> Result<(), Unsupported> {
-    dynasm!(ops ; .arch aarch64 ; sub sp, sp, MACHINE_ROOT_RECORD_SIZE);
-    if site.roots.is_empty() {
-        dynasm!(ops ; .arch aarch64 ; mov x13, xzr);
-    } else {
-        let offset = root_offset(frame, 0)?
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .and_then(|offset| offset.checked_add(outer_sp_bias))
-            .ok_or(Unsupported::OperandShape("scalar machine root base"))?;
-        if offset <= 4095 {
-            dynasm!(ops ; .arch aarch64 ; add x13, sp, offset);
-        } else {
-            emit_load_u64(ops, 13, u64::from(offset));
-            dynasm!(ops ; .arch aarch64 ; add x13, sp, x13);
-        }
-    }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x9, [x19, MACHINE_ROOTS_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; str x10, [sp, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET]
-        ; str x13, [sp, MACHINE_ROOT_RECORD_BASE_OFFSET]
-        ; movz w11, site.roots.len() as u32
-        // One word initializes both root_count and the reserved zero field.
-        ; str w11, [sp, MACHINE_ROOT_RECORD_COUNT_OFFSET]
-        ; movz w11, site.id.0
-        ; str w11, [sp, MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET]
-        ; ldr x11, [x19, NATIVE_FRAME_OFFSET]
-        ; ldr w11, [x11, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
-        ; str x11, [sp, MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET]
-        ; mov x12, sp
-        ; str x12, [x9]
-    );
-    Ok(())
-}
-
-fn emit_clear_machine_roots(ops: &mut dynasmrt::aarch64::Assembler) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x9, [x19, MACHINE_ROOTS_PTR_OFFSET]
-        ; ldr x10, [sp, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET]
-        ; str x10, [x9]
-        ; add sp, sp, MACHINE_ROOT_RECORD_SIZE
-    );
+/// Name the safepoint of the call about to be made in the executing frame's
+/// record. A collection during the call resolves `(code_object_id, call_site)`
+/// to the saved root homes at the frame's `machine_roots` base.
+fn emit_stamp_call_site(ops: &mut dynasmrt::aarch64::Assembler, site: &MachineSafepointSite) {
+    dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, NATIVE_FRAME_OFFSET]);
+    emit_load_u64(ops, 10, u64::from(site.id.0));
+    dynasm!(ops ; .arch aarch64 ; str w10, [x9, NATIVE_FRAME_CALL_SITE_OFFSET]);
 }
 
 fn emit_load_allocated_tagged(
@@ -5248,8 +5147,19 @@ fn emit_prologue(
         ; .arch aarch64
         ; mov x19, x0
         ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
-        ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
+    // Publish the root-home base once; call sites then name only their
+    // safepoint.
+    if let Ok(roots) = frame.root_offset(0) {
+        if roots <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; add x16, sp, roots);
+        } else {
+            emit_load_u64(ops, 16, u64::from(roots));
+            dynasm!(ops ; .arch aarch64 ; add x16, sp, x16);
+        }
+        dynasm!(ops ; .arch aarch64 ; str x16, [x17, NATIVE_FRAME_MACHINE_ROOTS_OFFSET]);
+    }
+    dynasm!(ops ; .arch aarch64 ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]);
 }
 
 /// Store the forwarding function's parameter-scope context, the forward
@@ -6104,10 +6014,7 @@ mod tests {
                 true,
             )
             .expect("committed-runtime emission");
-            assert_eq!(
-                emission.generated_stack_frame_bytes,
-                frame.frame_bytes() + super::MACHINE_ROOT_RECORD_SIZE
-            );
+            assert_eq!(emission.generated_stack_frame_bytes, frame.frame_bytes());
             assert!(
                 emission
                     .structural_regions

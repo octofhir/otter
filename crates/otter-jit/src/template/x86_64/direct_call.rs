@@ -39,7 +39,7 @@ use crate::{
         CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
         CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET, FUNCTION_ENTRY_GENERATION_CELL_OFFSET,
         GENERATED_DEPTH_LIMIT_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_CALLER_OFFSET,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_CALLER_OFFSET,
         NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_DEPTH_OFFSET,
         NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_STACK_LIMIT_OFFSET,
     },
@@ -681,6 +681,7 @@ fn emit_construct_with_arguments(
         ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
         ; add r9d, 1
         ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
+        ; mov DWORD [rsp + NATIVE_FRAME_CALL_SITE_OFFSET as i32], -1
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
     );
     crate::entry::x86_64_tiering::emit_entry(ops);
@@ -972,6 +973,7 @@ fn emit_candidate(
         ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
         ; add r9d, 1
         ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
+        ; mov DWORD [rsp + NATIVE_FRAME_CALL_SITE_OFFSET as i32], -1
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
     );
     crate::entry::x86_64_tiering::emit_entry(ops);

@@ -74,12 +74,10 @@ use crate::{
         CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
         DOUBLE_OFFSET_HI16, FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_DEPTH_LIMIT_OFFSET,
         GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, LAB_LIMIT_OFFSET,
-        LAB_TOP_OFFSET, MACHINE_ROOT_RECORD_BASE_OFFSET, MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET,
-        MACHINE_ROOT_RECORD_COUNT_OFFSET, MACHINE_ROOT_RECORD_PREVIOUS_OFFSET,
-        MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET, MACHINE_ROOT_RECORD_SIZE,
-        MACHINE_ROOTS_PTR_OFFSET, NATIVE_FRAME_CALLER_OFFSET, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET,
-        NATIVE_FRAME_DEPTH_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
-        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        LAB_TOP_OFFSET, NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_CALLER_OFFSET,
+        NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_DEPTH_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
+        NATIVE_FRAME_MACHINE_ROOTS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
         NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
         NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
         PropertySourceCell, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
@@ -2404,7 +2402,7 @@ pub(super) fn emit(
                     )?;
                     if publish_inline {
                         save_roots(&mut ops, frame, site)?;
-                        publish_roots(&mut ops, frame, site)?;
+                        stamp_call_site(&mut ops, site);
                         inline_calls::enter(
                             &mut ops,
                             view,
@@ -2464,7 +2462,6 @@ pub(super) fn emit(
                         dynasm!(ops ; .arch x64 ; jmp =>finish_error ; =>inline_fatal);
                         inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
                         dynasm!(ops ; .arch x64 ; jmp =>fatal ; =>inline_publication_fail);
-                        clear_roots(&mut ops);
                         reload_roots(&mut ops, frame, site)?;
                         dynasm!(ops ; .arch x64 ; jmp =>exit);
                     }
@@ -2876,19 +2873,7 @@ pub(super) fn emit(
                 0
             } else {
                 DEOPT_DUMP_BYTES as u32
-            }
-            .max(
-                if sequence.call_descriptors().iter().any(|descriptor| {
-                    matches!(
-                        descriptor.target,
-                        CallTarget::CommittedRuntime { .. } | CallTarget::LiteralAllocation { .. }
-                    )
-                }) {
-                    MACHINE_ROOT_RECORD_SIZE
-                } else {
-                    0
-                },
-            ),
+            },
         relocations,
         osr_headers,
         osr_regions,
@@ -2969,6 +2954,16 @@ fn prologue(ops: &mut Assembler, frame: MachineFrameLayout, saved: SavedFrame) {
         dynasm!(ops ; .arch x64 ; sub rsp, frame.spill_area_bytes() as i32);
     }
     dynasm!(ops ; .arch x64 ; mov r15, rdi);
+    // Publish the root-home base once; call sites then name only their
+    // safepoint.
+    if let Ok(roots) = frame.root_offset(0) {
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+            ; lea r11, [rsp + roots as i32]
+            ; mov [r10 + NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], r11
+        );
+    }
 }
 
 fn epilogue(ops: &mut Assembler, frame: MachineFrameLayout, saved: SavedFrame) {
@@ -3913,7 +3908,7 @@ fn literal_allocation_call(
         ))?;
 
     save_roots(ops, frame, site)?;
-    publish_roots(ops, frame, site)?;
+    stamp_call_site(ops, site);
     let count = u16::try_from(arguments.len())
         .map_err(|_| Unsupported::OperandShape("x86-64 value-span length"))?;
     if count == 0 {
@@ -3931,18 +3926,20 @@ fn literal_allocation_call(
             load_saved_root(ops, frame, site, value, 10)?;
             let offset = frame
                 .raw_offset(packet.raw_start + index as u16)
-                .map_err(|_| Unsupported::OperandShape("x86-64 value-span slot"))?
-                .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                .and_then(|offset| i32::try_from(offset).ok())
-                .ok_or(Unsupported::OperandShape("x86-64 value-span slot"))?;
+                .map_err(|_| Unsupported::OperandShape("x86-64 value-span slot"))
+                .and_then(|offset| {
+                    i32::try_from(offset)
+                        .map_err(|_| Unsupported::OperandShape("x86-64 value-span slot"))
+                })?;
             dynasm!(ops ; .arch x64 ; mov [rsp + offset], r10);
         }
         let offset = frame
             .raw_offset(packet.raw_start)
-            .map_err(|_| Unsupported::OperandShape("x86-64 value-span base"))?
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .and_then(|offset| i32::try_from(offset).ok())
-            .ok_or(Unsupported::OperandShape("x86-64 value-span base"))?;
+            .map_err(|_| Unsupported::OperandShape("x86-64 value-span base"))
+            .and_then(|offset| {
+                i32::try_from(offset)
+                    .map_err(|_| Unsupported::OperandShape("x86-64 value-span base"))
+            })?;
         dynasm!(ops ; .arch x64 ; lea rsi, [rsp + offset] ; mov edx, count as i32);
     }
     dynasm!(ops
@@ -3953,7 +3950,6 @@ fn literal_allocation_call(
     );
     runtime(ops, relocations, transitions.entry(target), target);
     dynasm!(ops ; .arch x64 ; call r11 ; mov r8, rax ; mov r9, rdx);
-    clear_roots(ops);
     reload_roots(ops, frame, site)?;
     dynasm!(ops ; .arch x64 ; test r9, r9 ; jne =>fatal);
     store_integer(ops, frame, result_location, 8)?;
@@ -4033,7 +4029,7 @@ fn committed_value_call(
         ))?;
 
     save_roots(ops, frame, site)?;
-    publish_roots(ops, frame, site)?;
+    stamp_call_site(ops, site);
     load64(ops, 6, VALUE_UNDEFINED);
     load64(ops, 2, VALUE_UNDEFINED);
     for (index, value) in arguments.iter().copied().enumerate() {
@@ -4061,7 +4057,6 @@ fn committed_value_call(
         ; jmp =>fatal
         ; =>js_throw
     );
-    clear_roots_preserving_r11(ops);
     reload_roots_preserving_r11(ops, frame, site)?;
     match descriptor.exceptional {
         ExceptionalEdge::LandingPad(target) => {
@@ -4084,10 +4079,8 @@ fn committed_value_call(
         ExceptionalEdge::None => unreachable!("validated above"),
     }
     dynasm!(ops ; .arch x64 ; =>fatal);
-    clear_roots_preserving_r11(ops);
     reload_roots_preserving_r11(ops, frame, site)?;
     dynasm!(ops ; .arch x64 ; jmp =>fatal_exit ; =>completed);
-    clear_roots_preserving_r11(ops);
     reload_roots_preserving_r11(ops, frame, site)?;
     store_integer(ops, frame, result_location, 11)?;
     Ok(())
@@ -4156,19 +4149,13 @@ fn committed_pair_call(
         .ok_or(Unsupported::OperandShape("x86-64 committed pair safepoint"))?;
 
     save_roots(ops, frame, site)?;
-    publish_roots(ops, frame, site)?;
+    stamp_call_site(ops, site);
     load64(ops, 6, VALUE_UNDEFINED);
     load64(ops, 2, VALUE_UNDEFINED);
     for index in 0..semantic_arity {
         let destination = [6_u8, 2, 1][index];
         if named_property && index + 1 == semantic_arity {
-            load_integer_with_bias(
-                ops,
-                frame,
-                locations[index],
-                destination,
-                MACHINE_ROOT_RECORD_SIZE,
-            )?;
+            load_integer_with_bias(ops, frame, locations[index], destination, 0)?;
         } else {
             let value = instruction.operands[index].value;
             load_saved_root(ops, frame, site, value, destination)?;
@@ -4187,61 +4174,20 @@ fn committed_pair_call(
         ; mov r8, rax
         ; mov r9, rdx
     );
-    clear_roots(ops);
     reload_roots(ops, frame, site)?;
     store_integer(ops, frame, locations[*payload_index], 8)?;
     store_integer(ops, frame, locations[*status_index], 9)?;
     Ok(())
 }
 
-fn publish_roots(
-    ops: &mut Assembler,
-    frame: MachineFrameLayout,
-    site: &MachineSafepointSite,
-) -> Result<(), Unsupported> {
-    dynasm!(ops ; .arch x64 ; sub rsp, MACHINE_ROOT_RECORD_SIZE as i32);
-    if site.roots.is_empty() {
-        dynasm!(ops ; .arch x64 ; xor r10d, r10d);
-    } else {
-        let offset = root_offset(frame, 0)?
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .and_then(|offset| i32::try_from(offset).ok())
-            .ok_or(Unsupported::OperandShape("x86-64 machine root base"))?;
-        dynasm!(ops ; .arch x64 ; lea r10, [rsp + offset]);
-    }
+/// Name the safepoint of the call about to be made in the executing frame's
+/// record; a collection during the call resolves it to the saved root homes
+/// at the frame's `machine_roots` base.
+fn stamp_call_site(ops: &mut Assembler, site: &MachineSafepointSite) {
     dynasm!(ops
         ; .arch x64
-        ; mov r11, [r15 + MACHINE_ROOTS_PTR_OFFSET as i32]
-        ; mov rax, [r11]
-        ; mov [rsp + MACHINE_ROOT_RECORD_PREVIOUS_OFFSET as i32], rax
-        ; mov [rsp + MACHINE_ROOT_RECORD_BASE_OFFSET as i32], r10
-        ; mov DWORD [rsp + MACHINE_ROOT_RECORD_COUNT_OFFSET as i32], site.roots.len() as i32
-        ; mov DWORD [rsp + MACHINE_ROOT_RECORD_SAFEPOINT_ID_OFFSET as i32], site.id.0 as i32
-        ; mov rax, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov eax, [rax + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [rsp + MACHINE_ROOT_RECORD_CODE_OBJECT_ID_OFFSET as i32], rax
-        ; mov [r11], rsp
-    );
-    Ok(())
-}
-
-fn clear_roots(ops: &mut Assembler) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov r11, [r15 + MACHINE_ROOTS_PTR_OFFSET as i32]
-        ; mov rax, [rsp + MACHINE_ROOT_RECORD_PREVIOUS_OFFSET as i32]
-        ; mov [r11], rax
-        ; add rsp, MACHINE_ROOT_RECORD_SIZE as i32
-    );
-}
-
-fn clear_roots_preserving_r11(ops: &mut Assembler) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10, [r15 + MACHINE_ROOTS_PTR_OFFSET as i32]
-        ; mov rax, [rsp + MACHINE_ROOT_RECORD_PREVIOUS_OFFSET as i32]
-        ; mov [r10], rax
-        ; add rsp, MACHINE_ROOT_RECORD_SIZE as i32
+        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov DWORD [r10 + NATIVE_FRAME_CALL_SITE_OFFSET as i32], site.id.0 as i32
     );
 }
 
@@ -4259,9 +4205,8 @@ fn load_saved_root(
             .ok_or(Unsupported::OperandShape(
                 "x86-64 canonical safepoint argument root",
             ))?;
-    let offset = root_offset(frame, root.save_slot)?
-        .checked_add(MACHINE_ROOT_RECORD_SIZE)
-        .and_then(|offset| i32::try_from(offset).ok())
+    let offset = i32::try_from(root_offset(frame, root.save_slot)?)
+        .ok()
         .ok_or(Unsupported::OperandShape(
             "x86-64 safepoint argument root offset",
         ))?;

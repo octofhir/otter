@@ -288,7 +288,6 @@ mod tests {
             native_frame: &mut native_frame,
             error: &mut error,
             generated_depth_limit: u64::MAX,
-            machine_roots_ptr: std::ptr::null_mut(),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
             global_this_offset: std::ptr::null(),

@@ -199,7 +199,6 @@ impl Interpreter {
             register_stack: crate::register_stack::RegisterStack::new(),
             jit_frame_cell: None,
             jit_detached_frame: 0,
-            jit_machine_roots: 0,
             work_budget: crate::WorkBudget::default(),
             work_budget_stats: crate::WorkBudgetStats::default(),
             work_budget_telemetry: crate::WorkBudgetTelemetry::default(),

@@ -1060,7 +1060,7 @@ checksum;
 
     runtime
         .force_gc()
-        .expect("completed ArrayConstruct calls must unlink native root records");
+        .expect("completed ArrayConstruct calls must leave only live call-site roots");
     let before_reuse = runtime.execution_stats();
     let reused = run(
         &mut runtime,

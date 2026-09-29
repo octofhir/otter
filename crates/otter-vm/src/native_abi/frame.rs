@@ -26,7 +26,9 @@
 //!   The innermost frame of the live compiled entry is the entry's
 //!   `JitCtx::native_frame`; [`VmThread::frame_cell`] names that cell.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
-//!   recomputed after any allocating or reentrant call.
+//!   recomputed after any allocating or reentrant call. An optimized frame
+//!   names its in-progress call's safepoint in its own record; nothing else
+//!   publishes its roots.
 //!
 //! # See also
 //! - [`super::safepoints`] for precise root maps.
@@ -233,6 +235,14 @@ pub struct NativeFrame {
     /// included. The logical JavaScript depth of generated frames; linkage
     /// computes it from the caller's value.
     pub depth: u32,
+    /// Safepoint of the optimized call this frame is making, or
+    /// [`super::NO_SAFEPOINT`]. Optimized code names it before every
+    /// collecting call; the collector resolves `(code_object_id, call_site)`
+    /// to the tagged root homes at [`Self::machine_roots`].
+    pub call_site: super::SafepointId,
+    /// Base of the optimized frame's tagged root homes, written once by its
+    /// prologue. Read only while `call_site` names a safepoint.
+    pub machine_roots: u64,
 }
 
 impl NativeFrame {
@@ -258,6 +268,8 @@ impl NativeFrame {
             arguments_object: crate::object::JsObject::null(),
             caller: 0,
             depth: 0,
+            call_site: super::NO_SAFEPOINT,
+            machine_roots: 0,
         }
     }
 
@@ -400,7 +412,7 @@ impl NativeFrame {
 const _: [(); 88] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
-const _: [(); 72] = [(); std::mem::size_of::<NativeFrame>()];
+const _: [(); 80] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, frame_cell)];
 const _: [(); 32] = [(); std::mem::offset_of!(VmThread, gc_heap)];
@@ -421,6 +433,8 @@ const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, argument_count)];
 const _: [(); 12] = [(); std::mem::offset_of!(NativeFrame, code_object_id)];
 const _: [(); 56] = [(); std::mem::offset_of!(NativeFrame, caller)];
 const _: [(); 64] = [(); std::mem::offset_of!(NativeFrame, depth)];
+const _: [(); 68] = [(); std::mem::offset_of!(NativeFrame, call_site)];
+const _: [(); 72] = [(); std::mem::offset_of!(NativeFrame, machine_roots)];
 
 /// Byte offset of [`NativeFrame::code_object_id`]. It shares the eight-byte
 /// word that starts at the register count, so linkage writes the register
@@ -429,8 +443,14 @@ pub const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, code_object_id) as u32;
 /// Byte offset of [`NativeFrame::caller`].
 pub const NATIVE_FRAME_CALLER_OFFSET: u32 = std::mem::offset_of!(NativeFrame, caller) as u32;
-/// Byte offset of [`NativeFrame::depth`].
+/// Byte offset of [`NativeFrame::depth`]. It shares an eight-byte word with
+/// `call_site`, so linkage initializes both with one store.
 pub const NATIVE_FRAME_DEPTH_OFFSET: u32 = std::mem::offset_of!(NativeFrame, depth) as u32;
+/// Byte offset of [`NativeFrame::call_site`].
+pub const NATIVE_FRAME_CALL_SITE_OFFSET: u32 = std::mem::offset_of!(NativeFrame, call_site) as u32;
+/// Byte offset of [`NativeFrame::machine_roots`].
+pub const NATIVE_FRAME_MACHINE_ROOTS_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, machine_roots) as u32;
 
 /// Byte offset of [`NativeFrame::register_base`].
 pub const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
@@ -534,7 +554,7 @@ mod tests {
     #[test]
     fn native_frame_layout_holds_no_binding_storage() {
         assert_eq!(std::mem::size_of::<VmFrameHeader>(), 12);
-        assert_eq!(std::mem::size_of::<NativeFrame>(), 72);
+        assert_eq!(std::mem::size_of::<NativeFrame>(), 80);
         assert_eq!(NATIVE_FRAME_REGISTER_BASE_OFFSET, 16);
         assert_eq!(NATIVE_FRAME_THIS_OFFSET, 24);
         assert_eq!(NATIVE_FRAME_NEW_TARGET_OFFSET, 32);
@@ -543,5 +563,7 @@ mod tests {
         assert_eq!(NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET, 52);
         assert_eq!(NATIVE_FRAME_CALLER_OFFSET, 56);
         assert_eq!(NATIVE_FRAME_DEPTH_OFFSET, 64);
+        assert_eq!(NATIVE_FRAME_CALL_SITE_OFFSET, 68);
+        assert_eq!(NATIVE_FRAME_MACHINE_ROOTS_OFFSET, 72);
     }
 }

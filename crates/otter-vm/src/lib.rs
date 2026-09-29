@@ -1290,8 +1290,6 @@ pub struct Interpreter {
     jit_frame_cell: Option<std::ptr::NonNull<u64>>,
     /// Innermost Rust-published frame while no compiled entry runs.
     jit_detached_frame: u64,
-    /// Top of the linked Machine IR allocator-root record chain.
-    jit_machine_roots: u64,
     /// Optional per-slice work policy shared by interpreter, JIT, native,
     /// RegExp, GC, and microtask checkpoints.
     work_budget: WorkBudget,

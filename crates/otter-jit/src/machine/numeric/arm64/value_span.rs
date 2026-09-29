@@ -34,15 +34,11 @@ pub(super) fn emit_value_span_arguments(
         return Err(Unsupported::OperandShape("scalar value-span capacity"));
     }
     for (index, value) in arguments.enumerate() {
-        emit_load_safepoint_root(ops, frame, site, value, 16, MACHINE_ROOT_RECORD_SIZE)?;
-        let offset = raw_offset(frame, packet.raw_start + index as u16)?
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .ok_or(Unsupported::OperandShape("scalar value-span slot"))?;
+        emit_load_safepoint_root(ops, frame, site, value, 16, 0)?;
+        let offset = raw_offset(frame, packet.raw_start + index as u16)?;
         emit_frame_str_x(ops, 16, offset);
     }
-    let offset = raw_offset(frame, packet.raw_start)?
-        .checked_add(MACHINE_ROOT_RECORD_SIZE)
-        .ok_or(Unsupported::OperandShape("scalar value-span base"))?;
+    let offset = raw_offset(frame, packet.raw_start)?;
     emit_sp_address_x9(ops, offset);
     dynasm!(ops ; .arch aarch64 ; mov x1, x9 ; movz w2, u32::from(count));
     Ok(())

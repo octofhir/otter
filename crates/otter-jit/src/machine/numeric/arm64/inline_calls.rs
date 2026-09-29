@@ -28,9 +28,7 @@ const HEADER_WORDS: usize = std::mem::size_of::<NativeFrame>() / 8;
 fn offset(frame: MachineFrameLayout, word: u16) -> Result<u32, Unsupported> {
     frame
         .raw_offset(word)
-        .map_err(|_| Unsupported::OperandShape("inline native frame word"))?
-        .checked_add(MACHINE_ROOT_RECORD_SIZE)
-        .ok_or(Unsupported::OperandShape("inline native frame offset"))
+        .map_err(|_| Unsupported::OperandShape("inline native frame word"))
 }
 
 fn load_slot(
@@ -46,9 +44,7 @@ fn load_slot(
             .iter()
             .find(|root| root.value == value)
             .ok_or(Unsupported::OperandShape("inline native frame root"))?;
-        let address = root_offset(frame, root.save_slot)?
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .ok_or(Unsupported::OperandShape("inline native root offset"))?;
+        let address = root_offset(frame, root.save_slot)?;
         emit_frame_ldr_x(ops, target, address);
     } else {
         emit_load_u64(ops, target, VALUE_UNDEFINED);
@@ -129,7 +125,8 @@ pub(super) fn enter(
             ; str x9, [x13, NATIVE_FRAME_CALLER_OFFSET]
             ; ldr w10, [x9, NATIVE_FRAME_DEPTH_OFFSET]
             ; add w10, w10, #1
-            ; str w10, [x13, NATIVE_FRAME_DEPTH_OFFSET]
+            ; orr x10, x10, crate::entry::NO_CALL_SITE_WORD
+            ; str x10, [x13, NATIVE_FRAME_DEPTH_OFFSET]
             ; ldr w10, [x9, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
             ; str w10, [x13, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]);
         caller_start = Some(start);

@@ -64,15 +64,7 @@ pub(super) fn emit(
                 .get(usize::from(source))
                 .ok_or(Unsupported::OperandShape("forward source operand"))?
                 .value;
-            emit_load_safepoint_root(
-                ops,
-                frame,
-                site,
-                value,
-                target,
-                bias.checked_add(MACHINE_ROOT_RECORD_SIZE)
-                    .ok_or(Unsupported::OperandShape("forward root bias"))?,
-            )
+            emit_load_safepoint_root(ops, frame, site, value, target, bias)
         },
         |ops, destination, source, bias| {
             let location = *locations
@@ -82,7 +74,6 @@ pub(super) fn emit(
         },
         |ops| {
             dynasm!(ops ; .arch aarch64 ; mov x17, x0);
-            emit_clear_machine_roots(ops);
             emit_reload_safepoint_roots(ops, frame, site)?;
             dynasm!(ops ; .arch aarch64 ; mov x0, x17);
             Ok(())
@@ -108,9 +99,7 @@ pub(super) fn emit(
                 .iter()
                 .find(|root| root.value == value)
                 .ok_or(Unsupported::OperandShape("forward binding root"))?;
-            let offset = root_offset(frame, root.save_slot)?
-                .checked_add(MACHINE_ROOT_RECORD_SIZE)
-                .ok_or(Unsupported::OperandShape("forward binding home offset"))?;
+            let offset = root_offset(frame, root.save_slot)?;
             emit_load_u64(ops, 16, u64::from(offset));
             dynasm!(ops ; .arch aarch64 ; add x16, X(base), x16 ; ldr x14, [x16]);
             Ok(())
@@ -130,14 +119,7 @@ pub(super) fn emit_cold_source_admission(
     bail: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let abi_source = otter_vm::native_abi::STUB_JIT_FORWARD_SOURCE_READY;
-    emit_load_safepoint_root(
-        ops,
-        frame,
-        site,
-        instruction.operands[0].value,
-        1,
-        MACHINE_ROOT_RECORD_SIZE,
-    )?;
+    emit_load_safepoint_root(ops, frame, site, instruction.operands[0].value, 1, 0)?;
     dynasm!(ops ; .arch aarch64 ; mov x0, x19);
     emit_load_symbolic_u64(
         ops,
@@ -148,7 +130,6 @@ pub(super) fn emit_cold_source_admission(
     );
     let admitted = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; blr x16 ; cbnz x0, =>admitted);
-    emit_clear_machine_roots(ops);
     emit_reload_safepoint_roots(ops, frame, site)?;
     dynasm!(ops ; .arch aarch64 ; b =>bail ; =>admitted);
     Ok(())

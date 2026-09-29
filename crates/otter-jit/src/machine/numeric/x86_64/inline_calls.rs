@@ -44,9 +44,8 @@ fn load_slot(
             .iter()
             .find(|root| root.value == value)
             .ok_or(Unsupported::OperandShape("x86-64 inline native frame root"))?;
-        let address = root_offset(frame, root.save_slot)?
-            .checked_add(MACHINE_ROOT_RECORD_SIZE)
-            .and_then(|offset| i32::try_from(offset).ok())
+        let address = i32::try_from(root_offset(frame, root.save_slot)?)
+            .ok()
             .ok_or(Unsupported::OperandShape(
                 "x86-64 inline native root offset",
             ))?;
@@ -84,7 +83,7 @@ pub(super) fn enter(
         ; cmp r10, [r15 + GENERATED_DEPTH_LIMIT_OFFSET as i32]
         ; ja =>fail
     );
-    let parent_slot = offset(frame, first, MACHINE_ROOT_RECORD_SIZE)?;
+    let parent_slot = offset(frame, first, 0)?;
     dynasm!(ops ; .arch x64
         ; mov [rsp + parent_slot], r12
         ; mov DWORD [r12 + NATIVE_FRAME_PC_OFFSET as i32], parent_pc as i32
@@ -106,7 +105,7 @@ pub(super) fn enter(
         .ok_or(Unsupported::OperandShape("x86-64 inline native source PC"))?;
         let start_word = u16::try_from(word)
             .map_err(|_| Unsupported::OperandShape("x86-64 inline native start"))?;
-        let start = offset(frame, start_word, MACHINE_ROOT_RECORD_SIZE)?;
+        let start = offset(frame, start_word, 0)?;
         dynasm!(ops ; .arch x64 ; xor eax, eax);
         for slot in 0..HEADER_WORDS {
             dynasm!(ops ; .arch x64 ; mov [rsp + start + slot as i32 * 8], rax);
@@ -139,6 +138,7 @@ pub(super) fn enter(
             ; mov r9d, [r8 + NATIVE_FRAME_DEPTH_OFFSET as i32]
             ; add r9d, 1
             ; mov [r13 + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
+            ; mov DWORD [r13 + NATIVE_FRAME_CALL_SITE_OFFSET as i32], -1
             ; mov r9d, [r8 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32]
             ; mov [r13 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32], r9d
         );

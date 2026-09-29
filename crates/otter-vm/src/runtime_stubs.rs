@@ -451,7 +451,7 @@ impl<'a> AllocSafepointFrameRoots<'a> {
     ///
     /// # Safety
     ///
-    /// `ctx.thread.current_frame` must publish a live, writable tagged window for the
+    /// `ctx`'s current frame must publish a live, writable tagged window for the
     /// duration of any heap registration created from this value.
     pub unsafe fn new(
         ctx: &'a RuntimeStubAllocContext,
@@ -2774,9 +2774,10 @@ mod tests {
             Value::undefined(),
         );
         let frame = Box::leak(Box::new(native_frame));
+        frame.code_object_id = 1;
+        let cell = Box::leak(Box::new(std::ptr::from_mut(frame) as u64));
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::from_mut(frame) as u64;
-        thread.current_code_object_id = 1;
+        thread.frame_cell = std::ptr::from_mut(cell) as u64;
         thread.runtime_context = std::ptr::from_ref(reentry) as u64;
         thread.code_registry = std::ptr::from_ref(registry) as u64;
         let thread = Box::leak(Box::new(thread));

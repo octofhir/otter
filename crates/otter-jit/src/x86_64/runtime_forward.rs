@@ -29,16 +29,15 @@ use crate::{
         relocation::{RelocationCapture, RelocationTarget},
     },
     entry::{
-        ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
         CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
         CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
         CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
-        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
-        NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET, THREAD_OFFSET, TransitionTable,
-        VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
-        VM_THREAD_CURRENT_FRAME_OFFSET,
+        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_DEPTH_LIMIT_OFFSET,
+        GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, NATIVE_FRAME_CALLER_OFFSET,
+        NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_DEPTH_OFFSET,
+        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
+        NATIVE_STACK_LIMIT_OFFSET, TransitionTable, VALUE_NULL, VALUE_UNDEFINED,
     },
 };
 
@@ -51,11 +50,10 @@ const SCRATCH_COUNT: u32 = PLAN_BYTES + 16;
 
 const RESULT_WORD: u32 = NATIVE_FRAME_STACK_SIZE;
 const ENTRY_WORD: u32 = NATIVE_FRAME_STACK_SIZE + 8;
-const CALLER_FRAME: u32 = NATIVE_FRAME_STACK_SIZE + 16;
-const CALLER_CODE_OBJECT_ID: u32 = NATIVE_FRAME_STACK_SIZE + 24;
-const TARGET_CELL: u32 = NATIVE_FRAME_STACK_SIZE + 32;
-const ALLOCATION_SIZE: u32 = NATIVE_FRAME_STACK_SIZE + 40;
-const REGISTER_BASE: u32 = NATIVE_FRAME_STACK_SIZE + 48;
+const PLAN: u32 = NATIVE_FRAME_STACK_SIZE + 16;
+const TARGET_CELL: u32 = NATIVE_FRAME_STACK_SIZE + 24;
+const ALLOCATION_SIZE: u32 = NATIVE_FRAME_STACK_SIZE + 32;
+const REGISTER_BASE: u32 = NATIVE_FRAME_STACK_SIZE + 40;
 
 const PLAN_ENTRY: u32 = std::mem::offset_of!(JitDirectCallPlan, entry_cell) as u32;
 const PLAN_THIS: u32 = std::mem::offset_of!(JitDirectCallPlan, this_mode) as u32;
@@ -192,9 +190,9 @@ where
 
     dynasm!(ops
         ; .arch x64
-        ; mov r10, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r11, [r10]
-        ; cmp r11, [r15 + ACTIVATION_LIMIT_OFFSET as i32]
+        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov r11d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; cmp r11, [r15 + GENERATED_DEPTH_LIMIT_OFFSET as i32]
         ; jae =>caller_bail
     );
     load(ops, method, 6, 0)?;
@@ -231,7 +229,7 @@ where
         ; mov r11, rsp
         ; sub rsp, r9
         ; mov [rsp + ALLOCATION_SIZE as i32], r10d
-        ; mov [rsp + CALLER_CODE_OBJECT_ID as i32], r11
+        ; mov [rsp + PLAN as i32], r11
         ; mov eax, [r11 + SCRATCH_COUNT as i32]
         ; mov [rsp + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], rax
         ; lea rax, [rsp + r8]
@@ -255,14 +253,14 @@ where
         ; mov [rsp + ENTRY_WORD as i32], rdx
         ; mov rdx, [rax + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32]
         ; mov [rsp], rdx
-        ; mov edx, [rax + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32 + 8]
+        ; mov rdx, [rax + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32 + 8]
         ; cmp BYTE [r11 + PLAN_ACTUALS as i32], 0
         ; je >header_ready
         ; test DWORD [rax + CODE_ENTRY_FLAGS_OFFSET as i32], abi::CODE_ENTRY_PARAMETER_PREFIX as i32
         ; jnz =>uncommitted_rejected
-        ; or edx, INCOMING_ARGUMENTS_HEADER_WORD as i32
+        ; or rdx, INCOMING_ARGUMENTS_HEADER_WORD as i32
         ; header_ready:
-        ; mov [rsp + 8], edx
+        ; mov [rsp + 8], rdx
         ; mov r9, [r11 + SCRATCH_CALLEE as i32]
         ; mov rcx, [r11 + SCRATCH_RECEIVER as i32]
         ; mov [rsp + NATIVE_FRAME_SELF_OFFSET as i32], r9
@@ -289,7 +287,7 @@ where
     let global_this = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
-        ; mov r11, [rsp + CALLER_CODE_OBJECT_ID as i32]
+        ; mov r11, [rsp + PLAN as i32]
         ; cmp BYTE [r11 + PLAN_THIS as i32], otter_vm::JitDirectCallThisMode::StrictOrLexical as i8
         ; je =>this_ready
     );
@@ -331,7 +329,7 @@ where
     // Initialize the complete traced register/actual window before publication.
     dynasm!(ops
         ; .arch x64
-        ; mov r11, [rsp + CALLER_CODE_OBJECT_ID as i32]
+        ; mov r11, [rsp + PLAN as i32]
         ; movzx ecx, WORD [r11 + PLAN_REGISTERS as i32]
         ; cmp BYTE [r11 + PLAN_ACTUALS as i32], 0
         ; je >initialize_words
@@ -362,7 +360,7 @@ where
         ; cmp rax, -1
         ; je =>uncommitted_rejected
         ; mov r8, rax
-        ; mov r11, [rsp + CALLER_CODE_OBJECT_ID as i32]
+        ; mov r11, [rsp + PLAN as i32]
         ; movzx edx, WORD [r11 + PLAN_PARAMS as i32]
         ; movzx ecx, WORD [r11 + PLAN_REGISTERS as i32]
     );
@@ -399,20 +397,11 @@ where
         ; .arch x64
         ; mov r12, [rsp + TARGET_CELL as i32]
         ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov [rsp + CALLER_FRAME as i32], r10
-        ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov r10, [r11 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [rsp + CALLER_CODE_OBJECT_ID as i32], r10
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; mov [r10 + r9 * 8], rsp
-        ; add r9, 1
-        ; mov [r8], r9
+        ; mov [rsp + NATIVE_FRAME_CALLER_OFFSET as i32], r10
+        ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; add r9d, 1
+        ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
-        ; mov r10, [r12 + CODE_ENTRY_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [r11 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], rsp
-        ; mov [r11 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32], r10
     );
     let entry_start = ops.offset().0;
     crate::entry::x86_64_tiering::emit_entry(ops);
@@ -468,7 +457,8 @@ where
         ; mov edx, view.code_block.id as i32
         ; mov ecx, logical_pc as i32
         ; mov r8, [r10 + CODE_ENTRY_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov r9, [rsp + CALLER_CODE_OBJECT_ID as i32]
+        ; mov r9, [rsp + NATIVE_FRAME_CALLER_OFFSET as i32]
+        ; mov r9d, [r9 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32]
         ; sub rsp, 16
         ; mov QWORD [rsp], 0
         ; mov [rsp + 8], rax
@@ -479,18 +469,8 @@ where
         ; call r11
         ; add rsp, 16
         ; =>result_ready
-        ; mov r10, [rsp + CALLER_FRAME as i32]
-        ; mov r11, [rsp + CALLER_CODE_OBJECT_ID as i32]
+        ; mov r10, [rsp + NATIVE_FRAME_CALLER_OFFSET as i32]
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r10
-        ; mov r8, [r15 + THREAD_OFFSET as i32]
-        ; mov [r8 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], r10
-        ; mov [r8 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32], r11
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; sub r9, 1
-        ; mov [r8], r9
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; mov QWORD [r10 + r9 * 8], 0
         ; mov [rsp + RESULT_WORD as i32], rax
         ; mov [rsp + ENTRY_WORD as i32], rdx
         ; mov rax, [rsp + RESULT_WORD as i32]

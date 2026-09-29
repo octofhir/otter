@@ -32,7 +32,7 @@ use super::{RuntimeCall, RuntimeFrameIdentity};
 
 struct InlinePublication {
     vm: NonNull<Interpreter>,
-    base: usize,
+    base: *mut NativeFrame,
     recipes: *mut DeoptFrame<Value>,
     natives: *const NativeFrame,
     count: usize,
@@ -53,8 +53,8 @@ impl Drop for InlinePublication {
             entry.closure = native.self_value();
             entry.new_target = native.new_target();
         }
-        while vm.jit_native_activation_top > self.base {
-            vm.jit_pop_native_activation();
+        while vm.jit_innermost_native_frame() != self.base {
+            vm.jit_pop_native_frame();
         }
     }
 }
@@ -80,13 +80,12 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = &self.context;
         let stack = unsafe { self.stack.as_ref() };
-        let base = vm.jit_native_activation_top;
-        if base == 0 || vm.jit_native_activations[base - 1].frame != self.frame.as_ptr() {
+        let base = vm.jit_innermost_native_frame();
+        if base != self.frame.as_ptr() {
             return Err(VmError::InvalidOperand);
         }
-        if frames.len() > vm.jit_generated_activation_limit().saturating_sub(base)
-            || frames.len() as u64 + u64::from(vm.logical_call_depth(stack))
-                > u64::from(vm.max_stack_depth)
+        if frames.len() as u64 + u64::from(vm.logical_call_depth(stack))
+            > u64::from(vm.max_stack_depth)
         {
             return Err(VmError::StackOverflow {
                 limit: vm.max_stack_depth,
@@ -94,8 +93,9 @@ impl RuntimeCall<'_> {
         }
         let mut natives = Vec::with_capacity(frames.len());
         // SAFETY: RuntimeCall retains this validated, already-published caller.
-        let mut parent_registers =
-            usize::from(unsafe { self.frame.as_ref() }.header.register_count);
+        let parent = unsafe { self.frame.as_ref() };
+        let mut parent_registers = usize::from(parent.header.register_count);
+        let code_object_id = parent.code_object_id;
         for recipe in frames.iter_mut() {
             let entry = recipe.entry.as_ref().ok_or(VmError::InvalidOperand)?;
             let owner = context
@@ -142,6 +142,7 @@ impl RuntimeCall<'_> {
                 native.set_derived_constructor();
             }
             native.set_stack_registers();
+            native.code_object_id = code_object_id;
             natives.push(native);
             parent_registers = recipe.slots.len();
         }

@@ -18,7 +18,7 @@
 //! - `crate::template::code` and [`crate::optimizing`] own finalized code
 //!   objects that call this.
 
-use super::{JitCtx, JitEntry, jit_pop_native_activation_stub, jit_push_native_activation_stub};
+use super::{JitCtx, JitEntry};
 use otter_vm::{
     ActivationStack, Interpreter, JitExecOutcome, VmError, VmRuntimeActivation,
     native_abi::{
@@ -59,21 +59,26 @@ pub(crate) unsafe fn enter_compiled(
         // This interpreter-to-native entry boundary reads
         // the materialized activation once through the tier-neutral API; the
         // resulting NativeFrame is the sole machine-visible state thereafter.
-        let (regs, self_value, this_value) = {
+        let (regs, self_value, this_value, interpreter_frames) = {
             // SAFETY: `activation.stack_ptr()` names the exclusively frozen
             // interpreter stack for this compiled-entry transaction.
             let stack_ref = unsafe { &mut *stack };
+            let interpreter_frames = stack_ref.len();
             let frame = &mut stack_ref[activation.frame_index()];
             let active = ActiveFrameMut::materialized(frame);
             let regs = active.register_base_ptr().cast::<u64>();
-            (regs, active.self_value(), active.this_value())
+            (
+                regs,
+                active.self_value(),
+                active.this_value(),
+                interpreter_frames,
+            )
         };
-        // SAFETY: same contract; the activation array is isolate-owned, never
-        // resized, and outlives every compiled activation.
-        let activation_base = unsafe { (*vm).jit_native_activation_base() };
+        // SAFETY: same contract; the interpreter outlives every compiled
+        // activation.
         let machine_roots_ptr = unsafe { (*vm).jit_machine_roots_addr() };
-        let activation_top_ptr = unsafe { (*vm).jit_native_activation_top_addr() };
-        let activation_limit = unsafe { (*vm).jit_generated_activation_limit() };
+        let generated_depth_limit =
+            u64::from(unsafe { (*vm).jit_generated_depth_limit(interpreter_frames) });
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let marking_flag = unsafe { (*vm).jit_marking_flag_ptr() };
         let alloc_window = unsafe { (*vm).jit_allocation_window() };
@@ -110,12 +115,12 @@ pub(crate) unsafe fn enter_compiled(
             self_value,
             this_value,
         );
+        native_frame.code_object_id = u32::try_from(code_object_id)
+            .expect("code object ids fit the frame record's generation field");
         if let Err(error) = activation.initialize_native_frame_state(&mut native_frame) {
             return JitExecOutcome::Fatal(error);
         }
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
-        thread.current_code_object_id = code_object_id;
         thread.runtime_context = std::ptr::addr_of!(activation) as u64;
         // SAFETY: the boxed registry cell is isolate-owned and address-stable;
         // its view resolves safepoints for any installed code object, so a
@@ -134,9 +139,7 @@ pub(crate) unsafe fn enter_compiled(
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
-            activation_base: activation_base.cast(),
-            activation_top_ptr,
-            activation_limit,
+            generated_depth_limit,
             machine_roots_ptr,
             alloc_window,
             runtime_stats,
@@ -147,16 +150,21 @@ pub(crate) unsafe fn enter_compiled(
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
         let entry: JitEntry = unsafe { std::mem::transmute(entry) };
-        let activation_status = jit_push_native_activation_stub(&mut ctx);
-        if activation_status != NativeResultStatus::Success as u64 {
-            return JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand));
-        }
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
+        // SAFETY: the cell and the entry frame it holds live on this Rust
+        // frame until the matching leave below.
+        let enclosing = match unsafe {
+            (*vm).jit_enter_native_frames(
+                std::ptr::NonNull::from(&mut ctx.native_frame).cast::<u64>(),
+            )
+        } {
+            Ok(enclosing) => enclosing,
+            Err(error) => return JitExecOutcome::Fatal(error),
+        };
         let ret =
             unsafe { activation.with_native_frame_extent(ctx.native_frame, || entry(&mut ctx)) };
-        let pop_status = jit_pop_native_activation_stub(&mut ctx);
-        if pop_status != NativeResultStatus::Success as u64 {
-            return JitExecOutcome::Fatal(error.take().unwrap_or(VmError::InvalidOperand));
-        }
+        debug_assert_eq!(ctx.native_frame, std::ptr::addr_of_mut!(native_frame));
+        unsafe { (*vm).jit_leave_native_frames(enclosing) };
         let ret = match ret {
             Ok(ret) => ret,
             Err(error) => return JitExecOutcome::Fatal(error),

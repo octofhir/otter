@@ -30,7 +30,10 @@ pub(super) fn decode(ctx: &JitCtx) -> Result<Box<[DeoptFrame<Value>]>, VmError> 
     let Some(roots) = (unsafe { (address as *const JitMachineRootRecord).as_ref() }) else {
         return Ok(Box::default());
     };
-    if roots.code_object_id != thread.current_code_object_id {
+    // SAFETY: the context's innermost frame is live for this cold call.
+    let current =
+        unsafe { ctx.native_frame.as_ref() }.map_or(0, |frame| u64::from(frame.code_object_id));
+    if roots.code_object_id != current {
         return Ok(Box::default());
     }
     // SAFETY: the VM publishes a stable registry view for every active code object.

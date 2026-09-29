@@ -1045,14 +1045,9 @@ pub struct Interpreter {
     sync_reentry_depth: u32,
     /// Published compiler-generated frames temporarily mirrored by cold
     /// interpreter materialization. Logical-depth reads subtract this transfer
-    /// count from the canonical native-activation scan. Each (native address,
+    /// count from the innermost frame's depth. Each (native address,
     /// materialized index) also identifies the same frame during stack capture.
     jit_materialized_generated_calls: Vec<(usize, usize)>,
-    /// Activation-array indices of published frames whose registers live in
-    /// the interpreter arena (outer compiled entries). Every other published
-    /// activation is a generated frame, so the generated call depth is the
-    /// cursor minus this count.
-    jit_arena_activation_indices: Vec<usize>,
     /// Whether synchronous `Atomics.wait` may block this isolate's host thread.
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed
@@ -1289,11 +1284,12 @@ pub struct Interpreter {
     /// VM-owned native register arena. Its published prefix is a precise GC
     /// root set for in-flight compiled call windows.
     register_stack: register_stack::RegisterStack,
-    /// Fixed VM-owned descriptors for native JIT contexts whose scalar binding
-    /// slots must stay visible to a moving collection across safepoints.
-    jit_native_activations: Vec<jit::JitNativeActivation>,
-    /// Live prefix of [`Self::jit_native_activations`].
-    jit_native_activation_top: usize,
+    /// Innermost-frame cell of the live compiled entry (its
+    /// `JitCtx::native_frame`), or `None` while no compiled entry runs.
+    /// Generated linkage keeps the cell current; the frame chain hangs off it.
+    jit_frame_cell: Option<std::ptr::NonNull<u64>>,
+    /// Innermost Rust-published frame while no compiled entry runs.
+    jit_detached_frame: u64,
     /// Top of the linked Machine IR allocator-root record chain.
     jit_machine_roots: u64,
     /// Optional per-slice work policy shared by interpreter, JIT, native,

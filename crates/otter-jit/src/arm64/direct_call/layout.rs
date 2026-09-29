@@ -14,8 +14,10 @@
 //!   bindings through its SELF closure's context.
 //! - Control slots and tagged windows are eight-byte aligned, and the complete
 //!   reservation is sixteen-byte aligned.
-//! - Forwarded actual windows keep their runtime reservation in a fixed control
-//!   slot. Their complete size is bounded before SP changes and root publication.
+//! - Forwarded actual windows keep their runtime reservation and the admitted
+//!   call plan in fixed control slots. Their complete size is bounded before
+//!   SP changes and root publication.
+//! - The caller link and depth live in the native header, not in control slots.
 //! - Every size operation is checked before applying the generated-call bound.
 //!
 //! # See also
@@ -30,13 +32,12 @@ use crate::entry::NATIVE_FRAME_STACK_SIZE;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StackLayout {
     pub(super) allocation_size: Option<u32>,
+    pub(super) plan: Option<u32>,
     pub(super) register_base: u32,
     pub(super) incoming_base: u32,
     pub(super) incoming_count: u32,
     pub(super) saved_x25: u32,
     pub(super) entry_addr: u32,
-    pub(super) caller_frame: u32,
-    pub(super) caller_code_object_id: u32,
     pub(super) target_cell: u32,
     pub(super) frame_bytes: u32,
 }
@@ -76,9 +77,10 @@ impl StackLayout {
 
     fn for_windows(register_count: u32, incoming_count: u32, dynamic: bool) -> Option<Self> {
         let saved_x25 = NATIVE_FRAME_STACK_SIZE;
-        let control_end = saved_x25.checked_add(40)?;
-        let allocation_size = dynamic.then_some(control_end);
-        let register_base = control_end.checked_add(if dynamic { 8 } else { 0 })?;
+        let control_end = saved_x25.checked_add(24)?;
+        let plan = dynamic.then_some(control_end);
+        let allocation_size = dynamic.then_some(control_end + 8);
+        let register_base = control_end.checked_add(if dynamic { 16 } else { 0 })?;
         let register_bytes = register_count.checked_mul(8)?;
         let incoming_base = register_base.checked_add(register_bytes)?;
         let frame_bytes = incoming_base
@@ -87,14 +89,13 @@ impl StackLayout {
             & !15;
         (frame_bytes <= MAX_DIRECT_CALL_FRAME_BYTES).then_some(Self {
             allocation_size,
+            plan,
             register_base,
             incoming_base,
             incoming_count,
             saved_x25,
             entry_addr: saved_x25 + 8,
-            caller_frame: saved_x25 + 16,
-            caller_code_object_id: saved_x25 + 24,
-            target_cell: saved_x25 + 32,
+            target_cell: saved_x25 + 16,
             frame_bytes,
         })
     }
@@ -114,8 +115,7 @@ mod tests {
                 assert_eq!(layout.allocation_size.is_some(), dynamic);
                 assert_eq!(layout.saved_x25, empty.saved_x25);
                 assert_eq!(layout.entry_addr, empty.entry_addr);
-                assert_eq!(layout.caller_frame, empty.caller_frame);
-                assert_eq!(layout.caller_code_object_id, empty.caller_code_object_id);
+                assert_eq!(layout.plan, empty.plan);
                 assert_eq!(layout.target_cell, empty.target_cell);
                 assert_eq!(layout.register_base, empty.register_base);
                 assert_eq!(layout.incoming_base, layout.register_base + 19 * 8);

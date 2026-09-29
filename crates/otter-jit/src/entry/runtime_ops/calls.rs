@@ -15,46 +15,10 @@
 //! - `super::reentry` — shared throw resumption and error parking.
 //! - `otter_vm::interp::jit_call` — VM-owned generated-call accounting.
 
-use otter_vm::{
-    VmError,
-    native_abi::{NativeResultPair, NativeResultStatus},
-};
+use otter_vm::{VmError, native_abi::NativeResultPair};
 
 use super::super::JitCtx;
-use super::reentry::{compiled_error, compiled_fatal, park_jit_error};
-
-/// Publish one machine-constructed [`JitCtx`] before its compiled entry can
-/// reach an allocating/reentrant safepoint. Structural failure is parked in
-/// the shared slot and reported as [`NativeResultStatus::Fatal`].
-pub(crate) extern "C" fn jit_push_native_activation_stub(ctx: *mut JitCtx) -> u64 {
-    // SAFETY: the caller has fully initialized `ctx` on its native stack and
-    // keeps it live until the matching pop stub.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let Some(frame) = (unsafe { ctx.native_frame.as_mut() }) else {
-        park_jit_error(ctx, VmError::InvalidOperand);
-        return NativeResultStatus::Fatal as u64;
-    };
-    // SAFETY: the complete canonical frame remains live on the native stack
-    // until the matching pop; the VM publishes and traces it as one unit.
-    match unsafe { vm.jit_push_native_frame(frame) } {
-        Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            NativeResultStatus::Fatal as u64
-        }
-    }
-}
-
-/// Release the topmost native JIT activation before its `JitCtx` stack record
-/// is discarded.
-pub(crate) extern "C" fn jit_pop_native_activation_stub(ctx: *mut JitCtx) -> u64 {
-    // SAFETY: the active context and its interpreter pointer are live by ABI.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    vm.jit_pop_native_activation();
-    NativeResultStatus::Success as u64
-}
+use super::reentry::{compiled_error, compiled_fatal};
 
 /// Cold deoptimization for one already-started generated stack call.
 ///
@@ -153,9 +117,7 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::null_mut(),
             error: std::ptr::addr_of_mut!(error),
-            activation_base: std::ptr::null_mut(),
-            activation_top_ptr: std::ptr::null_mut(),
-            activation_limit: 0,
+            generated_depth_limit: u64::MAX,
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,

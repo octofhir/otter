@@ -1365,7 +1365,7 @@ mod tests {
             call.store_property_value(0, call.pc(), registers[1], registers[3])
                 .expect("second canonical Cell store");
         }
-        vm.jit_pop_native_activation();
+        vm.jit_pop_native_frame();
 
         for (receiver, rhs, marker) in [
             (registers[0], registers[2], 41),

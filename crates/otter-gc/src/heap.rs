@@ -65,8 +65,8 @@ use crate::extra_roots::{ExtraRoots, ExtraRootsGuard};
 use crate::finalize::WeakFinalizationRegistry;
 use crate::frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard};
 use crate::handle::{GlobalHandleTable, HandleStack};
-use crate::lab::LinearAllocationArea;
 use crate::header::{GcHeader, MarkColor};
+use crate::lab::LinearAllocationArea;
 use crate::marking::MarkingState;
 
 use crate::oom::OutOfMemory;

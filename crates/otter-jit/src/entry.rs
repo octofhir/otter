@@ -312,14 +312,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_new_object_literal_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_PUSH_NATIVE_ACTIVATION,
-            jit_push_native_activation_stub as *const () as usize,
-        ),
-        binding(
-            abi::STUB_JIT_POP_NATIVE_ACTIVATION,
-            jit_pop_native_activation_stub as *const () as usize,
-        ),
-        binding(
             abi::STUB_JIT_LOOSE_EQ,
             jit_loose_eq_stub as *const () as usize,
         ),

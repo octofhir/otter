@@ -150,7 +150,6 @@ impl Interpreter {
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
             jit_materialized_generated_calls: Vec::new(),
-            jit_arena_activation_indices: Vec::new(),
             allow_blocking_atomics_wait: false,
             microtasks: crate::MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
@@ -198,11 +197,8 @@ impl Interpreter {
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
             register_stack: crate::register_stack::RegisterStack::new(),
-            jit_native_activations: vec![
-                crate::jit::JitNativeActivation::EMPTY;
-                crate::DEFAULT_MAX_STACK_DEPTH as usize
-            ],
-            jit_native_activation_top: 0,
+            jit_frame_cell: None,
+            jit_detached_frame: 0,
             jit_machine_roots: 0,
             work_budget: crate::WorkBudget::default(),
             work_budget_stats: crate::WorkBudgetStats::default(),

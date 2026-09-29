@@ -1315,7 +1315,7 @@ impl Interpreter {
         feedback_dirty: bool,
     ) -> Result<NativeResultPair, VmError> {
         self.jit_generated_feedback_pending |= feedback_dirty;
-        if self.jit_native_activation_top != 0 {
+        if self.jit_has_native_frames() {
             return Ok(result);
         }
 
@@ -1377,7 +1377,7 @@ impl Interpreter {
     /// existing optimizing resolver sample hot baseline callees. Optimizing
     /// generations never become promotion candidates.
     fn reconcile_generated_feedback(&mut self, context: &ExecutionContext) {
-        debug_assert_eq!(self.jit_native_activation_top, 0);
+        debug_assert!(!self.jit_has_native_frames());
         debug_assert!(self.jit_generated_feedback_pending);
         self.jit_generated_feedback_pending = false;
 
@@ -2308,14 +2308,20 @@ mod tests {
         let context = empty_context();
         let result = NativeResultPair::success(Value::number_i32(41));
 
-        vm.jit_native_activation_top = 1;
+        let mut parent = crate::native_abi::NativeFrame::new(
+            crate::native_abi::VmFrameHeader::interpreter(0, 0),
+            0,
+            Value::undefined(),
+            Value::undefined(),
+        );
+        vm.jit_detached_frame = std::ptr::addr_of_mut!(parent) as u64;
         let nested = vm
             .finish_compiled_entry_transaction(&context, result, true)
             .expect("nested completion");
         assert_eq!(nested, result);
         assert!(vm.jit_generated_feedback_pending);
 
-        vm.jit_native_activation_top = 0;
+        vm.jit_detached_frame = 0;
         let outer = vm
             .finish_compiled_entry_transaction(&context, result, false)
             .expect("outer completion");

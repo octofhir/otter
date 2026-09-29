@@ -3,15 +3,18 @@
 //! # Contents
 //! Register allocation/reclaim on the contiguous register stack, ActivationStack
 //! draw/return, cold-frame attach/detach, frame pop/unwind
-//! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), canonical native
-//! JIT activation publication, linked Machine IR safepoint roots, and the raw
-//! pointers compiled code uses to address the reg window.
+//! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), the native frame
+//! chain (entry cells, Rust publication, depth, tracing), linked Machine IR
+//! safepoint roots, and the raw pointers compiled code uses to address the reg
+//! window.
 //!
 //! # Invariants
 //! The reg stack is a GC root region: windows must be zeroed on alloc
 //! and truncated on reclaim so stale slots never masquerade as values.
 //! Stack-owned native frames and Machine root records remain published for the
 //! complete dynamic extent of every allocating or reentrant compiled call.
+//! Frames are published and unpublished innermost first; each links to its
+//! caller, so the chain from the innermost frame is the complete live set.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -162,54 +165,158 @@ impl Interpreter {
         self.register_stack.release(base);
     }
 
-    /// Publish a canonical native activation for GC and tier-neutral frame
-    /// access.
+    /// Innermost published native frame, or null when none is published.
+    #[inline]
+    #[must_use]
+    pub fn jit_innermost_native_frame(&self) -> *mut crate::native_abi::NativeFrame {
+        let bits = match self.jit_frame_cell {
+            // SAFETY: the live compiled entry keeps its frame cell valid until
+            // `jit_leave_native_frames` restores the enclosing cell.
+            Some(cell) => unsafe { *cell.as_ptr() },
+            None => self.jit_detached_frame,
+        };
+        bits as *mut crate::native_abi::NativeFrame
+    }
+
+    fn set_jit_innermost_native_frame(&mut self, frame: *mut crate::native_abi::NativeFrame) {
+        match self.jit_frame_cell {
+            // SAFETY: see `jit_innermost_native_frame`.
+            Some(cell) => unsafe { *cell.as_ptr() = frame as u64 },
+            None => self.jit_detached_frame = frame as u64,
+        }
+    }
+
+    /// Whether any native frame is published. Executable retirement waits
+    /// until none is, because published frames may return into old code.
+    #[inline]
+    #[must_use]
+    pub(crate) fn jit_has_native_frames(&self) -> bool {
+        !self.jit_innermost_native_frame().is_null()
+    }
+
+    /// Published native frames from the innermost outward.
+    pub(crate) fn jit_native_frames(
+        &self,
+    ) -> impl Iterator<Item = *mut crate::native_abi::NativeFrame> + '_ {
+        let mut frame = self.jit_innermost_native_frame();
+        std::iter::from_fn(move || {
+            if frame.is_null() {
+                return None;
+            }
+            let current = frame;
+            // SAFETY: every published record stays live and linked to its
+            // caller until it is unpublished, innermost first.
+            frame = unsafe { (*current).caller_frame() };
+            Some(current)
+        })
+    }
+
+    /// Link `frame` as the innermost published native frame.
     ///
     /// # Safety
     /// `frame` and its explicit register window must remain live,
     /// initialized, stable, and exclusively owned by the active mutator until
-    /// the matching [`Self::jit_pop_native_activation`].
+    /// the matching [`Self::jit_pop_native_frame`].
     pub unsafe fn jit_push_native_frame(
         &mut self,
         frame: &mut crate::native_abi::NativeFrame,
     ) -> Result<(), VmError> {
-        if self.jit_native_activation_top >= self.jit_native_activations.len() {
-            return Err(VmError::StackOverflow {
-                limit: self.max_stack_depth,
-            });
-        }
         // SAFETY: forwarded from this function's publication contract. The
         // checked view centralizes null/alignment/window validation before the
-        // activation becomes visible to GC.
+        // frame becomes visible to GC.
         unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
-        if !frame
+        self.link_native_frame(frame)
+    }
+
+    fn link_native_frame(
+        &mut self,
+        frame: &mut crate::native_abi::NativeFrame,
+    ) -> Result<(), VmError> {
+        let caller = self.jit_innermost_native_frame();
+        // SAFETY: the innermost published record is live.
+        let caller_depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
+        let depth = if frame
             .header
             .flags
             .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
         {
-            self.jit_arena_activation_indices
-                .push(self.jit_native_activation_top);
-        }
-        self.jit_native_activations[self.jit_native_activation_top] = jit::JitNativeActivation {
-            frame: std::ptr::from_mut(frame),
+            caller_depth.saturating_add(1)
+        } else {
+            caller_depth
         };
-        self.jit_native_activation_top += 1;
+        if depth > self.max_stack_depth {
+            return Err(VmError::StackOverflow {
+                limit: self.max_stack_depth,
+            });
+        }
+        frame.caller = caller as u64;
+        frame.depth = depth;
+        self.set_jit_innermost_native_frame(std::ptr::from_mut(frame));
         Ok(())
     }
 
-    /// Base of the native JIT activation array. The backing allocation is
-    /// created once at interpreter construction and never resized, so the
-    /// pointer stays valid for the isolate's lifetime; compiled code indexes
-    /// it directly to publish/unpublish activations without a Rust call.
-    pub fn jit_native_activation_base(&mut self) -> *mut jit::JitNativeActivation {
-        self.jit_native_activations.as_mut_ptr()
+    /// Unpublish the innermost native frame.
+    #[inline]
+    pub fn jit_pop_native_frame(&mut self) {
+        let frame = self.jit_innermost_native_frame();
+        debug_assert!(!frame.is_null());
+        // SAFETY: the innermost published record is live until this unlink.
+        let caller = unsafe { (*frame).caller_frame() };
+        self.set_jit_innermost_native_frame(caller);
     }
 
-    /// Address of the native JIT activation cursor, read and bumped by
-    /// compiled direct-call sequences.
-    pub fn jit_native_activation_top_addr(&mut self) -> *mut usize {
-        &mut self.jit_native_activation_top
+    /// Begin a compiled entry whose innermost-frame cell is `cell`.
+    ///
+    /// The cell holds the entry's own frame, which links to the enclosing
+    /// innermost frame; generated linkage then keeps the cell current. Returns
+    /// the enclosing entry's cell for [`Self::jit_leave_native_frames`].
+    ///
+    /// # Safety
+    /// `cell` must hold a valid unpublished entry frame and stay live, with
+    /// that frame, until the matching leave.
+    pub unsafe fn jit_enter_native_frames(
+        &mut self,
+        cell: std::ptr::NonNull<u64>,
+    ) -> Result<Option<std::ptr::NonNull<u64>>, VmError> {
+        // SAFETY: forwarded from the entry contract.
+        let frame = unsafe { &mut *(*cell.as_ptr() as *mut crate::native_abi::NativeFrame) };
+        // SAFETY: as in `jit_push_native_frame`.
+        unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        let caller = self.jit_innermost_native_frame();
+        // SAFETY: the innermost published record is live.
+        frame.depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
+        frame.caller = caller as u64;
+        Ok(self.jit_frame_cell.replace(cell))
+    }
+
+    /// End the compiled entry begun by [`Self::jit_enter_native_frames`].
+    pub fn jit_leave_native_frames(&mut self, enclosing: Option<std::ptr::NonNull<u64>>) {
+        self.jit_frame_cell = enclosing;
+    }
+
+    /// Generated-frame depth bound for a compiled entry starting while
+    /// `interpreter_frames` interpreter frames are live: a generated call may
+    /// link its frame only while its caller's depth is below this value, so
+    /// interpreter plus generated frames never exceed the JS depth budget.
+    #[must_use]
+    pub fn jit_generated_depth_limit(&self, interpreter_frames: usize) -> u32 {
+        self.max_stack_depth
+            .saturating_sub(u32::try_from(interpreter_frames).unwrap_or(u32::MAX))
+    }
+
+    /// Logical depth owned by compiler-generated frames that remain native.
+    ///
+    /// The innermost frame's depth counts every stack-register frame in the
+    /// chain. Cold deoptimization may temporarily mirror one published frame
+    /// in the materialized stack, which the transfer count removes here.
+    #[inline]
+    pub(crate) fn jit_generated_call_depth(&self) -> u32 {
+        // SAFETY: the innermost published record is live.
+        unsafe { self.jit_innermost_native_frame().as_ref() }
+            .map_or(0, |frame| frame.depth)
+            .saturating_sub(self.jit_materialized_generated_calls.len() as u32)
     }
 
     /// Address of the linked Machine IR allocator-root chain head.
@@ -217,66 +324,16 @@ impl Interpreter {
         &mut self.jit_machine_roots
     }
 
-    /// Capacity of the native JIT activation array — the overflow bound
-    /// compiled code checks before an inline publish.
-    pub fn jit_native_activation_limit(&self) -> usize {
-        self.jit_native_activations.len()
-    }
-
-    /// Effective activation cursor bound for one outer compiled entry.
-    ///
-    /// The physical array provides the hard publication bound; the JS call
-    /// depth budget provides the logical one. Generated frames live on the
-    /// native stack, which linkage bounds separately in bytes, and never
-    /// re-enter Rust, so the synchronous re-entry budget does not apply to
-    /// them. Generated calls use the cursor as their sole recursion counter;
-    /// reaching it means the call is about to exceed the JS depth budget.
-    pub fn jit_generated_activation_limit(&self) -> usize {
-        (self.max_stack_depth as usize).min(self.jit_native_activations.len())
-    }
-
-    /// Unpublish the most recently pushed native JIT activation.
-    #[inline]
-    pub fn jit_pop_native_activation(&mut self) {
-        debug_assert!(self.jit_native_activation_top > 0);
-        self.jit_native_activation_top -= 1;
-        if self.jit_arena_activation_indices.last() == Some(&self.jit_native_activation_top) {
-            self.jit_arena_activation_indices.pop();
-        }
-        self.jit_native_activations[self.jit_native_activation_top] =
-            jit::JitNativeActivation::EMPTY;
-    }
-
-    /// Logical depth owned by compiler-generated frames that remain native.
-    ///
-    /// The published activation array is the canonical frame inventory. Only
-    /// stack-register frames are generated callees; the outer compiled entry
-    /// keeps its registers in the interpreter arena. Cold deoptimization may
-    /// temporarily mirror one published frame in the materialized stack, which
-    /// the transfer count removes here.
-    #[inline]
-    pub(crate) fn jit_generated_call_depth(&self) -> u32 {
-        // Every bytecode call consults this depth, so it is O(1): generated
-        // code publishes only stack-register frames, and Rust publication
-        // records the arena-register ones it pushes.
-        let published = self
-            .jit_native_activation_top
-            .saturating_sub(self.jit_arena_activation_indices.len());
-        u32::try_from(published)
-            .unwrap_or(u32::MAX)
-            .saturating_sub(self.jit_materialized_generated_calls.len() as u32)
-    }
-
-    /// Trace every canonical native activation currently capable of crossing a
-    /// safepoint. Register-arena windows are traced once by
-    /// [`Self::trace_reg_stack`]; generated-code stack windows are absent from
-    /// that arena and are traced through their published frame here.
+    /// Trace every published native frame. Register-arena windows are traced
+    /// once by [`Self::trace_reg_stack`]; generated-code stack windows are
+    /// absent from that arena and are traced through their frame here.
     pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        for activation in &self.jit_native_activations[..self.jit_native_activation_top] {
-            // SAFETY: `jit_push_native_frame`/the equivalent generated fast
-            // publication keep the frame and its windows live until pop.
-            let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(activation.frame) }
-                .expect("published native activation must remain valid");
+        let mut frames = 0usize;
+        for native in self.jit_native_frames() {
+            // SAFETY: published frames and their windows stay live until
+            // unpublished.
+            let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(native) }
+                .expect("published native frame must remain valid");
             if frame
                 .header()
                 .flags
@@ -285,13 +342,14 @@ impl Interpreter {
                 frame.trace_stack_register_slots(visitor);
             }
             frame.trace_non_register_slots(visitor);
+            frames += 1;
         }
         let mut record = self.jit_machine_roots;
         let mut depth = 0usize;
         while record != 0 {
             assert!(
-                depth < self.jit_native_activations.len(),
-                "Machine IR root chain must be bounded by native activation capacity"
+                depth < frames,
+                "every Machine IR root record belongs to a published native frame"
             );
             // SAFETY: generated publication keeps every record and root window
             // live until it atomically restores the previous chain head.

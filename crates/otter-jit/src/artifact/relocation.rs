@@ -1723,7 +1723,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_METHOD_VALUE),
             RelocationTarget::RuntimeStub {
-                id: 85,
+                id: 83,
                 name: "jit_call_method_value",
                 signature: "reentrantValueSpan",
             }
@@ -1739,7 +1739,7 @@ mod tests {
         assert_eq!(
             RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC),
             RelocationTarget::RuntimeStub {
-                id: 29,
+                id: 27,
                 name: "copy_context_alloc",
                 signature: "allocValue3",
             }

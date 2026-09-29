@@ -48,11 +48,7 @@ fn large_object_old_to_young_edge_survives_scavenge() {
     heap.register_traceable::<Big>();
 
     let big = heap
-        .alloc_trailing_with_roots(
-            Big { child: Gc::null() },
-            BALLAST_BYTES,
-            &mut |_| {},
-        )
+        .alloc_trailing_with_roots(Big { child: Gc::null() }, BALLAST_BYTES, &mut |_| {})
         .expect("large alloc");
     assert!(
         unsafe { (*big.as_header_ptr()).is_old() },

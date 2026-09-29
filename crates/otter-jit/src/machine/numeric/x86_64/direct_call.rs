@@ -54,8 +54,6 @@ struct StackLayout {
     incoming_count: u32,
     result_word: u32,
     status_word: u32,
-    caller_frame: u32,
-    caller_code_object_id: u32,
     target_cell: u32,
     frame_bytes: u32,
 }
@@ -80,7 +78,7 @@ impl StackLayout {
             .generated_stack_frame_bytes
             .filter(|bytes| *bytes != 0)?;
         let control = NATIVE_FRAME_STACK_SIZE;
-        let register_base = control.checked_add(40)?;
+        let register_base = control.checked_add(24)?;
         let incoming_count = if target.plan.needs_incoming_arguments {
             u32::try_from(argument_count).ok()?
         } else {
@@ -98,9 +96,7 @@ impl StackLayout {
             incoming_count,
             result_word: control,
             status_word: control + 8,
-            caller_frame: control + 16,
-            caller_code_object_id: control + 24,
-            target_cell: control + 32,
+            target_cell: control + 16,
             frame_bytes,
         })
     }
@@ -500,9 +496,9 @@ pub(super) fn emit(
     // receiver allocation or other observable constructor work.
     dynasm!(ops
         ; .arch x64
-        ; mov r10, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r11, [r10]
-        ; cmp r11, [r15 + ACTIVATION_LIMIT_OFFSET as i32]
+        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov r11d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; cmp r11, [r15 + GENERATED_DEPTH_LIMIT_OFFSET as i32]
         ; jae =>guard_fail
     );
     load_saved_root(ops, frame, site, instruction.operands[0].value, 9)?;
@@ -720,20 +716,11 @@ pub(super) fn emit(
         ; .arch x64
         ; mov r12, [rsp + layout.target_cell as i32]
         ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov [rsp + layout.caller_frame as i32], r10
-        ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov rax, [r11 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [rsp + layout.caller_code_object_id as i32], rax
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; mov [r10 + r9 * 8], rsp
-        ; add r9, 1
-        ; mov [r8], r9
+        ; mov [rsp + NATIVE_FRAME_CALLER_OFFSET as i32], r10
+        ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; add r9d, 1
+        ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
-        ; mov rax, [r12 + CODE_ENTRY_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [r11 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], rsp
-        ; mov [r11 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32], rax
     );
     crate::entry::x86_64_tiering::emit_entry(ops);
     dynasm!(ops
@@ -832,7 +819,8 @@ pub(super) fn emit(
         ; mov edx, caller_function_id as i32
         ; mov ecx, logical_pc as i32
         ; mov r8, [r12 + CODE_ENTRY_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov r9, [rsp + layout.caller_code_object_id as i32]
+        ; mov r9, [rsp + NATIVE_FRAME_CALLER_OFFSET as i32]
+        ; mov r9d, [r9 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32]
         ; sub rsp, 16
         ; mov QWORD [rsp], 2
         ; mov [rsp + 8], rax
@@ -848,18 +836,8 @@ pub(super) fn emit(
     // Restore the caller publication before making the callee frame private.
     dynasm!(ops
         ; .arch x64
-        ; mov r10, [rsp + layout.caller_frame as i32]
-        ; mov r11, [rsp + layout.caller_code_object_id as i32]
+        ; mov r10, [rsp + NATIVE_FRAME_CALLER_OFFSET as i32]
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r10
-        ; mov r12, [r15 + THREAD_OFFSET as i32]
-        ; mov [r12 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], r10
-        ; mov [r12 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32], r11
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; sub r9, 1
-        ; mov [r8], r9
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; mov QWORD [r10 + r9 * 8], 0
         ; mov [rsp + layout.result_word as i32], rax
         ; mov [rsp + layout.status_word as i32], rdx
     );
@@ -1017,9 +995,9 @@ fn emit_generated_value_call(
 
     dynasm!(ops
         ; .arch x64
-        ; mov r10, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r11, [r10]
-        ; cmp r11, [r15 + ACTIVATION_LIMIT_OFFSET as i32]
+        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov r11d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; cmp r11, [r15 + GENERATED_DEPTH_LIMIT_OFFSET as i32]
         ; jae =>guard_fail
     );
     load_saved_root(ops, frame, site, instruction.operands[0].value, 9)?;
@@ -1183,20 +1161,11 @@ fn emit_generated_value_call(
         ; .arch x64
         ; mov r12, [rsp + layout.target_cell as i32]
         ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov [rsp + layout.caller_frame as i32], r10
-        ; mov r11, [r15 + THREAD_OFFSET as i32]
-        ; mov rax, [r11 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [rsp + layout.caller_code_object_id as i32], rax
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; mov [r10 + r9 * 8], rsp
-        ; add r9, 1
-        ; mov [r8], r9
+        ; mov [rsp + NATIVE_FRAME_CALLER_OFFSET as i32], r10
+        ; mov r9d, [r10 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; add r9d, 1
+        ; mov [rsp + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], rsp
-        ; mov rax, [r12 + CODE_ENTRY_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov [r11 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], rsp
-        ; mov [r11 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32], rax
     );
     crate::entry::x86_64_tiering::emit_entry(ops);
     dynasm!(ops
@@ -1227,7 +1196,8 @@ fn emit_generated_value_call(
         ; mov edx, caller_function_id as i32
         ; mov ecx, logical_pc as i32
         ; mov r8, [r12 + CODE_ENTRY_CODE_OBJECT_ID_OFFSET as i32]
-        ; mov r9, [rsp + layout.caller_code_object_id as i32]
+        ; mov r9, [rsp + NATIVE_FRAME_CALLER_OFFSET as i32]
+        ; mov r9d, [r9 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32]
         ; sub rsp, 16
         ; mov QWORD [rsp], deopt_call_kind
         ; mov [rsp + 8], rax
@@ -1242,18 +1212,8 @@ fn emit_generated_value_call(
 
     dynasm!(ops
         ; .arch x64
-        ; mov r10, [rsp + layout.caller_frame as i32]
-        ; mov r11, [rsp + layout.caller_code_object_id as i32]
+        ; mov r10, [rsp + NATIVE_FRAME_CALLER_OFFSET as i32]
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r10
-        ; mov r12, [r15 + THREAD_OFFSET as i32]
-        ; mov [r12 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], r10
-        ; mov [r12 + VM_THREAD_CODE_OBJECT_ID_OFFSET as i32], r11
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; sub r9, 1
-        ; mov [r8], r9
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; mov QWORD [r10 + r9 * 8], 0
         ; mov [rsp + layout.result_word as i32], rax
         ; mov [rsp + layout.status_word as i32], rdx
     );
@@ -1578,14 +1538,14 @@ fn initialize_frame(ops: &mut Assembler, target: &otter_vm::JitDirectCallee, lay
         ; mov r12, [rsp + layout.target_cell as i32]
         ; mov rax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32]
         ; mov [rsp], rax
-        ; mov eax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32 + 8]
+        ; mov rax, [r12 + CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET as i32 + 8]
     );
     if target.plan.needs_incoming_arguments {
-        dynasm!(ops ; .arch x64 ; or eax, INCOMING_ARGUMENTS_HEADER_WORD as i32);
+        dynasm!(ops ; .arch x64 ; or rax, INCOMING_ARGUMENTS_HEADER_WORD as i32);
     }
     dynasm!(ops
         ; .arch x64
-        ; mov [rsp + 8], eax
+        ; mov [rsp + 8], rax
         ; lea rax, [rsp + layout.register_base as i32]
         ; mov [rsp + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], rax
         ; mov QWORD [rsp + otter_vm::native_abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32], layout.incoming_count as i32

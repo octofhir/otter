@@ -165,8 +165,8 @@ pub fn context_allocation_plan(
 pub const JIT_YOUNG_CLOSURE_HEADER_WORD: u64 = crate::closure::JS_CLOSURE_BODY_TYPE_TAG as u64
     | ((JIT_GC_YOUNG_FLAG as u64) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET));
 /// Bytes of a closure cell without bound words.
-pub const JIT_CLOSURE_CELL_BYTES: u32 = (otter_gc::header::HEADER_SIZE
-    + std::mem::size_of::<crate::closure::JsClosureBody>()) as u32;
+pub const JIT_CLOSURE_CELL_BYTES: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::size_of::<crate::closure::JsClosureBody>()) as u32;
 
 // A carve writes the call header as one word (function id, then flags) and
 // clears the rare handle and the last-instance observation with one store.
@@ -1381,25 +1381,6 @@ pub struct JitDirectMethod {
     pub callee: JitDirectCallee,
 }
 
-/// VM-owned root descriptor for one native JIT activation.
-///
-/// The pointer names the canonical [`crate::native_abi::NativeFrame`]. Machine
-/// IR values that live across reentrant calls are published separately through
-/// the interpreter-owned [`JitMachineRootRecord`] chain.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct JitNativeActivation {
-    /// Published canonical native activation.
-    pub frame: *mut crate::native_abi::NativeFrame,
-}
-
-impl JitNativeActivation {
-    /// Empty inactive descriptor.
-    pub const EMPTY: Self = Self {
-        frame: std::ptr::null_mut(),
-    };
-}
-
 /// One stack-owned Machine IR root publication linked into the interpreter's
 /// active native-root chain.
 #[repr(C, align(8))]
@@ -1425,10 +1406,6 @@ const _: [(); 8] = [(); std::mem::offset_of!(JitMachineRootRecord, root_base)];
 const _: [(); 16] = [(); std::mem::offset_of!(JitMachineRootRecord, code_object_id)];
 const _: [(); 24] = [(); std::mem::offset_of!(JitMachineRootRecord, root_count)];
 const _: [(); 28] = [(); std::mem::offset_of!(JitMachineRootRecord, safepoint_id)];
-
-const _: [(); 8] = [(); std::mem::size_of::<JitNativeActivation>()];
-const _: [(); 8] = [(); std::mem::align_of::<JitNativeActivation>()];
-const _: [(); 0] = [(); std::mem::offset_of!(JitNativeActivation, frame)];
 
 /// Current static offsets needed by native Array guards.
 ///

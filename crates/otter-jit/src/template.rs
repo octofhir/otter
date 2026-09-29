@@ -273,8 +273,6 @@ mod tests {
         let mut error = None;
         let interrupt_probe: u8 = interrupt;
         let mut backedge_fuel_probe: u64 = fuel;
-        let mut activation_probe = [0u64; 32];
-        let mut activation_top_probe: usize = 0;
         let mut native_frame = otter_vm::native_abi::NativeFrame::new(
             otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
             regs.as_mut_ptr() as u64,
@@ -282,17 +280,14 @@ mod tests {
             otter_vm::Value::undefined(),
         );
         let mut thread = otter_vm::native_abi::VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
-        thread.current_code_object_id = 1;
+        native_frame.code_object_id = 1;
         thread.interrupt_cell = std::ptr::addr_of!(interrupt_probe) as u64;
         thread.backedge_fuel_cell = std::ptr::addr_of_mut!(backedge_fuel_probe) as u64;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: &mut native_frame,
             error: &mut error,
-            activation_base: activation_probe.as_mut_ptr().cast(),
-            activation_top_ptr: std::ptr::addr_of_mut!(activation_top_probe),
-            activation_limit: 16,
+            generated_depth_limit: u64::MAX,
             machine_roots_ptr: std::ptr::null_mut(),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
@@ -300,6 +295,7 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
         };
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         // SAFETY: the fixture owns every published context record, and the
         // entry's executable mapping outlives the complete call.
         let entry: JitEntry = unsafe { std::mem::transmute(entry_ptr) };

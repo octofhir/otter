@@ -280,6 +280,13 @@ impl ExecutableModule {
 }
 
 impl CodeBlock {
+    /// Whether the function materializes `arguments`, so its callers publish
+    /// the actual-argument window after the complete register window.
+    #[must_use]
+    pub fn needs_arguments(&self) -> bool {
+        self.needs_arguments
+    }
+
     /// Heap bytes this code block retains beyond `size_of::<Self>()`: the
     /// instruction stream, overflow operand words, control-flow and span
     /// tables, feedback vector, and annotation-hint tables.
@@ -548,6 +555,7 @@ impl CodeBlock {
             is_async_generator: false,
             is_derived_constructor: false,
             makes_function: false,
+            observes_this: true,
             needs_arguments: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Box::new([]),
@@ -1014,6 +1022,10 @@ pub struct CodeBlock {
     /// `true` when this function body contains an `Op::MakeFunction` or
     /// `Op::MakeClosure`.
     pub(crate) makes_function: bool,
+    /// Whether an activation's `this` binding is observable: the body reads
+    /// it (`LoadThis`), creates a closure (an arrow captures it) or holds a
+    /// direct eval. Generated callers skip receiver conversion otherwise.
+    pub(crate) observes_this: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
     /// Arguments object shape requested by the compiler.
@@ -1150,9 +1162,13 @@ impl CodeBlock {
             .code
             .iter()
             .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
+        let observes_this = makes_function
+            || function.contains_direct_eval
+            || function.code.iter().any(|instr| instr.op == Op::LoadThis);
         Self {
             id: function.id,
             makes_function,
+            observes_this,
             param_count: function.param_count,
             register_count,
             is_strict: function.is_strict,

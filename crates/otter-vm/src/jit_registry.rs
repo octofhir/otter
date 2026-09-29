@@ -208,7 +208,11 @@ impl JitCodeRegistry {
             flags |= CODE_ENTRY_OPTIMIZING_TIER;
         }
         if code.generated_entry_uses_parameter_prefix() {
-            if code.safepoint_count() != 0 || param_count > register_count {
+            // Only the optimizing tier publishes a prefix; its safepoints
+            // name call-site root homes, never window slots.
+            if code.native_frame_kind() != NativeFrameKind::Optimizing
+                || param_count > register_count
+            {
                 return false;
             }
             flags |= CODE_ENTRY_PARAMETER_PREFIX;
@@ -417,7 +421,8 @@ impl JitCodeRegistry {
             code_object_id: generation.code_object_id,
             entry_cell: std::ptr::from_ref(function_entry) as u64,
             tier: registered.code.native_frame_kind(),
-            this_mode: if function.is_strict || function.is_arrow {
+            // An unobservable binding needs no OrdinaryCallBindThis.
+            this_mode: if function.is_strict || function.is_arrow || !function.observes_this {
                 JitDirectCallThisMode::StrictOrLexical
             } else {
                 JitDirectCallThisMode::SloppyGlobal

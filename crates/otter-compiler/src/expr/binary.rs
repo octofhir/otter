@@ -473,7 +473,10 @@ fn compile_binary_to(
 fn typeof_literal_pair<'a, 'b>(
     left: &'b Expression<'a>,
     right: &'b Expression<'a>,
-) -> Option<(&'b oxc_ast::ast::UnaryExpression<'a>, otter_bytecode::TypeOfKind)> {
+) -> Option<(
+    &'b oxc_ast::ast::UnaryExpression<'a>,
+    otter_bytecode::TypeOfKind,
+)> {
     fn unwrap<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
         let mut expr = expr;
         while let Expression::ParenthesizedExpression(p) = expr {

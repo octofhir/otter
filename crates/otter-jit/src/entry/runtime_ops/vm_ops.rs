@@ -343,15 +343,12 @@ mod tests {
         );
         frame.set_stack_registers();
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(frame) as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(frame),
             error: std::ptr::addr_of_mut!(error),
-            activation_base: std::ptr::null_mut(),
-            activation_top_ptr: std::ptr::null_mut(),
-            activation_limit: 0,
+            generated_depth_limit: u64::MAX,
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
@@ -359,6 +356,7 @@ mod tests {
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         let mut cell = PropertySourceCell::default();
 
         let loaded = jit_load_property_stub(&mut ctx, Value::undefined().to_bits(), &mut cell);
@@ -402,15 +400,12 @@ mod tests {
         );
         frame.set_stack_registers();
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(frame) as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(frame),
             error: std::ptr::addr_of_mut!(error),
-            activation_base: std::ptr::null_mut(),
-            activation_top_ptr: std::ptr::null_mut(),
-            activation_limit: 0,
+            generated_depth_limit: u64::MAX,
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
@@ -418,6 +413,7 @@ mod tests {
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         let packet = [Value::number_i32(7), Value::number_i32(11)];
 
         let result = jit_call_method_value_stub(&mut ctx, packet.as_ptr(), packet.len() as u32);

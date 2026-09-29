@@ -54,7 +54,7 @@ impl Interpreter {
             return Ok(());
         }
         debug_assert_eq!(self.sync_reentry_depth, 0);
-        debug_assert_eq!(self.jit_native_activation_top, 0);
+        debug_assert!(!self.jit_has_native_frames());
         debug_assert_eq!(self.jit_machine_roots, 0);
 
         self.code_eviction_stats.census_passes =

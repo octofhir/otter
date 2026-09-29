@@ -13,7 +13,7 @@
 //!
 //! # See also
 //! - [`crate::stack_snapshot`] — source resolution shared with interpreter views.
-//! - [`crate::Interpreter::jit_push_native_frame`] — publication lifetime.
+//! - [`crate::Interpreter::jit_native_frames`] — the published frame chain.
 
 use crate::native_abi::NativeFrameFlags;
 use crate::{ActivationStack, ExecutionContext, Interpreter, StackFrameSnapshot};
@@ -25,18 +25,20 @@ impl Interpreter {
         stack: &ActivationStack,
         limit: usize,
     ) -> Vec<StackFrameSnapshot> {
-        let mut sites = Vec::with_capacity(stack.len() + self.jit_native_activation_top);
+        let mut natives: Vec<_> = self.jit_native_frames().collect();
+        natives.reverse();
+        let mut sites = Vec::with_capacity(stack.len() + natives.len());
         let mut owners = vec![None; stack.len()];
         let mut cursor = 0;
-        for activation in &self.jit_native_activations[..self.jit_native_activation_top] {
+        for address in natives {
             // SAFETY: publication keeps this header live through the complete
             // metadata-only walk. No managed window is borrowed or dereferenced.
-            let native = unsafe { &*activation.frame };
+            let native = unsafe { &*address };
             let transferred =
                 self.jit_materialized_generated_calls
                     .iter()
-                    .find_map(|&(address, index)| {
-                        (address == activation.frame as usize).then_some(index)
+                    .find_map(|&(materialized, index)| {
+                        (materialized == address as usize).then_some(index)
                     });
             let owner = transferred.or_else(|| {
                 (!native

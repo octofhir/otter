@@ -120,11 +120,7 @@ impl NewSpace {
                 let header = page.header();
                 if header.bump_remaining() >= min_bytes {
                     let base = page.base_ptr() as usize;
-                    return Some((
-                        base,
-                        base + header.bump_cursor,
-                        base + header.span_bytes(),
-                    ));
+                    return Some((base, base + header.bump_cursor, base + header.span_bytes()));
                 }
                 self.active += 1;
                 continue;

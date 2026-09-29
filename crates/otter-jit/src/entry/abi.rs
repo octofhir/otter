@@ -30,27 +30,26 @@ use otter_vm::{
 /// The context contains execution services, not duplicated JavaScript frame
 /// state. Registers, SELF, `this`, PC, and tier state live only in
 /// [`NativeFrame`]; every compiled tier resolves them through that canonical
-/// activation, and captured bindings through the contexts its registers hold. Nested calls reuse this context and swap only its active-frame
-/// pointer for the dynamic extent of the callee. Machine IR safepoints link
-/// allocator-owned tagged homes through the VM-owned root-chain head.
+/// activation, and captured bindings through the contexts its registers hold.
+/// Nested calls reuse this context: linkage links the callee's frame to the
+/// current one and makes it `native_frame` for the dynamic extent of the
+/// call. Machine IR safepoints link allocator-owned tagged homes through the
+/// VM-owned root-chain head.
 #[repr(C)]
 pub(crate) struct JitCtx {
     /// Sole machine-visible VM state pointer.
     pub(crate) thread: *mut VmThread,
-    /// Published authoritative activation.
+    /// Innermost published frame: the frame now executing generated code.
+    /// The VM reads the frame chain through this cell.
     pub(crate) native_frame: *mut NativeFrame,
     /// Error slot shared by direct callees and runtime stubs when a re-entered
     /// operation throws. Pointer form keeps the slot stable while the shared
     /// context swaps its active native frame for a nested callee.
     pub(crate) error: *mut Option<VmError>,
-    /// Base of the interpreter's native activation array (one pointer-sized
-    /// `JitNativeActivation` per entry). Compiled call sequences publish and
-    /// unpublish the complete canonical frame through it.
-    pub(crate) activation_base: *mut u8,
-    /// Address of the interpreter's native activation cursor.
-    pub(crate) activation_top_ptr: *mut usize,
-    /// Capacity of the activation array — the inline publish overflow bound.
-    pub(crate) activation_limit: usize,
+    /// A generated call links a new frame only while the caller's
+    /// [`NativeFrame::depth`] is below this bound, which keeps interpreter
+    /// plus generated frames within the JavaScript depth budget.
+    pub(crate) generated_depth_limit: u64,
     /// Address of the active realm's GC-rooted `globalThis` compressed offset.
     pub(crate) global_this_offset: *const u32,
     /// Lowest native-stack address generated callees may reserve.
@@ -204,21 +203,13 @@ pub(crate) const VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell) as u32;
 pub(crate) const VM_THREAD_ACTIVE_REALM_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, active_realm_cell) as u32;
-pub(crate) const VM_THREAD_CODE_OBJECT_ID_OFFSET: u32 =
-    std::mem::offset_of!(VmThread, current_code_object_id) as u32;
 pub(crate) const VM_THREAD_CODE_REGISTRY_OFFSET: u32 =
     std::mem::offset_of!(VmThread, code_registry) as u32;
 pub(crate) const CODE_REGISTRY_VIEW_HOT_FUNCTION_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::native_abi::CodeRegistryView, hot_function) as u32;
-pub(crate) const VM_THREAD_CURRENT_FRAME_OFFSET: u32 =
-    std::mem::offset_of!(VmThread, current_frame) as u32;
-/// Byte offsets of the native-activation publish fields in [`JitCtx`], used by
-/// inline direct-call activation push/pop sequences.
-pub(crate) const ACTIVATION_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, activation_base) as u32;
-pub(crate) const ACTIVATION_TOP_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, activation_top_ptr) as u32;
-pub(crate) const ACTIVATION_LIMIT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, activation_limit) as u32;
+/// Byte offset of the generated-frame depth bound in [`JitCtx`].
+pub(crate) const GENERATED_DEPTH_LIMIT_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, generated_depth_limit) as u32;
 pub(crate) const MACHINE_ROOTS_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, machine_roots_ptr) as u32;
 pub(crate) const MACHINE_ROOT_RECORD_PREVIOUS_OFFSET: u32 =
@@ -291,6 +282,7 @@ pub(crate) const NATIVE_FRAME_STACK_SIZE: u32 =
 /// Byte offsets of the callee-frame fields emitted nested-call sequences fill,
 /// re-exported from the VM-owned [`NativeFrame`] layout.
 pub(crate) use otter_vm::native_abi::{
+    NATIVE_FRAME_CALLER_OFFSET, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_DEPTH_OFFSET,
     NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
     NATIVE_FRAME_THIS_OFFSET,
 };
@@ -302,7 +294,7 @@ pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFr
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 104] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 88] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> NativeResultPair;

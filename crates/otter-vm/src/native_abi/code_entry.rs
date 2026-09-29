@@ -112,6 +112,10 @@ pub struct CodeEntryCell {
     /// immutable for this generation. Packing them once removes per-entry
     /// metadata decoding from generated call linkage.
     pub native_frame_header: VmFrameHeader,
+    /// This generation's id as the frame record's 32-bit `code_object_id`.
+    /// It completes the header's second word, so linkage copies register
+    /// shape, tier, flags and generation with one load/store pair.
+    pub native_frame_code_object_id: u32,
     /// Per-function execution count at which generated baseline calls wake the
     /// cold optimizing cost policy. This is derived from the function's size
     /// and calibrated coefficients when the generation is installed.
@@ -178,6 +182,8 @@ impl CodeEntryCell {
                 kind,
                 flags: frame_flags,
             },
+            native_frame_code_object_id: u32::try_from(code_object_id)
+                .expect("code object ids fit the frame record's generation field"),
             generated_tiering_break_even,
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
@@ -294,6 +300,7 @@ const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_fra
 const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
 const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, _native_frame_alignment)];
 const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
+const _: [(); 44] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_code_object_id)];
 const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
 const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
 const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];

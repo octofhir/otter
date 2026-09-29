@@ -693,7 +693,7 @@ mod tests {
                 )
             })
             .expect("stack-call catch resumes");
-        interpreter.jit_pop_native_activation();
+        interpreter.jit_pop_native_frame();
         assert_eq!(result, thrown);
         assert!(stack.is_empty());
     }

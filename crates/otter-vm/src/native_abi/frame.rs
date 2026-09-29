@@ -3,7 +3,8 @@
 //! # Contents
 //! - [`VmThread`] is the only process state generated code receives.
 //! - [`VmFrameHeader`] is the tier-independent frame prefix.
-//! - [`NativeFrame`] is the compact activation record shared by every tier.
+//! - [`NativeFrame`] is the compact activation record shared by every tier;
+//!   records link to their callers into one frame chain.
 //! - `NATIVE_FRAME_*_OFFSET` constants give generated code the byte offset of
 //!   every field it reads or writes.
 //! - [`NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET`] locates the lazy arguments root.
@@ -19,6 +20,11 @@
 //!   context, so SELF is always the exact closure being executed.
 //! - The nullable arguments cache is initialized before publication and traced
 //!   in place; exact deopt preserves its identity in the interpreter frame.
+//! - Published frames form one chain from the innermost frame through
+//!   [`NativeFrame::caller`] across every nested compiled entry. Nothing else
+//!   records the live frame set: collectors, stack snapshots and deopt walk it.
+//!   The innermost frame of the live compiled entry is the entry's
+//!   `JitCtx::native_frame`; [`VmThread::frame_cell`] names that cell.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
 //!   recomputed after any allocating or reentrant call.
 //!
@@ -31,10 +37,11 @@ use crate::Value;
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmThread {
-    /// Address of the currently published [`NativeFrame`], or zero.
-    pub current_frame: u64,
-    /// Installed code generation owning `current_frame`, or zero outside JIT.
-    pub current_code_object_id: u64,
+    /// Address of the cell holding the innermost published [`NativeFrame`]
+    /// of this compiled entry (the entry's `JitCtx::native_frame`), or zero.
+    /// Generated linkage updates the cell; runtime stubs read the current
+    /// frame and its generation through it.
+    pub frame_cell: u64,
     /// Opaque isolate-owned runtime context address.
     pub runtime_context: u64,
     /// Address of the active [`super::CodeRegistryView`].
@@ -73,8 +80,7 @@ impl VmThread {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            current_frame: 0,
-            current_code_object_id: 0,
+            frame_cell: 0,
             runtime_context: 0,
             code_registry: 0,
             interrupt_cell: 0,
@@ -201,6 +207,10 @@ impl VmFrameHeader {
 pub struct NativeFrame {
     /// Common tier-independent header.
     pub header: VmFrameHeader,
+    /// Installed code generation executing this frame, or zero for an
+    /// interpreter-owned record. Stubs resolve the frame's safepoints and
+    /// inline recipes through it.
+    pub code_object_id: u32,
     /// Base address of initialized tagged register slots.
     pub register_base: u64,
     /// Boxed `this` value.
@@ -214,8 +224,15 @@ pub struct NativeFrame {
     /// [`NativeFrameFlags::INCOMING_ARGUMENTS`] is set; otherwise unused.
     pub argument_count: u32,
     /// Lazily materialized arguments identity. Null means the actual window
-    /// remains authoritative. This occupies the native record's tail padding.
+    /// remains authoritative.
     pub(crate) arguments_object: crate::object::JsObject,
+    /// Calling frame's record, or null for the outermost published frame.
+    /// Linkage writes it before the frame becomes the innermost one.
+    pub caller: u64,
+    /// Stack-register frames in the chain from this record outward, this one
+    /// included. The logical JavaScript depth of generated frames; linkage
+    /// computes it from the caller's value.
+    pub depth: u32,
 }
 
 impl NativeFrame {
@@ -232,12 +249,15 @@ impl NativeFrame {
     ) -> Self {
         Self {
             header,
+            code_object_id: 0,
             register_base,
             this_value_bits: this_value.to_abi_bits(),
             new_target_bits: Value::UNDEFINED.to_abi_bits(),
             self_value_bits: self_value.to_abi_bits(),
             argument_count: 0,
             arguments_object: crate::object::JsObject::null(),
+            caller: 0,
+            depth: 0,
         }
     }
 
@@ -249,6 +269,12 @@ impl NativeFrame {
     /// Publish the identity in the collector-traced native frame slot.
     pub(crate) fn set_arguments_object(&mut self, object: Option<crate::object::JsObject>) {
         self.arguments_object = object.unwrap_or_else(crate::object::JsObject::null);
+    }
+
+    /// Calling frame's record, or null for the outermost published frame.
+    #[must_use]
+    pub fn caller_frame(&self) -> *mut NativeFrame {
+        self.caller as *mut NativeFrame
     }
 
     /// Exact running function object.
@@ -371,20 +397,19 @@ impl NativeFrame {
     }
 }
 
-const _: [(); 96] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 88] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
-const _: [(); 56] = [(); std::mem::size_of::<NativeFrame>()];
+const _: [(); 72] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
-const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
-const _: [(); 8] = [(); std::mem::offset_of!(VmThread, current_code_object_id)];
-const _: [(); 40] = [(); std::mem::offset_of!(VmThread, gc_heap)];
-const _: [(); 48] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
-const _: [(); 56] = [(); std::mem::offset_of!(VmThread, global_lexical_epoch_cell)];
-const _: [(); 64] = [(); std::mem::offset_of!(VmThread, marking_flag_cell)];
-const _: [(); 72] = [(); std::mem::offset_of!(VmThread, array_index_protector_cell)];
-const _: [(); 80] = [(); std::mem::offset_of!(VmThread, active_realm_cell)];
-const _: [(); 88] = [(); std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell)];
+const _: [(); 0] = [(); std::mem::offset_of!(VmThread, frame_cell)];
+const _: [(); 32] = [(); std::mem::offset_of!(VmThread, gc_heap)];
+const _: [(); 40] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
+const _: [(); 48] = [(); std::mem::offset_of!(VmThread, global_lexical_epoch_cell)];
+const _: [(); 56] = [(); std::mem::offset_of!(VmThread, marking_flag_cell)];
+const _: [(); 64] = [(); std::mem::offset_of!(VmThread, array_index_protector_cell)];
+const _: [(); 72] = [(); std::mem::offset_of!(VmThread, active_realm_cell)];
+const _: [(); 80] = [(); std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell)];
 const _: [(); 4] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 11] = [(); std::mem::offset_of!(VmFrameHeader, flags)];
@@ -393,6 +418,19 @@ const _: [(); 24] = [(); std::mem::offset_of!(NativeFrame, this_value_bits)];
 const _: [(); 32] = [(); std::mem::offset_of!(NativeFrame, new_target_bits)];
 const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, self_value_bits)];
 const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, argument_count)];
+const _: [(); 12] = [(); std::mem::offset_of!(NativeFrame, code_object_id)];
+const _: [(); 56] = [(); std::mem::offset_of!(NativeFrame, caller)];
+const _: [(); 64] = [(); std::mem::offset_of!(NativeFrame, depth)];
+
+/// Byte offset of [`NativeFrame::code_object_id`]. It shares the eight-byte
+/// word that starts at the register count, so linkage writes the register
+/// shape, tier, flags and generation with one store.
+pub const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, code_object_id) as u32;
+/// Byte offset of [`NativeFrame::caller`].
+pub const NATIVE_FRAME_CALLER_OFFSET: u32 = std::mem::offset_of!(NativeFrame, caller) as u32;
+/// Byte offset of [`NativeFrame::depth`].
+pub const NATIVE_FRAME_DEPTH_OFFSET: u32 = std::mem::offset_of!(NativeFrame, depth) as u32;
 
 /// Byte offset of [`NativeFrame::register_base`].
 pub const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
@@ -423,7 +461,7 @@ mod tests {
     #[test]
     fn empty_thread_has_no_published_activation() {
         let thread = VmThread::empty();
-        assert_eq!(thread.current_frame, 0);
+        assert_eq!(thread.frame_cell, 0);
     }
 
     #[test]
@@ -496,12 +534,14 @@ mod tests {
     #[test]
     fn native_frame_layout_holds_no_binding_storage() {
         assert_eq!(std::mem::size_of::<VmFrameHeader>(), 12);
-        assert_eq!(std::mem::size_of::<NativeFrame>(), 56);
+        assert_eq!(std::mem::size_of::<NativeFrame>(), 72);
         assert_eq!(NATIVE_FRAME_REGISTER_BASE_OFFSET, 16);
         assert_eq!(NATIVE_FRAME_THIS_OFFSET, 24);
         assert_eq!(NATIVE_FRAME_NEW_TARGET_OFFSET, 32);
         assert_eq!(NATIVE_FRAME_SELF_OFFSET, 40);
         assert_eq!(NATIVE_FRAME_ARGUMENT_COUNT_OFFSET, 48);
         assert_eq!(NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET, 52);
+        assert_eq!(NATIVE_FRAME_CALLER_OFFSET, 56);
+        assert_eq!(NATIVE_FRAME_DEPTH_OFFSET, 64);
     }
 }

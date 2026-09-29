@@ -35,7 +35,7 @@ exceptions and symbol properties. A getter may expose or mutate its receiver;
 every subsequent arguments operation in the activation uses that same object.
 The operation completes once and is never replayed after a cold call.
 
-The native activation owns a nullable compressed object root at byte offset 68
+The native activation owns a nullable compressed object root at byte offset 52
 of its 72-byte `NativeFrame`. Every generated entry initializes it before
 publication. The collector rewrites it in place. Native entry, interpreter
 continuations and exact deoptimization preserve the current identity. The

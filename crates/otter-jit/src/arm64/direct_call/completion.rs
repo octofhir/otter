@@ -179,7 +179,8 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; ldr x4, [x25, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
-        ; ldr x5, [sp, layout.caller_code_object_id]
+        ; ldr x5, [sp, NATIVE_FRAME_CALLER_OFFSET]
+        ; ldr w5, [x5, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
     );
     emit_load_u64(
         ops,
@@ -222,19 +223,9 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; =>cleanup
-        // Restore caller publication before retiring the callee generation.
-        ; ldr x13, [sp, layout.caller_frame]
-        ; ldr x15, [sp, layout.caller_code_object_id]
+        // The caller becomes the innermost frame again.
+        ; ldr x13, [sp, NATIVE_FRAME_CALLER_OFFSET]
         ; str x13, [X(context_register), NATIVE_FRAME_OFFSET]
-        ; ldr x14, [X(context_register), THREAD_OFFSET]
-        ; stp x13, x15, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
-        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, #1
-        ; str x10, [x9]
-        ; ldr x11, [X(context_register), ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #3
-        ; str xzr, [x12]
     );
     dynasm!(ops
         ; .arch aarch64

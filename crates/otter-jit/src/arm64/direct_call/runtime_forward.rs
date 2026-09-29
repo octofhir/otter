@@ -57,6 +57,7 @@ where
 {
     let layout = StackLayout::dynamic_prefix();
     let size_slot = layout.allocation_size.expect("dynamic prefix");
+    let plan_slot = layout.plan.expect("dynamic prefix");
     let caller_bail = ops.new_dynamic_label();
     let caller_transition = ops.new_dynamic_label();
     let scratch_miss = ops.new_dynamic_label();
@@ -68,9 +69,9 @@ where
     let start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; ldr x11, [X(context_register), ACTIVATION_LIMIT_OFFSET]
+        ; ldr x9, [X(context_register), NATIVE_FRAME_OFFSET]
+        ; ldr w10, [x9, NATIVE_FRAME_DEPTH_OFFSET]
+        ; ldr x11, [X(context_register), GENERATED_DEPTH_LIMIT_OFFSET]
         ; cmp x10, x11
         ; b.hs =>caller_bail
     );
@@ -113,8 +114,7 @@ where
         ; sub sp, sp, x16
         ; str w15, [sp, size_slot]
         ; str x25, [sp, layout.saved_x25]
-        // Metadata pointer is dead before this slot becomes caller code id.
-        ; str x17, [sp, layout.caller_code_object_id]
+        ; str x17, [sp, plan_slot]
         ; str x8, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         ; add x9, sp, x9
         ; str x9, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
@@ -134,7 +134,7 @@ where
         ; cbz x16, =>entry_rejected
         ; str x16, [sp, layout.entry_addr]
         ; ldr x13, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET]
-        ; ldr w14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET + 8]
+        ; ldr x14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET + 8]
         ; str x13, [sp]
     );
     let header_ready = ops.new_dynamic_label();
@@ -144,9 +144,9 @@ where
         ; .arch aarch64
         ; ldr w13, [x25, CODE_ENTRY_FLAGS_OFFSET]
         ; tbnz w13, #PARAMETER_PREFIX_FLAG_BIT, =>uncommitted_rejected
-        ; orr w14, w14, INCOMING_ARGUMENTS_HEADER_WORD
+        ; orr x14, x14, INCOMING_ARGUMENTS_HEADER_WORD as u64
         ; =>header_ready
-        ; str w14, [sp, 8]
+        ; str x14, [sp, 8]
         ; ldr x9, [x17, PLAN_BYTES]
         ; ldr x12, [x17, PLAN_BYTES + 8]
         ; str x9, [sp, NATIVE_FRAME_SELF_OFFSET]
@@ -192,7 +192,7 @@ where
     dynasm!(ops
         ; .arch aarch64
         ; str x13, [sp, NATIVE_FRAME_NEW_TARGET_OFFSET]
-        ; ldr x17, [sp, layout.caller_code_object_id]
+        ; ldr x17, [sp, plan_slot]
         ; ldrh w13, [x17, PLAN_REGISTERS]
         ; ldr w14, [sp, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
         ; add w13, w13, w14
@@ -224,31 +224,13 @@ where
         ; .arch aarch64
         ; blr x16
         ; tbnz x0, #63, =>uncommitted_rejected
-        ; ldr x17, [sp, layout.caller_code_object_id]
+        ; ldr x17, [sp, plan_slot]
         ; ldrh w2, [x17, PLAN_PARAMS]
         ; ldrh w3, [x17, PLAN_REGISTERS]
     );
     forward_bindings::emit(ops, view, layout, load_binding)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
-        ; ldr x14, [X(context_register), THREAD_OFFSET]
-        ; ldr x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
-        ; str x13, [sp, layout.caller_frame]
-        ; str x15, [sp, layout.caller_code_object_id]
-        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; ldr x11, [X(context_register), ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #3
-        ; mov x15, sp
-        ; str x15, [x12]
-        ; add x10, x10, #1
-        ; str x10, [x9]
-        ; str x15, [X(context_register), NATIVE_FRAME_OFFSET]
-        ; ldr x13, [x25, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
-        ; stp x15, x13, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
-        ; ldr x16, [sp, layout.entry_addr]
-    );
+    emit_link_callee_frame(ops, context_register);
+    dynasm!(ops ; .arch aarch64 ; ldr x16, [sp, layout.entry_addr]);
     let entry_start = ops.offset().0;
     tiering::emit_entry(ops, context_register);
     dynasm!(ops

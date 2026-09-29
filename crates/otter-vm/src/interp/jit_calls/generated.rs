@@ -72,18 +72,20 @@ impl Interpreter {
         let Some(source) = record.inline_frames.last() else {
             return false;
         };
-        if source.function_id != function_id || self.jit_native_activation_top < 2 {
+        if source.function_id != function_id {
             return false;
         }
-        let active = &self.jit_native_activations[..self.jit_native_activation_top];
-        if !std::ptr::eq(active[active.len() - 1].frame, callee) {
+        // The callee is innermost; its callers are the published inline
+        // parents, callee-most first, then the physical root frame.
+        let active: Vec<_> = self
+            .jit_native_frames()
+            .take(record.inline_frames.len() + 2)
+            .collect();
+        if active.len() != record.inline_frames.len() + 2 || !std::ptr::eq(active[0], callee) {
             return false;
         }
-        let Some(base) = active.len().checked_sub(record.inline_frames.len() + 2) else {
-            return false;
-        };
-        // SAFETY: the published activation array owns live canonical frame pointers.
-        let Some(root) = (unsafe { active[base].frame.as_ref() }) else {
+        // SAFETY: published frames stay live throughout the cold check.
+        let Some(root) = (unsafe { active[active.len() - 1].as_ref() }) else {
             return false;
         };
         if root.header.function_id != owner {
@@ -91,7 +93,7 @@ impl Interpreter {
         }
         for (index, source) in record.inline_frames.iter().enumerate() {
             // SAFETY: all published parents remain live throughout the cold check.
-            let Some(parent) = (unsafe { active[base + 1 + index].frame.as_ref() }) else {
+            let Some(parent) = (unsafe { active[active.len() - 2 - index].as_ref() }) else {
                 return false;
             };
             let Some(function) = context.exec_function(source.function_id) else {

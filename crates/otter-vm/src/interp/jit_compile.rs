@@ -574,9 +574,9 @@ impl Interpreter {
                 }
                 self.jit_next_code_object_id += 1;
                 // Generated callers do not take a per-call executable lease.
-                // Any published native activation pins the current retirement
+                // Any published native frame pins the current retirement
                 // epoch, including across reentrant compilation/invalidation.
-                if self.jit_native_activation_top == 0 {
+                if !self.jit_has_native_frames() {
                     self.jit_code_registry.retire_unreferenced();
                 }
                 let installed = self.jit_code_registry.install_compiled(
@@ -830,7 +830,7 @@ impl Interpreter {
                 // Sweep before registering: cached/installed users hold an
                 // `Arc`; executing generated generations are protected by the
                 // isolate's published native-activation epoch.
-                if self.jit_native_activation_top == 0 {
+                if !self.jit_has_native_frames() {
                     self.jit_code_registry.retire_unreferenced();
                 }
                 let installed = self.jit_code_registry.install_compiled(

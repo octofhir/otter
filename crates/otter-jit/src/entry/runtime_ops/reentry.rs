@@ -1637,15 +1637,12 @@ mod tests {
         );
         frame.set_stack_registers();
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(frame) as u64;
         let mut error = None;
         let mut ctx = JitCtx {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(frame),
             error: std::ptr::addr_of_mut!(error),
-            activation_base: std::ptr::null_mut(),
-            activation_top_ptr: std::ptr::null_mut(),
-            activation_limit: 0,
+            generated_depth_limit: u64::MAX,
             machine_roots_ptr: std::ptr::null_mut(),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
@@ -1653,6 +1650,7 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
         };
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         test(&mut ctx);
     }
 

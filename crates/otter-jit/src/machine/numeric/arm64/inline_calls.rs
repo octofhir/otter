@@ -3,7 +3,7 @@
 //! # Contents
 //! - Bounded native headers and register windows in the owning Machine frame.
 //! - Exact source PCs, SELF closures and moving values from safepoint homes.
-//! - Publication and release through the existing native activation cursor.
+//! - Publication and release by linking the parents into the frame chain.
 //!
 //! # Invariants
 //! - No VM operation, allocation or collection occurs during publication.
@@ -17,8 +17,8 @@
 
 use super::*;
 use crate::entry::{
-    ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
-    VM_THREAD_CURRENT_FRAME_OFFSET,
+    GENERATED_DEPTH_LIMIT_OFFSET, NATIVE_FRAME_CALLER_OFFSET, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET,
+    NATIVE_FRAME_DEPTH_OFFSET,
 };
 use crate::machine::MachineInstruction;
 use otter_vm::native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind};
@@ -76,17 +76,17 @@ pub(super) fn enter(
             .ok_or(Unsupported::OperandShape("inline native root source"))?
             .0;
     dynasm!(ops ; .arch aarch64
-        ; ldr x9, [x19, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
+        ; ldr x12, [x19, NATIVE_FRAME_OFFSET]
+        ; ldr w10, [x12, NATIVE_FRAME_DEPTH_OFFSET]
         ; add x10, x10, count as u32
-        ; ldr x11, [x19, ACTIVATION_LIMIT_OFFSET]
+        ; ldr x11, [x19, GENERATED_DEPTH_LIMIT_OFFSET]
         ; cmp x10, x11
-        ; b.hi =>fail
-        ; ldr x12, [x19, NATIVE_FRAME_OFFSET]);
+        ; b.hi =>fail);
     emit_frame_str_x(ops, 12, offset(frame, first)?);
     emit_load_u64(ops, 15, u64::from(parent_pc));
     dynasm!(ops ; .arch aarch64 ; str w15, [x12, NATIVE_FRAME_PC_OFFSET]);
     let mut word = usize::from(first) + 1;
+    let mut caller_start = None;
     for (index, recipe) in instruction.inline_frames.iter().enumerate().skip(1) {
         let entry = recipe
             .entry
@@ -119,6 +119,20 @@ pub(super) fn enter(
             | (u32::from(NativeFrameFlags::STACK_REGISTERS) << 24);
         emit_load_u64(ops, 14, u64::from(header));
         dynasm!(ops ; .arch aarch64 ; str w14, [x13, NATIVE_FRAME_REGISTER_COUNT_OFFSET]);
+        // Each parent links to the previous one; the first to the physical
+        // frame. All share the physical frame's generation.
+        match caller_start {
+            Some(caller) => emit_sp_address_x9(ops, caller),
+            None => dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, NATIVE_FRAME_OFFSET]),
+        }
+        dynasm!(ops ; .arch aarch64
+            ; str x9, [x13, NATIVE_FRAME_CALLER_OFFSET]
+            ; ldr w10, [x9, NATIVE_FRAME_DEPTH_OFFSET]
+            ; add w10, w10, #1
+            ; str w10, [x13, NATIVE_FRAME_DEPTH_OFFSET]
+            ; ldr w10, [x9, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
+            ; str w10, [x13, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]);
+        caller_start = Some(start);
         emit_sp_address_x9(ops, start + std::mem::size_of::<NativeFrame>() as u32);
         dynasm!(ops ; .arch aarch64 ; str x9, [x13, NATIVE_FRAME_REGISTER_BASE_OFFSET]);
         for (value, member) in [
@@ -142,19 +156,9 @@ pub(super) fn enter(
             load_slot(ops, frame, site, *value, 14)?;
             emit_frame_str_x(ops, 14, start + (HEADER_WORDS + index) as u32 * 8);
         }
-        dynasm!(ops ; .arch aarch64
-            ; ldr x9, [x19, ACTIVATION_TOP_PTR_OFFSET]
-            ; ldr x10, [x9]
-            ; ldr x11, [x19, ACTIVATION_BASE_OFFSET]
-            ; str x13, [x11, x10, lsl #3]
-            ; add x10, x10, #1
-            ; str x10, [x9]);
         word += HEADER_WORDS + recipe.slots.len();
     }
-    dynasm!(ops ; .arch aarch64
-        ; str x13, [x19, NATIVE_FRAME_OFFSET]
-        ; ldr x9, [x19, THREAD_OFFSET]
-        ; str x13, [x9, VM_THREAD_CURRENT_FRAME_OFFSET]);
+    dynasm!(ops ; .arch aarch64 ; str x13, [x19, NATIVE_FRAME_OFFSET]);
     Ok(())
 }
 
@@ -167,20 +171,7 @@ pub(super) fn leave(
     if instruction.inline_frames.is_empty() {
         return Ok(());
     }
-    let count = instruction.inline_frames.len() - 1;
     emit_frame_ldr_x(ops, 12, offset(frame, first)?);
-    dynasm!(ops ; .arch aarch64
-        ; str x12, [x19, NATIVE_FRAME_OFFSET]
-        ; ldr x9, [x19, THREAD_OFFSET]
-        ; str x12, [x9, VM_THREAD_CURRENT_FRAME_OFFSET]
-        ; ldr x9, [x19, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, count as u32
-        ; str x10, [x9]
-        ; ldr x11, [x19, ACTIVATION_BASE_OFFSET]
-        ; add x11, x11, x10, lsl #3);
-    for index in 0..count {
-        dynasm!(ops ; .arch aarch64 ; str xzr, [x11, index as u32 * 8]);
-    }
+    dynasm!(ops ; .arch aarch64 ; str x12, [x19, NATIVE_FRAME_OFFSET]);
     Ok(())
 }

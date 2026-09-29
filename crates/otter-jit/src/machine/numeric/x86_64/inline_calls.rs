@@ -3,7 +3,7 @@
 //! # Contents
 //! - Bounded native headers and register windows in the owning Machine frame.
 //! - Exact source PCs, SELF closures and moving values from safepoint homes.
-//! - Publication and release through the native activation cursor.
+//! - Publication and release by linking the parents into the frame chain.
 //!
 //! # Invariants
 //! - Publication performs no VM operation, allocation, or collection.
@@ -78,12 +78,11 @@ pub(super) fn enter(
             ))?
             .0;
     dynasm!(ops ; .arch x64
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; lea r10, [r9 + count as i32]
-        ; cmp r10, [r15 + ACTIVATION_LIMIT_OFFSET as i32]
-        ; ja =>fail
         ; mov r12, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov r9d, [r12 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+        ; lea r10, [r9 + count as i32]
+        ; cmp r10, [r15 + GENERATED_DEPTH_LIMIT_OFFSET as i32]
+        ; ja =>fail
     );
     let parent_slot = offset(frame, first, MACHINE_ROOT_RECORD_SIZE)?;
     dynasm!(ops ; .arch x64
@@ -92,6 +91,7 @@ pub(super) fn enter(
     );
 
     let mut word = usize::from(first) + 1;
+    let mut caller_start = None;
     for (index, recipe) in instruction.inline_frames.iter().enumerate().skip(1) {
         let entry = recipe
             .entry
@@ -127,6 +127,22 @@ pub(super) fn enter(
             ; lea r14, [r13 + HEADER_WORDS as i32 * 8]
             ; mov [r13 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32], r14
         );
+        // Each parent links to the previous one; the first to the physical
+        // frame. All share the physical frame's generation.
+        match caller_start {
+            Some(caller) => dynasm!(ops ; .arch x64 ; lea r8, [rsp + caller]),
+            None => dynasm!(ops ; .arch x64 ; mov r8, [rsp + parent_slot]),
+        }
+        dynasm!(ops
+            ; .arch x64
+            ; mov [r13 + NATIVE_FRAME_CALLER_OFFSET as i32], r8
+            ; mov r9d, [r8 + NATIVE_FRAME_DEPTH_OFFSET as i32]
+            ; add r9d, 1
+            ; mov [r13 + NATIVE_FRAME_DEPTH_OFFSET as i32], r9d
+            ; mov r9d, [r8 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32]
+            ; mov [r13 + NATIVE_FRAME_CODE_OBJECT_ID_OFFSET as i32], r9d
+        );
+        caller_start = Some(start);
         for (value, member) in [
             (entry.this, NATIVE_FRAME_THIS_OFFSET),
             (entry.new_target, NATIVE_FRAME_NEW_TARGET_OFFSET),
@@ -144,23 +160,9 @@ pub(super) fn enter(
                 ))?;
             dynasm!(ops ; .arch x64 ; mov [rsp + destination], r14);
         }
-        dynasm!(ops
-            ; .arch x64
-            ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-            ; mov r9, [r8]
-            ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-            ; mov [r10 + r9 * 8], r13
-            ; add r9, 1
-            ; mov [r8], r9
-        );
         word += HEADER_WORDS + recipe.slots.len();
     }
-    dynasm!(ops
-        ; .arch x64
-        ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r13
-        ; mov r8, [r15 + THREAD_OFFSET as i32]
-        ; mov [r8 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], r13
-    );
+    dynasm!(ops ; .arch x64 ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r13);
     Ok(())
 }
 
@@ -173,24 +175,11 @@ pub(super) fn leave(
     if instruction.inline_frames.is_empty() {
         return Ok(());
     }
-    let count = instruction.inline_frames.len() - 1;
     let parent_slot = offset(frame, first, 0)?;
     dynasm!(ops
         ; .arch x64
         ; mov r10, [rsp + parent_slot]
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r10
-        ; mov r8, [r15 + THREAD_OFFSET as i32]
-        ; mov [r8 + VM_THREAD_CURRENT_FRAME_OFFSET as i32], r10
-        ; mov r8, [r15 + ACTIVATION_TOP_PTR_OFFSET as i32]
-        ; mov r9, [r8]
-        ; sub r9, count as i32
-        ; mov [r8], r9
-        ; mov r10, [r15 + ACTIVATION_BASE_OFFSET as i32]
-        ; lea r10, [r10 + r9 * 8]
-        ; xor r11d, r11d
     );
-    for index in 0..count {
-        dynasm!(ops ; .arch x64 ; mov [r10 + index as i32 * 8], r11);
-    }
     Ok(())
 }

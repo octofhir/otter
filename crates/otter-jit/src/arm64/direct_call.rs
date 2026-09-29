@@ -44,16 +44,17 @@
 //! - A callee bailout is not replayed. The live published frame enters the
 //!   cold stack-call deoptimizer, which resumes the already-started callee.
 //! - Callers load the current generation through a stable per-function cell.
-//!   Executable retirement is deferred while an outer native activation is
-//!   published. Plain/method calls enter immediately. A cold receiver miss may
+//!   Executable retirement is deferred while any native frame is published. Plain/method calls enter immediately. A cold receiver miss may
 //!   reenter while retaining the already-selected generation, which then enters
 //!   through its normal dependency guards.
 //! - Tier publication patches the function cell; a missing target enters one
 //!   no-allocation cold resolver and never invalidates the generated caller.
-//! - The activation cursor is both the publication and generated-recursion
-//!   bound. Prospective callee `sp` is compared with one immutable native-stack
-//!   limit. Normal cleanup therefore restores frame publication only; it
-//!   mutates no duplicate resource counters.
+//! - Publication is one link: the callee record names the current frame as
+//!   its caller, carries the caller's depth plus one, and becomes the context's
+//!   innermost frame; cleanup makes the caller innermost again. The caller's
+//!   depth against the entry's bound limits generated recursion, and the
+//!   prospective callee `sp` is compared with one immutable native-stack limit.
+//!   No other resource counter is mutated.
 //!
 //! # See also
 //! - `otter-vm/src/native_abi/code_entry.rs` — stable generation leases.
@@ -87,20 +88,20 @@ use crate::{
         relocation::{RelocationCapture, RelocationTarget},
     },
     entry::{
-        ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
         ALLOC_WINDOW_LAB_OFFSET, CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
         CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_ENTRIES_OFFSET,
         CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET, CODE_ENTRY_GENERATED_THROWS_OFFSET,
         CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET, CODE_REGISTRY_VIEW_HOT_FUNCTION_OFFSET,
-        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET,
-        GLOBAL_THIS_OFFSET_PTR_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
-        NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_STACK_LIMIT_OFFSET, OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET,
-        RECEIVER_ALLOC_GENERATED_OFFSET, RECEIVER_ALLOC_GUARD_MISSES_OFFSET,
-        RECEIVER_ALLOC_SPACE_MISSES_OFFSET, RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported,
-        VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_CODE_OBJECT_ID_OFFSET,
-        VM_THREAD_CODE_REGISTRY_OFFSET, VM_THREAD_CURRENT_FRAME_OFFSET, reg_offset,
+        FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_DEPTH_LIMIT_OFFSET,
+        GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, LAB_LIMIT_OFFSET,
+        LAB_TOP_OFFSET, NATIVE_FRAME_CALLER_OFFSET, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET,
+        NATIVE_FRAME_DEPTH_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
+        NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
+        NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET,
+        OBJECT_BODY_TYPE_TAG, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
+        RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
+        RUNTIME_STATS_OFFSET, THREAD_OFFSET, Unsupported, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
+        VM_THREAD_CODE_REGISTRY_OFFSET, reg_offset,
     },
 };
 
@@ -214,6 +215,21 @@ pub(crate) enum DirectCallArguments<'a> {
     /// Live actual count in an X register, after the committed intrinsic-apply
     /// probe. Operand loaders must preserve x8 until the frame is reserved.
     Forward { count: u8 },
+}
+
+/// Link the fully initialized callee record at `sp` to the current frame and
+/// make it the innermost one. Clobbers x10, x13 and x15.
+fn emit_link_callee_frame(ops: &mut Assembler, context_register: u8) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
+        ; ldr w10, [x13, NATIVE_FRAME_DEPTH_OFFSET]
+        ; add w10, w10, #1
+        ; str x13, [sp, NATIVE_FRAME_CALLER_OFFSET]
+        ; str w10, [sp, NATIVE_FRAME_DEPTH_OFFSET]
+        ; mov x15, sp
+        ; str x15, [X(context_register), NATIVE_FRAME_OFFSET]
+    );
 }
 
 fn emit_release_linkage(ops: &mut Assembler, layout: &StackLayout) {
@@ -766,13 +782,12 @@ where
     let construct_prepare_ready = ops.new_dynamic_label();
 
     let guard_start = ops.offset().0;
-    // The effective activation limit combines physical publication capacity
-    // with the outer entry's remaining recursion budget.
+    // The caller's frame depth bounds the logical JS depth of the callee.
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; ldr x11, [X(context_register), ACTIVATION_LIMIT_OFFSET]
+        ; ldr x9, [X(context_register), NATIVE_FRAME_OFFSET]
+        ; ldr w10, [x9, NATIVE_FRAME_DEPTH_OFFSET]
+        ; ldr x11, [X(context_register), GENERATED_DEPTH_LIMIT_OFFSET]
         ; cmp x10, x11
         ; b.hs =>caller_transition
     );
@@ -1088,10 +1103,10 @@ where
         ; cbz x16, =>entry_rejected
         ; str x16, [sp, layout.entry_addr]
         ; ldr x13, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET]
-        ; ldr w14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET + 8]
+        ; ldr x14, [x25, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET + 8]
         ; str x13, [sp]
     );
-    // The header word covers register count, tier, and flags. A target that
+    // The header word covers register count, tier, flags and generation. A target that
     // materializes `arguments` gets its actual-argument window published in
     // the same store; every frame records its argument count so the field is
     // never read uninitialized. The 64-bit count store also clears the adjacent
@@ -1099,12 +1114,12 @@ where
     if site.target.plan.needs_incoming_arguments {
         dynasm!(ops
             ; .arch aarch64
-            ; orr w14, w14, INCOMING_ARGUMENTS_HEADER_WORD
+            ; orr x14, x14, INCOMING_ARGUMENTS_HEADER_WORD as u64
         );
     }
     dynasm!(ops
         ; .arch aarch64
-        ; str w14, [sp, 8]
+        ; str x14, [sp, 8]
         ; add x14, sp, layout.register_base
         ; str x14, [sp, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
@@ -1435,26 +1450,8 @@ where
         emit_load_u64(ops, 3, u64::from(site.target.plan.register_count));
         forward_bindings::emit(ops, view, layout, load_binding)?;
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x13, [X(context_register), NATIVE_FRAME_OFFSET]
-        ; ldr x14, [X(context_register), THREAD_OFFSET]
-        ; ldr x15, [x14, VM_THREAD_CODE_OBJECT_ID_OFFSET]
-        ; str x13, [sp, layout.caller_frame]
-        ; str x15, [sp, layout.caller_code_object_id]
-        ; ldr x9, [X(context_register), ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; ldr x11, [X(context_register), ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #3
-        ; mov x15, sp
-        ; str x15, [x12]
-        ; add x10, x10, #1
-        ; str x10, [x9]
-        ; str x15, [X(context_register), NATIVE_FRAME_OFFSET]
-        ; ldr x13, [x25, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
-        ; stp x15, x13, [x14, VM_THREAD_CURRENT_FRAME_OFFSET as i32]
-        ; ldr x16, [sp, layout.entry_addr]
-    );
+    emit_link_callee_frame(ops, context_register);
+    dynasm!(ops ; .arch aarch64 ; ldr x16, [sp, layout.entry_addr]);
     record_region(
         &mut code_map,
         "directCallFrameSetup",

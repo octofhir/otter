@@ -7988,8 +7988,7 @@ mod tests {
             this_value,
         );
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
-        thread.current_code_object_id = metadata.code_object_id;
+        native_frame.code_object_id = u32::try_from(metadata.code_object_id).unwrap();
         thread.interrupt_cell = interrupt as u64;
         thread.gc_heap = heap as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
@@ -7999,9 +7998,7 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
-            activation_base: std::ptr::null_mut(),
-            activation_top_ptr: std::ptr::null_mut(),
-            activation_limit: 0,
+            generated_depth_limit: u64::MAX,
             machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
@@ -8009,6 +8006,7 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
         };
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         let result = entry(&mut ctx);
         (
             result,
@@ -9971,8 +9969,7 @@ mod tests {
         );
         native_frame.self_value_bits = self_bits;
         let mut thread = VmThread::empty();
-        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
-        thread.current_code_object_id = metadata.code_object_id;
+        native_frame.code_object_id = u32::try_from(metadata.code_object_id).unwrap();
         thread.interrupt_cell = std::ptr::addr_of!(interrupt) as u64;
         thread.gc_heap = std::ptr::from_ref(&heap) as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(&mut fuel) as u64;
@@ -9982,9 +9979,7 @@ mod tests {
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
             error: &mut error,
-            activation_base: std::ptr::null_mut(),
-            activation_top_ptr: std::ptr::null_mut(),
-            activation_limit: 0,
+            generated_depth_limit: u64::MAX,
             machine_roots_ptr: std::ptr::addr_of_mut!(machine_roots),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
@@ -9992,6 +9987,7 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
         };
+        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         let result = entry(&mut ctx);
         (result, native_frame.header.pc)
     }

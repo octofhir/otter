@@ -189,10 +189,10 @@ fn inline_activation_reentry_preserves_stack_and_moving_roots() {
                 .unwrap();
             assert_eq!(exact_closure.function_id(), 1);
             assert_eq!(exact_closure.bound_this(&vm.gc_heap), Some(result));
-            assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
+            assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 1);
         });
-        vm.jit_pop_native_activation();
-        assert_eq!(vm.jit_native_activation_top, 0);
+        vm.jit_pop_native_frame();
+        assert_eq!(vm.jit_native_frames().count(), 0);
     }
 }
 
@@ -222,7 +222,7 @@ fn inline_activation_validation_and_unwind_leave_caller_published() {
             .is_err()
     );
     assert!(!entered);
-    assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
+    assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 1);
     invalid[1] = recipe(&context, 2, Value::undefined());
     invalid[1].entry.as_mut().unwrap().closure = Value::function(0);
     assert!(
@@ -230,20 +230,20 @@ fn inline_activation_validation_and_unwind_leave_caller_published() {
             .is_err()
     );
     assert!(!entered);
-    assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
+    assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 1);
     let mut valid = [recipe(&context, 1, Value::undefined())];
     let outcome: Result<(), crate::VmError> = call
         .with_inline_activations(&mut valid, |_| Err(crate::VmError::Uncaught))
         .unwrap();
     assert!(matches!(outcome, Err(crate::VmError::Uncaught)));
-    assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
+    assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 1);
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = call.with_inline_activations(&mut valid, |_| panic!("cold operation panic"));
     }));
     assert!(failure.is_err());
     assert_eq!(call.function_id(), 0);
-    assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
-    vm.jit_pop_native_activation();
+    assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 1);
+    vm.jit_pop_native_frame();
 }
 
 #[test]
@@ -285,12 +285,12 @@ fn inline_activation_nested_scopes_restore_the_same_parent() {
             .unwrap();
         assert_eq!(parent.function_id(), 1);
         assert_eq!(parent.read(0).unwrap(), Value::number_i32(11));
-        assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 2);
+        assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 2);
     })
     .unwrap();
     assert_eq!(call.function_id(), 0);
-    assert_eq!(unsafe { &*vm_ptr }.jit_native_activation_top, 1);
-    vm.jit_pop_native_activation();
+    assert_eq!(unsafe { &*vm_ptr }.jit_native_frames().count(), 1);
+    vm.jit_pop_native_frame();
 }
 
 #[test]
@@ -332,5 +332,5 @@ fn inline_constructor_new_target_is_a_moving_root() {
         .unwrap();
         assert_eq!(recipes[0].entry.as_ref().unwrap().new_target, registers[0]);
     });
-    vm.jit_pop_native_activation();
+    vm.jit_pop_native_frame();
 }

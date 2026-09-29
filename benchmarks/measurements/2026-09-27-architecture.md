@@ -982,6 +982,34 @@ receiver conversion; (5) JS→JS returns carry only the value.
   completion; status checks leave JS→JS call sites.
 - **C6 inline frames from data.** Residual calls in spliced bodies.
 
+### C1 landed: frame chain
+`NativeFrame` is 72 bytes: `code_object_id` joins the register-shape word
+(one copy from the entry cell's header), `caller` and `depth` close the
+record. Linkage checks the caller's depth against `JitCtx`'s generated-depth
+bound (the JS depth budget minus live interpreter frames), writes
+`caller`/`depth` and makes the callee `JitCtx::native_frame`; cleanup makes
+the caller innermost again. The activation array, its cursor, the arena
+index list, the push/pop stubs, `VmThread::current_frame/code_object_id`
+and the caller-id linkage slots are gone. The interpreter holds only the
+live entry's frame cell (or a detached head for Rust-published frames);
+GC tracing, stack snapshots, `generated_caller_matches`, inline
+publication, retirement and logical depth walk the chain; allocating stubs
+reach the frame through `VmThread::frame_cell`.
+
+| Workload | instr before | after | wall before | after |
+|---|---:|---:|---:|---:|
+| fib | 3.64G | 3.38G (−7.2%) | 0.230s | 0.212s (−7.8%) |
+| earley-boyer | 111.5G | 108.6G (−2.5%) | 6.72s | 6.53s (−2.9%) |
+| ts-fixed | 173.7G | 172.0G (−1.0%) | 17.51s | 17.48s |
+| ast_ctor | 21.75G | 21.58G (−0.8%) | 1.45s | 1.41s |
+| crypto / zlib / mega_method | 13.68 / 154.5 / 10.0G | same | 0.86 / 9.47 / 0.48s | 0.81 / 9.36 / 0.48s |
+
+Stdout identical; difftest 85/85; Test262 `language/` 24,077/0,
+`built-ins/` 23,520 with the two `RGI_Emoji` budget failures; GC stress
+1–16 in three tiers clean on 19 call/frame corpora
+(`derived_class_fields_super_shapes` differs from Node in the interpreter
+without stress: the known derived-field timing gap).
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

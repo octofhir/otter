@@ -639,7 +639,6 @@ mod tests {
             MachineOpcode::CacheIrPublishShape {
                 byte_pc: 0,
                 shape: 1,
-                new_len: 1,
             },
         ] {
             let effects = unrelated.effects();

@@ -117,10 +117,8 @@ pub(super) fn emit(
         ; cbz w12, =>miss
         ; cmp w14, w12
         ; b.ne =>miss
+        // The matched holder shape names the slot, so the slot is live.
         ; ldrh w11, [x17, cache.slot_byte]
-        ; ldrh w12, [x13, view.object_slab_len_byte]
-        ; cmp w11, w12
-        ; b.hs =>miss
         ; ldr w12, [x13, view.object_slab_handle_byte]
         ; cbz w12, =>inline
         ; add x15, x16, x12
@@ -242,10 +240,8 @@ pub(super) fn emit_store(
         ; cbz w12, =>miss
         ; cmp w14, w12
         ; b.ne =>miss
+        // The matched holder shape names the slot, so the slot is live.
         ; ldrh w11, [x17, cache.slot_byte]
-        ; ldrh w12, [x13, view.object_slab_len_byte]
-        ; cmp w11, w12
-        ; b.hs =>miss
         ; ldr w12, [x13, view.object_slab_handle_byte]
         ; cbz w12, =>inline
         ; add x15, x16, x12
@@ -427,10 +423,9 @@ fn emit_transition_store(
         ; cbnz w10, =>miss
         ; ldrb w10, [x12, view.object_flags_byte]
         ; tbz w10, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
+        // The matched receiver shape has exactly `slot` slots: the append
+        // index is its property count.
         ; ldrh w9, [x17, cache.slot_byte]
-        ; ldrh w10, [x12, view.object_slab_len_byte]
-        ; cmp w9, w10
-        ; b.ne =>miss
         ; ldr w10, [x12, view.object_slab_handle_byte]
         ; cbz w10, =>inline
         ; add x15, x16, x10
@@ -450,8 +445,6 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch aarch64
         ; str x10, [x15, x9, lsl #3]
-        ; add w9, w9, #1
-        ; strh w9, [x12, view.object_slab_len_byte]
         ; ldr w10, [x17, cache.target_shape_byte]
         ; str w10, [x12, view.object_shape_byte]
         ; mov x11, #1

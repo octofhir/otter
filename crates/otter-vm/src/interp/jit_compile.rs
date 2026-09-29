@@ -2432,6 +2432,13 @@ impl Interpreter {
             self.simple_constructor_shape_cache.get(&base_function_id),
         ) {
             (Some(init), Some(shape)) if init.fields.len() <= capacity => {
+                // Generated allocation derives the slot count from this
+                // shape, so it must name exactly the initial fields.
+                debug_assert_eq!(
+                    crate::object::shape_property_count(*shape, &self.gc_heap) as usize,
+                    init.fields.len(),
+                    "simple-constructor shape and initial fields diverged"
+                );
                 (shape.offset(), u8::try_from(init.fields.len()).ok()?)
             }
             _ => (self.shape_root().offset(), 0),

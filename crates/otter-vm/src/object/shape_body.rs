@@ -83,6 +83,11 @@ pub struct ShapeBody {
 /// Identity word read by generated probes of the shared property lookup table.
 pub(crate) const SHAPE_BODY_ID_OFFSET: usize = std::mem::offset_of!(ShapeBody, id);
 
+/// `u32` property count, read by generated code that needs a shaped object's
+/// slot count without a compile-time shape.
+pub(crate) const SHAPE_BODY_PROPERTY_COUNT_OFFSET: usize =
+    std::mem::offset_of!(ShapeBody, property_count);
+
 impl ShapeBody {
     #[must_use]
     fn root(id: ShapeId) -> Self {
@@ -333,6 +338,28 @@ pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &s
 #[must_use]
 pub(crate) fn shape_property_count(heap: &GcHeap, shape: ShapeHandle) -> u32 {
     heap.read_payload(shape, ShapeBody::property_count)
+}
+
+/// The property count of a live, non-null `shape`, read without the heap.
+///
+/// An object's slot count is its shape's, and the collector's trace of the
+/// object reads it here. Shapes live in non-moving old space and are
+/// immutable, so the read is valid at any point where the object's shape
+/// handle is.
+#[inline]
+#[must_use]
+pub(crate) fn property_count_of(shape: ShapeHandle) -> u32 {
+    debug_assert!(!shape.is_null());
+    // SAFETY: a non-null shape handle decompresses to a live ShapeBody cell;
+    // its payload follows the header.
+    unsafe {
+        (*(shape
+            .as_header_ptr()
+            .cast::<u8>()
+            .add(otter_gc::header::HEADER_SIZE)
+            .cast::<ShapeBody>()))
+        .property_count
+    }
 }
 
 /// Return the transition key installed at `offset`, if the shape contains one.

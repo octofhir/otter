@@ -794,8 +794,6 @@ pub struct PropertyStoreTransition {
     pub prototype_shapes: Box<[u32]>,
     /// Child hidden class published after the value store.
     pub child_shape: u32,
-    /// Logical slot length after publication.
-    pub new_len: u16,
 }
 
 /// Target-neutral name of a selected machine operation.
@@ -1301,8 +1299,6 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// Stable compressed child hidden-class token.
         shape: u32,
-        /// Logical slot length after publication.
-        new_len: u16,
     },
     /// Apply the post-store generational/incremental barrier. A false incoming
     /// condition is a no-op; no miss or exit is possible after the store.
@@ -2884,7 +2880,6 @@ impl InstructionSequence {
                                     && case.value_byte % 8 == 0
                                     && case.transition.as_ref().is_none_or(|transition| {
                                         transition.child_shape != 0
-                                            && transition.new_len != 0
                                             && transition.prototype_shapes.iter().all(|&s| s != 0)
                                     })
                             });
@@ -2911,12 +2906,11 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::CacheIrPublishShape { shape, new_len, .. } => {
+                    MachineOpcode::CacheIrPublishShape { shape, .. } => {
                         let [owner, active] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
                         if *shape == 0
-                            || *new_len == 0
                             || *owner != MachineOperand::location_input(owner.value)
                             || self.representations[owner.value.0 as usize]
                                 != MachineRepresentation::Int64

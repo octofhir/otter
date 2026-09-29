@@ -219,7 +219,6 @@ impl CacheStub {
                     ops.push(JitCacheIrOp::PublishShape {
                         object: 0,
                         shape: to_shape,
-                        new_len: transition.slot.checked_add(1)?,
                     });
                 }
             }

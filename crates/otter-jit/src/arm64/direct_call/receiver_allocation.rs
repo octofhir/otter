@@ -124,7 +124,13 @@ fn emit_receiver_candidate(
         ; cbz w17, =>guard_miss ; add x17, x12, x17
         ; ldr w11, [x2, view.closure_call_layout.last_instance_byte]
         ; cbz w11, =>guard_miss ; add x13, x12, x11
-        ; ldrh w11, [x13, view.object_slab_len_byte]
+        // The last receiver's slot count is its shape's; a dictionary-mode
+        // receiver teaches nothing.
+        ; ldr w11, [x13, view.object_shape_byte]
+        ; cbz w11, >counted
+        ; add x11, x12, x11
+        ; ldr w11, [x11, view.shape_property_count_byte]
+        ; counted:
         ; ldrh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
         ; cmp w11, w14 ; csel w14, w11, w14, hi
         ; cmp w14, u32::from(plan.inline_capacity) ; b.hi =>guard_miss
@@ -139,8 +145,8 @@ fn emit_receiver_candidate(
     dynasm!(ops ; .arch aarch64
         ; ldr w14, [x17, view.closure_call_layout.prototype_shape_byte] ; cbz w14, =>guard_miss
         ; ldr w15, [x13, view.object_shape_byte] ; cmp w14, w15 ; b.ne =>guard_miss
+        // The bag's shape names the prototype slot, so the slot is live.
         ; ldr w14, [x17, view.closure_call_layout.prototype_slot_byte]
-        ; ldrh w15, [x13, view.object_slab_len_byte] ; cmp w14, w15 ; b.hs =>guard_miss
         // The bag's slot base: in-object until it spills, then its slab's
         // words (`x12` holds the cage base).
         ; ldr w15, [x13, view.object_slab_handle_byte]
@@ -206,29 +212,18 @@ fn emit_receiver_candidate(
     );
 
     // Initialize the header and the whole fixed body before publishing the
-    // bump cursor. The body is four words: shape + null slab, prototype +
-    // null sidecar, dictionary epoch + slot count + flags + in-object
-    // capacity, and the unassigned dictionary id. In-object words past the
-    // initial fields are never read before a store publishes them.
-    let header_word = u64::from(OBJECT_BODY_TYPE_TAG)
-        | (u64::from(otter_vm::jit::JIT_GC_YOUNG_FLAG) << 8)
-        | (u64::from(cell_bytes) << 32);
-    emit_load_u64(ops, 14, header_word);
+    // bump cursor. The header carries the flag and in-object capacity bytes;
+    // the body is two words: shape + null slab, prototype + null sidecar.
+    // The receiver shape names exactly the initial fields, so the slot count
+    // follows from it. In-object words past the initial fields are never
+    // read before a store publishes them.
+    emit_load_u64(ops, 14, plan.cell_header_word(cell_bytes));
     dynasm!(ops ; .arch aarch64 ; str x14, [x16]);
     emit_load_u64(ops, 14, u64::from(plan.receiver_shape));
-    let layout_word = (u64::from(plan.initial_field_count) << 32)
-        | (u64::from(otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE) << 48)
-        | (u64::from(plan.inline_capacity) << 56);
     dynasm!(ops
         ; .arch aarch64
         ; str x14, [x16, view.object_shape_byte]
         ; str x4, [x16, view.jit_proto_byte]
-    );
-    emit_load_u64(ops, 14, layout_word);
-    dynasm!(ops
-        ; .arch aarch64
-        ; str x14, [x16, view.object_dictionary_layout_byte]
-        ; str xzr, [x16, view.object_dictionary_layout_byte + 8]
     );
     if plan.initial_field_count != 0 {
         emit_load_u64(ops, 14, VALUE_UNDEFINED);

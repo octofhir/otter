@@ -166,9 +166,8 @@ pub(crate) fn capture_store_property_transition(
             return None;
         }
         let to_shape_id = super::next_shape_id();
-        body.dictionary_shape_id = to_shape_id;
         // A fast body enters dictionary mode: every slot-layout proof moves.
-        body.advance_dictionary_layout();
+        body.enter_dictionary_mode_as(to_shape_id, true);
         if let Some(table) = dict_table {
             body.exotic_mut().dictionary_keys = table;
         }
@@ -176,7 +175,6 @@ pub(crate) fn capture_store_property_transition(
             body.exotic_mut().slots = table;
         }
         super::dict_push_key(body, key.name().to_owned());
-        body.shape = super::ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), stored);
         Some(StorePropertyTransition {
             from_shape_id,
@@ -340,10 +338,8 @@ pub(crate) fn replay_store_property_transition(
     heap.with_payload(obj, |body| {
         let offset = usize::from(transition.slot);
         if to_shape.is_null() {
-            body.dictionary_shape_id = transition.to_shape_id;
-            if !body.shape.is_null() {
-                body.advance_dictionary_layout();
-            }
+            let advance_layout = !body.shape.is_null();
+            body.enter_dictionary_mode_as(transition.to_shape_id, advance_layout);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;
             }
@@ -351,7 +347,6 @@ pub(crate) fn replay_store_property_transition(
                 body.exotic_mut().slots = table;
             }
             super::dict_push_key(body, key.name().to_owned());
-            body.shape = super::ShapeHandle::null();
         } else {
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
             body.shape = to_shape;

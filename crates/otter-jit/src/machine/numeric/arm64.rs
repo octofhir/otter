@@ -863,7 +863,20 @@ fn emit_binding_guard(
                 dynasm!(ops
                     ; .arch aarch64
                     ; cbnz w14, =>miss
-                    ; ldr w14, [x13, view.object_dictionary_layout_byte]
+                    ; ldr w14, [x13, view.object_exotic_handle_byte]
+                    ; cbz w14, =>miss
+                );
+                emit_load_symbolic_u64(
+                    ops,
+                    relocations,
+                    11,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x14, x11, x14
+                    ; ldr w14, [x14, view.exotic_dictionary_layout_byte]
                 );
                 emit_load_u64(ops, 11, shape);
                 dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);
@@ -2294,7 +2307,12 @@ fn emit_with_reach(
                     miss,
                 )?;
                 crate::template::arm64::ic_probe::emit_dictionary_layout_guard(
-                    &mut ops, view, 13, layout, miss,
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    13,
+                    layout,
+                    miss,
                 );
                 emit_load_u64(&mut ops, 9, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
@@ -2757,10 +2775,9 @@ fn emit_with_reach(
                             ; =>fits
                             ; ldrb w14, [x12, view.object_flags_byte]
                             ; tbz w14, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
-                            ; ldrh w14, [x12, view.object_slab_len_byte]
                         );
-                        emit_load_u64(&mut ops, 16, u64::from(slot));
-                        dynasm!(ops ; .arch aarch64 ; cmp w14, w16 ; b.ne =>miss);
+                        // The matched receiver shape has exactly `slot`
+                        // slots, so the store is the exact append.
                     }
                     // Every guard passed: store, then publish the transition.
                     dynasm!(ops ; .arch aarch64 ; mov x13, x12);
@@ -2769,13 +2786,8 @@ fn emit_with_reach(
                     emit_load_u64(&mut ops, 17, u64::from(case.value_byte));
                     dynasm!(ops ; .arch aarch64 ; str x9, [x13, x17]);
                     if let Some(transition) = &case.transition {
-                        emit_load_u64(&mut ops, 14, u64::from(transition.new_len));
                         emit_load_u64(&mut ops, 17, u64::from(transition.child_shape));
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; strh w14, [x12, view.object_slab_len_byte]
-                            ; str w17, [x12, view.object_shape_byte]
-                        );
+                        dynasm!(ops ; .arch aarch64 ; str w17, [x12, view.object_shape_byte]);
                     } else {
                         emit_load_u64(&mut ops, 17, VALUE_UNDEFINED);
                     }
@@ -2885,11 +2897,9 @@ fn emit_with_reach(
                     ; =>storage_fits
                     ; ldrb w16, [x13, view.object_flags_byte]
                     ; tbz w16, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
-                    ; ldrh w16, [x13, view.object_slab_len_byte]
-                    ; lsr w15, w17, #3
-                    ; cmp w16, w15
-                    ; b.ne =>miss
                 );
+                // The program's receiver shape guard fixes the slot count at
+                // the appended index, so the store is the exact append.
                 emit_load_u64(&mut ops, 9, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                 emit_load_u64(&mut ops, 9, 0);
@@ -2905,18 +2915,15 @@ fn emit_with_reach(
             MachineOpcode::CacheIrPublishShape {
                 byte_pc,
                 shape,
-                new_len,
             } => {
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
                 emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 dynasm!(ops ; .arch aarch64 ; cbz w9, =>done);
                 emit_load_allocated_integer(&mut ops, frame, locations[0], 13, 0)?;
-                emit_load_u64(&mut ops, 14, u64::from(new_len));
                 emit_load_u64(&mut ops, 15, u64::from(shape));
                 dynasm!(ops
                     ; .arch aarch64
-                    ; strh w14, [x13, view.object_slab_len_byte]
                     ; str w15, [x13, view.object_shape_byte]
                     ; =>done
                 );

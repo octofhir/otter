@@ -325,22 +325,20 @@ impl CodeBlock {
             // pointer to its shape handle for native CacheIR guards.
             object_shape_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
-            object_dictionary_layout_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET as u32,
+            exotic_dictionary_layout_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::EXOTIC_SLOTS_DICTIONARY_LAYOUT_OFFSET as u32,
             object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32,
             object_slab_handle_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_SLAB_HANDLE_OFFSET as u32,
-            object_slab_len_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_SLAB_LEN_OFFSET as u32,
-            object_inline_capacity_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_INLINE_CAPACITY_OFFSET as u32,
+            shape_property_count_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::SHAPE_BODY_PROPERTY_COUNT_OFFSET as u32,
+            object_inline_capacity_byte: crate::object::OBJECT_CELL_INLINE_CAPACITY_BYTE as u32,
             object_slab_capacity_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::slot_slab::SLOT_SLAB_CAPACITY_OFFSET as u32,
             object_slab_words_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::slot_slab::SLOT_SLAB_WORDS_OFFSET as u32,
-            object_flags_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_FLAGS_OFFSET as u32,
+            object_flags_byte: crate::object::OBJECT_CELL_FLAGS_BYTE as u32,
             object_exotic_handle_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32,
             object_fixed_cell_bytes: crate::object::object_cell_bytes(0) as u32,
@@ -1513,14 +1511,8 @@ mod tests {
         let snapshot = function.jit_compile_snapshot();
         let header = otter_gc::header::HEADER_SIZE as u32;
 
-        assert_eq!(
-            snapshot.object_flags_byte,
-            header + crate::object::OBJECT_BODY_FLAGS_OFFSET as u32
-        );
-        assert_eq!(
-            snapshot.object_inline_capacity_byte,
-            header + crate::object::OBJECT_BODY_INLINE_CAPACITY_OFFSET as u32
-        );
+        assert_eq!(snapshot.object_flags_byte, 2);
+        assert_eq!(snapshot.object_inline_capacity_byte, 3);
         assert_eq!(
             snapshot.object_exotic_handle_byte,
             header + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32

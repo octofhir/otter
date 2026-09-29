@@ -546,18 +546,17 @@ impl Interpreter {
             crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
         }
         let count = layout.len as usize;
-        // The shape goes on while the object is still slotless; the slab is
-        // grown once; the slots are then appended without a further
-        // allocation, so no handle can go stale between them.
+        // The slab is grown once, then the shape and its `undefined` slots go
+        // on together, so no handle can go stale between them.
         let object = self.scoped_object_handle(handle)?;
-        crate::object::set_fresh_object_shape(object, &mut self.gc_heap, shape);
-        let mut growable = object;
-        crate::object::reserve_slot_capacity(&mut growable, &mut self.gc_heap, count, &mut [])
-            .map_err(VmError::from)?;
-        let object = self.scoped_object_handle(handle)?;
-        for index in 0..count {
-            crate::object::push_layout_slot(object, &mut self.gc_heap, index, Value::undefined());
-        }
+        let slots = smallvec::SmallVec::<[Value; 8]>::from_elem(Value::undefined(), count);
+        crate::object::install_fresh_shape_with_slots(
+            object,
+            &mut self.gc_heap,
+            shape,
+            slots.as_slice(),
+            count,
+        );
         Ok(handle)
     }
 

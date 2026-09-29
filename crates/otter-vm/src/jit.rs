@@ -214,6 +214,24 @@ pub struct JitReceiverAllocationPlan {
     pub prototype_shapes: [u32; JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
 }
 
+impl JitReceiverAllocationPlan {
+    /// GC header word of the receiver cell: the ordinary-object tag, the
+    /// young flag, the object flag byte (a fresh object is exactly
+    /// extensible), the in-object capacity byte and the cell size.
+    #[must_use]
+    pub fn cell_header_word(&self, cell_bytes: u32) -> u64 {
+        let [flags_byte, capacity_byte] = [
+            crate::object::OBJECT_CELL_FLAGS_BYTE,
+            crate::object::OBJECT_CELL_INLINE_CAPACITY_BYTE,
+        ];
+        u64::from(crate::object::OBJECT_BODY_TYPE_TAG)
+            | (u64::from(JIT_GC_YOUNG_FLAG) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
+            | (u64::from(JIT_OBJECT_FLAG_EXTENSIBLE) << (8 * flags_byte))
+            | (u64::from(self.inline_capacity) << (8 * capacity_byte))
+            | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET))
+    }
+}
+
 /// Where generated code reads `typeof` from a cell's GC type tag. A tag
 /// listed as `slow_*` needs the heap-aware leaf (a callable plain object, a
 /// native function that may be `[[IsHTMLDDA]]`, a proxy, an internal body);
@@ -428,10 +446,11 @@ pub struct JitCompileSnapshot {
     /// emitter reads `[obj_ptr + object_shape_byte]` for CacheIR shape guards
     /// `LoadProperty` cell guard, staying layout-agnostic.
     pub object_shape_byte: u32,
-    /// Byte offset from a decompressed object pointer to its `u32`
-    /// dictionary slot-layout epoch. Read only after the ordinary shape handle
-    /// is null; a match keeps every existing key at its captured slot.
-    pub object_dictionary_layout_byte: u32,
+    /// Byte offset from a decompressed sidecar (`ExoticSlots`) cell pointer
+    /// to a dictionary-mode object's `u32` slot-layout epoch. Read only after
+    /// the object's shape handle is null and its sidecar handle non-null; a
+    /// match keeps every existing key at its captured slot.
+    pub exotic_dictionary_layout_byte: u32,
     /// Byte offset from a decompressed object pointer to its first in-object
     /// slot (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`). While the slab
     /// handle is null, string-keyed slot `i` is the word at
@@ -441,16 +460,16 @@ pub struct JitCompileSnapshot {
     /// handle (`HEADER_SIZE + OBJECT_BODY_SLAB_HANDLE_OFFSET`). The emitter
     /// reads this 4-byte handle to pick the slot base: null means the slots
     /// live in-object, non-null means they moved to the out-of-line slab.
-    /// `slab_len` cannot decide this — the capacity model can spill a small
-    /// object early.
+    /// The slot count cannot decide this — the capacity model can spill a
+    /// small object early.
     pub object_slab_handle_byte: u32,
-    /// Byte offset from a decompressed object pointer to the `u16`
-    /// [`slab_len`](crate::object) counter (`HEADER_SIZE +
-    /// OBJECT_BODY_SLAB_LEN_OFFSET`).
-    pub object_slab_len_byte: u32,
+    /// Byte offset from a decompressed shape cell pointer to its `u32`
+    /// property count — a shaped object's slot count.
+    pub shape_property_count_byte: u32,
     /// Byte offset from a decompressed object pointer to its `u8` in-object
-    /// capacity. An add-transition into an object whose slots are still
-    /// in-object proves the appended slot index is below it.
+    /// capacity, the second body-owned GC-header byte. An add-transition into
+    /// an object whose slots are still in-object proves the appended slot
+    /// index is below it.
     pub object_inline_capacity_byte: u32,
     /// Byte offset from a decompressed out-of-line slab cell pointer to its
     /// `u32` word capacity (`HEADER_SIZE + SLOT_SLAB_CAPACITY_OFFSET`). An
@@ -461,9 +480,10 @@ pub struct JitCompileSnapshot {
     /// Byte offset from a decompressed out-of-line slab cell pointer to its
     /// first word (`HEADER_SIZE + size_of::<SlotSlabBody>()`).
     pub object_slab_words_byte: u32,
-    /// Byte offset of the ordinary object's one-byte flag set (see
-    /// [`JIT_OBJECT_FLAG_EXTENSIBLE`] and its siblings). Shape-state guards
-    /// test the bits they require with one load.
+    /// Byte offset of the ordinary object's one-byte flag set, the first
+    /// body-owned GC-header byte (see [`JIT_OBJECT_FLAG_EXTENSIBLE`] and its
+    /// siblings). Shape-state guards test the bits they require with one
+    /// load.
     pub object_flags_byte: u32,
     /// Byte offset of the 4-byte rare-state GC handle. Conservative generated
     /// property programs require a zero handle; programs that prove ordinary
@@ -1042,8 +1062,6 @@ pub enum JitCacheIrOp {
         object: u8,
         /// Stable compressed child hidden-class token.
         shape: u32,
-        /// Logical value-slab length after the append.
-        new_len: u16,
     },
 }
 
@@ -1650,10 +1668,10 @@ impl JitCompileSnapshot {
             unseen_element_sites: rustc_hash::FxHashSet::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
-            object_dictionary_layout_byte: 0,
+            exotic_dictionary_layout_byte: 0,
             object_inline_values_byte: 0,
             object_slab_handle_byte: 0,
-            object_slab_len_byte: 0,
+            shape_property_count_byte: 0,
             object_inline_capacity_byte: 0,
             object_slab_capacity_byte: 0,
             object_slab_words_byte: 0,

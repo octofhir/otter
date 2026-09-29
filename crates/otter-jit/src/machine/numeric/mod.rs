@@ -4130,7 +4130,6 @@ fn select_cache_ir_property_programs(
                 otter_vm::JitCacheIrOp::PublishShape {
                     object,
                     shape,
-                    new_len,
                 } => {
                     let object = cache_ir_object(&objects, object, instructions.len())?;
                     let Some((stored_object, owner, hit)) = committed_store.take() else {
@@ -4143,7 +4142,6 @@ fn select_cache_ir_property_programs(
                         MachineOpcode::CacheIrPublishShape {
                             byte_pc: source.byte_pc,
                             shape,
-                            new_len,
                         },
                         vec![
                             MachineOperand::location_input(owner),
@@ -8294,7 +8292,6 @@ mod tests {
                 JitCacheIrOp::PublishShape {
                     object: 0,
                     shape: 11,
-                    new_len: 2,
                 },
             ]
             .into_boxed_slice(),
@@ -8729,8 +8726,7 @@ mod tests {
                     value_byte: 0,
                     transition: Some(transition),
                 }] if transition.child_shape == 11
-                    && transition.prototype_shapes.as_ref() == [13]
-                    && transition.new_len == 1)
+                    && transition.prototype_shapes.as_ref() == [13])
         )));
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::GuardCondition && instruction.frame_state.is_some()
@@ -10664,7 +10660,7 @@ mod tests {
             panic!("one add-transition case: {cases:?}");
         };
         let transition = case.transition.as_ref().expect("add-transition contract");
-        assert!(transition.child_shape != 0 && transition.new_len != 0);
+        assert!(transition.child_shape != 0);
         // Guards, store and publication live inside the dispatch; the value
         // and child-shape edges follow it as explicit barriers.
         assert!(!opcodes.iter().any(|opcode| matches!(

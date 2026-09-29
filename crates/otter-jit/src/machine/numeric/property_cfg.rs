@@ -528,7 +528,6 @@ mod tests {
                 JitCacheIrOp::PublishShape {
                     object: 0,
                     shape: 21,
-                    new_len: 3,
                 },
             ]
             .into_boxed_slice(),

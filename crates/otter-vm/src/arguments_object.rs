@@ -79,8 +79,7 @@ pub(crate) fn initialize_unmapped(
     slab.extend(args.iter().copied());
     slab.push(Value::number(NumberValue::from_i32(args.len() as i32)));
     slab.push(callee_cell);
-    object::set_fresh_object_shape(obj, heap, shape);
-    object::initialize_shaped_data_slots(obj, heap, &slab);
+    object::install_fresh_shape_with_slots(obj, heap, shape, &slab, slab.len());
     if let Some(symbol) = iterator_symbol {
         object::define_own_symbol_property_partial(
             &mut obj,
@@ -139,8 +138,7 @@ pub(crate) fn initialize_mapped(
     slab.extend(args.iter().copied());
     slab.push(Value::number(NumberValue::from_i32(args.len() as i32)));
     slab.push(callee);
-    object::set_fresh_object_shape(obj, heap, shape);
-    object::initialize_shaped_data_slots(obj, heap, &slab);
+    object::install_fresh_shape_with_slots(obj, heap, shape, &slab, slab.len());
     if let Some(symbol) = iterator_symbol {
         object::define_own_symbol_property_partial(
             &mut obj,

@@ -103,7 +103,7 @@ pub(super) fn ordinary_set_data_property(
         if !body.extensible() {
             return false;
         }
-        body.replace_dictionary_identity(true);
+        body.enter_dictionary_mode(true);
         if let Some(table) = dict_table {
             body.exotic_mut().dictionary_keys = table;
         }
@@ -111,7 +111,6 @@ pub(super) fn ordinary_set_data_property(
             body.exotic_mut().slots = table;
         }
         super::dict_push_key(body, key.to_owned());
-        body.shape = ShapeHandle::null();
         body.push_slot(append_index, SlotMeta::data_default(), stored);
         true
     });

@@ -460,7 +460,7 @@ where
                     emit_check_shape(ops, view, header, shape, next);
                 }
                 otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
-                    emit_dictionary_layout_guard(ops, view, 15, layout, next);
+                    emit_dictionary_layout_guard(ops, relocations, view, 15, layout, next);
                 }
                 otter_vm::JitCacheIrOp::GuardDictionaryLayout { .. } => {
                     return Err(Unsupported::OperandShape(
@@ -683,11 +683,10 @@ where
                         ; =>storage_fits
                         ; ldrb w16, [x13, view.object_flags_byte]
                         ; tbz w16, EXTENSIBLE_BIT, =>next
-                        ; ldrh w16, [x13, view.object_slab_len_byte]
-                        ; lsr w15, w17, #3
-                        ; cmp w16, w15
-                        ; b.ne =>next
                     );
+                    // The program's receiver shape guard fixes the slot
+                    // count at the appended index: the store is the exact
+                    // append.
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot { .. }
                 | otter_vm::JitCacheIrOp::LoadPrototype { .. }
@@ -708,16 +707,10 @@ where
                         dynasm!(ops ; .arch aarch64 ; b =>existing);
                     }
                 }
-                otter_vm::JitCacheIrOp::PublishShape {
-                    object: 0,
-                    shape,
-                    new_len,
-                } if terminal => {
-                    emit_load_u64(ops, 14, u64::from(new_len));
+                otter_vm::JitCacheIrOp::PublishShape { object: 0, shape } if terminal => {
                     emit_load_u64(ops, 16, u64::from(shape));
                     dynasm!(ops
                         ; .arch aarch64
-                        ; strh w14, [x13, view.object_slab_len_byte]
                         ; str w16, [x13, view.object_shape_byte]
                         ; b =>matched
                     );
@@ -1953,11 +1946,13 @@ fn emit_body_guard(ops: &mut Assembler, guard: JitBodyGuard, miss: DynamicLabel)
 }
 
 /// Prove a dictionary-mode holder in `header` keeps its captured key/slot
-/// layout: a null shape and an unchanged `u32` slot-layout epoch. Every
-/// delete, descriptor change or re-entry into dictionary mode advances the
-/// epoch; appending an unrelated key does not. Clobbers `x12` and `x14`.
+/// layout: a null shape, a sidecar, and an unchanged `u32` slot-layout epoch
+/// in that sidecar. Every delete, descriptor change or re-entry into
+/// dictionary mode advances the epoch; appending an unrelated key does not.
+/// Clobbers `x12` and `x14`.
 pub(crate) fn emit_dictionary_layout_guard(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     header: u8,
     layout: u64,
@@ -1967,7 +1962,20 @@ pub(crate) fn emit_dictionary_layout_guard(
         ; .arch aarch64
         ; ldr w14, [X(header), view.object_shape_byte]
         ; cbnz w14, =>miss
-        ; ldr w14, [X(header), view.object_dictionary_layout_byte]
+        ; ldr w14, [X(header), view.object_exotic_handle_byte]
+        ; cbz w14, =>miss
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        12,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x14, x12, x14
+        ; ldr w14, [x14, view.exotic_dictionary_layout_byte]
     );
     emit_load_u64(ops, 12, layout);
     dynasm!(ops ; .arch aarch64 ; cmp w14, w12 ; b.ne =>miss);
@@ -2029,7 +2037,7 @@ pub(crate) fn emit_prototype_guard(
             dynasm!(ops ; .arch aarch64 ; cmp w14, w12 ; b.ne =>miss);
         }
         JitMethodHolder::Dictionary(layout) => {
-            emit_dictionary_layout_guard(ops, view, 15, layout, miss);
+            emit_dictionary_layout_guard(ops, relocations, view, 15, layout, miss);
         }
         JitMethodHolder::Receiver => {
             return Err(Unsupported::OperandShape(

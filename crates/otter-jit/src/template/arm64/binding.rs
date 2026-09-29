@@ -93,7 +93,20 @@ fn emit_global_object_guard(
         dynasm!(ops
             ; .arch aarch64
             ; cbnz w14, =>miss
-            ; ldr w14, [x13, view.object_dictionary_layout_byte]
+            ; ldr w14, [x13, view.object_exotic_handle_byte]
+            ; cbz w14, =>miss
+        );
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            11,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x14, x11, x14
+            ; ldr w14, [x14, view.exotic_dictionary_layout_byte]
         );
         emit_load_u64(ops, 11, shape);
         dynasm!(ops ; .arch aarch64 ; cmp w14, w11 ; b.ne =>miss);

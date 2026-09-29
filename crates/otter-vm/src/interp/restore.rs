@@ -193,6 +193,8 @@ impl Interpreter {
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_runtime_stats: crate::JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
+            jit_compile_shapes: std::cell::RefCell::default(),
+            runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
             register_stack: crate::register_stack::RegisterStack::new(),

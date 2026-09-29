@@ -217,8 +217,6 @@ fn record_method_native_leaf_distribution(
                 recv_shape: method_site.recv_shape,
                 proto_chain: method_site.proto_chain,
                 method_value_byte: method_site.method_value_byte,
-                recv_shape_offset: method_site.recv_shape_offset,
-                holder_shape_offset: method_site.holder_shape_offset,
             });
             true
         }
@@ -386,8 +384,6 @@ mod tests {
             recv_shape: ShapeId::for_test(raw),
             proto_chain: MethodProtoChain::own(),
             method_value_byte: raw as u32 * 8,
-            recv_shape_offset: raw as u32,
-            holder_shape_offset: 0,
         }
     }
 

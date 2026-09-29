@@ -58,6 +58,11 @@ struct RegisteredCode {
     code: Arc<dyn JitFunctionCode>,
     dependencies: Box<[CodeDependency]>,
     state: CodeLifetimeState,
+    /// Hidden classes the machine code names as immediates. Shapes are
+    /// collectable, and the code compares and publishes these handles until
+    /// it retires — invalidation alone does not stop it running — so the
+    /// registration keeps them alive.
+    shapes: Box<[crate::object::ShapeHandle]>,
     /// Exact `GeneratedCodeBytes` charge for the executable mapping and its
     /// owned metadata. Released when the retired object is physically
     /// dropped from the registry.
@@ -276,6 +281,7 @@ impl JitCodeRegistry {
                 code,
                 dependencies,
                 state: CodeLifetimeState::Installed,
+                shapes: Box::new([]),
                 _generated_code_lease: generated_code_lease,
             },
         );
@@ -563,6 +569,28 @@ impl JitCodeRegistry {
     /// executing until that boundary.
     ///
     /// Returns how many objects retired.
+    /// Record the hidden classes an installed code object embeds.
+    pub(crate) fn retain_shapes(
+        &mut self,
+        code_object_id: u64,
+        shapes: Box<[crate::object::ShapeHandle]>,
+    ) {
+        if let Some(registered) = self.codes.get_mut(&code_object_id) {
+            registered.shapes = shapes;
+        }
+    }
+
+    /// Visit every hidden class a registered (not yet retired) code object
+    /// embeds, as strong roots.
+    pub(crate) fn trace_retained_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for registered in self.codes.values() {
+            for shape in &*registered.shapes {
+                // Shapes never move, so the slot is never rewritten.
+                visitor(std::ptr::from_ref(shape).cast_mut().cast::<otter_gc::raw::RawGc>());
+            }
+        }
+    }
+
     pub(crate) fn retire_unreferenced(&mut self) -> usize {
         let before = self.codes.len();
         let entry_cells = &self.entry_cells;

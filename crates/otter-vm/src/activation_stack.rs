@@ -303,7 +303,13 @@ impl Interpreter {
             .register_frame_roots(provider as *const dyn otter_gc::FrameRoots);
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
+        self.runtime_turn_depth += 1;
         let result = body(RuntimeTurn::from_rooted_parts(self, rooted.as_mut()));
+        self.runtime_turn_depth -= 1;
+        if self.runtime_turn_depth == 0 {
+            // No Rust frame of this turn still holds a fresh shape.
+            self.shape_runtime.unpin_turn_shapes();
+        }
         drop(extra_roots_guard);
         drop(frame_roots_guard);
         result

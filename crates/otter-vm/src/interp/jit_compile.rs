@@ -469,6 +469,21 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        let shapes_start = self.jit_compile_shapes.borrow().len();
+        let code = self.compile_optimized_jit_function_session(context, fid, osr_pc, shapes_start);
+        self.jit_compile_shapes.borrow_mut().truncate(shapes_start);
+        code
+    }
+
+    /// [`Self::compile_optimized_jit_function`] inside one compile-shape
+    /// session starting at `shapes_start`.
+    fn compile_optimized_jit_function_session(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        osr_pc: Option<u32>,
+        shapes_start: usize,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let hook = self.jit_hook.as_ref()?.clone();
         if !hook.optimizing_tier_enabled() {
             return None;
@@ -568,6 +583,7 @@ impl Interpreter {
                     &function,
                 );
                 if installed {
+                    self.retain_compiled_shapes(code_object_id, shapes_start);
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                 }
@@ -693,6 +709,28 @@ impl Interpreter {
         osr_pc: Option<u32>,
         eager_direct_target_depth: u8,
     ) -> TemplateCompileOutcome {
+        let shapes_start = self.jit_compile_shapes.borrow().len();
+        let outcome = self.compile_jit_function_session(
+            context,
+            fid,
+            osr_pc,
+            eager_direct_target_depth,
+            shapes_start,
+        );
+        self.jit_compile_shapes.borrow_mut().truncate(shapes_start);
+        outcome
+    }
+
+    /// [`Self::compile_jit_function_with_direct_targets_unchecked`] inside one
+    /// compile-shape session starting at `shapes_start`.
+    fn compile_jit_function_session(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        osr_pc: Option<u32>,
+        eager_direct_target_depth: u8,
+        shapes_start: usize,
+    ) -> TemplateCompileOutcome {
         let Some(hook) = self.jit_hook.as_ref().cloned() else {
             return TemplateCompileOutcome::Deferred;
         };
@@ -797,6 +835,7 @@ impl Interpreter {
                     &function,
                 );
                 if installed {
+                    self.retain_compiled_shapes(code_object_id, shapes_start);
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                     self.optimizing_tier_policy.observe_template_generation(
@@ -814,6 +853,47 @@ impl Interpreter {
             Ok(jit::JitCompileStatus::Unsupported { .. }) => TemplateCompileOutcome::Unsupported,
             Ok(jit::JitCompileStatus::Unavailable) | Err(_) => TemplateCompileOutcome::Deferred,
         }
+    }
+
+    /// Name `shape` in the code being compiled and return the compressed
+    /// handle generated code compares or publishes. Hidden classes are
+    /// collectable, so the compilation keeps the shape alive and the
+    /// installed code object takes it over ([`Self::retain_compiled_shapes`]).
+    pub(crate) fn bake_shape(&self, shape: crate::object::ShapeHandle) -> u32 {
+        self.jit_compile_shapes.borrow_mut().push(shape);
+        shape.offset()
+    }
+
+    /// [`Self::bake_shape`] for a shape feedback names by id; `None` when
+    /// that shape has been collected since.
+    pub(crate) fn bake_shape_id(&self, id: crate::object::ShapeId) -> Option<u32> {
+        self.shape_runtime
+            .handle_for_id(id)
+            .map(|shape| self.bake_shape(shape))
+    }
+
+    /// The live layout of a method holder as a generated guard names it: its
+    /// baked hidden class, else its dictionary slot-layout epoch.
+    pub(crate) fn jit_method_holder(
+        &self,
+        holder: crate::object::JsObject,
+    ) -> Option<jit::JitMethodHolder> {
+        let shape = crate::object::shape(holder, &self.gc_heap);
+        if !shape.is_null() {
+            return Some(jit::JitMethodHolder::Shape(self.bake_shape(shape)));
+        }
+        crate::object::dictionary_layout(holder, &self.gc_heap)
+            .map(|layout| jit::JitMethodHolder::Dictionary(u64::from(layout)))
+    }
+
+    /// Hand the shapes baked since `shapes_start` to the installed code
+    /// object `code_object_id`, which keeps them alive until it retires.
+    fn retain_compiled_shapes(&mut self, code_object_id: u64, shapes_start: usize) {
+        let mut shapes = self.jit_compile_shapes.borrow()[shapes_start..].to_vec();
+        shapes.sort_unstable_by_key(|shape| shape.offset());
+        shapes.dedup();
+        self.jit_code_registry
+            .retain_shapes(code_object_id, shapes.into_boxed_slice());
     }
 
     /// Bake fixed Array-body fields used by native guards. Element backing
@@ -880,9 +960,7 @@ impl Interpreter {
             }
             let mut programs = slot
                 .jit_programs(|shape_id| {
-                    self.shape_runtime
-                        .handle_for_id(shape_id)
-                        .map(|shape| shape.offset())
+                    self.bake_shape_id(shape_id)
                         .filter(|&offset| offset != 0)
                 })
                 .unwrap_or_default();
@@ -911,22 +989,12 @@ impl Interpreter {
             view.constructor_field_transitions = transitions
                 .iter()
                 .filter_map(|(&byte_pc, transition)| {
-                    let from_shape = self
-                        .shape_runtime
-                        .handle_for_id(transition.from_shape)?
-                        .offset();
-                    let to_shape = self
-                        .shape_runtime
-                        .handle_for_id(transition.to_shape)?
-                        .offset();
+                    let from_shape = self.bake_shape_id(transition.from_shape)?;
+                    let to_shape = self.bake_shape_id(transition.to_shape)?;
                     let prototype_shapes = transition
                         .prototype_shapes
                         .iter()
-                        .map(|&shape| {
-                            self.shape_runtime
-                                .handle_for_id(shape)
-                                .map(|shape| shape.offset())
-                        })
+                        .map(|&shape| self.bake_shape_id(shape))
                         .collect::<Option<Vec<_>>>()?;
                     Some((
                         byte_pc,
@@ -1113,8 +1181,8 @@ impl Interpreter {
             .state()
         {
             crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } => {
-                let shape = self.shape_runtime.handle_for_id(shape_id)?;
-                Some((shape.offset(), u32::from(slot) * SLOT_BYTES))
+                let shape = self.bake_shape_id(shape_id)?;
+                Some((shape, u32::from(slot) * SLOT_BYTES))
             }
             crate::feedback::PropertyFeedbackState::Empty => {
                 let slot = self.class_annotation_property_slot(context, code_block, instruction)?;
@@ -1152,7 +1220,7 @@ impl Interpreter {
         };
         let key = context.property_atom(name_idx)?;
         let slot = crate::object::shape_offset_of_str(&self.gc_heap, shape, key.name())?;
-        Some((shape.offset(), slot * SLOT_BYTES))
+        Some((self.bake_shape(shape), slot * SLOT_BYTES))
     }
 
     /// Whether a method-call site's feedback has already saturated to
@@ -1251,18 +1319,24 @@ impl Interpreter {
             let Some(MethodCallFeedback::MonoNativeLeaf {
                 stub_id,
                 method_value_byte,
-                recv_shape_offset,
-                holder_shape_offset,
-                ..
+                recv_shape,
+                proto_chain,
             }) = self.method_target_feedback(site)
             else {
                 continue;
             };
-            // An empty shape token never matches a live receiver, so a site
-            // that cannot name its guard stays on the runtime path.
-            if recv_shape_offset == 0 {
+            // Feedback names shapes by id; a shape collected since then leaves
+            // the site on the runtime path.
+            let Some(recv_shape_handle) = self.shape_runtime.handle_for_id(recv_shape) else {
                 continue;
-            }
+            };
+            let holder = match proto_chain.as_slice().last() {
+                None => jit::JitMethodHolder::Receiver,
+                Some(&holder_id) => match self.bake_shape_id(holder_id) {
+                    Some(holder) => jit::JitMethodHolder::Shape(holder),
+                    None => continue,
+                },
+            };
             let Some(declaration) = crate::jit_static_native::jit_leaf_builtin(stub_id)
                 .filter(|declaration| !declaration.this_operand)
             else {
@@ -1279,13 +1353,9 @@ impl Interpreter {
                 byte_pc,
                 jit::JitGuardedMethodCall {
                     receiver: jit::JitGuardedReceiver::Shape {
-                        shape: recv_shape_offset,
+                        shape: self.bake_shape(recv_shape_handle),
                     },
-                    holder: if holder_shape_offset == 0 {
-                        jit::JitMethodHolder::Receiver
-                    } else {
-                        jit::JitMethodHolder::Shape(holder_shape_offset)
-                    },
+                    holder,
                     method_value_byte,
                     builtin_native_ref,
                     entry_stub_id: stub_id,
@@ -1323,8 +1393,6 @@ impl Interpreter {
                 recv_shape,
                 proto_chain: crate::MethodProtoChain::own(),
                 method_value_byte: slot_byte(slot),
-                recv_shape_offset: recv_shape_handle.offset(),
-                holder_shape_offset: 0,
             });
         }
         // Walk the prototype chain, recording each hopped object's shape; the
@@ -1343,8 +1411,6 @@ impl Interpreter {
                     recv_shape,
                     proto_chain,
                     method_value_byte: slot_byte(slot),
-                    recv_shape_offset: recv_shape_handle.offset(),
-                    holder_shape_offset: shape.offset(),
                 });
             }
         }
@@ -1561,7 +1627,7 @@ impl Interpreter {
                 }
                 (u64::from(layout), true)
             } else {
-                (u64::from(shape.offset()), false)
+                (u64::from(self.bake_shape(shape)), false)
             };
             const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
             view.global_object_loads.insert(
@@ -1653,7 +1719,7 @@ impl Interpreter {
                 }
                 (u64::from(layout), true)
             } else {
-                (u64::from(shape.offset()), false)
+                (u64::from(self.bake_shape(shape)), false)
             };
             const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
             view.binding_hit_proofs.insert(
@@ -2313,20 +2379,16 @@ impl Interpreter {
     /// shape-handle offsets. Resolving every hop here keeps heap/runtime layout
     /// knowledge on the VM side.
     fn bake_method_guard(&self, target: &PolyMethodTarget) -> Option<jit::JitMethodGuard> {
-        let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
+        let recv_shape = self.bake_shape_id(target.recv_shape)?;
         let proto_chain = target
             .proto_chain
             .as_slice()
             .iter()
-            .map(|shape_id| {
-                self.shape_runtime
-                    .handle_for_id(*shape_id)
-                    .map(|shape| shape.offset())
-            })
+            .map(|shape_id| self.bake_shape_id(*shape_id))
             .collect::<Option<Vec<_>>>()?;
         Some(jit::JitMethodGuard {
             method_fid: target.method_fid,
-            recv_shape: recv_shape.offset(),
+            recv_shape,
             proto_chain,
             method_value_byte: target.method_value_byte,
         })
@@ -2406,7 +2468,7 @@ impl Interpreter {
             return Some(jit::JitReceiverAllocationPlan {
                 new_target_function_id,
                 class_allocation,
-                receiver_shape: self.shape_root().offset(),
+                receiver_shape: self.bake_shape(self.shape_root()),
                 initial_field_count: 0,
                 inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(learned))
                     .ok()?,
@@ -2423,7 +2485,7 @@ impl Interpreter {
         }
         let mut prototype_shapes = [0; jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP];
         for (destination, shape_id) in prototype_shapes.iter_mut().zip(prototype_ids) {
-            *destination = self.shape_runtime.handle_for_id(*shape_id)?.offset();
+            *destination = self.bake_shape_id(*shape_id)?;
         }
         let (receiver_shape, initial_field_count) = match (
             self.simple_constructor_init_cache
@@ -2439,9 +2501,9 @@ impl Interpreter {
                     init.fields.len(),
                     "simple-constructor shape and initial fields diverged"
                 );
-                (shape.offset(), u8::try_from(init.fields.len()).ok()?)
+                (self.bake_shape(*shape), u8::try_from(init.fields.len()).ok()?)
             }
-            _ => (self.shape_root().offset(), 0),
+            _ => (self.bake_shape(self.shape_root()), 0),
         };
         Some(jit::JitReceiverAllocationPlan {
             new_target_function_id,

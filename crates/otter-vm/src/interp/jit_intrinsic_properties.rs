@@ -121,7 +121,7 @@ impl Interpreter {
                 },
                 JitCacheIrOp::GuardShape {
                     object: 1,
-                    shape: shape.offset(),
+                    shape: self.bake_shape(shape),
                 },
                 JitCacheIrOp::GuardAtomSlot {
                     object: 1,
@@ -153,7 +153,7 @@ impl Interpreter {
         }
         let prototype = self.realm_intrinsics.string_prototype()?;
         let crate::jit::JitMethodHolder::Dictionary(layout) =
-            crate::jit::JitMethodHolder::of(prototype, &self.gc_heap)?
+            self.jit_method_holder(prototype)?
         else {
             return None;
         };

@@ -15,8 +15,11 @@
 //!   It owns an ordinary internal property table, never a JS exotic receiver.
 //!   Dictionary migration may retain an empty metadata sidecar; that does not
 //!   invalidate a matching shape with no overridden slot attributes.
-//! - Shape handles are interned and immortal. A cached slot is usable only after
-//!   matching the live bag shape and ordinary unmodified descriptor guards.
+//! - `prototype_shape` is a traced shape handle: hidden classes are
+//!   collectable, and generated code compares the live bag's shape handle
+//!   against it, so the record keeps the proof's shape alive (a later shape
+//!   can never take its cell). A cached slot is usable only after matching
+//!   the live bag shape and ordinary unmodified descriptor guards.
 //! - `proto_override` is meaningful only while the owning closure's
 //!   [`crate::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE`] bit is set; it is traced
 //!   either way.
@@ -45,7 +48,7 @@ pub type ClosureRareHandle = otter_gc::Gc<ClosureRareBody>;
 #[derive(Debug)]
 pub struct ClosureRareBody {
     pub(crate) own_props: JsObject,
-    pub(crate) prototype_shape: u32,
+    pub(crate) prototype_shape: crate::object::ShapeHandle,
     pub(crate) prototype_slot: u32,
     pub(crate) learned_instance_fields: Cell<u16>,
     pub(crate) proto_override: Value,
@@ -67,7 +70,7 @@ impl Default for ClosureRareBody {
     fn default() -> Self {
         Self {
             own_props: JsObject::null(),
-            prototype_shape: 0,
+            prototype_shape: crate::object::ShapeHandle::null(),
             prototype_slot: 0,
             learned_instance_fields: Cell::new(0),
             proto_override: Value::undefined(),
@@ -82,6 +85,9 @@ impl otter_gc::SafeTraceable for ClosureRareBody {
         use crate::pelt::PeltField as _;
         self.own_props.pelt_trace(visitor);
         self.proto_override.pelt_trace(visitor);
+        if !self.prototype_shape.is_null() {
+            visitor(std::ptr::addr_of_mut!(self.prototype_shape).cast::<otter_gc::raw::RawGc>());
+        }
     }
 }
 
@@ -134,15 +140,16 @@ impl crate::Interpreter {
                 return None;
             }
             let slot = crate::object::shape_offset_of_str(&self.gc_heap, shape, "prototype")?;
-            Some((shape.offset(), slot))
+            Some((shape, slot))
         });
         let Some(rare) = closure.rare(&self.gc_heap) else {
             return;
         };
+        let (shape, slot) = proof.unwrap_or((crate::object::ShapeHandle::null(), 0));
         self.gc_heap.with_payload(rare, |rare| {
-            let (shape, slot) = proof.unwrap_or((0, 0));
             rare.prototype_shape = shape;
             rare.prototype_slot = slot;
         });
+        self.gc_heap.record_write(rare, &shape);
     }
 }

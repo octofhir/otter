@@ -2139,6 +2139,17 @@ impl GcHeap {
         if let Some(processor) = self.post_mark {
             processor(self);
         }
+        // Owner tables forget unreached cells last: the processor's
+        // ephemeron fixpoint may still mark objects.
+        let sources = self.extra_roots.clone();
+        let mut seen: Vec<ExtraRoots> = Vec::with_capacity(sources.len());
+        for source in sources {
+            if seen.iter().any(|earlier| earlier.same_source(&source)) {
+                continue;
+            }
+            source.sweep_weak(self);
+            seen.push(source);
+        }
     }
 
     /// Whether a collection since the last call may have emptied a

@@ -22,6 +22,7 @@
 //! - `otter_vm::closure_construct` — canonical state and weak observation lifetime.
 
 use super::*;
+use crate::arm64::allocation::emit_count_allocation;
 use crate::template::arm64::values::{CellTest, emit_cell_test};
 
 /// Emit the shared no-safepoint receiver allocation program.
@@ -203,7 +204,7 @@ fn emit_receiver_candidate(
     let cell_bytes = receiver_cell_bytes(view, plan);
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x13, [X(context_register), RECEIVER_ALLOC_LAB_OFFSET]
+        ; ldr x13, [X(context_register), ALLOC_WINDOW_LAB_OFFSET]
         ; ldr x16, [x13, LAB_TOP_OFFSET]
         ; ldr x14, [x13, LAB_LIMIT_OFFSET]
         ; add x15, x16, cell_bytes
@@ -266,23 +267,14 @@ fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot, con
         ; add x15, x16, x17
         ; str x15, [x13, LAB_TOP_OFFSET]
     );
-    for (pointer_offset, by_size) in [
-        (RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET, true),
-        (RECEIVER_ALLOC_TYPE_COUNT_OFFSET, false),
-        (RECEIVER_ALLOC_TYPE_BYTES_OFFSET, true),
-    ] {
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x13, [X(context_register), pointer_offset]
-            ; ldr x14, [x13]
-        );
-        if by_size {
-            dynasm!(ops ; .arch aarch64 ; add x14, x14, x17);
-        } else {
-            dynasm!(ops ; .arch aarch64 ; add x14, x14, 1);
-        }
-        dynasm!(ops ; .arch aarch64 ; str x14, [x13]);
-    }
+    emit_count_allocation(
+        ops,
+        context_register,
+        OBJECT_BODY_TYPE_TAG as u8,
+        17,
+        13,
+        14,
+    );
     let observation_done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; ldrb w14, [x2] ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG as u32 ; b.ne =>observation_done

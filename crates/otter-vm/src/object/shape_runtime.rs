@@ -325,7 +325,12 @@ impl ShapeRuntime {
             flags,
             is_accessor,
         };
-        let child = self.tables.borrow().transitions.get(&transition_key).copied()?;
+        let child = self
+            .tables
+            .borrow()
+            .transitions
+            .get(&transition_key)
+            .copied()?;
         self.notify_observer(heap, parent_id, child, key, true);
         Some(child)
     }
@@ -353,7 +358,12 @@ impl ShapeRuntime {
             flags,
             is_accessor,
         };
-        let existing = self.tables.borrow().transitions.get(&transition_key).copied();
+        let existing = self
+            .tables
+            .borrow()
+            .transitions
+            .get(&transition_key)
+            .copied();
         if let Some(child) = existing {
             self.notify_observer(heap, parent_id, child, key, true);
             return Ok(child);
@@ -421,7 +431,10 @@ impl ShapeRuntime {
             cache.insert(atom, offset);
         }
         let result = cache.get(&atom).copied();
-        self.tables.borrow_mut().offset_cache.insert(shape_id, cache);
+        self.tables
+            .borrow_mut()
+            .offset_cache
+            .insert(shape_id, cache);
         result
     }
 

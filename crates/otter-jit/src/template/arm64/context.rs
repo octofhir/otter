@@ -4,7 +4,8 @@
 //! - `LoadClosureContext`: SELF's closure context word.
 //! - Unchecked `LoadContextSlot` / `StoreContextSlot` over a static hop count.
 //! - The inline hit path of the checked (TDZ) slot accesses.
-//! - `CreateContext` / `CopyContext` through the VM-owned allocating ABI.
+//! - `CreateContext` / `CopyContext` carved inline from the linear
+//!   allocation buffer, with the VM-owned allocating ABI as the slow path.
 //!
 //! # Invariants
 //! - A context is a heap `Value` whose word is its `GcHeader` address, so a
@@ -18,9 +19,10 @@
 //!   never throws and never publishes a PC.
 //! - A slot store of a cell value runs the canonical write barrier: contexts
 //!   are young and movable, and incremental marking needs the insertion half.
-//! - Allocation publishes a full-window safepoint; a refused allocation exits
-//!   before any effect at the original opcode, which the interpreter
-//!   re-executes (and which owns the heap-limit `RangeError`).
+//! - An inline carve cannot collect. The slow path publishes a full-window
+//!   safepoint; a refused allocation exits before any effect at the original
+//!   opcode, which the interpreter re-executes (and which owns the
+//!   heap-limit `RangeError`).
 //! - A checked access completes inline when its slot holds a value; only the
 //!   `hole` (TDZ) outcome branches to the committed binding boundary in
 //!   [`super::binding`], which owns the `ReferenceError`. Lookup accesses
@@ -38,6 +40,7 @@ use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg,
     emit_write_barrier,
 };
+use crate::arm64::allocation::{emit_copy_context, emit_create_context};
 use crate::artifact::relocation::RelocationCapture;
 use crate::entry::{
     ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
@@ -261,9 +264,10 @@ pub(super) enum ContextAllocation {
     Copy { source: u16 },
 }
 
-/// Allocate one context through the `AllocValue3` boundary and commit it to
-/// `r<dst>`. A refused allocation exits at the original opcode before any
-/// effect.
+/// Allocate one context and commit it to `r<dst>`: carved inline from the
+/// linear allocation buffer when it fits, otherwise through the
+/// `AllocValue3` boundary. A refused allocation exits at the original opcode
+/// before any effect.
 pub(super) fn emit_context_allocation(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -280,6 +284,61 @@ pub(super) fn emit_context_allocation(
     let stub_addr = alloc_value_stub_by_id(descriptor.id)
         .and_then(|stub| stub.entry_addr())
         .ok_or(Unsupported::OperandShape("context allocating stub entry"))?;
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    match allocation {
+        ContextAllocation::Create { parent, scope } => {
+            let Some(plan) = view.context_allocations.get(&(view.code_block.id, scope)) else {
+                return emit_context_allocation_call(
+                    ops,
+                    relocations,
+                    view,
+                    dst,
+                    allocation,
+                    descriptor,
+                    stub_addr,
+                    safepoint,
+                    miss,
+                );
+            };
+            emit_load_reg(ops, 2, parent)?;
+            emit_create_context(ops, view, plan, 20, 2, slow);
+        }
+        ContextAllocation::Copy { source } => {
+            emit_load_reg(ops, 2, source)?;
+            emit_copy_context(ops, view, 20, 2, slow);
+        }
+    }
+    emit_store_reg(ops, 0, dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
+    emit_context_allocation_call(
+        ops,
+        relocations,
+        view,
+        dst,
+        allocation,
+        descriptor,
+        stub_addr,
+        safepoint,
+        miss,
+    )?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
+}
+
+/// The allocating-call half of [`emit_context_allocation`].
+#[allow(clippy::too_many_arguments)]
+fn emit_context_allocation_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    dst: u16,
+    allocation: ContextAllocation,
+    descriptor: abi::RuntimeStubDescriptor,
+    stub_addr: usize,
+    safepoint: abi::SafepointId,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
     dynasm!(ops
         ; .arch aarch64
         ; sub sp, sp, ALLOC_CTX_STACK_SIZE

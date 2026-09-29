@@ -550,6 +550,16 @@ pub enum DirectCallArgumentMode {
 pub enum CallTarget {
     /// VM-owned runtime entry with one statically declared ABI.
     RuntimeStub(otter_vm::native_abi::RuntimeStubDescriptor),
+    /// Context allocation through the VM's `AllocValue3` entry. The emitter
+    /// carves the context from the linear allocation buffer first and calls
+    /// the entry only when the carve misses.
+    ContextAllocation {
+        /// `STUB_CREATE_CONTEXT_ALLOC` or `STUB_COPY_CONTEXT_ALLOC`.
+        target: otter_vm::native_abi::RuntimeStubDescriptor,
+        /// `(function id, scope index)` of a `CreateContext`, naming its
+        /// allocation plan; `None` for a copy.
+        scope: Option<(u32, u32)>,
+    },
     /// Canonical non-reentrant literal allocation from a boxed-value span.
     /// Arguments and unrelated live roots remain allocator-visible; the result
     /// commits once without an interpreter destination or pre-effect replay.
@@ -1000,6 +1010,16 @@ pub enum MachineOpcode {
         byte_pc: u32,
         /// The generic operator the committed site completes.
         operator: otter_vm::native_abi::BinaryOperator,
+    },
+    /// No-call closure carve of a committed `MakeClosure` (tagged context
+    /// input) or `MakeFunction` (no input) site: tagged closure, Boolean hit.
+    /// A site without an allocation plan, an unexpected context operand or
+    /// a full allocation buffer misses to the canonical committed sibling.
+    ClosureAllocationProbe {
+        /// Source bytecode offset; keys the site's allocation plan.
+        byte_pc: u32,
+        /// The site takes its context operand (`MakeClosure`).
+        with_context: bool,
     },
     /// Read an unmaterialized native arguments window without a runtime call.
     ArgumentsReadProbe {
@@ -3153,12 +3173,19 @@ impl InstructionSequence {
                     | MachineOpcode::LooseEqualityProbe { .. }
                     | MachineOpcode::InstanceofProbe { .. }
                     | MachineOpcode::BinaryNumberProbe { .. }
+                    | MachineOpcode::ClosureAllocationProbe { .. }
                     | MachineOpcode::ArgumentsReadProbe { .. } => {
                         let (input_count, result_type) =
                             if let MachineOpcode::ArgumentsReadProbe { element, .. } =
                                 instruction.opcode
                             {
                                 (usize::from(element), MachineRepresentation::Tagged)
+                            } else if let MachineOpcode::ClosureAllocationProbe {
+                                with_context,
+                                ..
+                            } = instruction.opcode
+                            {
+                                (usize::from(with_context), MachineRepresentation::Tagged)
                             } else if matches!(instruction.opcode, MachineOpcode::TruthinessProbe) {
                                 (1, MachineRepresentation::Boolean)
                             } else {
@@ -3197,7 +3224,8 @@ impl InstructionSequence {
                                     MachineOpcode::BinaryNumberProbe { .. } => {
                                         target_spec.clobbers(TargetClobberSet::NumberProbe)
                                     }
-                                    MachineOpcode::InstanceofProbe { .. } => {
+                                    MachineOpcode::InstanceofProbe { .. }
+                                    | MachineOpcode::ClosureAllocationProbe { .. } => {
                                         target_spec.clobbers(TargetClobberSet::PropertyLoad)
                                     }
                                     _ => &[],
@@ -3732,6 +3760,16 @@ impl InstructionSequence {
                                 && instruction.exits.is_empty()
                         }
                         CallTarget::RuntimeStub(_) => true,
+                        CallTarget::ContextAllocation { target, scope } => {
+                            (if scope.is_some() {
+                                *target == otter_vm::native_abi::STUB_CREATE_CONTEXT_ALLOC
+                            } else {
+                                *target == otter_vm::native_abi::STUB_COPY_CONTEXT_ALLOC
+                            }) && descriptor.arguments == [MachineRepresentation::Tagged; 3]
+                                && descriptor.results == [MachineRepresentation::Tagged]
+                                && descriptor.exceptional == ExceptionalEdge::None
+                                && descriptor.safepoint == SafepointKind::Gc
+                        }
                         CallTarget::LiteralAllocation { target, .. } => {
                             let arguments = descriptor.arguments.len();
                             matches!(
@@ -3930,7 +3968,9 @@ impl InstructionSequence {
                     {
                         return Err(VerificationError::CallSafepointMismatch(id));
                     }
-                    if let CallTarget::RuntimeStub(target) = descriptor.target {
+                    if let CallTarget::RuntimeStub(target)
+                    | CallTarget::ContextAllocation { target, .. } = descriptor.target
+                    {
                         if usize::from(target.argument_count) != descriptor.arguments.len() {
                             return Err(VerificationError::CallSignatureMismatch(id));
                         }

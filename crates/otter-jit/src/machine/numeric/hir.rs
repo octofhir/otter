@@ -4004,7 +4004,13 @@ fn lower_instruction(
         Op::TestTypeOf => {
             let source = read_value(registers, register(instruction, code, 1)?)?;
             let test = instruction.imm32(code, 2)? as u32;
-            let value = push(nodes, NumericNode::TaggedTestTypeOf { value: source, test });
+            let value = push(
+                nodes,
+                NumericNode::TaggedTestTypeOf {
+                    value: source,
+                    test,
+                },
+            );
             block_nodes.push(value);
             push_frame_state(
                 frame_states,

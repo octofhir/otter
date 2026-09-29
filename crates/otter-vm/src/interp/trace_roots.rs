@@ -281,7 +281,11 @@ impl Interpreter {
         let compiling = self.jit_compile_shapes.borrow();
         for shape in compiling.iter() {
             // Shapes never move, so the slot is never rewritten.
-            visitor(std::ptr::from_ref(shape).cast_mut().cast::<otter_gc::raw::RawGc>());
+            visitor(
+                std::ptr::from_ref(shape)
+                    .cast_mut()
+                    .cast::<otter_gc::raw::RawGc>(),
+            );
         }
     }
 

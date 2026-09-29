@@ -63,7 +63,7 @@ pub(crate) struct JitCtx {
     pub(crate) machine_roots_ptr: *mut u64,
     /// Audited nursery page and per-type accounting pointers for inline
     /// receiver allocation. A null page forces the rooted cold boundary.
-    pub(crate) receiver_alloc: otter_vm::jit::JitMachineAllocationWindow,
+    pub(crate) alloc_window: otter_vm::jit::JitMachineAllocationWindow,
     /// Stable aggregate counter record updated by generated allocation paths.
     pub(crate) runtime_stats: *mut otter_vm::JitRuntimeStats,
 }
@@ -239,21 +239,12 @@ pub(crate) const NATIVE_STACK_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, native_stack_limit) as u32;
 pub(crate) const GENERATED_FEEDBACK_CLEAN_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, generated_feedback_clean) as u32;
-pub(crate) const RECEIVER_ALLOC_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, receiver_alloc)
+pub(crate) const ALLOC_WINDOW_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
     + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, lab))
     as u32;
-pub(crate) const RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET: u32 =
-    (std::mem::offset_of!(JitCtx, receiver_alloc)
-        + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_live_bytes))
-        as u32;
-pub(crate) const RECEIVER_ALLOC_TYPE_COUNT_OFFSET: u32 =
-    (std::mem::offset_of!(JitCtx, receiver_alloc)
-        + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_alloc_count))
-        as u32;
-pub(crate) const RECEIVER_ALLOC_TYPE_BYTES_OFFSET: u32 =
-    (std::mem::offset_of!(JitCtx, receiver_alloc)
-        + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_alloc_bytes))
-        as u32;
+pub(crate) const ALLOC_WINDOW_TYPE_STATS_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
+    + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_stats))
+    as u32;
 pub(crate) const RUNTIME_STATS_OFFSET: u32 = std::mem::offset_of!(JitCtx, runtime_stats) as u32;
 pub(crate) const RECEIVER_ALLOC_ATTEMPTS_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_attempts) as u32;
@@ -311,7 +302,7 @@ pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFr
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 120] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 104] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> NativeResultPair;

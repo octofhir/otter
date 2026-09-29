@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`emit_direct_call`] — compiler-generated monomorphic plain-call linkage.
 //! - Guarded static-native leaves for extracted builtins.
+//! - [`allocation`] — nursery carves shared by both tiers.
 //! - Shared generated-code policy constants used by multiple native tiers.
 //!
 //! # Invariants
@@ -21,6 +22,7 @@
 // conversion is intentionally redundant.
 #![allow(clippy::useless_conversion)]
 
+pub(crate) mod allocation;
 mod direct_call;
 pub(crate) mod inline_guard;
 mod method_guard;

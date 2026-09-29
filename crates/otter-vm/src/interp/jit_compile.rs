@@ -512,6 +512,8 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
         self.bake_constructor_field_transitions(&mut snapshot);
+        Self::bake_context_allocations(&mut snapshot);
+        Self::bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
@@ -765,6 +767,8 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut view);
         self.bake_element_accesses(&mut view);
         self.bake_constructor_field_transitions(&mut view);
+        Self::bake_context_allocations(&mut view);
+        Self::bake_closure_allocations(&mut view, context);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -896,6 +900,87 @@ impl Interpreter {
             .retain_shapes(code_object_id, shapes.into_boxed_slice());
     }
 
+    /// Plan inline context allocation for every scope of this function and
+    /// of every body inlined into it.
+    pub(crate) fn bake_context_allocations(view: &mut jit::JitCompileSnapshot) {
+        fn collect(
+            view: &jit::JitCompileSnapshot,
+            plans: &mut rustc_hash::FxHashMap<(u32, u32), jit::JitContextAllocationPlan>,
+            depth: u32,
+        ) {
+            let code_block = &view.code_block;
+            for scope in 0..code_block.scopes.len() {
+                let Ok(scope) = u32::try_from(scope) else {
+                    break;
+                };
+                if let Some(plan) = jit::context_allocation_plan(code_block, scope) {
+                    plans.insert((code_block.id, scope), plan);
+                }
+            }
+            // Inline nesting is bounded by the inliner; the cap only guards
+            // a malformed snapshot graph.
+            if depth >= 16 {
+                return;
+            }
+            for callee in view.inline_callees.values() {
+                collect(&callee.body, plans, depth + 1);
+            }
+            for method in view.inline_methods.values() {
+                collect(&method.body, plans, depth + 1);
+            }
+        }
+        let mut plans = rustc_hash::FxHashMap::default();
+        collect(view, &mut plans, 0);
+        view.context_allocations = plans;
+    }
+
+    /// Plan inline closure allocation for every `MakeClosure` and
+    /// `MakeFunction` site of this function. `context` owns the function.
+    pub(crate) fn bake_closure_allocations(
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+    ) {
+        let mut plans = rustc_hash::FxHashMap::default();
+        for instruction in &view.instructions {
+            let op = instruction.op(&view.code_block);
+            if !matches!(op, Op::MakeClosure | Op::MakeFunction) {
+                continue;
+            }
+            let Some(function_id) = instruction
+                .const_index(&view.code_block, 1)
+                .and_then(|index| context.function_id_constant(index))
+            else {
+                continue;
+            };
+            // A generator or async function starts from its kind's
+            // prototype, not the ordinary `%Function.prototype%` lookup; its
+            // closures take the allocating runtime entry.
+            let plain = context.for_function(function_id).ok().is_some_and(|owner| {
+                owner.function(function_id).is_some_and(|function| {
+                    !function.is_generator && !function.is_async && !function.is_async_generator
+                })
+            });
+            if !plain {
+                continue;
+            }
+            let arrow = op == Op::MakeClosure && context.function_is_arrow(function_id);
+            let flags = crate::closure::CLOSURE_FLAGS_ORDINARY_LOOKUP
+                | if arrow {
+                    crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS
+                } else {
+                    0
+                };
+            plans.insert(
+                instruction.byte_pc,
+                jit::JitClosureAllocationPlan {
+                    call_word: u64::from(function_id) | (u64::from(flags) << 32),
+                    arrow,
+                },
+            );
+        }
+        view.closure_allocations = plans;
+    }
+
     /// Bake fixed Array-body fields used by native guards. Element backing
     /// stores remain behind runtime stubs and are deliberately absent here.
     pub(crate) fn bake_typed_array_layout(view: &mut jit::JitCompileSnapshot) {
@@ -959,10 +1044,7 @@ impl Interpreter {
                 continue;
             }
             let mut programs = slot
-                .jit_programs(|shape_id| {
-                    self.bake_shape_id(shape_id)
-                        .filter(|&offset| offset != 0)
-                })
+                .jit_programs(|shape_id| self.bake_shape_id(shape_id).filter(|&offset| offset != 0))
                 .unwrap_or_default();
             if op == Op::LoadProperty
                 && let Some(key) = name_index.and_then(|name_index| {
@@ -2501,7 +2583,10 @@ impl Interpreter {
                     init.fields.len(),
                     "simple-constructor shape and initial fields diverged"
                 );
-                (self.bake_shape(*shape), u8::try_from(init.fields.len()).ok()?)
+                (
+                    self.bake_shape(*shape),
+                    u8::try_from(init.fields.len()).ok()?,
+                )
             }
             _ => (self.bake_shape(self.shape_root()), 0),
         };

@@ -152,8 +152,7 @@ impl Interpreter {
             return None;
         }
         let prototype = self.realm_intrinsics.string_prototype()?;
-        let crate::jit::JitMethodHolder::Dictionary(layout) =
-            self.jit_method_holder(prototype)?
+        let crate::jit::JitMethodHolder::Dictionary(layout) = self.jit_method_holder(prototype)?
         else {
             return None;
         };

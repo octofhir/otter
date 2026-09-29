@@ -69,6 +69,151 @@ pub use crate::property_cache::jit::{JitPropertyLookupCache, JitStoreTransitionC
 
 /// Opaque collector-owned nursery window carried by the compiled-entry ABI.
 pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
+/// Largest context (slots plus extension word) generated code carves inline;
+/// a bigger scope takes the allocating runtime entry.
+pub const JIT_INLINE_CONTEXT_MAX_WORDS: usize = 32;
+/// GC header word of a young context cell with a zero size; generated code
+/// ORs the cell size in at [`JIT_GC_HEADER_SIZE_BYTES_OFFSET`].
+pub const JIT_YOUNG_CONTEXT_HEADER_WORD: u64 = crate::context::CONTEXT_BODY_TYPE_TAG as u64
+    | ((JIT_GC_YOUNG_FLAG as u64) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET));
+/// Bit of a context's `u16` scope index marking an eval-extension word.
+pub const JIT_CONTEXT_HAS_EXTENSION_BIT: u32 =
+    crate::context::CONTEXT_HAS_EXTENSION.trailing_zeros();
+
+// The plan's body word packs the function id, the scope index word and the
+// slot count in payload order, directly before the parent word.
+const _: () = {
+    assert!(crate::context::CONTEXT_BODY_SCOPE_FUNCTION_ID_OFFSET == 0);
+    assert!(crate::context::CONTEXT_BODY_SCOPE_INDEX_OFFSET == 4);
+    assert!(crate::context::CONTEXT_BODY_SLOT_COUNT_OFFSET == 6);
+    assert!(crate::context::CONTEXT_BODY_PARENT_OFFSET == 8);
+};
+
+/// Everything generated code needs to carve one `CreateContext` from the
+/// linear allocation buffer: the cell size, its complete GC header word, the
+/// fixed body word before the parent, and every trailing word's initial
+/// value (each slot's `hole` or `undefined`, then the eval-extension word
+/// when the scope has one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitContextAllocationPlan {
+    /// Cell bytes, header included.
+    pub cell_bytes: u32,
+    /// GC header word: context tag, young flag, cell size.
+    pub header_word: u64,
+    /// Scope function id, scope index word and slot count, as one word.
+    pub body_word: u64,
+    /// Initial value of every trailing word.
+    pub initial_words: Box<[u64]>,
+}
+
+/// The inline allocation plan for a context of `code_block`'s scope
+/// `scope`, or `None` when the scope is unknown or too large to carve inline.
+#[must_use]
+pub fn context_allocation_plan(
+    code_block: &crate::executable::CodeBlock,
+    scope: u32,
+) -> Option<JitContextAllocationPlan> {
+    let descriptor = code_block.scopes.get(scope as usize)?;
+    let scope_index = u16::try_from(scope).ok()?;
+    if scope_index & crate::context::CONTEXT_HAS_EXTENSION != 0 {
+        return None;
+    }
+    let slot_count = u16::try_from(descriptor.slots.len()).ok()?;
+    let has_extension = descriptor.flags.has_extension;
+    let words = usize::from(slot_count) + usize::from(has_extension);
+    if words > JIT_INLINE_CONTEXT_MAX_WORDS {
+        return None;
+    }
+    let cell_bytes = u32::try_from(
+        otter_gc::header::HEADER_SIZE
+            + std::mem::size_of::<crate::context::ContextBody>()
+            + words * std::mem::size_of::<crate::Value>(),
+    )
+    .ok()?;
+    let scope_index_word = if has_extension {
+        scope_index | crate::context::CONTEXT_HAS_EXTENSION
+    } else {
+        scope_index
+    };
+    let mut initial_words: Vec<u64> = descriptor
+        .slots
+        .iter()
+        .map(|slot| {
+            if slot.kind.initial_hole() {
+                crate::Value::hole().to_bits()
+            } else {
+                crate::Value::undefined().to_bits()
+            }
+        })
+        .collect();
+    if has_extension {
+        initial_words.push(crate::Value::undefined().to_bits());
+    }
+    Some(JitContextAllocationPlan {
+        cell_bytes,
+        header_word: JIT_YOUNG_CONTEXT_HEADER_WORD
+            | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
+        body_word: u64::from(code_block.id)
+            | (u64::from(scope_index_word) << 32)
+            | (u64::from(slot_count) << 48),
+        initial_words: initial_words.into_boxed_slice(),
+    })
+}
+
+/// GC header word of a young closure cell with a zero size; generated code
+/// ORs the cell size in at [`JIT_GC_HEADER_SIZE_BYTES_OFFSET`].
+pub const JIT_YOUNG_CLOSURE_HEADER_WORD: u64 = crate::closure::JS_CLOSURE_BODY_TYPE_TAG as u64
+    | ((JIT_GC_YOUNG_FLAG as u64) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET));
+/// Bytes of a closure cell without bound words.
+pub const JIT_CLOSURE_CELL_BYTES: u32 = (otter_gc::header::HEADER_SIZE
+    + std::mem::size_of::<crate::closure::JsClosureBody>()) as u32;
+
+// A carve writes the call header as one word (function id, then flags) and
+// clears the rare handle and the last-instance observation with one store.
+const _: () = {
+    assert!(crate::closure::CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET == 0);
+    assert!(crate::closure::CLOSURE_CALL_HEADER_FLAGS_OFFSET == 4);
+    assert!(
+        crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET
+            == crate::closure::CLOSURE_BODY_RARE_OFFSET + 4
+    );
+};
+
+/// Everything generated code needs to carve the closure one `MakeClosure`
+/// or `MakeFunction` site creates from the linear allocation buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitClosureAllocationPlan {
+    /// The call-header word: function id, then the flags word every closure
+    /// of the site starts with (the named-lookup summary and, for an arrow,
+    /// the bound-`this` bit).
+    pub call_word: u64,
+    /// The site binds the creating activation's `this`, and its `new.target`
+    /// when defined (a `MakeClosure` of an arrow). A defined `new.target`
+    /// adds [`Self::bound_new_target_word`] to the call word.
+    pub arrow: bool,
+}
+
+impl JitClosureAllocationPlan {
+    /// Call-word bit of a bound `new.target`.
+    #[must_use]
+    pub const fn bound_new_target_word() -> u64 {
+        (crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET as u64) << 32
+    }
+}
+
+/// Bytes of one per-type-tag allocation statistics row; generated
+/// allocators update the row at `tag * JIT_TYPE_STATS_ROW_BYTES`.
+pub const JIT_TYPE_STATS_ROW_BYTES: u32 = std::mem::size_of::<otter_gc::TypeStats>() as u32;
+/// Offset of a statistics row's live-byte counter.
+pub const JIT_TYPE_STATS_LIVE_BYTES_OFFSET: u32 =
+    std::mem::offset_of!(otter_gc::TypeStats, live_bytes) as u32;
+/// Offset of a statistics row's allocation counter.
+pub const JIT_TYPE_STATS_ALLOC_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(otter_gc::TypeStats, alloc_count_total) as u32;
+/// Offset of a statistics row's allocated-byte counter.
+pub const JIT_TYPE_STATS_ALLOC_BYTES_OFFSET: u32 =
+    std::mem::offset_of!(otter_gc::TypeStats, alloc_bytes_total) as u32;
+
 /// Byte offset of the linear allocation buffer's `top` address, derived on
 /// the VM side so the backend does not depend directly on the collector.
 pub const JIT_LAB_TOP_OFFSET: u32 = otter_gc::LAB_TOP_OFFSET;
@@ -416,6 +561,13 @@ pub struct JitCompileSnapshot {
     /// Constructor `StoreProperty` sites with a pre-reserved, guarded hidden
     /// class transition, keyed by byte-PC.
     pub constructor_field_transitions: rustc_hash::FxHashMap<u32, JitConstructorFieldTransition>,
+    /// Inline `CreateContext` plans keyed by `(function id, scope index)` —
+    /// for this function and every body inlined into it.
+    pub context_allocations: rustc_hash::FxHashMap<(u32, u32), JitContextAllocationPlan>,
+    /// Inline `MakeClosure` / `MakeFunction` plans of this function, keyed by
+    /// byte-PC. A site without a plan (a generator or async function) takes
+    /// the allocating runtime entry.
+    pub closure_allocations: rustc_hash::FxHashMap<u32, JitClosureAllocationPlan>,
     /// Typed reasons observed at each logical PC in earlier optimized
     /// generations. The reason identity remains available to later policy and
     /// lowering instead of collapsing distinct failures into a PC-only bit.
@@ -779,7 +931,6 @@ pub enum JitMethodHolder {
     /// hidden class.
     Dictionary(u64),
 }
-
 
 /// One `Op::CallMethodValue` site whose callee is a declared native entry.
 ///
@@ -1693,6 +1844,8 @@ impl JitCompileSnapshot {
             property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             constructor_field_transitions: rustc_hash::FxHashMap::default(),
+            context_allocations: rustc_hash::FxHashMap::default(),
+            closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
@@ -2441,7 +2594,10 @@ mod layout_tests {
             std::mem::offset_of!(JitClosureCallLayout, learned_instance_fields_byte),
             std::mem::offset_of!(JitClosureCallLayout, last_instance_byte),
         ];
-        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]);
+        assert_eq!(
+            fields,
+            [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]
+        );
     }
 
     #[test]

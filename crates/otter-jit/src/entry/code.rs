@@ -76,7 +76,7 @@ pub(crate) unsafe fn enter_compiled(
         let activation_limit = unsafe { (*vm).jit_generated_activation_limit() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let marking_flag = unsafe { (*vm).jit_marking_flag_ptr() };
-        let receiver_alloc = unsafe { (*vm).jit_receiver_allocation_window() };
+        let alloc_window = unsafe { (*vm).jit_allocation_window() };
         let runtime_stats = unsafe { (*vm).jit_runtime_stats_mut_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
@@ -138,7 +138,7 @@ pub(crate) unsafe fn enter_compiled(
             activation_top_ptr,
             activation_limit,
             machine_roots_ptr,
-            receiver_alloc,
+            alloc_window,
             runtime_stats,
             global_this_offset,
             native_stack_limit,

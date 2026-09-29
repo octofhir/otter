@@ -106,10 +106,10 @@ pub use descriptor::{
 };
 pub(crate) use key_order::array_index_property_name;
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
-pub(crate) use shape_body::{SHAPE_BODY_ID_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET};
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
+pub(crate) use shape_body::{SHAPE_BODY_ID_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET};
 pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
@@ -2323,13 +2323,17 @@ impl ObjectBody {
         }
         // SAFETY: a non-null handle names a live sidecar payload.
         exotic_body_of(self.exotic.get())
-            .map_or(0, |exotic| unsafe { (*exotic).dictionary_slot_count } as usize)
+            .map_or(0, |exotic| unsafe { (*exotic).dictionary_slot_count }
+                as usize)
     }
 
     /// Set a dictionary-mode object's slot count.
     #[inline]
     fn set_dictionary_slot_count(&mut self, count: usize) {
-        debug_assert!(self.shape.is_null(), "a shaped object's count is its shape's");
+        debug_assert!(
+            self.shape.is_null(),
+            "a shaped object's count is its shape's"
+        );
         self.exotic_mut().dictionary_slot_count =
             u32::try_from(count).expect("slot count exceeds u32");
     }
@@ -3424,7 +3428,11 @@ pub(crate) fn install_fresh_shape_with_slots(
         return;
     }
     heap.with_payload(obj, |body| {
-        debug_assert_eq!(body.slot_count(), 0, "shape install requires a fresh object");
+        debug_assert_eq!(
+            body.slot_count(),
+            0,
+            "shape install requires a fresh object"
+        );
         let base = body.values_base();
         for (index, &value) in stored.iter().enumerate() {
             // SAFETY: the reservation above made room for every index.
@@ -3568,8 +3576,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object =
-        alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
+    let object = alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Untraced(Box::new(data)));
         true
@@ -3597,8 +3604,7 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object =
-        alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
+    let object = alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
     // The sidecar is an old-space body from birth, so the host slots just
     // installed never crossed the mutator write barrier. Record each
     // child edge now, or an old(sidecar)→young(child) reference is

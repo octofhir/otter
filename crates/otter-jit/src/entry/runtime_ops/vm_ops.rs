@@ -356,7 +356,7 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
             machine_roots_ptr: std::ptr::null_mut(),
-            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
         let mut cell = PropertySourceCell::default();
@@ -415,7 +415,7 @@ mod tests {
             native_stack_limit: 0,
             generated_feedback_clean: 1,
             machine_roots_ptr: std::ptr::null_mut(),
-            receiver_alloc: otter_vm::jit::JitMachineAllocationWindow::disabled(),
+            alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
         let packet = [Value::number_i32(7), Value::number_i32(11)];

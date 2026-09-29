@@ -1,8 +1,9 @@
 //! Explicit fast/cold CFG for committed operations with a generated probe.
 //!
 //! # Contents
-//! - [`expand`] splits derived-this, loose-equality, `instanceof` and generic
-//!   binary-operator and activation-arguments calls before allocation.
+//! - [`expand`] splits derived-this, loose-equality, `instanceof`, generic
+//!   binary-operator, activation-arguments and closure-creation calls before
+//!   allocation.
 //!
 //! # Invariants
 //! - Each probe owns its complete no-call proof and reports whether it finished.
@@ -40,6 +41,9 @@ pub(super) enum ProbeKind {
     BinaryNumber {
         operator: otter_vm::native_abi::BinaryOperator,
     },
+    Closure {
+        with_context: bool,
+    },
 }
 
 pub(super) fn expand(
@@ -74,9 +78,9 @@ pub(super) fn expand(
                 };
                 let kind = *sites.get(&index)?;
                 let expected = match kind {
-                    ProbeKind::DerivedThis | ProbeKind::Arguments { .. } => {
-                        otter_vm::native_abi::STUB_JIT_SCALAR_VALUE
-                    }
+                    ProbeKind::DerivedThis
+                    | ProbeKind::Arguments { .. }
+                    | ProbeKind::Closure { .. } => otter_vm::native_abi::STUB_JIT_SCALAR_VALUE,
                     ProbeKind::LooseEquality { .. }
                     | ProbeKind::Instanceof
                     | ProbeKind::BinaryNumber { .. } => {
@@ -102,6 +106,7 @@ pub(super) fn expand(
                 != match kind {
                     ProbeKind::DerivedThis => 1,
                     ProbeKind::Arguments { element } => usize::from(element),
+                    ProbeKind::Closure { with_context } => usize::from(with_context),
                     ProbeKind::LooseEquality { .. }
                     | ProbeKind::Instanceof
                     | ProbeKind::BinaryNumber { .. } => 2,
@@ -241,6 +246,28 @@ pub(super) fn expand(
                             MachineOperand::register_output(fast_result),
                             MachineOperand::register_output(condition),
                         ],
+                    );
+                    probe.clobbers = target_spec
+                        .clobbers(TargetClobberSet::PropertyLoad)
+                        .to_vec();
+                    bodies[current].push(probe);
+                }
+                ProbeKind::Closure { with_context } => {
+                    let mut operands: Vec<_> = inputs
+                        .iter()
+                        .copied()
+                        .map(MachineOperand::register_input)
+                        .collect();
+                    operands.extend([
+                        MachineOperand::register_output(fast_result),
+                        MachineOperand::register_output(condition),
+                    ]);
+                    let mut probe = MachineInstruction::plain(
+                        MachineOpcode::ClosureAllocationProbe {
+                            byte_pc,
+                            with_context,
+                        },
+                        operands,
                     );
                     probe.clobbers = target_spec
                         .clobbers(TargetClobberSet::PropertyLoad)

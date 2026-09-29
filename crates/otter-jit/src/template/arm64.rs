@@ -657,6 +657,14 @@ fn compile_with_reach(
                 emit_store_reg(&mut ops, 0, dst)?;
             }
             TemplateOp::MakeFunction { dst, constant } => {
+                let done = ops.new_dynamic_label();
+                if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
+                    let slow = ops.new_dynamic_label();
+                    emit_load_u64(&mut ops, 15, VALUE_UNDEFINED);
+                    crate::arm64::allocation::emit_closure(&mut ops, view, plan, 20, 21, slow);
+                    emit_store_reg(&mut ops, 16, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
+                }
                 transitions::emit_make_function(
                     &mut ops,
                     &mut relocations,
@@ -666,12 +674,21 @@ fn compile_with_reach(
                     threw,
                     fatal,
                 );
+                dynasm!(ops ; .arch aarch64 ; =>done);
             }
             TemplateOp::MakeClosure {
                 dst,
                 function,
                 context,
             } => {
+                let done = ops.new_dynamic_label();
+                if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
+                    let slow = ops.new_dynamic_label();
+                    emit_load_reg(&mut ops, 15, context)?;
+                    crate::arm64::allocation::emit_closure(&mut ops, view, plan, 20, 21, slow);
+                    emit_store_reg(&mut ops, 16, dst)?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
+                }
                 transitions::emit_make_closure(
                     &mut ops,
                     &mut relocations,
@@ -683,6 +700,7 @@ fn compile_with_reach(
                     threw,
                     fatal,
                 );
+                dynasm!(ops ; .arch aarch64 ; =>done);
             }
             TemplateOp::LoadRegExp { dst, constant } => {
                 transitions::emit_load_regexp(

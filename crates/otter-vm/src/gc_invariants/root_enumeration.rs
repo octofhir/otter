@@ -127,6 +127,7 @@ fn context_root_survives_force_gc() {
         scope_function_id: 0,
         scope_index: 0,
         slot_count,
+        has_extension: true,
     };
     let outer = context::alloc_context_with_roots(
         interp.gc_heap_mut(),

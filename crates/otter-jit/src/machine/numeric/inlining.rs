@@ -770,6 +770,10 @@ fn map_body_node(
         },
         TaggedStrictEqual(left, right) => TaggedStrictEqual(map(left), map(right)),
         TaggedToBoolean(value) => TaggedToBoolean(map(value)),
+        TaggedTestTypeOf { value, test } => TaggedTestTypeOf {
+            value: map(value),
+            test,
+        },
         InlineConstructGuard {
             source,
             function_id,

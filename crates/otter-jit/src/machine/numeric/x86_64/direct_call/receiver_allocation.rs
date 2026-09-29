@@ -2,12 +2,15 @@
 //!
 //! # Contents
 //! - Live `new.target` and prototype-chain guards.
-//! - Fully initialized unpublished object construction in the active nursery.
+//! - Fully initialized unpublished object construction at the heap's linear
+//!   allocation buffer `top`.
 //! - Separate candidate probing and atomic bump publication for Machine SSA.
 //! - Allocator/statistics accounting shared by direct calls and SSA effects.
 //!
 //! # Invariants
-//! - Every guard and capacity miss occurs before the nursery bump moves.
+//! - Every guard and capacity miss occurs before the buffer bump moves.
+//! - The heap empties its buffer whenever marking, stress, tenuring or a heap
+//!   cap needs the rooted path, so the bump is the only collector test.
 //! - Header, the whole fixed body, and the initial in-object slots are
 //!   initialized before publication makes the object visible to the collector.
 //! - Closure prototype observations require the VM-owned live weak sample.
@@ -69,7 +72,6 @@ fn emit_receiver_candidate(
     let closure = ops.new_dynamic_label();
     let prototype_ready = ops.new_dynamic_label();
     let target_ready = ops.new_dynamic_label();
-    let capacity_ready = ops.new_dynamic_label();
 
     // A JS cell is an aligned cage address with none of the immediate tag bits.
     dynasm!(ops ; .arch x64 ; test rdx, rdx ; jz =>guard_miss);
@@ -136,8 +138,15 @@ fn emit_receiver_candidate(
         ; cmp DWORD [rdx + view.closure_call_layout.function_id_byte as i32], plan.new_target_function_id as i32
         ; jne =>guard_miss
     );
+    // The learned size, the bag and the prototype slot proof live in the
+    // closure's rare record (`rcx`, free until the nursery reservation); a
+    // closure without one was never prepared as a constructor.
     dynasm!(ops
         ; .arch x64
+        ; mov ecx, [rdx + view.closure_call_layout.rare_byte as i32]
+        ; test ecx, ecx
+        ; jz =>guard_miss
+        ; add rcx, r8
         ; mov r10d, [rdx + view.closure_call_layout.last_instance_byte as i32]
         ; test r10d, r10d
         ; jz =>guard_miss
@@ -146,13 +155,13 @@ fn emit_receiver_candidate(
     dynasm!(ops
         ; .arch x64
         ; movzx r10d, WORD [r9 + view.object_slab_len_byte as i32]
-        ; movzx r11d, WORD [rdx + view.closure_call_layout.learned_instance_fields_byte as i32]
+        ; movzx r11d, WORD [rcx + view.closure_call_layout.learned_instance_fields_byte as i32]
         ; cmp r10d, r11d
         ; cmova r11d, r10d
         ; cmp r11d, i32::from(plan.inline_capacity)
         ; ja =>guard_miss
-        ; mov [rdx + view.closure_call_layout.learned_instance_fields_byte as i32], r11w
-        ; mov r10d, [rdx + view.closure_call_layout.own_props_byte as i32]
+        ; mov [rcx + view.closure_call_layout.learned_instance_fields_byte as i32], r11w
+        ; mov r10d, [rcx + view.closure_call_layout.own_props_byte as i32]
         ; test r10d, r10d
         ; jz =>guard_miss
         ; lea r9, [r8 + r10]
@@ -163,7 +172,7 @@ fn emit_receiver_candidate(
     );
     dynasm!(ops
         ; .arch x64
-        ; mov r10d, [rdx + view.closure_call_layout.prototype_shape_byte as i32]
+        ; mov r10d, [rcx + view.closure_call_layout.prototype_shape_byte as i32]
         ; test r10d, r10d
         ; jz =>guard_miss
     );
@@ -174,7 +183,7 @@ fn emit_receiver_candidate(
     );
     dynasm!(ops
         ; .arch x64
-        ; mov r10d, [rdx + view.closure_call_layout.prototype_slot_byte as i32]
+        ; mov r10d, [rcx + view.closure_call_layout.prototype_slot_byte as i32]
         ; movzx r11d, WORD [r9 + view.object_slab_len_byte as i32]
         ; cmp r10d, r11d
         ; jae =>guard_miss
@@ -240,33 +249,16 @@ fn emit_receiver_candidate(
         dynasm!(ops ; .arch x64 ; test r10d, r10d ; jnz =>guard_miss);
     }
 
-    // The collector withdraws this window during marking or refill. All
-    // capacity and heap-limit checks precede writes and bump publication.
+    // Only a complete cell fit below the buffer limit may mutate the nursery.
+    // `rcx` keeps the buffer for publication; the candidate lives at `top`.
     let cell_bytes = receiver_cell_bytes(view, plan);
     dynasm!(ops
         ; .arch x64
-        ; mov r10, [r15 + THREAD_OFFSET as i32]
-        ; mov r10, [r10 + VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
-        ; cmp BYTE [r10], 0
-        ; jne =>space_miss
-        ; mov rcx, [r15 + RECEIVER_ALLOC_PAGE_OFFSET as i32]
-        ; test rcx, rcx
-        ; jz =>space_miss
-        ; cmp BYTE [rcx + PAGE_SPACE_OFFSET as i32], NEW_FROM_SPACE_KIND as i8
-        ; jne =>space_miss
-        ; mov r10, [rcx + PAGE_BUMP_CURSOR_OFFSET as i32]
-        ; lea r11, [r10 + cell_bytes as i32]
-        ; cmp r11, GC_PAGE_SIZE as i32
+        ; mov rcx, [r15 + RECEIVER_ALLOC_LAB_OFFSET as i32]
+        ; mov rax, [rcx + LAB_TOP_OFFSET as i32]
+        ; lea r11, [rax + cell_bytes as i32]
+        ; cmp r11, [rcx + LAB_LIMIT_OFFSET as i32]
         ; ja =>space_miss
-        ; lea rax, [rcx + r10]
-        ; mov r10, [r15 + RECEIVER_ALLOC_TRACKED_BYTES_OFFSET as i32]
-        ; test r10, r10
-        ; jz =>capacity_ready
-        ; mov r9, [r10]
-        ; add r9, cell_bytes as i32
-        ; cmp r9, [r15 + RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET as i32]
-        ; ja =>space_miss
-        ; =>capacity_ready
     );
 
     // Initialize the header and the whole fixed body before publishing the
@@ -313,27 +305,19 @@ fn receiver_cell_bytes(
     view.object_fixed_cell_bytes + 8 * u32::from(plan.inline_capacity)
 }
 
-/// Publish one completely initialized candidate from `rax` on page `rcx`.
+/// Publish one completely initialized candidate from `rax` in buffer `rcx`.
 ///
-/// This operation cannot miss: the candidate probe has completed every
-/// collector, capacity, and heap-limit proof without a safepoint or reentry.
-/// The cell size is read back from the candidate's header, which the
-/// candidate wrote from its plan. Clobbers `r10` and `r11`.
+/// This operation cannot miss: the candidate probe proved the buffer bump
+/// without a safepoint or reentry, and the heap charged the buffer to any cap
+/// when it was carved. The cell size is read back from the candidate's
+/// header, which the candidate wrote from its plan. Clobbers `r10` and `r11`.
 fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot) {
     let observation_done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
         ; mov r10d, [rax + otter_vm::jit::JIT_GC_HEADER_SIZE_BYTES_OFFSET as i32]
-        ; mov r11, rax
-        ; sub r11, rcx
-        ; add r11, r10
-        ; mov [rcx + PAGE_BUMP_CURSOR_OFFSET as i32], r11
-        ; add [rcx + PAGE_ALLOCATED_BYTES_OFFSET as i32], r10
-        ; mov r11, [r15 + RECEIVER_ALLOC_TRACKED_BYTES_OFFSET as i32]
-        ; test r11, r11
-        ; jz >tracked_done
-        ; add [r11], r10
-        ; tracked_done:
+        ; lea r11, [rax + r10]
+        ; mov [rcx + LAB_TOP_OFFSET as i32], r11
     );
     for pointer_offset in [
         RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET,
@@ -360,7 +344,7 @@ fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot) {
 /// Complete the allocation half of a Machine receiver probe.
 ///
 /// `rdx` is the live new.target input. A hit returns the initialized,
-/// unpublished receiver in `rax` and its page in `rcx`; either pre-effect miss
+/// unpublished receiver in `rax` and its allocation buffer in `rcx`; either pre-effect miss
 /// returns undefined in `rax` and zero in `rcx`.
 pub(in crate::machine::numeric) fn emit_receiver_candidate_probe(
     ops: &mut Assembler,

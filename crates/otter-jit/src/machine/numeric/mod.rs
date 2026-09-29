@@ -2709,6 +2709,49 @@ fn select_with_loop_entries(
                     call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
                     call
                 }
+                NumericNode::TaggedTestTypeOf { value, test } => {
+                    let value = tagged_call_argument(
+                        hir,
+                        &values,
+                        &mut representations,
+                        &mut instructions,
+                        value,
+                    );
+                    let test_word = push_value(&mut representations, MachineRepresentation::Tagged);
+                    instructions.push(MachineInstruction::plain(
+                        // Boxed as an int32 so no safepoint ever reads the
+                        // test word as a cell; the leaf takes its low 32 bits.
+                        MachineOpcode::TaggedConstant(
+                            otter_vm::Value::number_i32(test as i32).to_bits(),
+                        ),
+                        vec![MachineOperand::register_output(test_word)],
+                    ));
+                    let descriptor_index = intern_leaf_boolean_call_descriptor(
+                        target_spec,
+                        &mut call_descriptors,
+                        otter_vm::native_abi::STUB_TYPEOF_TEST_LEAF,
+                        2,
+                    );
+                    let mut call = MachineInstruction::plain(
+                        MachineOpcode::Call(descriptor_index as u32),
+                        vec![
+                            MachineOperand::fixed_register_input(
+                                value,
+                                target_spec.integer_argument(1).expect("target argument 1"),
+                            ),
+                            MachineOperand::fixed_register_input(
+                                test_word,
+                                target_spec.integer_argument(2).expect("target argument 2"),
+                            ),
+                            MachineOperand::fixed_register_output(
+                                result,
+                                target_spec.integer_result(),
+                            ),
+                        ],
+                    );
+                    call.clobbers = call_descriptors[descriptor_index].clobbers.clone();
+                    call
+                }
                 NumericNode::TaggedNullishEqual {
                     value,
                     equal,
@@ -4600,6 +4643,7 @@ fn frame_state_exits(
             | NumericNode::TaggedToInt32(..)
             | NumericNode::ClassSuperConstructor(..)
             | NumericNode::TaggedToBoolean(..)
+            | NumericNode::TaggedTestTypeOf { .. }
             | NumericNode::TaggedStrictEqual(..)
             | NumericNode::TaggedNullishEqual { .. }
             | NumericNode::TaggedStringConcat(..) => {
@@ -9554,7 +9598,6 @@ mod tests {
             let first = layout.slots_byte as usize / 8;
             let mut words = vec![0_u64; first + slots.len()].into_boxed_slice();
             words[layout.parent_byte as usize / 8] = parent;
-            words[layout.extension_byte as usize / 8] = Value::undefined().to_bits();
             words[first..].copy_from_slice(slots);
             Self(words)
         }

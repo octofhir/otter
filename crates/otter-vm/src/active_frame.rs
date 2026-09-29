@@ -1036,6 +1036,7 @@ mod tests {
                 scope_function_id: 7,
                 scope_index: 0,
                 slot_count: 1,
+                has_extension: false,
             },
             Value::undefined(),
             |_| false,

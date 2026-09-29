@@ -69,20 +69,11 @@ pub use crate::property_cache::jit::{JitPropertyLookupCache, JitStoreTransitionC
 
 /// Opaque collector-owned nursery window carried by the compiled-entry ABI.
 pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
-/// Machine allocation page-layout constants, derived on the VM side so the
-/// backend does not depend directly on the collector crate.
-pub const JIT_PAGE_SPACE_OFFSET: u32 =
-    std::mem::offset_of!(otter_gc::page::PageHeader, space) as u32;
-/// Byte offset of the nursery page's committed bump cursor.
-pub const JIT_PAGE_BUMP_CURSOR_OFFSET: u32 =
-    std::mem::offset_of!(otter_gc::page::PageHeader, bump_cursor) as u32;
-/// Byte offset of the nursery page's allocated-byte accounting word.
-pub const JIT_PAGE_ALLOCATED_BYTES_OFFSET: u32 =
-    std::mem::offset_of!(otter_gc::page::PageHeader, allocated_bytes) as u32;
-/// Machine discriminant proving a page is the active young from-space.
-pub const JIT_NEW_FROM_SPACE_KIND: u32 = otter_gc::page::SpaceKind::NewFrom as u32;
-/// Fixed regular GC page size used by the bump-limit check.
-pub const JIT_GC_PAGE_SIZE: u32 = otter_gc::page::PAGE_SIZE as u32;
+/// Byte offset of the linear allocation buffer's `top` address, derived on
+/// the VM side so the backend does not depend directly on the collector.
+pub const JIT_LAB_TOP_OFFSET: u32 = otter_gc::LAB_TOP_OFFSET;
+/// Byte offset of the linear allocation buffer's `limit` address.
+pub const JIT_LAB_LIMIT_OFFSET: u32 = otter_gc::LAB_LIMIT_OFFSET;
 /// Header flag installed on a generated young object.
 pub const JIT_GC_YOUNG_FLAG: u8 = otter_gc::header::GENERATION_YOUNG_FLAG;
 /// Byte offset of the `u32` cell size inside a GC header.
@@ -152,10 +143,11 @@ pub struct JitClosureCallLayout {
     /// Byte offset of the 8-byte [`crate::closure::ClosureCallHeader::context`]
     /// word: a context value (full heap address) or `undefined`.
     pub context_byte: u32,
-    /// Byte offset of canonical [`crate::closure::JsClosureBody::bound_this`].
+    /// Byte offset of the trailing bound `this` word, valid only while
+    /// [`Self::bound_this_flag`] is set.
     pub bound_this_byte: u32,
-    /// Byte offset of canonical
-    /// [`crate::closure::JsClosureBody::bound_new_target`].
+    /// Byte offset of the trailing bound `new.target` word, valid only while
+    /// [`Self::bound_new_target_flag`] is set.
     pub bound_new_target_byte: u32,
     /// Presence bit for canonical `bound_this`.
     pub bound_this_flag: u32,
@@ -163,15 +155,21 @@ pub struct JitClosureCallLayout {
     pub bound_new_target_flag: u32,
     /// Flags requiring the call-setup runtime stub before compiled entry.
     pub runtime_setup_flags: u32,
-    /// Byte offset of canonical closure constructor own_props state.
+    /// Byte offset of the closure's 4-byte handle to its rare record
+    /// ([`crate::closure_construct::ClosureRareBody`]); zero means none.
+    pub rare_byte: u32,
+    /// Byte offset of the own-property bag handle, from the decompressed
+    /// rare-record pointer.
     pub own_props_byte: u32,
-    /// Byte offset of canonical closure constructor prototype_shape state.
+    /// Byte offset of the prototype-slot proof's bag shape, from the rare
+    /// record.
     pub prototype_shape_byte: u32,
-    /// Byte offset of canonical closure constructor prototype_slot state.
+    /// Byte offset of the prototype-slot proof's slot index, from the rare
+    /// record.
     pub prototype_slot_byte: u32,
-    /// Byte offset of canonical closure constructor learned_instance_fields state.
+    /// Byte offset of the `u16` learned instance size, from the rare record.
     pub learned_instance_fields_byte: u32,
-    /// Byte offset of canonical closure constructor last_instance state.
+    /// Byte offset of the last-receiver observation, from the closure.
     pub last_instance_byte: u32,
 }
 
@@ -215,6 +213,45 @@ pub struct JitReceiverAllocationPlan {
     /// Complete nearest-first ordinary prototype chain.
     pub prototype_shapes: [u32; JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
 }
+
+/// Where generated code reads `typeof` from a cell's GC type tag. A tag
+/// listed as `slow_*` needs the heap-aware leaf (a callable plain object, a
+/// native function that may be `[[IsHTMLDDA]]`, a proxy, an internal body);
+/// every other cell tag not listed is `"object"`.
+#[derive(Debug, Clone, Copy)]
+pub struct JitTypeOfTags {
+    /// `"string"` cells.
+    pub string: u8,
+    /// `"symbol"` cells.
+    pub symbol: u8,
+    /// `"bigint"` cells.
+    pub bigint: u8,
+    /// Always-callable cells: closures, bound functions, class constructors.
+    pub functions: [u8; 3],
+    /// Plain objects: `"object"` unless their sidecar carries a native call.
+    pub plain_object: u8,
+    /// Cells the leaf decides.
+    pub slow: [u8; 4],
+}
+
+/// The GC type tags behind `typeof`, for inline type tests.
+pub const JIT_TYPEOF_TAGS: JitTypeOfTags = JitTypeOfTags {
+    string: crate::string::JS_STRING_BODY_TYPE_TAG,
+    symbol: crate::symbol::SYMBOL_BODY_TYPE_TAG,
+    bigint: crate::bigint::BIG_INT_BODY_TYPE_TAG,
+    functions: [
+        crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+        crate::bound_function::BOUND_FUNCTION_BODY_TYPE_TAG,
+        crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
+    ],
+    plain_object: crate::object::OBJECT_BODY_TYPE_TAG,
+    slow: [
+        crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG,
+        crate::proxy::PROXY_BODY_TYPE_TAG,
+        crate::context::CONTEXT_BODY_TYPE_TAG,
+        crate::eval_env::EVAL_EXTENSION_BODY_TYPE_TAG,
+    ],
+};
 
 /// `[[Extensible]]` bit of an ordinary object's flag byte.
 pub const JIT_OBJECT_FLAG_EXTENSIBLE: u8 = crate::object::ObjectFlags::EXTENSIBLE;
@@ -262,7 +299,7 @@ pub(crate) struct JitConstructorFieldTransitionPlan {
     pub(crate) slot: u16,
 }
 
-const _: [(); 52] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 56] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -276,8 +313,8 @@ const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setu
 /// Machine-readable [`crate::context::ContextBody`] layout.
 ///
 /// Every byte offset is measured from the cell's [`otter_gc::GcHeader`] — a
-/// heap `Value` is the header's full address, so `parent`, `extension`, and a
-/// closure's context word are each one 8-byte load away from the next hop.
+/// heap `Value` is the header's full address, so `parent` and a closure's
+/// context word are each one 8-byte load away from the next hop.
 /// Slot `i` of a context is at `slots_byte + 8 * i`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -292,9 +329,6 @@ pub struct JitContextLayout {
     pub slot_count_byte: u32,
     /// Byte offset of the 8-byte parent word (context value or `undefined`).
     pub parent_byte: u32,
-    /// Byte offset of the 8-byte eval-extension word (extension value or
-    /// `undefined`). Mutable: a direct eval may install it at any call.
-    pub extension_byte: u32,
     /// Byte offset of slot 0.
     pub slots_byte: u32,
 }
@@ -311,7 +345,6 @@ impl JitContextLayout {
             scope_index_byte: header + crate::context::CONTEXT_BODY_SCOPE_INDEX_OFFSET as u32,
             slot_count_byte: header + crate::context::CONTEXT_BODY_SLOT_COUNT_OFFSET as u32,
             parent_byte: header + crate::context::CONTEXT_BODY_PARENT_OFFSET as u32,
-            extension_byte: header + crate::context::CONTEXT_BODY_EXTENSION_OFFSET as u32,
             slots_byte: header + crate::context::CONTEXT_BODY_SLOTS_OFFSET as u32,
         }
     }
@@ -2384,7 +2417,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 52);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 56);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -2395,13 +2428,14 @@ mod layout_tests {
             std::mem::offset_of!(JitClosureCallLayout, bound_this_flag),
             std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag),
             std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
+            std::mem::offset_of!(JitClosureCallLayout, rare_byte),
             std::mem::offset_of!(JitClosureCallLayout, own_props_byte),
             std::mem::offset_of!(JitClosureCallLayout, prototype_shape_byte),
             std::mem::offset_of!(JitClosureCallLayout, prototype_slot_byte),
             std::mem::offset_of!(JitClosureCallLayout, learned_instance_fields_byte),
             std::mem::offset_of!(JitClosureCallLayout, last_instance_byte),
         ];
-        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]);
+        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]);
     }
 
     #[test]
@@ -2413,8 +2447,7 @@ mod layout_tests {
         assert_eq!(layout.scope_index_byte, header + 4);
         assert_eq!(layout.slot_count_byte, header + 6);
         assert_eq!(layout.parent_byte, header + 8);
-        assert_eq!(layout.extension_byte, header + 16);
-        assert_eq!(layout.slots_byte, header + 24);
+        assert_eq!(layout.slots_byte, header + 16);
     }
 
     #[test]

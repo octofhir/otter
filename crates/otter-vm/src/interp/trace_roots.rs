@@ -165,7 +165,26 @@ impl Interpreter {
         // in a table keyed by the shared bytecode template id.
         if let Some(closure) = value.as_closure(&self.gc_heap) {
             match proto {
-                Some(proto) => closure.set_proto_override(&mut self.gc_heap, proto),
+                Some(proto) => {
+                    // The override lives in the closure's rare record; its
+                    // allocation roots the closure and the new prototype.
+                    let mut closure_value = Value::closure(closure);
+                    let mut proto = proto;
+                    let proto_slot: *mut Value = &mut proto;
+                    let rooted = {
+                        // SAFETY: the local outlives the call.
+                        let proto_ref = unsafe { &*proto_slot };
+                        self.ensure_closure_rare(None, &mut closure_value, &[proto_ref])
+                    };
+                    if rooted.is_err() {
+                        return;
+                    }
+                    // SAFETY: an initialized local the collector rewrote.
+                    let proto = unsafe { std::ptr::read_volatile(proto_slot) };
+                    if let Some(closure) = closure_value.as_closure(&self.gc_heap) {
+                        closure.set_proto_override(&mut self.gc_heap, proto);
+                    }
+                }
                 None => closure.clear_proto_override(&mut self.gc_heap),
             }
             return;

@@ -282,6 +282,9 @@ pub(super) fn compile(
                 rhs,
                 negate,
             } => emit_loose_compare(&mut ops, dst, lhs, rhs, negate, type_mismatch),
+            TemplateOp::TestTypeOf { dst, src, test } => {
+                emit_test_typeof(&mut ops, &mut relocations, dst, src, test, type_mismatch)
+            }
             TemplateOp::IntBitwise {
                 dst,
                 lhs,
@@ -2158,6 +2161,38 @@ fn emit_compare(
     emit_load_u64(ops, 0, VALUE_FALSE);
     dynasm!(ops ; .arch x64 ; =>done);
     emit_store_reg(ops, 0, dst);
+}
+
+/// `r<dst> = (typeof r<src> === kind)` through the leaf `(heap, value, test)`
+/// probe; its only miss is a null heap, which exits to `bail`.
+fn emit_test_typeof(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    dst: u16,
+    src: u16,
+    test: i32,
+    bail: DynamicLabel,
+) {
+    emit_load_reg(ops, 6, src);
+    emit_load_u64(ops, 2, u64::from(test as u32));
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, [r15 + THREAD_OFFSET as i32]
+        ; mov rdi, [rdi + VM_THREAD_GC_HEAP_OFFSET as i32]
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        otter_vm::runtime_stubs::TYPEOF_TEST_LEAF.entry_addr() as u64,
+        abi::STUB_TYPEOF_TEST_LEAF,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rdx, rdx
+        ; jne =>bail
+        ; mov [r13 + i32::from(dst) * 8], rax
+    );
 }
 
 fn emit_loose_compare(

@@ -476,6 +476,7 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         | N::BoxTagged(value)
         | N::ArrayConstruct { length: value, .. }
         | N::TaggedToBoolean(value)
+        | N::TaggedTestTypeOf { value, .. }
         | N::WidenInt32(value)
         | N::WidenUint32(value)
         | N::FloatToInt32(value)
@@ -673,6 +674,7 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         | N::ConstructReceiverHit(value)
         | N::BoxTagged(value)
         | N::TaggedToBoolean(value)
+        | N::TaggedTestTypeOf { value, .. }
         | N::WidenInt32(value)
         | N::WidenUint32(value)
         | N::FloatToInt32(value)

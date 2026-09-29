@@ -361,6 +361,99 @@ pub(crate) fn emit_slab_base(
     );
 }
 
+/// Classify `X(value)` into its `typeof` kind code
+/// ([`otter_bytecode::TypeOfKind`] discriminant) in `W(out)`, branching to
+/// `slow` for the cells only the heap can decide: a plain object whose
+/// sidecar may carry a native `[[Call]]`, a native function that may be
+/// `[[IsHTMLDDA]]`, a proxy, or an internal body. Numbers, immediates and
+/// every other cell resolve from the value bits and the GC type tag (V8's
+/// `TestTypeOf` lowering). Clobbers `W(scratch)`.
+pub(crate) fn emit_typeof_kind(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    value: u8,
+    out: u8,
+    scratch: u8,
+    slow: DynamicLabel,
+) {
+    use otter_bytecode::TypeOfKind as K;
+    use otter_vm::value::tag;
+    let tags = otter_vm::jit::JIT_TYPEOF_TAGS;
+    let done = ops.new_dynamic_label();
+    let not_number = ops.new_dynamic_label();
+    let immediate = ops.new_dynamic_label();
+    let plain_object = ops.new_dynamic_label();
+    let object = ops.new_dynamic_label();
+    let function = ops.new_dynamic_label();
+    let undefined = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; tst X(value), tag::NUMBER_TAG
+        ; b.eq =>not_number
+        ; movz W(out), K::Number as u32
+        ; b =>done
+        ; =>not_number
+        ; tst X(value), tag::OTHER_TAG
+        ; b.ne =>immediate
+        ; cbz X(value), =>slow
+        ; ldrb W(scratch), [X(value)]
+        ; cmp WSP(scratch), u32::from(tags.plain_object)
+        ; b.eq =>plain_object
+        ; cmp WSP(scratch), u32::from(tags.string)
+        ; b.ne >not_string
+        ; movz W(out), K::String as u32
+        ; b =>done
+        ; not_string:
+    );
+    for tag_byte in tags.functions {
+        dynasm!(ops ; .arch aarch64 ; cmp WSP(scratch), u32::from(tag_byte) ; b.eq =>function);
+    }
+    for tag_byte in tags.slow {
+        dynasm!(ops ; .arch aarch64 ; cmp WSP(scratch), u32::from(tag_byte) ; b.eq =>slow);
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp WSP(scratch), u32::from(tags.symbol)
+        ; b.ne >not_symbol
+        ; movz W(out), K::Symbol as u32
+        ; b =>done
+        ; not_symbol:
+        ; cmp WSP(scratch), u32::from(tags.bigint)
+        ; b.ne =>object
+        ; movz W(out), K::BigInt as u32
+        ; b =>done
+        ; =>plain_object
+        ; ldr W(scratch), [X(value), view.object_exotic_handle_byte]
+        ; cbnz W(scratch), =>slow
+        ; =>object
+        ; movz W(out), K::Object as u32
+        ; b =>done
+        ; =>function
+        ; movz W(out), K::Function as u32
+        ; b =>done
+        ; =>immediate
+        ; cmp XSP(value), tag::VALUE_UNDEFINED as u32
+        ; b.eq =>undefined
+        ; cmp XSP(value), tag::VALUE_HOLE as u32
+        ; b.eq =>undefined
+        ; cmp XSP(value), tag::VALUE_NULL as u32
+        ; b.eq =>object
+        ; and XSP(scratch), X(value), 0xffff_ffff_ffff_fffe
+        ; cmp XSP(scratch), tag::VALUE_FALSE as u32
+        ; b.ne >not_boolean
+        ; movz W(out), K::Boolean as u32
+        ; b =>done
+        ; not_boolean:
+        ; and XSP(scratch), X(value), 0xffff
+        ; cmp XSP(scratch), tag::FUNCTION_ID_TAG as u32
+        ; b.eq =>function
+        ; b =>slow
+        ; =>undefined
+        ; movz W(out), K::Undefined as u32
+        ; =>done
+    );
+}
+
 /// Branch to `exit` when `X(value)` is the one cell kind whose loose equality
 /// with `null`/`undefined` its tag does not decide.
 ///

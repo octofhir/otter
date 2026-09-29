@@ -44,7 +44,7 @@ use crate::native_abi::{
     STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
     STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
     STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_STARTS_WITH_LEAF,
-    STUB_TO_BOOLEAN_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
+    STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord, TaggedLocationKind,
     validate_stub_descriptor,
 };
 use crate::rooting::RootScopeExt;
@@ -651,6 +651,12 @@ pub const TO_BOOLEAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: to_boolean_leaf,
 };
 
+/// Callable ABI entry for the fused `typeof` test.
+pub const TYPEOF_TEST_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_TYPEOF_TEST_LEAF,
+    entry: typeof_test_leaf,
+};
+
 /// Callable ABI entry for the numeric-remainder probe.
 pub const NUMBER_REM_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_NUMBER_REM_LEAF,
@@ -861,6 +867,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
         id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
+        id if id == STUB_TYPEOF_TEST_LEAF.id => Some(TYPEOF_TEST_LEAF),
         id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
         id if id == STUB_STRING_CHAR_CODE_AT_LEAF.id => Some(STRING_CHAR_CODE_AT_LEAF),
         id if id == STUB_STRING_CODE_POINT_AT_LEAF.id => Some(STRING_CODE_POINT_AT_LEAF),
@@ -1377,6 +1384,27 @@ pub extern "C" fn to_boolean_leaf(
     let value = Value::from_abi_bits(value_bits);
     let truthy = value.to_boolean(heap);
     NativeResultPair::success(Value::boolean(truthy))
+}
+
+/// `typeof value === kind` (or its negation) for an `Op::TestTypeOf`
+/// immediate: the cases generated code cannot decide from the value bits and
+/// the cell's type tag alone (a callable plain object, a native function
+/// that may be `[[IsHTMLDDA]]`, a proxy).
+#[must_use]
+pub extern "C" fn typeof_test_leaf(
+    heap: *const otter_gc::GcHeap,
+    value_bits: u64,
+    test_word: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let Some(test) = otter_bytecode::TypeOfTest::decode(test_word as u32 as i32) else {
+        return NativeResultPair::miss();
+    };
+    let kind = Value::from_abi_bits(value_bits).typeof_kind_with_heap(heap);
+    NativeResultPair::success(Value::boolean((kind == test.kind) != test.negate))
 }
 
 /// Full f64 remainder over two operand words already guarded to be numbers

@@ -203,58 +203,19 @@ pub(crate) fn compile_unary(
         cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
         return Ok(dst);
     }
-    // §13.5.3 `typeof Identifier` — IsUnresolvableReference
-    // returns `"undefined"` rather than throwing
-    // ReferenceError. Re-route the global-fallback step to
-    // `LoadGlobalOrUndefined` so an unbound free identifier
-    // never throws under `typeof`.
-    // <https://tc39.es/ecma262/#sec-typeof-operator>
-    // §13.5.3 — parentheses preserve the Reference, so
-    // `typeof (x)` is the identifier form too.
-    let mut typeof_arg = &u.argument;
-    while let Expression::ParenthesizedExpression(p) = typeof_arg {
-        typeof_arg = &p.expression;
-    }
-    if matches!(u.operator, UnaryOperator::Typeof)
-        && let Expression::Identifier(id) = typeof_arg
-    {
-        let name = id.name.as_str();
-        let reference = cx.resolve_ref(name);
-        if matches!(reference, crate::compiler::NameRef::Global(_))
-            && find_module_import_binding(cx, name).is_none()
-            && !is_builtin_error_class_name(name)
-            && name != "NaN"
-            && name != "Infinity"
-            && name != "undefined"
-        {
-            let value_reg = cx.alloc_scratch();
-            // §9.1.1.2.1 — an enclosing `with` environment shadows the
-            // global fallback; probe it first so `typeof name` sees
-            // the with-object's property.
-            let active_with_envs = cx.active_with_envs.clone();
-            let probe =
-                crate::with_statement::emit_with_binding_probe(cx, name, &active_with_envs, span)?;
-            let mut with_done = None;
-            if let Some(probe) = &probe {
-                let fallback =
-                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
-                cx.emit_load_property(value_reg, probe.object_reg, name, span);
-                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
-                cx.patch_branch_to_here(fallback);
-            }
-            // An eval-created `var` shadows the global fallback.
-            cx.emit_name_load(value_reg, name, &reference, true, span);
-            if let Some(done) = with_done {
-                cx.patch_branch_to_here(done);
-            }
-            let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::TypeOf,
-                [Operand::Register(dst), Operand::Register(value_reg)],
-                span,
-            );
-            return Ok(dst);
-        }
+    // §13.5.3 `typeof` — the operand is evaluated with `typeof`'s own
+    // unresolvable-reference rule (see [`typeof_operand`]).
+    if matches!(u.operator, UnaryOperator::Typeof) {
+        let mark = cx.scratch;
+        let value = typeof_operand(cx, u, span)?;
+        cx.reset_scratch(mark);
+        let dst = distinct_result_register(cx, value);
+        cx.emit(
+            Op::TypeOf,
+            [Operand::Register(dst), Operand::Register(value)],
+            span,
+        );
+        return Ok(dst);
     }
     // `-<numeric literal>` is notation for the negated number, not a runtime
     // operation: the operand needs no coercion and `Neg` cannot be observed.
@@ -313,6 +274,71 @@ pub(crate) fn compile_unary(
         span,
     );
     Ok(dst)
+}
+
+/// Evaluate a `typeof` operand into a register.
+///
+/// §13.5.3 — `typeof Identifier` on an unresolvable reference yields
+/// `"undefined"` rather than throwing ReferenceError, so the global-fallback
+/// step becomes `LoadGlobalOrUndefined` and an unbound free identifier never
+/// throws under `typeof`. Parentheses preserve the Reference, so `typeof (x)`
+/// is the identifier form too. Shared by `typeof` itself and by the fused
+/// `typeof x === "kind"` test.
+///
+/// <https://tc39.es/ecma262/#sec-typeof-operator>
+pub(crate) fn typeof_operand(
+    cx: &mut Compiler,
+    u: &UnaryExpression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let mut typeof_arg = &u.argument;
+    while let Expression::ParenthesizedExpression(p) = typeof_arg {
+        typeof_arg = &p.expression;
+    }
+    if let Expression::Identifier(id) = typeof_arg {
+        let name = id.name.as_str();
+        let reference = cx.resolve_ref(name);
+        if matches!(reference, crate::compiler::NameRef::Global(_))
+            && find_module_import_binding(cx, name).is_none()
+            && !is_builtin_error_class_name(name)
+            && name != "NaN"
+            && name != "Infinity"
+            && name != "undefined"
+        {
+            let value_reg = cx.alloc_scratch();
+            // §9.1.1.2.1 — an enclosing `with` environment shadows the
+            // global fallback; probe it first so `typeof name` sees
+            // the with-object's property.
+            let active_with_envs = cx.active_with_envs.clone();
+            let probe =
+                crate::with_statement::emit_with_binding_probe(cx, name, &active_with_envs, span)?;
+            let mut with_done = None;
+            if let Some(probe) = &probe {
+                let fallback =
+                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+                cx.emit_load_property(value_reg, probe.object_reg, name, span);
+                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+                cx.patch_branch_to_here(fallback);
+            }
+            // An eval-created `var` shadows the global fallback.
+            cx.emit_name_load(value_reg, name, &reference, true, span);
+            if let Some(done) = with_done {
+                cx.patch_branch_to_here(done);
+            }
+            return Ok(value_reg);
+        }
+    }
+    compile_expr(cx, &u.argument, span)
+}
+
+/// A result register distinct from `operand`: the opcode reads its operand
+/// before writing, but the optimizing tier side-exits on an aliased result.
+pub(crate) fn distinct_result_register(cx: &mut Compiler, operand: u16) -> u16 {
+    let mut candidate = cx.alloc_scratch();
+    while candidate == operand && !cx.register_overflow {
+        candidate = cx.alloc_scratch();
+    }
+    candidate
 }
 
 /// §13.5.1.2 step 5.b — emit the unconditional ReferenceError a

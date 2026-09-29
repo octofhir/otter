@@ -78,7 +78,11 @@ pub(super) fn emit(
             ; cmp w9, u32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
             ; b.ne =>miss
             // `prototype` lives in the bag once observed; without a bag it is
-            // still virtual and the committed operation materializes it.
+            // still virtual and the committed operation materializes it. The
+            // bag and its slot proof live in the rare record (`x16` from here).
+            ; ldr w13, [x16, layout.rare_byte]
+            ; cbz w13, =>miss
+            ; add x16, x11, x13
             ; ldr w10, [x16, layout.own_props_byte]
             ; cbz w10, =>miss
             ; add x10, x11, x10

@@ -9,11 +9,14 @@ use otter_gc::{GcHeap, OutOfMemory, init_cage_with_size};
 
 const SMALL_CAGE: usize = 16 * 1024 * 1024; // 64 pages
 
-// Use a payload bigger than LARGE_OBJECT_THRESHOLD so each Big
-// consumes its own page; cage exhaustion is then trivially
-// observable.
+// Each cell carries a trailing payload bigger than
+// LARGE_OBJECT_THRESHOLD so it consumes its own page; cage exhaustion is
+// then trivially observable. The payload trails the body instead of living
+// in it, so no 200 KiB value is moved through the allocator by value.
+const BIG_TRAILING_BYTES: usize = 200 * 1024; // > 1/2 page.
+
 struct Big {
-    _payload: [u8; 200 * 1024], // 200 KiB — > 1/2 page.
+    _length: u64,
 }
 
 impl Traceable for Big {
@@ -28,9 +31,7 @@ fn cage_exhaustion_surfaces_out_of_memory() {
     let mut heap = GcHeap::new().expect("heap");
     let mut allocations = 0;
     loop {
-        match heap.alloc(Big {
-            _payload: [0; 200 * 1024],
-        }) {
+        match heap.alloc_trailing_with_roots(Big { _length: 0 }, BIG_TRAILING_BYTES, &mut |_| {}) {
             Ok(_) => allocations += 1,
             Err(e) => {
                 assert!(matches!(e, OutOfMemory::CageExhausted));

@@ -1626,6 +1626,19 @@ impl Interpreter {
                     frame.advance_pc()?;
                     continue;
                 }
+                Op::TestTypeOf => {
+                    let dst = instr.reg(0);
+                    let src = instr.reg(1);
+                    let test = function
+                        .imm32(instr, 2)
+                        .and_then(otter_bytecode::TypeOfTest::decode)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let kind = read_register(frame, src)?.typeof_kind_with_heap(&self.gc_heap);
+                    write_register(frame, dst, Value::boolean((kind == test.kind) != test.negate))?;
+                    frame.advance_pc()?;
+                    continue;
+                }
                 Op::LoadThis => {
                     let dst = instr.reg(0);
                     let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);

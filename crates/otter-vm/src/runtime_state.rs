@@ -149,6 +149,9 @@ impl<'a> RuntimeState<'a> {
         if let Some(symbol) = interp.intl_fallback_symbol_for_trace() {
             symbol.trace_value_slots(visitor);
         }
+        for string in interp.typeof_strings_for_trace() {
+            string.trace_handle_slot(visitor);
+        }
         interp
             .well_known_symbols_for_trace()
             .trace_gc_roots(visitor);

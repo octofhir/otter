@@ -194,10 +194,12 @@ pub(crate) const VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET: u32 =
 pub(crate) const VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, global_lexical_epoch_cell) as u32;
 pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, gc_heap) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const VM_THREAD_MARKING_FLAG_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, marking_flag_cell) as u32;
 pub(crate) const VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, array_index_protector_cell) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell) as u32;
 pub(crate) const VM_THREAD_ACTIVE_REALM_CELL_OFFSET: u32 =
@@ -237,8 +239,8 @@ pub(crate) const NATIVE_STACK_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, native_stack_limit) as u32;
 pub(crate) const GENERATED_FEEDBACK_CLEAN_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, generated_feedback_clean) as u32;
-pub(crate) const RECEIVER_ALLOC_PAGE_OFFSET: u32 = (std::mem::offset_of!(JitCtx, receiver_alloc)
-    + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, page_header))
+pub(crate) const RECEIVER_ALLOC_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, receiver_alloc)
+    + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, lab))
     as u32;
 pub(crate) const RECEIVER_ALLOC_TYPE_LIVE_BYTES_OFFSET: u32 =
     (std::mem::offset_of!(JitCtx, receiver_alloc)
@@ -252,14 +254,6 @@ pub(crate) const RECEIVER_ALLOC_TYPE_BYTES_OFFSET: u32 =
     (std::mem::offset_of!(JitCtx, receiver_alloc)
         + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_alloc_bytes))
         as u32;
-pub(crate) const RECEIVER_ALLOC_TRACKED_BYTES_OFFSET: u32 =
-    (std::mem::offset_of!(JitCtx, receiver_alloc)
-        + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, tracked_bytes))
-        as u32;
-pub(crate) const RECEIVER_ALLOC_MAX_HEAP_BYTES_OFFSET: u32 =
-    (std::mem::offset_of!(JitCtx, receiver_alloc)
-        + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, max_heap_bytes))
-        as u32;
 pub(crate) const RUNTIME_STATS_OFFSET: u32 = std::mem::offset_of!(JitCtx, runtime_stats) as u32;
 pub(crate) const RECEIVER_ALLOC_ATTEMPTS_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_attempts) as u32;
@@ -269,11 +263,8 @@ pub(crate) const RECEIVER_ALLOC_GUARD_MISSES_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_guard_misses) as u32;
 pub(crate) const RECEIVER_ALLOC_SPACE_MISSES_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_space_misses) as u32;
-pub(crate) const PAGE_SPACE_OFFSET: u32 = otter_vm::jit::JIT_PAGE_SPACE_OFFSET;
-pub(crate) const PAGE_BUMP_CURSOR_OFFSET: u32 = otter_vm::jit::JIT_PAGE_BUMP_CURSOR_OFFSET;
-pub(crate) const PAGE_ALLOCATED_BYTES_OFFSET: u32 = otter_vm::jit::JIT_PAGE_ALLOCATED_BYTES_OFFSET;
-pub(crate) const NEW_FROM_SPACE_KIND: u32 = otter_vm::jit::JIT_NEW_FROM_SPACE_KIND;
-pub(crate) const GC_PAGE_SIZE: u32 = otter_vm::jit::JIT_GC_PAGE_SIZE;
+pub(crate) const LAB_TOP_OFFSET: u32 = otter_vm::jit::JIT_LAB_TOP_OFFSET;
+pub(crate) const LAB_LIMIT_OFFSET: u32 = otter_vm::jit::JIT_LAB_LIMIT_OFFSET;
 pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, thread) as u32;
 pub(crate) const ALLOC_CTX_SAFEPOINT_ID_OFFSET: u32 =
@@ -320,7 +311,7 @@ pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(NativeFr
 // The native entry ABI targets 64-bit engines. These assertions describe the
 // one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 136] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 120] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> NativeResultPair;

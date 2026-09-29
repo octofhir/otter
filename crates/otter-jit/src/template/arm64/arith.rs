@@ -346,6 +346,66 @@ pub(super) fn emit_add_generic(
 
 /// Strict (in)equality additionally decides non-number immediates by raw bit
 /// identity and side-exits on heap cells.
+/// `r<dst> = (typeof r<src> === kind)` or its negation. The value bits and
+/// the cell's type tag decide every case except the heap-dependent cells,
+/// which ask the leaf `(heap, value, test)` probe; its only miss is a null
+/// heap (isolate-less harness), which exits to `bail`.
+pub(super) fn emit_test_typeof(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    dst: u16,
+    src: u16,
+    test: i32,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let decoded =
+        otter_bytecode::TypeOfTest::decode(test).ok_or(Unsupported::OperandShape("TestTypeOf"))?;
+    let slow = ops.new_dynamic_label();
+    let have_bool = ops.new_dynamic_label();
+    emit_load_reg(ops, 9, src)?;
+    super::values::emit_typeof_kind(ops, view, 9, 16, 17, slow);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp w16, decoded.kind as u32
+    );
+    if decoded.negate {
+        dynasm!(ops ; .arch aarch64 ; cset w13, ne);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; cset w13, eq);
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; b =>have_bool
+        ; =>slow
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        ; mov x1, x9
+    );
+    emit_load_u64(ops, 2, u64::from(test as u32));
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        otter_vm::runtime_stubs::TYPEOF_TEST_LEAF.entry_addr() as u64,
+        abi::STUB_TYPEOF_TEST_LEAF,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cbnz x1, =>bail
+    );
+    emit_load_u64(ops, 11, VALUE_TRUE);
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x0, x11
+        ; cset w13, eq
+        ; =>have_bool
+    );
+    emit_box_bool(ops, 13, 12);
+    emit_store_reg(ops, 13, dst)
+}
+
 pub(super) fn emit_compare(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

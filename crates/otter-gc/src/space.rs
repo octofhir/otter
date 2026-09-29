@@ -105,14 +105,39 @@ impl NewSpace {
         }
     }
 
-    /// Current mutator page for a generated-code allocation probe.
+    /// Hand the unused tail of the current from-space page to a linear
+    /// allocation buffer.
     ///
-    /// The returned page remains cage-owned for the heap lifetime. Generated
-    /// code must still validate its live [`SpaceKind`] and bump limit before
-    /// carving a cell because a collection may flip the semispaces after this
-    /// view is captured.
-    pub(crate) fn machine_active_page(&self) -> Option<&Page> {
-        self.from.get(self.active)
+    /// Moves to the next page — growing the semispace while quota allows —
+    /// until one has at least `min_bytes` left. Returns the page base
+    /// address and the tail's `[start, end)` absolute addresses. The page's
+    /// own cursor stays at `start`: the buffer owner publishes its top into
+    /// the page, and no other allocation may bump the page meanwhile.
+    pub(crate) fn take_tail(&mut self, min_bytes: usize) -> Option<(usize, usize, usize)> {
+        loop {
+            if self.active < self.from.len() {
+                let page = &self.from[self.active];
+                let header = page.header();
+                if header.bump_remaining() >= min_bytes {
+                    let base = page.base_ptr() as usize;
+                    return Some((
+                        base,
+                        base + header.bump_cursor,
+                        base + header.span_bytes(),
+                    ));
+                }
+                self.active += 1;
+                continue;
+            }
+            if self.from.len() < self.max_pages {
+                let extra_from = Page::new(SpaceKind::NewFrom)?;
+                let extra_to = Page::new(SpaceKind::NewTo)?;
+                self.from.push(extra_from);
+                self.to.push(extra_to);
+                continue;
+            }
+            return None;
+        }
     }
 
     /// Bump-allocate inside `to`-space — used by the scavenger

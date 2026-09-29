@@ -4117,6 +4117,22 @@ fn emit_with_reach(
                             }
                             (*target, to_boolean_entry, 2, false)
                         }
+                        CallTarget::RuntimeStub(target)
+                            if *target == otter_vm::native_abi::STUB_TYPEOF_TEST_LEAF =>
+                        {
+                            if locations.len() < 3
+                                || integer_register(locations[0])? != 1
+                                || integer_register(locations[1])? != 2
+                            {
+                                return Err(Unsupported::OperandShape("scalar typeof test call"));
+                            }
+                            (
+                                *target,
+                                otter_vm::runtime_stubs::TYPEOF_TEST_LEAF.entry_addr() as u64,
+                                2,
+                                false,
+                            )
+                        }
                         CallTarget::RuntimeStub(target) if *target == STUB_STRICT_EQ_LEAF => {
                             if locations.len() < 3
                                 || integer_register(locations[0])? != 1
@@ -4189,11 +4205,17 @@ fn emit_with_reach(
                         return Err(Unsupported::OperandShape("scalar runtime call result"));
                     }
                     let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
-                    let strict_equal_done = (target == STUB_STRICT_EQ_LEAF).then(|| {
+                    let strict_equal_done = if target == STUB_STRICT_EQ_LEAF {
                         let done = ops.new_dynamic_label();
                         emit_strict_equal_fast_path(&mut ops, done);
-                        done
-                    });
+                        Some(done)
+                    } else if target == otter_vm::native_abi::STUB_TYPEOF_TEST_LEAF {
+                        let done = ops.new_dynamic_label();
+                        emit_typeof_test_fast_path(&mut ops, view, done);
+                        Some(done)
+                    } else {
+                        None
+                    };
                     let array_construct_region = if target == STUB_ARRAY_CONSTRUCT_ALLOC {
                         let byte_pc = instruction
                             .deopt_id()
@@ -5384,6 +5406,30 @@ fn emit_frame_str_d(ops: &mut dynasmrt::aarch64::Assembler, register: u8, offset
 /// strings or two BigInts fall through to the strict-equality leaf call that
 /// follows, which compares their contents. Uses the call's clobbers: x16,
 /// x17, d0 and d1.
+/// Decide `typeof x1 === kind` from the value bits and the cell's type tag
+/// with the boxed `Op::TestTypeOf` immediate in `x2`, leaving the boolean in
+/// `w0` and branching to `done`; heap-dependent cells fall through to the
+/// leaf call. Clobbers `x16`, `x17`.
+fn emit_typeof_test_fast_path(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    view: &JitCompileSnapshot,
+    done: DynamicLabel,
+) {
+    let slow = ops.new_dynamic_label();
+    crate::template::arm64::values::emit_typeof_kind(ops, view, 1, 16, 17, slow);
+    dynasm!(ops
+        ; .arch aarch64
+        ; and w17, w2, 0xff
+        ; cmp w16, w17
+        ; cset w0, eq
+        // Bit 8 of the immediate negates the test.
+        ; ubfx w17, w2, 8, 1
+        ; eor w0, w0, w17
+        ; b =>done
+        ; =>slow
+    );
+}
+
 fn emit_strict_equal_fast_path(ops: &mut dynasmrt::aarch64::Assembler, done: DynamicLabel) {
     use otter_vm::value::tag;
     let differ = ops.new_dynamic_label();

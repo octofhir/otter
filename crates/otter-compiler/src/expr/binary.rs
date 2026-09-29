@@ -331,6 +331,36 @@ fn compile_binary_to(
         // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
         BinaryOperator::In => Op::HasProperty,
     };
+    // `typeof x === "kind"` (and `!==`, `==`, `!=`, either side) against one
+    // of the eight `typeof` spellings is a type test, not a string compare:
+    // no result string is produced (V8's `TestTypeOf`). The literal side has
+    // no effect, so evaluating only the `typeof` operand keeps the order.
+    if matches!(
+        op,
+        Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual
+    ) && let Some((unary, kind)) = typeof_literal_pair(&b.left, &b.right)
+    {
+        let test = otter_bytecode::TypeOfTest {
+            kind,
+            negate: matches!(op, Op::NotEqual | Op::LooseNotEqual),
+        };
+        let value = crate::expr::unary::typeof_operand(cx, unary, span)?;
+        cx.reset_scratch(mark);
+        let dst = match destination {
+            Some(dst) => dst,
+            None => crate::expr::unary::distinct_result_register(cx, value),
+        };
+        cx.emit(
+            Op::TestTypeOf,
+            [
+                Operand::Register(dst),
+                Operand::Register(value),
+                Operand::Imm32(test.encode()),
+            ],
+            span,
+        );
+        return Ok(dst);
+    }
     // Fold an integer-literal right operand into an immediate-right opcode,
     // dropping the separate `LoadInt32` the register form would emit. The left
     // operand keeps full operator semantics; the literal right operand has no
@@ -436,4 +466,33 @@ fn compile_binary_to(
         span,
     );
     Ok(dst)
+}
+
+/// `typeof <operand>` compared with a string literal that spells one of the
+/// eight `typeof` results, in either operand order.
+fn typeof_literal_pair<'a, 'b>(
+    left: &'b Expression<'a>,
+    right: &'b Expression<'a>,
+) -> Option<(&'b oxc_ast::ast::UnaryExpression<'a>, otter_bytecode::TypeOfKind)> {
+    fn unwrap<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
+        let mut expr = expr;
+        while let Expression::ParenthesizedExpression(p) = expr {
+            expr = &p.expression;
+        }
+        expr
+    }
+    let pair = |typeof_side: &'b Expression<'a>, literal_side: &'b Expression<'a>| {
+        let Expression::UnaryExpression(unary) = unwrap(typeof_side) else {
+            return None;
+        };
+        if unary.operator != oxc_ast::ast::UnaryOperator::Typeof {
+            return None;
+        }
+        let Expression::StringLiteral(literal) = unwrap(literal_side) else {
+            return None;
+        };
+        let kind = otter_bytecode::TypeOfKind::from_name(literal.value.as_str())?;
+        Some((unary.as_ref(), kind))
+    };
+    pair(left, right).or_else(|| pair(right, left))
 }

@@ -384,6 +384,12 @@ pub(super) enum NumericNode {
         byte_pc: u32,
     },
     TaggedToBoolean(NumericValue),
+    /// `typeof value === kind` (or its negation) for an `Op::TestTypeOf`
+    /// immediate; a boolean.
+    TaggedTestTypeOf {
+        value: NumericValue,
+        test: u32,
+    },
     TaggedStrictEqual(NumericValue, NumericValue),
     TaggedNullishEqual {
         value: NumericValue,
@@ -754,6 +760,7 @@ impl NumericNode {
             | Self::IntegerGreaterThan(..)
             | Self::IntegerGreaterEqual(..)
             | Self::TaggedToBoolean(..)
+            | Self::TaggedTestTypeOf { .. }
             | Self::TaggedStrictEqual(..)
             | Self::TaggedNullishEqual { .. }
             | Self::IntegerToBoolean(..)
@@ -810,6 +817,7 @@ impl NumericNode {
             | Self::NativeCall { .. }
             | Self::NativeLeaf { .. }
             | Self::TaggedToBoolean(..)
+            | Self::TaggedTestTypeOf { .. }
             | Self::TaggedStrictEqual(..)
             | Self::TaggedNullishEqual { .. }
             | Self::TaggedStringConcat(..)
@@ -3986,6 +3994,26 @@ fn lower_instruction(
                 register(instruction, code, 1)?,
                 TaggedNumericDecode::Number,
             )?;
+            write(
+                registers,
+                register(instruction, code, 0)?,
+                RegisterState::Value(value),
+            )?;
+            return Some(());
+        }
+        Op::TestTypeOf => {
+            let source = read_value(registers, register(instruction, code, 1)?)?;
+            let test = instruction.imm32(code, 2)? as u32;
+            let value = push(nodes, NumericNode::TaggedTestTypeOf { value: source, test });
+            block_nodes.push(value);
+            push_frame_state(
+                frame_states,
+                NumericFramePoint::Node(value),
+                function_id,
+                instruction.byte_pc,
+                registers,
+                live_in,
+            );
             write(
                 registers,
                 register(instruction, code, 0)?,

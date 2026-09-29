@@ -7,14 +7,16 @@
 //!   every outer binding its body reaches is a fixed hop,
 //! - an optional bound `this` (arrow closures capture their receiver
 //!   lexically; non-arrow closures take `this` from the call site),
-//! - an optional bound `new.target` for arrow closures.
+//! - an optional bound `new.target` for arrow closures,
+//! - a handle to its out-of-line [`ClosureRareBody`] once it has an own
+//!   property or a `[[Prototype]]` override.
 //!
 //! # Contents
 //!
 //! - [`ClosureCallHeader`] — stable machine-facing call ABI prefix.
 //! - [`ClosureCallState`] — allocation-neutral VM call metadata.
-//! - [`JsClosureBody`] — GC body holding the ABI prefix, canonical
-//!   bound values, and per-instance property state.
+//! - [`JsClosureBody`] — GC body: the ABI prefix, the rare handle, the
+//!   constructor's last-receiver observation, then the bound values.
 //! - [`JsClosure`] — 8-byte handle plus cached function id.
 //! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocators.
 //! - [`JS_CLOSURE_BODY_TYPE_TAG`] — reserved
@@ -22,24 +24,31 @@
 //!
 //! # Invariants
 //!
-//! - The machine-facing prefix is `#[repr(C)]`: native linkage may read
-//!   [`ClosureCallHeader`], bound values and the constructor header only.
+//! - The machine-facing prefix is `#[repr(C)]`: native linkage reads
+//!   [`ClosureCallHeader`], the bound `this` word, the rare handle and the
+//!   last-receiver word only.
 //! - [`ClosureCallHeader::context`] is a full 8-byte `Value` word holding a
 //!   context or `undefined`, fixed at creation. Generated code loads it with
 //!   one instruction and follows it without cage-base arithmetic.
-//! - Canonical `Value` fields are always traced, in the pending body too, so
-//!   an allocation-triggered collection rewrites the context and bound values
-//!   before they are copied into the cell. Presence flags distinguish `None`
-//!   from `Some(undefined)` while [`JsClosure`] keeps the ergonomic
-//!   `Option<Value>` API.
-//! - Closures are allocated in old space and never move; a bound
-//!   `new.target` requires the call-setup runtime stub.
+//! - The fixed body is 24 bytes. Bound `this` and `new.target` are trailing
+//!   words present only when their flag is set: a closure with a bound
+//!   `new.target` carries two words (the first `undefined` without a bound
+//!   `this`), one with only a bound `this` carries one, and a plain closure
+//!   none. Generated code reads the `this` word only after testing its flag.
+//! - Per-instance `name`/`length` deletion, non-extensibility and the
+//!   named-lookup summary are bits of [`ClosureCallHeader::flags`]; the
+//!   named-lookup summary is its most significant byte.
+//! - The context, the rare handle and the bound values are traced; the
+//!   pending body carries the context and rare handle, and the allocator
+//!   roots the bound values until they are copied into the cell. The
+//!   last-receiver word is a weak observation cleared by every trace.
 //!
 //! # See also
 //!
 //! - [`crate::native_abi::NativeFrame`] — fixed-width native activation ABI.
 //! - [`crate::jit::JitCompileSnapshot`] — publishes the closure byte offsets
 //!   to native backends.
+//! - [`crate::closure_construct`] — the rare record.
 //!
 //! # Spec
 //!
@@ -48,11 +57,13 @@
 //! - ECMA-262 §10.2.1.1 — `[[ThisMode]]` for arrow functions.
 
 use crate::Value;
+use crate::closure_construct::{ClosureRareBody, ClosureRareHandle};
 use crate::object::JsObject;
 use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
+use std::cell::Cell;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
@@ -67,6 +78,20 @@ pub const CLOSURE_CALL_FLAG_BOUND_NEW_TARGET: u32 = 1 << 1;
 /// `new.target` routes through setup before control returns to the compiled
 /// callee in the same native activation.
 pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 = CLOSURE_CALL_FLAG_BOUND_NEW_TARGET;
+/// [`ClosureCallHeader::flags`] bit: the intrinsic `name` metadata property
+/// was deleted from this instance (`delete f.name`). Sibling closures of the
+/// same template keep their own copies, so the marker cannot live in a table
+/// keyed by the bytecode function id.
+const CLOSURE_FLAG_NAME_DELETED: u32 = 1 << 8;
+/// As [`CLOSURE_FLAG_NAME_DELETED`] for `length`.
+const CLOSURE_FLAG_LENGTH_DELETED: u32 = 1 << 9;
+/// [`ClosureCallHeader::flags`] bit: §10.1.4 `[[Extensible]]` is false for
+/// this instance. Sibling closures of the same bytecode template are distinct
+/// function objects, so `Object.preventExtensions(f)` must not seal them.
+const CLOSURE_FLAG_NON_EXTENSIBLE: u32 = 1 << 10;
+/// Shift of the named-lookup summary byte (the `CLOSURE_LOOKUP_*` bits)
+/// inside [`ClosureCallHeader::flags`].
+const CLOSURE_NAMED_LOOKUP_SHIFT: u32 = 24;
 
 /// Stable machine-facing closure call metadata.
 #[repr(C, align(8))]
@@ -74,7 +99,8 @@ pub const CLOSURE_CALL_RUNTIME_SETUP_FLAGS: u32 = CLOSURE_CALL_FLAG_BOUND_NEW_TA
 pub struct ClosureCallHeader {
     /// Index into [`otter_bytecode::BytecodeModule::functions`].
     pub function_id: u32,
-    /// Presence and call-setup routing flags.
+    /// Presence and call-setup routing flags, per-instance state bits and
+    /// the named-lookup summary byte.
     pub flags: u32,
     /// The context this closure was created over, or `undefined`.
     pub context: Value,
@@ -120,52 +146,49 @@ impl ClosureCallHeader {
     pub const fn requires_runtime_setup(self) -> bool {
         self.flags & CLOSURE_CALL_RUNTIME_SETUP_FLAGS != 0
     }
+
+    /// The named-lookup summary byte.
+    #[inline]
+    const fn named_lookup(self) -> u8 {
+        (self.flags >> CLOSURE_NAMED_LOOKUP_SHIFT) as u8
+    }
+
+    /// Number of trailing bound-value words a body with these flags carries.
+    #[inline]
+    const fn bound_words(self) -> usize {
+        if self.flags & CLOSURE_CALL_FLAG_BOUND_NEW_TARGET != 0 {
+            2
+        } else if self.flags & CLOSURE_CALL_FLAG_BOUND_THIS != 0 {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// GC body backing every closure value.
 ///
-/// The prefix through `construct` is part of the stable call/allocation ABI.
-/// Everything after it is a traced implementation detail.
+/// The fixed body is part of the stable call/allocation ABI; the bound values
+/// trail it (see the module invariants).
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct JsClosureBody {
     /// Fixed-layout metadata read by native linkage.
     pub call_header: ClosureCallHeader,
-    /// Canonical traced lexical `this`; consult the header flag for presence.
-    pub bound_this: Value,
-    /// Canonical traced lexical `new.target`; consult the header flag for presence.
-    pub bound_new_target: Value,
-    /// Canonical property and weak constructor state in the fixed prefix.
-    pub(crate) construct: crate::closure_construct::ClosureConstructHeader,
-    /// Per-instance deletion of the intrinsic `name` metadata property
-    /// (`delete f.name`). Sibling closures of the same template keep
-    /// their own copies, so the marker cannot live in a table keyed by
-    /// the bytecode function id.
-    pub name_deleted: bool,
-    /// As [`Self::name_deleted`] for `length`.
-    pub length_deleted: bool,
-    /// §10.1.4 `[[Extensible]]` for this closure instance. Sibling
-    /// closures of the same bytecode template are distinct function
-    /// objects, so `Object.preventExtensions(f)` must not seal them.
-    pub non_extensible: bool,
-    /// §10.1.2 `[[Prototype]]` override installed by
-    /// `Object.setPrototypeOf` / `f.__proto__ = p`. `None` means the
-    /// closure still walks the realm's `%Function.prototype%`; a
-    /// stored `Value::null()` is an explicit null prototype.
-    pub proto_override: Option<Value>,
-    /// Named-lookup summary read by generated property guards: the
-    /// `CLOSURE_LOOKUP_*` bits. Exactly [`CLOSURE_LOOKUP_ORDINARY`] means a
-    /// name the closure does not own virtually resolves on the active realm's
-    /// `%Function.prototype%`.
-    pub(crate) named_lookup: u8,
+    /// Out-of-line state; null until the closure needs it.
+    rare: ClosureRareHandle,
+    /// Weak observation of the receiver this closure last constructed, never
+    /// a root. Nonzero requires an entry in the pending-constructor ledger;
+    /// every trace clears it before movement. Generated allocation may
+    /// replace it only while that entry exists.
+    last_instance: Cell<JsObject>,
 }
 
-/// [`JsClosureBody::named_lookup`] bit: the function kind's default
+/// [`ClosureCallHeader::flags`] named-lookup bit: the function kind's default
 /// `[[Prototype]]` is `%Function.prototype%` (not a generator or async kind).
 pub const CLOSURE_LOOKUP_ORDINARY: u8 = 1 << 0;
 /// Generated proof that a closure's named lookup is ordinary: its
-/// [`JsClosureBody::named_lookup`] byte reads exactly
-/// [`CLOSURE_LOOKUP_ORDINARY`].
+/// named-lookup byte reads exactly [`CLOSURE_LOOKUP_ORDINARY`].
 #[must_use]
 pub(crate) fn ordinary_named_lookup_guard() -> crate::jit::JitBodyGuard {
     crate::jit::JitBodyGuard {
@@ -175,15 +198,29 @@ pub(crate) fn ordinary_named_lookup_guard() -> crate::jit::JitBodyGuard {
     }
 }
 
-/// [`JsClosureBody::named_lookup`] bit: an own-property bag exists.
+/// Named-lookup bit: an own-property bag exists.
 pub const CLOSURE_LOOKUP_OWN_PROPS: u8 = 1 << 1;
-/// [`JsClosureBody::named_lookup`] bit: a `[[Prototype]]` override is installed.
+/// Named-lookup bit: a `[[Prototype]]` override is installed.
 pub const CLOSURE_LOOKUP_PROTO_OVERRIDE: u8 = 1 << 2;
 
 impl otter_gc::SafeTraceable for JsClosureBody {
     const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        use crate::pelt::PeltField as _;
+        self.trace_fixed_fields(visitor);
+        let words = self.call_header.bound_words();
+        let base = self.bound_words_ptr();
+        for index in 0..words {
+            // SAFETY: an allocated body carries `bound_words` initialized
+            // trailing words.
+            unsafe { (*base.add(index)).pelt_trace(visitor) };
+        }
+    }
+
+    /// The pending payload has no trailing words yet: its bound values are
+    /// the allocator's rooted locals, copied in by the initializer.
+    fn trace_pending_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.trace_fixed_fields(visitor);
     }
 }
@@ -208,50 +245,24 @@ pub const CLOSURE_BODY_CALL_FLAGS_OFFSET: usize =
 /// Byte offset of the nested context word in [`JsClosureBody`]'s payload.
 pub const CLOSURE_BODY_CONTEXT_OFFSET: usize =
     CLOSURE_BODY_CALL_HEADER_OFFSET + CLOSURE_CALL_HEADER_CONTEXT_OFFSET;
-/// Byte offset of canonical `bound_this` in [`JsClosureBody`]'s payload.
-pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, bound_this);
-/// Byte offset of canonical `bound_new_target` in [`JsClosureBody`]'s payload.
+/// Byte offset of the rare-record handle in [`JsClosureBody`]'s payload.
+pub const CLOSURE_BODY_RARE_OFFSET: usize = std::mem::offset_of!(JsClosureBody, rare);
+/// Byte offset of the last-receiver observation in [`JsClosureBody`]'s payload.
+pub const CLOSURE_BODY_LAST_INSTANCE_OFFSET: usize =
+    std::mem::offset_of!(JsClosureBody, last_instance);
+/// Byte offset of the trailing bound `this` word, valid only when
+/// [`CLOSURE_CALL_FLAG_BOUND_THIS`] is set.
+pub const CLOSURE_BODY_BOUND_THIS_OFFSET: usize = std::mem::size_of::<JsClosureBody>();
+/// Byte offset of the trailing bound `new.target` word, valid only when
+/// [`CLOSURE_CALL_FLAG_BOUND_NEW_TARGET`] is set.
 pub const CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET: usize =
-    std::mem::offset_of!(JsClosureBody, bound_new_target);
+    CLOSURE_BODY_BOUND_THIS_OFFSET + std::mem::size_of::<Value>();
 
-/// Byte offset of [`JsClosureBody::named_lookup`] in the payload.
-pub const CLOSURE_BODY_NAMED_LOOKUP_OFFSET: usize =
-    std::mem::offset_of!(JsClosureBody, named_lookup);
-/// Byte offset of [`JsClosureBody::named_lookup`] from the cell header, as
-/// generated code addresses it.
-pub const CLOSURE_NAMED_LOOKUP_BYTE: u32 =
-    (otter_gc::header::HEADER_SIZE + CLOSURE_BODY_NAMED_LOOKUP_OFFSET) as u32;
-
-/// Byte offset of canonical constructor own_props state.
-pub const CLOSURE_BODY_OWN_PROPS_OFFSET: usize = std::mem::offset_of!(JsClosureBody, construct)
-    + std::mem::offset_of!(crate::closure_construct::ClosureConstructHeader, own_props);
-/// Byte offset of canonical constructor prototype_shape state.
-pub const CLOSURE_BODY_PROTOTYPE_SHAPE_OFFSET: usize =
-    std::mem::offset_of!(JsClosureBody, construct)
-        + std::mem::offset_of!(
-            crate::closure_construct::ClosureConstructHeader,
-            prototype_shape
-        );
-/// Byte offset of canonical constructor prototype_slot state.
-pub const CLOSURE_BODY_PROTOTYPE_SLOT_OFFSET: usize =
-    std::mem::offset_of!(JsClosureBody, construct)
-        + std::mem::offset_of!(
-            crate::closure_construct::ClosureConstructHeader,
-            prototype_slot
-        );
-/// Byte offset of canonical constructor learned_instance_fields state.
-pub const CLOSURE_BODY_LEARNED_INSTANCE_FIELDS_OFFSET: usize =
-    std::mem::offset_of!(JsClosureBody, construct)
-        + std::mem::offset_of!(
-            crate::closure_construct::ClosureConstructHeader,
-            learned_instance_fields
-        );
-/// Byte offset of canonical constructor last_instance state.
-pub const CLOSURE_BODY_LAST_INSTANCE_OFFSET: usize = std::mem::offset_of!(JsClosureBody, construct)
-    + std::mem::offset_of!(
-        crate::closure_construct::ClosureConstructHeader,
-        last_instance
-    );
+/// Byte offset of the named-lookup summary byte from the cell header, as
+/// generated code addresses it (the most significant byte of the flags word).
+pub const CLOSURE_NAMED_LOOKUP_BYTE: u32 = (otter_gc::header::HEADER_SIZE
+    + CLOSURE_BODY_CALL_FLAGS_OFFSET
+    + (CLOSURE_NAMED_LOOKUP_SHIFT / 8) as usize) as u32;
 
 const _: [(); 16] = [(); std::mem::size_of::<ClosureCallHeader>()];
 const _: [(); 8] = [(); std::mem::align_of::<ClosureCallHeader>()];
@@ -259,69 +270,65 @@ const _: [(); 0] = [(); CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET];
 const _: [(); 4] = [(); CLOSURE_CALL_HEADER_FLAGS_OFFSET];
 const _: [(); 8] = [(); CLOSURE_CALL_HEADER_CONTEXT_OFFSET];
 const _: [(); 0] = [(); CLOSURE_BODY_CALL_HEADER_OFFSET];
-const _: [(); 16] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
-const _: [(); 24] = [(); CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET];
-const _: [(); 32] = [(); CLOSURE_BODY_OWN_PROPS_OFFSET];
+const _: [(); 16] = [(); CLOSURE_BODY_RARE_OFFSET];
+const _: [(); 20] = [(); CLOSURE_BODY_LAST_INSTANCE_OFFSET];
+const _: [(); 24] = [(); CLOSURE_BODY_BOUND_THIS_OFFSET];
+const _: [(); 24] = [(); std::mem::size_of::<JsClosureBody>()];
+// The named-lookup byte is the flags word's top byte on a little-endian host.
+const _: () = assert!(cfg!(target_endian = "little"));
 
 impl JsClosureBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         visitor(self.call_header.function_id);
         crate::code_liveness::visit_value(&self.call_header.context, visitor);
-        crate::code_liveness::visit_value(&self.bound_this, visitor);
-        crate::code_liveness::visit_value(&self.bound_new_target, visitor);
-        if let Some(value) = &self.proto_override {
-            crate::code_liveness::visit_value(value, visitor);
+        let words = self.call_header.bound_words();
+        let base = self.bound_words_ptr();
+        for index in 0..words {
+            // SAFETY: an allocated body carries `bound_words` trailing words.
+            crate::code_liveness::visit_value(unsafe { &*base.add(index) }, visitor);
         }
     }
 
-    fn new(
-        function_id: u32,
-        context: Value,
-        bound_this: Option<Value>,
-        bound_new_target: Option<Value>,
-    ) -> Self {
+    fn new(function_id: u32, context: Value, bound_this: bool, bound_new_target: bool) -> Self {
         debug_assert!(context.is_undefined() || context.as_context().is_some());
-        let call_header = ClosureCallHeader::new(
-            function_id,
-            context,
-            bound_this.is_some(),
-            bound_new_target.is_some(),
-        );
         Self {
-            call_header,
-            bound_this: bound_this.unwrap_or_else(Value::undefined),
-            bound_new_target: bound_new_target.unwrap_or_else(Value::undefined),
-            construct: crate::closure_construct::ClosureConstructHeader::default(),
-            name_deleted: false,
-            length_deleted: false,
-            non_extensible: false,
-            proto_override: None,
-            named_lookup: 0,
+            call_header: ClosureCallHeader::new(function_id, context, bound_this, bound_new_target),
+            rare: ClosureRareHandle::null(),
+            last_instance: Cell::new(JsObject::null()),
         }
+    }
+
+    /// Base of the trailing bound-value words.
+    #[inline]
+    fn bound_words_ptr(&self) -> *mut Value {
+        // SAFETY: computes the tail address only; dereferenced solely for the
+        // words the flags say the allocation reserved.
+        unsafe { (self as *const Self).add(1).cast_mut().cast::<Value>() }
     }
 
     fn trace_fixed_fields(&mut self, visitor: &mut SlotVisitor<'_>) {
         use crate::pelt::PeltField as _;
-        self.construct.last_instance.set(JsObject::null());
+        self.last_instance.set(JsObject::null());
         self.call_header.context.pelt_trace(visitor);
-        self.bound_this.pelt_trace(visitor);
-        self.bound_new_target.pelt_trace(visitor);
-        self.construct.own_props.pelt_trace(visitor);
-        self.proto_override.pelt_trace(visitor);
+        if !self.rare.is_null() {
+            visitor(&mut self.rare as *mut ClosureRareHandle as *mut RawGc);
+        }
     }
 
     #[inline]
     pub(crate) fn bound_this_option(&self) -> Option<Value> {
         self.call_header
             .has_flag(CLOSURE_CALL_FLAG_BOUND_THIS)
-            .then_some(self.bound_this)
+            // SAFETY: the flag guarantees the first trailing word exists.
+            .then(|| unsafe { *self.bound_words_ptr() })
     }
 
     #[inline]
     pub(crate) fn bound_new_target_option(&self) -> Option<Value> {
         self.call_header
             .has_flag(CLOSURE_CALL_FLAG_BOUND_NEW_TARGET)
-            .then_some(self.bound_new_target)
+            // SAFETY: the flag guarantees both trailing words exist.
+            .then(|| unsafe { *self.bound_words_ptr().add(1) })
     }
 
     fn call_state(&self) -> ClosureCallState {
@@ -329,6 +336,55 @@ impl JsClosureBody {
             bound_this: self.bound_this_option(),
             bound_new_target: self.bound_new_target_option(),
         }
+    }
+
+    /// The rare record, if allocated.
+    #[inline]
+    pub(crate) fn rare(&self) -> Option<ClosureRareHandle> {
+        (!self.rare.is_null()).then_some(self.rare)
+    }
+
+    /// The named-lookup summary byte.
+    #[inline]
+    pub(crate) fn named_lookup(&self) -> u8 {
+        self.call_header.named_lookup()
+    }
+
+    #[inline]
+    fn set_named_lookup_bits(&mut self, bits: u8, on: bool) {
+        let shifted = u32::from(bits) << CLOSURE_NAMED_LOOKUP_SHIFT;
+        if on {
+            self.call_header.flags |= shifted;
+        } else {
+            self.call_header.flags &= !shifted;
+        }
+    }
+
+    #[inline]
+    fn set_state_flag(&mut self, flag: u32, on: bool) {
+        if on {
+            self.call_header.flags |= flag;
+        } else {
+            self.call_header.flags &= !flag;
+        }
+    }
+
+    /// The constructor's last-receiver observation, if any.
+    pub(crate) fn observed_receiver(&self) -> Option<JsObject> {
+        let receiver = self.last_instance.get();
+        (!receiver.is_null()).then_some(receiver)
+    }
+
+    /// Take the last-receiver observation, leaving none.
+    pub(crate) fn take_receiver(&self) -> Option<JsObject> {
+        let receiver = self.last_instance.replace(JsObject::null());
+        (!receiver.is_null()).then_some(receiver)
+    }
+
+    /// Record `receiver` as the last one constructed; returns whether an
+    /// observation was already present.
+    pub(crate) fn replace_receiver(&self, receiver: JsObject) -> bool {
+        !self.last_instance.replace(receiver).is_null()
     }
 }
 
@@ -356,11 +412,12 @@ pub struct JsClosure {
 impl JsClosure {
     /// Per-instance deleted-metadata flag for `name`/`length`.
     pub(crate) fn metadata_deleted(self, heap: &otter_gc::GcHeap, key: &str) -> bool {
-        heap.read_payload(self.handle(), |body| match key {
-            "name" => body.name_deleted,
-            "length" => body.length_deleted,
-            _ => false,
-        })
+        let flag = match key {
+            "name" => CLOSURE_FLAG_NAME_DELETED,
+            "length" => CLOSURE_FLAG_LENGTH_DELETED,
+            _ => return false,
+        };
+        heap.read_payload(self.handle(), |body| body.call_header.has_flag(flag))
     }
 
     /// Record (or clear) the per-instance deleted-metadata flag.
@@ -370,11 +427,12 @@ impl JsClosure {
         key: &str,
         deleted: bool,
     ) {
-        heap.with_payload(self.handle(), |body| match key {
-            "name" => body.name_deleted = deleted,
-            "length" => body.length_deleted = deleted,
-            _ => {}
-        });
+        let flag = match key {
+            "name" => CLOSURE_FLAG_NAME_DELETED,
+            "length" => CLOSURE_FLAG_LENGTH_DELETED,
+            _ => return,
+        };
+        heap.with_payload(self.handle(), |body| body.set_state_flag(flag, deleted));
     }
 
     /// Construct from a raw handle + the function id stored inside
@@ -451,75 +509,135 @@ impl JsClosure {
     /// `[[Prototype]]` to `%Function.prototype%`. Set once at creation.
     pub(crate) fn mark_ordinary_lookup(self, heap: &mut GcHeap) {
         heap.with_payload(self.handle, |body| {
-            body.named_lookup |= CLOSURE_LOOKUP_ORDINARY;
+            body.set_named_lookup_bits(CLOSURE_LOOKUP_ORDINARY, true);
         });
+    }
+
+    /// This closure's rare record, if allocated.
+    #[must_use]
+    pub(crate) fn rare(self, heap: &GcHeap) -> Option<ClosureRareHandle> {
+        heap.read_payload(self.handle, JsClosureBody::rare)
+    }
+
+    /// Install a freshly allocated rare record. The closure may be older than
+    /// the record, so the edge is barriered.
+    pub(crate) fn install_rare(self, heap: &mut GcHeap, rare: ClosureRareHandle) {
+        heap.with_payload(self.handle, |body| {
+            debug_assert!(body.rare.is_null(), "a closure keeps its first rare record");
+            body.rare = rare;
+        });
+        heap.write_barrier(self.handle, rare);
+    }
+
+    /// Read the rare record with `read`, or `None` without one.
+    fn with_rare<R>(self, heap: &GcHeap, read: impl FnOnce(&ClosureRareBody) -> R) -> Option<R> {
+        let rare = self.rare(heap)?;
+        Some(heap.read_payload(rare, read))
     }
 
     /// This closure instance's own-property bag, if it has been
     /// materialized. The zero compressed handle denotes an absent bag.
     #[must_use]
     pub fn own_props(self, heap: &GcHeap) -> Option<JsObject> {
-        heap.read_payload(self.handle, |body| {
-            let bag = body.construct.own_props;
-            (!bag.is_null()).then_some(bag)
-        })
+        self.with_rare(heap, |rare| rare.own_props)
+            .filter(|bag| !bag.is_null())
     }
 
-    /// Install the per-instance own-property bag. Records the
-    /// closure→bag edge with the GC write barrier (the body lives in
-    /// old space; the bag may be younger).
+    /// Install the per-instance own-property bag into the rare record the
+    /// caller already allocated. Records the rare→bag edge with the GC write
+    /// barrier (the bag may be younger).
     pub fn set_own_props(self, heap: &mut GcHeap, bag: JsObject) {
+        let rare = self
+            .rare(heap)
+            .expect("an own-property bag is installed into an allocated rare record");
+        heap.with_payload(rare, |rare| rare.own_props = bag);
+        heap.write_barrier(rare, bag);
         heap.with_payload(self.handle, |body| {
-            body.construct.own_props = bag;
-            body.named_lookup |= CLOSURE_LOOKUP_OWN_PROPS;
+            body.set_named_lookup_bits(CLOSURE_LOOKUP_OWN_PROPS, true);
         });
-        heap.write_barrier(self.handle, bag);
+    }
+
+    /// The learned instance size recorded for this constructor closure.
+    pub(crate) fn learned_instance_fields(self, heap: &GcHeap) -> u16 {
+        self.with_rare(heap, |rare| rare.learned_instance_fields.get())
+            .unwrap_or(0)
+    }
+
+    /// Raise the learned instance size; a closure without a rare record keeps
+    /// none (the function-keyed profile still records it).
+    pub(crate) fn raise_learned_instance_fields(self, heap: &GcHeap, learned: u16) {
+        let _ = self.with_rare(heap, |rare| {
+            rare.learned_instance_fields
+                .set(rare.learned_instance_fields.get().max(learned));
+        });
+    }
+
+    /// Overwrite the learned instance size.
+    pub(crate) fn set_learned_instance_fields(self, heap: &GcHeap, learned: u16) {
+        let _ = self.with_rare(heap, |rare| rare.learned_instance_fields.set(learned));
     }
 
     /// §10.1.3 `[[IsExtensible]]` for this closure instance.
     #[must_use]
     pub fn is_extensible(self, heap: &GcHeap) -> bool {
-        !heap.read_payload(self.handle, |body| body.non_extensible)
+        !heap.read_payload(self.handle, |body| {
+            body.call_header.has_flag(CLOSURE_FLAG_NON_EXTENSIBLE)
+        })
     }
 
     /// §10.1.4 `[[PreventExtensions]]` for this closure instance.
     pub fn prevent_extensions(self, heap: &mut GcHeap) {
-        heap.with_payload(self.handle, |body| body.non_extensible = true);
+        heap.with_payload(self.handle, |body| {
+            body.set_state_flag(CLOSURE_FLAG_NON_EXTENSIBLE, true);
+        });
     }
 
     /// The `[[Prototype]]` override installed on this closure instance,
-    /// if any. See [`JsClosureBody::proto_override`].
+    /// if any. `None` means the closure still walks the realm's
+    /// `%Function.prototype%`; a stored `Value::null()` is an explicit null
+    /// prototype.
     #[must_use]
     pub fn proto_override(self, heap: &GcHeap) -> Option<Value> {
-        heap.read_payload(self.handle, |body| body.proto_override)
+        let installed = heap.read_payload(self.handle, |body| {
+            body.named_lookup() & CLOSURE_LOOKUP_PROTO_OVERRIDE != 0
+        });
+        if !installed {
+            return None;
+        }
+        self.with_rare(heap, |rare| rare.proto_override)
     }
 
     /// Drop the per-instance `[[Prototype]]` override, restoring the
     /// intrinsic `%Function.prototype%` walk.
     pub fn clear_proto_override(self, heap: &mut GcHeap) {
+        if let Some(rare) = self.rare(heap) {
+            heap.with_payload(rare, |rare| rare.proto_override = Value::undefined());
+        }
         heap.with_payload(self.handle, |body| {
-            body.proto_override = None;
-            body.named_lookup &= !CLOSURE_LOOKUP_PROTO_OVERRIDE;
+            body.set_named_lookup_bits(CLOSURE_LOOKUP_PROTO_OVERRIDE, false);
         });
     }
 
-    /// Install the per-instance `[[Prototype]]` override. The body lives
-    /// in old space and the new prototype may be younger, so every heap
-    /// slot the value carries is recorded in the remembered set.
+    /// Install the per-instance `[[Prototype]]` override into the rare record
+    /// the caller already allocated. The new prototype may be younger than
+    /// the record, so every heap slot the value carries is recorded in the
+    /// remembered set.
     pub fn set_proto_override(self, heap: &mut GcHeap, proto: Value) {
         use crate::pelt::PeltField as _;
 
+        let rare = self
+            .rare(heap)
+            .expect("a prototype override is installed into an allocated rare record");
+        heap.with_payload(rare, |rare| rare.proto_override = proto);
         heap.with_payload(self.handle, |body| {
-            body.proto_override = Some(proto);
-            body.named_lookup |= CLOSURE_LOOKUP_PROTO_OVERRIDE;
+            body.set_named_lookup_bits(CLOSURE_LOOKUP_PROTO_OVERRIDE, true);
         });
         let mut child = proto;
-        let handle = self.handle;
         let mut visit = |slot: *mut RawGc| {
             // SAFETY: `pelt_trace` hands out pointers into the local copy
             // of the value; the slot is read to record its edge only.
             let raw = unsafe { *slot };
-            heap.record_write_edge(handle, raw);
+            heap.record_write_edge(rare, raw);
         };
         child.pelt_trace(&mut visit);
     }
@@ -543,8 +661,7 @@ impl JsClosure {
     }
 }
 
-/// Allocate one old-space closure over `context` (a context value or
-/// `undefined`).
+/// Allocate one closure over `context` (a context value or `undefined`).
 ///
 /// # Errors
 /// Surfaces [`OutOfMemory`] verbatim.
@@ -568,11 +685,11 @@ pub fn alloc_closure(
 /// Allocate a closure body while exposing caller-owned roots across
 /// any allocation-triggered collection.
 ///
-/// The context and bound values ride in the pending body, which the
-/// allocator traces, so a collection rewrites them before the copy into the
-/// cell. `external_visit` covers any other young value the caller holds in a
-/// Rust local across this call (per the [`GcHeap::alloc_with_roots`]
-/// contract).
+/// The context rides in the pending body, which the allocator traces; the
+/// bound values are rooted here and copied into their trailing words once
+/// the cell exists, so a collection rewrites them before the copy.
+/// `external_visit` covers any other young value the caller holds in a Rust
+/// local across this call (per the [`GcHeap::alloc_with_roots`] contract).
 ///
 /// # Errors
 ///
@@ -585,8 +702,38 @@ pub fn alloc_closure_with_roots(
     bound_new_target: Option<Value>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
-    let body = JsClosureBody::new(function_id, context, bound_this, bound_new_target);
-    let handle = heap.alloc_with_roots(body, external_visit)?;
+    let body = JsClosureBody::new(
+        function_id,
+        context,
+        bound_this.is_some(),
+        bound_new_target.is_some(),
+    );
+    let words = body.call_header.bound_words();
+    let mut bound = [
+        bound_this.unwrap_or_else(Value::undefined),
+        bound_new_target.unwrap_or_else(Value::undefined),
+    ];
+    let bound_slot = bound.as_mut_ptr();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        for index in 0..words {
+            // SAFETY: `index < 2`; the local array outlives the allocation.
+            unsafe { (*bound_slot.add(index)).trace_value_slot_mut(visitor) };
+        }
+    };
+    let handle = heap.alloc_trailing_with_roots_initialized(
+        body,
+        words * std::mem::size_of::<Value>(),
+        &mut visit,
+        |body| {
+            let base = body.bound_words_ptr();
+            for index in 0..words {
+                // SAFETY: the cell reserved `words` trailing words; the local
+                // array was rewritten by any collection the allocation ran.
+                unsafe { *base.add(index) = *bound_slot.add(index) };
+            }
+        },
+    )?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
 
@@ -615,6 +762,7 @@ mod tests {
                     scope_function_id: 71,
                     scope_index: 0,
                     slot_count: 1,
+                    has_extension: false,
                 },
                 Value::undefined(),
                 |_| false,
@@ -759,8 +907,7 @@ mod tests {
         heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.call_header.function_id, 7);
             assert_eq!(body.call_header.flags, 0);
-            assert!(body.bound_this.is_undefined());
-            assert!(body.bound_new_target.is_undefined());
+            assert!(body.rare().is_none());
         });
     }
 
@@ -804,20 +951,58 @@ mod tests {
         assert_eq!(CLOSURE_BODY_FUNCTION_ID_OFFSET, 0);
         assert_eq!(CLOSURE_BODY_CALL_FLAGS_OFFSET, 4);
         assert_eq!(CLOSURE_BODY_CONTEXT_OFFSET, 8);
-        assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 16);
-        assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 24);
-        assert_eq!(CLOSURE_BODY_OWN_PROPS_OFFSET, 32);
+        assert_eq!(CLOSURE_BODY_RARE_OFFSET, 16);
+        assert_eq!(CLOSURE_BODY_LAST_INSTANCE_OFFSET, 20);
+        assert_eq!(CLOSURE_BODY_BOUND_THIS_OFFSET, 24);
+        assert_eq!(CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET, 32);
     }
 
     #[test]
-    fn closure_body_carries_no_capture_tail() {
-        // Fixed-size body: the context word replaced the capture tail, the
-        // absolute spine base, and the eval-environment handle.
-        assert_eq!(std::mem::size_of::<JsClosureBody>(), 80);
+    fn plain_closure_is_a_32_byte_cell() {
+        assert_eq!(std::mem::size_of::<JsClosureBody>(), 24);
         let mut heap = GcHeap::new().expect("heap");
-        let closure = alloc_closure(&mut heap, 3, Value::undefined(), None, None).expect("alloc");
-        let tag = heap.debug_header_tag(closure.handle());
-        assert_eq!(tag, Some(JS_CLOSURE_BODY_TYPE_TAG));
+        let plain = alloc_closure(&mut heap, 3, Value::undefined(), None, None).expect("alloc");
+        assert_eq!(
+            heap.debug_header_tag(plain.handle()),
+            Some(JS_CLOSURE_BODY_TYPE_TAG)
+        );
+        let arrow = alloc_closure(&mut heap, 3, Value::undefined(), Some(Value::null()), None)
+            .expect("arrow");
+        let lexical = alloc_closure(
+            &mut heap,
+            3,
+            Value::undefined(),
+            None,
+            Some(Value::number_i32(5)),
+        )
+        .expect("lexical new.target");
+        assert_eq!(arrow.bound_this(&heap), Some(Value::null()));
+        assert_eq!(lexical.bound_this(&heap), None);
+        assert_eq!(lexical.bound_new_target(&heap), Some(Value::number_i32(5)));
+        let sizes = [plain, arrow, lexical].map(|closure| {
+            // SAFETY: the handle names a live closure cell.
+            unsafe { (*closure.handle().as_header_ptr()).size_bytes() }
+        });
+        assert_eq!(sizes, [32, 40, 48]);
+    }
+
+    #[test]
+    fn per_instance_state_lives_in_the_flags_word() {
+        let mut heap = GcHeap::new().expect("heap");
+        let closure = alloc_closure(&mut heap, 4, Value::undefined(), None, None).expect("alloc");
+        closure.mark_ordinary_lookup(&mut heap);
+        closure.set_metadata_deleted(&mut heap, "length", true);
+        closure.prevent_extensions(&mut heap);
+        assert!(closure.metadata_deleted(&heap, "length"));
+        assert!(!closure.metadata_deleted(&heap, "name"));
+        assert!(!closure.is_extensible(&heap));
+        let header = closure.call_header(&heap);
+        assert!(!header.requires_runtime_setup());
+        // SAFETY: the handle names a live closure cell.
+        let lookup = unsafe {
+            *(closure.handle().as_header_ptr() as *const u8).add(CLOSURE_NAMED_LOOKUP_BYTE as usize)
+        };
+        assert_eq!(lookup, CLOSURE_LOOKUP_ORDINARY);
     }
 
     #[test]

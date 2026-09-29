@@ -22,12 +22,14 @@ impl Traceable for Small {
     }
 }
 
-/// Payload fat enough to land in large-object space
-/// (> LARGE_OBJECT_THRESHOLD = half a page).
+/// Body whose trailing ballast is fat enough to land in large-object
+/// space (> LARGE_OBJECT_THRESHOLD = half a page). The ballast trails the
+/// body so the allocator never moves it by value.
 struct Big {
     child: Gc<Small>,
-    _ballast: [u8; 192 * 1024],
 }
+
+const BALLAST_BYTES: usize = 192 * 1024;
 
 impl Traceable for Big {
     const TYPE_TAG: u8 = 0x63;
@@ -46,10 +48,11 @@ fn large_object_old_to_young_edge_survives_scavenge() {
     heap.register_traceable::<Big>();
 
     let big = heap
-        .alloc(Big {
-            child: Gc::null(),
-            _ballast: [0u8; 192 * 1024],
-        })
+        .alloc_trailing_with_roots(
+            Big { child: Gc::null() },
+            BALLAST_BYTES,
+            &mut |_| {},
+        )
         .expect("large alloc");
     assert!(
         unsafe { (*big.as_header_ptr()).is_old() },

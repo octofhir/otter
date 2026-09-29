@@ -895,6 +895,7 @@ mod tests {
         Op::NewFinalizationRegistry,
         Op::SymbolLoad,
         Op::TypeOf,
+        Op::TestTypeOf,
         Op::DeleteElement,
         Op::Await,
         Op::SameValue,

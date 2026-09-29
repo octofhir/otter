@@ -131,6 +131,15 @@ impl BigIntValue {
         self.inner
     }
 
+    /// Trace this wrapper's body handle as a GC slot so a moving collector
+    /// rewrites it in place, where a `BigIntValue` is stored outside a
+    /// `Value` (a BigInt wrapper's `[[BigIntData]]`).
+    pub(crate) fn trace_handle_slot(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if !self.inner.is_null() {
+            visitor(std::ptr::addr_of_mut!(self.inner).cast::<otter_gc::raw::RawGc>());
+        }
+    }
+
     /// Rebuild a [`BigIntValue`] from a pre-existing
     /// [`BigIntHandle`]. Heap-free; the wrapper carries no cached
     /// fields beyond the handle.

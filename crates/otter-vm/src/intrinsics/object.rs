@@ -150,28 +150,33 @@ fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     // the matching internal data slot. Object-typed operands fall
     // through and return unchanged.
     let v = *value;
+    // The wrapped heap primitive is re-read from the rooted value after the
+    // wrapper allocation, which can move it.
     if let Some(b) = v.as_boolean() {
-        return wrap_primitive(ctx, "Boolean", v, |mut obj, heap| {
+        return wrap_primitive(ctx, "Boolean", v, |mut obj, heap, _| {
             crate::object::set_boolean_data(&mut obj, heap, b);
         });
     }
     if let Some(n) = v.as_number() {
-        return wrap_primitive(ctx, "Number", v, |mut obj, heap| {
+        return wrap_primitive(ctx, "Number", v, |mut obj, heap, _| {
             crate::object::set_number_data(&mut obj, heap, n);
         });
     }
-    if let Some(s) = v.as_string(ctx.heap()) {
-        return wrap_primitive(ctx, "String", v, |mut obj, heap| {
+    if v.as_string(ctx.heap()).is_some() {
+        return wrap_primitive(ctx, "String", v, |mut obj, heap, value| {
+            let s = value.as_string(heap).expect("rooted string primitive");
             crate::object::set_string_data(&mut obj, heap, s);
         });
     }
-    if let Some(sym) = v.as_symbol(ctx.heap()) {
-        return wrap_primitive(ctx, "Symbol", v, |mut obj, heap| {
+    if v.as_symbol(ctx.heap()).is_some() {
+        return wrap_primitive(ctx, "Symbol", v, |mut obj, heap, value| {
+            let sym = value.as_symbol(heap).expect("rooted symbol primitive");
             crate::object::set_symbol_data(&mut obj, heap, sym);
         });
     }
-    if let Some(bigint) = v.as_big_int() {
-        return wrap_primitive(ctx, "BigInt", v, |mut obj, heap| {
+    if v.as_big_int().is_some() {
+        return wrap_primitive(ctx, "BigInt", v, |mut obj, heap, value| {
+            let bigint = value.as_big_int().expect("rooted bigint primitive");
             crate::object::set_bigint_data(&mut obj, heap, bigint);
         });
     }
@@ -201,7 +206,7 @@ fn wrap_primitive<F>(
     apply_data_slot: F,
 ) -> Result<Value, NativeError>
 where
-    F: FnOnce(JsObject, &mut otter_gc::GcHeap),
+    F: FnOnce(JsObject, &mut otter_gc::GcHeap, Value),
 {
     let interp = ctx.interp_mut();
     let proto = interp
@@ -216,6 +221,7 @@ where
             name: "Object",
             reason: err.to_string(),
         })?;
-    apply_data_slot(obj, &mut interp.gc_heap);
+    // `value` rode the allocation as a root and names the moved primitive.
+    apply_data_slot(obj, &mut interp.gc_heap, value);
     Ok(Value::object(obj))
 }

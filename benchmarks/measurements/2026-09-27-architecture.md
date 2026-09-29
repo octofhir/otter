@@ -362,6 +362,64 @@ read their receiver before flattening a rope key (stale receiver after the
 flattening allocation: Set iteration order diverged under stress), and the
 `-p` completion value was unrooted across the event-loop drain.
 
+## 9. E1b so far: equality, typed views, atoms, young closures
+
+Fixed-work instructions (same method as section 8; stdout identical to E1a
+for every workload):
+
+| Workload | E1a `360a3244` | + inline `===`, typed views, atoms | + young closures `1903aa8e` | RSS E1a → now |
+|---|---:|---:|---:|---|
+| ts-fixed | 184.7G | 185.2G | 181.4G | 535 → 566 MB |
+| zlib-fixed | 243.1G | 233.9G | 234.0G | 722 → 725 MB |
+| crypto-fixed | 16.82G | 16.95G | 16.70G | 52 → 52 MB |
+| fib | 3.65G | 3.65G | 3.65G | 59 → 59 MB |
+| mega_method | 10.01G | 10.01G | 10.01G | 59 → 59 MB |
+| ast_ctor | 27.63G | 27.62G | 27.63G | 130 → 130 MB |
+| earley-boyer | 184.5G | 169.4G | 153.9G | 154 → 133 MB |
+
+(`benchmarks/results/arch-2026-09-27/e1b-eq-view`, `e1b-young`.) Earley's
+RSS is back under HEAD's 134 MB: a closure no longer drags its context into
+old space, and short-lived closures die in the nursery.
+
+- Strict equality is decided inline in both tiers (V8 `StrictEqual`): equal
+  bits, then numbers, then distinct cells by type tag; only string and BigInt
+  pairs call out.
+- Typed-array element views (off-heap data pointer + length) are GVN'd and
+  hoisted like any load keyed by a reentry epoch instead of memory versions:
+  only a reentrant call or a shape/element-metadata write can invalidate them.
+- Runtime property names are looked up by atom id; a name the interner has
+  never seen cannot be an own property of a shaped object.
+- Closures are allocated young. Moving closures exposed every Rust frame that
+  held a user function, or a value next to one, across an allocation; each
+  now reads it from a traced root afterwards (call-frame callee anchors,
+  handle scopes in prototype materialization and closure property paths,
+  anchors in the Array / Iterator / TypedArray callback natives, capability
+  handles in the Promise combinators, rooted Proxy `ownKeys` validation).
+  Some were older than this change (Promise combinators with a rejected
+  element, Proxy `ownKeys`, `Iterator.zip` result getters); built-ins under
+  `OTTER_GC_STRESS=16` went from 43 failures and crashes to 15 older ones.
+
+### Where earley's time goes now
+
+A `sample` of the isolate thread: generated code 59%, collector ~20%
+(scavenger slot processing, copying, root scan), context allocation 4%,
+closure allocation 1.6%. The allocation census explains the collector share:
+
+| Body | Allocations | Bytes | Bytes / cell |
+|---|---:|---:|---:|
+| ordinary object | 73.4M | 7.04 GB | 96 |
+| context | 20.3M | 1.54 GB | 76 |
+| closure | 10.2M | 0.90 GB | 88 |
+| string | 7.3M | 0.41 GB | 56 |
+
+9.9 GB allocated per run, 695 scavenges (1.56 s of 9.8 s wall) and 34 full
+collections (0.23 s). 73.0M of the 73.4M objects are constructor receivers
+allocated by generated code, almost all `sc_Pair` with two fields: a 96-byte
+cell where JSC's `JSFinalObject` needs 32 bytes (8-byte cell header, butterfly,
+two inline slots) and V8 needs 20 (compressed map, properties, elements, two
+fields). The ordinary-object layout is therefore the largest remaining lever
+for allocation-heavy code, ahead of inline context allocation.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):
@@ -378,7 +436,9 @@ Series E1 (environments), state at the time of writing (2026-09-29):
   `function arguments`, derived-class field initialization timing); `-e`/`-p`
   source runs in the CommonJS eval scope, where every loop scope is a context
   (a `CopyContext` allocation per iteration of a plain counting loop).
-- Next: E1b — context size (drop the per-context `extension` word for scopes
-  without sloppy eval, V8-style), young closures and inline context/closure
-  allocation in both JIT tiers, singleton-context folding; then earley RSS
-  and census re-measured.
+- E1b (section 9): inline `===`, typed-view hoisting, atom lookups and young
+  closures are committed; earley RSS is back under HEAD.
+- Next: the ordinary-object layout (section 9: 96-byte receivers), then
+  context size (drop the per-context `extension` word for scopes without
+  sloppy eval, V8-style), inline context/closure allocation in both JIT tiers,
+  singleton-context folding.

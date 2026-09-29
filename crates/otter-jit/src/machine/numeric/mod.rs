@@ -357,6 +357,7 @@ pub(crate) fn try_compile(
     let inline_diagnostics = inlining::splice(&mut hir, view, capture_events);
     let partial_escape = partial_escape::optimize(&mut hir);
     truncation::optimize(&mut hir);
+    truncation::wrap_truncated_integer_arithmetic(&mut hir);
     let loop_entries = hir.plan_loop_entries();
     let sequence =
         select_with_loop_entries(target_spec, &hir, &loop_entries, osr_pc).map_err(|error| {
@@ -2342,9 +2343,9 @@ fn select_with_loop_entries(
                         ) => Some(super::committed_probe::ProbeKind::DerivedThis),
                         CommittedValueOperation::Scalar(
                             otter_vm::native_abi::ScalarValueOp::MakeClosure,
-                        ) => Some(super::committed_probe::ProbeKind::Closure {
-                            with_context: true,
-                        }),
+                        ) => {
+                            Some(super::committed_probe::ProbeKind::Closure { with_context: true })
+                        }
                         CommittedValueOperation::Scalar(
                             otter_vm::native_abi::ScalarValueOp::MakeFunction,
                         ) => Some(super::committed_probe::ProbeKind::Closure {

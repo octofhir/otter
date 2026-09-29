@@ -202,11 +202,12 @@ pub(super) fn select_probe(
     Ok(())
 }
 
-/// Lower a speculative indexed access: the same view, bounds and slot probe
-/// as the committed form, then one exact deoptimization when any proof failed
-/// and, for a store, the no-fail write. Nothing observable happens before the
-/// exit, so the interpreter re-executes the whole access; the site's exit
-/// profile turns its next generation into the committed form.
+/// Lower a speculative indexed access: the committed form's view, then one
+/// checked operation that proves the view's hit, the bounds and the slot (or
+/// the stored value) in place and takes one exact deoptimization when any
+/// proof fails, and, for a store, the no-fail write. Nothing observable
+/// happens before the exit, so the interpreter re-executes the whole access;
+/// the site's exit profile turns its next generation into the committed form.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_guarded(
     target_spec: &TargetSpec,
@@ -221,33 +222,76 @@ pub(super) fn select_guarded(
     representations: &mut Vec<MachineRepresentation>,
     instructions: &mut Vec<MachineInstruction>,
 ) -> Result<(), super::super::VerificationError> {
-    let mut values = Values::new(representations);
-    if let Some(result) = result {
-        values.fast_payload = result;
-    }
-    select_probe(
-        target_spec,
-        byte_pc,
-        Some(access),
-        inputs,
-        values,
-        representations,
-        instructions,
-    )?;
-    let mut require = MachineInstruction::plain(
-        MachineOpcode::GuardCondition,
-        vec![MachineOperand::register_input(values.hit)],
-    );
-    require.clobbers = target_spec
-        .clobbers(TargetClobberSet::StatusScratch)
-        .to_vec();
-    attach_frame_state(hir, machine_values, state_index, exits, &mut require);
-    instructions.push(require);
-    if let Some(stored) = inputs.stored_fast {
+    let length = push_value(representations, MachineRepresentation::Int64);
+    let view_hit = push_value(representations, MachineRepresentation::Boolean);
+    // A dense receiver's proof holds no address, so it can outlive
+    // collections; the checked operation reads the base from the receiver.
+    // A typed view's off-heap base is materialized by the view itself.
+    let (proof, base) = if matches!(access.base, otter_vm::JitElementBase::InBody { .. }) {
+        (
+            MachineInstruction::plain(
+                MachineOpcode::ElementProof { byte_pc, access },
+                vec![
+                    MachineOperand::location_input(inputs.receiver),
+                    MachineOperand::register_output(length),
+                    MachineOperand::register_output(view_hit),
+                ],
+            ),
+            inputs.receiver,
+        )
+    } else {
+        let base = push_value(representations, MachineRepresentation::Int64);
+        (
+            MachineInstruction::plain(
+                MachineOpcode::ElementView { byte_pc, access },
+                vec![
+                    MachineOperand::location_input(inputs.receiver),
+                    MachineOperand::register_output(base),
+                    MachineOperand::register_output(length),
+                    MachineOperand::register_output(view_hit),
+                ],
+            ),
+            base,
+        )
+    };
+    let mut proof = proof;
+    proof.clobbers = element_clobbers(target_spec);
+    instructions.push(proof);
+    let mut operands = vec![
+        MachineOperand::location_input(base),
+        MachineOperand::location_input(length),
+        if representations[inputs.index.0 as usize] == MachineRepresentation::Float64 {
+            MachineOperand::register_input(inputs.index)
+        } else {
+            MachineOperand::location_input(inputs.index)
+        },
+        MachineOperand::register_input(view_hit),
+    ];
+    let address = inputs
+        .stored_fast
+        .map(|_| push_value(representations, MachineRepresentation::Int64));
+    let opcode = if let (Some(stored), Some(address)) = (inputs.stored_fast, address) {
+        operands.push(MachineOperand::location_input(stored));
+        operands.push(MachineOperand::register_output(address));
+        MachineOpcode::ElementCheckedAddress { byte_pc, access }
+    } else {
+        let Some(result) = result else {
+            return Err(super::super::VerificationError::OpcodeSignatureMismatch(
+                MachineInstructionId(instructions.len() as u32),
+            ));
+        };
+        operands.push(MachineOperand::register_output(result));
+        MachineOpcode::ElementCheckedLoad { byte_pc, access }
+    };
+    let mut checked = MachineInstruction::plain(opcode, operands);
+    checked.clobbers = element_clobbers(target_spec);
+    attach_frame_state(hir, machine_values, state_index, exits, &mut checked);
+    instructions.push(checked);
+    if let (Some(stored), Some(address)) = (inputs.stored_fast, address) {
         let mut effect = MachineInstruction::plain(
             MachineOpcode::ElementValueStore { byte_pc, access },
             vec![
-                MachineOperand::location_input(values.address),
+                MachineOperand::location_input(address),
                 MachineOperand::location_input(stored),
             ],
         );

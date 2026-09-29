@@ -3,6 +3,8 @@
 //! # Contents
 //! - A walk of the shared dominator tree (`super::dominance`) over the
 //!   complete normal/exception CFG.
+//! - Int32 bitwise identities (`x | 0`, `x ^ 0`, `x & -1`, shifts by zero)
+//!   replaced by their surviving input.
 //! - A scoped available-expression table keyed by canonical operands,
 //!   representation, dependency epoch, alias class, and memory version, with
 //!   a fingerprint index so each lookup is constant time.
@@ -222,6 +224,7 @@ pub(super) fn optimize(
         .map(|value| MachineValue(value as u32))
         .collect::<Vec<_>>();
     let mut eliminated = vec![false; sequence.instructions.len()];
+    let integer_constants = integer_constants(&sequence);
     let mut stats = MachineOptimizationStats::default();
     let mut visited = vec![false; sequence.blocks.len()];
     let mut available = AvailableTable::default();
@@ -268,6 +271,20 @@ pub(super) fn optimize(
                     })
                     .map(|operand| operand.value)
                     .collect::<Vec<_>>();
+                if let [output] = outputs.as_slice()
+                    && !edge_values[output.0 as usize]
+                    && let Some(source) = integer_identity(
+                        instruction,
+                        &sequence.representations,
+                        &integer_constants,
+                        &replacements,
+                    )
+                {
+                    replacements[output.0 as usize] = resolve(&replacements, source);
+                    *eliminated_slot = true;
+                    stats.eliminated_instructions += 1;
+                    continue;
+                }
                 let candidate = (!outputs.iter().any(|output| edge_values[output.0 as usize]))
                     .then(|| {
                         expression_key(
@@ -320,6 +337,72 @@ pub(super) fn optimize(
     Ok((sequence, stats))
 }
 
+/// Every integer constant's value, by the SSA value it defines.
+fn integer_constants(sequence: &InstructionSequence) -> FxHashMap<MachineValue, i64> {
+    sequence
+        .instructions
+        .iter()
+        .filter_map(
+            |instruction| match (&instruction.opcode, instruction.operands.as_slice()) {
+                (MachineOpcode::IntegerConstant(value), [output]) => Some((output.value, *value)),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// The input an int32 bitwise identity returns unchanged: `x | 0`, `x ^ 0`,
+/// `x & -1`, `x << 0` and `x >> 0` (V8's MachineOperatorReducer rules). The
+/// operation and its surviving input share the Int32 representation, so the
+/// result bits are exactly the input's.
+fn integer_identity(
+    instruction: &MachineInstruction,
+    representations: &[MachineRepresentation],
+    constants: &FxHashMap<MachineValue, i64>,
+    replacements: &[MachineValue],
+) -> Option<MachineValue> {
+    let [left, right, output] = instruction.operands.as_slice() else {
+        return None;
+    };
+    let constant = |operand: &super::MachineOperand| {
+        constants
+            .get(&resolve(replacements, operand.value))
+            .map(|value| *value as i32)
+    };
+    let (left, right) = (
+        resolve(replacements, left.value),
+        resolve(replacements, right.value),
+    );
+    let identity = match instruction.opcode {
+        MachineOpcode::IntegerOr | MachineOpcode::IntegerXor => {
+            if constant(&instruction.operands[1]) == Some(0) {
+                Some(left)
+            } else if constant(&instruction.operands[0]) == Some(0) {
+                Some(right)
+            } else {
+                None
+            }
+        }
+        MachineOpcode::IntegerAnd => {
+            if constant(&instruction.operands[1]) == Some(-1) {
+                Some(left)
+            } else if constant(&instruction.operands[0]) == Some(-1) {
+                Some(right)
+            } else {
+                None
+            }
+        }
+        // Shift counts are taken modulo 32.
+        MachineOpcode::IntegerShiftLeft | MachineOpcode::IntegerShiftRight => {
+            (constant(&instruction.operands[1]).map(|count| count & 31) == Some(0)).then_some(left)
+        }
+        _ => None,
+    }?;
+    (representations[identity.0 as usize] == MachineRepresentation::Int32
+        && representations[output.value.0 as usize] == MachineRepresentation::Int32)
+        .then_some(identity)
+}
+
 fn expression_key(
     instruction: &MachineInstruction,
     representations: &[MachineRepresentation],
@@ -357,15 +440,22 @@ fn expression_key(
         })
         .map(|operand| operand.value)
         .collect();
-    if instruction.opcode.is_off_heap_element_view() {
+    if instruction.opcode.is_collection_stable_element_proof() {
         // A typed-array view's base is off-heap storage, so a dominating view
         // of the same receiver stands for this one until JavaScript may run.
+        // A dense proof holds no address either, but generated stores write
+        // its length and representation, so it also keys on those versions.
+        let dense = matches!(instruction.opcode, MachineOpcode::ElementProof { .. });
         return Some(ExpressionKey {
             opcode: canonical_opcode(&instruction.opcode),
             inputs,
             outputs,
             dependency_epoch: state.reentry_epoch,
-            memory_versions: Vec::new(),
+            memory_versions: if dense {
+                state.memory_key(effects)
+            } else {
+                Vec::new()
+            },
             block: None,
         });
     }
@@ -393,6 +483,10 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             access: *access,
         },
+        MachineOpcode::ElementProof { access, .. } => MachineOpcode::ElementProof {
+            byte_pc: 0,
+            access: *access,
+        },
         MachineOpcode::ElementAddress { access, .. } => MachineOpcode::ElementAddress {
             byte_pc: 0,
             access: *access,
@@ -405,6 +499,16 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             byte_pc: 0,
             access: *access,
         },
+        MachineOpcode::ElementCheckedLoad { access, .. } => MachineOpcode::ElementCheckedLoad {
+            byte_pc: 0,
+            access: *access,
+        },
+        MachineOpcode::ElementCheckedAddress { access, .. } => {
+            MachineOpcode::ElementCheckedAddress {
+                byte_pc: 0,
+                access: *access,
+            }
+        }
         MachineOpcode::ElementValueStore { access, .. } => MachineOpcode::ElementValueStore {
             byte_pc: 0,
             access: *access,

@@ -1106,6 +1106,17 @@ pub enum MachineOpcode {
         /// Complete immutable layout program owned by this instruction.
         access: otter_vm::JitElementAccess,
     },
+    /// Prove a dense receiver's identity and representation and read its
+    /// live element count, without materializing its in-heap element base.
+    /// A miss only clears the Boolean result. Nothing here is a raw address,
+    /// so the proof survives collections: only a write of the receiver's
+    /// shape or element metadata, or JavaScript reentry, ends it.
+    ElementProof {
+        /// Source bytecode offset used only for diagnostics.
+        byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
+    },
     /// Prove an exact integer index is in bounds and derive one raw address
     /// from a prior view. This operation has no heap effect.
     ElementAddress {
@@ -1124,6 +1135,30 @@ pub enum MachineOpcode {
     /// Prove that a value can be written directly to one addressed element.
     /// No store is performed by this guard.
     ElementValueGuard {
+        /// Source bytecode offset used only for diagnostics.
+        byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
+    },
+    /// Speculative indexed read from a prior view or proof: the hit, the
+    /// bounds and the slot's presence are proven in place and any failure
+    /// takes the instruction's one exact deoptimization. No Boolean is
+    /// materialized; the value is the only output. A dense access takes the
+    /// rooted receiver and loads its element base after the hit check; a
+    /// typed view takes the view's off-heap base.
+    ElementCheckedLoad {
+        /// Source bytecode offset used only for diagnostics.
+        byte_pc: u32,
+        /// Complete immutable layout program owned by this instruction.
+        access: otter_vm::JitElementAccess,
+    },
+    /// Speculative store proof from a prior view or proof: the hit, the
+    /// bounds and the stored value's representation are proven in place and
+    /// any failure takes the instruction's one exact deoptimization. The
+    /// output is the raw element address the following
+    /// [`Self::ElementValueStore`] writes; no store is performed here. The
+    /// base operand is as for [`Self::ElementCheckedLoad`].
+    ElementCheckedAddress {
         /// Source bytecode offset used only for diagnostics.
         byte_pc: u32,
         /// Complete immutable layout program owned by this instruction.
@@ -3564,6 +3599,28 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }
+                if let MachineOpcode::ElementProof { access, .. } = instruction.opcode {
+                    let [receiver, length, hit] = instruction.operands.as_slice() else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let valid = matches!(access.base, otter_vm::JitElementBase::InBody { .. })
+                        && *receiver == MachineOperand::location_input(receiver.value)
+                        && *length == MachineOperand::register_output(length.value)
+                        && *hit == MachineOperand::register_output(hit.value)
+                        && self.representations[receiver.value.0 as usize]
+                            == MachineRepresentation::Tagged
+                        && self.representations[length.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && self.representations[hit.value.0 as usize]
+                            == MachineRepresentation::Boolean
+                        && instruction.clobbers == target_spec.clobbers(TargetClobberSet::Element)
+                        && instruction.safepoint.is_none()
+                        && instruction.exits.is_empty()
+                        && instruction.control == ControlFlow::None;
+                    if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
                 if matches!(instruction.opcode, MachineOpcode::ElementAddress { .. }) {
                     let [base, length, index, active, address, hit] =
                         instruction.operands.as_slice()
@@ -3659,6 +3716,84 @@ impl InstructionSequence {
                             self.representations[value.value.0 as usize],
                         );
                     if !valid {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    }
+                }
+                if let MachineOpcode::ElementCheckedLoad { access, .. }
+                | MachineOpcode::ElementCheckedAddress { access, .. } = instruction.opcode
+                {
+                    let load =
+                        matches!(instruction.opcode, MachineOpcode::ElementCheckedLoad { .. });
+                    let fixed = if load { 5 } else { 6 };
+                    let Some((fixed_operands, state)) =
+                        instruction.operands.split_at_checked(fixed)
+                    else {
+                        return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    };
+                    let (base, length, index, active) = (
+                        &fixed_operands[0],
+                        &fixed_operands[1],
+                        &fixed_operands[2],
+                        &fixed_operands[3],
+                    );
+                    let index_representation = self.representations[index.value.0 as usize];
+                    let mut frame_values = std::collections::BTreeSet::new();
+                    let operands_valid = [base, length]
+                        .into_iter()
+                        .all(|operand| *operand == MachineOperand::location_input(operand.value))
+                        && self.representations[base.value.0 as usize]
+                            == if matches!(access.base, otter_vm::JitElementBase::InBody { .. }) {
+                                MachineRepresentation::Tagged
+                            } else {
+                                MachineRepresentation::Int64
+                            }
+                        && self.representations[length.value.0 as usize]
+                            == MachineRepresentation::Int64
+                        && matches!(
+                            index_representation,
+                            MachineRepresentation::Tagged
+                                | MachineRepresentation::Int32
+                                | MachineRepresentation::Uint32
+                                | MachineRepresentation::Float64
+                        )
+                        && *index
+                            == if index_representation == MachineRepresentation::Float64 {
+                                MachineOperand::register_input(index.value)
+                            } else {
+                                MachineOperand::location_input(index.value)
+                            }
+                        && *active == MachineOperand::register_input(active.value)
+                        && self.representations[active.value.0 as usize]
+                            == MachineRepresentation::Boolean
+                        && if load {
+                            let value = &fixed_operands[4];
+                            *value == MachineOperand::register_output(value.value)
+                                && element::valid_load(
+                                    access.element,
+                                    self.representations[value.value.0 as usize],
+                                )
+                        } else {
+                            let (stored, address) = (&fixed_operands[4], &fixed_operands[5]);
+                            *stored == MachineOperand::location_input(stored.value)
+                                && element::valid_store(
+                                    access.element,
+                                    self.representations[stored.value.0 as usize],
+                                )
+                                && *address == MachineOperand::register_output(address.value)
+                                && self.representations[address.value.0 as usize]
+                                    == MachineRepresentation::Int64
+                        }
+                        && state.iter().all(|operand| {
+                            *operand == MachineOperand::frame_value(operand.value)
+                                && frame_values.insert(operand.value)
+                        });
+                    if !operands_valid
+                        || instruction.exits.is_empty()
+                        || instruction.frame_state.is_none()
+                        || instruction.clobbers != target_spec.clobbers(TargetClobberSet::Element)
+                        || instruction.safepoint.is_some()
+                        || instruction.control != ControlFlow::None
+                    {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     }
                 }

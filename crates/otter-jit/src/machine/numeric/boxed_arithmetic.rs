@@ -132,7 +132,7 @@ fn span(
 }
 
 /// Exhaustive use classification: adding a node requires stating its demands.
-fn visit_inputs(
+pub(super) fn visit_inputs(
     function: &NumericFunction,
     node: NumericNode,
     mut visit: impl FnMut(NumericValue, bool),

@@ -28,10 +28,10 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
-    JIT_CONTEXT_HAS_EXTENSION_BIT, JIT_INLINE_CONTEXT_MAX_WORDS, JIT_TYPE_STATS_ALLOC_BYTES_OFFSET,
-    JIT_TYPE_STATS_ALLOC_COUNT_OFFSET, JIT_TYPE_STATS_LIVE_BYTES_OFFSET, JIT_TYPE_STATS_ROW_BYTES,
-    JIT_CLOSURE_CELL_BYTES, JIT_YOUNG_CLOSURE_HEADER_WORD, JIT_YOUNG_CONTEXT_HEADER_WORD,
-    JitClosureAllocationPlan, JitContextAllocationPlan,
+    JIT_CLOSURE_CELL_BYTES, JIT_CONTEXT_HAS_EXTENSION_BIT, JIT_INLINE_CONTEXT_MAX_WORDS,
+    JIT_TYPE_STATS_ALLOC_BYTES_OFFSET, JIT_TYPE_STATS_ALLOC_COUNT_OFFSET,
+    JIT_TYPE_STATS_LIVE_BYTES_OFFSET, JIT_TYPE_STATS_ROW_BYTES, JIT_YOUNG_CLOSURE_HEADER_WORD,
+    JIT_YOUNG_CONTEXT_HEADER_WORD, JitClosureAllocationPlan, JitContextAllocationPlan,
 };
 
 use crate::entry::{
@@ -259,5 +259,10 @@ pub(crate) fn emit_closure(
         // The rare handle and the last-instance observation start null.
         ; str xzr, [x16, layout.rare_byte]
     );
-    emit_publish(ops, context_register, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG, 17);
+    emit_publish(
+        ops,
+        context_register,
+        otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG,
+        17,
+    );
 }

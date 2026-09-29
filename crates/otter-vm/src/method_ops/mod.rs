@@ -57,6 +57,10 @@ impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
         self.interp_roots.prepare_collection(heap);
     }
 
+    fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
+        self.interp_roots.sweep_weak(heap);
+    }
+
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         self.interp_roots.visit(visitor);
         self.recv.trace_value_slots(visitor);
@@ -80,6 +84,10 @@ struct CollectionFastDispatchRoots<'a> {
 impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
     fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
         self.interp_roots.prepare_collection(heap);
+    }
+
+    fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
+        self.interp_roots.sweep_weak(heap);
     }
 
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {

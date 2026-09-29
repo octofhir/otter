@@ -11,8 +11,10 @@
 //! - VM publication replaces one complete `Cell<Entry>` on the owning mutator
 //!   thread. A generated probe neither allocates nor reenters, so it cannot race
 //!   an entry update and needs no atomic publication protocol or epoch.
-//! - Entries contain scalar keys and pinned, immortal shape handles, never a
-//!   moving receiver, prototype, JavaScript value or borrowed slab address.
+//! - Entries contain scalar keys and non-moving shape handles, never a moving
+//!   receiver, prototype, JavaScript value or borrowed slab address. A full
+//!   collection drops every entry whose holder shape it collects before the
+//!   cell can be reused, so a handle compare here is exact.
 //! - Generated positive hits validate the live receiver/holder ordinary state,
 //!   exact key and holder shape, descriptor kind and storage bounds. Loads may
 //!   use own/direct-prototype data slots. Stores additionally require an own

@@ -683,11 +683,12 @@ impl ShapeId {
 pub(crate) struct AtomOwnPropertyHit {
     /// Shape observed on the receiver object.
     pub(crate) shape_id: ShapeId,
-    /// GC handle of the observed shape. Carried so the JIT can bake the
-    /// shape's (stable) compressed offset into a monomorphic property guard.
-    /// Not traced: shapes are immortal (rooted forever by the transition
-    /// tables) and pinned in non-moving old space, so the handle never
-    /// dangles or relocates. `Gc::null()` in dictionary mode.
+    /// GC handle of the observed shape, the fast reject of a cached hit.
+    /// Not traced: hidden classes are collectable and a later shape may take
+    /// a collected one's cell, so every consumer also compares
+    /// [`Self::shape_id`], which is never reused (the shared lookup cache is
+    /// pruned instead, because generated probes compare only the handle).
+    /// `Gc::null()` in dictionary mode.
     pub(crate) shape: ShapeHandle,
     /// Atomized named-property key from the executable context.
     pub(crate) atom_id: AtomId,
@@ -4152,15 +4153,15 @@ pub(crate) fn load_own_data_slot_atom(
     hit: AtomOwnPropertyHit,
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
-        // A shaped object's shape handle is interned and immortal, so a handle
-        // match proves identical layout with a single offset compare — no
-        // deref into the shape body to read its id, and no key compare. The
-        // handle also fixes the slot, so the cached `slot` is valid. Dictionary
-        // mode (null handle) reuses a per-object shape id that does not bump on
-        // every slot mutation, so it still confirms the id and the key by name.
+        // A shaped object's handle plus the shape's never-reused id prove the
+        // identical layout (the handle alone could name a later shape in a
+        // collected shape's cell); no key compare. The shape also fixes the
+        // slot, so the cached `slot` is valid. Dictionary mode (null handle)
+        // reuses a per-object shape id that does not bump on every slot
+        // mutation, so it still confirms the id and the key by name.
         let shaped = !body.shape.is_null();
         let shape_ok = if shaped {
-            body.shape == hit.shape
+            shaped_hit_matches(body.shape, &hit)
         } else {
             body_shape_id(heap, body) == hit.shape_id
         };
@@ -4212,6 +4213,14 @@ pub(crate) fn load_own_data_slot_atom(
     })
 }
 
+/// Whether a live object's `shape` is the one a cached `hit` was recorded
+/// under: the handle for the fast reject, then the id, since hidden classes
+/// are collectable and a later shape may occupy a collected one's cell.
+#[inline]
+fn shaped_hit_matches(shape: ShapeHandle, hit: &AtomOwnPropertyHit) -> bool {
+    shape == hit.shape && shape_body::id_of(shape) == hit.shape_id
+}
+
 /// Read a cached own data slot guarded by shape identity alone.
 ///
 /// A shape-handle match fixes both the slot and its key, so the atom compare
@@ -4228,7 +4237,7 @@ pub(crate) fn load_own_data_slot_by_shape(
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
         if body.shape.is_null()
-            || body.shape != hit.shape
+            || !shaped_hit_matches(body.shape, &hit)
             || !hit.is_data
             || !matches!(body.shape_cache_mode(), ShapeCacheMode::Fast)
             || body.chain_link_opaque()
@@ -4265,7 +4274,7 @@ pub(crate) fn store_own_data_slot_atom(
     let guard_matches = heap.read_payload(obj, |body| {
         let offset = hit.slot as usize;
         let shape_ok = if !body.shape.is_null() {
-            body.shape == hit.shape
+            shaped_hit_matches(body.shape, &hit)
         } else {
             body_shape_id(heap, body) == hit.shape_id
         };

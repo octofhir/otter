@@ -183,6 +183,19 @@ impl PropertyLookupCache {
         }
     }
 
+    /// Forget every entry whose holder hit names a shape the full
+    /// collection is about to free. Receiver keys are ids, which are never
+    /// reused, but generated megamorphic probes compare the holder's shape
+    /// handle, which a later shape could reuse.
+    pub(crate) fn forget_shapes(&self, dead: &rustc_hash::FxHashSet<u32>) {
+        for way in &*self.ways {
+            let entry = way.get();
+            if !entry.hit.shape.is_null() && dead.contains(&entry.hit.shape.offset()) {
+                way.set(Entry::EMPTY);
+            }
+        }
+    }
+
     /// Record a resolution so any site asking for this `(shape, atom)` pair
     /// answers without the ladder. Overwrites whatever shared the index —
     /// re-resolving a displaced pair costs one walk, keeping a second way

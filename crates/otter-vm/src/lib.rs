@@ -834,8 +834,6 @@ pub(crate) enum MethodCallFeedback {
         recv_shape: object::ShapeId,
         proto_chain: MethodProtoChain,
         method_value_byte: u32,
-        recv_shape_offset: u32,
-        holder_shape_offset: u32,
     },
     /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
     /// site is too polymorphic to inline profitably and always side-exits.
@@ -856,13 +854,6 @@ pub(crate) struct MethodSite {
     proto_chain: MethodProtoChain,
     /// Byte offset of the method slot within the holder's value slab.
     method_value_byte: u32,
-    /// Receiver shape as the compressed handle offset generated code compares,
-    /// captured here because the live receiver is only available at record
-    /// time. Shapes are interned and pinned, so the token stays valid.
-    pub(crate) recv_shape_offset: u32,
-    /// Compressed handle offset of the object owning the method slot, or `0`
-    /// when the receiver owns it and no prototype hop is performed.
-    pub(crate) holder_shape_offset: u32,
 }
 
 /// Match-based bytecode interpreter and isolate-owned runtime state.
@@ -1280,6 +1271,13 @@ pub struct Interpreter {
     /// published safepoint-resolver view; entries are registered at compile
     /// install and retained while any native frame can name them.
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
+    /// Hidden classes named by the compilations in progress (a stack: a
+    /// compile can start a nested one). A root until the code object that
+    /// embeds them is registered and takes them over.
+    jit_compile_shapes: std::cell::RefCell<Vec<object::ShapeHandle>>,
+    /// Nesting depth of [`Self::with_runtime_turn`]; shapes created during a
+    /// turn stay pinned until the outermost one ends.
+    runtime_turn_depth: u32,
     /// Whether compiler-generated entry-cell feedback awaits one cold,
     /// outermost-activation reconciliation pass.
     jit_generated_feedback_pending: bool,
@@ -1909,6 +1907,17 @@ impl Interpreter {
 impl otter_gc::ExtraRootSource for Interpreter {
     fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
         self.flush_constructor_observations(heap);
+    }
+
+    /// Hidden classes are collectable: forget the shapes the marking left
+    /// unreached in the shape tables and in every table generated code
+    /// probes by shape handle. Rust-side hits that outlive their shape are
+    /// rejected by id ([`object::load_own_data_slot_atom`] and siblings).
+    fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
+        let dead = self.shape_runtime.sweep_dead(heap);
+        if !dead.is_empty() {
+            self.property_cache.forget_shapes(&dead);
+        }
     }
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);

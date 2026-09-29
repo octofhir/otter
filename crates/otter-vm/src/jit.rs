@@ -780,18 +780,6 @@ pub enum JitMethodHolder {
     Dictionary(u64),
 }
 
-impl JitMethodHolder {
-    /// The live layout of `holder`: its hidden class, else its dictionary
-    /// slot-layout epoch.
-    pub(crate) fn of(holder: crate::object::JsObject, heap: &otter_gc::GcHeap) -> Option<Self> {
-        let shape = crate::object::shape(holder, heap);
-        if !shape.is_null() {
-            return Some(Self::Shape(shape.offset()));
-        }
-        crate::object::dictionary_layout(holder, heap)
-            .map(|layout| Self::Dictionary(u64::from(layout)))
-    }
-}
 
 /// One `Op::CallMethodValue` site whose callee is a declared native entry.
 ///

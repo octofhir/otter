@@ -38,6 +38,14 @@ pub(crate) struct ObjectLayoutCache {
 }
 
 impl ObjectLayoutCache {
+    /// Shape ids of every cached layout, for the root walk: a layout handed
+    /// to an embedder must keep resolving.
+    pub(crate) fn shape_ids(&self) -> impl Iterator<Item = crate::object::ShapeId> + '_ {
+        self.layouts
+            .values()
+            .flat_map(|entries| entries.iter().map(|entry| entry.layout.shape_id()))
+    }
+
     /// Translate a host atom into this isolate's permanent property atom.
     pub(crate) fn atom_id(&mut self, names: &NameInterner, atom: &HostAtom) -> AtomId {
         if let Some(id) = self.host_atoms.get(&atom.id()) {

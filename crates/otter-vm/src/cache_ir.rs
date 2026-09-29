@@ -21,9 +21,9 @@
 //! - Operand `0` is always the receiver; `1` is the receiver's prototype once a
 //!   [`CacheOp::LoadPrototype`] has run. No op reads an operand before it is
 //!   defined (guaranteed by the builders).
-//! - Shapes referenced by stub data are interned and immortal (rooted by the
-//!   transition tables, pinned in non-moving old space), so the stored
-//!   [`crate::object::ShapeId`]/hit metadata never dangles.
+//! - Stub data names shapes by id (never reused) or, in hits, by handle plus
+//!   id; a stub that outlives its shape only misses. Replayed transition
+//!   targets are traced, so a stub can never publish a collected shape.
 
 use smallvec::SmallVec;
 

@@ -657,6 +657,54 @@ setters remembered the object instead of the old-space sidecar, and
 `Object(primitive)` / sloppy-`this` wrapping used the primitive string read
 before the wrapper allocation moved it.
 
+
+### L2b research: prototype in the hidden class
+
+| | V8 | JSC | SpiderMonkey |
+|---|---|---|---|
+| where the prototype lives | `Map::prototype` | `Structure::m_prototype` (poly-proto keeps it in an inline slot when one constructor sees many prototypes) | `BaseShape::proto` |
+| fresh object for prototype P | `Map::GetObjectCreateMap` → `PrototypeInfo::ObjectCreateMap` cached on P (weak) | `Structure` cache per prototype (`StructureCache::emptyObjectStructureForPrototype`) | `SharedShape::getInitialShape(clasp, realm, proto)` in a weak zone table |
+| `setPrototypeOf` | `Map::TransitionToPrototype`: prototype transitions on the source map (weak array) | `changePrototypeTransition` | new BaseShape → new shape lineage |
+| chain guard | map check per link, or one prototype-validity cell for the whole chain | structure check per link + watchpoints | shape guard per link (`ShapeGuardProtoChain`) |
+| hidden classes collectable | yes: transitions and code embed maps weakly; dead map deopts dependent code | yes: weak transition table, code jettisoned when a structure dies | yes: shape tables are weak sets swept each GC |
+
+Otter's shapes are immortal (the shape runtime roots every handle), which
+is harmless while a shape holds only keys: a shape holding its prototype
+would keep every prototype — `Object.create(tmp)` targets, per-closure
+`.prototype` objects — alive forever. L2b therefore has two steps:
+collectable shapes first (weak side tables pruned by the post-mark pass,
+compiled code keeping the shapes it embeds, shape-keyed caches flushed when
+a full collection frees shapes), then the prototype moves into the shape
+with per-prototype roots and prototype transitions.
+
+### L2b-0 landed: collectable hidden classes
+
+- The shape runtime's id, transition and offset tables are weak; a full
+  collection's new `ExtraRootSource::sweep_weak` pass (after the ephemeron
+  fixpoint, before sweep) forgets every shape the marking left unreached
+  and hands the dead handles to the owner. The root shape and interned key
+  strings stay strong.
+- Compiled code names shapes only as immediates, so every compile-time bake
+  goes through `bake_shape`/`bake_shape_id`: the shapes are rooted for the
+  compilation and then held by the registered code object until it retires
+  (invalidated code keeps running until then).
+- Handle compares that could meet a later shape in a collected shape's cell
+  also compare the never-reused id (Rust IC hits); the shared lookup cache,
+  whose handles generated megamorphic probes compare, is pruned in the weak
+  pass. Method-leaf feedback keeps ids instead of raw offsets; a closure's
+  prototype-slot proof holds a traced shape; cached object layouts keep
+  their shapes alive.
+- A shape created during a runtime turn is pinned until the outermost turn
+  ends, which covers every Rust window between creating a shape and
+  installing it without rooting each local; shapes become collectable at
+  the next full collection after their turn.
+
+A 300-turn program creating objects with turn-unique key sets runs with a
+bounded shape set (checksums identical under `OTTER_GC_STRESS=2/16/full`);
+fixed work is unchanged (±0.3%, `benchmarks/results/arch-2026-09-27/e1b-l2b0`).
+This is the precondition for L2b-1: a shape that holds its prototype can
+now die with it.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

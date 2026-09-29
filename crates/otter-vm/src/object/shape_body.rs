@@ -24,7 +24,10 @@
 //! - Shape bodies have no interior mutability; all transition/cache mutation
 //!   belongs to interpreter-owned side tables.
 //! - The C layout exposes only the immutable identity word to generated
-//!   shared-cache probes; shape handles remain pinned in old space.
+//!   shared-cache probes; shapes live in non-moving old space, so a handle
+//!   never relocates. Shapes are collectable (see
+//!   [`super::shape_runtime`]); an id is never reused, a handle may be once
+//!   its shape is collected.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
@@ -211,11 +214,11 @@ impl otter_gc::SafeTraceable for ShapeBody {
 
 /// Allocate the root hidden-class node.
 ///
-/// Shapes are allocated directly in non-moving old space: they are immortal
-/// (rooted forever by the shape-transition tables) and the JIT bakes a
-/// shape's handle offset into emitted monomorphic property guards, so the
-/// offset must stay stable for the life of the isolate. Old-space pinning
-/// guarantees that without a separate stability mechanism.
+/// Shapes are allocated directly in non-moving old space: the JIT bakes a
+/// shape's handle offset into emitted guards and publications, so the offset
+/// must stay stable while anything names the shape (compiled code keeps the
+/// shapes it bakes alive). Old-space placement guarantees that without a
+/// separate stability mechanism.
 pub(crate) fn alloc_root_shape_body_with_roots(
     heap: &mut GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
@@ -338,6 +341,23 @@ pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &s
 #[must_use]
 pub(crate) fn shape_property_count(heap: &GcHeap, shape: ShapeHandle) -> u32 {
     heap.read_payload(shape, ShapeBody::property_count)
+}
+
+/// The id of a live, non-null `shape`, read without the heap.
+#[inline]
+#[must_use]
+pub(crate) fn id_of(shape: ShapeHandle) -> ShapeId {
+    debug_assert!(!shape.is_null());
+    // SAFETY: a non-null shape handle decompresses to a live ShapeBody cell;
+    // its payload follows the header.
+    unsafe {
+        (*(shape
+            .as_header_ptr()
+            .cast::<u8>()
+            .add(otter_gc::header::HEADER_SIZE)
+            .cast::<ShapeBody>()))
+        .id
+    }
 }
 
 /// The property count of a live, non-null `shape`, read without the heap.

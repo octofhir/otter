@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //!
-//! - [`ExtraRootSource`] — root owners and pre-collection observation hooks.
+//! - [`ExtraRootSource`] — root owners, pre-collection observation hooks, and
+//!   the post-mark weak pass over owner-held tables.
 //! - [`ExtraRoots`] — raw-pointer trampoline stored by [`crate::heap::GcHeap`].
 //! - [`ExtraRootsGuard`] — RAII registration removed on return or unwind.
 //!
@@ -37,6 +38,13 @@ pub trait ExtraRootSource {
     /// allowed, including at incremental-mark steps and sweep boundaries.
     fn prepare_collection(&self, _heap: &GcHeap) {}
 
+    /// Drop owner-held references to cells a full collection's marking left
+    /// unreached, before the sweep frees them (V8's weak-object processing,
+    /// SpiderMonkey's weak-table sweep). Mark bits are final: the ephemeron
+    /// fixpoint has run. The hook must not allocate, mark, reenter JavaScript
+    /// or retain the heap reference; it may only forget entries.
+    fn sweep_weak(&self, _heap: &GcHeap) {}
+
     /// Visit every mutable raw root slot owned by this source.
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc));
 }
@@ -47,6 +55,7 @@ pub struct ExtraRoots {
     data: *const (),
     thunk: unsafe fn(*const (), &mut dyn FnMut(*mut RawGc)),
     prepare: unsafe fn(*const (), &GcHeap),
+    sweep: unsafe fn(*const (), &GcHeap),
 }
 
 impl ExtraRoots {
@@ -65,10 +74,16 @@ impl ExtraRoots {
             unsafe { (&*(data as *const S)).prepare_collection(heap) };
         }
 
+        unsafe fn sweep<S: ExtraRootSource>(data: *const (), heap: &GcHeap) {
+            // SAFETY: the same source lifetime and concrete type as the root thunk.
+            unsafe { (&*(data as *const S)).sweep_weak(heap) };
+        }
+
         Self {
             data: source as *const S as *const (),
             thunk: thunk::<S>,
             prepare: prepare::<S>,
+            sweep: sweep::<S>,
         }
     }
 
@@ -77,6 +92,13 @@ impl ExtraRoots {
     pub fn prepare_collection(self, heap: &GcHeap) {
         // SAFETY: the registered source is live throughout this GC pause.
         unsafe { (self.prepare)(self.data, heap) };
+    }
+
+    /// Run the source's post-mark weak pass. Composite sources must forward
+    /// this hook as well as [`Self::visit`].
+    pub fn sweep_weak(self, heap: &GcHeap) {
+        // SAFETY: the registered source is live throughout this GC pause.
+        unsafe { (self.sweep)(self.data, heap) };
     }
 
     /// Visit the source's roots. Public so a composite

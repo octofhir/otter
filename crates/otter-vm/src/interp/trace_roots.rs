@@ -274,6 +274,34 @@ impl Interpreter {
             .chain(self.arguments_shape_cache.values())
     }
 
+    /// Keep alive the hidden classes compiled code embeds: those of every
+    /// registered code object and of the compilations in progress.
+    pub(crate) fn trace_compiled_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.jit_code_registry.trace_retained_shapes(visitor);
+        let compiling = self.jit_compile_shapes.borrow();
+        for shape in compiling.iter() {
+            // Shapes never move, so the slot is never rewritten.
+            visitor(std::ptr::from_ref(shape).cast_mut().cast::<otter_gc::raw::RawGc>());
+        }
+    }
+
+    /// Keep the shapes the object-layout caches name alive. Hidden classes are
+    /// collectable, and a cached layout (object literals, embedder layouts)
+    /// resolves its id to a shape on every use.
+    pub(crate) fn trace_layout_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        let ids = self
+            .object_literal_layouts
+            .values()
+            .map(|layout| layout.shape_id())
+            .chain(self.object_layout_cache.shape_ids());
+        for id in ids {
+            if let Some(mut shape) = self.shape_runtime.handle_for_id(id) {
+                // Shapes never move, so the local copy is never rewritten.
+                visitor(std::ptr::addr_of_mut!(shape).cast::<otter_gc::raw::RawGc>());
+            }
+        }
+    }
+
     /// Trace cached transition shapes through live CodeBlock-owned IC slots
     /// and the shared megamorphic transition table.
     pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {

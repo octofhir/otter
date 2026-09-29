@@ -167,8 +167,12 @@ impl<'a> RuntimeState<'a> {
         interp.trace_iterator_prototypes(visitor);
         interp.trace_function_kind_roots(visitor);
         interp.trace_iterator_side_tables(visitor);
-        // 7) GC-managed hidden-class root/key/transition side tables.
+        // 7) Hidden classes: the root shape and interned keys (the id and
+        //    transition tables are weak), the constructor and arguments shape
+        //    caches, and every shape a cached object layout names.
         interp.shape_runtime_for_trace().trace_roots(visitor);
+        interp.trace_layout_shapes(visitor);
+        interp.trace_compiled_shapes(visitor);
         for shape in interp.simple_constructor_shapes_for_trace() {
             let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
             visitor(p);

@@ -573,12 +573,12 @@ impl Interpreter {
                 .get()
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
-            crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
             let mut slots = SmallVec::<[Value; 8]>::new();
             slots.resize(initial_fields, Value::undefined());
-            crate::object::initialize_shaped_data_slots_with_capacity(
+            crate::object::install_fresh_shape_with_slots(
                 receiver,
                 &mut self.gc_heap,
+                shape,
                 slots.as_slice(),
                 field_count,
             );
@@ -2620,8 +2620,13 @@ impl Interpreter {
             &init,
         )?;
 
-        crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
-        crate::object::initialize_shaped_data_slots(receiver, &mut self.gc_heap, values.as_slice());
+        crate::object::install_fresh_shape_with_slots(
+            receiver,
+            &mut self.gc_heap,
+            shape,
+            values.as_slice(),
+            values.len(),
+        );
 
         let top_idx = stack.len() - 1;
         let frame = &mut stack[top_idx];

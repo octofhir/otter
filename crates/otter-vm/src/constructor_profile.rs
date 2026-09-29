@@ -55,7 +55,7 @@ impl ConstructorInstanceProfile {
     ) -> usize {
         const MAX_LEARNED_FIELDS: usize = 64;
         let sampled = last_receiver
-            .map(|receiver| heap.read_payload(receiver, crate::object::ObjectBody::slab_len))
+            .map(|receiver| heap.read_payload(receiver, crate::object::ObjectBody::slot_count))
             .unwrap_or(0);
         learned.max(sampled).min(MAX_LEARNED_FIELDS)
     }

@@ -46,6 +46,12 @@ pub const HEADER_FLAGS_BYTE_OFFSET: usize = 1;
 /// read by generated code that publishes a cell it sized itself.
 pub const HEADER_SIZE_BYTES_OFFSET: usize = 4;
 
+/// Byte offset of the two body-owned header bytes. The collector never
+/// reads or writes them after allocation zeroes them; the body type gives
+/// them meaning (JSC keeps per-cell type flags in its cell header the same
+/// way). They travel with the cell because evacuation copies whole cells.
+pub const HEADER_BODY_BYTES_OFFSET: usize = 2;
+
 /// The young-generation flag bit within the [`GcHeader`] flag byte
 /// ([`HEADER_FLAGS_BYTE_OFFSET`]). Exposed so the JIT can emit an inline
 /// generational write barrier (`flags & GENERATION_YOUNG_FLAG`).
@@ -128,9 +134,11 @@ pub enum MarkColor {
 pub struct GcHeader {
     type_tag: u8,
     flags: AtomicU8,
-    _reserved: u16,
+    body_bytes: [u8; 2],
     size_bytes: u32,
 }
+
+const _: () = assert!(std::mem::offset_of!(GcHeader, body_bytes) == HEADER_BODY_BYTES_OFFSET);
 
 const _: () = assert!(std::mem::offset_of!(GcHeader, size_bytes) == HEADER_SIZE_BYTES_OFFSET);
 
@@ -149,7 +157,7 @@ impl GcHeader {
         Self {
             type_tag: FREE_TAG,
             flags: AtomicU8::new(0),
-            _reserved: 0,
+            body_bytes: [0; 2],
             size_bytes,
         }
     }
@@ -161,7 +169,7 @@ impl GcHeader {
         Self {
             type_tag,
             flags: AtomicU8::new(0),
-            _reserved: 0,
+            body_bytes: [0; 2],
             size_bytes,
         }
     }
@@ -172,7 +180,7 @@ impl GcHeader {
         Self {
             type_tag,
             flags: AtomicU8::new(FLAG_YOUNG),
-            _reserved: 0,
+            body_bytes: [0; 2],
             size_bytes,
         }
     }
@@ -185,7 +193,7 @@ impl GcHeader {
         Self {
             type_tag,
             flags: AtomicU8::new(FLAG_YOUNG | (MarkColor::Black as u8)),
-            _reserved: 0,
+            body_bytes: [0; 2],
             size_bytes,
         }
     }
@@ -194,6 +202,24 @@ impl GcHeader {
     #[inline]
     pub const fn type_tag(&self) -> u8 {
         self.type_tag
+    }
+
+    /// The two body-owned header bytes ([`HEADER_BODY_BYTES_OFFSET`]).
+    #[inline]
+    pub const fn body_bytes(&self) -> [u8; 2] {
+        self.body_bytes
+    }
+
+    /// Replace the two body-owned header bytes.
+    ///
+    /// # Safety
+    /// `this` must address the header of a live cell owned by the caller's
+    /// body type; no other agent writes these bytes.
+    #[inline]
+    pub unsafe fn set_body_bytes(this: *mut Self, bytes: [u8; 2]) {
+        // SAFETY: caller contract; the field is a plain byte pair distinct
+        // from the atomic flag byte.
+        unsafe { std::ptr::addr_of_mut!((*this).body_bytes).write(bytes) };
     }
 
     /// Returns the total allocation size (header + payload).

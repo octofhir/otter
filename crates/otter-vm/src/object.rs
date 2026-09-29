@@ -106,7 +106,7 @@ pub use descriptor::{
 };
 pub(crate) use key_order::array_index_property_name;
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
-pub(crate) use shape_body::SHAPE_BODY_ID_OFFSET;
+pub(crate) use shape_body::{SHAPE_BODY_ID_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET};
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
@@ -119,7 +119,9 @@ pub(crate) use shape_transition::{
     capture_store_property_transition_with_shape, replay_store_property_transition,
 };
 
-static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
+/// Ids 0 and 1 are reserved: [`ShapeId::UNASSIGNED`] and
+/// [`ShapeId::EMPTY_DICTIONARY`].
+static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(2);
 
 fn next_shape_id() -> ShapeId {
     ShapeId(NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed))
@@ -635,15 +637,20 @@ fn slot_lookup(flags: PropertyFlags, kind: &SlotKind, value: Value) -> PropertyL
 ///
 /// Shape ids are internal metadata only. They are not serialized and have no
 /// JavaScript-observable meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(transparent)]
 pub(crate) struct ShapeId(u64);
 
 impl ShapeId {
-    /// Placeholder for fast-shaped objects that have never needed dictionary
-    /// identity. Shape-backed objects read identity from the installed GC shape;
-    /// dictionary-mode transitions overwrite this with [`next_shape_id`].
+    /// No identity: an empty cache way, or a sidecar that never held a
+    /// dictionary object's identity.
     pub(crate) const UNASSIGNED: Self = Self(0);
+
+    /// Shared identity of every empty dictionary-mode object without a
+    /// sidecar. Such objects have the same (empty) own key set, so one id
+    /// describes them all, as the root shape does for every empty shaped
+    /// object; the first key allocates the sidecar and a fresh id.
+    pub(crate) const EMPTY_DICTIONARY: Self = Self(1);
 
     /// Raw VM-local id. Exposed to the [`crate::inspect`] snapshot
     /// surface so embedder DTOs can carry a stable identity without
@@ -741,10 +748,17 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// (readers). Every store of a `Gc<…>`-bearing field is recorded through
 /// [`otter_gc::GcHeap::record_write`].
 ///
-/// The fixed body is 32 bytes and is followed in the same cell by
-/// [`Self::inline_capacity`] in-object value slots, sized per allocation
-/// site (object literals by their property count, constructor receivers by
-/// the learned field count): the JSC `JSFinalObject` / V8 in-object layout.
+/// The fixed body is 16 bytes — shape, slab, prototype and sidecar handles —
+/// and is followed in the same cell by [`Self::inline_capacity`] in-object
+/// value slots, sized per allocation site (object literals by their property
+/// count, constructor receivers by the learned field count): the JSC
+/// `JSFinalObject` / V8 in-object layout. The [`ObjectFlags`] byte and the
+/// in-object capacity live in the two body-owned GC-header bytes
+/// ([`otter_gc::header::HEADER_BODY_BYTES_OFFSET`]), as JSC keeps per-cell
+/// flags in its cell header. The live slot count is the shape's property
+/// count, or the sidecar's dictionary slot count for a dictionary-mode
+/// object, so appending to a shaped object stores a slot and a shape and
+/// nothing else.
 /// String-keyed slot `i` lives in those in-object slots while the object has
 /// no out-of-line slab, and at word `i` of the slab once it has one; the
 /// first store past the in-object capacity moves every slot to the slab.
@@ -753,7 +767,7 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
 /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct ObjectBody {
     /// GC-managed hidden class for fast ordinary objects. First field so
     /// the JIT can read the shape token at a fixed byte offset
@@ -784,41 +798,15 @@ pub struct ObjectBody {
     jit_proto: JsObject,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
     /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
-    /// slots, and the Date/Error/raw-JSON/arguments markers. Null for plain
+    /// slots, the Date/Error/raw-JSON/arguments markers, and a dictionary-mode
+    /// object's keys, slot count and structural identity. Null for plain
     /// objects and class instances (the overwhelming common case), so an
-    /// ordinary object never pays for these ~140 bytes. Allocated on first
-    /// write through [`ObjectBody::exotic_mut`].
+    /// ordinary object never pays for these ~140 bytes.
     exotic: ExoticSlot,
-    /// Slot-layout epoch of a dictionary-mode object: which key occupies
-    /// which slot with which kind and attributes. Unlike
-    /// [`Self::dictionary_shape_id`] it survives appending a new key to an
-    /// object already in dictionary mode — no existing key moves or changes
-    /// kind — and advances on every other structural change: entering
-    /// dictionary mode, deleting a key, or redefining a slot a compiled proof
-    /// watches ([`watch_dictionary_slot`]). Generated
-    /// proofs about one existing key (a global binding, a dictionary
-    /// prototype's method) guard this word, so unrelated globals added after
-    /// compilation do not retire them. `0` means "never in dictionary mode";
-    /// the counter saturates at `u32::MAX`, a value no proof may capture.
-    dictionary_layout: u32,
-    /// Count of live string-keyed slots, in-object or in the slab.
-    slab_len: u16,
-    /// [`ObjectFlags`] bits: `[[Extensible]]`, in-place attribute override,
-    /// prototype-chain opacity and dictionary-compatible cache mode. One byte
-    /// so a generated guard tests every state bit it needs with one load.
-    flags: u8,
-    /// Number of in-object value slots trailing this body. Fixed for the
-    /// object's lifetime; the cell holds exactly this many words after the
-    /// fixed body.
-    inline_capacity: u8,
-    /// Fallback/dictionary identity used only when [`Self::shape`] is null.
-    /// Fast shaped objects keep this as [`ShapeId::UNASSIGNED`] so allocation
-    /// does not need per-object unique metadata; conversion to dictionary mode
-    /// assigns a fresh id before clearing the shape.
-    dictionary_shape_id: ShapeId,
 }
 
-/// Bits of [`ObjectBody::flags`].
+/// Bits of an ordinary object's flag byte, the first body-owned GC-header
+/// byte.
 ///
 /// A fresh ordinary object carries exactly [`ObjectFlags::EXTENSIBLE`], so
 /// generated receiver allocation writes one constant byte.
@@ -856,16 +844,39 @@ impl ObjectFlags {
 impl ObjectBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         if self.slab.is_null() {
-            for value in &self.inline_values()[..self.slab_len as usize] {
+            for value in &self.inline_values()[..self.slot_count()] {
                 crate::code_liveness::visit_value(value, visitor);
             }
         }
     }
 
+    /// The cell header in front of this body. Valid only for a body that
+    /// lives in its heap cell; a pending body carries its header bytes in
+    /// [`PendingObject`].
+    #[inline]
+    fn cell_header(&self) -> *mut otter_gc::GcHeader {
+        // SAFETY: address computation only; every heap-resident body follows
+        // its header in the same cell.
+        unsafe {
+            (self as *const Self)
+                .cast::<u8>()
+                .sub(otter_gc::header::HEADER_SIZE)
+                .cast::<otter_gc::GcHeader>()
+                .cast_mut()
+        }
+    }
+
+    /// The [`ObjectFlags`] byte.
+    #[inline]
+    fn flags(&self) -> u8 {
+        // SAFETY: a heap-resident body's header precedes it.
+        unsafe { (*self.cell_header()).body_bytes()[0] }
+    }
+
     /// `[[Extensible]]`.
     #[inline]
     pub(crate) fn extensible(&self) -> bool {
-        self.flags & ObjectFlags::EXTENSIBLE != 0
+        self.flags() & ObjectFlags::EXTENSIBLE != 0
     }
 
     #[inline]
@@ -876,7 +887,7 @@ impl ObjectBody {
     /// See [`ObjectFlags::SLOT_ATTRS_OVERRIDDEN`].
     #[inline]
     pub(crate) fn slot_attrs_overridden(&self) -> bool {
-        self.flags & ObjectFlags::SLOT_ATTRS_OVERRIDDEN != 0
+        self.flags() & ObjectFlags::SLOT_ATTRS_OVERRIDDEN != 0
     }
 
     #[inline]
@@ -887,7 +898,7 @@ impl ObjectBody {
     /// See [`ObjectFlags::CHAIN_LINK_OPAQUE`].
     #[inline]
     pub(crate) fn chain_link_opaque(&self) -> bool {
-        self.flags & ObjectFlags::CHAIN_LINK_OPAQUE != 0
+        self.flags() & ObjectFlags::CHAIN_LINK_OPAQUE != 0
     }
 
     #[inline]
@@ -898,7 +909,7 @@ impl ObjectBody {
     /// Whether string-keyed shape assumptions are IC-compatible.
     #[inline]
     pub(crate) fn shape_cache_mode(&self) -> ShapeCacheMode {
-        if self.flags & ObjectFlags::DICTIONARY_COMPATIBLE != 0 {
+        if self.flags() & ObjectFlags::DICTIONARY_COMPATIBLE != 0 {
             ShapeCacheMode::DictionaryCompatible
         } else {
             ShapeCacheMode::Fast
@@ -915,17 +926,30 @@ impl ObjectBody {
 
     #[inline]
     fn set_flag(&mut self, bit: u8, on: bool) {
-        if on {
-            self.flags |= bit;
-        } else {
-            self.flags &= !bit;
+        let header = self.cell_header();
+        // SAFETY: a heap-resident body's header precedes it; the mutator is
+        // the only writer of the body-owned header bytes.
+        unsafe {
+            let [flags, capacity] = (*header).body_bytes();
+            let flags = if on { flags | bit } else { flags & !bit };
+            otter_gc::GcHeader::set_body_bytes(header, [flags, capacity]);
         }
     }
 
     /// Number of in-object value slots in this cell.
     #[inline]
     pub(crate) fn inline_capacity(&self) -> usize {
-        usize::from(self.inline_capacity)
+        // SAFETY: a heap-resident body's header precedes it.
+        usize::from(unsafe { (*self.cell_header()).body_bytes()[1] })
+    }
+
+    /// Write the header bytes of a freshly allocated cell, before any
+    /// collection can observe it.
+    #[inline]
+    fn init_cell_bytes(&mut self, flags: u8, capacity: u8) {
+        // SAFETY: called by the allocation initializer on the body's final
+        // address.
+        unsafe { otter_gc::GcHeader::set_body_bytes(self.cell_header(), [flags, capacity]) };
     }
 
     /// Base of the in-object slots trailing the fixed body.
@@ -940,8 +964,8 @@ impl ObjectBody {
     #[inline]
     fn inline_values(&self) -> &[Value] {
         // SAFETY: an allocated body owns `inline_capacity` words after the
-        // fixed part; words past `slab_len` hold stale or zero bits that are
-        // never traced or read as slots.
+        // fixed part; words past the slot count hold stale or zero bits that
+        // are never traced or read as slots.
         unsafe { std::slice::from_raw_parts(self.inline_values_ptr(), self.inline_capacity()) }
     }
 }
@@ -1086,6 +1110,25 @@ pub struct ExoticSlots {
     /// `[[ParameterMap]]` presence marker for arguments-exotic objects
     /// (§10.4.4); mapping data itself lives in `host_data`.
     is_arguments_object: bool,
+    /// Live slot count of a dictionary-mode object (null shape). A shaped
+    /// object's count is its shape's property count, so this is meaningful
+    /// only while the owner is in dictionary mode.
+    dictionary_slot_count: u32,
+    /// Slot-layout epoch of a dictionary-mode object: which key occupies
+    /// which slot with which kind and attributes. Unlike
+    /// [`Self::dictionary_shape_id`] it survives appending a new key to an
+    /// object already in dictionary mode — no existing key moves or changes
+    /// kind — and advances on every other structural change: entering
+    /// dictionary mode, deleting a key, or redefining a slot a compiled proof
+    /// watches ([`watch_dictionary_slot`]). Generated proofs about one
+    /// existing key (a global binding, a dictionary prototype's method) guard
+    /// this word, so unrelated globals added after compilation do not retire
+    /// them. `0` means "never in dictionary mode"; the counter saturates at
+    /// `u32::MAX`, a value no proof may capture.
+    dictionary_layout: u32,
+    /// Structural identity of a dictionary-mode object, refreshed on every
+    /// key-set change; [`ShapeId::UNASSIGNED`] once it adopts a shape.
+    dictionary_shape_id: ShapeId,
 }
 
 impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
@@ -1339,14 +1382,14 @@ impl DictKeysBody {
     }
 
     /// Entry index of `key`, or `None`.
-    fn find(&self, key: &str) -> Option<u16> {
+    fn find(&self, key: &str) -> Option<u32> {
         let bucket = (dict_key_hash(key) as u32 & self.bucket_mask) as usize;
         // SAFETY: `bucket < bucket_count`; buckets were initialised.
         let mut current = unsafe { *self.buckets_ptr().add(bucket) };
         while current != DICT_CHAIN_END {
             let index = current as usize;
             if self.key_at(index) == key {
-                return Some(index as u16);
+                return Some(u32::try_from(index).expect("dictionary index exceeds u32"));
             }
             // SAFETY: chain indices always name written entries.
             current = unsafe { (*self.entries_ptr().add(index)).next };
@@ -2087,6 +2130,15 @@ pub(crate) fn ensure_exotic_with_roots(
     let owner = *object;
     heap.with_payload(owner, |body| {
         body.exotic.set(sidecar);
+        // A dictionary object leaves the shared empty identity the moment it
+        // can hold keys: every sidecar-bearing dictionary object has an id
+        // of its own, and its slot-layout epoch starts at the first provable
+        // value (appends keep it; `0` would make it unprovable forever).
+        if body.shape.is_null() {
+            let exotic = body.exotic_mut();
+            exotic.dictionary_shape_id = next_shape_id();
+            exotic.dictionary_layout = 1;
+        }
         true
     });
     // Installed by a raw payload write, so record the edge the mutator
@@ -2142,13 +2194,6 @@ where
 /// JIT reads the shape handle here for the monomorphic IC guard.
 pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
 
-/// Byte offset of the dictionary slot-layout epoch
-/// ([`ObjectBody::dictionary_layout`]). Generated proofs about one existing
-/// key of a dictionary-mode object compare this `u32` after proving the
-/// ordinary shape handle is absent.
-pub(crate) const OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, dictionary_layout);
-
 /// Byte offset of the flat [`ObjectBody::jit_proto`] mirror within an
 /// [`ObjectBody`] payload. The method-inline guard reads the receiver's
 /// prototype handle here to chase the prototype chain in machine code.
@@ -2159,21 +2204,24 @@ pub(crate) const OBJECT_BODY_JIT_PROTO_OFFSET: usize = std::mem::offset_of!(Obje
 /// `OBJECT_BODY_INLINE_VALUES_OFFSET + 8 * i`.
 pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize = std::mem::size_of::<ObjectBody>();
 
-/// Byte offset of the [`ObjectBody::slab_len`] counter.
-pub(crate) const OBJECT_BODY_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab_len);
-
 /// Byte offset of the out-of-line slab handle. The JIT reads it to branch
 /// in-object vs out-of-line: a null handle means the slots live in-object.
-/// `slab_len` cannot decide this — the capacity model can move an object's
-/// slots out of line before they outgrow the in-object capacity (an
+/// The slot count cannot decide this — the capacity model can move an
+/// object's slots out of line before they outgrow the in-object capacity (an
 /// existing-slot slow store reserves ahead), and a spilled slab that shrinks
 /// back stays out of line.
 pub(crate) const OBJECT_BODY_SLAB_HANDLE_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab);
-/// Byte offset of the [`ObjectFlags`] byte.
-pub(crate) const OBJECT_BODY_FLAGS_OFFSET: usize = std::mem::offset_of!(ObjectBody, flags);
-/// Byte offset of the in-object capacity byte.
-pub(crate) const OBJECT_BODY_INLINE_CAPACITY_OFFSET: usize =
-    std::mem::offset_of!(ObjectBody, inline_capacity);
+/// Cell offset (from the GC header) of the [`ObjectFlags`] byte.
+pub(crate) const OBJECT_CELL_FLAGS_BYTE: usize = otter_gc::header::HEADER_BODY_BYTES_OFFSET;
+/// Cell offset (from the GC header) of the in-object capacity byte.
+pub(crate) const OBJECT_CELL_INLINE_CAPACITY_BYTE: usize =
+    otter_gc::header::HEADER_BODY_BYTES_OFFSET + 1;
+/// Byte offset of a dictionary-mode object's slot-layout epoch inside its
+/// [`ExoticSlots`] payload. Generated proofs about one existing key of a
+/// dictionary-mode object compare this `u32` after proving the shape handle
+/// is absent and the sidecar present.
+pub(crate) const EXOTIC_SLOTS_DICTIONARY_LAYOUT_OFFSET: usize =
+    std::mem::offset_of!(ExoticSlots, dictionary_layout);
 /// Byte offset of the 4-byte rare-state GC handle inside [`ExoticSlot`].
 /// A zero word proves the complete sidecar is absent.
 pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
@@ -2188,47 +2236,101 @@ const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
 const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 4);
 const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 8);
 const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 12);
-const _: () = assert!(OBJECT_BODY_DICTIONARY_LAYOUT_OFFSET == 16);
-const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 20);
-const _: () = assert!(OBJECT_BODY_FLAGS_OFFSET == 22);
-const _: () = assert!(OBJECT_BODY_INLINE_CAPACITY_OFFSET == 23);
-const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 32);
+const _: () = assert!(OBJECT_CELL_FLAGS_BYTE == 2);
+const _: () = assert!(OBJECT_CELL_INLINE_CAPACITY_BYTE == 3);
+const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 16);
 // The in-object slots must stay 8-aligned for the JIT's word loads.
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
 const _: () = assert!(std::mem::align_of::<ObjectBody>() == 8);
 const _: () = assert!(MAX_INLINE_CAPACITY <= u8::MAX as usize);
 
-// Pin the fixed footprint: shape, slab, prototype, sidecar, dictionary epoch,
-// slot count, flag and capacity bytes, dictionary id. Every in-object slot
-// follows in the same cell.
-const _: () = assert!(std::mem::size_of::<ObjectBody>() == 32);
+// Pin the fixed footprint: shape, slab, prototype and sidecar handles. Every
+// in-object slot follows in the same cell.
+const _: () = assert!(std::mem::size_of::<ObjectBody>() == 16);
 
 impl ObjectBody {
-    /// Assign a fresh dictionary structural id for a key-set change.
+    /// Enter (or stay in) dictionary mode for a key-set change: carry the
+    /// live slot count into the sidecar, assign a fresh structural id, and
+    /// clear the shape.
     ///
-    /// `append` marks a change that only appends a new key: when the object is
-    /// already in dictionary mode every existing key keeps its slot, kind and
-    /// attributes, so [`Self::dictionary_layout`] survives. Every other change
-    /// passed here — entering dictionary mode, deleting a key, clearing the
-    /// key set — also advances the layout epoch. Call before clearing a shape
-    /// handle, so the current mode is still observable.
-    fn replace_dictionary_identity(&mut self, append: bool) {
-        self.dictionary_shape_id = next_shape_id();
-        if !append || !self.shape.is_null() {
-            self.advance_dictionary_layout();
+    /// `append` marks a change that only appends a new key: when the object
+    /// is already in dictionary mode every existing key keeps its slot, kind
+    /// and attributes, so the slot-layout epoch
+    /// ([`ExoticSlots::dictionary_layout`]) survives. Every other change —
+    /// entering dictionary mode, deleting a key, clearing the key set — also
+    /// advances the epoch. A dictionary object keeps its keys in the
+    /// sidecar, so the sidecar exists whenever the object has a slot; an
+    /// empty object without one stays at [`ShapeId::EMPTY_DICTIONARY`].
+    fn enter_dictionary_mode(&mut self, append: bool) {
+        let advance_layout = !append || !self.shape.is_null();
+        self.enter_dictionary_mode_as(next_shape_id(), advance_layout);
+    }
+
+    /// [`Self::enter_dictionary_mode`] under a structural id the caller
+    /// chose (a captured transition replays its id), advancing the
+    /// slot-layout epoch when `advance_layout`.
+    pub(super) fn enter_dictionary_mode_as(&mut self, id: ShapeId, advance_layout: bool) {
+        let count = self.slot_count();
+        if self.exotic.is_null() {
+            debug_assert_eq!(count, 0, "a dictionary object with slots owns a sidecar");
+            self.shape = ShapeHandle::null();
+            return;
+        }
+        let exotic = self.exotic_mut();
+        exotic.dictionary_slot_count = u32::try_from(count).expect("slot count exceeds u32");
+        exotic.dictionary_shape_id = id;
+        if advance_layout {
+            exotic.dictionary_layout = exotic.dictionary_layout.saturating_add(1);
+        }
+        self.shape = ShapeHandle::null();
+    }
+
+    /// Advance a dictionary-mode object's slot-layout epoch, saturating at
+    /// the unprovable `u32::MAX`.
+    pub(super) fn advance_dictionary_layout(&mut self) {
+        if !self.exotic.is_null() {
+            let exotic = self.exotic_mut();
+            exotic.dictionary_layout = exotic.dictionary_layout.saturating_add(1);
         }
     }
 
-    /// Advance the slot-layout epoch, saturating at the unprovable
-    /// `u32::MAX`.
-    pub(super) fn advance_dictionary_layout(&mut self) {
-        self.dictionary_layout = self.dictionary_layout.saturating_add(1);
+    /// Structural id of a dictionary-mode object.
+    fn dictionary_shape_id(&self) -> ShapeId {
+        exotic_body_of(self.exotic.get()).map_or(ShapeId::EMPTY_DICTIONARY, |exotic| {
+            // SAFETY: a non-null handle names a live sidecar payload.
+            let id = unsafe { (*exotic).dictionary_shape_id };
+            if id == ShapeId::UNASSIGNED {
+                ShapeId::EMPTY_DICTIONARY
+            } else {
+                id
+            }
+        })
     }
 
-    /// Number of live string-keyed slots.
+    /// A dictionary-mode object's slot-layout epoch; `0` when it has none.
+    fn dictionary_layout(&self) -> u32 {
+        // SAFETY: a non-null handle names a live sidecar payload.
+        exotic_body_of(self.exotic.get()).map_or(0, |exotic| unsafe { (*exotic).dictionary_layout })
+    }
+
+    /// Number of live string-keyed slots: the shape's property count, or the
+    /// sidecar's dictionary slot count in dictionary mode.
     #[inline]
-    pub(crate) fn slab_len(&self) -> usize {
-        self.slab_len as usize
+    pub(crate) fn slot_count(&self) -> usize {
+        if !self.shape.is_null() {
+            return shape_body::property_count_of(self.shape) as usize;
+        }
+        // SAFETY: a non-null handle names a live sidecar payload.
+        exotic_body_of(self.exotic.get())
+            .map_or(0, |exotic| unsafe { (*exotic).dictionary_slot_count } as usize)
+    }
+
+    /// Set a dictionary-mode object's slot count.
+    #[inline]
+    fn set_dictionary_slot_count(&mut self, count: usize) {
+        debug_assert!(self.shape.is_null(), "a shaped object's count is its shape's");
+        self.exotic_mut().dictionary_slot_count =
+            u32::try_from(count).expect("slot count exceeds u32");
     }
 
     /// Whether the slab is held inline in the body (small object) rather than
@@ -2281,7 +2383,7 @@ impl ObjectBody {
     /// Read the value word for string-keyed slot `i`.
     #[inline]
     fn slot_word(&self, i: usize) -> Value {
-        debug_assert!(i < self.slab_len(), "slab read out of range");
+        debug_assert!(i < self.slot_count(), "slab read out of range");
         // SAFETY: `i` is below the live slot count, which never exceeds the
         // active buffer's capacity.
         unsafe { *self.values_base().add(i) }
@@ -2296,35 +2398,47 @@ impl ObjectBody {
     /// Write a value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: Value) {
-        debug_assert!(i < self.slab_len(), "slab write out of range");
+        debug_assert!(i < self.slot_count(), "slab write out of range");
         // SAFETY: same in-range word as `slot_word`.
         unsafe { *self.values_base().add(i) = value };
     }
 
-    /// Append one slot word into the active buffer. The caller reserved the
-    /// room through [`reserve_slot_capacity`], which moves every slot to a
-    /// slab when the in-object capacity is exhausted.
+    /// Write slot word `index` of an append into the active buffer. The
+    /// caller reserved the room through [`reserve_slot_capacity`], which
+    /// moves every slot to a slab when the in-object capacity is exhausted.
+    /// A shaped object's count follows from the shape its caller installs
+    /// (before or after this write, with no safepoint between); a
+    /// dictionary object's count advances here.
     #[inline]
-    fn push_slab_word(&mut self, value: Value) {
-        let len = self.slab_len();
+    fn push_slab_word(&mut self, index: usize, value: Value) {
         debug_assert!(
-            len < self.slab_capacity(),
-            "slab append past reserved capacity: len={len} capacity={}; \
+            index < self.slab_capacity(),
+            "slab append past reserved capacity: index={index} capacity={}; \
              the caller must reserve through `reserve_slot_capacity` first",
             self.slab_capacity(),
         );
         // SAFETY: the append index is inside the reserved capacity of the
         // active buffer.
-        unsafe { *self.values_base().add(len) = value };
-        self.slab_len += 1;
+        unsafe { *self.values_base().add(index) = value };
+        if self.shape.is_null() {
+            debug_assert_eq!(self.slot_count(), index, "dictionary append desynced");
+            self.set_dictionary_slot_count(index + 1);
+        } else {
+            let count = self.slot_count();
+            debug_assert!(
+                count == index || count == index + 1,
+                "shaped append at {index} under a shape of {count} slots"
+            );
+        }
     }
 
-    /// Remove the slot word at `i`, shifting later words down. Stays out of
-    /// line once spilled (delete normalizes to dictionary mode, an uncommon
-    /// path).
+    /// Remove the slot word at `i` of a dictionary-mode object, shifting
+    /// later words down. Stays out of line once spilled (delete normalizes to
+    /// dictionary mode, an uncommon path).
     #[inline]
     fn remove_slab_word(&mut self, i: usize) {
-        let len = self.slab_len();
+        debug_assert!(self.shape.is_null(), "only dictionary objects remove slots");
+        let len = self.slot_count();
         // SAFETY: `i < len <= capacity`; the shift stays inside the live
         // words of whichever buffer is active.
         unsafe {
@@ -2332,7 +2446,7 @@ impl ObjectBody {
             std::ptr::copy(base.add(i + 1), base.add(i), len - i - 1);
             *base.add(len - 1) = Value::default();
         }
-        self.slab_len -= 1;
+        self.set_dictionary_slot_count(len - 1);
     }
 
     /// Install a larger out-of-line slab, copying the live words across.
@@ -2344,7 +2458,7 @@ impl ObjectBody {
     /// capacity that already exists.
     fn adopt_slab(&mut self, slab: slot_slab::SlotSlabHandle) {
         debug_assert!(!slab.is_null(), "adopting a null slab");
-        let live = self.slab_len();
+        let live = self.slot_count();
         let source = self.values_base();
         // SAFETY: the new slab was allocated with capacity for at least
         // `live` words and does not overlap the current buffer.
@@ -2368,8 +2482,7 @@ impl ObjectBody {
     /// index-aligned with the value array. For an accessor slot `value` is the
     /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
     fn push_slot(&mut self, index: usize, meta: SlotMeta, value: Value) {
-        debug_assert_eq!(self.slab_len(), index, "value slab append desynced");
-        self.push_slab_word(value);
+        self.push_slab_word(index, value);
         if self.slots_materialized() {
             debug_assert_eq!(self.slots().len(), index, "materialized slots desynced");
             self.slots_mut().push(meta);
@@ -2430,7 +2543,7 @@ impl ObjectBody {
                 // slot some compiled proof reads directly moves the slot-layout
                 // epoch those proofs guard.
                 if redefined && self.shape.is_null() {
-                    self.dictionary_shape_id = next_shape_id();
+                    self.exotic_mut().dictionary_shape_id = next_shape_id();
                     if retires_proofs {
                         self.advance_dictionary_layout();
                     }
@@ -2519,7 +2632,7 @@ impl ObjectBody {
     /// materializing per-slot metadata first), so `slots()` is authoritative.
     fn remove_slot(&mut self, i: usize) {
         let len = self.slots().len();
-        debug_assert_eq!(self.slab_len(), len, "value slab metadata desynced");
+        debug_assert_eq!(self.slot_count(), len, "value slab metadata desynced");
         self.remove_slab_word(i);
         self.slots_mut().remove(i);
     }
@@ -2662,7 +2775,7 @@ impl ObjectBody {
     /// avoids allocating/maintaining a `FxHashMap` per object. This matters for
     /// `JSON.parse`, which builds large numbers of small dictionary objects.
     #[inline]
-    fn dictionary_index_get(&self, key: &str) -> Option<u16> {
+    fn dictionary_index_get(&self, key: &str) -> Option<u32> {
         self.dict_keys().and_then(|table| table.find(key))
     }
 
@@ -2795,8 +2908,11 @@ impl otter_gc::SafeTraceable for ObjectBody {
     fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
         self.trace_fixed_slots(v);
         let base = self.values_base();
-        for i in 0..self.slab_len() {
-            // SAFETY: `i < slab_len`, a live word of the active buffer.
+        // The fixed handles are visited first, so a relocating visitor has
+        // already rewritten the shape and sidecar handles the count reads.
+        for i in 0..self.slot_count() {
+            // SAFETY: `i` is below the slot count, a live word of the active
+            // buffer.
             // `Value` skips immediates and rewrites the low-word GC offset of
             // cells in place.
             unsafe { (*base.add(i)).trace_value_slot_mut(v) };
@@ -3055,26 +3171,40 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     }
 }
 
-fn empty_object_body(capacity: usize) -> ObjectBody {
-    debug_assert!(capacity <= MAX_INLINE_CAPACITY);
-    ObjectBody {
-        shape: ShapeHandle::null(),
-        slab: otter_gc::Gc::null(),
-        jit_proto: otter_gc::Gc::null(),
-        exotic: ExoticSlot::null(),
-        dictionary_layout: 0,
-        slab_len: 0,
-        flags: ObjectFlags::EXTENSIBLE,
-        inline_capacity: capacity as u8,
-        dictionary_shape_id: ShapeId::UNASSIGNED,
+/// An object body about to be allocated, with the flag and capacity bytes
+/// its allocation writes into the cell header.
+struct PendingObject {
+    body: ObjectBody,
+    flags: u8,
+    capacity: u8,
+}
+
+impl PendingObject {
+    /// Trailing in-object slot bytes of the cell.
+    fn trailing_bytes(&self) -> usize {
+        usize::from(self.capacity) * std::mem::size_of::<Value>()
     }
 }
 
-fn empty_object_body_with_shape(shape: ShapeHandle, capacity: usize) -> ObjectBody {
+fn empty_object_body(capacity: usize) -> PendingObject {
+    debug_assert!(capacity <= MAX_INLINE_CAPACITY);
+    PendingObject {
+        body: ObjectBody {
+            shape: ShapeHandle::null(),
+            slab: otter_gc::Gc::null(),
+            jit_proto: otter_gc::Gc::null(),
+            exotic: ExoticSlot::null(),
+        },
+        flags: ObjectFlags::EXTENSIBLE,
+        capacity: capacity as u8,
+    }
+}
+
+fn empty_object_body_with_shape(shape: ShapeHandle, capacity: usize) -> PendingObject {
     debug_assert_object_shape_handle(shape, "object allocation shape");
-    let mut body = empty_object_body(capacity);
-    body.shape = shape;
-    body
+    let mut pending = empty_object_body(capacity);
+    pending.body.shape = shape;
+    pending
 }
 
 fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
@@ -3094,37 +3224,45 @@ fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
     }
 }
 
-fn empty_dictionary_object_body(capacity: usize) -> ObjectBody {
-    let mut body = empty_object_body(capacity);
-    body.replace_dictionary_identity(false);
-    body
-}
-
-/// Trailing bytes of an object body with `capacity` in-object slots.
-#[inline]
-fn inline_bytes(body: &ObjectBody) -> usize {
-    body.inline_capacity() * std::mem::size_of::<Value>()
+/// An empty dictionary-mode object: a null shape and no sidecar, so its
+/// identity is the shared [`ShapeId::EMPTY_DICTIONARY`] until its first key.
+fn empty_dictionary_object_body(capacity: usize) -> PendingObject {
+    empty_object_body(capacity)
 }
 
 /// Allocate an ordinary object body in the young generation (old when the
 /// heap tenures), reserving its in-object slots.
 fn alloc_object_body_with_roots(
     heap: &mut GcHeap,
-    body: ObjectBody,
+    pending: PendingObject,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let extra = inline_bytes(&body);
-    heap.alloc_trailing_with_roots(body, extra, external_visit)
+    let extra = pending.trailing_bytes();
+    let PendingObject {
+        body,
+        flags,
+        capacity,
+    } = pending;
+    heap.alloc_trailing_with_roots_initialized(body, extra, external_visit, |body| {
+        body.init_cell_bytes(flags, capacity);
+    })
 }
 
 /// Allocate an ordinary object body directly in old space.
 fn alloc_object_body_old(
     heap: &mut GcHeap,
-    body: ObjectBody,
+    pending: PendingObject,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let extra = inline_bytes(&body);
+    let extra = pending.trailing_bytes();
+    let PendingObject {
+        body,
+        flags,
+        capacity,
+    } = pending;
     let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-    heap.alloc_variable_with_roots(body, extra, &mut no_roots)
+    heap.alloc_variable_with_roots_initialized(body, extra, &mut no_roots, |body| {
+        body.init_cell_bytes(flags, capacity);
+    })
 }
 
 /// Allocate an old-space object for raw GC fixtures.
@@ -3221,10 +3359,13 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     };
 
     let capacity = if fits_inline { values.len() } else { 0 };
-    let mut body = empty_object_body_with_shape(shape, capacity);
+    let PendingObject {
+        mut body,
+        flags,
+        capacity: capacity_byte,
+    } = empty_object_body_with_shape(shape, capacity);
     body.slab = slab;
     body.jit_proto = prototype.unwrap_or_default();
-    body.slab_len = u16::try_from(values.len()).expect("object layout exceeds u16 slots");
 
     let slab_slot = (!slab.is_null()).then(|| std::ptr::addr_of!(slab).cast_mut().cast::<RawGc>());
     let values_base = values.as_mut_ptr();
@@ -3242,6 +3383,7 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     };
     let extra = capacity * std::mem::size_of::<Value>();
     heap.alloc_trailing_with_roots_initialized(body, extra, &mut visit, |body| {
+        body.init_cell_bytes(flags, capacity_byte);
         if fits_inline {
             // SAFETY: the rooted buffer was rewritten by any collection the
             // allocation ran; the cell holds `values_len` in-object words.
@@ -3252,44 +3394,42 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     })
 }
 
-/// Initialize a freshly allocated shaped object with the values for every
-/// hidden-class data slot, in shape order.
-pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {
-    initialize_shaped_data_slots_with_capacity(obj, heap, values, values.len());
-}
-
-/// Initialize the visible prefix of a freshly shaped object while reserving
-/// room for later constructor-owned transitions.
+/// Install `shape` on a fresh, slotless object together with a value for
+/// every slot it names, in shape order, reserving room for `capacity` slots.
 ///
-/// Capacity is not observable: `slab_len` advances only for `values`, and each
-/// later field becomes visible at its original `StoreProperty` operation.
-pub(crate) fn initialize_shaped_data_slots_with_capacity(
+/// The shape fixes the object's slot count, so it goes on in the same payload
+/// borrow that writes the slots, after the only allocation (the slab
+/// reservation): no collection ever sees a counted slot unwritten. Capacity
+/// is not observable — later fields become visible at their own
+/// `StoreProperty` operations.
+pub(crate) fn install_fresh_shape_with_slots(
     obj: JsObject,
     heap: &mut GcHeap,
+    shape: ShapeHandle,
     values: &[Value],
     capacity: usize,
 ) {
+    debug_assert_object_shape_handle(shape, "fresh object shape install");
+    debug_assert!(!shape.is_null(), "a fresh shape install needs a shape");
+    debug_assert_eq!(
+        shape_body::property_count_of(shape) as usize,
+        values.len(),
+        "shape slot count and init value count diverged"
+    );
     let mut obj = obj;
-    let stored = SmallVec::<[Value; 8]>::from_slice(values);
-    let expected = heap.read_payload(obj, |body| body_property_count(heap, body));
-    let mut stored = stored;
+    let mut stored = SmallVec::<[Value; 8]>::from_slice(values);
+    debug_assert_eq!(heap.read_payload(obj, ObjectBody::slot_count), 0);
     if reserve_slot_capacity(&mut obj, heap, capacity.max(stored.len()), &mut stored).is_err() {
         return;
     }
     heap.with_payload(obj, |body| {
-        debug_assert!(
-            !body.shape.is_null(),
-            "bulk slot init only applies to shaped objects"
-        );
-        debug_assert!(body.slab_len == 0, "bulk slot init requires a fresh object");
-        debug_assert_eq!(
-            expected,
-            stored.len(),
-            "shape slot count and init value count diverged"
-        );
+        debug_assert_eq!(body.slot_count(), 0, "shape install requires a fresh object");
+        let base = body.values_base();
         for (index, &value) in stored.iter().enumerate() {
-            body.push_slot(index, SlotMeta::data_default(), value);
+            // SAFETY: the reservation above made room for every index.
+            unsafe { *base.add(index) = value };
         }
+        body.shape = shape;
     });
     for &value in &stored {
         record_slot_write(heap, obj, value);
@@ -3303,26 +3443,8 @@ pub(crate) fn reserve_fresh_object_slot_capacity(
     heap: &mut GcHeap,
     capacity: usize,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    debug_assert_eq!(heap.read_payload(*obj, ObjectBody::slab_len), 0);
+    debug_assert_eq!(heap.read_payload(*obj, ObjectBody::slot_count), 0);
     reserve_slot_capacity(obj, heap, capacity, &mut [])
-}
-
-/// Replace the root hidden class on a fresh, slotless object before bulk
-/// constructor initialization.
-pub(crate) fn set_fresh_object_shape(obj: JsObject, heap: &mut GcHeap, shape: ShapeHandle) {
-    heap.with_payload(obj, |body| {
-        debug_assert!(
-            body.slab_len == 0,
-            "fast constructor shape install requires a fresh object"
-        );
-        debug_assert!(
-            !shape.is_null(),
-            "fast constructor shape install requires a shaped target"
-        );
-        debug_assert_object_shape_handle(shape, "fresh object shape install");
-        debug_assert_object_shape_handle(shape, "shape-slot store");
-        body.shape = shape;
-    });
 }
 
 /// Try to allocate a fresh shaped object with `capacity` in-object slots
@@ -3332,10 +3454,17 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
     shape: ShapeHandle,
     capacity: usize,
 ) -> Option<JsObject> {
-    let body = empty_object_body_with_shape(shape, inline_capacity_for(capacity));
-    let extra = inline_bytes(&body);
-    heap.try_alloc_trailing_no_collect_or_return(body, extra, |_| {})
-        .ok()
+    let pending = empty_object_body_with_shape(shape, inline_capacity_for(capacity));
+    let extra = pending.trailing_bytes();
+    let PendingObject {
+        body,
+        flags,
+        capacity,
+    } = pending;
+    heap.try_alloc_trailing_no_collect_or_return(body, extra, |body| {
+        body.init_cell_bytes(flags, capacity);
+    })
+    .ok()
 }
 
 /// Allocate a fresh empty object for diagnostic delivery after the
@@ -3356,9 +3485,31 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
 pub(crate) fn alloc_diagnostic_object(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let body = empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY);
-    let extra = inline_bytes(&body);
-    heap.alloc_old_diagnostic_trailing(body, extra)
+    let PendingObject {
+        body,
+        flags,
+        capacity,
+    } = empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY);
+    let extra = usize::from(capacity) * std::mem::size_of::<Value>();
+    let object = heap.alloc_old_diagnostic_trailing(body, extra)?;
+    // No safepoint separates the allocation from this write.
+    heap.with_payload(object, |body| body.init_cell_bytes(flags, capacity));
+    Ok(object)
+}
+
+/// A host object body over `sidecar`: opaque as a prototype-chain link,
+/// since its host data can supply properties outside its slots.
+fn host_object_body(shape: ShapeHandle, sidecar: ExoticSlot) -> PendingObject {
+    PendingObject {
+        body: ObjectBody {
+            shape,
+            slab: otter_gc::Gc::null(),
+            jit_proto: otter_gc::Gc::null(),
+            exotic: sidecar,
+        },
+        flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
+        capacity: DEFAULT_INLINE_CAPACITY as u8,
+    }
 }
 
 /// Allocate a fresh object backed by Rust-owned host data.
@@ -3385,21 +3536,13 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     slot.set(sidecar);
     let object = alloc_object_body_with_roots(
         heap,
-        ObjectBody {
-            shape: ShapeHandle::null(),
-            slab: otter_gc::Gc::null(),
-            jit_proto: otter_gc::Gc::null(),
-            exotic: slot,
-            dictionary_layout: 1,
-            slab_len: 0,
-            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
-            inline_capacity: DEFAULT_INLINE_CAPACITY as u8,
-            dictionary_shape_id: next_shape_id(),
-        },
+        host_object_body(ShapeHandle::null(), slot),
         &mut visit,
     )?;
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Untraced(Box::new(data)));
+        exotic.dictionary_layout = 1;
+        exotic.dictionary_shape_id = next_shape_id();
         true
     });
     heap.record_write(object, &sidecar);
@@ -3424,21 +3567,8 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = alloc_object_body_with_roots(
-        heap,
-        ObjectBody {
-            shape,
-            slab: otter_gc::Gc::null(),
-            jit_proto: otter_gc::Gc::null(),
-            exotic: slot,
-            dictionary_layout: 0,
-            slab_len: 0,
-            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
-            inline_capacity: DEFAULT_INLINE_CAPACITY as u8,
-            dictionary_shape_id: ShapeId::UNASSIGNED,
-        },
-        &mut visit,
-    )?;
+    let object =
+        alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Untraced(Box::new(data)));
         true
@@ -3466,21 +3596,8 @@ pub(crate) fn alloc_traced_host_object_with_shape_roots<T: TracedHostObjectData>
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = alloc_object_body_with_roots(
-        heap,
-        ObjectBody {
-            shape,
-            slab: otter_gc::Gc::null(),
-            jit_proto: otter_gc::Gc::null(),
-            exotic: slot,
-            dictionary_layout: 0,
-            slab_len: 0,
-            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
-            inline_capacity: DEFAULT_INLINE_CAPACITY as u8,
-            dictionary_shape_id: ShapeId::UNASSIGNED,
-        },
-        &mut visit,
-    )?;
+    let object =
+        alloc_object_body_with_roots(heap, host_object_body(shape, slot), &mut visit)?;
     // The sidecar is an old-space body from birth, so the host slots just
     // installed never crossed the mutator write barrier. Record each
     // child edge now, or an old(sidecar)→young(child) reference is
@@ -3643,7 +3760,7 @@ fn apply_mapped_arguments_partial_define(
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
-    existing_offset: Option<u16>,
+    existing_offset: Option<u32>,
 ) {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
     let Some(cell) = mapped_cell else {
@@ -3670,7 +3787,7 @@ fn apply_mapped_arguments_partial_define(
             let stored = current;
             if let Some(offset) = existing_offset {
                 let is_data_slot = heap.read_payload(obj, |body| {
-                    (usize::from(offset) < body_property_count(heap, body))
+                    ((offset as usize) < body_property_count(heap, body))
                         && !body.slot_attrs(heap, offset as usize).1
                 });
                 if is_data_slot {
@@ -3710,8 +3827,8 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// See [`ObjectBody::dictionary_layout`].
 pub(crate) fn dictionary_layout(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<u32> {
     heap.read_payload(obj, |body| {
-        (body.shape.is_null() && body.dictionary_layout != 0 && body.dictionary_layout != u32::MAX)
-            .then_some(body.dictionary_layout)
+        let layout = body.dictionary_layout();
+        (body.shape.is_null() && layout != 0 && layout != u32::MAX).then_some(layout)
     })
 }
 
@@ -3763,12 +3880,7 @@ fn body_shape_id(heap: &otter_gc::GcHeap, body: &ObjectBody) -> ShapeId {
     if !body.shape.is_null() {
         return heap.read_payload(body.shape, shape_body::ShapeBody::id);
     }
-    debug_assert_ne!(
-        body.dictionary_shape_id,
-        ShapeId::UNASSIGNED,
-        "dictionary-mode object needs assigned shape id"
-    );
-    body.dictionary_shape_id
+    body.dictionary_shape_id()
 }
 
 fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
@@ -3778,11 +3890,10 @@ fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
     body.dict_key_count()
 }
 
-pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u16> {
+pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u32> {
     if !body.shape.is_null() {
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
-        return shape_body::shape_offset_of_str(heap, body.shape, key)
-            .and_then(|offset| u16::try_from(offset).ok());
+        return shape_body::shape_offset_of_str(heap, body.shape, key);
     }
     // O(1) dictionary lookup via the maintained index — a linear scan
     // here makes bulk property addition O(n²).
@@ -3798,14 +3909,13 @@ pub(super) fn body_offset_of_atom(
     heap: &otter_gc::GcHeap,
     body: &ObjectBody,
     key: AtomizedPropertyKey<'_>,
-) -> Option<u16> {
+) -> Option<u32> {
     if !body.shape.is_null() {
         if key.atom().id() == crate::property_atom::AtomId::NONE {
             return None;
         }
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
-        return shape_body::shape_offset_of_atom(heap, body.shape, key.atom().id())
-            .and_then(|offset| u16::try_from(offset).ok());
+        return shape_body::shape_offset_of_atom(heap, body.shape, key.atom().id());
     }
     body.dictionary_index_get(key.name())
 }
@@ -3967,13 +4077,13 @@ pub(crate) fn lookup_own_slot(
             {
                 *value = mapped_read(heap, cell);
             }
-            (
-                Some(OwnPropertySlotHit {
-                    shape_id: body_shape_id(heap, body),
-                    slot: offset,
-                }),
-                lookup,
-            )
+            // A cache slot is a `u16`; a dictionary key past it is looked up
+            // by name every time.
+            let hit = u16::try_from(offset).ok().map(|slot| OwnPropertySlotHit {
+                shape_id: body_shape_id(heap, body),
+                slot,
+            });
+            (hit, lookup)
         }
         None => (None, PropertyLookup::Absent),
     })
@@ -4015,16 +4125,16 @@ pub(crate) fn lookup_own_atom(
             {
                 *value = mapped_read(heap, cell);
             }
-            AtomPropertyLookup {
-                hit: Some(AtomOwnPropertyHit {
-                    shape_id: body_shape_id(heap, body),
-                    shape: body.shape,
-                    atom_id: key.atom().id(),
-                    slot: offset,
-                    is_data: matches!(lookup, PropertyLookup::Data { .. }),
-                }),
-                lookup,
-            }
+            // A cache slot is a `u16`; a dictionary key past it is looked up
+            // by name every time.
+            let hit = u16::try_from(offset).ok().map(|slot| AtomOwnPropertyHit {
+                shape_id: body_shape_id(heap, body),
+                shape: body.shape,
+                atom_id: key.atom().id(),
+                slot,
+                is_data: matches!(lookup, PropertyLookup::Data { .. }),
+            });
+            AtomPropertyLookup { hit, lookup }
         }
         None => AtomPropertyLookup {
             hit: None,
@@ -5010,42 +5120,6 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 
 // ---------- mutation -----------------------------------------------------
 
-/// Set or overwrite an own property as a default-attributes data
-/// slot (`writable / enumerable / configurable` all `true`).
-/// This is the construction-time path used by object literals,
-/// runtime intrinsics, and prototype scaffolding — it bypasses
-/// the §10.1.9 [[Set]] ladder entirely.
-///
-/// # Algorithm
-/// 1. If the key already lives on this object, overwrite the
-///    slot's value, preserving the slot's existing flags. This
-///    matches the `O[k] = v` shape for an existing data property
-///    that has not been re-configured by `defineProperty`.
-/// 2. Otherwise, append a new default-attributes data slot.
-///
-/// Construction-time callers do not respect the extensibility
-/// flag: this path is only used by code that owns the object and
-/// is allowed to seed it (`Error.prototype.message`, etc.).
-///
-/// Fire the generational/incremental barrier for the value just stored in an
-/// object slot. Immediate values expose no outgoing edge through `GcStore`.
-/// Append `value` as the object's slot `index`, for a bulk builder that has
-/// already installed the whole hidden class and reserved the slab.
-///
-/// No presence lookup and no shape work: the layout the caller installed
-/// already says this slot exists and which name it answers to.
-pub(crate) fn push_layout_slot(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    index: usize,
-    value: Value,
-) {
-    heap.with_payload(obj, |body| {
-        body.push_slot(index, SlotMeta::data_default(), value);
-    });
-    record_slot_write(heap, obj, value);
-}
-
 /// Overwrite slot `index` of an object whose hidden class already names it.
 pub(crate) fn write_layout_slot(
     obj: JsObject,
@@ -5160,7 +5234,7 @@ fn set_inner(
         return;
     };
     heap.with_payload(*obj, |body| {
-        body.replace_dictionary_identity(true);
+        body.enter_dictionary_mode(true);
         if let Some(table) = dict_table {
             body.exotic_mut().dictionary_keys = table;
         }
@@ -5168,7 +5242,6 @@ fn set_inner(
             body.exotic_mut().slots = table;
         }
         dict_push_key(body, key.to_owned());
-        body.shape = ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), stored);
     });
     let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
@@ -5491,12 +5564,11 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         if !body.slots()[offset as usize].flags.configurable() {
             return false;
         }
+        body.enter_dictionary_mode(false);
         body.remove_slot(offset as usize);
-        body.replace_dictionary_identity(false);
         if let Some(table) = replacement_table {
             body.exotic_mut().dictionary_keys = table;
         }
-        body.shape = ShapeHandle::null();
         shape_cache::invalidate_fast_shape_assumptions(
             body,
             ShapeCacheInvalidation::DeleteOwnProperty,
@@ -5561,12 +5633,11 @@ pub(crate) fn delete_if_same_data(
     };
     let obj = obj_for_table;
     heap.with_payload(obj, |body| {
+        body.enter_dictionary_mode(false);
         body.remove_slot(offset as usize);
-        body.replace_dictionary_identity(false);
         if let Some(table) = replacement_table {
             body.exotic_mut().dictionary_keys = table;
         }
-        body.shape = ShapeHandle::null();
         shape_cache::invalidate_fast_shape_assumptions(
             body,
             ShapeCacheInvalidation::DeleteOwnProperty,
@@ -5728,7 +5799,7 @@ pub fn define_own_property_partial(
             if !body.extensible() {
                 return false;
             }
-            body.replace_dictionary_identity(true);
+            body.enter_dictionary_mode(true);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;
             }
@@ -5736,7 +5807,6 @@ pub fn define_own_property_partial(
                 body.exotic_mut().slots = table;
             }
             dict_push_key(body, key.to_owned());
-            body.shape = ShapeHandle::null();
             body.push_slot(append_index, meta, stored);
             true
         }
@@ -6004,7 +6074,7 @@ pub fn define_own_property_in_place(
             if !body.extensible() {
                 return false;
             }
-            body.replace_dictionary_identity(true);
+            body.enter_dictionary_mode(true);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;
             }
@@ -6012,7 +6082,6 @@ pub fn define_own_property_in_place(
                 body.exotic_mut().slots = table;
             }
             dict_push_key(body, key.to_owned());
-            body.shape = ShapeHandle::null();
             body.push_slot(append_index, meta, stored);
             true
         }
@@ -6696,7 +6765,7 @@ pub(crate) fn redefine_merged_attrs(
     heap: &otter_gc::GcHeap,
     key: &str,
     descriptor: &PartialPropertyDescriptor,
-) -> Option<(PropertyFlags, bool, u16)> {
+) -> Option<(PropertyFlags, bool, u32)> {
     let offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key))?;
     let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
     let merged = descriptor_core::validate_and_apply_partial(&existing, descriptor, heap)?;
@@ -6758,11 +6827,12 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
     heap.with_payload(obj, |body| {
         body.shape = shape;
         body.set_slot_attrs_overridden(false);
-        body.dictionary_shape_id = ShapeId::UNASSIGNED;
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
             unsafe { &mut *e })
         {
+            exotic.dictionary_shape_id = ShapeId::UNASSIGNED;
+            exotic.dictionary_slot_count = 0;
             if let Some(table) = dict_keys_body_of(exotic.dictionary_keys) {
                 // SAFETY: a non-null handle names a live table.
                 unsafe { (*table).clear() };
@@ -6814,7 +6884,7 @@ fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec
 fn dictionary_keys_for_shape_transition(
     heap: &otter_gc::GcHeap,
     obj: JsObject,
-    existing_offset: Option<u16>,
+    existing_offset: Option<u32>,
 ) -> Option<Vec<String>> {
     if existing_offset.is_some() {
         return None;
@@ -6834,7 +6904,7 @@ fn dictionary_keys_for_shape_transition(
 fn slot_metas_for_shape_transition(
     heap: &otter_gc::GcHeap,
     obj: JsObject,
-    existing_offset: Option<u16>,
+    existing_offset: Option<u32>,
 ) -> Option<Vec<SlotMeta>> {
     if existing_offset.is_some() {
         return None;
@@ -6968,8 +7038,8 @@ mod tests {
 
     #[test]
     fn jit_semantic_guard_layout_is_frozen() {
-        assert_eq!(OBJECT_BODY_FLAGS_OFFSET, 22);
-        assert_eq!(OBJECT_BODY_INLINE_CAPACITY_OFFSET, 23);
+        assert_eq!(OBJECT_CELL_FLAGS_BYTE, 2);
+        assert_eq!(OBJECT_CELL_INLINE_CAPACITY_BYTE, 3);
         assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 12);
         assert_eq!(std::mem::size_of::<ExoticHandle>(), 4);
         let bits = [
@@ -6979,7 +7049,7 @@ mod tests {
             ObjectFlags::DICTIONARY_COMPATIBLE,
         ];
         assert_eq!(bits.iter().fold(0u8, |all, bit| all | bit).count_ones(), 4);
-        assert_eq!(object_cell_bytes(2), 56);
+        assert_eq!(object_cell_bytes(2), 40);
     }
 
     #[test]
@@ -7150,7 +7220,7 @@ mod tests {
             shape_id(o, interp.gc_heap()),
             interp
                 .gc_heap()
-                .read_payload(o, |body| body.dictionary_shape_id)
+                .read_payload(o, ObjectBody::dictionary_shape_id)
         );
     }
 
@@ -7166,7 +7236,6 @@ mod tests {
             .expect("set x");
         interp.gc_heap_mut().with_payload(o, |body| {
             dict_clear_keys(body);
-            body.replace_dictionary_identity(false);
         });
 
         assert_eq!(len(o, interp.gc_heap()), 1);

@@ -145,7 +145,6 @@ pub(super) fn store_case(
                 Op::PublishShape {
                     object: 0,
                     shape: child_shape,
-                    new_len,
                 },
             ] = *tail
             else {
@@ -179,7 +178,6 @@ pub(super) fn store_case(
                 transition: Some(super::super::PropertyStoreTransition {
                     prototype_shapes: prototype_shapes.into_boxed_slice(),
                     child_shape,
-                    new_len,
                 }),
             })
         }

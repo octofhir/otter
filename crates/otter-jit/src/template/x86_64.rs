@@ -2864,12 +2864,28 @@ fn emit_existing_property_load(
                     }
                 }
                 otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
+                    // A dictionary holder keeps its slot-layout epoch in its
+                    // sidecar.
                     dynasm!(ops
                         ; .arch x64
                         ; cmp DWORD [r8 + view.object_shape_byte as i32], 0
                         ; jne =>next
+                        ; mov r9d, [r8 + view.object_exotic_handle_byte as i32]
+                        ; test r9d, r9d
+                        ; jz =>next
+                    );
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        11,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    dynasm!(ops
+                        ; .arch x64
+                        ; add r9, r11
                         ; mov r11d, layout as u32 as i32
-                        ; cmp [r8 + view.object_dictionary_layout_byte as i32], r11d
+                        ; cmp [r9 + view.exotic_dictionary_layout_byte as i32], r11d
                         ; jne =>next
                     );
                 }
@@ -3003,10 +3019,10 @@ fn emit_existing_property_store(
                         ; =>storage_fits
                         ; test BYTE [r10 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
                         ; jz =>next
-                        ; movzx r9d, WORD [r10 + view.object_slab_len_byte as i32]
-                        ; cmp r9d, r11d
-                        ; jne =>next
                     );
+                    // The program's receiver shape guard fixes the slot
+                    // count at the appended index: the store is the exact
+                    // append.
                 }
                 otter_vm::JitCacheIrOp::StoreField {
                     object: 0,
@@ -3027,7 +3043,6 @@ fn emit_existing_property_store(
                 otter_vm::JitCacheIrOp::PublishShape {
                     object: 0,
                     shape,
-                    new_len,
                 } if terminal => {
                     let Some(otter_vm::JitCacheIrOp::StoreField {
                         object: 0,
@@ -3042,7 +3057,6 @@ fn emit_existing_property_store(
                     };
                     dynasm!(ops
                         ; .arch x64
-                        ; mov WORD [r10 + view.object_slab_len_byte as i32], new_len as i16
                         ; mov DWORD [r10 + view.object_shape_byte as i32], shape as i32
                         ; mov [r11 + value_byte as i32], rdx
                         ; sub rsp, 16

@@ -562,6 +562,101 @@ commit `055dbbc4`; stdout identical):
 The buffer is also the substrate generated context and closure allocation
 needs: both can now be carved inline with the same three instructions.
 
+## 12. L2 staging: the object body down to shape + backing
+
+Usage map (`research-2026-09-29/object-body-usage.md`) facts that shape the
+plan: shapes are immortal old-space GC cells with one isolate-wide root and
+no prototype, flags or dictionary state; generated guards compare the
+compressed shape handle; every object is allocated at the root shape and
+gets its prototype afterwards (73 call sites); the `ShapeEpoch` dependency
+has no production dependents; and `slab_len: u16` wraps past 65,535 keys —
+`o.k5` reads 65541 on a 70,000-key dictionary object.
+
+Where the reference engines keep each piece:
+
+| State | V8 | JSC | SpiderMonkey |
+|---|---|---|---|
+| property count | Map `NumberOfOwnDescriptors`; dictionary: the NameDictionary | Structure `m_offset`/`maxOffset`; dictionary: per-object Structure | Shape slot span; dictionary: `DictionaryPropertyMap` |
+| per-cell mutable flags | Map bits (`is_extensible` via map transition) | cell header bytes (`indexingTypeAndMisc`, `inlineTypeFlags`, `cellState`) + Structure flags | BaseShape/ObjectFlags in the shape |
+| in-object capacity | Map `instance_size` | Structure `inlineCapacity`, cell size | `AllocKind` of the cell |
+| dictionary identity | the dictionary map + the NameDictionary in `properties` | per-object uncacheable dictionary Structure | dictionary Shape per object |
+| prototype | Map `prototype` (prototype transitions are weak) | Structure `m_prototype` (poly-proto: inline slot) | BaseShape `proto` |
+
+Stages, each landing whole:
+
+1. **L2a — 16-byte body.** Fixed body = shape, slab, prototype, sidecar
+   handles (4 × u32). Object flags and inline capacity move to the two
+   reserved GC-header bytes (the JSC per-cell header bytes; the scavenger
+   copies whole cells, so they travel with the object). The slot count
+   becomes the shape's `property_count` for shaped objects and a `u32` in
+   the sidecar for dictionary objects, together with the dictionary layout
+   epoch and dictionary identity (state only a dictionary object has, as in
+   V8's NameDictionary). Appending a property on a shaped object is then a
+   slot store plus a shape store — the count store disappears from every
+   generated add-transition. Two-field `sc_Pair`: 56 → 40 bytes.
+2. **L2b — the shape owns the prototype.** Per-prototype roots cached on
+   the prototype (V8 `PrototypeInfo::ObjectCreateMap`), prototype
+   transitions, allocation takes the prototype, shapes become collectable
+   (weak transition tables, code keeps embedded shapes alive), so a
+   prototype-chain guard is one shape compare per link and `jit_proto`
+   leaves the body.
+3. **L2c — one backing handle.** Slab and sidecar merge behind one handle
+   (V8 `properties_or_hash`, JSC butterfly): an 8-byte body, `sc_Pair` in
+   32 bytes.
+
+### L2a landed
+
+The fixed body is 16 bytes. The flag byte and the in-object capacity are
+the two body-owned GC-header bytes (`HEADER_BODY_BYTES_OFFSET`, written by
+the allocation initializer, carried by whole-cell evacuation). A shaped
+object's slot count is its shape's `property_count`, read without the heap
+(shapes are immutable and non-moving); a dictionary object's count, layout
+epoch and structural id live in its sidecar, entered through one
+`enter_dictionary_mode` step that carries the count across. Every generated
+add transition lost its count store and its exact-append check (the
+receiver-shape guard implies both); the dictionary layout guard reads the
+epoch through the sidecar handle.
+
+Changes the count model forced:
+- A shape now fixes the count, so installing a shape on a fresh object and
+  writing its slots is one step after the slab reservation
+  (`install_fresh_shape_with_slots`); the old install-then-reserve order
+  would have exposed counted, unwritten slots to a collection.
+- Dictionary keys past 65,535 read other keys' values: the count was a
+  `u16` and dictionary offsets were truncated `as u16`. Counts and
+  dictionary offsets are `u32`; cache slots stay `u16` and a wider key is
+  simply not cached.
+- An empty dictionary object without a sidecar shares one reserved
+  identity (`ShapeId::EMPTY_DICTIONARY`), as every empty shaped object
+  shares the root shape; the sidecar allocation gives it a fresh id.
+
+Fixed work against the linear-allocation-buffer commit
+(`benchmarks/results/arch-2026-09-27/e1b-l2a`, stdout identical):
+
+| Workload | LAB | L2a | Δ | RSS |
+|---|---:|---:|---:|---|
+| ts-fixed | 175.19G | 174.32G | −0.5% | 557 → 397 MB |
+| zlib-fixed | 233.96G | 233.87G | 0 | 716 → 715 MB |
+| crypto-fixed | 16.71G | 16.87G | +0.9% | 49 → 49 MB |
+| fib | 3.64G | 3.64G | 0 | 55 → 55 MB |
+| mega_method | 10.00G | 10.00G | 0 | 55 → 55 MB |
+| ast_ctor | 21.99G | 21.84G | −0.7% | 88 → 88 MB |
+| earley-boyer | 131.69G | 128.24G | −2.6% | 124 → 124 MB |
+
+The first measurement had ts at +31%: an empty dictionary object's
+slot-layout epoch started at the unprovable `0` and appends never advance
+it, so the global object and dictionary prototypes lost every generated
+layout proof. The epoch now starts at 1 when the sidecar appears. crypto's
++0.9% is the extra sidecar load in its global-binding guards, which a
+V8-style property cell with a code dependency removes.
+
+Older defects the stress runs surfaced on the way (`built-ins/Object` at
+`OTTER_GC_STRESS=4`: 8 failures → 0): the sidecar never traced a wrapper's
+`[[StringData]]`/`[[SymbolData]]`/`[[BigIntData]]` handles and their
+setters remembered the object instead of the old-space sidecar, and
+`Object(primitive)` / sloppy-`this` wrapping used the primitive string read
+before the wrapper allocation moved it.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

@@ -1052,7 +1052,21 @@ pub(super) fn emit(
                     ; .arch x64
                     ; cmp DWORD [r11 + view.object_shape_byte as i32], 0
                     ; jne =>miss
-                    ; cmp [r11 + view.object_dictionary_layout_byte as i32], r10d
+                    ; mov r9d, [r11 + view.object_exotic_handle_byte as i32]
+                    ; test r9d, r9d
+                    ; jz =>miss
+                );
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    8,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch x64
+                    ; add r9, r8
+                    ; cmp [r9 + view.exotic_dictionary_layout_byte as i32], r10d
                     ; jne =>miss
                     ; mov r10d, 1
                     ; jmp =>done
@@ -1433,10 +1447,9 @@ pub(super) fn emit(
                             ; =>fits
                             ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
                             ; jz =>miss
-                            ; movzx r9d, WORD [r11 + view.object_slab_len_byte as i32]
-                            ; cmp r9d, slot as i32
-                            ; jne =>miss
                         );
+                        // The matched receiver shape has exactly `slot`
+                        // slots, so the store is the exact append.
                     }
                     slab_base(&mut ops, &mut relocations, view);
                     load_integer(&mut ops, frame, loc[1], 10)?;
@@ -1444,7 +1457,6 @@ pub(super) fn emit(
                     if let Some(transition) = &case.transition {
                         dynasm!(ops
                             ; .arch x64
-                            ; mov WORD [r11 + view.object_slab_len_byte as i32], transition.new_len as i16
                             ; mov DWORD [r11 + view.object_shape_byte as i32], transition.child_shape as i32
                             ; mov r9d, transition.child_shape as i32
                         );
@@ -1544,9 +1556,8 @@ pub(super) fn emit(
                     ; =>storage_fits
                     ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
                     ; jz =>miss
-                    ; movzx r9d, WORD [r11 + view.object_slab_len_byte as i32]
-                    ; cmp r9d, r10d
-                    ; jne =>miss
+                    // The program's receiver shape guard fixes the slot
+                    // count at the appended index.
                     ; mov r10d, 1
                     ; jmp =>done
                     ; =>miss
@@ -1564,7 +1575,6 @@ pub(super) fn emit(
             MachineOpcode::CacheIrPublishShape {
                 byte_pc,
                 shape,
-                new_len,
             } => {
                 let start = ops.offset().0;
                 let done = ops.new_dynamic_label();
@@ -1573,7 +1583,6 @@ pub(super) fn emit(
                 load_integer(&mut ops, frame, loc[0], 11)?;
                 dynasm!(ops
                     ; .arch x64
-                    ; mov WORD [r11 + view.object_slab_len_byte as i32], new_len as i16
                     ; mov DWORD [r11 + view.object_shape_byte as i32], shape as i32
                     ; =>done
                 );
@@ -3629,10 +3638,18 @@ fn binding_guard(
                     ; cmp DWORD [r11 + view.object_shape_byte as i32], 0
                     ; jne =>miss
                 );
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r10d, [r11 + view.object_exotic_handle_byte as i32]
+                    ; test r10d, r10d
+                    ; jz =>miss
+                );
+                symbolic(ops, relocations, 9, view.cage_base as u64, RelocationTarget::GcCageBase);
                 load64(ops, 8, shape);
                 dynasm!(ops
                     ; .arch x64
-                    ; cmp [r11 + view.object_dictionary_layout_byte as i32], r8d
+                    ; add r10, r9
+                    ; cmp [r10 + view.exotic_dictionary_layout_byte as i32], r8d
                     ; jne =>miss
                 );
             } else {

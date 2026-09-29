@@ -152,9 +152,15 @@ fn emit_receiver_candidate(
         ; jz =>guard_miss
         ; lea r9, [r8 + r10]
     );
+    // The last receiver's slot count is its shape's; a dictionary-mode
+    // receiver teaches nothing.
     dynasm!(ops
         ; .arch x64
-        ; movzx r10d, WORD [r9 + view.object_slab_len_byte as i32]
+        ; mov r10d, [r9 + view.object_shape_byte as i32]
+        ; test r10d, r10d
+        ; jz >counted
+        ; mov r10d, [r8 + r10 + view.shape_property_count_byte as i32]
+        ; counted:
         ; movzx r11d, WORD [rcx + view.closure_call_layout.learned_instance_fields_byte as i32]
         ; cmp r10d, r11d
         ; cmova r11d, r10d
@@ -181,12 +187,10 @@ fn emit_receiver_candidate(
         ; cmp r10d, [r9 + view.object_shape_byte as i32]
         ; jne =>guard_miss
     );
+    // The bag's shape names the prototype slot, so the slot is live.
     dynasm!(ops
         ; .arch x64
         ; mov r10d, [rcx + view.closure_call_layout.prototype_slot_byte as i32]
-        ; movzx r11d, WORD [r9 + view.object_slab_len_byte as i32]
-        ; cmp r10d, r11d
-        ; jae =>guard_miss
     );
     // The bag's slot base: in-object until it spills, then its slab's
     // words (`r8` holds the cage base).
@@ -262,29 +266,18 @@ fn emit_receiver_candidate(
     );
 
     // Initialize the header and the whole fixed body before publishing the
-    // bump cursor. The body is four words: shape + null slab, prototype +
-    // null sidecar, dictionary epoch + slot count + flags + in-object
-    // capacity, and the unassigned dictionary id. In-object words past the
-    // initial fields are never read before a store publishes them.
-    let header_word = u64::from(OBJECT_BODY_TYPE_TAG)
-        | (u64::from(otter_vm::jit::JIT_GC_YOUNG_FLAG) << 8)
-        | (u64::from(cell_bytes) << 32);
-    let layout_word = (u64::from(plan.initial_field_count) << 32)
-        | (u64::from(otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE) << 48)
-        | (u64::from(plan.inline_capacity) << 56);
-    load64(ops, 11, header_word);
+    // bump cursor. The header carries the flag and in-object capacity bytes;
+    // the body is two words: shape + null slab, prototype + null sidecar.
+    // The receiver shape names exactly the initial fields, so the slot count
+    // follows from it. In-object words past the initial fields are never
+    // read before a store publishes them.
+    load64(ops, 11, plan.cell_header_word(cell_bytes));
     dynasm!(ops ; .arch x64 ; mov [rax], r11);
     load64(ops, 11, u64::from(plan.receiver_shape));
     dynasm!(ops
         ; .arch x64
         ; mov [rax + view.object_shape_byte as i32], r11
         ; mov [rax + view.jit_proto_byte as i32], rsi
-    );
-    load64(ops, 11, layout_word);
-    dynasm!(ops
-        ; .arch x64
-        ; mov [rax + view.object_dictionary_layout_byte as i32], r11
-        ; mov QWORD [rax + (view.object_dictionary_layout_byte + 8) as i32], 0
     );
     if plan.initial_field_count != 0 {
         load64(ops, 11, VALUE_UNDEFINED);

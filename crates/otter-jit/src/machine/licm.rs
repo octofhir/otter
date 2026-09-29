@@ -797,7 +797,6 @@ mod tests {
                 MachineOpcode::CacheIrPublishShape {
                     byte_pc: 9,
                     shape: 2,
-                    new_len: 1,
                 },
                 vec![
                     MachineOperand::location_input(owner),

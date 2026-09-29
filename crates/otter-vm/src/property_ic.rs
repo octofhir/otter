@@ -554,7 +554,6 @@ mod tests {
                 JitCacheIrOp::PublishShape {
                     object: 0,
                     shape: 202,
-                    new_len: 2,
                 },
             ]
         );

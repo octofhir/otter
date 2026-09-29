@@ -99,10 +99,8 @@ pub(super) fn emit(
             ; ldr w9, [x10, view.object_shape_byte]
             ; cmp w9, w12
             ; b.ne =>miss
+            // The bag's shape names the prototype slot, so the slot is live.
             ; ldr w12, [x16, layout.prototype_slot_byte]
-            ; ldrh w9, [x10, view.object_slab_len_byte]
-            ; cmp w12, w9
-            ; b.hs =>miss
             // The bag's slot base: in-object until it spills, then its
             // slab's words (`x11` holds the cage base).
             ; ldr w13, [x10, view.object_slab_handle_byte]

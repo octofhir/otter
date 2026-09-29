@@ -86,10 +86,8 @@ pub(super) fn emit(
             ; jz =>miss
             ; cmp eax, [r8 + view.object_shape_byte as i32]
             ; jne =>miss
+            // The bag's shape names the prototype slot, so the slot is live.
             ; mov eax, [r11 + layout.prototype_slot_byte as i32]
-            ; movzx ecx, WORD [r8 + view.object_slab_len_byte as i32]
-            ; cmp eax, ecx
-            ; jae =>miss
             // The bag's slot base: in-object until it spills, then its
             // slab's words (`r9` holds the cage base).
             ; mov ecx, [r8 + view.object_slab_handle_byte as i32]

@@ -122,10 +122,8 @@ pub(super) fn emit(
         ; jz =>miss
         ; cmp eax, [r8 + cache.holder_shape_byte as i32]
         ; jne =>miss
+        // The matched holder shape names the slot, so the slot is live.
         ; movzx edx, WORD [r8 + cache.slot_byte as i32]
-        ; movzx eax, WORD [r11 + view.object_slab_len_byte as i32]
-        ; cmp edx, eax
-        ; jae =>miss
         ; mov r10d, [r11 + view.object_slab_handle_byte as i32]
         ; test r10d, r10d
         ; jnz =>spilled
@@ -243,10 +241,8 @@ pub(super) fn emit_store(
         ; mov eax, [r11 + view.object_shape_byte as i32]
         ; cmp eax, [r8 + cache.holder_shape_byte as i32]
         ; jne =>miss
+        // The matched holder shape names the slot, so the slot is live.
         ; movzx edx, WORD [r8 + cache.slot_byte as i32]
-        ; movzx eax, WORD [r11 + view.object_slab_len_byte as i32]
-        ; cmp edx, eax
-        ; jae =>miss
         ; mov r10d, [r11 + view.object_slab_handle_byte as i32]
         ; test r10d, r10d
         ; jz =>inline
@@ -461,9 +457,9 @@ fn emit_transition_store(
         ; mov r11, rsi
         ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
         ; jz =>miss
+        // The matched receiver shape has exactly `slot` slots: the append
+        // index is its property count.
         ; movzx edx, WORD [r8 + cache.slot_byte as i32]
-        ; cmp dx, [r11 + view.object_slab_len_byte as i32]
-        ; jne =>miss
         ; mov r9d, [r8 + cache.target_shape_byte as i32]
         ; mov eax, [r11 + view.object_slab_handle_byte as i32]
         ; test eax, eax
@@ -494,8 +490,6 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; mov [r8 + rdx * 8], r10
-        ; inc edx
-        ; mov [r11 + view.object_slab_len_byte as i32], dx
         ; mov [r11 + view.object_shape_byte as i32], r9d
         ; mov rax, r11
         ; mov r9d, 1

@@ -222,7 +222,8 @@ pub(crate) struct MethodGuardArtifact {
     pub(crate) receiver_register: u16,
     pub(crate) method_function_id: u32,
     pub(crate) receiver_shape: u32,
-    pub(crate) prototype_shapes: Vec<u32>,
+    pub(crate) prototype_validity: Option<u64>,
+    pub(crate) holder_root: u32,
     pub(crate) method_value_byte: u32,
 }
 
@@ -414,7 +415,8 @@ impl CodeRegion {
             receiver_register,
             method_function_id: guard.method_fid,
             receiver_shape: guard.recv_shape,
-            prototype_shapes: guard.proto_chain.clone(),
+            prototype_validity: guard.prototype_validity.map(|cell| cell.identity),
+            holder_root: guard.holder_root,
             method_value_byte: guard.method_value_byte,
         });
         region

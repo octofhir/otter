@@ -1,7 +1,7 @@
 //! AArch64 reads and writes through the isolate's shared property tables.
 //!
 //! # Contents
-//! - A bounded own/direct-prototype load producing a tagged value and hit bit.
+//! - An own or chain-proven inherited load producing a tagged value and hit bit.
 //! - An own writable-data store producing an owner address and hit bit.
 //! - A guarded add transition producing the same owner and hit bit.
 //!
@@ -48,6 +48,7 @@ pub(super) fn emit(
         13,
         miss,
     )?;
+    emit_ordinary_lookup_state_guard(ops, view, 13, miss);
     emit_load_symbolic_u64(
         ops,
         relocations,
@@ -105,24 +106,17 @@ pub(super) fn emit(
         ; b.ne =>miss
         ; cbz w12, =>holder
     );
-    crate::template::arm64::values::emit_load_prototype(ops, view, 12, 13, 16);
     dynasm!(ops
         ; .arch aarch64
+        ; ldr x12, [x17, cache.validity_byte]
+        ; cbz x12, =>miss
+        ; ldar w12, [x12]
         ; cbz w12, =>miss
-        ; add x13, x16, x12
-        ; ldrb w14, [x13]
-        ; cmp w14, u32::from(otter_vm::object::OBJECT_BODY_TYPE_TAG)
-        ; b.ne =>miss
-    );
-    emit_ordinary_lookup_state_guard(ops, view, 13, miss);
-    dynasm!(ops
-        ; .arch aarch64
+        ; ldr w12, [x17, cache.holder_root_byte]
+        ; add x12, x16, x12
+        ; ldr w13, [x12, view.shape_prototype_byte]
+        ; add x13, x16, x13
         ; =>holder
-        ; ldr w14, [x13, view.object_shape_byte]
-        ; ldr w12, [x17, cache.holder_shape_byte]
-        ; cbz w12, =>miss
-        ; cmp w14, w12
-        ; b.ne =>miss
         // The matched holder shape names the slot, so the slot is live.
         ; ldrh w11, [x17, cache.slot_byte]
         ; ldr w12, [x13, view.object_slab_handle_byte]
@@ -188,6 +182,7 @@ pub(super) fn emit_store(
         miss,
     )?;
     emit_ordinary_lookup_state_guard(ops, view, 13, miss);
+    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
     emit_load_symbolic_u64(
         ops,
         relocations,
@@ -321,8 +316,6 @@ fn emit_transition_store(
     {
         return Err(Unsupported::OperandShape("shared store transition table"));
     }
-    let proto_ready = ops.new_dynamic_label();
-    let chain_loop = ops.new_dynamic_label();
     let chain_done = ops.new_dynamic_label();
     let inline = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
@@ -352,29 +345,8 @@ fn emit_transition_store(
         ; ldr x11, [x14, cache.shape_id_byte]
         ; mov x15, xzr
     );
-    crate::template::arm64::values::emit_load_prototype(ops, view, 14, 13, 16);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz w14, =>proto_ready
-        ; add x13, x16, x14
-        ; ldrb w14, [x13]
-        ; cmp w14, u32::from(otter_vm::object::OBJECT_BODY_TYPE_TAG)
-        ; b.ne =>miss
-    );
-    emit_shape_state_guard(ops, view, 13, miss);
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w14, [x13, view.object_shape_byte]
-        ; add x14, x16, x14
-        ; ldrb w15, [x14, view.shape_kind_byte]
-        ; tbnz w15, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
-        ; ldr x15, [x14, cache.shape_id_byte]
-        ; =>proto_ready
-    );
     emit_load_u64(ops, 10, cache.hash_shape_multiplier);
     dynasm!(ops ; .arch aarch64 ; mul x9, x11, x10);
-    emit_load_u64(ops, 10, cache.hash_atom_multiplier);
-    dynasm!(ops ; .arch aarch64 ; mul x10, x15, x10 ; ror x10, x10, #47 ; eor x9, x9, x10);
     emit_load_u64(
         ops,
         10,
@@ -405,9 +377,6 @@ fn emit_transition_store(
         ; ldr x10, [x17, cache.receiver_shape_byte]
         ; cmp x10, x11
         ; b.ne =>next_way
-        ; ldr x10, [x17, cache.prototype_shape_byte]
-        ; cmp x10, x15
-        ; b.ne =>next_way
         ; ldr w10, [x17, cache.atom_byte]
         ; cmp w10, w14
         ; b.eq =>found
@@ -419,45 +388,13 @@ fn emit_transition_store(
         ; =>found
         ; ldr w10, [x17, cache.target_shape_byte]
         ; cbz w10, =>miss
-        ; ldrb w9, [x17, cache.chain_len_byte]
-        ; cmp w9, #8
-        ; b.hi =>miss
-        ; mov x13, x12
-        ; mov x11, xzr
-        ; cbz w9, =>chain_done
-        ; =>chain_loop
-    );
-    crate::template::arm64::values::emit_load_prototype(ops, view, 10, 13, 16);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz w10, =>miss
-        ; add x13, x16, x10
-        ; ldrb w10, [x13]
-        ; cmp w10, u32::from(otter_vm::object::OBJECT_BODY_TYPE_TAG)
-        ; b.ne =>miss
-    );
-    emit_shape_state_guard(ops, view, 13, miss);
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w10, [x13, view.object_shape_byte]
-        ; add x10, x16, x10
-        ; ldrb w14, [x10, view.shape_kind_byte]
-        ; tbnz w14, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
-        ; ldr x10, [x10, cache.shape_id_byte]
-        ; add x14, x17, cache.chain_byte
-        ; ldr x14, [x14, x11, lsl #3]
-        ; cmp x10, x14
-        ; b.ne =>miss
-        ; add x11, x11, #1
-        ; cmp x11, x9
-        ; b.lo =>chain_loop
+        ; ldr x9, [x17, cache.validity_byte]
+        ; cbz x9, =>chain_done
+        ; ldar w9, [x9]
+        ; cbz w9, =>miss
         ; =>chain_done
-    );
-    crate::template::arm64::values::emit_load_prototype(ops, view, 10, 13, 16);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbnz w10, =>miss
         ; ldrb w10, [x12, view.object_flags_byte]
+        ; tbnz w10, 4, =>miss
         ; tbz w10, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
         // The matched receiver shape has exactly `slot` slots: the append
         // index is its property count.

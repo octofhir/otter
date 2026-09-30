@@ -9,11 +9,15 @@
 //! Register-index methods own a short [`crate::ActiveFrameMut`] scope
 //! internally. Fixed-value methods instead use the published frame only for
 //! execution ownership and operate on explicitly rooted boxed operands. Named
-//! property operations receive their source function/PC explicitly. The
+//! property operations receive their source function/PC explicitly. Boxed
+//! calls resolve virtual source positions from the code-owned safepoint. The
 //! JIT supplies decoded inputs and receives semantic results; no borrowed
 //! frame/window representation crosses the VM service boundary.
 //! A virtual graph is materialized once under one VM handle scope; the JIT
 //! receives only the completed identities it must publish into frame slots.
+//!
+//! # See also
+//! `call_source` keeps source calls distinct from physical frame positions.
 
 use smallvec::SmallVec;
 
@@ -77,9 +81,11 @@ impl RuntimeCall<'_> {
     /// is the constructor itself, as for any direct `new` expression.
     pub fn construct_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (callee, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
-        let function_id = self.function_id();
-        let call_pc = self.pc();
-        let context = &self.context;
+        let (function_id, call_pc) = self.value_call_source()?;
+        let context = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -101,7 +107,7 @@ impl RuntimeCall<'_> {
         let args = SmallVec::from_slice(args);
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        vm.jit_runtime_construct_values(context, stack, function_id, call_pc, *callee, args)
+        vm.jit_runtime_construct_values(&context, stack, function_id, call_pc, *callee, args)
     }
 
     /// Complete the exact published explicit-receiver call from boxed SSA
@@ -112,9 +118,11 @@ impl RuntimeCall<'_> {
     pub fn call_with_this_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (callee, rest) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let (receiver, args) = rest.split_first().ok_or(VmError::InvalidOperand)?;
-        let function_id = self.function_id();
-        let call_pc = self.pc();
-        let context = &self.context;
+        let (function_id, call_pc) = self.value_call_source()?;
+        let context = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -140,7 +148,7 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         vm.jit_runtime_call_with_this_values(
-            context,
+            &context,
             stack,
             function_id,
             call_pc,
@@ -158,9 +166,11 @@ impl RuntimeCall<'_> {
     /// keeps this boundary effect-once even when lookup or the callee throws.
     pub fn call_method_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (receiver, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
-        let function_id = self.function_id();
-        let call_pc = self.pc();
-        let context = &self.context;
+        let (function_id, call_pc) = self.value_call_source()?;
+        let context = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -190,7 +200,7 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         vm.jit_runtime_method_call_values(
-            context,
+            &context,
             stack,
             function_id,
             call_pc,

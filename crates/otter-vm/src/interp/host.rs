@@ -628,11 +628,10 @@ impl Interpreter {
         self.gc_heap.visit_embedder_root_slots(visitor);
     }
 
-    /// Shared handle to this isolate's code space, for the in-process
-    /// snapshot.
+    /// Frozen code directory with empty feedback for an isolate snapshot.
     #[must_use]
-    pub(crate) fn snapshot_code_space(&self) -> std::sync::Arc<crate::code_space::CodeSpace> {
-        self.code_space.clone()
+    pub(crate) fn snapshot_code_space(&self) -> crate::code_space::snapshot::CodeSpaceSnapshot {
+        self.code_space.capture()
     }
 
     /// The property-name atom table, in id order. Restoring the list

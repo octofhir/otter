@@ -147,7 +147,7 @@ impl Interpreter {
             let result = resolved.value;
             return Ok(result);
         }
-        // Not cache-representable (accessor, deep prototype, absent):
+        // Not cache-representable (accessor, opaque lookup, absent):
         // complete the load in place through the full cascade.
         let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
         Ok(result)
@@ -320,8 +320,6 @@ impl Interpreter {
                     }
                 } else {
                     path = Path::InstallTransition;
-                    let prototype_shape =
-                        crate::property_cache::prototype_shape_id(current_obj, &self.gc_heap);
                     if let Some(transition) = self
                         .capture_store_property_transition_with_stack_roots(
                             stack,
@@ -330,8 +328,7 @@ impl Interpreter {
                             &value,
                         )?
                     {
-                        self.store_transition_cache
-                            .record(prototype_shape, transition);
+                        self.store_transition_cache.record(transition);
                         return Ok(());
                     }
                 }

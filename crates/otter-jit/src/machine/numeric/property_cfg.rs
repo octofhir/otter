@@ -508,15 +508,12 @@ mod tests {
                     object: 0,
                     shape: 9,
                 },
-                JitCacheIrOp::LoadPrototype {
-                    object: 0,
-                    result: 1,
+                JitCacheIrOp::GuardPrototypeValidity {
+                    validity: otter_vm::jit::JitPrototypeValidity {
+                        address: 1,
+                        identity: 13,
+                    },
                 },
-                JitCacheIrOp::GuardShape {
-                    object: 1,
-                    shape: 13,
-                },
-                JitCacheIrOp::GuardPrototypeNull { object: 1 },
                 JitCacheIrOp::GuardExtensible {
                     object: 0,
                     value_byte: 16,
@@ -557,10 +554,10 @@ mod tests {
             assert_eq!(
                 (
                     cases[1].shape,
-                    added.prototype_shapes.as_ref(),
+                    added.prototype_validity.map(|cell| cell.identity),
                     added.child_shape
                 ),
-                (9, &[13][..], 21)
+                (9, Some(13), 21)
             );
             assert_eq!(
                 dispatch.clobbers,

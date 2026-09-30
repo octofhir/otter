@@ -335,11 +335,12 @@ fn render_region_annotation(
     if let Some(method_guard) = &region.method_guard {
         write!(
             output,
-            " method-guard-receiver-register={} method-guard-function={} method-guard-receiver-shape={} method-guard-prototype-shapes={:?} method-guard-value-byte={}",
+            " method-guard-receiver-register={} method-guard-function={} method-guard-receiver-shape={} method-guard-prototype-validity={:?} method-guard-holder-root={} method-guard-value-byte={}",
             method_guard.receiver_register,
             method_guard.method_function_id,
             method_guard.receiver_shape,
-            method_guard.prototype_shapes,
+            method_guard.prototype_validity,
+            method_guard.holder_root,
             method_guard.method_value_byte,
         )
         .expect("writing to String cannot fail");
@@ -488,6 +489,9 @@ fn symbolic_target(target: &RelocationTarget) -> String {
             name,
             signature,
         } => format!("runtimeStub(id={id},name={name:?},signature={signature:?})"),
+        RelocationTarget::PrototypeValidityCell { identity } => {
+            format!("prototypeValidityCell identity={identity}")
+        }
         RelocationTarget::GcCageBase => "gcCageBase".to_string(),
         RelocationTarget::PropertyLookupCacheTable => "propertyLookupCacheTable".to_string(),
         RelocationTarget::StoreTransitionCacheTable => "storeTransitionCacheTable".to_string(),

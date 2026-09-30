@@ -329,8 +329,15 @@ pub struct JitClassConstructorLayout {
     pub prototype_byte: u32,
 }
 
-/// Maximum ordinary prototype depth admitted by generated receiver allocation.
-pub const JIT_RECEIVER_PROTOTYPE_GUARD_CAP: usize = 8;
+/// Address-stable validity word for a complete ordinary prototype chain.
+/// The VM retains its owner until the compiled generation retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JitPrototypeValidity {
+    /// Process-local address of an atomic `u32`: one is valid, zero invalid.
+    pub address: usize,
+    /// Instance-root shape identity, used only for address-free artifacts.
+    pub identity: u64,
+}
 
 /// One GC-movement-stable receiver allocation program.
 ///
@@ -353,10 +360,10 @@ pub struct JitReceiverAllocationPlan {
     /// In-object slots of the allocated receiver: room for its initial
     /// fields and every field its constructor is known to add.
     pub inline_capacity: u8,
-    /// Number of live entries in [`Self::prototype_shapes`].
-    pub prototype_shape_count: u8,
-    /// Complete nearest-first ordinary prototype chain.
-    pub prototype_shapes: [u32; JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
+    /// Complete ordinary prototype proof, absent for unprepared allocation.
+    pub prototype_validity: Option<JitPrototypeValidity>,
+    /// Root shape fixing the prototype proved above; zero when unprepared.
+    pub prototype_root: u32,
 }
 
 impl JitReceiverAllocationPlan {
@@ -422,6 +429,8 @@ pub const JIT_SHAPE_KIND_DICTIONARY: u8 = crate::object::SHAPE_KIND_DICTIONARY;
 
 /// `[[Extensible]]` bit of an ordinary object's flag byte.
 pub const JIT_OBJECT_FLAG_EXTENSIBLE: u8 = crate::object::ObjectFlags::EXTENSIBLE;
+/// Stores to prototypes invalidate their subscribed chain proofs.
+pub const JIT_OBJECT_FLAG_USED_AS_PROTOTYPE: u8 = crate::object::ObjectFlags::USED_AS_PROTOTYPE;
 /// In-place attribute override bit: the shape no longer describes the slots'
 /// attributes.
 pub const JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN: u8 =
@@ -451,8 +460,8 @@ pub struct JitConstructorFieldTransition {
     pub from_shape: u32,
     /// Receiver hidden class after the field is added.
     pub to_shape: u32,
-    /// Full ordinary prototype-chain shapes, nearest first.
-    pub prototype_shapes: Vec<u32>,
+    /// Complete inherited-property proof.
+    pub prototype_validity: JitPrototypeValidity,
     /// Appended own-slot index.
     pub slot: u16,
 }
@@ -462,7 +471,8 @@ pub struct JitConstructorFieldTransition {
 pub(crate) struct JitConstructorFieldTransitionPlan {
     pub(crate) from_shape: crate::object::ShapeId,
     pub(crate) to_shape: crate::object::ShapeId,
-    pub(crate) prototype_shapes: Vec<crate::object::ShapeId>,
+    pub(crate) prototype_validity:
+        std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
     pub(crate) slot: u16,
 }
 
@@ -943,7 +953,14 @@ impl JitIntrinsicPrototype {
 pub enum JitMethodHolder {
     /// The shaped receiver owns the slot.
     Receiver,
-    /// A fast-mode holder with this nonzero hidden-class handle offset.
+    /// An inherited ordinary method proved by one chain cell.
+    Prototype {
+        /// Retained chain proof.
+        validity: JitPrototypeValidity,
+        /// Root shape whose traced prototype is the holder.
+        root: u32,
+    },
+    /// A fast-mode intrinsic holder with this nonzero hidden-class handle offset.
     Shape(u32),
     /// A dictionary-mode holder with this slot-layout epoch. Every delete,
     /// descriptor change or re-entry into dictionary mode advances it, so an
@@ -1098,9 +1115,10 @@ pub struct JitMethodGuard {
     pub method_fid: u32,
     /// Receiver shape-handle compressed offset.
     pub recv_shape: u32,
-    /// Shape-handle compressed offsets of each prototype hopped from the
-    /// receiver to the method holder, in hop order.
-    pub proto_chain: Vec<u32>,
+    /// Shared ordinary prototype-chain proof, absent for an own method.
+    pub prototype_validity: Option<JitPrototypeValidity>,
+    /// Root shape whose traced prototype is the method holder; zero for own.
+    pub holder_root: u32,
     /// Byte offset inside the holder object's value slab for the method slot.
     pub method_value_byte: u32,
 }
@@ -1109,14 +1127,10 @@ pub struct JitMethodGuard {
 /// Carries the method's body plus the shared identity guard. Per body
 /// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
 /// decompressed receiver.
-/// Method identity is verified inline before body entry: the emitter chases
-/// the prototype a hop's shape fixes once per
-/// [`JitMethodGuard::proto_chain`] entry,
-/// guards each hopped object's shape, reads the method slot at
-/// [`JitMethodGuard::method_value_byte`] from the final holder, and
-/// compares the resolved closure's `function_id` to
-/// [`JitMethodGuard::method_fid`]. A prototype-method reassignment or any
-/// shape change along the chain side-exits at the original method call before
+/// Method identity is verified before body entry by the receiver shape and
+/// one prototype validity cell. The holder is read from a traced root shape;
+/// the current slot must still identify [`JitMethodGuard::method_fid`].
+/// Prototype mutation invalidates the proof before any dependent call has
 /// effects. An optimizing backend may reuse that proof across iterations only
 /// after proving the receiver loop-invariant and the whole natural loop free
 /// of mutation and reentrant execution.
@@ -1206,6 +1220,18 @@ pub enum JitDirectCallThisMode {
 /// compressed offsets validated by the VM while the snapshot is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitCacheIrOp {
+    /// Read a moving holder through its pinned, traced instance-root shape.
+    LoadPrototypeHolder {
+        /// Root shape fixed by the preceding chain proof.
+        root: u32,
+        /// CacheIR operand receiving the holder.
+        result: u8,
+    },
+    /// Prove every prototype dependency with one immutable cell identity.
+    GuardPrototypeValidity {
+        /// Retained chain proof, checked before any property effect.
+        validity: JitPrototypeValidity,
+    },
     /// Continue only while the object has the expected fast hidden class.
     GuardShape {
         /// CacheIR object operand to inspect.
@@ -1234,13 +1260,6 @@ pub enum JitCacheIrOp {
         value_byte: u32,
         /// Whether the terminal operation requires a writable data slot.
         writable: bool,
-    },
-    /// Read an object's direct prototype into another CacheIR operand.
-    LoadPrototype {
-        /// CacheIR object operand whose prototype is read.
-        object: u8,
-        /// CacheIR object operand receiving the prototype.
-        result: u8,
     },
     /// Prove an exotic receiver and read its pinned canonical prototype.
     /// Subsequent ordinary guards validate the prototype's live data slot.

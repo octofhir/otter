@@ -370,6 +370,7 @@ pub(super) fn emit_binding_value(
                             global_lexical_epoch,
                             miss,
                         );
+                        dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
                         dynasm!(ops ; .arch aarch64 ; mov x12, x13);
                         emit_slab_base(ops, relocations, view, 13, 14);
                         dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);

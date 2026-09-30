@@ -236,8 +236,8 @@ pub struct IcEntrySnapshot {
 pub enum IcEntryVariant {
     /// Receiver owns the matched data slot.
     OwnData,
-    /// Receiver's direct prototype owns the matched data slot.
-    DirectPrototypeData,
+    /// An inherited holder owns the matched data slot.
+    InheritedData,
     /// Append transition that adds a slot on store.
     OwnAddTransition,
     /// Store transition guarded by a missing-key prototype chain.
@@ -394,9 +394,9 @@ pub(crate) fn snapshot_load_state(
                             slot: Some(hit.slot),
                             to_shape_id: None,
                         }
-                    } else if let Some((receiver_shape_id, hit)) = ic.direct_prototype_load() {
+                    } else if let Some((receiver_shape_id, hit)) = ic.inherited_data_load() {
                         IcEntrySnapshot {
-                            variant: IcEntryVariant::DirectPrototypeData,
+                            variant: IcEntryVariant::InheritedData,
                             receiver_shape_id: receiver_shape_id.raw(),
                             key: None,
                             slot: Some(hit.slot),

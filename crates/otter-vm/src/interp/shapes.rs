@@ -8,6 +8,9 @@
 //! # Invariants
 //! Shape children are interned via the shape runtime; allocating a
 //! child must root any live object value passed alongside it.
+//!
+//! # See also
+//! `object::prototype_validity` for dependencies on prepared prototype chains.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -297,38 +300,36 @@ impl Interpreter {
     /// storage for life. Nothing can be cached on such an object: an inline
     /// cache names its receiver by hidden class, and a dictionary object has
     /// none. Migrating on the first cache attach puts them back on the ordinary
-    /// shaped path, where the way walk, the prototype hop and the method-call
-    /// guards all already work.
+    /// shaped path, where a validity cell can cover the complete chain.
     ///
-    /// `obj` is rooted across every transition allocation and refreshed through
-    /// it, and each prototype is re-read from the refreshed receiver, so a
-    /// scavenge during migration cannot leave the walk on a vacated cell.
+    /// Handles root the receiver and traversal cursor across allocations.
+    /// The walk has the same cycle/depth safety bound as prototype lookup.
     pub(crate) fn migrate_slow_to_fast(&mut self, obj: &mut object::JsObject) {
-        /// Prototype depth the migration walks. Deeper holders are out of reach
-        /// of the guard chains that consume the result anyway.
-        const MAX_MIGRATED_CHAIN: usize = 8;
-        for depth in 0..MAX_MIGRATED_CHAIN {
-            let mut current = *obj;
-            for _ in 0..depth {
-                let Some(proto) = object::prototype(current, &self.gc_heap) else {
-                    return;
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, Value::object(*obj));
+            let cursor = interp.scoped_value(scope, Value::object(*obj));
+            for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+                let mut current = interp.escape_scoped(cursor).as_object().unwrap();
+                if let Some(ordered) =
+                    object::dictionary_ordered_slot_attrs(current, &interp.gc_heap)
+                {
+                    let mut no_extra_roots = |_: &mut dyn FnMut(*mut RawGc)| {};
+                    let Ok(shape) = interp.rebuild_shape_from_slots(
+                        &mut current,
+                        &ordered,
+                        &mut no_extra_roots,
+                    ) else {
+                        break;
+                    };
+                    object::adopt_fast_shape(current, &mut interp.gc_heap, shape);
+                }
+                let Some(next) = object::prototype(current, &interp.gc_heap) else {
+                    break;
                 };
-                current = proto;
+                interp.set_scoped(cursor, Value::object(next));
             }
-            let Some(ordered) = object::dictionary_ordered_slot_attrs(current, &self.gc_heap)
-            else {
-                continue;
-            };
-            let mut root_receiver = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                visitor((obj as *mut object::JsObject).cast::<RawGc>());
-            };
-            let Ok(shape) =
-                self.rebuild_shape_from_slots(&mut current, &ordered, &mut root_receiver)
-            else {
-                return;
-            };
-            object::adopt_fast_shape(current, &mut self.gc_heap, shape);
-        }
+            *obj = interp.escape_scoped(receiver).as_object().unwrap();
+        });
     }
 
     /// Replay `ordered` `(key, flags, is_accessor)` slots from the root of

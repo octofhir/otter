@@ -171,6 +171,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
         if !body.extensible() {
             return false;
         }
+        body.invalidate_prototype_proofs();
         body.shape = next_shape;
         body.push_slot(append_index, SlotMeta::data_default(), stored);
         true

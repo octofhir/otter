@@ -400,11 +400,15 @@ impl MachineOpcode {
             | Self::PropertyShapeProof { .. } => {
                 MachineEffects::read(SHAPE.union(PROPERTY_METADATA).union(PROTOTYPE), Guard)
             }
-            Self::CacheIrLoadPrototype { .. } => MachineEffects::read(PROTOTYPE, Value),
+            Self::CacheIrLoadPrototypeHolder { .. } => MachineEffects::read(PROTOTYPE, Value),
             Self::CacheIrLoadIntrinsicPrototype { .. } => {
                 MachineEffects::read(PROPERTY_METADATA.union(PROTOTYPE), Guard)
             }
             Self::CacheIrGuardPrototypeNull { .. } => MachineEffects::read(PROTOTYPE, Guard),
+            Self::CacheIrGuardPrototypeValidity { .. } => MachineEffects::read(
+                PROTOTYPE.union(PROPERTY_METADATA).union(PROPERTY_FIELD).union(SHAPE),
+                Guard,
+            ),
             // The latch flips only when some object gains an indexed accessor,
             // a prototype-contents change that every reentrant or writing
             // boundary already invalidates.

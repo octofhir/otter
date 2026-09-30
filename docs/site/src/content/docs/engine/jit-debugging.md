@@ -505,8 +505,13 @@ This changes the work inside the call without changing its crossing count.
 Megamorphic named accesses expose `machineMegamorphicPropertyLoad` and
 `machineMegamorphicPropertyStore`. These probes read the isolate's existing
 shared shape/atom table through a symbolic `propertyLookupCacheTable`
-relocation. Own and direct-prototype data loads validate the live object state,
-full key, holder shape and storage bounds, then load the current slot. Stores
+relocation. Own data loads validate the live object state, full key, shape and
+storage bounds. Inherited loads validate one prototype-chain cell and load the
+holder through its pinned root shape's traced prototype field. The
+`prototypeValidityCell` relocation identifies the shared proof; generated
+CacheIR exposes `machineCacheIrGuardPrototypeValidity` and
+`machineCacheIrLoadPrototypeHolder`. Invalidated cells never become valid
+again, and installed code retains its cells until physical retirement. Stores
 additionally require an own writable data slot, perform one write, and run the
 existing generated value barrier. Cache fills and collisions do not replace
 the compiled body.

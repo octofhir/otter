@@ -131,9 +131,8 @@ pub(super) fn store_case(
             })
         }
         [Op::GuardShape { object: 0, shape }, ref rest @ ..] if shape != 0 => {
-            let (links, tail) = rest.split_last_chunk::<4>()?;
             let [
-                Op::GuardPrototypeNull { object: last },
+                proof,
                 Op::GuardExtensible {
                     object: 0,
                     value_byte: slot,
@@ -146,39 +145,24 @@ pub(super) fn store_case(
                     object: 0,
                     shape: child_shape,
                 },
-            ] = *tail
+            ] = *rest
             else {
                 return None;
             };
-            if slot != value_byte || value_byte % 8 != 0 || child_shape == 0 {
-                return None;
-            }
-            let mut prototype_shapes = Vec::with_capacity(links.len() / 2);
-            let mut holder = 0u8;
-            for link in links.chunks(2) {
-                let [
-                    Op::LoadPrototype { object, result: 1 },
-                    Op::GuardShape {
-                        object: 1,
-                        shape: prototype,
-                    },
-                ] = *link
-                else {
-                    return None;
-                };
-                if object != holder || prototype == 0 {
-                    return None;
+            let prototype_validity = match proof {
+                Op::GuardPrototypeNull { object: 0 } => None,
+                Op::GuardPrototypeValidity { validity } => Some(validity),
+                _ => return None,
+            };
+            (slot == value_byte && value_byte % 8 == 0 && child_shape != 0).then_some({
+                super::super::PropertyStoreCase {
+                    shape,
+                    value_byte,
+                    transition: Some(super::super::PropertyStoreTransition {
+                        prototype_validity,
+                        child_shape,
+                    }),
                 }
-                prototype_shapes.push(prototype);
-                holder = 1;
-            }
-            (last == holder).then(|| super::super::PropertyStoreCase {
-                shape,
-                value_byte,
-                transition: Some(super::super::PropertyStoreTransition {
-                    prototype_shapes: prototype_shapes.into_boxed_slice(),
-                    child_shape,
-                }),
             })
         }
         _ => None,

@@ -2866,6 +2866,29 @@ fn emit_existing_property_load(
                         ; jne =>next
                     );
                 }
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        9,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    emit_load_u64(ops, 8, u64::from(root));
+                    dynasm!(ops ; .arch x64 ; mov r8d, [r9 + r8 + view.shape_prototype_byte as i32] ; add r8, r9);
+                }
+                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        9,
+                        validity.address as u64,
+                        RelocationTarget::PrototypeValidityCell {
+                            identity: validity.identity,
+                        },
+                    );
+                    dynasm!(ops ; .arch x64 ; cmp DWORD [r9], 0 ; je =>next);
+                }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = if object == 0 { 10 } else { 8 };
                     if intrinsic {
@@ -2912,10 +2935,6 @@ fn emit_existing_property_load(
                 otter_vm::JitCacheIrOp::GuardAtomSlot {
                     writable: false, ..
                 } => {}
-                otter_vm::JitCacheIrOp::LoadPrototype {
-                    object: 0,
-                    result: 1,
-                } => emit_template_prototype(ops, relocations, view, 10, false, next),
                 otter_vm::JitCacheIrOp::LoadField { object, value_byte } => {
                     let header = if object == 0 { 10 } else { 8 };
                     emit_template_slab_base(ops, relocations, view, header, 11, 9);
@@ -2956,6 +2975,13 @@ fn emit_existing_property_store(
     };
     emit_load_reg(ops, 0, object);
     emit_template_object_header(ops, relocations, view, 0, 10, miss);
+    emit_template_flags_guard(
+        ops,
+        view,
+        10,
+        otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE,
+        miss,
+    );
     for program in programs {
         if !program
             .ops
@@ -2975,6 +3001,29 @@ fn emit_existing_property_store(
         });
         for (index, op) in program.ops.iter().enumerate() {
             match *op {
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        9,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    emit_load_u64(ops, 8, u64::from(root));
+                    dynasm!(ops ; .arch x64 ; mov r8d, [r9 + r8 + view.shape_prototype_byte as i32] ; add r8, r9);
+                }
+                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        9,
+                        validity.address as u64,
+                        RelocationTarget::PrototypeValidityCell {
+                            identity: validity.identity,
+                        },
+                    );
+                    dynasm!(ops ; .arch x64 ; cmp DWORD [r9], 0 ; je =>next);
+                }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = if object == 0 { 10 } else { 8 };
                     if add_transition && object == 1 {
@@ -2989,10 +3038,6 @@ fn emit_existing_property_store(
                     writable: true,
                     ..
                 } if object <= 1 => {}
-                otter_vm::JitCacheIrOp::LoadPrototype { object, result: 1 } if object <= 1 => {
-                    let header = if object == 0 { 10 } else { 8 };
-                    emit_template_prototype(ops, relocations, view, header, add_transition, next);
-                }
                 otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
                     let header = if object == 0 { 10 } else { 8 };
                     emit_load_symbol_u64(
@@ -3221,37 +3266,6 @@ fn emit_template_shape_identity_guard(
         ; cmp DWORD [Rq(header) + view.object_shape_byte as i32], shape as i32
         ; jne =>miss
     );
-}
-
-fn emit_template_prototype(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-    chain_link: bool,
-    miss: DynamicLabel,
-) {
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        9,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    emit_x64_load_prototype(ops, view, 8, header, 9);
-    dynasm!(ops
-        ; .arch x64
-        ; test r8d, r8d
-        ; jz =>miss
-        ; add r8, r9
-        ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
-        ; jne =>miss
-    );
-    if chain_link {
-        emit_template_shape_state_guard(ops, view, 8, miss);
-    } else {
-        emit_template_fast_state_guard(ops, view, 8, miss);
-    }
 }
 
 /// Load into `Rd(dst)` the compressed `[[Prototype]]` of the object whose

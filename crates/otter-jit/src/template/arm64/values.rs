@@ -70,6 +70,26 @@ pub(crate) fn emit_load_symbol_u64(
     relocations.record_mov_wide(start, ops.offset().0, t, target);
 }
 
+/// Check one retained chain validity word before any dependent effect.
+pub(crate) fn emit_prototype_validity_guard(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    validity: otter_vm::jit::JitPrototypeValidity,
+    scratch: u8,
+    miss: DynamicLabel,
+) {
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        scratch,
+        validity.address as u64,
+        RelocationTarget::PrototypeValidityCell {
+            identity: validity.identity,
+        },
+    );
+    dynasm!(ops ; .arch aarch64 ; ldar W(scratch), [X(scratch)] ; cbz W(scratch), =>miss);
+}
+
 /// Materialize a validated runtime-stub entry and attach its descriptor.
 pub(super) fn emit_load_runtime_stub(
     ops: &mut Assembler,

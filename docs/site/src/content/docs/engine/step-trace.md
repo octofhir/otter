@@ -112,7 +112,7 @@ the streaming trace:
   property inline-cache site. Each site reports `Empty`,
   `Polymorphic { entries, misses }`, or `Megamorphic`. Polymorphic
   entries carry the receiver shape id, the matched slot offset, and
-  the IC variant (`OwnData`, `DirectPrototypeData`,
+  the IC variant (`OwnData`, `InheritedData`,
   `OwnAddTransition`, …).
 - `Runtime::shape_transition_snapshot()` returns the live
   hidden-class transition tree as a flat node list ordered by

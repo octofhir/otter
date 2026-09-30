@@ -18,14 +18,19 @@
 //! - Store misses are allocation-free; failure while growing a matched
 //!   transition propagates as OOM rather than falling through to another stub.
 //!
-//! - Operand `0` is always the receiver; `1` is the receiver's prototype once a
-//!   [`CacheOp::LoadPrototype`] has run. No op reads an operand before it is
+//! - Operand `0` is always the receiver; `1` is the proven holder once a
+//!   [`CacheOp::LoadPrototypeHolder`] has run. No op reads an operand before it is
 //!   defined (guaranteed by the builders).
 //! - Stub data names shapes by id (never reused) or, in hits, by handle plus
 //!   id; a stub that outlives its shape only misses. Replayed transition
 //!   targets are traced, so a stub can never publish a collected shape.
+//!
+//! # See also
+//! [`object::prototype_validity`] owns the shared inherited-property proofs.
 
+use crate::object::prototype_validity::{PrototypeValidity, chain_validity};
 use smallvec::SmallVec;
+use std::{cell::Cell, sync::Arc};
 
 use otter_gc::raw::SlotVisitor;
 
@@ -34,7 +39,7 @@ use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, Value};
 
 /// Operand slot in a stub's tiny register file. `0` is the receiver; `1` is the
-/// receiver's prototype after [`CacheOp::LoadPrototype`].
+/// inherited holder after [`CacheOp::LoadPrototypeHolder`].
 type OperandId = u8;
 
 /// A single guard or load in a cache stub. Data-bearing ops carry an index into
@@ -48,14 +53,8 @@ pub(crate) enum CacheOp {
         /// Index into the stub's `shape_ids`.
         shape: u8,
     },
-    /// Load `operands[obj]`'s `[[Prototype]]` into `operands[dst]`. Fails the
-    /// stub when there is no prototype or it is not fast-IC compatible.
-    LoadPrototype {
-        /// Operand to read the prototype of.
-        obj: OperandId,
-        /// Operand to write the prototype into.
-        dst: OperandId,
-    },
+    /// Prove the inherited lookup and load its holder from the traced root.
+    LoadPrototypeHolder,
     /// Terminal (load): produce the data value at `hits[hit]` on
     /// `operands[obj]`, validating the slot's shape/atom/key guard.
     LoadDataSlotResult {
@@ -82,9 +81,14 @@ pub(crate) enum CacheOp {
 /// A cache stub: a linear op program plus the data its ops reference.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CacheStub {
+    /// Complete inherited-property proof and its moving holder's rooted shape.
+    validity: Option<Arc<PrototypeValidity>>,
+    holder_root: Cell<object::ShapeHandle>,
+    holder_root_id: ShapeId,
+
     /// The guard/load program, run in order against operand `0` (the receiver).
     ops: SmallVec<[CacheOp; 4]>,
-    /// Receiver / prototype shape ids guarded by [`CacheOp::GuardShapeId`].
+    /// Receiver shape ids guarded by [`CacheOp::GuardShapeId`].
     shape_ids: SmallVec<[ShapeId; 1]>,
     /// Atom-aware own-property hits consumed by load terminals.
     hits: SmallVec<[AtomOwnPropertyHit; 1]>,
@@ -103,6 +107,9 @@ impl CacheStub {
     pub(crate) fn snapshot_for_jit(
         &self,
         mut resolve_shape: impl FnMut(ShapeId) -> Option<u32>,
+        mut resolve_validity: impl FnMut(
+            &std::sync::Arc<object::prototype_validity::PrototypeValidity>,
+        ) -> Option<crate::jit::JitPrototypeValidity>,
     ) -> Option<crate::jit::JitCacheIrProgram> {
         use crate::jit::JitCacheIrOp;
 
@@ -117,25 +124,30 @@ impl CacheStub {
                     }
                     ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
                 }
-                CacheOp::LoadPrototype { obj, dst } => {
-                    ops.push(JitCacheIrOp::LoadPrototype {
-                        object: obj,
-                        result: dst,
+                CacheOp::LoadPrototypeHolder => {
+                    ops.push(JitCacheIrOp::GuardPrototypeValidity {
+                        validity: resolve_validity(self.validity.as_ref()?)?,
+                    });
+                    ops.push(JitCacheIrOp::LoadPrototypeHolder {
+                        root: resolve_shape(self.holder_root_id)?,
+                        result: 1,
                     });
                 }
                 CacheOp::LoadDataSlotResult { obj, hit } => {
                     let hit = *self.hits.get(hit as usize)?;
-                    let shape = resolve_shape(hit.shape_id)?;
-                    if shape == 0 {
-                        return None;
+                    if obj == 0 {
+                        let shape = resolve_shape(hit.shape_id)?;
+                        if shape == 0 {
+                            return None;
+                        }
+                        ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
+                        ops.push(JitCacheIrOp::GuardAtomSlot {
+                            object: obj,
+                            atom: hit.atom_id.raw(),
+                            value_byte: slot_value_byte(hit.slot),
+                            writable: false,
+                        });
                     }
-                    ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
-                    ops.push(JitCacheIrOp::GuardAtomSlot {
-                        object: obj,
-                        atom: hit.atom_id.raw(),
-                        value_byte: slot_value_byte(hit.slot),
-                        writable: false,
-                    });
                     ops.push(JitCacheIrOp::LoadField {
                         object: obj,
                         value_byte: slot_value_byte(hit.slot),
@@ -174,36 +186,12 @@ impl CacheStub {
                         object::StorePropertyTransitionKind::OwnAdd => {
                             ops.push(JitCacheIrOp::GuardPrototypeNull { object: 0 });
                         }
-                        object::StorePropertyTransitionKind::PrototypeChainMissing { chain } => {
-                            let mut object = 0;
-                            for expected in chain {
-                                let shape = resolve_shape(*expected)?;
-                                if shape == 0 {
-                                    return None;
-                                }
-                                ops.push(JitCacheIrOp::LoadPrototype { object, result: 1 });
-                                ops.push(JitCacheIrOp::GuardShape { object: 1, shape });
-                                object = 1;
-                            }
-                            ops.push(JitCacheIrOp::GuardPrototypeNull { object });
-                        }
-                        object::StorePropertyTransitionKind::DirectPrototypeWritableData {
-                            prototype_hit,
+                        object::StorePropertyTransitionKind::PrototypeChainMissing { validity }
+                        | object::StorePropertyTransitionKind::DirectPrototypeWritableData {
+                            validity,
                         } => {
-                            let shape = resolve_shape(prototype_hit.shape_id)?;
-                            if shape == 0 {
-                                return None;
-                            }
-                            ops.push(JitCacheIrOp::LoadPrototype {
-                                object: 0,
-                                result: 1,
-                            });
-                            ops.push(JitCacheIrOp::GuardShape { object: 1, shape });
-                            ops.push(JitCacheIrOp::GuardAtomSlot {
-                                object: 1,
-                                atom: prototype_hit.atom_id.raw(),
-                                value_byte: slot_value_byte(prototype_hit.slot),
-                                writable: true,
+                            ops.push(JitCacheIrOp::GuardPrototypeValidity {
+                                validity: resolve_validity(validity)?,
                             });
                         }
                     }
@@ -240,22 +228,20 @@ impl CacheStub {
         }
     }
 
-    /// Direct-prototype data load: the receiver's prototype owns the slot. The
-    /// receiver shape is guarded before the prototype hop so a transitioned
-    /// receiver re-resolves.
+    /// Inherited data load with one complete chain proof.
     #[must_use]
-    pub(crate) fn load_direct_prototype_data(
-        receiver_shape_id: ShapeId,
-        hit: AtomOwnPropertyHit,
-    ) -> Self {
-        let mut ops = SmallVec::new();
-        ops.push(CacheOp::GuardShapeId { obj: 0, shape: 0 });
-        ops.push(CacheOp::LoadPrototype { obj: 0, dst: 1 });
-        ops.push(CacheOp::LoadDataSlotResult { obj: 1, hit: 0 });
+    fn load_inherited_data(receiver_shape_id: ShapeId, resolved: &ResolvedDataSlot) -> Self {
         Self {
-            ops,
+            ops: smallvec::smallvec![
+                CacheOp::GuardShapeId { obj: 0, shape: 0 },
+                CacheOp::LoadPrototypeHolder,
+                CacheOp::LoadDataSlotResult { obj: 1, hit: 0 }
+            ],
             shape_ids: SmallVec::from_elem(receiver_shape_id, 1),
-            hits: SmallVec::from_elem(hit, 1),
+            hits: SmallVec::from_elem(resolved.hit, 1),
+            validity: resolved.validity.clone(),
+            holder_root: Cell::new(resolved.holder_root),
+            holder_root_id: resolved.holder_root_id,
             ..Self::default()
         }
     }
@@ -276,17 +262,24 @@ impl CacheStub {
             match *op {
                 CacheOp::GuardShapeId { obj, shape } => {
                     let obj = Self::operand(&operands, obj)?;
-                    if object::shape_id(obj, heap) != self.shape_ids[shape as usize] {
+                    if !object::supports_fast_property_ic(obj, heap)
+                        || object::shape_id(obj, heap) != self.shape_ids[shape as usize]
+                    {
                         return None;
                     }
                 }
-                CacheOp::LoadPrototype { obj, dst } => {
-                    let obj = Self::operand(&operands, obj)?;
-                    let proto = object::prototype(obj, heap)?;
-                    if !object::supports_fast_property_ic(proto, heap) {
+                CacheOp::LoadPrototypeHolder => {
+                    if !self.validity.as_ref()?.is_valid()
+                        || heap.read_payload(recv, |body| body.chain_link_opaque())
+                    {
                         return None;
                     }
-                    operands[dst as usize] = Some(proto);
+                    let object::shape_body::ShapePrototype::Object(holder) =
+                        object::shape_body::prototype_of(self.holder_root.get())
+                    else {
+                        return None;
+                    };
+                    operands[1] = Some(holder);
                 }
                 // Terminals are handled by the per-kind executors below.
                 CacheOp::LoadDataSlotResult { .. }
@@ -316,7 +309,18 @@ impl CacheStub {
             return None;
         };
         let obj = Self::operand(&operands, obj)?;
-        object::load_own_data_slot_atom(obj, heap, key, self.hits[hit as usize])
+        if self.validity.is_some() {
+            if key.atom().id() != self.hits[hit as usize].atom_id {
+                return None;
+            }
+            Some(object::load_proven_data_slot(
+                obj,
+                heap,
+                self.hits[hit as usize].slot,
+            ))
+        } else {
+            object::load_own_data_slot_atom(obj, heap, key, self.hits[hit as usize])
+        }
     }
 
     /// The load program for an already-resolved data slot.
@@ -327,7 +331,7 @@ impl CacheStub {
     ) -> Self {
         match resolved.hops {
             0 => Self::load_own_data(resolved.hit),
-            _ => Self::load_direct_prototype_data(receiver_shape_id, resolved.hit),
+            _ => Self::load_inherited_data(receiver_shape_id, resolved),
         }
     }
 
@@ -342,10 +346,10 @@ impl CacheStub {
         }
     }
 
-    /// The `(receiver shape id, prototype hit)` of a direct-prototype data load
+    /// The `(receiver shape id, holder hit)` of an inherited data load
     /// stub, for devtools rendering.
     #[must_use]
-    pub(crate) fn direct_prototype_load(&self) -> Option<(ShapeId, AtomOwnPropertyHit)> {
+    pub(crate) fn inherited_data_load(&self) -> Option<(ShapeId, AtomOwnPropertyHit)> {
         match (
             self.ops.as_slice(),
             self.shape_ids.as_slice(),
@@ -354,7 +358,7 @@ impl CacheStub {
             (
                 [
                     CacheOp::GuardShapeId { obj: 0, shape: 0 },
-                    CacheOp::LoadPrototype { obj: 0, dst: 1 },
+                    CacheOp::LoadPrototypeHolder,
                     CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
                 ],
                 [shape_id],
@@ -464,6 +468,9 @@ impl CacheStub {
 
     /// Visit GC roots in stub data — the target shapes of replayed transitions.
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+        if !self.holder_root.get().is_null() {
+            visitor(self.holder_root.as_ptr().cast());
+        }
         for transition in &self.transitions {
             transition.trace_roots(visitor);
         }
@@ -472,12 +479,12 @@ impl CacheStub {
 
 /// Where a named data property lives relative to the receiver, and what it
 /// currently holds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ResolvedDataSlot {
-    /// Prototype hops from the receiver to the holder: `0` own, `1` the
-    /// receiver's direct prototype. Deeper holders are not resolved here —
-    /// proving the property absent on every object in between costs a guard
-    /// per link, which is exactly the boundary the cache stubs already draw.
+    pub(crate) validity: Option<Arc<PrototypeValidity>>,
+    pub(crate) holder_root: object::ShapeHandle,
+    pub(crate) holder_root_id: ShapeId,
+    /// Holder category: `0` for own data, `1` for inherited data at any depth.
     pub(crate) hops: u8,
     /// The holder's own-slot hit, guarded by its shape.
     pub(crate) hit: AtomOwnPropertyHit,
@@ -487,13 +494,9 @@ pub(crate) struct ResolvedDataSlot {
     pub(crate) is_writable: bool,
 }
 
-/// Resolve a named property to a plain data slot on the receiver or its direct
-/// prototype.
-///
-/// This is the one resolution both consumers share: the per-site stub builder
-/// above, and the isolate-wide `(shape, atom)` cache that answers sites the
-/// stub layer has given up on. `None` for accessors, deeper holders, absent
-/// properties, and any receiver hidden classes cannot describe.
+/// Resolve own or inherited ordinary data with one shared chain proof.
+/// Both per-site stubs and the shared property table consume this answer.
+/// Accessors, absent properties and opaque lookup state return `None`.
 #[must_use]
 pub(crate) fn resolve_atom_data_slot(
     obj: JsObject,
@@ -507,28 +510,42 @@ pub(crate) fn resolve_atom_data_slot(
     if let (Some(hit), object::PropertyLookup::Data { value, flags }) = (own.hit, own.lookup) {
         return Some(ResolvedDataSlot {
             hops: 0,
+            validity: None,
+            holder_root: object::ShapeHandle::null(),
+            holder_root_id: ShapeId::UNASSIGNED,
             hit,
             value,
             is_writable: flags.writable(),
         });
     }
-    if own.hit.is_some() {
+    if own.hit.is_some() || heap.read_payload(obj, |body| body.chain_link_opaque()) {
         return None;
     }
-    let proto = object::prototype(obj, heap)?;
-    if !object::supports_fast_property_ic(proto, heap) {
-        return None;
-    }
-    let inherited = object::lookup_own_atom(proto, heap, key);
-    if let (Some(hit), object::PropertyLookup::Data { value, flags }) =
-        (inherited.hit, inherited.lookup)
-    {
-        return Some(ResolvedDataSlot {
-            hops: 1,
-            hit,
-            value,
-            is_writable: flags.writable(),
-        });
+    let first = object::prototype(obj, heap)?;
+    let validity = chain_validity(first, heap)?;
+    let mut proto = first;
+    for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+        if !object::supports_fast_property_ic(proto, heap) {
+            return None;
+        }
+        let inherited = object::lookup_own_atom(proto, heap, key);
+        match (inherited.hit, inherited.lookup) {
+            (Some(hit), object::PropertyLookup::Data { value, flags }) => {
+                let holder_root = object::cached_instance_root(proto, heap)?;
+                return Some(ResolvedDataSlot {
+                    hops: 1,
+                    hit,
+                    value,
+                    is_writable: flags.writable(),
+                    validity: Some(validity),
+                    holder_root,
+                    holder_root_id: heap
+                        .read_payload(holder_root, object::shape_body::ShapeBody::id),
+                });
+            }
+            (_, object::PropertyLookup::Absent) => proto = object::prototype(proto, heap)?,
+            _ => return None,
+        }
     }
     None
 }

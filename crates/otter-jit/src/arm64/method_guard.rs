@@ -13,8 +13,8 @@
 //!   the exact callable as SELF; frameless inlining admits only bodies that
 //!   never read it.
 //! - The returned callable is a full tagged `Value`, never a compressed slot.
-//! - One materialized cage base in `x12` serves the receiver and every
-//!   prototype hop; `x13` advances through the guarded object chain.
+//! - One validity word proves an inherited lookup. Its holder is read through
+//!   a retained root shape, whose prototype field follows moving GC.
 //!
 //! # See also
 //! - [`otter_vm::JitMethodGuard`] — owned compile-time guard metadata.
@@ -114,23 +114,22 @@ pub(crate) fn emit_method_guard_from_tagged_register(
     );
     emit_load_u64(ops, 15, u64::from(guard.recv_shape));
     dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>bail);
+    crate::template::arm64::ic_probe::emit_ordinary_lookup_state_guard(ops, view, 13, bail);
     if let Some(register) = receiver_body_register {
         dynasm!(ops ; .arch aarch64 ; mov X(register), x13);
     }
 
-    for &hop_shape in &guard.proto_chain {
-        crate::template::arm64::values::emit_load_prototype(ops, view, 9, 13, 12);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz w9, =>bail
-            ; add x13, x12, x9
-            ; ldrb w14, [x13]
-            ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>bail
-            ; ldr w14, [x13, view.object_shape_byte]
+    if let Some(validity) = guard.prototype_validity {
+        crate::template::arm64::values::emit_prototype_validity_guard(
+            ops,
+            relocations,
+            validity,
+            14,
+            bail,
         );
-        emit_load_u64(ops, 15, u64::from(hop_shape));
-        dynasm!(ops ; .arch aarch64 ; cmp w14, w15 ; b.ne =>bail);
+        emit_load_u64(ops, 14, u64::from(guard.holder_root));
+        dynasm!(ops ; .arch aarch64 ; add x14, x12, x14
+            ; ldr w13, [x14, view.shape_prototype_byte] ; add x13, x12, x13);
     }
 
     emit_slab_base(ops, relocations, view, 13, 14);

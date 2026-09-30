@@ -97,6 +97,7 @@ mod descriptor;
 mod descriptor_core;
 mod key_order;
 mod lookup;
+pub(crate) mod prototype_validity;
 pub(crate) mod shape_body;
 mod shape_cache;
 #[cfg(test)]
@@ -820,8 +821,8 @@ impl ObjectFlags {
     /// without meaning `null`), or it is a String wrapper whose index
     /// and `length` keys live outside its shape, or it owns host data that
     /// can supply namespace properties or mapped argument values outside its
-    /// ordinary slots. Generated shape guards test this bit for every chain
-    /// link, so a shape match proves ordinary key/slot lookup only on objects
+    /// ordinary slots. Chain capture and generated receiver guards test this
+    /// bit, so a shape match proves ordinary key/slot lookup only on objects
     /// whose shape fully describes it. Symbol properties and native call
     /// metadata alone do not make a link opaque.
     pub(crate) const CHAIN_LINK_OPAQUE: u8 = 1 << 2;
@@ -829,9 +830,22 @@ impl ObjectFlags {
     /// properties marks the object so future dictionary storage keeps the
     /// same invalidation contract without installing stale ICs.
     pub(crate) const DICTIONARY_COMPATIBLE: u8 = 1 << 3;
+    /// Stores must invalidate the prototype's dependent chain proofs.
+    pub(crate) const USED_AS_PROTOTYPE: u8 = 1 << 4;
 }
 
 impl ObjectBody {
+    /// Retire dependent proofs before changing a watched prototype.
+    #[inline]
+    fn invalidate_prototype_proofs(&self) {
+        if self.flags() & ObjectFlags::USED_AS_PROTOTYPE != 0 {
+            self.exotic()
+                .expect("prototype sidecar")
+                .prototype_watchpoints
+                .invalidate();
+        }
+    }
+
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         if self.slab.is_null() {
             for value in &self.inline_values()[..self.slot_count()] {
@@ -916,6 +930,7 @@ impl ObjectBody {
 
     #[inline]
     fn set_flag(&mut self, bit: u8, on: bool) {
+        self.invalidate_prototype_proofs();
         let header = self.cell_header();
         // SAFETY: a heap-resident body's header precedes it; the mutator is
         // the only writer of the body-owned header bytes.
@@ -1046,10 +1061,12 @@ impl ExoticSlot {
 }
 
 /// Rare/exotic object state, kept out of [`ObjectBody`] so ordinary
-/// objects stay small. Its own GC body, so an object that has one still
-/// owns nothing outside the heap.
+/// objects stay small. GC handles live in this sidecar; host payloads and
+/// prototype watchpoints own Rust storage and are severed on snapshot restore.
 #[derive(Default)]
 pub struct ExoticSlots {
+    /// Mutation subscriptions and the current proof of this prototype chain.
+    prototype_watchpoints: prototype_validity::PrototypeWatchpoints,
     /// Root shape of the objects whose `[[Prototype]]` is this object (V8's
     /// `PrototypeInfo::ObjectCreateMap`), created on first use. The root holds
     /// this object as its prototype, so the pair lives and dies together.
@@ -1122,14 +1139,16 @@ pub struct ExoticSlots {
 }
 
 impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
-    /// Sever foreign ownership on a snapshot restore: the copied host payload
-    /// box aliases the source isolate's allocation and would become a second
-    /// owner, so even this body's own trace impl must never see it. Capturable
-    /// graphs carry no live host payloads.
+    /// Sever foreign ownership on a snapshot restore. Host payloads and
+    /// prototype watchpoints belong to the capture isolate. Restored chains
+    /// establish fresh cells and subscriptions on their first lookup.
     fn sever_restored_payload(&mut self) {
         // SAFETY: overwriting without dropping (or reading) severs the
         // alias; the capture isolate remains the owner.
-        unsafe { std::ptr::write(&mut self.host_data, None) };
+        unsafe {
+            std::ptr::write(&mut self.host_data, None);
+            std::ptr::write(&mut self.prototype_watchpoints, Default::default());
+        }
     }
 }
 
@@ -2256,6 +2275,7 @@ impl ObjectBody {
     /// chose (a captured transition replays its id), advancing the
     /// slot-layout epoch when `advance_layout`.
     pub(super) fn enter_dictionary_mode_as(&mut self, id: ShapeId, advance_layout: bool) {
+        self.invalidate_prototype_proofs();
         let count = self.slot_count();
         let dictionary = shape_body::dictionary_of(self.shape);
         if self.exotic.is_null() {
@@ -2387,6 +2407,7 @@ impl ObjectBody {
     /// Write a value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: Value) {
+        self.invalidate_prototype_proofs();
         debug_assert!(i < self.slot_count(), "slab write out of range");
         // SAFETY: same in-range word as `slot_word`.
         unsafe { *self.values_base().add(i) = value };
@@ -2400,6 +2421,7 @@ impl ObjectBody {
     /// dictionary object's count advances here.
     #[inline]
     fn push_slab_word(&mut self, index: usize, value: Value) {
+        self.invalidate_prototype_proofs();
         debug_assert!(
             index < self.slab_capacity(),
             "slab append past reserved capacity: index={index} capacity={}; \
@@ -2426,6 +2448,7 @@ impl ObjectBody {
     /// dictionary mode, an uncommon path).
     #[inline]
     fn remove_slab_word(&mut self, i: usize) {
+        self.invalidate_prototype_proofs();
         debug_assert!(self.is_dictionary(), "only dictionary objects remove slots");
         let len = self.slot_count();
         // SAFETY: `i < len <= capacity`; the shift stays inside the live
@@ -3469,11 +3492,13 @@ pub(crate) fn install_fresh_shape_with_slots(
             0,
             "shape install requires a fresh object"
         );
+        body.invalidate_prototype_proofs();
         let base = body.values_base();
         for (index, &value) in stored.iter().enumerate() {
             // SAFETY: the reservation above made room for every index.
             unsafe { *base.add(index) = value };
         }
+        body.invalidate_prototype_proofs();
         body.shape = shape;
     });
     for &value in &stored {
@@ -4009,16 +4034,6 @@ pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
     }
 }
 
-fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) -> bool {
-    if !body.is_dictionary() {
-        return u32::try_from(offset)
-            .ok()
-            .and_then(|offset| shape_body::shape_key_at_offset(heap, body.shape, offset))
-            .is_some();
-    }
-    body.dict_keys().is_some_and(|table| offset < table.len())
-}
-
 fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, key: &str) -> bool {
     if !body.is_dictionary() {
         return u32::try_from(offset).ok().is_some_and(|offset| {
@@ -4356,26 +4371,10 @@ pub(crate) fn store_own_data_slot_atom(
     Some(())
 }
 
-fn has_writable_own_data_slot_atom(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
-    atom_id: AtomId,
-    hit: AtomOwnPropertyHit,
-) -> bool {
-    heap.read_payload(obj, |body| {
-        if body_shape_id(heap, body) != hit.shape_id || atom_id != hit.atom_id {
-            return false;
-        }
-        let offset = hit.slot as usize;
-        if !body_has_key_at(heap, body, offset) {
-            return false;
-        }
-        if offset >= body_property_count(heap, body) {
-            return false;
-        }
-        let (flags, is_accessor) = body.slot_attrs(heap, offset);
-        flags.writable() && !is_accessor
-    })
+/// Read a data slot authorized by a live prototype validity proof.
+/// No allocation or JavaScript may occur between checking the proof and reading.
+pub(crate) fn load_proven_data_slot(obj: JsObject, heap: &GcHeap, slot: u16) -> Value {
+    heap.read_payload(obj, |body| body.slot_word(usize::from(slot)))
 }
 
 /// Probe for a property with full prototype-chain walk. Returns
@@ -5361,6 +5360,7 @@ pub(crate) fn set_with_shape(
     }
     heap.with_payload(obj, |body| {
         debug_assert_object_shape_handle(next_shape, "shape-slot store");
+        body.invalidate_prototype_proofs();
         body.shape = next_shape;
         body.push_slot(index, SlotMeta::data_default(), stored);
     });
@@ -5451,7 +5451,10 @@ pub(crate) fn cache_instance_root(
     root: ShapeHandle,
 ) -> Result<(), otter_gc::OutOfMemory> {
     ensure_exotic(proto, heap)?;
-    heap.with_payload(*proto, |body| body.exotic_mut().instance_root = root);
+    heap.with_payload(*proto, |body| {
+        body.set_flag(ObjectFlags::USED_AS_PROTOTYPE, true);
+        body.exotic_mut().instance_root = root;
+    });
     let sidecar = heap.read_payload(*proto, |body| body.exotic.get());
     heap.record_write(sidecar, &root);
     Ok(())
@@ -5550,6 +5553,7 @@ pub(crate) fn install_prototype_shape(
             dictionary || body.slot_count() == shape_body::property_count_of(shape) as usize,
             "a prototype change keeps the object's slots",
         );
+        body.invalidate_prototype_proofs();
         body.shape = shape;
         if dictionary {
             body.enter_dictionary_mode_as(next_shape_id(), true);
@@ -6084,6 +6088,7 @@ pub(crate) fn define_own_property_partial_with_shape(
                 return false;
             }
             debug_assert_object_shape_handle(next_shape, "shape-slot store");
+            body.invalidate_prototype_proofs();
             body.shape = next_shape;
             body.push_slot(append_index, meta, stored);
             true
@@ -6660,6 +6665,7 @@ pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_sh
     heap.with_payload(obj, |body| {
         body.set_extensible(false);
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
+        body.invalidate_prototype_proofs();
         body.shape = new_shape;
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
@@ -6745,6 +6751,7 @@ pub(crate) fn freeze_with_shape(
     heap.with_payload(obj, |body| {
         body.set_extensible(false);
         debug_assert_object_shape_handle(new_shape, "shape-slot store");
+        body.invalidate_prototype_proofs();
         body.shape = new_shape;
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
             // SAFETY: a non-null handle names a live sidecar payload.
@@ -7029,6 +7036,7 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
         "migrated hidden class must record every dictionary slot"
     );
     heap.with_payload(obj, |body| {
+        body.invalidate_prototype_proofs();
         body.shape = shape;
         body.set_slot_attrs_overridden(false);
         if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|

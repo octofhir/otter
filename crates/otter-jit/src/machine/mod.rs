@@ -814,9 +814,8 @@ pub struct PropertyStoreCase {
 /// The missing-key and append contract of one add-transition store case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyStoreTransition {
-    /// Hidden classes of the prototype chain in order; the link after the
-    /// last one must be null. Empty for a receiver without a prototype.
-    pub prototype_shapes: Box<[u32]>,
+    /// Retained ordinary-chain proof; absent for a receiver with null prototype.
+    pub prototype_validity: Option<otter_vm::jit::JitPrototypeValidity>,
     /// Child hidden class published after the value store.
     pub child_shape: u32,
 }
@@ -1238,11 +1237,6 @@ pub enum MachineOpcode {
         /// Whether the terminal operation requires a writable data slot.
         writable: bool,
     },
-    /// Read a direct prototype under a prior CacheIR condition.
-    CacheIrLoadPrototype {
-        /// Source byte offset used by artifacts.
-        byte_pc: u32,
-    },
     /// Prove an exotic receiver's type and clean-instance latch, then expose
     /// its pinned realm prototype to ordinary CacheIR shape/slot guards.
     CacheIrLoadIntrinsicPrototype {
@@ -1279,6 +1273,20 @@ pub enum MachineOpcode {
     CacheIrGuardPrototypeNull {
         /// Source byte offset used by artifacts.
         byte_pc: u32,
+    },
+    /// Read the single retained validity word under a prior condition.
+    CacheIrGuardPrototypeValidity {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Complete ordinary-chain proof.
+        validity: otter_vm::jit::JitPrototypeValidity,
+    },
+    /// Read a moving prototype holder through a retained instance-root shape.
+    CacheIrLoadPrototypeHolder {
+        /// Source byte offset used by artifacts.
+        byte_pc: u32,
+        /// Compressed root shape, whose traced prototype field is the holder.
+        root: u32,
     },
     /// Read one own data field under a complete CacheIR guard chain.
     CacheIrLoadField {
@@ -1318,7 +1326,7 @@ pub enum MachineOpcode {
         cases: Box<[PolymorphicPropertyCase]>,
     },
     /// Probe the isolate's existing shape/atom table and read a live own or
-    /// direct-prototype data slot. Miss returns undefined/false without effects.
+    /// inherited data slot. Miss returns undefined/false without effects.
     PropertyMegamorphicLoad {
         /// Source byte offset used by artifacts.
         byte_pc: u32,
@@ -2785,7 +2793,30 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::CacheIrGuardArrayIndexProtector { .. } => {
+                    MachineOpcode::CacheIrLoadPrototypeHolder { root, .. } => {
+                        let [active, holder, output] = instruction.operands.as_slice() else {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        };
+                        if *root == 0
+                            || *active != MachineOperand::register_input(active.value)
+                            || self.representations[active.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || *holder != MachineOperand::register_output(holder.value)
+                            || self.representations[holder.value.0 as usize]
+                                != MachineRepresentation::Tagged
+                            || *output != MachineOperand::register_output(output.value)
+                            || self.representations[output.value.0 as usize]
+                                != MachineRepresentation::Boolean
+                            || instruction.clobbers
+                                != target_spec.clobbers(TargetClobberSet::PropertyLoad)
+                            || !instruction.exits.is_empty()
+                            || instruction.safepoint.is_some()
+                        {
+                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                        }
+                    }
+                    MachineOpcode::CacheIrGuardArrayIndexProtector { .. }
+                    | MachineOpcode::CacheIrGuardPrototypeValidity { .. } => {
                         let [active, output] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         };
@@ -2841,8 +2872,7 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::CacheIrLoadPrototype { .. }
-                    | MachineOpcode::CacheIrLoadIntrinsicPrototype { .. }
+                    MachineOpcode::CacheIrLoadIntrinsicPrototype { .. }
                     | MachineOpcode::CacheIrLoadField { .. } => {
                         let [object, active, payload, hit] = instruction.operands.as_slice() else {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
@@ -2953,7 +2983,9 @@ impl InstructionSequence {
                                     && case.value_byte % 8 == 0
                                     && case.transition.as_ref().is_none_or(|transition| {
                                         transition.child_shape != 0
-                                            && transition.prototype_shapes.iter().all(|&s| s != 0)
+                                            && transition
+                                                .prototype_validity
+                                                .is_none_or(|cell| cell.address != 0)
                                     })
                             });
                         if !cases_valid

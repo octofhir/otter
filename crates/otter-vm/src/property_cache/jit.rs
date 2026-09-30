@@ -17,10 +17,10 @@
 //!   receiver, prototype, JavaScript value or borrowed slab address. A full
 //!   collection drops every entry whose holder shape it collects before the
 //!   cell can be reused, so a handle compare here is exact.
-//! - Generated positive hits validate the live receiver/holder ordinary state,
-//!   exact key and holder shape, descriptor kind and storage bounds. Loads may
-//!   use own/direct-prototype data slots. Stores additionally require an own
-//!   writable data slot before their single effect.
+//! - Positive hits prove the receiver's live ordinary state, exact key, data
+//!   kind and bounds. Inherited loads check one retained validity cell and
+//!   load the holder through its traced root shape. Stores additionally require
+//!   an own writable slot and reject watched prototypes before their effect.
 //!
 //! # See also
 //! - `super` owns the only table and every producer/runtime consumer.
@@ -42,6 +42,10 @@ use crate::object::AtomOwnPropertyHit;
 /// `shape_id_byte`, which includes the collector header of a shape cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitPropertyLookupCache {
+    /// Entry offset of the retained chain validity-word address.
+    pub validity_byte: u32,
+    /// Entry offset of the holder's pinned instance-root shape.
+    pub holder_root_byte: u32,
     /// Address of the first entry in the existing fixed boxed table.
     pub table_addr: usize,
     /// Byte stride between table entries.
@@ -52,7 +56,7 @@ pub struct JitPropertyLookupCache {
     pub receiver_shape_id_byte: u32,
     /// Offset of the key's isolate-global `u32` atom identity.
     pub atom_byte: u32,
-    /// Offset of `u8` depth: zero means own, one means direct prototype.
+    /// Offset of the holder category: zero means own, one means inherited.
     /// Every other value is a generated miss.
     pub hops_byte: u32,
     /// Offset of the holder's pinned compressed `u32` shape handle.
@@ -87,23 +91,19 @@ pub struct JitStoreTransitionCache {
     pub ways: u32,
     /// Receiver shape identity offset within a way.
     pub receiver_shape_byte: u32,
-    /// Direct prototype shape identity offset within a way.
-    pub prototype_shape_byte: u32,
+    /// Address of the retained validity word; zero for a null chain.
+    pub validity_byte: u32,
     /// Property atom offset within a way.
     pub atom_byte: u32,
     /// Compressed child shape offset, zero when no generated handler exists.
     pub target_shape_byte: u32,
     /// Appended flat property slot offset within a way.
     pub slot_byte: u32,
-    /// Number of recorded missing-key prototype links.
-    pub chain_len_byte: u32,
-    /// Offset of the fixed prototype shape identity array.
-    pub chain_byte: u32,
     /// Header-inclusive immutable shape identity offset.
     pub shape_id_byte: u32,
     /// Receiver shape hash multiplier.
     pub hash_shape_multiplier: u64,
-    /// Property atom and prototype shape hash multiplier.
+    /// Property atom hash multiplier.
     pub hash_atom_multiplier: u64,
     /// Shift applied before the table mask.
     pub hash_shift: u8,
@@ -117,12 +117,10 @@ impl StoreTransitionCache {
             index_mask: (TRANSITION_SETS - 1) as u32,
             ways: TRANSITION_WAYS as u32,
             receiver_shape_byte: offset_of!(StoreTransitionJitEntry, receiver_shape) as u32,
-            prototype_shape_byte: offset_of!(StoreTransitionJitEntry, prototype_shape) as u32,
+            validity_byte: offset_of!(StoreTransitionJitEntry, validity) as u32,
             atom_byte: offset_of!(StoreTransitionJitEntry, atom) as u32,
             target_shape_byte: offset_of!(StoreTransitionJitEntry, target_shape) as u32,
             slot_byte: offset_of!(StoreTransitionJitEntry, slot) as u32,
-            chain_len_byte: offset_of!(StoreTransitionJitEntry, chain_len) as u32,
-            chain_byte: offset_of!(StoreTransitionJitEntry, chain) as u32,
             shape_id_byte: (otter_gc::header::HEADER_SIZE + crate::object::SHAPE_BODY_ID_OFFSET)
                 as u32,
             hash_shape_multiplier: HASH_SHAPE_MULTIPLIER,
@@ -137,6 +135,8 @@ impl PropertyLookupCache {
     pub(crate) fn jit_layout(&self) -> JitPropertyLookupCache {
         let hit = offset_of!(Entry, hit);
         JitPropertyLookupCache {
+            validity_byte: offset_of!(Entry, validity) as u32,
+            holder_root_byte: offset_of!(Entry, holder_root) as u32,
             table_addr: self.ways[0].as_ptr() as usize,
             entry_bytes: size_of::<Entry>() as u32,
             index_mask: (CAPACITY - 1) as u32,

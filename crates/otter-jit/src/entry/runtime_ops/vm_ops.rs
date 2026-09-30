@@ -117,8 +117,9 @@ pub(crate) extern "C" fn jit_store_property_stub(
 /// `packet[0]` is the receiver and the remaining `count - 1` values are every
 /// actual argument. The packet is copied before binding the VM runtime call so
 /// no pointer into generated stack storage survives allocation or JavaScript
-/// reentry. The published frame supplies exact function/PC identity, precise
-/// roots, and the immutable bytecode declaration of method name and argc.
+/// reentry. The published frame supplies precise roots; its safepoint recipe
+/// selects the source call for an inlined descendant. That source's bytecode
+/// declares the method name and argument count.
 pub(crate) extern "C" fn jit_call_method_value_stub(
     ctx: *mut JitCtx,
     packet: *const Value,

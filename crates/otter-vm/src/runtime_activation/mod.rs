@@ -10,6 +10,7 @@
 //!   operations instead of raw interpreter, stack, context, or frame handles.
 //! - `inline_activations` publishes boxed callee recipes only for committed
 //!   cold reentry and returns to the same compiled body without interpretation.
+//! - `call_source` resolves boxed calls within virtual inline descendants.
 //!
 //! # Invariants
 //! - Construction reads and validates scalar descriptors from the published
@@ -37,6 +38,7 @@
 //! - [`crate::active_frame`] validates the machine-published frame windows.
 
 mod bindings;
+mod call_source;
 mod class_ops;
 mod committed_values;
 mod control;

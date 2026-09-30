@@ -249,32 +249,6 @@ pub(super) fn value_packet_frame(
     })
 }
 
-fn inline_frame_words(sequence: &InstructionSequence) -> Result<u16, Unsupported> {
-    let header_words = std::mem::size_of::<otter_vm::native_abi::NativeFrame>() / 8;
-    let max = sequence
-        .instructions()
-        .iter()
-        .filter(|instruction| {
-            matches!(instruction.opcode, MachineOpcode::Call(index)
-                if matches!(sequence.call_descriptors()[index as usize].target, CallTarget::Direct { .. }))
-        })
-        .map(|instruction| {
-            if instruction.inline_frames.is_empty() {
-                0
-            } else {
-                1 + instruction
-                    .inline_frames
-                    .iter()
-                    .skip(1)
-                    .map(|frame| header_words + frame.slots.len())
-                    .sum::<usize>()
-            }
-        })
-        .max()
-        .unwrap_or(0);
-    u16::try_from(max).map_err(|_| Unsupported::OperandShape("inline native frame capacity"))
-}
-
 /// Allocation failure text naming, for an SSA rejection, the using
 /// instruction and every definition of the value together with their blocks,
 /// so a failing compile explains itself without an artifact.
@@ -432,7 +406,6 @@ pub(crate) fn try_compile(
             .iter()
             .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let method_packet = value_packet_frame(&sequence)?;
-    let inline_frame_words = inline_frame_words(&sequence)?;
     let frame = target_spec
         .frame_layout(
             &allocation,
@@ -440,7 +413,6 @@ pub(crate) fn try_compile(
             method_packet
                 .raw_start
                 .checked_add(method_packet.raw_words)
-                .and_then(|words| words.checked_add(inline_frame_words))
                 .ok_or(Unsupported::OperandShape("scalar value-span packet frame"))?,
         )
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))?;

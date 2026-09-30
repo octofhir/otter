@@ -102,7 +102,6 @@ use value_span::emit_value_span_arguments;
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
-pub(super) mod inline_calls;
 
 use otter_vm::{
     JitCompileSnapshot, Value,
@@ -125,8 +124,8 @@ use super::super::{
     CallTarget, ContextField, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBindingTarget, MachineCallGuard, MachineFrameLayout,
     MachineInstructionId, MachineOpcode, MachineOsrType, MachineRepresentation,
-    MachineSafepointSite, MachineSafepointTable, MachineValue, OperandPurpose,
-    binding_target_matches_semantics, is_explicit_committed_runtime_call,
+    MachineSafepointSite, MachineSafepointTable, OperandPurpose, binding_target_matches_semantics,
+    is_explicit_committed_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
@@ -3570,21 +3569,6 @@ fn emit_with_reach(
                     }
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_stamp_call_site(&mut ops, site);
-                    let packet = super::value_packet_frame(sequence)?;
-                    let inline_start = packet
-                        .raw_start
-                        .checked_add(packet.raw_words)
-                        .ok_or(Unsupported::OperandShape("inline native frame start"))?;
-                    let publication_fail = ops.new_dynamic_label();
-                    inline_calls::enter(
-                        &mut ops,
-                        view,
-                        frame,
-                        instruction,
-                        site,
-                        inline_start,
-                        publication_fail,
-                    )?;
                     let result_index = descriptor.arguments.len();
                     // An explicit-receiver call carries its receiver as
                     // operand one; the linkage takes it through the call form
@@ -3792,7 +3776,6 @@ fn emit_with_reach(
                                 // x17 is outside regalloc2's allocatable bank and
                                 // survives the activation-root descriptor cleanup.
                                 dynasm!(ops ; .arch aarch64 ; mov x17, x0);
-                                inline_calls::leave(ops, frame, instruction, inline_start)?;
                                 emit_reload_safepoint_roots(ops, frame, site)?;
                                 dynasm!(ops ; .arch aarch64 ; mov x0, x17);
                                 Ok(())
@@ -3971,11 +3954,7 @@ fn emit_with_reach(
                             dynasm!(ops ; .arch aarch64 ; b =>deopt);
                         }
                     }
-                    // Inline-frame publication fails only at the activation
-                    // bound: a resource limit, not a failed proof.
-                    dynasm!(ops ; .arch aarch64 ; b =>direct_bail ; =>publication_fail);
-                    emit_reload_safepoint_roots(&mut ops, frame, site)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>transition);
+                    dynasm!(ops ; .arch aarch64 ; b =>direct_bail);
                     dynasm!(ops
                         ; .arch aarch64
                         ; =>direct_bail

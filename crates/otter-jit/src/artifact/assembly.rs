@@ -753,7 +753,8 @@ mod tests {
         }]);
         let safepoints = [SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_published: false,
+            inline_frames_virtual: false,
+            call_pc: otter_vm::native_abi::NO_CALL_PC,
             id: 3,
             frame_state: 0,
             tagged_locations: vec![TaggedLocation::frame_slot(1)],

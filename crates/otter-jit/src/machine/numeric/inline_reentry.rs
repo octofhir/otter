@@ -5,12 +5,13 @@
 //! - Post-allocation safepoint recipes using the shared VM frame schema.
 //!
 //! # Invariants
-//! - The caller's register window is never copied; it stays natively published.
+//! - No inline activation is copied into a native frame: a generated call's
+//!   parents exist only in its recipe, which stack walks read.
 //! - Every descendant value comes from its exact allocator root save slot.
 //! - Source PCs belong to each frame's function, independently of property facts.
 //! - Only suspended parents adjust an after-call PC back to its call site.
-//! - Generated construct calls mark physical publication in the same record;
-//!   runtime decoding never republishes those descendants.
+//! - Generated calls mark their recipe virtual in the same record; runtime
+//!   decoding publishes only a committed runtime call's descendants.
 
 use super::*;
 use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry};
@@ -74,6 +75,36 @@ pub(super) fn prepare_safepoints(
     sequence: &InstructionSequence,
     safepoints: &mut super::super::MachineSafepointTable,
 ) -> Result<(), Unsupported> {
+    // Every generated JavaScript call names its position in the code
+    // object's own function; with inline parents that is the outermost
+    // frame's suspended call.
+    for (index, call) in sequence.instructions().iter().enumerate() {
+        let MachineOpcode::Call(descriptor) = call.opcode else {
+            continue;
+        };
+        let CallTarget::Direct { logical_pc, .. } =
+            sequence.call_descriptors()[descriptor as usize].target
+        else {
+            continue;
+        };
+        let Some(site) = safepoints.site(MachineInstructionId(index as u32)) else {
+            continue;
+        };
+        let call_pc = match call.inline_frames.first() {
+            Some(parent) => {
+                frame_state::suspended_call_pc(view, parent.function_id, parent.byte_pc)
+                    .ok_or(Unsupported::OperandShape("inline caller source PC"))?
+                    .0
+            }
+            None => logical_pc,
+        };
+        let id = site.id.0 as usize;
+        safepoints
+            .records_mut()
+            .get_mut(id)
+            .ok_or(Unsupported::OperandShape("call safepoint record"))?
+            .call_pc = call_pc;
+    }
     for (index, cold) in sequence.instructions().iter().enumerate() {
         if cold.inline_frames.is_empty() {
             continue;
@@ -131,7 +162,7 @@ pub(super) fn prepare_safepoints(
             .get_mut(safepoint_id as usize)
             .ok_or(Unsupported::OperandShape("inline reentry record"))?;
         record.inline_frames = frames;
-        record.inline_frames_published = matches!(cold.opcode, MachineOpcode::Call(descriptor)
+        record.inline_frames_virtual = matches!(cold.opcode, MachineOpcode::Call(descriptor)
             if matches!(sequence.call_descriptors()[descriptor as usize].target, CallTarget::Direct { .. }));
     }
     Ok(())

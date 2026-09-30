@@ -178,10 +178,20 @@ pub struct SafepointRecord {
     /// Cold inline descendants, with values indexed into the precise spill map.
     /// The owning code generation and this record's id select the recipe.
     pub inline_frames: Box<[crate::deopt::DeoptFrame<Option<u16>>]>,
-    /// Generated linkage has already published these descendants as NativeFrames.
-    /// Cold runtime entries must not reconstruct the same activations again.
-    pub inline_frames_published: bool,
+    /// A generated call to JavaScript: these descendants are never published
+    /// as NativeFrames. Stack walks describe them from this recipe for the
+    /// duration of the call, and cold runtime entries do not reconstruct them.
+    /// Otherwise (a committed runtime call) the runtime publishes them.
+    pub inline_frames_virtual: bool,
+    /// Canonical PC, in the code object's own function, of the generated
+    /// JavaScript call this safepoint belongs to, or [`NO_CALL_PC`]. Stack
+    /// walks read a calling frame's position here instead of a per-call PC
+    /// store.
+    pub call_pc: u32,
 }
+
+/// [`SafepointRecord::call_pc`] of a safepoint that is not a generated call.
+pub const NO_CALL_PC: u32 = u32::MAX;
 
 impl SafepointRecord {
     /// Build a full interpreter-visible register-window root set.
@@ -193,7 +203,8 @@ impl SafepointRecord {
     ) -> Self {
         Self {
             inline_frames: Box::default(),
-            inline_frames_published: false,
+            inline_frames_virtual: false,
+            call_pc: NO_CALL_PC,
             id,
             frame_state,
             tagged_locations: (0..register_count)
@@ -229,7 +240,8 @@ impl SafepointRecord {
             .collect();
         Some(Self {
             inline_frames: Box::default(),
-            inline_frames_published: false,
+            inline_frames_virtual: false,
+            call_pc: NO_CALL_PC,
             id: frame_map.id,
             frame_state,
             tagged_locations,

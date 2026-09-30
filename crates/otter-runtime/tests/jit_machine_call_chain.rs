@@ -217,8 +217,10 @@ const METHOD_CHAIN_GC_SETUP: &str = r#"
 globalThis.__machineChainGcSink = null;
 
 function machineChainGcMethod(argument, allocationCount) {
+  // Each iteration allocates a 32-element array as well, so the loop outgrows
+  // the young space whatever the ordinary-object layout is.
   for (let i = 0; i < allocationCount; i++) {
-    globalThis.__machineChainGcSink = { index: i, padding: i + 1 };
+    globalThis.__machineChainGcSink = { index: i, padding: new Array(32) };
   }
   return this.base + argument.value;
 }

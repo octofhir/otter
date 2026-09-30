@@ -663,7 +663,8 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
         native_return_offset: Option<u64>,
         tagged_locations: Vec<Location>,
         inline_frames: &'a [otter_vm::deopt::DeoptFrame<Option<u16>>],
-        inline_frames_published: bool,
+        inline_frames_virtual: bool,
+        call_pc: Option<u32>,
     }
 
     #[derive(Serialize)]
@@ -676,7 +677,8 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
         .iter()
         .map(|record| Point {
             inline_frames: &record.inline_frames,
-            inline_frames_published: record.inline_frames_published,
+            inline_frames_virtual: record.inline_frames_virtual,
+            call_pc: (record.call_pc != otter_vm::native_abi::NO_CALL_PC).then_some(record.call_pc),
             id: record.id,
             frame_state: record.frame_state,
             // Native correlation is added by the relocation/safepoint-site

@@ -4,9 +4,10 @@
 //! - Verification of the shared frame schema against explicit safepoint roots.
 //!
 //! # Invariants
-//! - Committed property/binding calls and single-target generated constructors
-//!   carry complete descendant recipes at their exact safepoint.
-//! - The published caller is represented by source identity, never copied slots.
+//! - Committed property/binding calls and single-target generated plain,
+//!   method, explicit-receiver and construct calls carry complete descendant
+//!   recipes at their exact safepoint.
+//! - The physical caller is represented by source identity, never copied slots.
 //! - Every descendant value is tagged and an explicit allocator-visible root.
 
 use super::*;
@@ -24,7 +25,13 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
         };
         let descriptor = &sequence.call_descriptors[descriptor as usize];
         let direct = matches!(&descriptor.target, CallTarget::Direct {
-            kind: DirectCallKind::Construct, argument_mode: DirectCallArgumentMode::Fixed, candidates, ..
+            kind: DirectCallKind::Plain
+                | DirectCallKind::Method
+                | DirectCallKind::CallWithThis
+                | DirectCallKind::Construct,
+            argument_mode: DirectCallArgumentMode::Fixed,
+            candidates,
+            ..
         } if candidates.len() == 1);
         if (!direct
             && !matches!(descriptor.target, CallTarget::CommittedRuntime { target, .. }

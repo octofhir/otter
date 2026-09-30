@@ -399,7 +399,8 @@ fn build_global_this_impl(
     // The realm global object is a permanent singleton root: pin it in
     // non-moving old space so every handle to it stays stable across young
     // scavenges and the large builtin-laden object is never copied.
-    let mut global = object::alloc_object_old(heap)?;
+    let global_shape = object::shape_body::dictionary_of(object::shape_body::null_root(heap));
+    let mut global = object::alloc_object_old(heap, global_shape)?;
     let mut bootstrap_roots = otter_gc::RootScope::new(heap);
     // SAFETY: `global` and the borrowed well-known-symbol table both outlive
     // this scope. Keeping them registered for the whole install pass makes
@@ -684,7 +685,7 @@ mod tests {
         const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 3468;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 600 * 1024;
 
-        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut heap = crate::object::fixture_heap();
         let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");
         let mut telemetry = BootstrapTelemetry::default();
         let global = build_global_this_with_telemetry(
@@ -738,7 +739,7 @@ mod tests {
 
     #[test]
     fn feature_gates_skip_console() {
-        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut heap = crate::object::fixture_heap();
         let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");
         let global = build_global_this_with_features(
             &mut heap,
@@ -752,7 +753,7 @@ mod tests {
 
     #[test]
     fn math_installs_with_static_native_methods_and_attrs() {
-        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut heap = crate::object::fixture_heap();
         let well_known = crate::symbol::WellKnownSymbols::new(&mut heap).expect("well-known");
         let global = build_global_this(&mut heap, &well_known).expect("global");
         let Some(math) = object::get(global, &heap, "Math")

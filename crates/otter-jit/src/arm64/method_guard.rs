@@ -119,9 +119,9 @@ pub(crate) fn emit_method_guard_from_tagged_register(
     }
 
     for &hop_shape in &guard.proto_chain {
+        crate::template::arm64::values::emit_load_prototype(ops, view, 9, 13, 12);
         dynasm!(ops
             ; .arch aarch64
-            ; ldr w9, [x13, view.jit_proto_byte]
             ; cbz w9, =>bail
             ; add x13, x12, x9
             ; ldrb w14, [x13]

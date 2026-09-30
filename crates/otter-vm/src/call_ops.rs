@@ -545,14 +545,23 @@ impl Interpreter {
         function_id: u32,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
+        // The receiver is created on its prototype's lineage
+        // (OrdinaryCreateFromConstructor); finding the root never collects.
+        let root = self.value_root(roots.scratch_0.get())?;
         let (reserved_field_count, profile) =
-            self.constructor_receiver_reservation(context, function_id, roots)?;
-        let simple_shape =
-            self.jit_simple_constructor_shape(context, function_id, roots.scratch_0.get(), roots)?;
+            self.constructor_receiver_reservation(context, function_id, roots, root)?;
+        let simple_shape = self.jit_simple_constructor_shape(
+            context,
+            function_id,
+            roots.scratch_0.get(),
+            root,
+            roots,
+        )?;
         let field_count = simple_shape
             .map_or(0, |(_, fields)| fields)
             .max(reserved_field_count);
         let receiver = self.alloc_runtime_rooted_object_with_capacity(
+            root,
             crate::object::receiver_inline_capacity(field_count),
             &[],
             &[],
@@ -594,11 +603,6 @@ impl Interpreter {
             .get()
             .as_object()
             .ok_or(VmError::InvalidOperand)?;
-        crate::object::set_prototype_value(
-            receiver,
-            &mut self.gc_heap,
-            Some(roots.scratch_0.get()),
-        );
         self.note_constructor_receiver(profile, roots.new_target.get(), receiver);
         Ok(roots.receiver.get())
     }
@@ -613,12 +617,14 @@ impl Interpreter {
         context: &ExecutionContext,
         function_id: u32,
         roots: &SyncJsCallRoots,
+        root: crate::object::ShapeHandle,
     ) -> Result<(usize, ConstructorProfileSample), VmError> {
         let baked_field_count = self.prepare_constructor_field_transitions(
             context,
             function_id,
             roots.new_target.get(),
             roots.scratch_0.get(),
+            root,
             roots,
         )?;
         let sample = self.sample_constructor_profile(function_id, roots.new_target.get());
@@ -686,6 +692,7 @@ impl Interpreter {
         context: &ExecutionContext,
         function_id: u32,
         prototype: Value,
+        root: crate::object::ShapeHandle,
         roots: &SyncJsCallRoots,
     ) -> Result<Option<(crate::object::ShapeHandle, usize)>, VmError> {
         let Ok(owner) = context.for_function(function_id) else {
@@ -713,8 +720,12 @@ impl Interpreter {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
         };
-        let shape =
-            self.simple_constructor_shape_with_roots(function_id, &init, &mut external_visit)?;
+        let shape = self.simple_constructor_shape_with_roots(
+            function_id,
+            root,
+            &init,
+            &mut external_visit,
+        )?;
         Ok(Some((shape, field_count)))
     }
 
@@ -849,11 +860,13 @@ impl Interpreter {
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let root = self.value_root(roots.scratch_0.get())?;
         self.prepare_constructor_field_transitions(
             context,
             base_function_id,
             roots.new_target.get(),
             roots.scratch_0.get(),
+            root,
             &roots,
         )?;
         Ok(())
@@ -865,6 +878,7 @@ impl Interpreter {
         base_function_id: u32,
         new_target: Value,
         prototype: Value,
+        root: crate::object::ShapeHandle,
         roots: &SyncJsCallRoots,
     ) -> Result<usize, VmError> {
         const MAX_PROTOTYPE_HOPS: usize = 64;
@@ -929,7 +943,7 @@ impl Interpreter {
             {
                 return Ok(0);
             }
-            if crate::object::shape(object, &self.gc_heap).is_null() {
+            if crate::object::is_dictionary(object, &self.gc_heap) {
                 return Ok(0);
             }
             let shape = crate::object::shape_id(object, &self.gc_heap);
@@ -943,7 +957,7 @@ impl Interpreter {
             functions.push(function_id);
         }
 
-        let mut shape = self.shape_root();
+        let mut shape = root;
         let mut slot = 0u16;
         let mut seen = rustc_hash::FxHashSet::default();
         let mut reopt_functions = smallvec::SmallVec::<[u32; 2]>::new();
@@ -1029,8 +1043,9 @@ impl Interpreter {
             if let Some(init) = simple_init {
                 self.simple_constructor_init_cache
                     .insert(function_id, Some(init));
+                let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
                 self.simple_constructor_shape_cache
-                    .insert(function_id, shape);
+                    .insert((function_id, root_id), shape);
             }
         }
         // The first generated receiver preparation can discover these plans
@@ -2471,15 +2486,18 @@ impl Interpreter {
             .as_ref()
             .map_or(0, |init| init.fields.len())
             .max(reservation.as_ref().map_or(0, |(reserved, _)| *reserved));
+        // The receiver is created on its prototype's lineage; finding the
+        // root never collects.
+        let root = self.value_root(proto)?;
         let proto_anchor = self.push_iteration_anchor(proto) - 1;
         let receiver = self.alloc_stack_rooted_object_with_capacity(
             stack,
+            root,
             &[&current, &effective_new_target],
             crate::object::receiver_inline_capacity(field_count),
         )?;
         let proto = self.iteration_anchor(proto_anchor);
         self.pop_iteration_anchors_to(proto_anchor);
-        crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         // Receiver allocation can scavenge as well. Reload the dispatch values
         // from the caller register before simple-init matching or frame setup.
         let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
@@ -2602,8 +2620,10 @@ impl Interpreter {
             .map(|field| field.source.resolve(args))
             .collect::<Vec<_>>();
 
+        let root = crate::object::shape(receiver, &self.gc_heap);
         let shape = self.simple_constructor_shape(
             function_id,
+            root,
             stack,
             &receiver,
             proto,
@@ -2628,6 +2648,7 @@ impl Interpreter {
     fn simple_constructor_shape(
         &mut self,
         function_id: u32,
+        root: crate::object::ShapeHandle,
         stack: &ActivationStack,
         receiver: &crate::object::JsObject,
         proto: Value,
@@ -2648,20 +2669,27 @@ impl Interpreter {
                 value.trace_value_slots(visitor);
             }
         };
-        self.simple_constructor_shape_with_roots(function_id, init, &mut external_visit)
+        self.simple_constructor_shape_with_roots(function_id, root, init, &mut external_visit)
     }
 
+    /// The final hidden class of a simple constructor's receivers on
+    /// `root`'s lineage, cached per constructor and prototype root.
     fn simple_constructor_shape_with_roots(
         &mut self,
         function_id: u32,
+        root: crate::object::ShapeHandle,
         init: &crate::constructor_fast_path::SimpleConstructorInit,
         external_visit: &mut dyn FnMut(&mut dyn FnMut(*mut RawGc)),
     ) -> Result<crate::object::ShapeHandle, VmError> {
-        if let Some(shape) = self.simple_constructor_shape_cache.get(&function_id) {
+        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
+        if let Some(shape) = self
+            .simple_constructor_shape_cache
+            .get(&(function_id, root_id))
+        {
             return Ok(*shape);
         }
 
-        let mut shape = self.shape_root();
+        let mut shape = root;
         for field in &init.fields {
             if let Some(child) = self.shape_runtime.child_if_cached(
                 &self.gc_heap,
@@ -2686,7 +2714,7 @@ impl Interpreter {
                 .map_err(VmError::from)?;
         }
         self.simple_constructor_shape_cache
-            .insert(function_id, shape);
+            .insert((function_id, root_id), shape);
         Ok(shape)
     }
 

@@ -45,8 +45,6 @@ pub(super) fn emit(
     dynasm!(ops
         ; .arch x64
         ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -58,6 +56,10 @@ pub(super) fn emit(
     dynasm!(ops
         ; .arch x64
         ; add rax, r10
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+        ; jnz =>miss
         ; mov r9, [rax + cache.shape_id_byte as i32]
         ; mov rax, r9
     );
@@ -96,9 +98,6 @@ pub(super) fn emit(
         ; ja =>miss
         ; test eax, eax
         ; jz =>holder
-        ; mov r11d, [r11 + view.jit_proto_byte as i32]
-        ; test r11d, r11d
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -107,8 +106,11 @@ pub(super) fn emit(
         view.cage_base as u64,
         RelocationTarget::GcCageBase,
     );
+    crate::template::x86_64::emit_x64_load_prototype(ops, view, 11, 11, 10);
     dynasm!(ops
         ; .arch x64
+        ; test r11d, r11d
+        ; jz =>miss
         ; add r11, r10
         ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
         ; jne =>miss
@@ -117,9 +119,8 @@ pub(super) fn emit(
     dynasm!(ops
         ; .arch x64
         ; =>holder
+        // A cached holder shape is keyed, never a dictionary shape.
         ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
         ; cmp eax, [r8 + cache.holder_shape_byte as i32]
         ; jne =>miss
         // The matched holder shape names the slot, so the slot is live.
@@ -188,8 +189,6 @@ pub(super) fn emit_store(
     dynasm!(ops
         ; .arch x64
         ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -201,6 +200,10 @@ pub(super) fn emit_store(
     dynasm!(ops
         ; .arch x64
         ; add rax, r10
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+        ; jnz =>miss
         ; mov r9, [rax + cache.shape_id_byte as i32]
         ; mov rax, r9
     );
@@ -310,7 +313,8 @@ fn emit_transition_store(
     miss: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    if cache.table_addr == 0 || cache.entry_bytes == 0 || cache.hash_shift >= 64 {
+    if cache.table_addr == 0 || cache.entry_bytes == 0 || cache.ways == 0 || cache.hash_shift >= 64
+    {
         return Err(Unsupported::OperandShape("shared store transition table"));
     }
     let proto_ready = ops.new_dynamic_label();
@@ -324,8 +328,6 @@ fn emit_transition_store(
         ; .arch x64
         ; mov rsi, r11
         ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -337,9 +339,16 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; add rax, r10
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+        ; jnz =>miss
         ; mov r9, [rax + cache.shape_id_byte as i32]
         ; xor edx, edx
-        ; mov eax, [r11 + view.jit_proto_byte as i32]
+    );
+    crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 11, 10);
+    dynasm!(ops
+        ; .arch x64
         ; test eax, eax
         ; jz =>proto_ready
         ; add rax, r10
@@ -351,8 +360,6 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -364,6 +371,10 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; add rax, r10
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+        ; jnz =>miss
         ; mov rdx, [rax + cache.shape_id_byte as i32]
         ; =>proto_ready
         ; mov rax, r9
@@ -382,7 +393,7 @@ fn emit_transition_store(
         ; xor rax, r10
         ; shr rax, cache.hash_shift as i8
         ; and eax, cache.index_mask as i32
-        ; imul rax, rax, cache.entry_bytes as i32
+        ; imul rax, rax, (cache.entry_bytes * cache.ways) as i32
     );
     symbolic(
         ops,
@@ -391,15 +402,27 @@ fn emit_transition_store(
         cache.table_addr as u64,
         RelocationTarget::StoreTransitionCacheTable,
     );
+    // Probe the set's ways in recording order; `r8` ends on the match.
+    let way = ops.new_dynamic_label();
+    let next_way = ops.new_dynamic_label();
+    let found = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
         ; add r8, rax
+        ; mov r10d, cache.ways as i32
+        ; =>way
         ; cmp QWORD [r8 + cache.receiver_shape_byte as i32], r9
-        ; jne =>miss
+        ; jne =>next_way
         ; cmp QWORD [r8 + cache.prototype_shape_byte as i32], rdx
-        ; jne =>miss
+        ; jne =>next_way
         ; cmp DWORD [r8 + cache.atom_byte as i32], atom as i32
-        ; jne =>miss
+        ; je =>found
+        ; =>next_way
+        ; add r8, cache.entry_bytes as i32
+        ; dec r10d
+        ; jnz =>way
+        ; jmp =>miss
+        ; =>found
         ; cmp DWORD [r8 + cache.target_shape_byte as i32], 0
         ; je =>miss
         ; movzx edx, BYTE [r8 + cache.chain_len_byte as i32]
@@ -410,9 +433,6 @@ fn emit_transition_store(
         ; test edx, edx
         ; jz =>chain_done
         ; =>chain_loop
-        ; mov eax, [r11 + view.jit_proto_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -421,8 +441,11 @@ fn emit_transition_store(
         view.cage_base as u64,
         RelocationTarget::GcCageBase,
     );
+    crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 11, 10);
     dynasm!(ops
         ; .arch x64
+        ; test eax, eax
+        ; jz =>miss
         ; add rax, r10
         ; mov r11, rax
         ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
@@ -432,8 +455,6 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; test eax, eax
-        ; jz =>miss
     );
     symbolic(
         ops,
@@ -445,6 +466,10 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch x64
         ; add rax, r10
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+        ; jnz =>miss
         ; mov rax, [rax + cache.shape_id_byte as i32]
         ; cmp rax, [r8 + r9 * 8 + cache.chain_byte as i32]
         ; jne =>miss
@@ -452,8 +477,19 @@ fn emit_transition_store(
         ; cmp r9d, edx
         ; jb =>chain_loop
         ; =>chain_done
-        ; cmp DWORD [r11 + view.jit_proto_byte as i32], 0
-        ; jne =>miss
+    );
+    symbolic(
+        ops,
+        relocations,
+        10,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 11, 10);
+    dynasm!(ops
+        ; .arch x64
+        ; test eax, eax
+        ; jnz =>miss
         ; mov r11, rsi
         ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
         ; jz =>miss

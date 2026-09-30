@@ -882,7 +882,7 @@ impl Interpreter {
         &self,
         holder: crate::object::JsObject,
     ) -> Option<jit::JitMethodHolder> {
-        let shape = crate::object::shape(holder, &self.gc_heap);
+        let shape = crate::object::keyed_shape(holder, &self.gc_heap);
         if !shape.is_null() {
             return Some(jit::JitMethodHolder::Shape(self.bake_shape(shape)));
         }
@@ -1294,7 +1294,17 @@ impl Interpreter {
             _ => return None,
         };
         let class_fid = code_block.class_hint(instruction.instruction_pc(code_block) as usize)?;
-        let shape = *self.simple_constructor_shape_cache.get(&class_fid)?;
+        // One prototype lineage per class in practice; several leave the
+        // site to its own feedback.
+        let mut shapes = self
+            .simple_constructor_shape_cache
+            .iter()
+            .filter(|((id, _), _)| *id == class_fid)
+            .map(|(_, shape)| *shape);
+        let shape = shapes.next()?;
+        if shapes.next().is_some() {
+            return None;
+        }
         let otter_bytecode::Operand::ConstIndex(name_idx) =
             instruction.operand(code_block, name_operand)?
         else {
@@ -1520,7 +1530,7 @@ impl Interpreter {
         self.migrate_slow_to_fast(&mut receiver);
         *recv = Value::object(receiver);
         let recv = receiver;
-        let recv_shape_handle = crate::object::shape(recv, &self.gc_heap);
+        let recv_shape_handle = crate::object::keyed_shape(recv, &self.gc_heap);
         if recv_shape_handle.is_null() {
             return None;
         }
@@ -1534,13 +1544,13 @@ impl Interpreter {
             });
         }
         // Walk the prototype chain, recording each hopped object's shape; the
-        // baked guard checks exactly this chain (flat-prototype chase + shape
+        // baked guard checks exactly this chain (shape-prototype chase + shape
         // compare per hop) before trusting the holder's slot offset.
         let mut proto_chain = crate::MethodProtoChain::own();
         let mut cur = recv;
         loop {
             cur = crate::object::prototype(cur, &self.gc_heap)?;
-            let shape = crate::object::shape(cur, &self.gc_heap);
+            let shape = crate::object::keyed_shape(cur, &self.gc_heap);
             if shape.is_null() || !proto_chain.push(crate::object::shape_id(cur, &self.gc_heap)) {
                 return None;
             }
@@ -1745,7 +1755,7 @@ impl Interpreter {
             else {
                 continue;
             };
-            let shape = crate::object::shape(self.global_this, &self.gc_heap);
+            let shape = crate::object::keyed_shape(self.global_this, &self.gc_heap);
             let (shape, dictionary) = if shape.is_null() {
                 // A dictionary global object is proven by its slot layout, so
                 // globals the program adds later do not retire the proof. The
@@ -1837,7 +1847,7 @@ impl Interpreter {
             else {
                 continue;
             };
-            let shape = crate::object::shape(self.global_this, &self.gc_heap);
+            let shape = crate::object::keyed_shape(self.global_this, &self.gc_heap);
             let (shape, dictionary) = if shape.is_null() {
                 // A dictionary global object is proven by its slot layout, so
                 // globals the program adds later do not retire the proof. The
@@ -2356,8 +2366,8 @@ impl Interpreter {
                     continue;
                 }
                 // Only the optimizing tier splices a reduced `f.call` target.
-                let tier_splices = !function_prototype_call
-                    || tier == jit_debug::JitDebugTier::Optimizing;
+                let tier_splices =
+                    !function_prototype_call || tier == jit_debug::JitDebugTier::Optimizing;
                 if inline_ineligible || target_count != 1 || !tier_splices {
                     continue;
                 }
@@ -2628,7 +2638,7 @@ impl Interpreter {
             return Some(jit::JitReceiverAllocationPlan {
                 new_target_function_id,
                 class_allocation,
-                receiver_shape: self.bake_shape(self.shape_root()),
+                receiver_shape: 0,
                 initial_field_count: 0,
                 inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(learned))
                     .ok()?,
@@ -2651,22 +2661,22 @@ impl Interpreter {
             self.simple_constructor_init_cache
                 .get(&base_function_id)
                 .and_then(Option::as_ref),
-            self.simple_constructor_shape_cache.get(&base_function_id),
+            self.simple_constructor_shape_for(base_function_id, prototype_ids[0]),
         ) {
             (Some(init), Some(shape)) if init.fields.len() <= capacity => {
                 // Generated allocation derives the slot count from this
                 // shape, so it must name exactly the initial fields.
                 debug_assert_eq!(
-                    crate::object::shape_property_count(*shape, &self.gc_heap) as usize,
+                    crate::object::shape_property_count(shape, &self.gc_heap) as usize,
                     init.fields.len(),
                     "simple-constructor shape and initial fields diverged"
                 );
                 (
-                    self.bake_shape(*shape),
+                    self.bake_shape(shape),
                     u8::try_from(init.fields.len()).ok()?,
                 )
             }
-            _ => (self.bake_shape(self.shape_root()), 0),
+            _ => (0, 0),
         };
         Some(jit::JitReceiverAllocationPlan {
             new_target_function_id,
@@ -2680,6 +2690,27 @@ impl Interpreter {
             prototype_shape_count: u8::try_from(prototype_ids.len()).ok()?,
             prototype_shapes,
         })
+    }
+
+    /// The simple-constructor shape of `function_id`'s receivers whose
+    /// prototype currently has the hidden class `prototype_shape`.
+    fn simple_constructor_shape_for(
+        &self,
+        function_id: u32,
+        prototype_shape: crate::object::ShapeId,
+    ) -> Option<crate::object::ShapeHandle> {
+        self.simple_constructor_shape_cache
+            .iter()
+            .filter(|((id, _), _)| *id == function_id)
+            .map(|(_, shape)| *shape)
+            .find(
+                |&shape| match crate::object::shape_body::prototype_of(shape) {
+                    crate::object::shape_body::ShapePrototype::Object(prototype) => {
+                        crate::object::shape_id(prototype, &self.gc_heap) == prototype_shape
+                    }
+                    _ => false,
+                },
+            )
     }
 
     /// Bake one inline-method candidate body for a `(method, receiver shape)`

@@ -52,7 +52,7 @@ fn pending_uncaught_throw_is_enumerated_as_a_root() {
     use otter_gc::raw::RawGc;
 
     let mut interp = Interpreter::new();
-    let thrown = crate::object::alloc_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
+    let thrown = crate::object::alloc_fixture_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
         .expect("alloc object");
     interp.set_pending_uncaught_throw(crate::Value::object(thrown));
 
@@ -351,7 +351,7 @@ fn packed_array_widening_traces_new_object_element() {
         "__packed_array_root",
         crate::Value::array(arr),
     );
-    let object = crate::object::alloc_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
+    let object = crate::object::alloc_fixture_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
         .expect("alloc object");
     crate::array::set(arr, interp.gc_heap_mut(), 0, crate::Value::object(object))
         .expect("widen packed array");

@@ -207,7 +207,8 @@ fn alloc_registry_object(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
     };
-    crate::object::alloc_object_with_roots(gc_heap, &mut external_visit).map_err(|_| oom())
+    crate::object::alloc_dictionary_object_with_roots(gc_heap, &mut external_visit)
+        .map_err(|_| oom())
 }
 
 /// Allocate a `JsString` while keeping `roots` live across the allocation.
@@ -1628,6 +1629,20 @@ impl ErrorClassRegistry {
             &self.aggregate_error,
         ] {
             object::set_prototype(entry.constructor, gc_heap, Some(self.error.constructor));
+        }
+        // Cache each prototype's instance root now, so an out-of-memory
+        // `RangeError` finds its root without allocating.
+        for entry in [
+            &self.error,
+            &self.type_error,
+            &self.range_error,
+            &self.syntax_error,
+            &self.reference_error,
+            &self.uri_error,
+            &self.eval_error,
+            &self.aggregate_error,
+        ] {
+            let _ = object::root_for_prototype(gc_heap, Some(entry.prototype));
         }
         // Register globals.
         for (name, entry) in [

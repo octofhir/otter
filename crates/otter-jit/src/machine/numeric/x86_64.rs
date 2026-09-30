@@ -1008,8 +1008,6 @@ pub(super) fn emit(
                 dynasm!(ops
                     ; .arch x64
                     ; mov r9d, [r11 + view.object_shape_byte as i32]
-                    ; test r9d, r9d
-                    ; jz =>miss
                 );
                 let labels = cases
                     .iter()
@@ -1069,8 +1067,6 @@ pub(super) fn emit(
                 dynasm!(ops
                     ; .arch x64
                     ; mov r10d, [r11 + view.object_shape_byte as i32]
-                    ; test r10d, r10d
-                    ; jz =>miss
                     ; cmp r10d, shape as i32
                     ; jne =>miss
                     ; mov r10d, 1
@@ -1095,14 +1091,6 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
                 load64(&mut ops, 10, layout);
-                dynasm!(ops
-                    ; .arch x64
-                    ; cmp DWORD [r11 + view.object_shape_byte as i32], 0
-                    ; jne =>miss
-                    ; mov r9d, [r11 + view.object_exotic_handle_byte as i32]
-                    ; test r9d, r9d
-                    ; jz =>miss
-                );
                 symbolic(
                     &mut ops,
                     &mut relocations,
@@ -1112,6 +1100,12 @@ pub(super) fn emit(
                 );
                 dynasm!(ops
                     ; .arch x64
+                    ; mov r9d, [r11 + view.object_shape_byte as i32]
+                    ; test BYTE [r8 + r9 + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+                    ; jz =>miss
+                    ; mov r9d, [r11 + view.object_exotic_handle_byte as i32]
+                    ; test r9d, r9d
+                    ; jz =>miss
                     ; add r9, r8
                     ; cmp [r9 + view.exotic_dictionary_layout_byte as i32], r10d
                     ; jne =>miss
@@ -1203,9 +1197,16 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; xor r9d, r9d);
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    10,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                crate::template::x86_64::emit_x64_load_prototype(&mut ops, view, 8, 11, 10);
                 dynasm!(ops
                     ; .arch x64
-                    ; mov r8d, [r11 + view.jit_proto_byte as i32]
                     ; test r8d, r8d
                     ; jz =>miss
                     ; mov r9d, 1
@@ -1257,10 +1258,18 @@ pub(super) fn emit(
                 load_integer(&mut ops, frame, loc[1], 10)?;
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    8,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                crate::template::x86_64::emit_x64_load_prototype(&mut ops, view, 10, 11, 8);
                 dynasm!(ops
                     ; .arch x64
-                    ; cmp DWORD [r11 + view.jit_proto_byte as i32], 0
-                    ; jne =>miss
+                    ; test r10d, r10d
+                    ; jnz =>miss
                     ; mov r10d, 1
                     ; jmp =>done
                     ; =>miss
@@ -1321,8 +1330,6 @@ pub(super) fn emit(
                 dynasm!(ops
                     ; .arch x64
                     ; mov r10d, [r11 + view.object_shape_byte as i32]
-                    ; test r10d, r10d
-                    ; jz =>miss
                     ; cmp r10d, shape as i32
                     ; jne =>miss
                     ; mov r10d, 1
@@ -1418,8 +1425,6 @@ pub(super) fn emit(
                 dynasm!(ops
                     ; .arch x64
                     ; mov r9d, [r11 + view.object_shape_byte as i32]
-                    ; test r9d, r9d
-                    ; jz =>miss
                     ; mov rsi, r11
                 );
                 let labels = cases
@@ -1434,12 +1439,6 @@ pub(super) fn emit(
                     dynasm!(ops ; .arch x64 ; =>label);
                     if let Some(transition) = &case.transition {
                         for &prototype in transition.prototype_shapes.iter() {
-                            dynasm!(ops
-                                ; .arch x64
-                                ; mov r10d, [r11 + view.jit_proto_byte as i32]
-                                ; test r10d, r10d
-                                ; jz =>miss
-                            );
                             symbolic(
                                 &mut ops,
                                 &mut relocations,
@@ -1447,8 +1446,13 @@ pub(super) fn emit(
                                 view.cage_base as u64,
                                 RelocationTarget::GcCageBase,
                             );
+                            crate::template::x86_64::emit_x64_load_prototype(
+                                &mut ops, view, 10, 11, 8,
+                            );
                             dynasm!(ops
                                 ; .arch x64
+                                ; test r10d, r10d
+                                ; jz =>miss
                                 ; lea r11, [r8 + r10]
                                 ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
                                 ; jne =>miss
@@ -1463,10 +1467,18 @@ pub(super) fn emit(
                         let slot = case.value_byte / 8;
                         let inline_storage = ops.new_dynamic_label();
                         let fits = ops.new_dynamic_label();
+                        symbolic(
+                            &mut ops,
+                            &mut relocations,
+                            8,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
+                        crate::template::x86_64::emit_x64_load_prototype(&mut ops, view, 10, 11, 8);
                         dynasm!(ops
                             ; .arch x64
-                            ; cmp DWORD [r11 + view.jit_proto_byte as i32], 0
-                            ; jne =>miss
+                            ; test r10d, r10d
+                            ; jnz =>miss
                             ; mov r11, rsi
                             ; mov r9d, [r11 + view.object_slab_handle_byte as i32]
                             ; test r9d, r9d
@@ -3735,23 +3747,21 @@ fn binding_guard(
             );
             dynasm!(ops ; .arch x64 ; add r11, r10);
             if dictionary {
-                dynasm!(ops
-                    ; .arch x64
-                    ; cmp DWORD [r11 + view.object_shape_byte as i32], 0
-                    ; jne =>miss
-                );
-                dynasm!(ops
-                    ; .arch x64
-                    ; mov r10d, [r11 + view.object_exotic_handle_byte as i32]
-                    ; test r10d, r10d
-                    ; jz =>miss
-                );
                 symbolic(
                     ops,
                     relocations,
                     9,
                     view.cage_base as u64,
                     RelocationTarget::GcCageBase,
+                );
+                dynasm!(ops
+                    ; .arch x64
+                    ; mov r10d, [r11 + view.object_shape_byte as i32]
+                    ; test BYTE [r9 + r10 + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+                    ; jz =>miss
+                    ; mov r10d, [r11 + view.object_exotic_handle_byte as i32]
+                    ; test r10d, r10d
+                    ; jz =>miss
                 );
                 load64(ops, 8, shape);
                 dynasm!(ops
@@ -4740,9 +4750,9 @@ fn emit_inline_method_guard(
         ; jne =>miss
     );
     for &shape in &guard.proto_chain {
+        crate::template::x86_64::emit_x64_load_prototype(ops, view, 10, 11, 0);
         dynasm!(ops
             ; .arch x64
-            ; mov r10d, [r11 + view.jit_proto_byte as i32]
             ; test r10d, r10d
             ; jz =>miss
             ; add r10, rax

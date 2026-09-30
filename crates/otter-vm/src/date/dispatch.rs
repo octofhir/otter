@@ -60,16 +60,14 @@ pub fn call(
         //   - 2+ args: (year, month, day?, hr?, min?, sec?, ms?).
         M::Construct => {
             let time = construct_time_value(zone, args, heap);
-            let mut obj = object::alloc_object_with_roots(heap, external_visit).map_err(|err| {
-                VmError::OutOfMemory {
-                    requested_bytes: err.requested_bytes(),
-                    heap_limit_bytes: err.heap_limit_bytes(),
-                }
-            })?;
+            let oom = |err: otter_gc::OutOfMemory| VmError::OutOfMemory {
+                requested_bytes: err.requested_bytes(),
+                heap_limit_bytes: err.heap_limit_bytes(),
+            };
+            let root = object::root_for_prototype(heap, prototype).map_err(oom)?;
+            let mut obj =
+                object::alloc_object_with_roots(heap, root, external_visit).map_err(oom)?;
             object::set_date_data(&mut obj, heap, time);
-            if let Some(proto) = prototype {
-                object::set_prototype(obj, heap, Some(proto));
-            }
             Ok(Value::object(obj))
         }
         M::Now | M::Parse | M::UTC => call_static(zone, method, args, heap),

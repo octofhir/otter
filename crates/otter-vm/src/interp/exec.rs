@@ -121,7 +121,7 @@ impl Interpreter {
         self.simple_constructor_init_cache
             .retain(|id, _| outside(id));
         self.simple_constructor_shape_cache
-            .retain(|id, _| outside(id));
+            .retain(|(id, _), _| outside(id));
         self.constructor_field_transition_cache
             .retain(|id, _| outside(id));
         self.constructor_field_capacity_cache

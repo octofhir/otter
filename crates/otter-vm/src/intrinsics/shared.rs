@@ -50,7 +50,7 @@ pub(crate) fn alloc_object_with_value_roots(
             value.trace_value_slots(visitor);
         }
     };
-    object::alloc_object_with_roots(heap, &mut external_visit)
+    object::alloc_dictionary_object_with_roots(heap, &mut external_visit)
 }
 
 /// Allocate a static native constructor with `value_roots` kept live.

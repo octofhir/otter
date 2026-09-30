@@ -11,7 +11,8 @@
 //! # Invariants
 //! - Every cached VM atom was minted by the owning isolate's `NameInterner`.
 //! - Property order is part of the signature; tag identity partitions records
-//!   that happen to expose the same keys.
+//!   that happen to expose the same keys, and the root shape of the realm's
+//!   `%Object.prototype%` — which a layout's shape fixes — partitions realms.
 //! - Cache keys contain no GC handles and need no root tracing.
 //! - A hit borrows the caller's atom slice and performs no allocation.
 //!
@@ -26,6 +27,7 @@ use rustc_hash::FxHashMap;
 
 #[derive(Debug)]
 struct LayoutEntry {
+    root: crate::object::ShapeId,
     keys: Box<[HostAtomId]>,
     layout: ObjectLayout,
 }
@@ -61,9 +63,15 @@ impl ObjectLayoutCache {
     /// The caller's atom slice is compared in place, so a hit allocates no
     /// temporary signature and never enters the isolate name interner.
     #[must_use]
-    pub(crate) fn get(&self, tag: &HostAtom, keys: &[&HostAtom]) -> Option<ObjectLayout> {
+    pub(crate) fn get(
+        &self,
+        root: crate::object::ShapeId,
+        tag: &HostAtom,
+        keys: &[&HostAtom],
+    ) -> Option<ObjectLayout> {
         self.layouts.get(&tag.id())?.iter().find_map(|entry| {
-            (entry.keys.len() == keys.len()
+            (entry.root == root
+                && entry.keys.len() == keys.len()
                 && entry
                     .keys
                     .iter()
@@ -74,10 +82,20 @@ impl ObjectLayoutCache {
     }
 
     /// Remember one complete signature after its shape chain has been built.
-    pub(crate) fn insert(&mut self, tag: &HostAtom, keys: &[&HostAtom], layout: ObjectLayout) {
+    pub(crate) fn insert(
+        &mut self,
+        root: crate::object::ShapeId,
+        tag: &HostAtom,
+        keys: &[&HostAtom],
+        layout: ObjectLayout,
+    ) {
         let entries = self.layouts.entry(tag.id()).or_default();
         let keys: Box<[HostAtomId]> = keys.iter().map(|key| key.id()).collect();
-        debug_assert!(entries.iter().all(|entry| entry.keys != keys));
-        entries.push(LayoutEntry { keys, layout });
+        debug_assert!(
+            entries
+                .iter()
+                .all(|entry| entry.root != root || entry.keys != keys)
+        );
+        entries.push(LayoutEntry { root, keys, layout });
     }
 }

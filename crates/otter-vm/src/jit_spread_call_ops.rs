@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Interpreter, Value, VmError, activation_stack::ActivationStack,
-    interp::helpers::is_constructor_runtime, object, read_register, write_register,
+    interp::helpers::is_constructor_runtime, read_register, write_register,
 };
 
 impl Interpreter {
@@ -332,13 +332,16 @@ impl Interpreter {
         mapped: bool,
     ) -> Result<crate::object::ShapeHandle, VmError> {
         const CACHED_ARGC_MAX: usize = 64;
-        let key = (argc as u32, mapped);
+        // An arguments object's prototype is the realm's `%Object.prototype%`
+        // (§10.4.4.6 step 2, §10.4.4.7 step 5); its root starts the chain.
+        let object_prototype = self.object_prototype_object_opt();
+        let mut shape = self.object_root(object_prototype)?;
+        let key = (argc as u32, mapped, crate::object::shape_body::id_of(shape));
         if argc <= CACHED_ARGC_MAX
             && let Some(shape) = self.arguments_shape_cache.get(&key)
         {
             return Ok(*shape);
         }
-        let mut shape = self.shape_root();
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
@@ -630,9 +633,6 @@ impl Interpreter {
                     &[&callee, &iterator_root],
                     &elements,
                 )?;
-                if let Some(proto) = interp.object_prototype_object_opt() {
-                    object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
-                }
                 let mapped = match &mapped {
                     Some((anchor, entries)) => Some(crate::object::MappedArguments {
                         context: interp
@@ -666,9 +666,6 @@ impl Interpreter {
                     &[&thrower, &iterator_root],
                     &elements,
                 )?;
-                if let Some(proto) = interp.object_prototype_object_opt() {
-                    object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
-                }
                 crate::arguments_object::initialize_unmapped(
                     obj,
                     &mut interp.gc_heap,

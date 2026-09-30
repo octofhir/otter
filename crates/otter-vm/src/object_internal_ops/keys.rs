@@ -1093,11 +1093,8 @@ impl Interpreter {
                 }
             }
             let proto_opt = if proto.is_null() { None } else { Some(*proto) };
-            let changed = object::set_prototype_value(obj, &mut self.gc_heap, proto_opt);
-            if changed {
-                self.bump_ordinary_object_prototype_shape_epoch();
-            }
-            return Ok(changed);
+            let mut obj = obj;
+            return self.set_ordinary_prototype(&mut obj, proto_opt);
         }
         if let Some(arr) = target.as_array() {
             let current_proto = self.get_prototype_for_op(target)?;

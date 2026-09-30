@@ -1349,6 +1349,98 @@ Found on the way (not fixed here):
 | crypto | 13.46G | 13.24G (−1.7%) | |
 | earley / zlib / fib / mega_method | unchanged | | |
 
+## 17. The prototype lives in the hidden class
+
+Before this section an object carried its `[[Prototype]]` itself (a flat
+`jit_proto` word in the body, a boxed override in the sidecar for Proxy and
+other non-ordinary prototypes), and a dictionary-mode object had a null shape.
+Two objects with different prototypes could share a shape, so every
+prototype-dependent proof (missing-key chains, method holders, receiver
+allocation) had to guard the prototype separately, and the ordinary-object
+prototype epoch existed only to paper over that.
+
+### How the reference engines do it
+
+- V8: `Map::prototype`; `Map::TransitionToPrototype` moves an object to a map
+  of the new prototype, and `PrototypeInfo::ObjectCreateMap` caches the
+  initial map of `Object.create(p)` objects on the prototype. Dictionary
+  objects have dictionary maps (`is_dictionary_map`), one per prototype.
+- JSC: `Structure::m_prototype` (stored in the structure); changing the
+  prototype is a structure transition (`changePrototypeTransition`); dictionary
+  structures are uncacheable/cacheable dictionary kinds of a structure.
+- SpiderMonkey: `BaseShape::proto`; `SetProto` reshapes the object.
+
+All three make shape identity imply prototype identity. Otter now does the same.
+
+### What changed
+
+- `ShapeBody` gained `kind` (dictionary bit), `prototype` (compressed ordinary
+  object, else null), `prototype_value` (Proxy / non-ordinary object value)
+  and `dictionary` (the lineage's dictionary shape; in that shape, the root).
+  Every lineage starts at a prototype's root; an ordinary prototype caches its
+  instances' root in its sidecar (`ExoticSlots::instance_root`, V8's
+  `ObjectCreateMap`), the `null` root lives in a new heap embedder root slot
+  (`GcHeap::embedder_root`, V8's roots table) so heap-only code reaches it.
+- `ObjectBody` lost `jit_proto`; `ExoticSlots` lost `proto_override`. Every
+  object has a shape; dictionary mode is the lineage's dictionary shape, never
+  null. The dictionary shape is never registered by id, so no id-keyed cache
+  or baked guard can resolve to it (all dictionary objects of a lineage share
+  it whatever their keys).
+- Creation picks the root: constructors (interpreter, runtime and generated
+  receiver allocation), `Object.create`, arguments objects (their cached
+  shapes are keyed by the `%Object.prototype%` root), JSON, dates, errors,
+  iterators and function-kind prototypes allocate on their prototype's root.
+- `[[SetPrototypeOf]]` is a shape change: a keyed object replays its keys on
+  the new root (offsets unchanged), a dictionary object takes the new
+  lineage's dictionary shape with a fresh structural id; the heap-only path
+  keeps an empty object keyed and normalizes a keyed one to dictionary.
+- Generated code reads a prototype as `object → shape → prototype` and tests
+  dictionary mode with the shape's kind byte (both backends; receiver
+  allocation, method guards, instanceof, CacheIR, megamorphic probes, global
+  bindings). Generated receiver allocation proves the baked shape's prototype
+  is the live `prototype`, or installs the root the live prototype caches.
+- Deleted: `CodeDependencyKind::ShapeEpoch`, the ordinary-object prototype
+  shape epoch, `jit_proto_byte`, `EMPTY_DICTIONARY`.
+
+### Defects found on the way
+
+- Dictionary-mode objects did not trace their shape (the old null-shape
+  test survived a mechanical rewrite); with the prototype only in the shape,
+  GC freed live lineages (difftest GC stress).
+- The code-liveness census did not visit shapes, whose `prototype_value` can
+  carry a function id.
+- A prototype-changing shape install needs a marking barrier: the new root
+  may be unmarked while the object is black.
+- The shared add-property transition cache was direct-mapped. Per-prototype
+  lineages give a base constructor reached from 24 subclasses 24 receiver
+  lineages; a handful of colliding keys thrashed and every thrash re-ran the
+  full capture (500k captures in `ast_ctor`). The table is now 512 sets × 4
+  ways, most recent first, probed way by way in both backends (V8 backs its
+  primary stub cache with a secondary table for the same reason).
+
+### Measurements (instructions, fixed work)
+
+| Workload | before (b77640ef) | after | |
+|---|---:|---:|---|
+| ast_ctor | 5.71G | 8.57G | +50%: 24 lineages make the base-constructor stores megamorphic (23.3G before the set-associative cache) |
+| mega_method | 10.00G | 7.38G | −26% |
+| ts-fixed | 156.5G | 155.1G | −0.9% |
+| earley-boyer | 101.05G | 101.32G | +0.3% |
+| crypto | 13.24G | 13.55G | +2.3% |
+| zlib / fib | unchanged | | |
+
+`ast_ctor` measured the old model's cross-prototype sharing; V8 sees the same
+megamorphic stores on this hierarchy. The next step that removes it is
+prototype validity cells (one guard per chain instead of per-hop shape
+checks) and megamorphic stores fully in generated code.
+
+Gates: difftest 90/90; Test262 `language/` 24,077/24,077, `built-ins/`
+23,520 (2 known RGI_Emoji); GC stress strides 1–16 on 11 prototype/store
+corpora 48/48 each; otter-vm lib 990, otter-jit lib 303, x86 machine 194.
+`derived_class_fields_super_shapes` fails GC stress at every stride and
+without stress: field initialization after an arrow/eval `super()` is the
+open compiler item from the E1 checkpoint below, not a shape effect.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

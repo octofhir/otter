@@ -42,7 +42,7 @@ fn empty_context() -> ExecutionContext {
 
 #[test]
 fn weak_ref_does_not_keep_target_alive() {
-    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let mut heap = crate::object::fixture_heap();
     let target = alloc_old_object(&mut heap).expect("target");
     let weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");
     assert_eq!(weak_ref_deref(weak_ref, &heap), Value::object(target));
@@ -59,7 +59,7 @@ fn weak_ref_does_not_keep_target_alive() {
 
 #[test]
 fn weak_ref_returns_target_while_strongly_rooted() {
-    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let mut heap = crate::object::fixture_heap();
     let target = alloc_old_object(&mut heap).expect("target");
     let weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");
 
@@ -157,7 +157,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
 
 #[test]
 fn dropped_finalization_registry_self_cycle_is_reaped() {
-    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let mut heap = crate::object::fixture_heap();
     let target = alloc_old_object(&mut heap).expect("target");
     let callback = native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::undefined()))
         .expect("native cleanup");
@@ -422,7 +422,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
 
 #[test]
 fn finalization_registry_unregister_token_removes_cells() {
-    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let mut heap = crate::object::fixture_heap();
     let callback = native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::undefined()))
         .expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
@@ -446,7 +446,7 @@ fn finalization_registry_unregister_token_removes_cells() {
 
 #[test]
 fn weak_finalization_registry_prunes_dead_handles_and_keeps_lazy_flag() {
-    let mut heap = otter_gc::GcHeap::new().expect("heap");
+    let mut heap = crate::object::fixture_heap();
     assert!(!heap.has_finalization_registries());
     let target = alloc_old_object(&mut heap).expect("target");
     let _weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");

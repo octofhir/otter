@@ -398,7 +398,18 @@ impl Interpreter {
             _ => return None,
         };
         let mut obj = if is_oom {
-            crate::object::alloc_diagnostic_object(&mut self.gc_heap).ok()?
+            let proto = match crate::object::get(
+                self.error_classes.constructor(kind),
+                &self.gc_heap,
+                "prototype",
+            ) {
+                Some(v) if let Some(proto) = v.as_object() => proto,
+                _ => self.error_classes.prototype(kind),
+            };
+            // Error prototypes carry their instances' root from bootstrap on,
+            // so finding it allocates nothing on an exhausted heap.
+            let root = crate::object::root_for_prototype(&mut self.gc_heap, Some(proto)).ok()?;
+            crate::object::alloc_diagnostic_object(&mut self.gc_heap, root).ok()?
         } else {
             self.make_error_instance_with_stack_roots(
                 stack,
@@ -408,17 +419,6 @@ impl Interpreter {
             )
             .ok()?
         };
-        if is_oom {
-            let proto = match crate::object::get(
-                self.error_classes.constructor(kind),
-                &self.gc_heap,
-                "prototype",
-            ) {
-                Some(v) if let Some(proto) = v.as_object() => proto,
-                _ => self.error_classes.prototype(kind),
-            };
-            crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        }
         // Build the diagnostic `message` / `code` / `info` properties inside a
         // handle scope. `obj` is a young object; each `from_str` and the nested
         // `info` allocation can relocate it, so writing through the raw local

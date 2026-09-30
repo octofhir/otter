@@ -1035,18 +1035,4 @@ impl Interpreter {
         );
         self.discard_invalidated_jit_state(&affected);
     }
-
-    /// Publish one successful ordinary-object prototype mutation.
-    pub(crate) fn bump_ordinary_object_prototype_shape_epoch(&mut self) {
-        self.shape_epoch = self
-            .shape_epoch
-            .checked_add(1)
-            .expect("ordinary-object prototype shape epoch exhausted");
-        let affected = self.jit_code_registry.invalidate_dependents(
-            crate::native_abi::CodeDependencyKind::ShapeEpoch,
-            crate::native_abi::ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY,
-            self.shape_epoch,
-        );
-        self.discard_invalidated_jit_state(&affected);
-    }
 }

@@ -208,7 +208,7 @@ impl Interpreter {
         // Publish only stable hidden-class guards, including for method-only
         // bodies compiled before any named collection property was observed.
         self.migrate_slow_to_fast(&mut proto);
-        let holder_shape = crate::object::shape(proto, &self.gc_heap);
+        let holder_shape = crate::object::keyed_shape(proto, &self.gc_heap);
         if holder_shape.is_null() {
             return None;
         }

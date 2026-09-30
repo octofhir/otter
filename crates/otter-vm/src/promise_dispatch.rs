@@ -1362,7 +1362,7 @@ fn new_generic_promise_capability(
         // list; the native body traces it, so no side hook is needed.
         let state_obj = {
             let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-            crate::object::alloc_object_with_roots(interp.gc_heap_mut(), &mut no_roots)?
+            crate::object::alloc_dictionary_object_with_roots(interp.gc_heap_mut(), &mut no_roots)?
         };
         let state_handle = interp.scoped_value(scope, Value::object(state_obj));
         let state_raw = interp.escape_scoped(state_handle);

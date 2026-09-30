@@ -172,7 +172,7 @@ impl BoundFunction {
                     arg.trace_value_slots(visitor);
                 }
             };
-            object::alloc_object_with_roots(heap, &mut visit)?
+            object::alloc_dictionary_object_with_roots(heap, &mut visit)?
         };
         let own_properties_root = Value::object(own_properties);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {

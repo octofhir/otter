@@ -343,7 +343,10 @@ pub struct JitReceiverAllocationPlan {
     pub new_target_function_id: u32,
     /// Class wrappers retain the template-wide capacity admission proof.
     pub class_allocation: bool,
-    /// Initial receiver hidden class.
+    /// Initial receiver hidden class naming its initial fields; generated
+    /// code proves the prototype it fixes is the live prototype. `0` for a
+    /// receiver with no initial fields: it takes the root the live prototype
+    /// caches for its instances.
     pub receiver_shape: u32,
     /// Number of already-visible undefined slots described by that shape.
     pub initial_field_count: u8,
@@ -412,6 +415,10 @@ pub const JIT_TYPEOF_TAGS: JitTypeOfTags = JitTypeOfTags {
         crate::eval_env::EVAL_EXTENSION_BODY_TYPE_TAG,
     ],
 };
+
+/// Shape kind bit of a dictionary shape: its objects keep their keys in
+/// dictionary storage, and the shape id alone does not fix their layout.
+pub const JIT_SHAPE_KIND_DICTIONARY: u8 = crate::object::SHAPE_KIND_DICTIONARY;
 
 /// `[[Extensible]]` bit of an ordinary object's flag byte.
 pub const JIT_OBJECT_FLAG_EXTENSIBLE: u8 = crate::object::ObjectFlags::EXTENSIBLE;
@@ -602,9 +609,14 @@ pub struct JitCompileSnapshot {
     pub object_shape_byte: u32,
     /// Byte offset from a decompressed sidecar (`ExoticSlots`) cell pointer
     /// to a dictionary-mode object's `u32` slot-layout epoch. Read only after
-    /// the object's shape handle is null and its sidecar handle non-null; a
+    /// the object's shape is a dictionary shape and its sidecar handle
+    /// non-null; a
     /// match keeps every existing key at its captured slot.
     pub exotic_dictionary_layout_byte: u32,
+    /// Byte offset from a decompressed sidecar cell pointer to the compressed
+    /// root shape a prototype caches for its instances; null until the
+    /// runtime first creates an instance of it.
+    pub exotic_instance_root_byte: u32,
     /// Byte offset from a decompressed object pointer to its first in-object
     /// slot (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`). While the slab
     /// handle is null, string-keyed slot `i` is the word at
@@ -652,12 +664,15 @@ pub struct JitCompileSnapshot {
     /// values; the card-mark is gated on [`cage_base`](Self::cage_base) being
     /// baked (the emitter decompresses parent/child pointers against it).
     pub gc_barrier: JitGcBarrierLayout,
-    /// Byte offset from a decompressed object pointer to its flat
-    /// `[[Prototype]]` mirror (`HEADER_SIZE + OBJECT_BODY_JIT_PROTO_OFFSET`). A
-    /// `#[repr(C)]` constant; the method-inline guard reads
-    /// `[recv_ptr + jit_proto_byte]` to chase the receiver's prototype chain
-    /// in machine code without runtime resolution.
-    pub jit_proto_byte: u32,
+    /// Byte offset from a decompressed shape cell pointer to the compressed
+    /// `[[Prototype]]` the shape fixes (`HEADER_SIZE +
+    /// SHAPE_BODY_PROTOTYPE_OFFSET`): an ordinary object, or null for a `null`
+    /// or non-ordinary prototype. Prototype-chain guards read the receiver's
+    /// shape, then this word, without runtime resolution.
+    pub shape_prototype_byte: u32,
+    /// Byte offset from a decompressed shape cell pointer to its `u8` kind
+    /// flags (see [`JIT_SHAPE_KIND_DICTIONARY`]).
+    pub shape_kind_byte: u32,
     /// Complete VM-owned closure-call ABI contract. Method identity guards use
     /// its function-id offset; native call linkage additionally consumes its
     /// flags, context word, and canonical bound-value metadata.
@@ -1095,7 +1110,7 @@ pub struct JitMethodGuard {
 /// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
 /// decompressed receiver.
 /// Method identity is verified inline before body entry: the emitter chases
-/// the flat prototype handle once per
+/// the prototype a hop's shape fixes once per
 /// [`JitMethodGuard::proto_chain`] entry,
 /// guards each hopped object's shape, reads the method slot at
 /// [`JitMethodGuard::method_value_byte`] from the final holder, and
@@ -1829,6 +1844,7 @@ impl JitCompileSnapshot {
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             exotic_dictionary_layout_byte: 0,
+            exotic_instance_root_byte: 0,
             object_inline_values_byte: 0,
             object_slab_handle_byte: 0,
             shape_property_count_byte: 0,
@@ -1839,7 +1855,8 @@ impl JitCompileSnapshot {
             object_exotic_handle_byte: 0,
             object_fixed_cell_bytes: 0,
             gc_barrier: JitGcBarrierLayout::default(),
-            jit_proto_byte: 0,
+            shape_prototype_byte: 0,
+            shape_kind_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),
             class_constructor_layout: JitClassConstructorLayout::default(),
             primitive_cell_type_tags: [0; 3],

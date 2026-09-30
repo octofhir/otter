@@ -218,8 +218,8 @@ mod tests {
     fn extension_values_survive_a_scavenge() {
         let mut heap = GcHeap::new().expect("heap");
         let extension = alloc_extension_with_roots(&mut heap, &mut |_| {}).expect("extension");
-        let object =
-            crate::object::alloc_object_with_roots(&mut heap, &mut |_| {}).expect("young object");
+        let object = crate::object::alloc_fixture_object_with_roots(&mut heap, &mut |_| {})
+            .expect("young object");
         extension_set_or_insert(&mut heap, extension, "o", Value::object(object));
         let mut root = Value::eval_extension(extension);
         let slot: *mut Value = &mut root;

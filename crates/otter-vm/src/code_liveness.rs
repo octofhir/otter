@@ -123,6 +123,9 @@ pub(crate) fn census_candidate_ids(
         heap.for_each_live_payload::<crate::object::ObjectBody, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });
+        heap.for_each_live_payload::<crate::object::ShapeBody, _>(|_, body| {
+            body.visit_function_ids(&mut visit);
+        });
         heap.for_each_live_payload::<crate::object::ExoticSlots, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });

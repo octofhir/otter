@@ -864,7 +864,6 @@ mod tests {
     use super::*;
     use crate::native_abi::{
         ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY, CodeObjectMetadata, NO_FRAME_STATE,
-        ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY,
     };
 
     #[derive(Debug)]
@@ -1400,59 +1399,5 @@ mod tests {
                 .jit_code_registry
                 .register(33, fake_code(33, vec![current]))
         );
-    }
-
-    #[test]
-    fn ordinary_object_prototype_change_bumps_shape_epoch_once_per_change() {
-        let mut interp = crate::Interpreter::new();
-        let dependency = CodeDependency::epoch(
-            CodeDependencyKind::ShapeEpoch,
-            ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY,
-            0,
-        );
-        assert!(
-            interp
-                .jit_code_registry
-                .register(41, fake_code(41, vec![dependency]))
-        );
-        let target = crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut())
-            .expect("target object");
-        let prototype = crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut())
-            .expect("prototype object");
-        let context = crate::ExecutionContext::from_module(
-            crate::test_support::minimal_bytecode_module("shape-epoch-test.js"),
-        )
-        .expect("valid bytecode fixture");
-        let target_value = crate::Value::object(target);
-        let prototype_value = crate::Value::object(prototype);
-        let mut stack = crate::activation_stack::ActivationStack::new();
-
-        assert!(
-            interp
-                .set_prototype_value_proxy_aware(
-                    &mut stack,
-                    &context,
-                    &target_value,
-                    &prototype_value,
-                )
-                .expect("ordinary prototype mutation")
-        );
-        assert_eq!(interp.shape_epoch(), 1);
-        assert_eq!(
-            interp.jit_code_registry.codes[&41].state,
-            CodeLifetimeState::Invalid
-        );
-
-        assert!(
-            interp
-                .set_prototype_value_proxy_aware(
-                    &mut stack,
-                    &context,
-                    &target_value,
-                    &prototype_value,
-                )
-                .expect("same prototype is accepted")
-        );
-        assert_eq!(interp.shape_epoch(), 1);
     }
 }

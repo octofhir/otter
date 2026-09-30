@@ -91,7 +91,7 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
         value: &Value,
     ) -> Result<Option<object::StorePropertyTransition>, VmError> {
-        let parent = object::shape(obj, &self.gc_heap);
+        let parent = object::keyed_shape(obj, &self.gc_heap);
         if parent.is_null() || self.shape_offset_of(parent, key.name()).is_some() {
             return Ok(None);
         }
@@ -1238,7 +1238,7 @@ pub(crate) fn typed_array_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let t = recv
         .as_typed_array(heap)
         .expect("receiver stays a typed array across the bag allocation");
@@ -1271,7 +1271,7 @@ pub(crate) fn regexp_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let r = recv
         .as_regexp()
         .expect("receiver stays a regexp across the bag allocation");
@@ -1303,7 +1303,7 @@ pub(crate) fn map_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let m = recv
         .as_map()
         .expect("receiver stays a map across the bag allocation");
@@ -1326,7 +1326,7 @@ pub(crate) fn weak_map_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let m = recv
         .as_weak_map()
         .expect("receiver stays a weak map across the bag allocation");
@@ -1349,7 +1349,7 @@ pub(crate) fn weak_set_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let s = recv
         .as_weak_set()
         .expect("receiver stays a weak set across the bag allocation");
@@ -1374,7 +1374,7 @@ pub(crate) fn generator_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let g = recv
         .as_generator()
         .expect("receiver stays a generator across the bag allocation");
@@ -1393,7 +1393,7 @@ pub(crate) fn set_ensure_expando_pub(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     crate::collections::set_set_expando(s, heap, bag);
     Ok(bag)
 }
@@ -1416,7 +1416,7 @@ pub(crate) fn temporal_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let t = recv
         .as_temporal(heap)
         .expect("receiver stays a temporal instance across the bag allocation");
@@ -1439,7 +1439,7 @@ pub(crate) fn promise_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let p = recv
         .as_promise()
         .expect("receiver stays a promise across the bag allocation");
@@ -1467,7 +1467,7 @@ pub(crate) fn array_buffer_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let b = recv
         .as_array_buffer()
         .expect("receiver stays an array buffer across the bag allocation");
@@ -1489,7 +1489,7 @@ pub(crate) fn data_view_ensure_expando_pub(
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let dv = recv
         .as_data_view()
         .expect("receiver stays a data view across the bag allocation");

@@ -850,9 +850,18 @@ fn emit_binding_guard(
                 ; ldr w14, [x13, view.object_shape_byte]
             );
             if dictionary {
+                emit_load_symbolic_u64(
+                    ops,
+                    relocations,
+                    11,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
                 dynasm!(ops
                     ; .arch aarch64
-                    ; cbnz w14, =>miss
+                    ; add x11, x11, x14
+                    ; ldrb w11, [x11, view.shape_kind_byte]
+                    ; tbz w11, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
                     ; ldr w14, [x13, view.object_exotic_handle_byte]
                     ; cbz w14, =>miss
                 );
@@ -2511,11 +2520,15 @@ fn emit_with_reach(
                     13,
                     miss,
                 )?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr w10, [x13, view.jit_proto_byte]
-                    ; cbz w10, =>miss
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    12,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
                 );
+                crate::template::arm64::values::emit_load_prototype(&mut ops, view, 10, 13, 12);
+                dynasm!(ops ; .arch aarch64 ; cbz w10, =>miss);
                 emit_load_u64(&mut ops, 11, 1);
                 dynasm!(ops ; .arch aarch64 ; =>miss ; =>done);
                 emit_store_allocated_tagged(&mut ops, frame, locations[2], 10, 0)?;
@@ -2567,7 +2580,15 @@ fn emit_with_reach(
                     13,
                     miss,
                 )?;
-                dynasm!(ops ; .arch aarch64 ; ldr w10, [x13, view.jit_proto_byte] ; cbnz w10, =>miss);
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    12,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                crate::template::arm64::values::emit_load_prototype(&mut ops, view, 10, 13, 12);
+                dynasm!(ops ; .arch aarch64 ; cbnz w10, =>miss);
                 emit_load_u64(&mut ops, 9, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                 emit_load_u64(&mut ops, 9, 0);
@@ -2594,11 +2615,9 @@ fn emit_with_reach(
                     miss,
                 )?;
                 emit_shape_state_guard(&mut ops, view, 13, miss);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr w15, [x13, view.object_shape_byte]
-                    ; cbz w15, =>miss
-                );
+                // Every case names a keyed shape, so a dictionary shape
+                // matches none.
+                dynasm!(ops ; .arch aarch64 ; ldr w15, [x13, view.object_shape_byte]);
                 let labels = cases
                     .iter()
                     .map(|_| ops.new_dynamic_label())
@@ -2793,10 +2812,11 @@ fn emit_with_reach(
                 )?;
                 emit_ordinary_lookup_state_guard(&mut ops, view, 13, miss);
                 // x12 keeps the receiver header for the whole case.
+                // Every case names a keyed shape, so a dictionary shape
+                // matches none.
                 dynasm!(ops
                     ; .arch aarch64
                     ; ldr w15, [x13, view.object_shape_byte]
-                    ; cbz w15, =>miss
                     ; mov x12, x13
                 );
                 let labels = cases
@@ -2814,21 +2834,20 @@ fn emit_with_reach(
                         // Missing-key proof: each prototype keeps its shape and
                         // chain-link state, and the chain ends in null.
                         dynasm!(ops ; .arch aarch64 ; mov x11, x12);
+                        emit_load_symbolic_u64(
+                            &mut ops,
+                            &mut relocations,
+                            13,
+                            view.cage_base as u64,
+                            RelocationTarget::GcCageBase,
+                        );
                         for &prototype in transition.prototype_shapes.iter() {
+                            crate::template::arm64::values::emit_load_prototype(
+                                &mut ops, view, 14, 11, 13,
+                            );
                             dynasm!(ops
                                 ; .arch aarch64
-                                ; ldr w14, [x11, view.jit_proto_byte]
                                 ; cbz w14, =>miss
-                            );
-                            emit_load_symbolic_u64(
-                                &mut ops,
-                                &mut relocations,
-                                13,
-                                view.cage_base as u64,
-                                RelocationTarget::GcCageBase,
-                            );
-                            dynasm!(ops
-                                ; .arch aarch64
                                 ; add x11, x13, x14
                                 ; ldrb w14, [x11]
                                 ; cmp w14, u32::from(otter_vm::object::OBJECT_BODY_TYPE_TAG)
@@ -2843,11 +2862,10 @@ fn emit_with_reach(
                                 ; b.ne =>miss
                             );
                         }
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; ldr w14, [x11, view.jit_proto_byte]
-                            ; cbnz w14, =>miss
+                        crate::template::arm64::values::emit_load_prototype(
+                            &mut ops, view, 14, 11, 13,
                         );
+                        dynasm!(ops ; .arch aarch64 ; cbnz w14, =>miss);
                         // Exact append into existing capacity of an
                         // extensible receiver.
                         let slot = case.value_byte / 8;

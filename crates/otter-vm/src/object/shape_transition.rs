@@ -338,7 +338,7 @@ pub(crate) fn replay_store_property_transition(
     heap.with_payload(obj, |body| {
         let offset = usize::from(transition.slot);
         if to_shape.is_null() {
-            let advance_layout = !body.shape.is_null();
+            let advance_layout = !body.is_dictionary();
             body.enter_dictionary_mode_as(transition.to_shape_id, advance_layout);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;

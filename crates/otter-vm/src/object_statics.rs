@@ -1515,10 +1515,8 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let mut obj = rooted_object(gc_heap, &[&proto], &[args])?;
-            if !crate::object::set_prototype_value(obj, gc_heap, proto_value) {
-                return Err(VmError::TypeMismatch);
-            }
+            let root = crate::object::root_for_prototype_value(gc_heap, proto_value)?;
+            let mut obj = rooted_object(gc_heap, root, &[&proto], &[args])?;
             if let Some(props_arg) = args.get(1)
                 && !props_arg.is_undefined()
             {
@@ -1979,7 +1977,8 @@ pub fn call(
         M::GetOwnPropertyDescriptors => {
             let target = expect_object(args.first())?;
             let target_root = Value::object(target);
-            let mut result = rooted_object(gc_heap, &[&target_root], &[args])?;
+            let root = crate::object::shape_body::null_root(gc_heap);
+            let mut result = rooted_object(gc_heap, root, &[&target_root], &[args])?;
             let result_root = Value::object(result);
             let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
                 crate::object::with_properties(target, gc_heap, |p| {
@@ -2497,6 +2496,7 @@ pub fn coerce_to_descriptor(
 
 fn rooted_object(
     gc_heap: &mut otter_gc::GcHeap,
+    root: crate::object::ShapeHandle,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<JsObject, VmError> {
@@ -2510,7 +2510,8 @@ fn rooted_object(
             }
         }
     };
-    crate::object::alloc_object_with_roots(gc_heap, &mut external_visit).map_err(VmError::from)
+    crate::object::alloc_object_with_roots(gc_heap, root, &mut external_visit)
+        .map_err(VmError::from)
 }
 
 fn rooted_array_from_elements<I>(
@@ -2555,7 +2556,8 @@ fn descriptor_to_object_with_roots(
             }
         }
     }
-    let mut result = rooted_object(gc_heap, &roots, slice_roots)?;
+    let root = crate::object::shape_body::null_root(gc_heap);
+    let mut result = rooted_object(gc_heap, root, &roots, slice_roots)?;
     match &desc.kind {
         DescriptorKind::Data { value } => {
             crate::object::set(&mut result, gc_heap, "value", *value);

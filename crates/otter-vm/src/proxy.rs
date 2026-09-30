@@ -25,7 +25,6 @@
 //! - <https://tc39.es/ecma262/#sec-proxy-objects>
 
 use crate::Value;
-use otter_gc::raw::SlotVisitor;
 use otter_macros::Pelt;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ProxyBodyGc`].
@@ -337,12 +336,6 @@ impl JsProxy {
     #[must_use]
     pub fn identity_addr(self) -> *const () {
         self.handle.offset() as usize as *const ()
-    }
-
-    /// Trace the embedded GC handle slot.
-    pub(crate) fn trace_value_slots_mut(&mut self, visitor: &mut SlotVisitor<'_>) {
-        let p = &mut self.handle as *mut ProxyHandle as *mut otter_gc::raw::RawGc;
-        visitor(p);
     }
 }
 

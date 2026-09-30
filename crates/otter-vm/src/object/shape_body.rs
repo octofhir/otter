@@ -1,21 +1,33 @@
 //! GC-managed hidden-class layout nodes.
 //!
-//! Shape nodes are immutable after allocation and record only the transition
-//! from their parent: parent shape, added property key, property count, and the
-//! slot offset assigned to that key. Transition tables and flattened lookup
-//! caches live outside this GC body so mutation never requires `Cell`/`RefCell`
-//! inside traced payloads.
+//! Shape nodes are immutable after allocation and record the transition from
+//! their parent — parent shape, added property key, property count, and the
+//! slot offset assigned to that key — together with what every object of the
+//! lineage shares: its `[[Prototype]]` (V8 `Map::prototype`, JSC
+//! `Structure::m_prototype`, SpiderMonkey `BaseShape::proto`) and its
+//! dictionary shape. Transition tables and flattened lookup caches live
+//! outside this GC body so mutation never requires `Cell`/`RefCell` inside
+//! traced payloads.
 //!
 //! # Contents
 //! - [`ShapeBody`] — immutable hidden-class layout node.
-//! - [`alloc_root_shape_body_with_roots`] — allocate the empty root shape.
+//! - [`ShapePrototype`] — the lineage's `[[Prototype]]` as a shape stores it.
+//! - [`alloc_root_shape_body_with_roots`] — allocate a prototype's empty root
+//!   shape together with its dictionary shape.
 //! - [`alloc_child_shape_body_with_roots`] — allocate one append transition.
+//! - [`null_root`] / [`set_null_root`] — the `null`-prototype root, kept in
+//!   the heap's embedder root slot so heap-only code reaches it.
 //! - [`shape_offset_of_atom`] / [`shape_offset_of_str`] / [`shape_keys_ordered`]
 //!   — parent-chain readers.
 //!
 //! # Invariants
-//! - `parent == Gc::null()` and `transition_key == Gc::null()` only for root,
-//!   which is also the only node whose `transition_atom` is [`AtomId::NONE`].
+//! - `parent == Gc::null()` and `transition_key == Gc::null()` only for a
+//!   root or a dictionary shape, the only nodes whose `transition_atom` is
+//!   [`AtomId::NONE`].
+//! - Every node of a lineage has its root's prototype and dictionary shape: a
+//!   shape fixes its objects' `[[Prototype]]`, so a prototype change is a
+//!   change of shape. A dictionary shape describes no keys (a dictionary
+//!   object keeps them in its sidecar) and is its own dictionary shape.
 //! - A node's `transition_atom` is the isolate-global atom of its
 //!   `transition_key`; the two never disagree.
 //! - Non-root `own_offset` is the parent's `property_count`.
@@ -53,6 +65,22 @@ pub const SHAPE_BODY_TYPE_TAG: u8 = 0x22;
 /// GC handle to a hidden-class layout node.
 pub type ShapeHandle = otter_gc::Gc<ShapeBody>;
 
+/// [`ShapeBody::kind`] of a dictionary shape.
+pub(crate) const SHAPE_KIND_DICTIONARY: u8 = 1 << 0;
+
+/// A lineage's `[[Prototype]]`: `null`, an ordinary object (the compressed
+/// handle generated code reads), or a non-ordinary value — a function, an
+/// array, a Proxy — that ordinary chain walks cannot follow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ShapePrototype {
+    /// `null`.
+    Null,
+    /// An ordinary object.
+    Object(super::JsObject),
+    /// A non-ordinary object value.
+    Value(crate::Value),
+}
+
 /// Immutable hidden-class layout node.
 #[derive(Debug, Clone)]
 #[repr(C)]
@@ -81,6 +109,16 @@ pub struct ShapeBody {
     /// `true` when the slot added by this transition is an accessor rather
     /// than a data property. Meaningless for the root.
     own_is_accessor: bool,
+    /// [`SHAPE_KIND_DICTIONARY`] for a dictionary shape; `0` otherwise.
+    kind: u8,
+    /// The lineage's ordinary-object `[[Prototype]]`; null for a `null` or a
+    /// non-ordinary prototype.
+    prototype: super::JsObject,
+    /// The lineage's non-ordinary `[[Prototype]]`, or `undefined`.
+    prototype_value: crate::Value,
+    /// The lineage's dictionary shape; in the dictionary shape itself, which
+    /// is its own, the lineage's root.
+    dictionary: ShapeHandle,
 }
 
 /// Identity word read by generated probes of the shared property lookup table.
@@ -91,9 +129,22 @@ pub(crate) const SHAPE_BODY_ID_OFFSET: usize = std::mem::offset_of!(ShapeBody, i
 pub(crate) const SHAPE_BODY_PROPERTY_COUNT_OFFSET: usize =
     std::mem::offset_of!(ShapeBody, property_count);
 
+/// Kind byte generated code tests for a dictionary shape.
+pub(crate) const SHAPE_BODY_KIND_OFFSET: usize = std::mem::offset_of!(ShapeBody, kind);
+
+/// Compressed ordinary-object prototype generated chain walks read.
+pub(crate) const SHAPE_BODY_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ShapeBody, prototype);
+
 impl ShapeBody {
+    /// An empty node of `prototype`'s lineage: a root when `dictionary` names
+    /// the lineage's dictionary shape, or that dictionary shape itself.
     #[must_use]
-    fn root(id: ShapeId) -> Self {
+    fn empty(id: ShapeId, prototype: ShapePrototype, kind: u8, dictionary: ShapeHandle) -> Self {
+        let (prototype, prototype_value) = match prototype {
+            ShapePrototype::Null => (super::JsObject::null(), crate::Value::undefined()),
+            ShapePrototype::Object(object) => (object, crate::Value::undefined()),
+            ShapePrototype::Value(value) => (super::JsObject::null(), value),
+        };
         Self {
             id,
             parent: ShapeHandle::null(),
@@ -103,22 +154,26 @@ impl ShapeBody {
             own_offset: 0,
             own_flags: PropertyFlags::data_default(),
             own_is_accessor: false,
+            kind,
+            prototype,
+            prototype_value,
+            dictionary,
         }
     }
 
     #[must_use]
     fn child(
-        parent: ShapeHandle,
+        parent_handle: ShapeHandle,
+        parent: &ShapeBody,
         key: JsStringHandle,
         atom: AtomId,
-        parent_property_count: u32,
         own_flags: PropertyFlags,
         own_is_accessor: bool,
     ) -> Self {
         debug_assert!(
-            parent.is_null() || parent.offset().is_multiple_of(8),
+            parent_handle.offset().is_multiple_of(8),
             "misaligned shape parent at child creation: parent={:?}",
-            parent
+            parent_handle
         );
         debug_assert!(
             key.is_null() || key.offset().is_multiple_of(8),
@@ -130,15 +185,20 @@ impl ShapeBody {
             AtomId::NONE,
             "a non-root shape node names the key it adds",
         );
+        debug_assert_eq!(parent.kind, 0, "a dictionary shape has no children");
         Self {
             id: next_shape_id(),
-            parent,
+            parent: parent_handle,
             transition_key: key,
             transition_atom: atom,
-            property_count: parent_property_count + 1,
-            own_offset: parent_property_count,
+            property_count: parent.property_count + 1,
+            own_offset: parent.property_count,
             own_flags,
             own_is_accessor,
+            kind: 0,
+            prototype: parent.prototype,
+            prototype_value: parent.prototype_value,
+            dictionary: parent.dictionary,
         }
     }
 
@@ -190,10 +250,43 @@ impl ShapeBody {
         self.own_is_accessor
     }
 
-    /// `true` for the root shape.
+    /// `true` for a root or a dictionary shape: a node that adds no key.
     #[must_use]
     pub(crate) const fn is_root(&self) -> bool {
         self.parent.is_null()
+    }
+
+    /// `true` for a dictionary shape.
+    #[must_use]
+    pub(crate) const fn is_dictionary(&self) -> bool {
+        self.kind & SHAPE_KIND_DICTIONARY != 0
+    }
+
+    /// The `[[Prototype]]` of every object with this shape.
+    #[must_use]
+    pub(crate) fn prototype(&self) -> ShapePrototype {
+        if !self.prototype.is_null() {
+            ShapePrototype::Object(self.prototype)
+        } else if self.prototype_value.is_undefined() {
+            ShapePrototype::Null
+        } else {
+            ShapePrototype::Value(self.prototype_value)
+        }
+    }
+
+    /// Report the function id a non-ordinary prototype value carries.
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        crate::code_liveness::visit_value(&self.prototype_value, visitor);
+    }
+
+    /// The lineage's dictionary shape, given this node's own handle.
+    #[must_use]
+    pub(crate) fn dictionary(&self, own: ShapeHandle) -> ShapeHandle {
+        if self.is_dictionary() {
+            own
+        } else {
+            self.dictionary
+        }
     }
 }
 
@@ -201,6 +294,7 @@ impl otter_gc::SafeTraceable for ShapeBody {
     const TYPE_TAG: u8 = SHAPE_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        use crate::pelt::PeltField as _;
         if !self.parent.is_null() {
             let p = &mut self.parent as *mut ShapeHandle as *mut RawGc;
             visitor(p);
@@ -209,26 +303,104 @@ impl otter_gc::SafeTraceable for ShapeBody {
             let p = &mut self.transition_key as *mut JsStringHandle as *mut RawGc;
             visitor(p);
         }
+        if !self.prototype.is_null() {
+            let p = &mut self.prototype as *mut super::JsObject as *mut RawGc;
+            visitor(p);
+        }
+        self.prototype_value.pelt_trace(visitor);
+        if !self.dictionary.is_null() {
+            let p = &mut self.dictionary as *mut ShapeHandle as *mut RawGc;
+            visitor(p);
+        }
     }
 }
 
-/// Allocate the root hidden-class node.
+/// Allocate `prototype`'s empty root shape and its dictionary shape, and
+/// return the root.
 ///
 /// Shapes are allocated directly in non-moving old space: the JIT bakes a
 /// shape's handle offset into emitted guards and publications, so the offset
 /// must stay stable while anything names the shape (compiled code keeps the
 /// shapes it bakes alive). Old-space placement guarantees that without a
-/// separate stability mechanism.
+/// separate stability mechanism. A young prototype is remembered from both.
 pub(crate) fn alloc_root_shape_body_with_roots(
     heap: &mut GcHeap,
+    prototype: ShapePrototype,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old_with_roots(ShapeBody::root(next_shape_id()), external_visit)
+    // A pending body is traced across its own allocation.
+    let root = heap.alloc_old_with_roots(
+        ShapeBody::empty(next_shape_id(), prototype, 0, ShapeHandle::null()),
+        external_visit,
+    )?;
+    // The root holds the collector-rewritten prototype; shapes never move.
+    let prototype = heap.read_payload(root, ShapeBody::prototype);
+    remember_prototype(heap, root, prototype);
+    let dictionary = heap.alloc_old_with_roots(
+        ShapeBody::empty(next_shape_id(), prototype, SHAPE_KIND_DICTIONARY, root),
+        external_visit,
+    )?;
+    let prototype = heap.read_payload(dictionary, ShapeBody::prototype);
+    remember_prototype(heap, dictionary, prototype);
+    // Completes the pair before either shape is published.
+    heap.with_payload(root, |body| body.dictionary = dictionary);
+    heap.record_write(root, &dictionary);
+    Ok(root)
+}
+
+/// Heap embedder root slot holding the `null`-prototype root shape.
+const NULL_ROOT_SLOT: usize = 0;
+
+/// The root shape of `null`-prototype objects.
+#[must_use]
+pub(crate) fn null_root(heap: &GcHeap) -> ShapeHandle {
+    // SAFETY: only `set_null_root` fills the slot, and with a shape.
+    unsafe { heap.embedder_root(NULL_ROOT_SLOT).cast() }
+}
+
+/// Make `root` the isolate's `null`-prototype root; the heap keeps it alive.
+pub(crate) fn set_null_root(heap: &GcHeap, root: ShapeHandle) {
+    heap.set_embedder_root(NULL_ROOT_SLOT, root.raw());
+}
+
+/// The root of a live, non-null `shape`'s lineage.
+#[must_use]
+pub(crate) fn lineage_root_of(heap: &GcHeap, shape: ShapeHandle) -> ShapeHandle {
+    let body = body_of(shape);
+    if body.is_dictionary() {
+        return body.dictionary;
+    }
+    let mut current = shape;
+    loop {
+        let parent = heap.read_payload(current, ShapeBody::parent);
+        if parent.is_null() {
+            return current;
+        }
+        current = parent;
+    }
+}
+
+/// Record the old-to-young edge from a new old-space shape to its prototype.
+fn remember_prototype(heap: &mut GcHeap, shape: ShapeHandle, prototype: ShapePrototype) {
+    use crate::pelt::PeltField as _;
+    let mut value = match prototype {
+        ShapePrototype::Null => return,
+        ShapePrototype::Object(object) => crate::Value::object(object),
+        ShapePrototype::Value(value) => value,
+    };
+    let mut record = |slot: *mut RawGc| {
+        // SAFETY: the slot points into the local copy of the value; it is read
+        // to record the edge only.
+        let raw = unsafe { *slot };
+        heap.record_write_edge(shape, raw);
+    };
+    value.pelt_trace(&mut record);
 }
 
 /// Allocate a child shape for adding `key` to `parent`.
 ///
-/// Old-space pinned for the same reason as [`alloc_root_shape_body_with_roots`].
+/// Old-space pinned for the same reason as [`alloc_root_shape_body_with_roots`];
+/// it shares its parent's prototype, whose edge the parent already records.
 pub(crate) fn alloc_child_shape_body_with_roots(
     heap: &mut GcHeap,
     parent: ShapeHandle,
@@ -238,18 +410,13 @@ pub(crate) fn alloc_child_shape_body_with_roots(
     own_is_accessor: bool,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    let parent_property_count = heap.read_payload(parent, ShapeBody::property_count);
-    heap.alloc_old_with_roots(
-        ShapeBody::child(
-            parent,
-            key,
-            atom,
-            parent_property_count,
-            own_flags,
-            own_is_accessor,
-        ),
-        external_visit,
-    )
+    let body = heap.read_payload(parent, |parent_body| {
+        ShapeBody::child(parent, parent_body, key, atom, own_flags, own_is_accessor)
+    });
+    let prototype = body.prototype();
+    let child = heap.alloc_old_with_roots(body, external_visit)?;
+    remember_prototype(heap, child, prototype);
+    Ok(child)
 }
 
 /// Walk `shape`'s parent chain and return the slot for `key`.
@@ -358,6 +525,38 @@ pub(crate) fn id_of(shape: ShapeHandle) -> ShapeId {
             .cast::<ShapeBody>()))
         .id
     }
+}
+
+/// The live, non-null `shape`'s body, read without the heap.
+fn body_of<'a>(shape: ShapeHandle) -> &'a ShapeBody {
+    debug_assert!(!shape.is_null());
+    // SAFETY: a non-null shape handle decompresses to a live ShapeBody cell
+    // in non-moving old space; its immutable payload follows the header.
+    unsafe {
+        &*(shape
+            .as_header_ptr()
+            .cast::<u8>()
+            .add(otter_gc::header::HEADER_SIZE)
+            .cast::<ShapeBody>())
+    }
+}
+
+/// The `[[Prototype]]` a live, non-null `shape` fixes, read without the heap.
+#[must_use]
+pub(crate) fn prototype_of(shape: ShapeHandle) -> ShapePrototype {
+    body_of(shape).prototype()
+}
+
+/// `true` when a live, non-null `shape` is a dictionary shape.
+#[must_use]
+pub(crate) fn is_dictionary_of(shape: ShapeHandle) -> bool {
+    body_of(shape).is_dictionary()
+}
+
+/// The dictionary shape of a live, non-null `shape`'s lineage.
+#[must_use]
+pub(crate) fn dictionary_of(shape: ShapeHandle) -> ShapeHandle {
+    body_of(shape).dictionary(shape)
 }
 
 /// The property count of a live, non-null `shape`, read without the heap.
@@ -509,7 +708,8 @@ mod tests {
     fn root_shape_has_no_parent_or_key() {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let root = alloc_root_shape_body_with_roots(&mut heap, &mut roots).expect("root");
+        let root = alloc_root_shape_body_with_roots(&mut heap, ShapePrototype::Null, &mut roots)
+            .expect("root");
 
         heap.read_payload(root, |body| {
             assert!(body.is_root());
@@ -538,7 +738,8 @@ mod tests {
             scope.add_raw_slot((&mut sx as *mut ShapeHandle).cast::<RawGc>());
             scope.add_raw_slot((&mut sxy as *mut ShapeHandle).cast::<RawGc>());
         }
-        root = alloc_root_shape_body_with_roots(&mut heap, &mut roots).expect("root");
+        root = alloc_root_shape_body_with_roots(&mut heap, ShapePrototype::Null, &mut roots)
+            .expect("root");
         x = alloc_key(&mut heap, 1, "x");
         y = alloc_key(&mut heap, 2, "y");
 

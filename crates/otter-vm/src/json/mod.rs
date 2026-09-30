@@ -523,7 +523,7 @@ mod tests {
     }
 
     fn make_heap() -> otter_gc::GcHeap {
-        otter_gc::GcHeap::new().expect("gc heap")
+        crate::object::fixture_heap()
     }
 
     #[test]

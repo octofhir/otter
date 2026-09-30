@@ -3,6 +3,8 @@
 //! # Contents
 //! - [`JitPropertyLookupCache`] declares scalar address, hash and field offsets.
 //! - [`PropertyLookupCache::jit_layout`] snapshots the one live table's layout.
+//! - [`JitStoreTransitionCache`] / [`StoreTransitionCache::jit_layout`] — the
+//!   set-associative add-property transition table generated stores probe.
 //!
 //! # Invariants
 //! - The fixed boxed table is allocated with its interpreter and never replaced
@@ -29,7 +31,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{
     CAPACITY, Entry, HASH_ATOM_MULTIPLIER, HASH_SHAPE_MULTIPLIER, HASH_SHIFT, PropertyLookupCache,
-    StoreTransitionCache, StoreTransitionJitEntry,
+    StoreTransitionCache, StoreTransitionJitEntry, TRANSITION_SETS, TRANSITION_WAYS,
 };
 use crate::object::AtomOwnPropertyHit;
 
@@ -76,10 +78,13 @@ pub struct JitPropertyLookupCache {
 pub struct JitStoreTransitionCache {
     /// Process-local address of the first scalar entry.
     pub table_addr: usize,
-    /// Byte stride between scalar table entries.
+    /// Byte stride between scalar table entries, the ways of one set.
     pub entry_bytes: u32,
-    /// Capacity minus one for the power-of-two table.
+    /// Set count minus one for the power-of-two set index.
     pub index_mask: u32,
+    /// Ways per set; a set's ways are consecutive entries, most recently
+    /// recorded first.
+    pub ways: u32,
     /// Receiver shape identity offset within a way.
     pub receiver_shape_byte: u32,
     /// Direct prototype shape identity offset within a way.
@@ -109,7 +114,8 @@ impl StoreTransitionCache {
         JitStoreTransitionCache {
             table_addr: self.jit_ways[0].as_ptr() as usize,
             entry_bytes: size_of::<StoreTransitionJitEntry>() as u32,
-            index_mask: (CAPACITY - 1) as u32,
+            index_mask: (TRANSITION_SETS - 1) as u32,
+            ways: TRANSITION_WAYS as u32,
             receiver_shape_byte: offset_of!(StoreTransitionJitEntry, receiver_shape) as u32,
             prototype_shape_byte: offset_of!(StoreTransitionJitEntry, prototype_shape) as u32,
             atom_byte: offset_of!(StoreTransitionJitEntry, atom) as u32,

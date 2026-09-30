@@ -102,7 +102,7 @@ impl Interpreter {
             return None;
         }
         self.migrate_slow_to_fast(&mut prototype);
-        let shape = object::shape(prototype, &self.gc_heap);
+        let shape = object::keyed_shape(prototype, &self.gc_heap);
         if shape.is_null() {
             return None;
         }

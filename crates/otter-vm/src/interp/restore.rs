@@ -137,7 +137,6 @@ impl Interpreter {
             store_transition_cache: crate::property_cache::StoreTransitionCache::default(),
             realm_context: None,
             shape_runtime,
-            shape_epoch: 0,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             object_literal_layouts: rustc_hash::FxHashMap::default(),
@@ -366,7 +365,10 @@ impl Interpreter {
                 // SAFETY: the payload walk visited a live `ShapeBody`
                 // cell at this cage offset.
                 let handle: object::ShapeHandle = unsafe { otter_gc::Gc::from_offset(offset) };
-                restored_shapes.push((body.id(), handle));
+                // A dictionary shape fixes no layout; no id names it.
+                if !body.is_dictionary() {
+                    restored_shapes.push((body.id(), handle));
+                }
             });
         for (id, handle) in restored_shapes {
             interp.shape_runtime.register_restored_shape(id, handle);

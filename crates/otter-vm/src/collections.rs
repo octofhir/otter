@@ -2036,7 +2036,7 @@ mod tests {
 
     fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
         let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        Value::object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
+        Value::object(crate::object::alloc_fixture_object_with_roots(heap, &mut no_roots).unwrap())
     }
 
     #[test]

@@ -97,23 +97,26 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
+        let root = self.null_prototype_root();
         self.alloc_runtime_rooted_object_with_capacity(
+            root,
             crate::object::DEFAULT_INLINE_CAPACITY,
             value_roots,
             slice_roots,
         )
     }
 
-    /// [`Self::alloc_runtime_rooted_object_with_roots`] with room for
-    /// `capacity` in-object slots.
+    /// An object of `root`'s lineage (whose prototype the root fixes) with
+    /// room for `capacity` in-object slots.
     pub(crate) fn alloc_runtime_rooted_object_with_capacity(
         &mut self,
+        root: crate::object::ShapeHandle,
         capacity: usize,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
-        let shape_root = self.shape_root();
+        let shape_root = root;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -144,7 +147,7 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
-        let shape_root = self.shape_root();
+        let shape_root = self.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -173,7 +176,7 @@ impl Interpreter {
         target_url: std::sync::Arc<str>,
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
         self.with_handle_scope(|interp, scope| {
-            let shape_root = interp.shape_root();
+            let shape_root = interp.null_prototype_root();
             let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
             let obj = crate::object::alloc_host_object_with_shape_roots(
                 &mut interp.gc_heap,
@@ -221,7 +224,7 @@ impl Interpreter {
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
         self.with_handle_scope(|interp, scope| {
             let env = interp.scoped_value(scope, Value::object(env));
-            let shape_root = interp.shape_root();
+            let shape_root = interp.null_prototype_root();
             let env_value = interp.escape_scoped(env);
             let env_object = env_value
                 .as_object()
@@ -271,38 +274,27 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        self.with_handle_scope(|interp, scope| {
-            let proto_handle = interp.scoped_value(scope, Value::object(proto));
-            let shape_root = interp.shape_root();
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for value in value_roots {
+        // The prototype's root fixes the object's prototype; finding it never
+        // collects.
+        let root = self.object_root(Some(proto))?;
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
                     value.trace_value_slots(visitor);
                 }
-                for slice in slice_roots {
-                    for value in *slice {
-                        value.trace_value_slots(visitor);
-                    }
-                }
-            };
-            let object = crate::object::alloc_object_with_shape_roots(
-                &mut interp.gc_heap,
-                shape_root,
-                crate::object::DEFAULT_INLINE_CAPACITY,
-                &mut external_visit,
-            )
-            .map_err(VmError::from)?;
-            let object_handle = interp.scoped_value(scope, Value::object(object));
-            let live_proto = interp
-                .escape_scoped(proto_handle)
-                .as_object()
-                .expect("object prototype handle must remain an object");
-            let live_object = interp
-                .escape_scoped(object_handle)
-                .as_object()
-                .expect("fresh object handle must remain an object");
-            crate::object::set_prototype(live_object, &mut interp.gc_heap, Some(live_proto));
-            Ok(live_object)
-        })
+            }
+        };
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)
     }
 
     pub(crate) fn alloc_runtime_rooted_array_from_values<I>(
@@ -545,11 +537,12 @@ impl Interpreter {
     pub(crate) fn alloc_stack_rooted_object_with_capacity(
         &mut self,
         stack: &ActivationStack,
+        root: crate::object::ShapeHandle,
         extra_roots: &[&Value],
         capacity: usize,
     ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_allocation_roots(stack);
-        let shape_root = self.shape_root();
+        let shape_root = root;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -579,7 +572,7 @@ impl Interpreter {
         pending: &mut [Value],
     ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_allocation_roots(stack);
-        let shape_root = self.shape_root();
+        let shape_root = self.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -617,7 +610,7 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_allocation_roots(stack);
-        let shape_root = self.shape_root();
+        let shape_root = self.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -647,42 +640,30 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        self.with_handle_scope(|interp, scope| {
-            let proto_handle = interp.scoped_value(scope, Value::object(proto));
-            let roots = interp.collect_allocation_roots(stack);
-            let shape_root = interp.shape_root();
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-                for value in value_roots {
+        // The prototype's root fixes the object's prototype; finding it never
+        // collects.
+        let root = self.object_root(Some(proto))?;
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
                     value.trace_value_slots(visitor);
                 }
-                for slice in slice_roots {
-                    for value in *slice {
-                        value.trace_value_slots(visitor);
-                    }
-                }
-            };
-            let object = crate::object::alloc_object_with_shape_roots(
-                &mut interp.gc_heap,
-                shape_root,
-                crate::object::DEFAULT_INLINE_CAPACITY,
-                &mut external_visit,
-            )
-            .map_err(VmError::from)?;
-            let object_handle = interp.scoped_value(scope, Value::object(object));
-            let live_proto = interp
-                .escape_scoped(proto_handle)
-                .as_object()
-                .expect("object prototype handle must remain an object");
-            let live_object = interp
-                .escape_scoped(object_handle)
-                .as_object()
-                .expect("fresh object handle must remain an object");
-            crate::object::set_prototype(live_object, &mut interp.gc_heap, Some(live_proto));
-            Ok(live_object)
-        })
+            }
+        };
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            root,
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)
     }
 
     pub(crate) fn alloc_stack_rooted_array(
@@ -819,26 +800,26 @@ impl Interpreter {
     /// the returned value can therefore be committed through either a
     /// `Frame` or an `ActiveFrameMut` after collection.
     pub(crate) fn allocate_object_literal_value(&mut self) -> Result<Value, VmError> {
-        let shape_root = self.shape_root();
+        // `%Object.prototype%`'s root fixes the prototype; shapes never move,
+        // so the root survives the allocation.
+        let prototype = self.object_prototype_object_opt();
+        let root = self.object_root(prototype)?;
         let obj = match crate::object::try_alloc_object_with_shape_no_collect(
             &mut self.gc_heap,
-            shape_root,
+            root,
             crate::object::DEFAULT_INLINE_CAPACITY,
         ) {
             Some(obj) => obj,
-            None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,
+            None => {
+                let _runtime_roots_guard = self.scope_runtime_roots_guard();
+                crate::object::alloc_object_with_shape_roots(
+                    &mut self.gc_heap,
+                    root,
+                    crate::object::DEFAULT_INLINE_CAPACITY,
+                    &mut |_: &mut dyn FnMut(*mut RawGc)| {},
+                )?
+            }
         };
-        // Allocate first, THEN read `%Object.prototype%`. The slow allocation
-        // can trigger a scavenge that relocates the realm prototype while
-        // it is still young; reading the handle beforehand would capture a
-        // stale offset and install a dangling `[[Prototype]]` on the new
-        // object (corrupting the proto chain — only on the alloc that
-        // happens to drive the GC). `object_prototype_object_opt` reads it
-        // from the always-traced realm-intrinsic table, so post-alloc it
-        // yields the relocated handle.
-        if let Some(proto) = self.object_prototype_object_opt() {
-            crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        }
         Ok(Value::object(obj))
     }
 
@@ -918,21 +899,13 @@ impl Interpreter {
             .shape_runtime
             .handle_for_id(layout.shape_id())
             .ok_or(VmError::TypeMismatch)?;
-        let mut prototype = self.object_prototype_object_opt();
         let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
-        let prototype_slot = prototype
-            .as_mut()
-            .map(|prototype| std::ptr::from_mut(prototype).cast::<RawGc>());
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(shape_slot);
-            if let Some(prototype_slot) = prototype_slot {
-                visitor(prototype_slot);
-            }
         };
         let object = crate::object::alloc_object_with_shape_and_values_roots(
             &mut self.gc_heap,
             shape,
-            prototype,
             values,
             &mut roots,
         )

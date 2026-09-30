@@ -438,7 +438,6 @@ pub fn install_iterator_well_knowns_post_bootstrap(
 /// `%IteratorPrototype%` is reachable.
 pub fn build_builtin_iterator_prototypes_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    mut shape_root: object::ShapeHandle,
     parent: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<crate::bootstrap::BuiltinIteratorPrototypes, JsSurfaceError> {
@@ -455,9 +454,6 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     // SAFETY: every canonical slot is declared before the scope and remains
     // stationary until the completed prototype set is returned.
     unsafe {
-        roots.add_raw_slot(
-            (&mut shape_root as *mut object::ShapeHandle).cast::<otter_gc::raw::RawGc>(),
-        );
         roots.add_value(&mut parent_value);
         roots.add_value(&mut array_root);
         roots.add_value(&mut map_root);
@@ -489,22 +485,17 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
             proto_scope.add_value(&mut tag_root);
         }
         let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        let root = object::root_for_prototype(heap, parent_value.as_object())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
         proto_root = Value::object(
             object::alloc_object_with_shape_roots(
                 heap,
-                shape_root,
+                root,
                 crate::object::DEFAULT_INLINE_CAPACITY,
                 &mut no_extra_roots,
             )
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
         );
-        let proto = proto_root
-            .as_object()
-            .expect("iterator prototype stays rooted after allocation");
-        let parent = parent_value
-            .as_object()
-            .expect("Iterator.prototype stays rooted during bootstrap");
-        object::set_prototype(proto, heap, Some(parent));
         tag_root = Value::string(
             crate::string::JsString::from_str(tag, heap)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?,
@@ -543,18 +534,15 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     // `@@toStringTag` of its own.
     wrap_root = Value::object({
         let mut visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-        let proto = object::alloc_object_with_shape_roots(
+        let root = object::root_for_prototype(heap, parent_value.as_object())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        object::alloc_object_with_shape_roots(
             heap,
-            shape_root,
+            root,
             crate::object::DEFAULT_INLINE_CAPACITY,
             &mut visit,
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let parent = parent_value
-            .as_object()
-            .expect("Iterator.prototype stays rooted during bootstrap");
-        object::set_prototype(proto, heap, Some(parent));
-        proto
+        .map_err(|_| JsSurfaceError::OutOfMemory)?
     });
     let install_method = |heap: &mut otter_gc::GcHeap,
                           proto: JsObject,

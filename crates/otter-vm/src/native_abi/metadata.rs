@@ -22,8 +22,6 @@
 
 /// Stable identity of the array-index accessor protector epoch.
 pub const ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY: u32 = 0;
-/// Stable identity of the ordinary-object prototype shape epoch.
-pub const ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY: u32 = 0;
 
 /// Machine-visible immutable code-object metadata header.
 #[repr(C, align(8))]
@@ -57,8 +55,6 @@ pub enum CodeDependencyKind {
     Protector = 1,
     /// Builtin identity epoch.
     BuiltinIdentity = 2,
-    /// Shape/prototype epoch.
-    ShapeEpoch = 3,
 }
 
 /// Explicit validity dependency owned by a code object.

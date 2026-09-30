@@ -720,7 +720,7 @@ pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 /// Longest prototype chain a method-call site's inline identity guard walks
 /// from the receiver to the object holding the method slot. Deeper
 /// resolutions stay uninlined (a chain this long is already rare; each hop
-/// costs one flat-prototype chase plus shape compare per call).
+/// costs one shape-prototype chase plus shape compare per call).
 pub(crate) const MAX_METHOD_PROTO_CHAIN: usize = 4;
 
 /// Stable shape identities for each prototype hopped from the receiver to the method holder,
@@ -804,7 +804,7 @@ pub(crate) enum MethodCallFeedback {
     /// object holding the method slot, and `method_value_byte` is that slot's
     /// byte offset within the holder's value slab — both captured at record
     /// time from the live receiver so the baseline can bake a fully-inline
-    /// identity guard (chase the flat prototype per hop, guard each shape,
+    /// identity guard (chase the shape's prototype per hop, guard each shape,
     /// load the slot, compare the closure's `function_id`) with no per-call
     /// runtime resolution.
     Mono {
@@ -1001,9 +1001,6 @@ pub struct Interpreter {
     /// Runtime object storage uses the root, interned shape keys, and
     /// transition/cache tables here.
     shape_runtime: object::ShapeRuntime,
-    /// Monotonic epoch for successful ordinary-object prototype changes made
-    /// through the proxy-aware `[[SetPrototypeOf]]` funnel.
-    shape_epoch: u64,
     /// Per-function cache for conservative base-class constructor initializers
     /// recognized by `constructor_fast_path`. Entries hold owned strings and
     /// source descriptors only; GC shape handles stay in `shape_runtime`.
@@ -1012,7 +1009,8 @@ pub struct Interpreter {
     /// Final hidden class reached by a cached simple constructor initializer.
     /// These handles are traced explicitly because a moving GC must rewrite the
     /// cache slot, not only the owning `shape_runtime` transition table.
-    simple_constructor_shape_cache: rustc_hash::FxHashMap<u32, object::ShapeHandle>,
+    simple_constructor_shape_cache:
+        rustc_hash::FxHashMap<(u32, object::ShapeId), object::ShapeHandle>,
     /// Final hidden class of each `Op::NewObjectLiteral` site, keyed by the
     /// owning function id and the site's first key constant.
     object_literal_layouts: rustc_hash::FxHashMap<(u32, u32), handles::ObjectLayout>,
@@ -1037,9 +1035,10 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<(u32, u32), constructor_profile::ConstructorInstanceProfile>,
     pending_constructor_samples:
         std::cell::RefCell<Vec<constructor_profile::PendingConstructorSample>>,
-    /// Final hidden class of an arguments object, keyed by argument count and
-    /// mapped-ness. Same tracing contract as the constructor cache above.
-    arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool), object::ShapeHandle>,
+    /// Final hidden class of an arguments object, keyed by argument count,
+    /// mapped-ness and the id of the `%Object.prototype%` root it grows from.
+    /// Same tracing contract as the constructor cache above.
+    arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool, object::ShapeId), object::ShapeHandle>,
     max_stack_depth: u32,
     /// Active synchronous host/interpreter JavaScript re-entry depth. Generated
     /// calls use the immutable effective activation limit computed when their

@@ -65,17 +65,6 @@ impl Interpreter {
         self.array_index_accessor_protector_epoch
     }
 
-    /// Current ordinary-object prototype shape epoch.
-    ///
-    /// Slice 11.8 advances this only for an actual prototype change in the
-    /// ordinary-`JsObject` branch of the proxy-aware `[[SetPrototypeOf]]`
-    /// funnel. Other exotic or low-level shape/prototype mutations are not
-    /// covered by this epoch yet.
-    #[must_use]
-    pub fn shape_epoch(&self) -> u64 {
-        self.shape_epoch
-    }
-
     /// Construct an interpreter with a string heap cap (`0` =
     /// unlimited). The same cap is honoured by the interpreter's
     /// GC heap.
@@ -94,6 +83,12 @@ impl Interpreter {
         gc_heap.set_tenure_all(true);
         object::register_gc_traceables(&mut gc_heap);
         startup_timer.mark("vm_gc_heap");
+        // First: every allocation after this creates objects on the heap's
+        // `null`-prototype root, which the shape runtime installs.
+        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
+        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))
+            .expect("shape root fits within any positive cap");
+        startup_timer.mark("vm_shape_runtime");
         let mut well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
             .expect("well-known symbol descriptions + bodies fit within any positive cap");
         let mut well_known_scope = otter_gc::RootScope::new(&mut gc_heap);
@@ -175,10 +170,6 @@ impl Interpreter {
                 global_this,
             );
         }
-        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
-        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap, std::sync::Arc::clone(&names))
-            .expect("shape root fits within any positive cap");
-        startup_timer.mark("vm_shape_runtime");
         // No GC allocation occurs between these drops and the struct move.
         // Dropping in reverse registration order keeps the frame-root stack
         // strictly LIFO and prevents providers from pointing at moved-from
@@ -216,7 +207,6 @@ impl Interpreter {
             store_transition_cache: crate::property_cache::StoreTransitionCache::default(),
             realm_context: None,
             shape_runtime,
-            shape_epoch: 0,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             object_literal_layouts: rustc_hash::FxHashMap::default(),
@@ -379,11 +369,9 @@ impl Interpreter {
         if let Ok(iter_proto_value) = interp.constructor_prototype_value("Iterator")
             && let Some(iter_proto) = iter_proto_value.as_object()
         {
-            let shape_root = interp.shape_runtime.root();
             let protos =
                 crate::intrinsics::iterator::build_builtin_iterator_prototypes_post_bootstrap(
                     &mut interp.gc_heap,
-                    shape_root,
                     iter_proto,
                     &interp.well_known_symbols,
                 )
@@ -658,11 +646,9 @@ impl Interpreter {
             })
             .and_then(|value| value.as_object())
         {
-            let shape_root = self.shape_runtime.root();
             let protos =
                 crate::intrinsics::iterator::build_builtin_iterator_prototypes_post_bootstrap(
                     &mut self.gc_heap,
-                    shape_root,
                     iter_proto,
                     &self.well_known_symbols,
                 )

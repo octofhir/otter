@@ -12,12 +12,6 @@
 use crate::*;
 
 impl Interpreter {
-    /// Empty GC-managed hidden-class root.
-    #[must_use]
-    pub(crate) fn shape_root(&self) -> object::ShapeHandle {
-        self.shape_runtime.root()
-    }
-
     /// Return the GC-managed child shape for appending `key` to `parent`.
     #[cfg(test)]
     pub(crate) fn shape_child(
@@ -114,7 +108,7 @@ impl Interpreter {
 
     pub(crate) fn should_add_property(&mut self, obj: object::JsObject, key: &str) -> bool {
         let shape = object::shape(obj, &self.gc_heap);
-        !shape.is_null()
+        !object::shape_body::is_dictionary_of(shape)
             && object::is_extensible(obj, &self.gc_heap)
             && matches!(
                 object::lookup_own(obj, &self.gc_heap, key),
@@ -260,7 +254,7 @@ impl Interpreter {
         // Redefine an existing slot on a shaped object: rebuild the hidden
         // class with the merged attributes so the shape keeps recording them
         // instead of flagging a per-object override.
-        if !shape.is_null()
+        if !object::shape_body::is_dictionary_of(shape)
             && let Some((flags, is_accessor, offset)) =
                 object::redefine_merged_attrs(*obj_ref, &self.gc_heap, key, &descriptor)
         {
@@ -337,11 +331,11 @@ impl Interpreter {
         }
     }
 
-    /// Replay `ordered` `(key, flags, is_accessor)` slots from the empty root,
-    /// returning the attribute-encoding hidden class they describe. The replay
-    /// reuses shared transitions, so objects modified the same way (frozen,
-    /// sealed, redefined) converge on one class and keep ICs monomorphic.
-    /// `obj` is rooted across every transition allocation.
+    /// Replay `ordered` `(key, flags, is_accessor)` slots from the root of
+    /// `obj`'s lineage, returning the attribute-encoding hidden class they
+    /// describe. The replay reuses shared transitions, so objects modified the
+    /// same way (frozen, sealed, redefined) converge on one class and keep ICs
+    /// monomorphic. `obj` is rooted across every transition allocation.
     pub(crate) fn rebuild_shape_from_slots(
         &mut self,
         obj: &mut object::JsObject,
@@ -350,7 +344,20 @@ impl Interpreter {
     ) -> Result<object::ShapeHandle, VmError> {
         // See `shape_child_rooting_object_value`.
         let _no_collection = self.gc_heap.always_allocate_scope();
-        let mut shape = self.shape_runtime.root();
+        let current = object::shape(*obj, &self.gc_heap);
+        let root = object::shape_body::lineage_root_of(&self.gc_heap, current);
+        self.replay_slots_from(root, obj, ordered, extra_visit)
+    }
+
+    /// Replay `ordered` slots onto `shape` (a lineage root), rooting `obj`.
+    pub(crate) fn replay_slots_from(
+        &mut self,
+        mut shape: object::ShapeHandle,
+        obj: &mut object::JsObject,
+        ordered: &[(String, object::PropertyFlags, bool)],
+        extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<object::ShapeHandle, VmError> {
+        let _no_collection = self.gc_heap.always_allocate_scope();
         for (key, flags, is_accessor) in ordered {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 let p = obj as *mut object::JsObject as *mut RawGc;
@@ -378,7 +385,7 @@ impl Interpreter {
     /// dictionary-mode objects fall back to the in-place path.
     pub(crate) fn freeze_object(&mut self, mut obj: object::JsObject) -> Result<(), VmError> {
         let shape = object::shape(obj, &self.gc_heap);
-        if shape.is_null() {
+        if object::shape_body::is_dictionary_of(shape) {
             object::freeze(obj, &mut self.gc_heap);
             return Ok(());
         }
@@ -400,7 +407,7 @@ impl Interpreter {
     /// dictionary-mode objects fall back to the in-place path.
     pub(crate) fn seal_object(&mut self, mut obj: object::JsObject) -> Result<(), VmError> {
         let shape = object::shape(obj, &self.gc_heap);
-        if shape.is_null() {
+        if object::shape_body::is_dictionary_of(shape) {
             object::seal(obj, &mut self.gc_heap);
             return Ok(());
         }

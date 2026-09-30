@@ -1276,9 +1276,9 @@ fn emit_method_guard(
         ; jne =>miss
     );
     for &shape in &guard.proto_chain {
+        super::emit_x64_load_prototype(ops, view, 10, 11, 12);
         dynasm!(ops
             ; .arch x64
-            ; mov r10d, [r11 + view.jit_proto_byte as i32]
             ; test r10d, r10d
             ; jz =>miss
             ; add r10, r12

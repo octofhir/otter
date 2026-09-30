@@ -1680,7 +1680,9 @@ fn select_base_construct_result(
     );
 }
 
-fn emit_construct_object_branch(
+/// Branch on whether the tagged value in `value` is an ECMAScript Object
+/// (a non-primitive cell or a bare function value). Clobbers r10/r11.
+pub(super) fn emit_construct_object_branch(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     value: u8,

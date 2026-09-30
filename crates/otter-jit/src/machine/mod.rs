@@ -497,6 +497,17 @@ pub enum MachineCallGuard {
         /// Already-profiled ordinary `this` policy to prove before entry.
         this_mode: otter_vm::JitDirectCallThisMode,
     },
+    /// Exact ordinary closure identity whose output is the `this` it binds
+    /// for an explicit receiver: a bound-`this` closure's own, the receiver of
+    /// a strict callee, and for a sloppy callee the receiver when it is an
+    /// object or the global object when it is nullish. A primitive receiver
+    /// of a sloppy callee needs `ToObject` and exits.
+    Explicit {
+        /// Canonical bytecode function identity.
+        function_id: u32,
+        /// Already-profiled ordinary `this` policy.
+        this_mode: otter_vm::JitDirectCallThisMode,
+    },
     /// Class-wrapper unwrapping followed by exact constructor identity.
     Construct {
         /// Canonical bytecode constructor identity.
@@ -3163,9 +3174,20 @@ impl InstructionSequence {
                             return Err(VerificationError::OpcodeSignatureMismatch(id));
                         }
                     }
-                    MachineOpcode::GuardCallTarget { .. } => {
-                        let [input, output, late @ ..] = instruction.operands.as_slice() else {
-                            return Err(VerificationError::OpcodeSignatureMismatch(id));
+                    MachineOpcode::GuardCallTarget { guard } => {
+                        // An explicit-receiver guard also reads the receiver
+                        // and defines the `this` it binds.
+                        let (inputs, output, late) = match (guard, instruction.operands.as_slice())
+                        {
+                            (
+                                MachineCallGuard::Explicit { .. },
+                                [callable, receiver, output, late @ ..],
+                            ) => (vec![callable, receiver], output, late),
+                            (MachineCallGuard::Explicit { .. }, _) => {
+                                return Err(VerificationError::OpcodeSignatureMismatch(id));
+                            }
+                            (_, [input, output, late @ ..]) => (vec![input], output, late),
+                            _ => return Err(VerificationError::OpcodeSignatureMismatch(id)),
                         };
                         let clobbers = if matches!(
                             instruction.opcode,
@@ -3180,9 +3202,11 @@ impl InstructionSequence {
                         if late
                             .iter()
                             .any(|operand| *operand != MachineOperand::frame_value(operand.value))
-                            || *input != MachineOperand::register_input(input.value)
+                            || inputs
+                                .iter()
+                                .any(|input| **input != MachineOperand::register_input(input.value))
                             || *output != MachineOperand::register_output(output.value)
-                            || [input, output].iter().any(|operand| {
+                            || inputs.iter().chain([&output]).any(|operand| {
                                 self.representations[operand.value.0 as usize]
                                     != MachineRepresentation::Tagged
                             })

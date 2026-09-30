@@ -2355,7 +2355,10 @@ impl Interpreter {
                 {
                     continue;
                 }
-                if inline_ineligible || target_count != 1 || function_prototype_call {
+                // Only the optimizing tier splices a reduced `f.call` target.
+                let tier_splices = !function_prototype_call
+                    || tier == jit_debug::JitDebugTier::Optimizing;
+                if inline_ineligible || target_count != 1 || !tier_splices {
                     continue;
                 }
                 let Some(body) = self.bake_inline_body(&callee_context, callee_fid, tier, budget)

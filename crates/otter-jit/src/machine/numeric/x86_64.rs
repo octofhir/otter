@@ -489,6 +489,26 @@ pub(super) fn emit(
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
             MachineOpcode::GuardCallTarget {
+                guard:
+                    MachineCallGuard::Explicit {
+                        function_id,
+                        this_mode,
+                    },
+            } => {
+                let start = ops.offset().0;
+                let miss = deopt(instruction.deopt_id(), &deopts)?;
+                // Either input may live in r9 or the identity proof's r8, so
+                // both are read before the proof; rax is not one of its
+                // scratch registers.
+                load_integer(&mut ops, frame, loc[1], 11)?;
+                load_integer(&mut ops, frame, loc[0], 9)?;
+                dynasm!(ops ; .arch x64 ; mov rax, r11);
+                emit_inline_identity(&mut ops, view, function_id, miss);
+                emit_inline_explicit_this(&mut ops, &mut relocations, view, this_mode, miss)?;
+                store_integer(&mut ops, frame, loc[2], 0)?;
+                structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
+            }
+            MachineOpcode::GuardCallTarget {
                 guard: MachineCallGuard::Construct { function_id },
             } => {
                 let start = ops.offset().0;
@@ -4835,6 +4855,71 @@ fn emit_inline_this(
             dynasm!(ops ; .arch x64 ; add rax, r10);
         }
         _ => unreachable!(),
+    }
+    dynasm!(ops ; .arch x64 ; =>done);
+    Ok(())
+}
+
+/// `this` of a spliced reduced `f.call(receiver, ...)` (§10.2.1.2
+/// OrdinaryCallBindThis): r9 holds the proven callable and rax the receiver,
+/// which receives the binding. A bound-`this` closure keeps its own; a sloppy
+/// callee binds an Object receiver, the global object for a nullish one, and
+/// misses on a primitive or a bound sloppy closure.
+fn emit_inline_explicit_this(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    this_mode: otter_vm::JitDirectCallThisMode,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let unbound = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    load64(ops, 10, NOT_CELL_MASK);
+    dynasm!(ops
+        ; .arch x64
+        ; mov r11, r9
+        ; and r11, r10
+        ; test r11, r11
+        ; jnz =>unbound
+        ; mov r11d, [r9 + view.closure_call_layout.flags_byte as i32]
+    );
+    load64(ops, 10, u64::from(view.closure_call_layout.bound_this_flag));
+    dynasm!(ops ; .arch x64 ; test r11d, r10d ; jz =>unbound);
+    match this_mode {
+        otter_vm::JitDirectCallThisMode::StrictOrLexical => {
+            dynasm!(ops
+                ; .arch x64
+                ; mov rax, [r9 + view.closure_call_layout.bound_this_byte as i32]
+                ; jmp =>done
+            );
+        }
+        otter_vm::JitDirectCallThisMode::SloppyGlobal => {
+            dynasm!(ops ; .arch x64 ; jmp =>miss);
+        }
+        _ => return Err(Unsupported::OperandShape("x86-64 inline this mode")),
+    }
+    dynasm!(ops ; .arch x64 ; =>unbound);
+    if this_mode == otter_vm::JitDirectCallThisMode::SloppyGlobal {
+        let global_this = ops.new_dynamic_label();
+        load64(ops, 10, VALUE_UNDEFINED);
+        dynasm!(ops ; .arch x64 ; cmp rax, r10 ; je =>global_this);
+        load64(ops, 10, Value::null().to_bits());
+        dynasm!(ops ; .arch x64 ; cmp rax, r10 ; je =>global_this);
+        direct_call::emit_construct_object_branch(ops, view, 0, done, miss);
+        dynasm!(ops
+            ; .arch x64
+            ; =>global_this
+            ; mov r10, [r15 + GLOBAL_THIS_OFFSET_PTR_OFFSET as i32]
+            ; mov eax, [r10]
+        );
+        symbolic(
+            ops,
+            relocations,
+            10,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
+        dynasm!(ops ; .arch x64 ; add rax, r10);
     }
     dynasm!(ops ; .arch x64 ; =>done);
     Ok(())

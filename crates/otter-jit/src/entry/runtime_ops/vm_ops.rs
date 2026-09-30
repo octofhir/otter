@@ -64,16 +64,13 @@ pub(crate) extern "C" fn jit_load_property_stub(
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
         let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
-        // Decode immutable recipes before reentry. No cell reference survives
-        // the semantic call.
-        let mut frames = super::inline_frames::decode(ctx)?;
+        // The site's own function and PC name the operation; inline parents
+        // stay in the call site's recipe, which stack walks read.
         let mut call = ctx.runtime_call()?;
-        call.with_inline_activations(&mut frames, |call| {
-            match call.load_property_value(function_id, pc, Value::from_bits(receiver_bits)) {
-                Ok(value) => Ok(NativeResultPair::success(value)),
-                Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
-            }
-        })?
+        match call.load_property_value(function_id, pc, Value::from_bits(receiver_bits)) {
+            Ok(value) => Ok(NativeResultPair::success(value)),
+            Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
+        }
     })();
     match result {
         Ok(pair) => pair,
@@ -98,19 +95,16 @@ pub(crate) extern "C" fn jit_store_property_stub(
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
         let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
-        let mut frames = super::inline_frames::decode(ctx)?;
         let mut call = ctx.runtime_call()?;
-        call.with_inline_activations(&mut frames, |call| {
-            match call.store_property_value(
-                function_id,
-                pc,
-                Value::from_bits(receiver_bits),
-                Value::from_bits(value_bits),
-            ) {
-                Ok(()) => Ok(NativeResultPair::success(Value::undefined())),
-                Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
-            }
-        })?
+        match call.store_property_value(
+            function_id,
+            pc,
+            Value::from_bits(receiver_bits),
+            Value::from_bits(value_bits),
+        ) {
+            Ok(()) => Ok(NativeResultPair::success(Value::undefined())),
+            Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
+        }
     })();
     match result {
         Ok(pair) => pair,

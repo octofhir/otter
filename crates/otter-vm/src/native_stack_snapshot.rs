@@ -9,9 +9,10 @@
 //!   interpreter PCs need the usual one-instruction adjustment.
 //! - Cold materialization supplies exact identity, never a function-name guess.
 //! - An OSR frame updates its materialized owner instead of duplicating it.
-//! - A frame making a generated call reports its call site's recorded PC,
-//!   followed by the inline parents that call site's recipe describes; the
-//!   parents have no frames.
+//! - A frame making a generated call, or a committed runtime call with a
+//!   virtual recipe, reports its call site's recorded PC, followed by the
+//!   inline parents that call site's recipe describes; the parents have no
+//!   frames.
 //! - The walk reads scalar metadata only, neither collecting nor invoking JS.
 //!
 //! # See also
@@ -38,11 +39,13 @@ impl Interpreter {
             // SAFETY: publication keeps this header live through the complete
             // metadata-only walk. No managed window is borrowed or dereferenced.
             let native = unsafe { &*address };
-            // A frame with an inner native frame is making a generated call:
-            // its call site names the call's PC and any inline parents.
-            let call = (position + 1 < native_count)
-                .then(|| self.generated_call_record(native))
-                .flatten();
+            // A frame with an inner native frame is making a generated call,
+            // and the innermost frame may be making a runtime call whose
+            // recipe is virtual: either call site names the call's PC and any
+            // inline parents.
+            let call = self
+                .generated_call_record(native)
+                .filter(|record| position + 1 < native_count || record.inline_frames_virtual);
             let native_pc = call
                 .map(|record| record.call_pc)
                 .filter(|&pc| pc != crate::native_abi::NO_CALL_PC)

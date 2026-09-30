@@ -1,7 +1,8 @@
 //! Bounded callee CFG splicing into the single numeric HIR.
 //!
 //! # Contents
-//! - Plain/method and base-constructor admission from each candidate's own snapshot.
+//! - Plain, method, reduced `f.call` and base-constructor admission from each
+//!   candidate's own snapshot; a reduced call binds its explicit receiver.
 //! - Argument substitution, return joins and complete deopt activation chains.
 //!
 //! # Invariants
@@ -91,7 +92,9 @@ fn splice_tree(
             continue;
         };
         let candidate = match call_target.kind {
-            NumericDirectCallKind::Plain | NumericDirectCallKind::Construct => {
+            NumericDirectCallKind::Plain
+            | NumericDirectCallKind::Construct
+            | NumericDirectCallKind::FunctionCall => {
                 view.inline_callees.get(&byte_pc).map(|c| &*c.body)
             }
             NumericDirectCallKind::Method => view.inline_methods.get(&byte_pc).map(|c| &*c.body),
@@ -290,13 +293,23 @@ fn splice_one(
     else {
         return None;
     };
-    if count != u32::from(body.parameter_count) {
-        return None;
-    }
-    let arguments = hir
+    // A reduced `f.call(this, ...)` carries its receiver as word zero; the
+    // callee's arguments follow it.
+    let explicit =
+        hir.direct_call_targets.get(target as usize)?.kind == NumericDirectCallKind::FunctionCall;
+    let words = hir
         .operand_values
         .get(start as usize..(start as usize).checked_add(count as usize)?)?
         .to_vec();
+    let (receiver, arguments) = if explicit {
+        let (&receiver, arguments) = words.split_first()?;
+        (Some(receiver), arguments.to_vec())
+    } else {
+        (None, words)
+    };
+    if arguments.len() != usize::from(body.parameter_count) {
+        return None;
+    }
     let instruction = view.instructions.get(logical_pc as usize)?;
     if instruction.byte_pc != byte_pc {
         return None;
@@ -321,6 +334,7 @@ fn splice_one(
     let old_block = hir.blocks[block_index].clone();
     let mut prefix = old_block.nodes[..position].to_vec();
     let source = boxed(hir, source, &mut prefix);
+    let receiver = receiver.map(|receiver| boxed(hir, receiver, &mut prefix));
     let call_target = hir.direct_call_targets.get(target as usize)?;
     let method = call_target.kind == NumericDirectCallKind::Method;
     let construct = call_target.kind == NumericDirectCallKind::Construct;
@@ -343,6 +357,7 @@ fn splice_one(
                 source,
                 function_id: body.function_id,
                 this_mode,
+                receiver,
             }
         },
     );
@@ -825,10 +840,12 @@ fn map_body_node(
             source,
             function_id,
             this_mode,
+            receiver,
         } => InlineCallGuard {
             source: map(source),
             function_id,
             this_mode,
+            receiver: receiver.map(map),
         },
         InlineMethodGuard { source, target } => InlineMethodGuard {
             source: map(source),

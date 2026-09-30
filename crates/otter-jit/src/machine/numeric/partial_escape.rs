@@ -490,8 +490,10 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
         | N::TaggedNullishEqual { value, .. }
         | N::InlineMethodGuard { source: value, .. }
         | N::InlineConstructGuard { source: value, .. }
-        | N::InlineCallGuard { source: value, .. }
         | N::ConstructReceiver { source: value, .. } => inputs.push(value),
+        N::InlineCallGuard {
+            source, receiver, ..
+        } => inputs.extend(std::iter::once(source).chain(receiver)),
         N::IntegerAddImmediate(value, _)
         | N::IntegerSubImmediate(value, _)
         | N::IntegerAndImmediate(value, _)
@@ -701,9 +703,16 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         N::TaggedNullishEqual { value, .. } => replacement(value),
         N::InlineMethodGuard { source, .. }
         | N::InlineConstructGuard { source, .. }
-        | N::InlineCallGuard { source, .. }
         | N::ConstructReceiver { source, .. }
         | N::NativeLeaf { source, .. } => replacement(source),
+        N::InlineCallGuard {
+            source, receiver, ..
+        } => {
+            replacement(source);
+            if let Some(receiver) = receiver {
+                replacement(receiver);
+            }
+        }
         N::IntegerAddImmediate(value, _)
         | N::IntegerSubImmediate(value, _)
         | N::IntegerAndImmediate(value, _)

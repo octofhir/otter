@@ -1311,6 +1311,44 @@ Node in every tier.
 ast_ctor −4% instructions (6.39G → 6.13G, 0.33 s), ts −0.5%, others
 unchanged.
 
+
+### Spliced reduced calls and virtual recipes for property calls
+Reduced `f.call` targets now splice like plain callees. The inline guard
+has an explicit-receiver form (`MachineCallGuard::Explicit`) that proves the
+callable and binds `this` per §10.2.1.2:
+- A bound-`this` closure keeps its own `this`.
+- A strict callee takes the receiver as is.
+- A sloppy callee binds an Object receiver, and the global object for a
+  nullish one.
+- A primitive receiver of a sloppy callee exits.
+
+x86-64 gained the same Object test. The first build read the receiver after
+the identity proof, whose scratch registers can hold it; ts caught the
+resulting garbage `this`, and both targets now park the receiver first.
+
+Splicing then cost ts +10% instructions. Every committed property load or
+store inside a spliced body decoded its recipe and materialized the
+parents as interpreter activations for the duration of the call, on every
+execution. Those operations name their own function and PC and never read
+the innermost activation. Their records are now virtual like generated
+calls (with the outermost frame's suspended call PC), the stubs call the
+runtime directly, and a stack walk expands a virtual recipe on the
+innermost frame as well. Binding accesses, which do read the callee's
+activation, still materialize it.
+
+Found on the way (not fixed here):
+- ts: 45k `runtimeTransition` exits from Template callees containing
+  `for-in`, which the optimizing tier declines.
+- Stack traces name accessor frames by path, and attribute a getter call to
+  the member expression rather than the property name.
+
+| Workload | instr before | after | wall |
+|---|---:|---:|---:|
+| ast_ctor | 6.13G | 5.71G (−7%) | 0.31s |
+| ts-fixed | 157.3G | 156.5G (−0.5%) | |
+| crypto | 13.46G | 13.24G (−1.7%) | |
+| earley / zlib / fib / mega_method | unchanged | | |
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

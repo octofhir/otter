@@ -5,6 +5,7 @@
 //!   symbolic-address capture.
 //! - Number guards, int32/double boxing, and NaN-purifying double encode.
 //! - Full-semantics `ToInt32`/`ToUint32` fast paths for bitwise operators.
+//! - Object shape reads: the prototype a shape fixes and its dictionary kind.
 //!
 //! # Invariants
 //! - Every helper documents its scratch registers; nothing survives a call.
@@ -327,6 +328,30 @@ fn emit_to_int32_common(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: Dynamic
         ; =>done
     );
 }
+
+/// Load into `W(dst)` the compressed `[[Prototype]]` of the object whose
+/// decompressed `GcHeader` pointer is in `X(object)`: the prototype word of
+/// its shape, an ordinary object or null. `X(cage)` holds the cage base;
+/// `dst` may be `object`.
+pub(crate) fn emit_load_prototype(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    dst: u8,
+    object: u8,
+    cage: u8,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr W(dst), [X(object), view.object_shape_byte]
+        ; add X(dst), X(cage), X(dst)
+        ; ldr W(dst), [X(dst), view.shape_prototype_byte]
+    );
+}
+
+/// Bit index of [`otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY`] in a shape's kind
+/// byte.
+pub(crate) const SHAPE_KIND_DICTIONARY_BIT: u32 =
+    otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY.trailing_zeros();
 
 /// Compute the slot base for a shape-matched object into `X(reg)`, which holds
 /// the decompressed `GcHeader` pointer on entry (`X(scratch)` is clobbered).

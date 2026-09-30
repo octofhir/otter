@@ -240,7 +240,7 @@ fn alloc_object_with_roots(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         visit_value_roots(visitor, value_roots, slice_roots);
     };
-    object::alloc_object_with_roots(heap, &mut external_visit)
+    object::alloc_dictionary_object_with_roots(heap, &mut external_visit)
 }
 
 fn alloc_object_with_raw_roots(
@@ -252,7 +252,7 @@ fn alloc_object_with_raw_roots(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         visit_raw_and_value_roots(visitor, raw_roots, value_roots, slice_roots);
     };
-    object::alloc_object_with_roots(heap, &mut external_visit)
+    object::alloc_dictionary_object_with_roots(heap, &mut external_visit)
 }
 
 fn native_from_call_with_raw_roots(
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn installs_static_attrs_and_static_native_call() {
-        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut heap = crate::object::fixture_heap();
         let ns = NamespaceBuilder::from_spec(&mut heap, &SPEC)
             .expect("builder")
             .build()
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn class_builder_installs_spec_shaped_constructor_value() {
-        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut heap = crate::object::fixture_heap();
         let class = ClassBuilder::from_spec(&mut heap, &CLASS_SPEC)
             .build()
             .expect("build");

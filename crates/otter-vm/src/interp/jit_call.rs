@@ -2277,7 +2277,7 @@ mod tests {
 
     fn assert_moving_payload_is_rewritten(status: NativeResultStatus) {
         let mut vm = Interpreter::new();
-        let object = crate::object::alloc_object_with_roots(&mut vm.gc_heap, &mut |_| {})
+        let object = crate::object::alloc_fixture_object_with_roots(&mut vm.gc_heap, &mut |_| {})
             .expect("young result object");
         let value = Value::object(object);
         let original_bits = value.to_abi_bits();

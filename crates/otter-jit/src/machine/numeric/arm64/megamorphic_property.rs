@@ -58,8 +58,11 @@ pub(super) fn emit(
     dynasm!(ops
         ; .arch aarch64
         ; ldr w14, [x13, view.object_shape_byte]
-        ; cbz w14, =>miss
         ; add x15, x16, x14
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; ldrb w12, [x15, view.shape_kind_byte]
+        ; tbnz w12, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
         ; ldr x11, [x15, cache.shape_id_byte]
     );
     emit_load_u64(ops, 15, cache.hash_shape_multiplier);
@@ -101,7 +104,10 @@ pub(super) fn emit(
         ; cmp w15, #1
         ; b.ne =>miss
         ; cbz w12, =>holder
-        ; ldr w12, [x13, view.jit_proto_byte]
+    );
+    crate::template::arm64::values::emit_load_prototype(ops, view, 12, 13, 16);
+    dynasm!(ops
+        ; .arch aarch64
         ; cbz w12, =>miss
         ; add x13, x16, x12
         ; ldrb w14, [x13]
@@ -192,8 +198,11 @@ pub(super) fn emit_store(
     dynasm!(ops
         ; .arch aarch64
         ; ldr w14, [x13, view.object_shape_byte]
-        ; cbz w14, =>miss
         ; add x15, x16, x14
+        // A dictionary shape is shared by its lineage's dictionary objects
+        // whatever their keys; no cache entry names one.
+        ; ldrb w12, [x15, view.shape_kind_byte]
+        ; tbnz w12, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
         ; ldr x11, [x15, cache.shape_id_byte]
     );
     emit_load_u64(ops, 15, cache.hash_shape_multiplier);
@@ -303,7 +312,13 @@ fn emit_transition_store(
     miss: dynasmrt::DynamicLabel,
     done: dynasmrt::DynamicLabel,
 ) -> Result<(), Unsupported> {
-    if cache.table_addr == 0 || cache.entry_bytes == 0 || cache.hash_shift >= 64 {
+    if cache.table_addr == 0
+        || cache.entry_bytes == 0
+        || cache.entry_bytes >= 4096
+        || cache.ways == 0
+        || cache.ways > u32::from(u16::MAX)
+        || cache.hash_shift >= 64
+    {
         return Err(Unsupported::OperandShape("shared store transition table"));
     }
     let proto_ready = ops.new_dynamic_label();
@@ -331,11 +346,15 @@ fn emit_transition_store(
         ; .arch aarch64
         ; mov x12, x13
         ; ldr w14, [x13, view.object_shape_byte]
-        ; cbz w14, =>miss
         ; add x14, x16, x14
+        ; ldrb w15, [x14, view.shape_kind_byte]
+        ; tbnz w15, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
         ; ldr x11, [x14, cache.shape_id_byte]
         ; mov x15, xzr
-        ; ldr w14, [x13, view.jit_proto_byte]
+    );
+    crate::template::arm64::values::emit_load_prototype(ops, view, 14, 13, 16);
+    dynasm!(ops
+        ; .arch aarch64
         ; cbz w14, =>proto_ready
         ; add x13, x16, x14
         ; ldrb w14, [x13]
@@ -346,8 +365,9 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch aarch64
         ; ldr w14, [x13, view.object_shape_byte]
-        ; cbz w14, =>miss
         ; add x14, x16, x14
+        ; ldrb w15, [x14, view.shape_kind_byte]
+        ; tbnz w15, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
         ; ldr x15, [x14, cache.shape_id_byte]
         ; =>proto_ready
     );
@@ -363,7 +383,7 @@ fn emit_transition_store(
     dynasm!(ops ; .arch aarch64 ; eor x9, x9, x10 ; lsr x9, x9, u32::from(cache.hash_shift));
     emit_load_u64(ops, 10, u64::from(cache.index_mask));
     dynasm!(ops ; .arch aarch64 ; and x9, x9, x10);
-    emit_load_u64(ops, 10, u64::from(cache.entry_bytes));
+    emit_load_u64(ops, 10, u64::from(cache.entry_bytes * cache.ways));
     dynasm!(ops ; .arch aarch64 ; mul x9, x9, x10);
     emit_load_symbolic_u64(
         ops,
@@ -372,22 +392,31 @@ fn emit_transition_store(
         cache.table_addr as u64,
         RelocationTarget::StoreTransitionCacheTable,
     );
+    emit_load_u64(ops, 14, u64::from(atom));
+    // Probe the set's ways in recording order; `x17` ends on the match.
+    let way = ops.new_dynamic_label();
+    let next_way = ops.new_dynamic_label();
+    let found = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; add x17, x17, x9
+        ; movz w9, cache.ways
+        ; =>way
         ; ldr x10, [x17, cache.receiver_shape_byte]
         ; cmp x10, x11
-        ; b.ne =>miss
+        ; b.ne =>next_way
         ; ldr x10, [x17, cache.prototype_shape_byte]
         ; cmp x10, x15
-        ; b.ne =>miss
+        ; b.ne =>next_way
         ; ldr w10, [x17, cache.atom_byte]
-    );
-    emit_load_u64(ops, 14, u64::from(atom));
-    dynasm!(ops
-        ; .arch aarch64
         ; cmp w10, w14
-        ; b.ne =>miss
+        ; b.eq =>found
+        ; =>next_way
+        ; add x17, x17, cache.entry_bytes
+        ; subs w9, w9, #1
+        ; b.ne =>way
+        ; b =>miss
+        ; =>found
         ; ldr w10, [x17, cache.target_shape_byte]
         ; cbz w10, =>miss
         ; ldrb w9, [x17, cache.chain_len_byte]
@@ -397,7 +426,10 @@ fn emit_transition_store(
         ; mov x11, xzr
         ; cbz w9, =>chain_done
         ; =>chain_loop
-        ; ldr w10, [x13, view.jit_proto_byte]
+    );
+    crate::template::arm64::values::emit_load_prototype(ops, view, 10, 13, 16);
+    dynasm!(ops
+        ; .arch aarch64
         ; cbz w10, =>miss
         ; add x13, x16, x10
         ; ldrb w10, [x13]
@@ -408,8 +440,9 @@ fn emit_transition_store(
     dynasm!(ops
         ; .arch aarch64
         ; ldr w10, [x13, view.object_shape_byte]
-        ; cbz w10, =>miss
         ; add x10, x16, x10
+        ; ldrb w14, [x10, view.shape_kind_byte]
+        ; tbnz w14, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
         ; ldr x10, [x10, cache.shape_id_byte]
         ; add x14, x17, cache.chain_byte
         ; ldr x14, [x14, x11, lsl #3]
@@ -419,7 +452,10 @@ fn emit_transition_store(
         ; cmp x11, x9
         ; b.lo =>chain_loop
         ; =>chain_done
-        ; ldr w10, [x13, view.jit_proto_byte]
+    );
+    crate::template::arm64::values::emit_load_prototype(ops, view, 10, 13, 16);
+    dynasm!(ops
+        ; .arch aarch64
         ; cbnz w10, =>miss
         ; ldrb w10, [x12, view.object_flags_byte]
         ; tbz w10, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss

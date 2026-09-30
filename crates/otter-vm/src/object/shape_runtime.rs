@@ -7,9 +7,11 @@
 //! VM's single-mutator model while preserving a simple traced payload shape.
 //!
 //! # Contents
-//! - [`ShapeRuntime`] — root shape, key interner, transitions, and offset cache.
+//! - [`ShapeRuntime`] — key interner, transitions and offset cache; creating
+//!   it creates the `null`-prototype root.
+//! - [`ShapeRuntime::new_root`] — a prototype's root and dictionary shapes.
 //! - [`ShapeRuntime::trace_roots`] — root walker for the strong handles: the
-//!   root shape and the interned key strings.
+//!   interned key strings and the shapes pinned for the current turn.
 //! - [`ShapeRuntime::sweep_dead`] — the full collection's weak pass over the
 //!   id and transition tables.
 //!
@@ -27,6 +29,14 @@
 //!   unreached before the sweep frees it, so no table ever hands out a dead
 //!   cell; ids are never reused, so an id that outlives its shape only misses.
 //! - Shapes live in non-moving old space: a weak entry never needs rewriting.
+//! - The id table never names a dictionary shape: all dictionary objects of a
+//!   lineage share one whatever their keys, so a guard baked from an id must
+//!   never resolve to it.
+//! - Every lineage starts at a prototype's root (V8's per-prototype initial
+//!   maps): the heap's embedder root slot keeps the `null`-prototype root
+//!   (`super::shape_body::null_root`), an ordinary prototype
+//!   keeps its instances' root on itself, and a non-ordinary prototype's root
+//!   lives as long as the objects built from it.
 //! - No table borrow is held across an allocation — the collection it may
 //!   run prunes the tables through `&self`.
 //! - A shape created during a runtime turn is pinned (strong) until the
@@ -60,6 +70,14 @@ use super::shape_body::{
     ShapeBody, ShapeHandle, alloc_child_shape_body_with_roots, alloc_root_shape_body_with_roots,
     shape_atoms_ordered,
 };
+
+/// Record a root under its id. Its dictionary shape stays unnamed: every
+/// dictionary object of the lineage shares it whatever its keys, so no
+/// id-keyed cache or baked guard may resolve to it.
+fn register_root(heap: &GcHeap, tables: &mut WeakShapeTables, root: ShapeHandle) {
+    let root_id = heap.read_payload(root, ShapeBody::id);
+    tables.handles_by_id.insert(root_id, root);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TransitionKey {
@@ -97,7 +115,6 @@ struct WeakShapeTables {
 
 /// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
-    root: Cell<ShapeHandle>,
     tables: RefCell<WeakShapeTables>,
     next_string_id: u32,
     /// Names this shape layer has already seen, spelling → (string body, atom).
@@ -115,7 +132,6 @@ impl std::fmt::Debug for ShapeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tables = self.tables.borrow();
         f.debug_struct("ShapeRuntime")
-            .field("root", &self.root)
             .field("next_string_id", &self.next_string_id)
             .field("interned_keys", &self.interned_keys.len())
             .field("transitions", &tables.transitions.len())
@@ -126,18 +142,22 @@ impl std::fmt::Debug for ShapeRuntime {
 }
 
 impl ShapeRuntime {
-    /// Allocate a fresh root shape and empty side tables.
+    /// Create the `null`-prototype root in the heap's embedder root slot, with
+    /// empty side tables.
     pub(crate) fn new(
         heap: &mut GcHeap,
         names: Arc<NameInterner>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let root = alloc_root_shape_body_with_roots(heap, &mut roots)?;
-        let root_id = heap.read_payload(root, ShapeBody::id);
+        let root = alloc_root_shape_body_with_roots(
+            heap,
+            super::shape_body::ShapePrototype::Null,
+            &mut roots,
+        )?;
         let mut tables = WeakShapeTables::default();
-        tables.handles_by_id.insert(root_id, root);
+        register_root(heap, &mut tables, root);
+        super::shape_body::set_null_root(heap, root);
         Ok(Self {
-            root: Cell::new(root),
             tables: RefCell::new(tables),
             next_string_id: 1,
             interned_keys: FxHashMap::default(),
@@ -167,28 +187,50 @@ impl ShapeRuntime {
             .collect()
     }
 
-    /// Empty hidden-class root.
-    #[must_use]
-    pub(crate) fn root(&self) -> ShapeHandle {
-        self.root.get()
+    /// Record `root` under its id when a heap-only path created it without
+    /// this runtime.
+    pub(crate) fn register_root(&self, heap: &GcHeap, root: ShapeHandle) {
+        let id = heap.read_payload(root, ShapeBody::id);
+        let mut tables = self.tables.borrow_mut();
+        if !tables.handles_by_id.contains_key(&id) {
+            register_root(heap, &mut tables, root);
+        }
+    }
+
+    /// Allocate and register `prototype`'s root and dictionary shapes, and
+    /// return the root. Both stay pinned for the current turn.
+    pub(crate) fn new_root(
+        &self,
+        heap: &mut GcHeap,
+        prototype: super::shape_body::ShapePrototype,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            self.trace_roots(visitor);
+            external_visit(visitor);
+        };
+        let root = alloc_root_shape_body_with_roots(heap, prototype, &mut visit)?;
+        let mut tables = self.tables.borrow_mut();
+        register_root(heap, &mut tables, root);
+        let dictionary = heap.read_payload(root, |body| body.dictionary(root));
+        tables.pinned.extend([root, dictionary]);
+        Ok(root)
     }
 
     /// Remove every side-table entry before heap teardown.
     pub(crate) fn clear(&mut self) {
         self.interned_keys.clear();
         *self.tables.borrow_mut() = WeakShapeTables::default();
-        self.root.set(ShapeHandle::null());
     }
 
-    /// A shell for the snapshot restore path: null root, empty side
-    /// tables. The snapshot root walk writes the restored root through
-    /// [`Self::visit_root_slot`]; [`Self::register_restored_shape`]
+    /// A shell for the snapshot restore path: empty side tables. The
+    /// snapshot root walk restores the `null`-prototype root into the heap's
+    /// embedder root slot; [`Self::register_restored_shape`]
     /// re-populates `handles_by_id` from the restored heap, and the
     /// remaining tables are lookup caches that refill on use.
     #[must_use]
     pub(crate) fn restored_shell(names: Arc<NameInterner>) -> Self {
         Self {
-            root: Cell::new(ShapeHandle::null()),
             tables: RefCell::new(WeakShapeTables::default()),
             next_string_id: 0,
             interned_keys: FxHashMap::default(),
@@ -202,19 +244,9 @@ impl ShapeRuntime {
         self.tables.borrow_mut().handles_by_id.insert(id, handle);
     }
 
-    /// Yield the root shape's cell slot for the snapshot root walk. The
-    /// other side tables are caches a restore rebuilds from the heap.
-    pub(crate) fn visit_root_slot(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        visitor(self.root.as_ptr() as *mut RawGc);
-    }
-
-    /// Yield the strong handles: the root shape and the interned key
-    /// strings. The id and transition tables are weak ([`Self::sweep_dead`]).
+    /// Yield the strong handles: the interned key strings and the pinned
+    /// shapes. The id and transition tables are weak ([`Self::sweep_dead`]).
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        if !self.root.get().is_null() {
-            let p = self.root.as_ptr() as *mut RawGc;
-            visitor(p);
-        }
         for key in self.interned_keys.values() {
             let p = key.handle.as_ptr() as *mut RawGc;
             visitor(p);
@@ -457,11 +489,12 @@ mod tests {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
 
         let flags = PropertyFlags::data_default();
+        let root = super::super::shape_body::null_root(&heap);
         let first = runtime
-            .child_with_roots(&mut heap, runtime.root(), "x", flags, false, &mut roots)
+            .child_with_roots(&mut heap, root, "x", flags, false, &mut roots)
             .expect("first child");
         let second = runtime
-            .child_with_roots(&mut heap, runtime.root(), "x", flags, false, &mut roots)
+            .child_with_roots(&mut heap, root, "x", flags, false, &mut roots)
             .expect("second child");
 
         assert_eq!(first, second);
@@ -472,7 +505,7 @@ mod tests {
     #[test]
     fn interpreter_roots_shape_runtime_across_force_gc() {
         let mut interp = crate::Interpreter::new();
-        let root = interp.shape_root();
+        let root = interp.null_prototype_root();
         let first = interp.shape_child(root, "x").expect("child");
         let first_id = interp.gc_heap.read_payload(first, ShapeBody::id);
         assert_eq!(interp.shape_runtime.handle_for_id(first_id), Some(first));
@@ -480,7 +513,7 @@ mod tests {
 
         interp.force_gc().expect("force GC");
 
-        let root = interp.shape_root();
+        let root = interp.null_prototype_root();
         let second = interp.shape_child(root, "x").expect("child after gc");
         assert_eq!(interp.shape_runtime.handle_for_id(first_id), Some(second));
         assert_eq!(interp.shape_offset_of(second, "x"), Some(0));
@@ -489,7 +522,7 @@ mod tests {
     #[test]
     fn unnamed_shapes_are_collected_after_their_turn() {
         let mut interp = crate::Interpreter::new();
-        let root = interp.shape_root();
+        let root = interp.null_prototype_root();
         let unused = interp.shape_child(root, "only_in_tables").expect("child");
         let unused_id = interp.gc_heap.read_payload(unused, ShapeBody::id);
         let kept = interp.shape_child(root, "kept").expect("child");

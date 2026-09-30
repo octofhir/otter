@@ -507,8 +507,8 @@ mod tests {
             &mut |_| {},
         )
         .expect("outer");
-        let payload =
-            crate::object::alloc_object_with_roots(&mut heap, &mut |_| {}).expect("young payload");
+        let payload = crate::object::alloc_fixture_object_with_roots(&mut heap, &mut |_| {})
+            .expect("young payload");
         assert!(write_slot(&mut heap, outer, 0, Value::object(payload)));
         let mut outer_value = Value::context(outer);
         let inner = {

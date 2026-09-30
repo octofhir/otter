@@ -344,14 +344,12 @@ impl Interpreter {
 
     /// Allocate an empty `%Object.prototype%`-backed object.
     fn json_make_plain_object(&mut self) -> Result<object::JsObject, VmError> {
-        let obj = object::alloc_object_with_roots(
-            self.gc_heap_mut(),
-            &mut |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {},
-        )
-        .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
         let object_proto = self.object_prototype_object_opt();
-        object::set_prototype_value(obj, self.gc_heap_mut(), object_proto.map(Value::object));
-        Ok(obj)
+        let root = self.object_root(object_proto)?;
+        object::alloc_object_with_roots(self.gc_heap_mut(), root, &mut |_: &mut dyn FnMut(
+            *mut otter_gc::raw::RawGc,
+        )| {})
+        .map_err(|_| self.err_type(("out of memory".to_string()).into()))
     }
 
     /// One key of InternalizeJSONProperty: recurse, then Delete on
@@ -1049,18 +1047,17 @@ impl Interpreter {
         let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             value.trace_value_slots(visitor);
         };
-        let obj = object::alloc_object_with_roots(self.gc_heap_mut(), &mut roots)
+        let object_proto = self.object_prototype_object_opt();
+        let root = self.object_root(object_proto)?;
+        let obj = object::alloc_object_with_roots(self.gc_heap_mut(), root, &mut roots)
             .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
-        // `set_prototype_value` and `set` intern the key and transition the
-        // shape — allocations that can move the young receiver. Root `obj` (and
-        // `value`) and re-read the receiver after each so the writes never go
-        // through a stale handle, and return the moved handle.
+        // `set` interns the key and transitions the shape — allocations that
+        // can move the young receiver. Root `obj` (and `value`) and re-read the
+        // receiver afterwards so the write never goes through a stale handle,
+        // and return the moved handle.
         let obj_root = self.json_root_push(Value::object(obj));
         let value_root = self.json_root_push(value);
         let result: Result<_, VmError> = {
-            let object_proto = self.object_prototype_object_opt();
-            let recv = self.json_root_get_object(obj_root);
-            object::set_prototype_value(recv, self.gc_heap_mut(), object_proto.map(Value::object));
             let mut recv = self.json_root_get_object(obj_root);
             let leaf = self.json_root_get(value_root);
             object::set(&mut recv, self.gc_heap_mut(), "", leaf);

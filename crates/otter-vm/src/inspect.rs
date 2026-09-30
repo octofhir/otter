@@ -484,7 +484,7 @@ pub(crate) fn build_shape_transition_snapshot(
     use crate::object::ShapeBody;
     use crate::string::to_utf16_vec;
 
-    let root_handle = shape_runtime.root();
+    let root_handle = crate::object::shape_body::null_root(heap);
     let root_shape_id = heap.read_payload(root_handle, ShapeBody::id).raw();
 
     let mut nodes = Vec::new();

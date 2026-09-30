@@ -623,8 +623,9 @@ impl Interpreter {
         // handles are realm-authoritative, fixed in count and order.
         self.error_classes.trace_gc_roots(visitor);
         // The shape runtime's side tables are caches a restore rebuilds
-        // from the heap; the root shape is the one authoritative handle.
-        self.shape_runtime.visit_root_slot(visitor);
+        // from the heap; the heap's embedder roots (the `null`-prototype
+        // root shape) are the authoritative handles.
+        self.gc_heap.visit_embedder_root_slots(visitor);
     }
 
     /// Shared handle to this isolate's code space, for the in-process

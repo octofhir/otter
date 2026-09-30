@@ -146,7 +146,7 @@ pub(crate) fn emit_object_flags_guard(
 /// A link needs less than a receiver: its shape fixes which keys it owns, so
 /// the guard requires only that hidden-class ICs may still trust that shape
 /// (fast mode) and that the link is not opaque — a Proxy or non-object
-/// `[[Prototype]]` leaves the flat mirror null without ending the chain, and a
+/// `[[Prototype]]` leaves the shape's prototype word null without ending the chain, and a
 /// String wrapper owns keys its shape does not list. Sidecars, overridden
 /// attributes, and extensibility do not affect whether a key is absent, so a
 /// prototype such as `Object.prototype` that carries a sidecar stays
@@ -173,22 +173,19 @@ pub(crate) fn emit_resolve_holder(
 ) {
     let shape_byte = view.object_shape_byte;
     let resolved = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz w7, =>resolved
-        ; ldr w12, [x13, view.jit_proto_byte]
-        ; cbz w12, =>miss
-    );
+    dynasm!(ops ; .arch aarch64 ; cbz w7, =>resolved);
     emit_load_symbol_u64(
         ops,
         relocations,
-        13,
+        14,
         view.cage_base as u64,
         RelocationTarget::GcCageBase,
     );
+    super::values::emit_load_prototype(ops, view, 12, 13, 14);
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12          // x13 = prototype GcHeader ptr
+        ; cbz w12, =>miss
+        ; add x13, x14, x12          // x13 = prototype GcHeader ptr
         ; ldrb w14, [x13]
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>miss
@@ -490,15 +487,15 @@ where
                     object: 0,
                     result: 1,
                 } => {
-                    dynasm!(ops ; .arch aarch64 ; ldr w12, [x13, view.jit_proto_byte] ; cbz w12, =>next);
                     emit_load_symbol_u64(
                         ops,
                         relocations,
-                        15,
+                        14,
                         view.cage_base as u64,
                         RelocationTarget::GcCageBase,
                     );
-                    dynasm!(ops ; .arch aarch64 ; add x15, x15, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
+                    super::values::emit_load_prototype(ops, view, 12, 13, 14);
+                    dynasm!(ops ; .arch aarch64 ; cbz w12, =>next ; add x15, x14, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
                     emit_ordinary_lookup_state_guard(ops, view, 15, next);
                 }
                 otter_vm::JitCacheIrOp::LoadPrototype { .. } => {
@@ -619,15 +616,15 @@ where
                             ));
                         }
                     };
-                    dynasm!(ops ; .arch aarch64 ; ldr w12, [X(header), view.jit_proto_byte] ; cbz w12, =>next);
                     emit_load_symbol_u64(
                         ops,
                         relocations,
-                        15,
+                        14,
                         view.cage_base as u64,
                         RelocationTarget::GcCageBase,
                     );
-                    dynasm!(ops ; .arch aarch64 ; add x15, x15, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
+                    super::values::emit_load_prototype(ops, view, 12, header, 14);
+                    dynasm!(ops ; .arch aarch64 ; cbz w12, =>next ; add x15, x14, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
                     if add_transition {
                         emit_chain_link_state_guard(ops, view, 15, next);
                     } else {
@@ -644,7 +641,15 @@ where
                             ));
                         }
                     };
-                    dynasm!(ops ; .arch aarch64 ; ldr w12, [X(header), view.jit_proto_byte] ; cbnz w12, =>next);
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        14,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    super::values::emit_load_prototype(ops, view, 12, header, 14);
+                    dynasm!(ops ; .arch aarch64 ; cbnz w12, =>next);
                 }
                 otter_vm::JitCacheIrOp::GuardExtensible {
                     object: 0,
@@ -1815,8 +1820,9 @@ fn emit_guarded_method_guard_impl(
                 ; b.ne =>miss
             );
             // A receiver-owned slot needs no hop. Otherwise the way's guarded
-            // prototype hop runs, which reads `[[Prototype]]` at run time
-            // because `setPrototypeOf` moves it while the shape stays put.
+            // prototype hop runs: the receiver's shape fixes its prototype,
+            // whose address the hop reads from that shape at run time since a
+            // young prototype moves.
             match call.holder {
                 JitMethodHolder::Receiver => {}
                 JitMethodHolder::Shape(holder_shape) => {
@@ -1946,7 +1952,7 @@ fn emit_body_guard(ops: &mut Assembler, guard: JitBodyGuard, miss: DynamicLabel)
 }
 
 /// Prove a dictionary-mode holder in `header` keeps its captured key/slot
-/// layout: a null shape, a sidecar, and an unchanged `u32` slot-layout epoch
+/// layout: a dictionary shape, a sidecar, and an unchanged `u32` slot-layout epoch
 /// in that sidecar. Every delete, descriptor change or re-entry into
 /// dictionary mode advances the epoch; appending an unrelated key does not.
 /// Clobbers `x12` and `x14`.
@@ -1958,12 +1964,9 @@ pub(crate) fn emit_dictionary_layout_guard(
     layout: u64,
     miss: DynamicLabel,
 ) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w14, [X(header), view.object_shape_byte]
-        ; cbnz w14, =>miss
-        ; ldr w14, [X(header), view.object_exotic_handle_byte]
-        ; cbz w14, =>miss
+    debug_assert!(
+        header != 12 && header != 14,
+        "the guard clobbers x12 and x14"
     );
     emit_load_symbol_u64(
         ops,
@@ -1974,6 +1977,12 @@ pub(crate) fn emit_dictionary_layout_guard(
     );
     dynasm!(ops
         ; .arch aarch64
+        ; ldr w14, [X(header), view.object_shape_byte]
+        ; add x14, x12, x14
+        ; ldrb w14, [x14, view.shape_kind_byte]
+        ; tbz w14, super::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
+        ; ldr w14, [X(header), view.object_exotic_handle_byte]
+        ; cbz w14, =>miss
         ; add x14, x12, x14
         ; ldr w14, [x14, view.exotic_dictionary_layout_byte]
     );

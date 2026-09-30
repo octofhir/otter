@@ -491,7 +491,7 @@ impl NativeFunction {
                     value.trace_value_slots(visitor);
                 }
             };
-            crate::object::alloc_object_with_roots(heap, &mut visit)?
+            crate::object::alloc_dictionary_object_with_roots(heap, &mut visit)?
         };
         if !metadata.extensible {
             crate::object::prevent_extensions(own_properties, heap);

@@ -46,8 +46,12 @@ fn host_lookup_opacity_survives_prototype_changes_for_every_allocator() {
         let prototype = alloc_object_old_for_fixture(&mut heap).expect("prototype");
         let env = alloc_object_old_for_fixture(&mut heap).expect("namespace environment");
         let mut roots = |_: &mut dyn FnMut(*mut RawGc)| {};
-        let shape =
-            shape_body::alloc_root_shape_body_with_roots(&mut heap, &mut roots).expect("shape");
+        let shape = shape_body::alloc_root_shape_body_with_roots(
+            &mut heap,
+            shape_body::ShapePrototype::Null,
+            &mut roots,
+        )
+        .expect("shape");
         let object = match allocator {
             0 => alloc_host_object_with_roots(&mut heap, HostPayload, &mut roots),
             1 => alloc_host_object_with_shape_roots(&mut heap, shape, HostPayload, &mut roots),

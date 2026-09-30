@@ -16,6 +16,7 @@ mod jit_compile;
 mod jit_intrinsic_properties;
 mod modules;
 mod protos;
+mod prototype_shapes;
 mod restore;
 mod shapes;
 mod stats;

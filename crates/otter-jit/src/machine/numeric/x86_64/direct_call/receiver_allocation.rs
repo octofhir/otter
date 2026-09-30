@@ -153,15 +153,12 @@ fn emit_receiver_candidate(
         ; jz =>guard_miss
         ; lea r9, [r8 + r10]
     );
-    // The last receiver's slot count is its shape's; a dictionary-mode
-    // receiver teaches nothing.
+    // The last receiver's slot count is its shape's; a dictionary shape
+    // counts none, so a dictionary-mode receiver teaches nothing.
     dynasm!(ops
         ; .arch x64
         ; mov r10d, [r9 + view.object_shape_byte as i32]
-        ; test r10d, r10d
-        ; jz >counted
         ; mov r10d, [r8 + r10 + view.shape_property_count_byte as i32]
-        ; counted:
         ; movzx r11d, WORD [rcx + view.closure_call_layout.learned_instance_fields_byte as i32]
         ; cmp r10d, r11d
         ; cmova r11d, r10d
@@ -200,8 +197,8 @@ fn emit_receiver_candidate(
             ; jne =>guard_miss
             ; cmp DWORD [r9 + view.object_shape_byte as i32], shape as i32
             ; jne =>guard_miss
-            ; mov r10d, [r9 + view.jit_proto_byte as i32]
         );
+        crate::template::x86_64::emit_x64_load_prototype(ops, view, 10, 9, 8);
         if index + 1 != usize::from(plan.prototype_shape_count) {
             dynasm!(ops
                 ; .arch x64
@@ -213,6 +210,28 @@ fn emit_receiver_candidate(
     }
     if plan.prototype_shape_count != 0 {
         dynasm!(ops ; .arch x64 ; test r10d, r10d ; jnz =>guard_miss);
+    }
+    // The receiver's shape, into `esi` (the live prototype is no longer
+    // needed once its lineage is proven).
+    if plan.receiver_shape != 0 {
+        load64(ops, 11, u64::from(plan.receiver_shape));
+        dynasm!(ops
+            ; .arch x64
+            ; cmp esi, [r8 + r11 + view.shape_prototype_byte as i32]
+            ; jne =>guard_miss
+            ; mov esi, r11d
+        );
+    } else {
+        dynasm!(ops
+            ; .arch x64
+            ; lea r9, [r8 + rsi]
+            ; mov r10d, [r9 + view.object_exotic_handle_byte as i32]
+            ; test r10d, r10d
+            ; jz =>guard_miss
+            ; mov esi, [r8 + r10 + view.exotic_instance_root_byte as i32]
+            ; test esi, esi
+            ; jz =>guard_miss
+        );
     }
 
     // Only a complete cell fit below the buffer limit may mutate the nursery.
@@ -229,17 +248,16 @@ fn emit_receiver_candidate(
 
     // Initialize the header and the whole fixed body before publishing the
     // bump cursor. The header carries the flag and in-object capacity bytes;
-    // the body is two words: shape + null slab, prototype + null sidecar.
+    // the body is two words: shape + null slab, null sidecar + padding.
     // The receiver shape names exactly the initial fields, so the slot count
     // follows from it. In-object words past the initial fields are never
     // read before a store publishes them.
     load64(ops, 11, plan.cell_header_word(cell_bytes));
-    dynasm!(ops ; .arch x64 ; mov [rax], r11);
-    load64(ops, 11, u64::from(plan.receiver_shape));
     dynasm!(ops
         ; .arch x64
-        ; mov [rax + view.object_shape_byte as i32], r11
-        ; mov [rax + view.jit_proto_byte as i32], rsi
+        ; mov [rax], r11
+        ; mov [rax + view.object_shape_byte as i32], rsi
+        ; mov QWORD [rax + view.object_exotic_handle_byte as i32], 0
     );
     if plan.initial_field_count != 0 {
         load64(ops, 11, VALUE_UNDEFINED);

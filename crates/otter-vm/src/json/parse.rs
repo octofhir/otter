@@ -677,8 +677,20 @@ fn finish_builder(
                     value.trace_value_slots(visitor);
                 }
             };
-            let mut obj = crate::object::alloc_object_with_roots(gc_heap, &mut roots)
-                .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
+            // The realm `%Object.prototype%`'s lineage fixes the prototype
+            // (§25.5.1); its own keys go straight to dictionary storage, so
+            // an own `"__proto__"` stays a data property.
+            let root = crate::object::root_for_prototype(
+                gc_heap,
+                object_proto.and_then(|proto| proto.as_object()),
+            )
+            .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
+            let mut obj = crate::object::alloc_object_with_roots(
+                gc_heap,
+                crate::object::shape_body::dictionary_of(root),
+                &mut roots,
+            )
+            .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
             // Filling each property transitions the hidden class and can grow the
             // value slab — an allocation that may collect. The object being
             // filled, the values not yet installed, and the enclosing builder
@@ -715,13 +727,6 @@ fn finish_builder(
                 gc_heap.register_extra_roots(otter_gc::ExtraRoots::new(&build_roots));
             for (k, v) in &entries {
                 crate::object::set(&mut obj, gc_heap, k, *v);
-            }
-            // Install the realm `%Object.prototype%` at construction time when the
-            // caller supplied it, after the own keys are defined so an own
-            // `"__proto__"` data property is preserved (§25.5.1). Kept inside the
-            // root scope: setting the prototype can transition the shape too.
-            if let Some(proto) = object_proto {
-                crate::object::set_prototype_value(obj, gc_heap, Some(proto));
             }
             Ok(Value::object(obj))
         }
@@ -1043,7 +1048,7 @@ mod tests {
     use super::*;
 
     fn parse_str(s: &str) -> Result<Value, ParseError> {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut gc_heap = crate::object::fixture_heap();
         parse(s, &mut gc_heap)
     }
 
@@ -1053,7 +1058,7 @@ mod tests {
 
     #[test]
     fn parses_primitives() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut gc_heap = crate::object::fixture_heap();
         assert!(parse_str_with_heap("null", &mut gc_heap).unwrap().is_null());
         assert_eq!(
             parse_str_with_heap("true", &mut gc_heap)
@@ -1089,14 +1094,14 @@ mod tests {
 
     #[test]
     fn parses_strings_with_escapes() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut gc_heap = crate::object::fixture_heap();
         let v = parse_str_with_heap("\"a\\nb\\\\c\\\"d\"", &mut gc_heap).unwrap();
         assert_eq!(v.display_string(&gc_heap), "a\nb\\c\"d");
     }
 
     #[test]
     fn parses_unicode_escape_and_surrogate_pair() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut gc_heap = crate::object::fixture_heap();
         // U+0041 'A' encoded as A.
         let v = parse_str_with_heap("\"\\u0041\"", &mut gc_heap).unwrap();
         assert_eq!(v.display_string(&gc_heap), "A");
@@ -1108,7 +1113,7 @@ mod tests {
 
     #[test]
     fn parses_array_and_object() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut gc_heap = crate::object::fixture_heap();
         let v = parse_str_with_heap("{\"x\":[1,2,3]}", &mut gc_heap).unwrap();
         let obj = v.as_object().expect("object");
         let arr = crate::object::get(obj, &gc_heap, "x")
@@ -1148,7 +1153,7 @@ mod tests {
 
     #[test]
     fn nested_object_round_trip() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut gc_heap = crate::object::fixture_heap();
         let v = parse_str_with_heap("{\"a\":{\"b\":{\"c\":42}}}", &mut gc_heap).unwrap();
         let o = v.as_object().expect("object");
         let o2 = crate::object::get(o, &gc_heap, "a")

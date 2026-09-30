@@ -334,6 +334,8 @@ impl CodeBlock {
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
             exotic_dictionary_layout_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::EXOTIC_SLOTS_DICTIONARY_LAYOUT_OFFSET as u32,
+            exotic_instance_root_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::EXOTIC_SLOTS_INSTANCE_ROOT_OFFSET as u32,
             object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32,
             object_slab_handle_byte: otter_gc::header::HEADER_SIZE as u32
@@ -354,8 +356,10 @@ impl CodeBlock {
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
                 remembered_flag: otter_gc::header::REMEMBERED_FLAG as u32,
             },
-            jit_proto_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_JIT_PROTO_OFFSET as u32,
+            shape_prototype_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::SHAPE_BODY_PROTOTYPE_OFFSET as u32,
+            shape_kind_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::SHAPE_BODY_KIND_OFFSET as u32,
             closure_call_layout: crate::jit::JitClosureCallLayout {
                 function_id_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,

@@ -120,7 +120,10 @@ pub(super) fn emit(
             ; =>step
             ; test BYTE [r10 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE as i8
             ; jnz =>miss
-            ; mov eax, [r10 + view.jit_proto_byte as i32]
+        );
+        crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 10, 9);
+        dynasm!(ops
+            ; .arch x64
             ; test eax, eax
             ; jz =>no
             ; add rax, r9

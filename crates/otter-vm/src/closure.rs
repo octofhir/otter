@@ -788,7 +788,7 @@ mod tests {
         const HEAP_CAP: u64 = 4 * 1024;
 
         let mut heap = GcHeap::with_max_heap_bytes(HEAP_CAP).expect("heap");
-        let this_object = crate::object::alloc_object_with_roots(&mut heap, &mut |_| {})
+        let this_object = crate::object::alloc_fixture_object_with_roots(&mut heap, &mut |_| {})
             .expect("young bound this");
         let mut bound_this = Value::object(this_object);
         let context = {
@@ -829,7 +829,7 @@ mod tests {
                 }
             };
             Some(Value::object(
-                crate::object::alloc_object_with_roots(&mut heap, &mut roots)
+                crate::object::alloc_fixture_object_with_roots(&mut heap, &mut roots)
                     .expect("young external root"),
             ))
         } else {

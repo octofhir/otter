@@ -4866,7 +4866,7 @@ fn is_callable_recognises_call_shapes() {
         crate::closure::alloc_closure(&mut closure_heap, 7, Value::undefined(), None, None)
             .expect("closure");
     assert!(is_callable(&Value::closure(closure_handle)));
-    let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+    let mut heap = crate::object::fixture_heap();
     let bound = BoundFunction::new(
         &mut heap,
         Value::function(7),

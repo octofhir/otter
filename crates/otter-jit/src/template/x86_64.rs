@@ -2888,14 +2888,6 @@ fn emit_existing_property_load(
                 otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
                     // A dictionary holder keeps its slot-layout epoch in its
                     // sidecar.
-                    dynasm!(ops
-                        ; .arch x64
-                        ; cmp DWORD [r8 + view.object_shape_byte as i32], 0
-                        ; jne =>next
-                        ; mov r9d, [r8 + view.object_exotic_handle_byte as i32]
-                        ; test r9d, r9d
-                        ; jz =>next
-                    );
                     emit_load_symbol_u64(
                         ops,
                         relocations,
@@ -2905,6 +2897,12 @@ fn emit_existing_property_load(
                     );
                     dynasm!(ops
                         ; .arch x64
+                        ; mov r9d, [r8 + view.object_shape_byte as i32]
+                        ; test BYTE [r11 + r9 + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
+                        ; jz =>next
+                        ; mov r9d, [r8 + view.object_exotic_handle_byte as i32]
+                        ; test r9d, r9d
+                        ; jz =>next
                         ; add r9, r11
                         ; mov r11d, layout as u32 as i32
                         ; cmp [r9 + view.exotic_dictionary_layout_byte as i32], r11d
@@ -2997,11 +2995,15 @@ fn emit_existing_property_store(
                 }
                 otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
                     let header = if object == 0 { 10 } else { 8 };
-                    dynasm!(ops
-                        ; .arch x64
-                        ; cmp DWORD [Rq(header) + view.jit_proto_byte as i32], 0
-                        ; jne =>next
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        9,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
                     );
+                    emit_x64_load_prototype(ops, view, 11, header, 9);
+                    dynasm!(ops ; .arch x64 ; test r11d, r11d ; jnz =>next);
                 }
                 otter_vm::JitCacheIrOp::GuardExtensible {
                     object: 0,
@@ -3229,12 +3231,6 @@ fn emit_template_prototype(
     chain_link: bool,
     miss: DynamicLabel,
 ) {
-    dynasm!(ops
-        ; .arch x64
-        ; mov r8d, [Rq(header) + view.jit_proto_byte as i32]
-        ; test r8d, r8d
-        ; jz =>miss
-    );
     emit_load_symbol_u64(
         ops,
         relocations,
@@ -3242,8 +3238,11 @@ fn emit_template_prototype(
         view.cage_base as u64,
         RelocationTarget::GcCageBase,
     );
+    emit_x64_load_prototype(ops, view, 8, header, 9);
     dynasm!(ops
         ; .arch x64
+        ; test r8d, r8d
+        ; jz =>miss
         ; add r8, r9
         ; cmp BYTE [r8], OBJECT_BODY_TYPE_TAG as i8
         ; jne =>miss
@@ -3253,6 +3252,25 @@ fn emit_template_prototype(
     } else {
         emit_template_fast_state_guard(ops, view, 8, miss);
     }
+}
+
+/// Load into `Rd(dst)` the compressed `[[Prototype]]` of the object whose
+/// `GcHeader` pointer is in `Rq(object)`: the prototype word of its shape, an
+/// ordinary object or null. `Rq(cage)` holds the cage base; `dst` may be
+/// `object` but not `cage`.
+pub(crate) fn emit_x64_load_prototype(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    dst: u8,
+    object: u8,
+    cage: u8,
+) {
+    debug_assert_ne!(dst, cage);
+    dynasm!(ops
+        ; .arch x64
+        ; mov Rd(dst), [Rq(object) + view.object_shape_byte as i32]
+        ; mov Rd(dst), [Rq(cage) + Rq(dst) + view.shape_prototype_byte as i32]
+    );
 }
 
 /// Compute the slot base of the object whose `GcHeader` pointer is in

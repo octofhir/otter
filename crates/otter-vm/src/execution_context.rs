@@ -1057,6 +1057,9 @@ mod tests {
 
     #[test]
     fn property_ic_stats_record_direct_prototype_load_hit_after_warmup() {
+        // Two receivers share one prototype, so they share its instance
+        // root: the second pass through the load site hits the prototype hop
+        // its first pass installed.
         let context = ExecutionContext::from_module(module_with(
             vec![
                 instr(0, Op::NewObject, [Operand::Register(0)]),
@@ -1071,14 +1074,15 @@ mod tests {
                         Operand::Register(2),
                     ],
                 ),
-                instr(3, Op::NewObject, [Operand::Register(3)]),
+                instr(3, Op::LoadFalse, [Operand::Register(5)]),
+                instr(4, Op::NewObject, [Operand::Register(3)]),
                 instr(
-                    4,
+                    5,
                     Op::SetPrototype,
                     [Operand::Register(3), Operand::Register(0)],
                 ),
                 instr(
-                    5,
+                    6,
                     Op::LoadProperty,
                     [
                         Operand::Register(4),
@@ -1086,22 +1090,18 @@ mod tests {
                         Operand::ConstIndex(0),
                     ],
                 ),
-                instr(6, Op::Return, [Operand::Register(4)]),
+                instr(7, Op::JumpIfTrue, [Operand::Imm32(2), Operand::Register(5)]),
+                instr(8, Op::LoadTrue, [Operand::Register(5)]),
+                instr(9, Op::Jump, [Operand::Imm32(-6)]),
+                instr(10, Op::Return, [Operand::Register(4)]),
             ],
             vec![string_constant("foo")],
-            5,
+            6,
         ))
         .expect("valid bytecode fixture");
         let mut interp = Interpreter::new();
 
-        assert_eq!(
-            interp.run(&context).expect("first run"),
-            Value::boolean(true)
-        );
-        assert_eq!(
-            interp.run(&context).expect("second run"),
-            Value::boolean(true)
-        );
+        assert_eq!(interp.run(&context).expect("run"), Value::boolean(true));
 
         let stats = interp.property_ic_stats();
         assert_eq!(stats.load_hits, 1);

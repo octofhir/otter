@@ -639,10 +639,15 @@ impl<'rt> NativeCtx<'rt> {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        // OrdinaryObjectCreate(%Object.prototype%) — natives building
+        // JS-visible objects (resolvedOptions, formatToParts entries, …)
+        // expect `hasOwnProperty` & friends to resolve. The root fixes the
+        // prototype; finding it never collects.
+        let prototype = self.cx.interp.object_prototype_object_opt();
+        let root = self.cx.interp.object_root(prototype)?;
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let shape_root = self.cx.interp.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -653,22 +658,12 @@ impl<'rt> NativeCtx<'rt> {
                 slice_roots,
             );
         };
-        let object = object::alloc_object_with_shape_roots(
+        object::alloc_object_with_shape_roots(
             self.heap_mut(),
-            shape_root,
+            root,
             crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
-        )?;
-        // OrdinaryObjectCreate(%Object.prototype%) — natives building
-        // JS-visible objects (resolvedOptions, formatToParts entries, …)
-        // expect `hasOwnProperty` & friends to resolve. Install the
-        // prototype only after the allocation (which can scavenge and
-        // relocate a still-young realm prototype); the realm-intrinsic
-        // table is always traced, so a post-alloc read is current.
-        if let Some(proto) = self.cx.interp.object_prototype_object_opt() {
-            object::set_prototype(object, self.heap_mut(), Some(proto));
-        }
-        Ok(object)
+        )
     }
 
     /// Allocate a host-data object through the native root contract.
@@ -688,7 +683,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let shape_root = self.cx.interp.shape_root();
+        let shape_root = self.cx.interp.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -728,7 +723,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let shape_root = self.cx.interp.shape_root();
+        let shape_root = self.cx.interp.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,

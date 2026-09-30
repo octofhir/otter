@@ -2174,7 +2174,7 @@ mod tests {
 
     #[test]
     fn cell_offset_round_trips_through_full_address() {
-        use crate::object::alloc_object_with_roots;
+        use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
@@ -2212,7 +2212,7 @@ mod tests {
 
     #[test]
     fn object_round_trip_via_real_heap() {
-        use crate::object::alloc_object_with_roots;
+        use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
@@ -2235,7 +2235,7 @@ mod tests {
 
     #[test]
     fn family_kind_dispatch_separates_object_function_other() {
-        use crate::object::alloc_object_with_roots;
+        use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
@@ -2404,7 +2404,7 @@ mod tests {
         // Callables / object-like references are always truthy.
         assert_eq!(Value::function_id(0).to_boolean_pure(), Some(true));
 
-        use crate::object::alloc_object_with_roots;
+        use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
         use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
@@ -2430,7 +2430,7 @@ mod tests {
 
     #[test]
     fn predicates_disambiguate_object_and_function_families() {
-        use crate::object::alloc_object_with_roots;
+        use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use crate::{Value as LegacyValue, alloc_closure};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
@@ -2492,7 +2492,7 @@ mod tests {
         assert_eq!(Value::function_id(0).kind(), ValueKind::FunctionId);
 
         use crate::bigint::alloc_big_int;
-        use crate::object::alloc_object_with_roots;
+        use crate::object::alloc_fixture_object_with_roots as alloc_object_with_roots;
         use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
         use crate::{Value as LegacyValue, alloc_closure};
         use num_bigint::BigInt;

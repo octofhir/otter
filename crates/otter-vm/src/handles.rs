@@ -451,7 +451,8 @@ impl Interpreter {
     /// transition after the first resolves from the transition cache — so a
     /// caller that builds many objects of one shape should keep the answer.
     pub(crate) fn object_layout(&mut self, keys: &[&str]) -> Result<ObjectLayout, VmError> {
-        let mut shape = self.shape_root();
+        let prototype = self.object_prototype_object_opt();
+        let mut shape = self.object_root(prototype)?;
         for key in keys {
             shape = self.layout_shape_child(shape, key)?;
         }
@@ -477,14 +478,19 @@ impl Interpreter {
         tag: &crate::HostAtom,
         keys: &[&crate::HostAtom],
     ) -> Result<ObjectLayout, VmError> {
-        if let Some(layout) = self.object_layout_cache.get(tag, keys) {
+        // A layout's shape fixes the realm's `%Object.prototype%`, so the
+        // realm's root partitions the cache.
+        let prototype = self.object_prototype_object_opt();
+        let root = self.object_root(prototype)?;
+        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
+        if let Some(layout) = self.object_layout_cache.get(root_id, tag, keys) {
             return Ok(layout);
         }
 
         let spellings: smallvec::SmallVec<[&str; 8]> =
             keys.iter().map(|key| key.as_str()).collect();
         let layout = self.object_layout(&spellings)?;
-        self.object_layout_cache.insert(tag, keys, layout);
+        self.object_layout_cache.insert(root_id, tag, keys, layout);
         Ok(layout)
     }
 
@@ -537,14 +543,9 @@ impl Interpreter {
             .shape_runtime
             .handle_for_id(layout.shape)
             .ok_or(VmError::TypeMismatch)?;
+        // The layout's shape fixes the prototype.
         let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         let handle = self.scoped_value(scope, Value::object(object));
-        // Read the prototype after the allocation, as `scoped_object` does:
-        // allocating can relocate a young realm intrinsic.
-        if let Some(proto) = self.object_prototype_object_opt() {
-            let object = self.scoped_object_handle(handle)?;
-            crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
-        }
         let count = layout.len as usize;
         // The slab is grown once, then the shape and its `undefined` slots go
         // on together, so no handle can go stale between them.
@@ -581,21 +582,13 @@ impl Interpreter {
                 .iter()
                 .map(|value| self.handle_arena.get(value.index())),
         );
-        let mut prototype = self.object_prototype_object_opt();
         let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
-        let prototype_slot = prototype
-            .as_mut()
-            .map(|prototype| std::ptr::from_mut(prototype).cast::<RawGc>());
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(shape_slot);
-            if let Some(prototype_slot) = prototype_slot {
-                visitor(prototype_slot);
-            }
         };
         let object = crate::object::alloc_object_with_shape_and_values_roots(
             &mut self.gc_heap,
             shape,
-            prototype,
             &mut stored,
             &mut roots,
         )
@@ -771,15 +764,10 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
     ) -> Result<Local<'s>, VmError> {
-        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
-        // Install the prototype only after the allocation: the object alloc can
-        // drive a scavenge that relocates the realm prototype while it is still
-        // young, so reading the handle beforehand could bake a stale offset
-        // (mirrors `run_new_object_reg`). The realm-intrinsic table is always
-        // traced, so a post-alloc read yields the relocated handle.
-        if let Some(proto) = self.object_prototype_object_opt() {
-            crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
-        }
+        let object = match self.object_prototype_object_opt() {
+            Some(proto) => self.alloc_runtime_rooted_object_with_proto(proto, &[], &[])?,
+            None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,
+        };
         Ok(self.scoped_value(scope, Value::object(object)))
     }
 
@@ -1074,16 +1062,11 @@ impl Interpreter {
         scope: &'s HandleScope,
         proto: Local<'_>,
     ) -> Result<Local<'s>, VmError> {
-        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
-        let handle = self.scoped_value(scope, Value::object(object));
-        let proto_obj = self.handle_arena.get(proto.index()).as_object();
-        let object = self
-            .handle_arena
-            .get(handle.index())
-            .as_object()
-            .ok_or(VmError::TypeMismatch)?;
-        crate::object::set_prototype(object, &mut self.gc_heap, proto_obj);
-        Ok(handle)
+        let object = match self.handle_arena.get(proto.index()).as_object() {
+            Some(proto) => self.alloc_runtime_rooted_object_with_proto(proto, &[], &[])?,
+            None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,
+        };
+        Ok(self.scoped_value(scope, Value::object(object)))
     }
 
     /// Define the symbol-keyed data property `key` on the object handle `obj`
@@ -1279,7 +1262,8 @@ impl Interpreter {
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
         let prototype = prototype.map(|handle| self.handle_arena.get(handle.index()));
-        if crate::object::set_prototype_value(object, &mut self.gc_heap, prototype) {
+        let mut object = object;
+        if self.set_ordinary_prototype(&mut object, prototype)? {
             Ok(())
         } else {
             Err(VmError::TypeMismatch)

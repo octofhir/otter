@@ -6,6 +6,8 @@
 //! - [`GcHeap`] — the orchestrator the rest of the runtime sees.
 //! - [`RootSlotVisitor`] — caller-supplied root source closure for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
+//! - [`GcHeap::embedder_root`] — strong handles the embedder keeps at fixed
+//!   indices for code that holds only the heap.
 //! - [`MachineAllocationWindow`] — the audited nursery/accounting view exposed
 //!   to generated-code allocators: the heap's linear allocation buffer plus
 //!   the per-type counters.
@@ -53,6 +55,7 @@
 //!
 //! - GC architecture plan §6.1 (unsafe boundary).
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -96,6 +99,9 @@ pub type RootSlotVisitor<'a> = dyn FnMut(&mut dyn FnMut(*mut RawGc)) + 'a;
 pub fn empty() -> EmptyRoots {
     EmptyRoots
 }
+
+/// Number of [`GcHeap::embedder_root`] slots.
+pub const EMBEDDER_ROOT_SLOTS: usize = 1;
 
 /// Growth-ratio major-GC trigger (used only when no hard cap is
 /// set). After a full GC the next trigger is `live × NUM / DEN`.
@@ -272,6 +278,10 @@ pub struct GcHeap {
     remembered_parents: Vec<RawGc>,
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
+    /// Strong handles the embedder keeps at fixed indices for code that holds
+    /// only the heap (V8's roots table). Traced as roots and rewritten in
+    /// place when their targets move.
+    embedder_roots: [Cell<RawGc>; EMBEDDER_ROOT_SLOTS],
     /// LIFO stack of runtime-owned root sources. A stack — not a
     /// single slot — because VM scopes nest (native call → re-entrant
     /// dispatch → nested native): replacing a single registration
@@ -489,6 +499,7 @@ impl GcHeap {
             remembered_parents: Vec::new(),
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
+            embedder_roots: Default::default(),
             extra_roots: Vec::new(),
             frame_root_providers: FrameRootProviders::new(),
             ephemerons: EphemeronRegistry::default(),
@@ -1124,6 +1135,34 @@ impl GcHeap {
     /// rooting APIs.
     pub(crate) fn global_handles(&self) -> &GlobalHandleTable {
         &self.global_handles
+    }
+
+    /// The handle in embedder root slot `index`; null until set.
+    #[must_use]
+    pub fn embedder_root(&self, index: usize) -> RawGc {
+        self.embedder_roots[index].get()
+    }
+
+    /// Keep `raw` alive in embedder root slot `index`.
+    pub fn set_embedder_root(&self, index: usize, raw: RawGc) {
+        self.embedder_roots[index].set(raw);
+    }
+
+    /// Visit every embedder root slot, filled or not, in index order: the
+    /// fixed-shape walk a heap snapshot captures and restores.
+    pub fn visit_embedder_root_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for slot in &self.embedder_roots {
+            visitor(slot.as_ptr());
+        }
+    }
+
+    /// Visit the filled embedder root slots.
+    fn trace_embedder_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for slot in &self.embedder_roots {
+            if !slot.get().is_null() {
+                visitor(slot.as_ptr());
+            }
+        }
     }
 
     /// Push an extra runtime root source onto the heap's LIFO
@@ -2052,12 +2091,14 @@ impl GcHeap {
         let global_handles: *const GlobalHandleTable = &*self.global_handles;
         let extra_roots: *const Vec<ExtraRoots> = &self.extra_roots;
         let frame_root_providers: *const FrameRootProviders = &self.frame_root_providers;
+        let embedder_roots: *const Self = self;
         let mut combined = move |visitor: &mut dyn FnMut(*mut RawGc)| {
             // SAFETY: STW pause; raw pointers reconstituted to
             // shared references.
             unsafe {
                 (*handle_stack).visit_slots(visitor);
                 (*global_handles).visit_slots(visitor);
+                (*embedder_roots).trace_embedder_roots(visitor);
             }
             external_visit(visitor);
             // SAFETY: STW pause; the heap owns the registration stack for the
@@ -2415,6 +2456,7 @@ impl GcHeap {
             (*handle_stack).visit_slots(&mut shade);
             (*global_handles).visit_slots(&mut shade);
         }
+        self.trace_embedder_roots(&mut shade);
         external_visit(&mut shade);
         visit_extra_roots_deduped(&self.extra_roots, &mut shade);
         self.frame_root_providers.trace(&mut shade);

@@ -11,7 +11,10 @@
 //!   GC flush invalidates that permission before moving either sampled object.
 //! - Descriptor/shape guards load the live own prototype slot, never a cached
 //!   prototype value. Every uncertain case reaches rooted canonical preparation.
-//! - Header, slots and prototype are initialized before publishing the bump.
+//! - The receiver's shape fixes its prototype: a baked shape is proved to fix
+//!   the live prototype, and a receiver with no initial fields takes the root
+//!   the live prototype caches for its instances.
+//! - Header and slots are initialized before publishing the bump.
 //! - The candidate helper mutates only bytes at or beyond the buffer's `top`;
 //!   the publication helper is the first operation that makes the cell
 //!   observable.
@@ -122,13 +125,11 @@ fn emit_receiver_candidate(
         ; cbz w17, =>guard_miss ; add x17, x12, x17
         ; ldr w11, [x2, view.closure_call_layout.last_instance_byte]
         ; cbz w11, =>guard_miss ; add x13, x12, x11
-        // The last receiver's slot count is its shape's; a dictionary-mode
-        // receiver teaches nothing.
+        // The last receiver's slot count is its shape's; a dictionary shape
+        // counts none, so a dictionary-mode receiver teaches nothing.
         ; ldr w11, [x13, view.object_shape_byte]
-        ; cbz w11, >counted
         ; add x11, x12, x11
         ; ldr w11, [x11, view.shape_property_count_byte]
-        ; counted:
         ; ldrh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
         ; cmp w11, w14 ; csel w14, w11, w14, hi
         ; cmp w14, u32::from(plan.inline_capacity) ; b.hi =>guard_miss
@@ -162,8 +163,8 @@ fn emit_receiver_candidate(
             ; .arch aarch64
             ; cmp w14, w15
             ; b.ne =>guard_miss
-            ; ldr w14, [x13, view.jit_proto_byte]
         );
+        crate::template::arm64::values::emit_load_prototype(ops, view, 14, 13, 12);
         if index + 1 != prototype_count {
             dynasm!(ops
                 ; .arch aarch64
@@ -174,6 +175,29 @@ fn emit_receiver_candidate(
     }
     if prototype_count != 0 {
         dynasm!(ops ; .arch aarch64 ; cbnz w14, =>guard_miss);
+    }
+    // The receiver's shape, into `w4` (the live prototype is no longer needed
+    // once its lineage is proven).
+    if plan.receiver_shape != 0 {
+        emit_load_u64(ops, 14, u64::from(plan.receiver_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x14, x12, x14
+            ; ldr w14, [x14, view.shape_prototype_byte]
+            ; cmp w14, w4
+            ; b.ne =>guard_miss
+        );
+        emit_load_u64(ops, 4, u64::from(plan.receiver_shape));
+    } else {
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x12, x4
+            ; ldr w14, [x13, view.object_exotic_handle_byte]
+            ; cbz w14, =>guard_miss
+            ; add x14, x12, x14
+            ; ldr w4, [x14, view.exotic_instance_root_byte]
+            ; cbz w4, =>guard_miss
+        );
     }
 
     // Only a complete cell fit below the buffer limit may mutate the nursery.
@@ -191,17 +215,16 @@ fn emit_receiver_candidate(
 
     // Initialize the header and the whole fixed body before publishing the
     // bump cursor. The header carries the flag and in-object capacity bytes;
-    // the body is two words: shape + null slab, prototype + null sidecar.
+    // the body is two words: shape + null slab, null sidecar + padding.
     // The receiver shape names exactly the initial fields, so the slot count
     // follows from it. In-object words past the initial fields are never
     // read before a store publishes them.
     emit_load_u64(ops, 14, plan.cell_header_word(cell_bytes));
-    dynasm!(ops ; .arch aarch64 ; str x14, [x16]);
-    emit_load_u64(ops, 14, u64::from(plan.receiver_shape));
     dynasm!(ops
         ; .arch aarch64
-        ; str x14, [x16, view.object_shape_byte]
-        ; str x4, [x16, view.jit_proto_byte]
+        ; str x14, [x16]
+        ; str x4, [x16, view.object_shape_byte]
+        ; str xzr, [x16, view.object_exotic_handle_byte]
     );
     if plan.initial_field_count != 0 {
         emit_load_u64(ops, 14, VALUE_UNDEFINED);

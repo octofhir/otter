@@ -282,8 +282,10 @@ impl Interpreter {
             let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                 receiver.trace_value_slots(visitor);
             };
-            let bag =
-                crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+            let bag = crate::object::alloc_dictionary_object_with_roots(
+                &mut self.gc_heap,
+                &mut external_visit,
+            )?;
             let mut table = self.iterator_user_props.take();
             let stored = self.iterator_side_store(&mut table, key, Value::object(bag));
             self.iterator_user_props = table;
@@ -300,7 +302,10 @@ impl Interpreter {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             receiver.trace_value_slots(visitor);
         };
-        let bag = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+        let bag = crate::object::alloc_dictionary_object_with_roots(
+            &mut self.gc_heap,
+            &mut external_visit,
+        )?;
         // Re-derive the handle after the allocation: the intl body may
         // have moved, but `receiver` was traced across it.
         let intl = receiver

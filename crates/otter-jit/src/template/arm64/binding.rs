@@ -90,9 +90,18 @@ fn emit_global_object_guard(
         ; ldr w14, [x13, view.object_shape_byte]
     );
     if dictionary {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            11,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
         dynasm!(ops
             ; .arch aarch64
-            ; cbnz w14, =>miss
+            ; add x11, x11, x14
+            ; ldrb w11, [x11, view.shape_kind_byte]
+            ; tbz w11, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
             ; ldr w14, [x13, view.object_exotic_handle_byte]
             ; cbz w14, =>miss
         );

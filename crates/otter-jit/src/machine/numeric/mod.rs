@@ -12788,7 +12788,13 @@ mod tests {
         // A zero divisor (NaN) and a zero result of a negative dividend (-0)
         // exit before the result is written.
         let interrupt = 0_u8;
-        for (left, right) in [(5, 0), (0, 0), (-8, 4), (i32::MIN, -1), (i32::MIN, i32::MIN)] {
+        for (left, right) in [
+            (5, 0),
+            (0, 0),
+            (-8, 4),
+            (i32::MIN, -1),
+            (i32::MIN, i32::MIN),
+        ] {
             let code = compile_output(&checked_binary_view(Op::Rem, left, right), None).code;
             let mut fuel = i64::MAX as u64;
             let (result, frame, pc) =

@@ -57,10 +57,14 @@
 //! - Runtime transaction rollback may force-remove only the own data slot that
 //!   still holds its expected published value; it never invokes an accessor or
 //!   removes a replacement installed by re-entrant code.
+//! - Every object has a shape, and the shape fixes its `[[Prototype]]`
+//!   (V8 maps, JSC structures): a keyed shape of its prototype's lineage, or
+//!   that lineage's dictionary shape in dictionary mode. A prototype change is
+//!   a shape change; nothing else stores the prototype.
 //! - GC shape bodies are immutable after allocation; transition tables and
 //!   offset maps live in interpreter-owned side caches.
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
-//!   prototype assignment, and every symbol-property write records
+//!   prototype-changing shape install, and every symbol-property write records
 //!   the store through [`otter_gc::GcHeap::record_write`] so the
 //!   generational and incremental marker observe the new pointer.
 //! - Traced host payloads enumerate the same strong slots for moving-GC
@@ -93,7 +97,7 @@ mod descriptor;
 mod descriptor_core;
 mod key_order;
 mod lookup;
-mod shape_body;
+pub(crate) mod shape_body;
 mod shape_cache;
 #[cfg(test)]
 mod shape_lookup_tests;
@@ -109,7 +113,10 @@ pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
 pub(crate) use shape_body::ShapeBody;
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_body::shape_offset_of_str;
-pub(crate) use shape_body::{SHAPE_BODY_ID_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET};
+pub(crate) use shape_body::{
+    SHAPE_BODY_ID_OFFSET, SHAPE_BODY_KIND_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET,
+    SHAPE_BODY_PROTOTYPE_OFFSET, SHAPE_KIND_DICTIONARY,
+};
 pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
@@ -119,9 +126,8 @@ pub(crate) use shape_transition::{
     capture_store_property_transition_with_shape, replay_store_property_transition,
 };
 
-/// Ids 0 and 1 are reserved: [`ShapeId::UNASSIGNED`] and
-/// [`ShapeId::EMPTY_DICTIONARY`].
-static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(2);
+/// Id 0 is reserved: [`ShapeId::UNASSIGNED`].
+static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_shape_id() -> ShapeId {
     ShapeId(NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed))
@@ -646,12 +652,6 @@ impl ShapeId {
     /// dictionary object's identity.
     pub(crate) const UNASSIGNED: Self = Self(0);
 
-    /// Shared identity of every empty dictionary-mode object without a
-    /// sidecar. Such objects have the same (empty) own key set, so one id
-    /// describes them all, as the root shape does for every empty shaped
-    /// object; the first key allocates the sidecar and a fresh id.
-    pub(crate) const EMPTY_DICTIONARY: Self = Self(1);
-
     /// Raw VM-local id. Exposed to the [`crate::inspect`] snapshot
     /// surface so embedder DTOs can carry a stable identity without
     /// publishing the wrapper type itself.
@@ -786,17 +786,6 @@ pub struct ObjectBody {
     /// owned malloc storage could not be captured into a page image, and a
     /// restored copy would alias the original buffer.
     slab: slot_slab::SlotSlabHandle,
-    /// `[[Prototype]]` — the single source of truth for the common Null /
-    /// ordinary-object case: a bare [`JsObject`] handle, or
-    /// [`otter_gc::Gc::null()`] for a `null` prototype. A non-ordinary
-    /// prototype (`Value` / `Proxy`) sets this to null and stores the real
-    /// prototype in [`ExoticSlots::proto_override`]; [`ObjectBody::prototype`]
-    /// reconstructs the full [`ObjectPrototype`]. The fixed offset
-    /// ([`OBJECT_BODY_JIT_PROTO_OFFSET`]) lets the method-inline guard read the
-    /// handle from machine code and chase the prototype's shape without a
-    /// per-call resolve bridge. Sole writer is [`set_prototype_value`]; traced
-    /// as a distinct GC slot.
-    jit_proto: JsObject,
     /// Lazily-allocated rare/exotic slots — symbol-keyed properties, host
     /// data, native `[[Call]]`/`[[Construct]]`, primitive-wrapper internal
     /// slots, the Date/Error/raw-JSON/arguments markers, and a dictionary-mode
@@ -822,13 +811,13 @@ impl ObjectFlags {
     /// per-slot attributes are guaranteed to match the shape, so attribute
     /// reads short-circuit to the shape. Once set, the materialized
     /// [`ExoticSlots::slots`] are the only authoritative attribute source.
-    /// Always clear for dictionary-mode objects (their shape is null and
-    /// reads use the materialized slots regardless).
+    /// Always clear for dictionary-mode objects (their dictionary shape
+    /// lists no slots, so reads use the materialized slots regardless).
     pub(crate) const SLOT_ATTRS_OVERRIDDEN: u8 = 1 << 1;
     /// The object cannot serve as a guarded link of a prototype chain: its
-    /// `[[Prototype]]` is a Proxy or a non-object value held in
-    /// [`ExoticSlots::proto_override`] (the flat `jit_proto` mirror is then
-    /// null without meaning `null`), or it is a String wrapper whose index
+    /// `[[Prototype]]` is a Proxy or another non-ordinary object its shape
+    /// holds as a value (the shape's compressed prototype word is then null
+    /// without meaning `null`), or it is a String wrapper whose index
     /// and `length` keys live outside its shape, or it owns host data that
     /// can supply namespace properties or mapped argument values outside its
     /// ordinary slots. Generated shape guards test this bit for every chain
@@ -1061,10 +1050,10 @@ impl ExoticSlot {
 /// owns nothing outside the heap.
 #[derive(Default)]
 pub struct ExoticSlots {
-    /// Non-ordinary `[[Prototype]]` (a `Value` or `Proxy`). `None` for the
-    /// common Null / ordinary-object prototype, which is encoded entirely by
-    /// `ObjectBody::jit_proto` (null handle == `null` prototype).
-    proto_override: Option<ObjectPrototype>,
+    /// Root shape of the objects whose `[[Prototype]]` is this object (V8's
+    /// `PrototypeInfo::ObjectCreateMap`), created on first use. The root holds
+    /// this object as its prototype, so the pair lives and dies together.
+    instance_root: ShapeHandle,
     /// Insertion-ordered dictionary keys with their content-hash index,
     /// in a [`DictKeysBody`] of their own — null until the object leaves
     /// fast-shape mode.
@@ -1148,10 +1137,9 @@ impl otter_gc::SafeTraceable for ExoticSlots {
     const TYPE_TAG: u8 = EXOTIC_SLOTS_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
-        match &mut self.proto_override {
-            None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
-            Some(ObjectPrototype::Value(value)) => value.trace_value_slot_mut(v),
-            Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots_mut(v),
+        if !self.instance_root.is_null() {
+            let slot = &mut self.instance_root as *mut ShapeHandle as *mut RawGc;
+            v(slot);
         }
         if !self.symbol_props.is_null() {
             let slot = &mut self.symbol_props as *mut SymbolPropsHandle as *mut RawGc;
@@ -1205,9 +1193,6 @@ impl otter_gc::SafeTraceable for ExoticSlots {
 
 impl ExoticSlots {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
-        if let Some(ObjectPrototype::Value(value)) = &self.proto_override {
-            crate::code_liveness::visit_value(value, visitor);
-        }
         if let Some(value) = &self.call_native {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -2135,7 +2120,7 @@ pub(crate) fn ensure_exotic_with_roots(
         // can hold keys: every sidecar-bearing dictionary object has an id
         // of its own, and its slot-layout epoch starts at the first provable
         // value (appends keep it; `0` would make it unprovable forever).
-        if body.shape.is_null() {
+        if body.is_dictionary() {
             let exotic = body.exotic_mut();
             exotic.dictionary_shape_id = next_shape_id();
             exotic.dictionary_layout = 1;
@@ -2195,11 +2180,6 @@ where
 /// JIT reads the shape handle here for the monomorphic IC guard.
 pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBody, shape);
 
-/// Byte offset of the flat [`ObjectBody::jit_proto`] mirror within an
-/// [`ObjectBody`] payload. The method-inline guard reads the receiver's
-/// prototype handle here to chase the prototype chain in machine code.
-pub(crate) const OBJECT_BODY_JIT_PROTO_OFFSET: usize = std::mem::offset_of!(ObjectBody, jit_proto);
-
 /// Byte offset of the first in-object slot, right after the fixed body.
 /// While the slab handle is null, string-keyed slot `i` is the word at
 /// `OBJECT_BODY_INLINE_VALUES_OFFSET + 8 * i`.
@@ -2219,10 +2199,15 @@ pub(crate) const OBJECT_CELL_INLINE_CAPACITY_BYTE: usize =
     otter_gc::header::HEADER_BODY_BYTES_OFFSET + 1;
 /// Byte offset of a dictionary-mode object's slot-layout epoch inside its
 /// [`ExoticSlots`] payload. Generated proofs about one existing key of a
-/// dictionary-mode object compare this `u32` after proving the shape handle
-/// is absent and the sidecar present.
+/// dictionary-mode object compare this `u32` after proving the shape is a
+/// dictionary shape and the sidecar present.
 pub(crate) const EXOTIC_SLOTS_DICTIONARY_LAYOUT_OFFSET: usize =
     std::mem::offset_of!(ExoticSlots, dictionary_layout);
+
+/// Offset of the instance root a prototype caches for its instances, which
+/// generated receiver allocation installs as a fresh receiver's shape.
+pub(crate) const EXOTIC_SLOTS_INSTANCE_ROOT_OFFSET: usize =
+    std::mem::offset_of!(ExoticSlots, instance_root);
 /// Byte offset of the 4-byte rare-state GC handle inside [`ExoticSlot`].
 /// A zero word proves the complete sidecar is absent.
 pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
@@ -2235,8 +2220,7 @@ pub(crate) const OBJECT_BODY_EXOTIC_HANDLE_OFFSET: usize =
 // deliberately, in lockstep with the JIT, when the body changes.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
 const _: () = assert!(OBJECT_BODY_SLAB_HANDLE_OFFSET == 4);
-const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 8);
-const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 12);
+const _: () = assert!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET == 8);
 const _: () = assert!(OBJECT_CELL_FLAGS_BYTE == 2);
 const _: () = assert!(OBJECT_CELL_INLINE_CAPACITY_BYTE == 3);
 const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 16);
@@ -2245,8 +2229,9 @@ const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET.is_multiple_of(8));
 const _: () = assert!(std::mem::align_of::<ObjectBody>() == 8);
 const _: () = assert!(MAX_INLINE_CAPACITY <= u8::MAX as usize);
 
-// Pin the fixed footprint: shape, slab, prototype and sidecar handles. Every
-// in-object slot follows in the same cell.
+// Pin the fixed footprint: shape, slab and sidecar handles (the prototype is
+// the shape's), padded to the slot alignment. Every in-object slot follows in
+// the same cell.
 const _: () = assert!(std::mem::size_of::<ObjectBody>() == 16);
 
 impl ObjectBody {
@@ -2261,9 +2246,9 @@ impl ObjectBody {
     /// entering dictionary mode, deleting a key, clearing the key set — also
     /// advances the epoch. A dictionary object keeps its keys in the
     /// sidecar, so the sidecar exists whenever the object has a slot; an
-    /// empty object without one stays at [`ShapeId::EMPTY_DICTIONARY`].
+    /// empty object without one carries its dictionary shape's own id.
     fn enter_dictionary_mode(&mut self, append: bool) {
-        let advance_layout = !append || !self.shape.is_null();
+        let advance_layout = !append || !self.is_dictionary();
         self.enter_dictionary_mode_as(next_shape_id(), advance_layout);
     }
 
@@ -2272,9 +2257,10 @@ impl ObjectBody {
     /// slot-layout epoch when `advance_layout`.
     pub(super) fn enter_dictionary_mode_as(&mut self, id: ShapeId, advance_layout: bool) {
         let count = self.slot_count();
+        let dictionary = shape_body::dictionary_of(self.shape);
         if self.exotic.is_null() {
             debug_assert_eq!(count, 0, "a dictionary object with slots owns a sidecar");
-            self.shape = ShapeHandle::null();
+            self.shape = dictionary;
             return;
         }
         let exotic = self.exotic_mut();
@@ -2283,7 +2269,7 @@ impl ObjectBody {
         if advance_layout {
             exotic.dictionary_layout = exotic.dictionary_layout.saturating_add(1);
         }
-        self.shape = ShapeHandle::null();
+        self.shape = dictionary;
     }
 
     /// Advance a dictionary-mode object's slot-layout epoch, saturating at
@@ -2295,16 +2281,14 @@ impl ObjectBody {
         }
     }
 
-    /// Structural id of a dictionary-mode object.
+    /// Structural id of a dictionary-mode object: the sidecar's, or the
+    /// dictionary shape's own id while the object has no key.
     fn dictionary_shape_id(&self) -> ShapeId {
-        exotic_body_of(self.exotic.get()).map_or(ShapeId::EMPTY_DICTIONARY, |exotic| {
+        let empty = shape_body::id_of(self.shape);
+        exotic_body_of(self.exotic.get()).map_or(empty, |exotic| {
             // SAFETY: a non-null handle names a live sidecar payload.
             let id = unsafe { (*exotic).dictionary_shape_id };
-            if id == ShapeId::UNASSIGNED {
-                ShapeId::EMPTY_DICTIONARY
-            } else {
-                id
-            }
+            if id == ShapeId::UNASSIGNED { empty } else { id }
         })
     }
 
@@ -2318,7 +2302,7 @@ impl ObjectBody {
     /// sidecar's dictionary slot count in dictionary mode.
     #[inline]
     pub(crate) fn slot_count(&self) -> usize {
-        if !self.shape.is_null() {
+        if !self.is_dictionary() {
             return shape_body::property_count_of(self.shape) as usize;
         }
         // SAFETY: a non-null handle names a live sidecar payload.
@@ -2331,7 +2315,7 @@ impl ObjectBody {
     #[inline]
     fn set_dictionary_slot_count(&mut self, count: usize) {
         debug_assert!(
-            self.shape.is_null(),
+            self.is_dictionary(),
             "a shaped object's count is its shape's"
         );
         self.exotic_mut().dictionary_slot_count =
@@ -2425,7 +2409,7 @@ impl ObjectBody {
         // SAFETY: the append index is inside the reserved capacity of the
         // active buffer.
         unsafe { *self.values_base().add(index) = value };
-        if self.shape.is_null() {
+        if self.is_dictionary() {
             debug_assert_eq!(self.slot_count(), index, "dictionary append desynced");
             self.set_dictionary_slot_count(index + 1);
         } else {
@@ -2442,7 +2426,7 @@ impl ObjectBody {
     /// dictionary mode, an uncommon path).
     #[inline]
     fn remove_slab_word(&mut self, i: usize) {
-        debug_assert!(self.shape.is_null(), "only dictionary objects remove slots");
+        debug_assert!(self.is_dictionary(), "only dictionary objects remove slots");
         let len = self.slot_count();
         // SAFETY: `i < len <= capacity`; the shift stays inside the live
         // words of whichever buffer is active.
@@ -2527,7 +2511,7 @@ impl ObjectBody {
                 }
             }
             None => {
-                if !self.shape.is_null() {
+                if !self.is_dictionary() {
                     self.set_slot_attrs_overridden(true);
                 }
                 debug_assert!(
@@ -2547,7 +2531,7 @@ impl ObjectBody {
                 // must retire every guard captured under the old id. Only a
                 // slot some compiled proof reads directly moves the slot-layout
                 // epoch those proofs guard.
-                if redefined && self.shape.is_null() {
+                if redefined && self.is_dictionary() {
                     self.exotic_mut().dictionary_shape_id = next_shape_id();
                     if retires_proofs {
                         self.advance_dictionary_layout();
@@ -2566,7 +2550,7 @@ impl ObjectBody {
     /// attribute-overridden objects.
     #[inline]
     fn slot_attrs(&self, heap: &otter_gc::GcHeap, i: usize) -> (PropertyFlags, bool) {
-        if !self.shape.is_null()
+        if !self.is_dictionary()
             && !self.slot_attrs_overridden()
             && let Some(attrs) = shape_body::shape_slot_attrs(heap, self.shape, i as u32)
         {
@@ -2646,17 +2630,35 @@ impl ObjectBody {
     // Reads return the field's default when no `ExoticSlots` is allocated;
     // mutators allocate the box on first write. Plain objects never touch it.
 
-    /// Reconstruct the `[[Prototype]]`. Common case (Null / ordinary object)
-    /// reads only `jit_proto`; a boxed `proto_override` covers Value / Proxy.
+    /// The `[[Prototype]]`, which the shape fixes.
     #[inline]
     fn prototype(&self) -> ObjectPrototype {
-        if let Some(over) = self.exotic().and_then(|e| e.proto_override.as_ref()) {
-            return over.clone();
+        match shape_body::prototype_of(self.shape) {
+            shape_body::ShapePrototype::Null => ObjectPrototype::Null,
+            shape_body::ShapePrototype::Object(object) => ObjectPrototype::Object(object),
+            shape_body::ShapePrototype::Value(value) => match value.as_proxy() {
+                Some(proxy) => ObjectPrototype::Proxy(proxy),
+                None => ObjectPrototype::Value(value),
+            },
         }
-        if self.jit_proto.is_null() {
-            ObjectPrototype::Null
+    }
+
+    /// `true` in dictionary mode: the object's keys live in its sidecar and
+    /// its shape is its lineage's dictionary shape.
+    #[inline]
+    pub(crate) fn is_dictionary(&self) -> bool {
+        shape_body::is_dictionary_of(self.shape)
+    }
+
+    /// The hidden class that fixes this object's layout, or null in
+    /// dictionary mode, where no shape does: every dictionary object of a
+    /// lineage shares one dictionary shape whatever its keys.
+    #[inline]
+    pub(crate) fn keyed_shape(&self) -> ShapeHandle {
+        if self.is_dictionary() {
+            ShapeHandle::null()
         } else {
-            ObjectPrototype::Object(self.jit_proto)
+            self.shape
         }
     }
 
@@ -2790,7 +2792,7 @@ impl ObjectBody {
     /// derives attributes from the hidden class and carries none.
     #[inline]
     fn slots_materialized(&self) -> bool {
-        self.shape.is_null() || self.slot_attrs_overridden()
+        self.is_dictionary() || self.slot_attrs_overridden()
     }
 
     /// Materialized per-slot metadata as a slice (`&[]` when the shape is the
@@ -2824,7 +2826,7 @@ impl ObjectBody {
 impl std::fmt::Debug for ObjectBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectBody")
-            .field("has_shape", &!self.shape.is_null())
+            .field("has_shape", &!self.is_dictionary())
             .field("dictionary_len", &self.dict_key_count())
             .field("shape_cache_mode", &self.shape_cache_mode())
             .field("slot_count", &self.slots().len())
@@ -2863,17 +2865,10 @@ impl ObjectBody {
         // while their handles still carry the capture isolate's offsets,
         // so a trace-entry read of the shape cell would dereference
         // pre-relocation state. The store paths keep the assert.
+        // Every object names its shape, a dictionary object its lineage's
+        // dictionary shape; the shape keeps the prototype alive.
         if !self.shape.is_null() {
             let p = &mut self.shape as *mut ShapeHandle as *mut RawGc;
-            v(p);
-        }
-        // The ordinary-object / null prototype lives solely in the flat
-        // `jit_proto` handle (null == `[[Prototype]]` null); the moving collector
-        // forwards it here so a baked inline guard never decompresses a stale
-        // offset. Non-ordinary (Value / Proxy) prototypes live in the boxed
-        // `proto_override` and are traced by the sidecar.
-        if !self.jit_proto.is_null() {
-            let p = &mut self.jit_proto as *mut JsObject as *mut RawGc;
             v(p);
         }
         // The out-of-line slab is an ordinary GC body: trace the handle so a
@@ -3191,29 +3186,33 @@ impl PendingObject {
     }
 }
 
-fn empty_object_body(capacity: usize) -> PendingObject {
+/// An empty body with `shape` installed: a keyed or root shape, or a
+/// dictionary shape. The shape fixes the object's prototype.
+fn empty_object_body(shape: ShapeHandle, capacity: usize) -> PendingObject {
     debug_assert!(capacity <= MAX_INLINE_CAPACITY);
+    debug_assert_object_shape_handle(shape, "object allocation shape");
+    let opaque = matches!(
+        shape_body::prototype_of(shape),
+        shape_body::ShapePrototype::Value(_)
+    );
     PendingObject {
         body: ObjectBody {
-            shape: ShapeHandle::null(),
+            shape,
             slab: otter_gc::Gc::null(),
-            jit_proto: otter_gc::Gc::null(),
             exotic: ExoticSlot::null(),
         },
-        flags: ObjectFlags::EXTENSIBLE,
+        flags: if opaque {
+            ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE
+        } else {
+            ObjectFlags::EXTENSIBLE
+        },
         capacity: capacity as u8,
     }
 }
 
-fn empty_object_body_with_shape(shape: ShapeHandle, capacity: usize) -> PendingObject {
-    debug_assert_object_shape_handle(shape, "object allocation shape");
-    let mut pending = empty_object_body(capacity);
-    pending.body.shape = shape;
-    pending
-}
-
 fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
-    if cfg!(debug_assertions) && !shape.is_null() {
+    debug_assert!(!shape.is_null(), "an object always has a shape ({context})");
+    if cfg!(debug_assertions) {
         // SAFETY: debug-only invariant check; a non-null shape handle stored in
         // ObjectBody must always address a live ShapeBody cell.
         unsafe {
@@ -3227,12 +3226,6 @@ fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
             );
         }
     }
-}
-
-/// An empty dictionary-mode object: a null shape and no sidecar, so its
-/// identity is the shared [`ShapeId::EMPTY_DICTIONARY`] until its first key.
-fn empty_dictionary_object_body(capacity: usize) -> PendingObject {
-    empty_object_body(capacity)
 }
 
 /// Allocate an ordinary object body in the young generation (old when the
@@ -3277,7 +3270,44 @@ fn alloc_object_body_old(
 pub(crate) fn alloc_object_old_for_fixture(
     heap: &mut GcHeap,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    alloc_object_body_old(heap, empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY))
+    let root = fixture_root_shape(heap)?;
+    alloc_object_body_old(heap, empty_object_body(root, DEFAULT_INLINE_CAPACITY))
+}
+
+/// The heap's `null`-prototype root for raw GC fixtures, created and
+/// installed on a heap no interpreter owns.
+#[cfg(test)]
+pub(crate) fn fixture_root_shape(heap: &mut GcHeap) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    if shape_body::null_root(heap).is_null() {
+        let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let root = shape_body::alloc_root_shape_body_with_roots(
+            heap,
+            shape_body::ShapePrototype::Null,
+            &mut no_roots,
+        )?;
+        shape_body::set_null_root(heap, root);
+    }
+    Ok(shape_body::null_root(heap))
+}
+
+/// A raw heap for fixtures that run heap-only VM code without an
+/// interpreter: it carries the `null`-prototype root that code allocates on.
+#[cfg(test)]
+pub(crate) fn fixture_heap() -> GcHeap {
+    let mut heap = GcHeap::new().expect("heap");
+    fixture_root_shape(&mut heap).expect("null-prototype root");
+    heap
+}
+
+/// An empty `null`-prototype object for GC fixtures, on a heap with or
+/// without an interpreter.
+#[cfg(test)]
+pub(crate) fn alloc_fixture_object_with_roots(
+    heap: &mut GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let root = fixture_root_shape(heap)?;
+    alloc_object_with_roots(heap, root, external_visit)
 }
 
 /// Allocate an empty object directly in non-moving old space.
@@ -3287,25 +3317,39 @@ pub(crate) fn alloc_object_old_for_fixture(
 /// across young scavenges and avoids copying a large, long-lived object on
 /// every minor collection. The empty body holds no GC edges, so no caller
 /// roots are required across the allocation.
-pub(crate) fn alloc_object_old(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
-    alloc_object_body_old(heap, empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY))
+pub(crate) fn alloc_object_old(
+    heap: &mut GcHeap,
+    root: ShapeHandle,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    alloc_object_body_old(heap, empty_object_body(root, DEFAULT_INLINE_CAPACITY))
 }
 
-/// Allocate a fresh empty object through the young-generation allocation path.
+/// Allocate a fresh empty object of `root`'s lineage — whose prototype the
+/// root fixes — through the young-generation allocation path.
 ///
-/// This is intentionally narrower than [`alloc_object`]: callers must provide
-/// every stack/register root the scavenger may need to rewrite if allocation
-/// triggers a minor collection. Use only at VM bytecode allocation sites that
-/// can expose the live frame stack.
+/// Callers must provide every stack/register root the scavenger may need to
+/// rewrite if allocation triggers a minor collection.
 pub(crate) fn alloc_object_with_roots(
     heap: &mut GcHeap,
+    root: ShapeHandle,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     alloc_object_body_with_roots(
         heap,
-        empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY),
+        empty_object_body(root, DEFAULT_INLINE_CAPACITY),
         external_visit,
     )
+}
+
+/// Allocate a fresh empty dictionary-mode object with a `null` prototype:
+/// the heap-only allocation, for callers without a shape runtime to take
+/// transitions through.
+pub(crate) fn alloc_dictionary_object_with_roots(
+    heap: &mut GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let shape = shape_body::dictionary_of(shape_body::null_root(heap));
+    alloc_object_with_roots(heap, shape, external_visit)
 }
 
 /// Allocate a fresh empty object with the given hidden class installed and
@@ -3318,7 +3362,7 @@ pub(crate) fn alloc_object_with_shape_roots(
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     alloc_object_body_with_roots(
         heap,
-        empty_object_body_with_shape(shape, inline_capacity_for(capacity)),
+        empty_object_body(shape, inline_capacity_for(capacity)),
         external_visit,
     )
 }
@@ -3334,7 +3378,6 @@ pub(crate) fn alloc_object_with_shape_roots(
 pub(crate) fn alloc_object_with_shape_and_values_roots(
     heap: &mut GcHeap,
     mut shape: ShapeHandle,
-    mut prototype: Option<JsObject>,
     values: &mut [Value],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
@@ -3345,15 +3388,9 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     );
 
     let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
-    let prototype_slot = prototype
-        .as_mut()
-        .map(|prototype| std::ptr::from_mut(prototype).cast::<RawGc>());
     let mut visit_owner_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
         visitor(shape_slot);
-        if let Some(prototype_slot) = prototype_slot {
-            visitor(prototype_slot);
-        }
     };
 
     let fits_inline = values.len() <= MAX_INLINE_CAPACITY;
@@ -3368,9 +3405,8 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
         mut body,
         flags,
         capacity: capacity_byte,
-    } = empty_object_body_with_shape(shape, capacity);
+    } = empty_object_body(shape, capacity);
     body.slab = slab;
-    body.jit_proto = prototype.unwrap_or_default();
 
     let slab_slot = (!slab.is_null()).then(|| std::ptr::addr_of!(slab).cast_mut().cast::<RawGc>());
     let values_base = values.as_mut_ptr();
@@ -3463,7 +3499,7 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
     shape: ShapeHandle,
     capacity: usize,
 ) -> Option<JsObject> {
-    let pending = empty_object_body_with_shape(shape, inline_capacity_for(capacity));
+    let pending = empty_object_body(shape, inline_capacity_for(capacity));
     let extra = pending.trailing_bytes();
     let PendingObject {
         body,
@@ -3493,12 +3529,13 @@ pub(crate) fn try_alloc_object_with_shape_no_collect(
 /// - <https://tc39.es/ecma262/#sec-error-objects>
 pub(crate) fn alloc_diagnostic_object(
     heap: &mut GcHeap,
+    root: ShapeHandle,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let PendingObject {
         body,
         flags,
         capacity,
-    } = empty_dictionary_object_body(DEFAULT_INLINE_CAPACITY);
+    } = empty_object_body(root, DEFAULT_INLINE_CAPACITY);
     let extra = usize::from(capacity) * std::mem::size_of::<Value>();
     let object = heap.alloc_old_diagnostic_trailing(body, extra)?;
     // No safepoint separates the allocation from this write.
@@ -3513,7 +3550,6 @@ fn host_object_body(shape: ShapeHandle, sidecar: ExoticSlot) -> PendingObject {
         body: ObjectBody {
             shape,
             slab: otter_gc::Gc::null(),
-            jit_proto: otter_gc::Gc::null(),
             exotic: sidecar,
         },
         flags: ObjectFlags::EXTENSIBLE | ObjectFlags::CHAIN_LINK_OPAQUE,
@@ -3543,11 +3579,9 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     };
     let mut slot = ExoticSlot::null();
     slot.set(sidecar);
-    let object = alloc_object_body_with_roots(
-        heap,
-        host_object_body(ShapeHandle::null(), slot),
-        &mut visit,
-    )?;
+    let dictionary = shape_body::dictionary_of(fixture_root_shape(heap)?);
+    let object =
+        alloc_object_body_with_roots(heap, host_object_body(dictionary, slot), &mut visit)?;
     heap.with_payload(sidecar, |exotic| {
         exotic.host_data = Some(HostData::Untraced(Box::new(data)));
         exotic.dictionary_layout = 1;
@@ -3671,7 +3705,7 @@ pub(crate) fn arguments_direct_snapshot(
         if !body.is_arguments_object() || body.host_data_ref().is_some() {
             return None;
         }
-        if body.shape.is_null() {
+        if body.is_dictionary() {
             return None;
         }
         let count = shape_body::shape_property_count(heap, body.shape) as usize;
@@ -3835,7 +3869,7 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 pub(crate) fn dictionary_layout(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<u32> {
     heap.read_payload(obj, |body| {
         let layout = body.dictionary_layout();
-        (body.shape.is_null() && layout != 0 && layout != u32::MAX).then_some(layout)
+        (body.is_dictionary() && layout != 0 && layout != u32::MAX).then_some(layout)
     })
 }
 
@@ -3849,7 +3883,7 @@ pub(crate) fn dictionary_layout(obj: JsObject, heap: &otter_gc::GcHeap) -> Optio
 /// or `slot` has no metadata record.
 pub(crate) fn watch_dictionary_slot(obj: JsObject, heap: &mut otter_gc::GcHeap, slot: u16) -> bool {
     heap.with_payload(obj, |body| {
-        if !body.shape.is_null() || !body.slots_materialized() {
+        if !body.is_dictionary() || !body.slots_materialized() {
             return false;
         }
         match body.slots_mut().entries_mut().get_mut(usize::from(slot)) {
@@ -3884,21 +3918,21 @@ pub(crate) fn data_value_at(obj: JsObject, heap: &otter_gc::GcHeap, slot: u16) -
 }
 
 fn body_shape_id(heap: &otter_gc::GcHeap, body: &ObjectBody) -> ShapeId {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         return heap.read_payload(body.shape, shape_body::ShapeBody::id);
     }
     body.dictionary_shape_id()
 }
 
 fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         return shape_body::shape_property_count(heap, body.shape) as usize;
     }
     body.dict_key_count()
 }
 
 pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u32> {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
         return shape_body::shape_offset_of_str(heap, body.shape, key);
     }
@@ -3917,7 +3951,7 @@ pub(super) fn body_offset_of_atom(
     body: &ObjectBody,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<u32> {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         if key.atom().id() == crate::property_atom::AtomId::NONE {
             return None;
         }
@@ -3928,14 +3962,10 @@ pub(super) fn body_offset_of_atom(
 }
 
 /// Number of own string-keyed properties recorded in a fast-mode
-/// shape (`0` for the null/dictionary shape). Used to decide when an
-/// object should normalize to dictionary storage.
+/// shape (`0` for a dictionary shape). Used to decide when an object should
+/// normalize to dictionary storage.
 pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) -> u32 {
-    if shape.is_null() {
-        0
-    } else {
-        shape_body::shape_property_count(heap, shape)
-    }
+    shape_body::shape_property_count(heap, shape)
 }
 
 /// Maximum number of own properties an object keeps in fast
@@ -3980,7 +4010,7 @@ pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
 }
 
 fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) -> bool {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         return u32::try_from(offset)
             .ok()
             .and_then(|offset| shape_body::shape_key_at_offset(heap, body.shape, offset))
@@ -3990,7 +4020,7 @@ fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) ->
 }
 
 fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, key: &str) -> bool {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         return u32::try_from(offset).ok().is_some_and(|offset| {
             shape_body::shape_key_matches_str(heap, body.shape, offset, key)
         });
@@ -4136,7 +4166,7 @@ pub(crate) fn lookup_own_atom(
             // by name every time.
             let hit = u16::try_from(offset).ok().map(|slot| AtomOwnPropertyHit {
                 shape_id: body_shape_id(heap, body),
-                shape: body.shape,
+                shape: body.keyed_shape(),
                 atom_id: key.atom().id(),
                 slot,
                 is_data: matches!(lookup, PropertyLookup::Data { .. }),
@@ -4165,7 +4195,7 @@ pub(crate) fn load_own_data_slot_atom(
         // slot, so the cached `slot` is valid. Dictionary mode (null handle)
         // reuses a per-object shape id that does not bump on every slot
         // mutation, so it still confirms the id and the key by name.
-        let shaped = !body.shape.is_null();
+        let shaped = !body.is_dictionary();
         let shape_ok = if shaped {
             shaped_hit_matches(body.shape, &hit)
         } else {
@@ -4242,7 +4272,7 @@ pub(crate) fn load_own_data_slot_by_shape(
     hit: AtomOwnPropertyHit,
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
-        if body.shape.is_null()
+        if body.is_dictionary()
             || !shaped_hit_matches(body.shape, &hit)
             || !hit.is_data
             || !matches!(body.shape_cache_mode(), ShapeCacheMode::Fast)
@@ -4279,7 +4309,7 @@ pub(crate) fn store_own_data_slot_atom(
     // reuse the caller's receiver.
     let guard_matches = heap.read_payload(obj, |body| {
         let offset = hit.slot as usize;
-        let shape_ok = if !body.shape.is_null() {
+        let shape_ok = if !body.is_dictionary() {
             shaped_hit_matches(body.shape, &hit)
         } else {
             body_shape_id(heap, body) == hit.shape_id
@@ -4291,10 +4321,10 @@ pub(crate) fn store_own_data_slot_atom(
         // matching fast shape fixes every slot's attributes, so neither the
         // chain walk for this slot's attributes nor the bounds need
         // consulting. Dictionary storage and overridden descriptors still do.
-        if !body.shape.is_null() && !body.slot_attrs_overridden() {
+        if !body.is_dictionary() && !body.slot_attrs_overridden() {
             return true;
         }
-        let key_matches = !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
+        let key_matches = !body.is_dictionary() || body_key_matches(heap, body, offset, key.name());
         let slot_attrs =
             (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset));
         key_matches
@@ -5041,21 +5071,36 @@ pub(crate) fn set_deferred_namespace_populated(obj: JsObject, heap: &otter_gc::G
     });
 }
 
-/// Borrow the GC-managed hidden class, if installed.
+/// The object's hidden class: a keyed shape, or its lineage's dictionary
+/// shape in dictionary mode.
 #[must_use]
 pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
     heap.read_payload(obj, |body| body.shape)
+}
+
+/// The hidden class that fixes the object's layout, or null in dictionary
+/// mode. Caches and generated guards that prove a layout by shape identity
+/// must name this, never the lineage's shared dictionary shape.
+#[must_use]
+pub(crate) fn keyed_shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
+    heap.read_payload(obj, ObjectBody::keyed_shape)
+}
+
+/// `true` when the object is in dictionary mode.
+#[must_use]
+pub(crate) fn is_dictionary(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, ObjectBody::is_dictionary)
 }
 
 /// Invariant check after a shape-advancing append: the hidden class must
 /// record `(flags, is_accessor)` for the freshly appended slot at the new last
 /// offset. A shaped object carries no per-slot metadata of its own, so the
 /// shape is the sole attribute source and must own that offset. Dictionary-mode
-/// objects (null shape) are skipped. Debug-only.
+/// objects are skipped. Debug-only.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_appended_shape_slot(obj: JsObject, heap: &otter_gc::GcHeap) {
     let shape = shape(obj, heap);
-    if shape.is_null() {
+    if shape_body::is_dictionary_of(shape) {
         return;
     }
     heap.read_payload(obj, |body| {
@@ -5385,15 +5430,151 @@ pub(crate) fn ordinary_set_data_property_with_shape(
     success
 }
 
-/// Replace the prototype with a spec-legal value. `None` or
-/// `Some(Value::null())` detaches the chain.
+/// The root shape cached on the prototype `proto` for its instances.
+#[must_use]
+pub(crate) fn cached_instance_root(
+    proto: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<ShapeHandle> {
+    heap.read_payload(proto, |body| {
+        body.exotic()
+            .map(|exotic| exotic.instance_root)
+            .filter(|root| !root.is_null())
+    })
+}
+
+/// Cache `root` on the prototype `proto` for its instances; the sidecar may
+/// be allocated, moving `proto`.
+pub(crate) fn cache_instance_root(
+    proto: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    root: ShapeHandle,
+) -> Result<(), otter_gc::OutOfMemory> {
+    ensure_exotic(proto, heap)?;
+    heap.with_payload(*proto, |body| body.exotic_mut().instance_root = root);
+    let sidecar = heap.read_payload(*proto, |body| body.exotic.get());
+    heap.record_write(sidecar, &root);
+    Ok(())
+}
+
+/// What §10.1.2.1 OrdinarySetPrototypeOf decides before a prototype change.
+#[derive(Debug, Clone)]
+pub(crate) enum PrototypeChange {
+    /// Step 4: the prototype already is `proto`.
+    Unchanged,
+    /// Steps 5 and 8: the object is non-extensible, or `proto`'s chain
+    /// reaches the object.
+    Rejected,
+    /// The object's shape moves to `proto`'s lineage.
+    To(ObjectPrototype),
+}
+
+/// §10.1.2.1 OrdinarySetPrototypeOf steps 4–8 for `obj` and `proto`
+/// (`None` or a `null` value for `null`). A primitive `proto` is rejected;
+/// callers raise the spec's `TypeError` for a `false` answer.
 ///
-/// Implements `OrdinarySetPrototypeOf` per ECMA-262 §10.1.2.1 — the
-/// `SameValue(V, current)` early-return, the non-extensibility
-/// guard, and the new-prototype cycle walk. Returns `false` for any
-/// abrupt outcome so callers (the `__proto__` setter,
-/// `Object.setPrototypeOf`, `Reflect.setPrototypeOf`) can raise the
-/// spec-mandated `TypeError`.
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinarysetprototypeof>
+pub(crate) fn prototype_change(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    proto: Option<Value>,
+) -> PrototypeChange {
+    let new_proto = match proto {
+        None => ObjectPrototype::Null,
+        Some(value) if value.is_null() => ObjectPrototype::Null,
+        Some(value) => {
+            if let Some(o) = value.as_object() {
+                ObjectPrototype::Object(o)
+            } else if let Some(p) = value.as_proxy() {
+                ObjectPrototype::Proxy(p)
+            } else if value.is_object_type() {
+                ObjectPrototype::Value(value)
+            } else {
+                return PrototypeChange::Rejected;
+            }
+        }
+    };
+    // Step 4 — `SameValue(V, current) is true → return true`.
+    let current = heap.read_payload(obj, |body| body.prototype());
+    if prototype_same(&current, &new_proto) {
+        return PrototypeChange::Unchanged;
+    }
+    // Step 5 — non-extensible objects reject any change.
+    if !is_extensible(obj, heap) {
+        return PrototypeChange::Rejected;
+    }
+    // Step 8 — walk the new chain; abort when a hop lands back on `obj`
+    // (cycle) or strays past `PROTO_CHAIN_HARD_CAP` (a safety net for
+    // adversarial inputs). Non-ordinary prototypes (Proxy / Value) end the
+    // walk per step 8.c.i: their `[[GetPrototypeOf]]` is not
+    // `OrdinaryGetPrototypeOf`.
+    let mut cursor = new_proto.clone();
+    let mut hops = 0usize;
+    loop {
+        match cursor {
+            ObjectPrototype::Null => break,
+            ObjectPrototype::Object(p) => {
+                if p == obj || hops >= PROTO_CHAIN_HARD_CAP {
+                    return PrototypeChange::Rejected;
+                }
+                hops += 1;
+                cursor = heap.read_payload(p, |body| body.prototype());
+            }
+            ObjectPrototype::Proxy(_) | ObjectPrototype::Value(_) => break,
+        }
+    }
+    PrototypeChange::To(new_proto)
+}
+
+/// Install `shape` — the object's layout replayed on a new prototype's
+/// lineage, or that lineage's dictionary shape for a dictionary object —
+/// completing a prototype change. A dictionary object takes a fresh
+/// structural identity and slot-layout epoch, since its old identity named
+/// the old prototype.
+pub(crate) fn install_prototype_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    shape: ShapeHandle,
+) {
+    debug_assert_object_shape_handle(shape, "prototype change");
+    heap.with_payload(obj, |body| {
+        let dictionary = body.is_dictionary();
+        debug_assert_eq!(
+            dictionary,
+            shape_body::is_dictionary_of(shape),
+            "a prototype change keeps the object's storage mode",
+        );
+        debug_assert!(
+            dictionary || body.slot_count() == shape_body::property_count_of(shape) as usize,
+            "a prototype change keeps the object's slots",
+        );
+        body.shape = shape;
+        if dictionary {
+            body.enter_dictionary_mode_as(next_shape_id(), true);
+        }
+        let opaque_prototype = matches!(
+            shape_body::prototype_of(shape),
+            shape_body::ShapePrototype::Value(_)
+        );
+        body.set_chain_link_opaque(
+            body.string_data().is_some() || body.host_data_ref().is_some() || opaque_prototype,
+        );
+    });
+    // The new lineage may be unmarked while the object is already marked.
+    heap.record_write(obj, &shape);
+}
+
+/// §10.1.2.1 OrdinarySetPrototypeOf without a shape runtime — for heap-only
+/// installers. `None` or a `null` value detaches the chain; `false` is the
+/// spec's rejection, which callers raise as a `TypeError`.
+///
+/// The object moves to the new prototype's lineage: an object with no keys
+/// yet to its root, a dictionary object to its dictionary shape. With no
+/// transition table to replay keys through, a keyed object normalizes to
+/// dictionary storage; [`crate::Interpreter::set_ordinary_prototype`] keeps it
+/// keyed.
 ///
 /// # Spec
 ///
@@ -5403,105 +5584,122 @@ pub fn set_prototype_value(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) -> bool {
-    let mut obj = obj;
-    let new_proto = if let Some(value) = proto {
-        if value.is_null() {
-            ObjectPrototype::Null
-        } else if let Some(o) = value.as_object() {
-            ObjectPrototype::Object(o)
-        } else if let Some(p) = value.as_proxy() {
-            ObjectPrototype::Proxy(p)
-        } else if value.is_object_type() {
-            ObjectPrototype::Value(value)
-        } else {
-            return false;
-        }
-    } else {
-        ObjectPrototype::Null
+    let new_proto = match prototype_change(obj, heap, proto) {
+        PrototypeChange::Unchanged => return true,
+        PrototypeChange::Rejected => return false,
+        PrototypeChange::To(prototype) => prototype,
     };
-    if matches!(
-        new_proto,
-        ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)
-    ) {
-        // Only a non-ordinary prototype lives in the sidecar; Null and
-        // ordinary objects are encoded entirely by `jit_proto`, and
-        // clearing a stale override needs no sidecar to exist. Reserved
-        // here, outside the payload borrow, because creating it
-        // allocates — and this may move `obj`, hence the `mut` local.
-        ensure_exotic(&mut obj, heap).expect("exotic sidecar");
-    }
-    // §10.1.2.1 step 4 — `SameValue(V, current) is true → return true`.
-    let current = heap.read_payload(obj, |body| body.prototype());
-    if prototype_same(&current, &new_proto) {
+    // Heap-only callers hold bare handles: nothing here may collect.
+    let _no_collection = heap.always_allocate_scope();
+    let root = heap_instance_root(&new_proto, heap).expect("prototype root shape");
+    let shape = shape(obj, heap);
+    if !shape_body::is_dictionary_of(shape) && shape_body::property_count_of(shape) == 0 {
+        // An object with no keys yet moves to the new lineage's root.
+        install_prototype_shape(obj, heap, root);
         return true;
     }
-    // §10.1.2.1 step 5 — non-extensible objects reject any change.
-    if !is_extensible(obj, heap) {
-        return false;
-    }
-    // §10.1.2.1 step 8 — walk the new chain; abort with `false` if
-    // any hop lands back on `obj` (cycle) or strays past
-    // `PROTO_CHAIN_HARD_CAP` (foundation safety net for adversarial
-    // inputs). Non-ordinary prototypes (Proxy / Value variants)
-    // terminate the walk per step 8.c.i — their `[[GetPrototypeOf]]`
-    // is not `OrdinaryGetPrototypeOf`, so the spec stops following
-    // the chain.
-    let mut cursor = new_proto.clone();
-    let mut hops = 0usize;
-    loop {
-        match cursor {
-            ObjectPrototype::Null => break,
-            ObjectPrototype::Object(p) => {
-                if p == obj {
-                    return false;
-                }
-                if hops >= PROTO_CHAIN_HARD_CAP {
-                    return false;
-                }
-                hops += 1;
-                cursor = heap.read_payload(p, |body| body.prototype());
+    let mut obj = obj;
+    normalize_to_dictionary(&mut obj, heap);
+    install_prototype_shape(obj, heap, shape_body::dictionary_of(root));
+    true
+}
+
+/// [`set_prototype_value`] for an ordinary object or `null` prototype.
+pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
+    set_prototype_value(obj, heap, proto.map(Value::object));
+}
+
+/// The root shape of objects created with the ordinary `prototype` (or
+/// `null`) in a heap-only context. Nothing here collects.
+pub(crate) fn root_for_prototype(
+    heap: &mut otter_gc::GcHeap,
+    prototype: Option<JsObject>,
+) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    let _no_collection = heap.always_allocate_scope();
+    heap_instance_root(
+        &prototype.map_or(ObjectPrototype::Null, ObjectPrototype::Object),
+        heap,
+    )
+}
+
+/// The root shape of objects created with the prototype value `proto`
+/// (`None` or `null` for none) in a heap-only context. Nothing here collects.
+pub(crate) fn root_for_prototype_value(
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    let _no_collection = heap.always_allocate_scope();
+    heap_instance_root(&object_prototype_of_value(proto), heap)
+}
+
+/// The prototype value `proto` (`None`, `null` or `undefined` for none, else
+/// an object value) as an object's `[[Prototype]]`.
+pub(crate) fn object_prototype_of_value(proto: Option<Value>) -> ObjectPrototype {
+    match proto {
+        None => ObjectPrototype::Null,
+        Some(value) if value.is_null() || value.is_undefined() => ObjectPrototype::Null,
+        Some(value) => {
+            if let Some(object) = value.as_object() {
+                ObjectPrototype::Object(object)
+            } else if let Some(proxy) = value.as_proxy() {
+                ObjectPrototype::Proxy(proxy)
+            } else {
+                ObjectPrototype::Value(value)
             }
-            ObjectPrototype::Proxy(_) | ObjectPrototype::Value(_) => break,
         }
     }
-    let barrier_value = new_proto.as_value();
-    let jit_proto = match &new_proto {
-        ObjectPrototype::Object(o) => *o,
-        ObjectPrototype::Null | ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => {
-            otter_gc::Gc::null()
+}
+
+/// `prototype`'s root shape without a shape runtime: the `null`-prototype
+/// root, the one cached on an ordinary prototype (created and cached on first
+/// use), or a fresh root. The runtime registers such a root when it next
+/// meets it.
+fn heap_instance_root(
+    prototype: &ObjectPrototype,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+    let shape_prototype = match *prototype {
+        ObjectPrototype::Null => return Ok(shape_body::null_root(heap)),
+        ObjectPrototype::Object(mut proto) => {
+            if let Some(root) = cached_instance_root(proto, heap) {
+                return Ok(root);
+            }
+            let root = shape_body::alloc_root_shape_body_with_roots(
+                heap,
+                shape_body::ShapePrototype::Object(proto),
+                &mut no_roots,
+            )?;
+            cache_instance_root(&mut proto, heap, root)?;
+            return Ok(root);
         }
+        ObjectPrototype::Value(value) => shape_body::ShapePrototype::Value(value),
+        ObjectPrototype::Proxy(proxy) => shape_body::ShapePrototype::Value(Value::proxy(proxy)),
     };
-    heap.with_payload(obj, |body| {
-        body.jit_proto = jit_proto;
-        body.set_chain_link_opaque(
-            body.string_data().is_some()
-                || body.host_data_ref().is_some()
-                || matches!(
-                    new_proto,
-                    ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_)
-                ),
-        );
-        match &new_proto {
-            // Common case: encoded entirely by `jit_proto`; drop any stale
-            // non-ordinary override so the object carries no exotic box for it.
-            ObjectPrototype::Null | ObjectPrototype::Object(_) => {
-                if let Some(exotic) = exotic_body_of(body.exotic.get()).map(|e|
-            // SAFETY: a non-null handle names a live sidecar payload.
-            unsafe { &mut *e })
-                {
-                    exotic.proto_override = None;
-                }
-            }
-            // Non-ordinary prototype: store it in the boxed override.
-            ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => {
-                body.exotic_mut().proto_override = Some(new_proto.clone());
-            }
+    shape_body::alloc_root_shape_body_with_roots(heap, shape_prototype, &mut no_roots)
+}
+
+/// Move a keyed object's string-keyed properties into dictionary storage,
+/// keeping their order, values and attributes. A dictionary object is left
+/// as is.
+fn normalize_to_dictionary(obj: &mut JsObject, heap: &mut otter_gc::GcHeap) {
+    if is_dictionary(*obj, heap) {
+        return;
+    }
+    let keys = heap.read_payload(*obj, |body| string_keys_in_shape_order(heap, body));
+    materialize_slots(*obj, heap);
+    let table = dict_keys_table_for_install(obj, heap, &Some(keys), "", &mut [])
+        .expect("dictionary key table");
+    heap.with_payload(*obj, |body| {
+        body.enter_dictionary_mode(false);
+        if let Some(table) = table {
+            body.exotic_mut().dictionary_keys = table;
         }
     });
-    if let Some(value) = &barrier_value {
-        record_exotic_write(heap, obj, value);
+    if let Some(table) = table {
+        let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
+        heap.record_write(sidecar, &table);
     }
-    true
 }
 
 fn prototype_same(a: &ObjectPrototype, b: &ObjectPrototype) -> bool {
@@ -5522,15 +5720,6 @@ fn same_prototype_value(a: &Value, b: &Value) -> bool {
         return crate::array::ptr_eq(x, y);
     }
     false
-}
-
-/// Replace the prototype with an ordinary object or `null`.
-///
-/// This compatibility helper preserves existing call sites that do
-/// not need Proxy-as-prototype support.
-pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
-    let value = proto.map(Value::object);
-    set_prototype_value(obj, heap, value);
 }
 
 /// Remove an own property. Per ECMA-262 §10.1.10 OrdinaryDelete:
@@ -6741,7 +6930,7 @@ impl<'a> Properties<'a> {
 }
 
 fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<(String, usize)> {
-    let insertion_order = if !body.shape.is_null() {
+    let insertion_order = if !body.is_dictionary() {
         shape_body::shape_keys_ordered(heap, body.shape)
             .into_iter()
             .map(|(key, offset)| {
@@ -6801,7 +6990,7 @@ pub(crate) fn dictionary_ordered_slot_attrs(
     heap: &otter_gc::GcHeap,
 ) -> Option<Vec<(String, PropertyFlags, bool)>> {
     heap.read_payload(obj, |body| {
-        if !body.shape.is_null() || !shape_cache::supports_fast_property_ic(body) {
+        if !body.is_dictionary() || !shape_cache::supports_fast_property_ic(body) {
             return None;
         }
         let count = body.dict_key_count();
@@ -6883,7 +7072,7 @@ pub(crate) fn shape_ordered_slot_attrs(
 }
 
 fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<String> {
-    if !body.shape.is_null() {
+    if !body.is_dictionary() {
         return shape_body::shape_keys_ordered(heap, body.shape)
             .into_iter()
             .map(|(key, _)| String::from_utf16_lossy(&to_utf16_vec(heap, key)))
@@ -6905,7 +7094,7 @@ fn dictionary_keys_for_shape_transition(
         return None;
     }
     heap.read_payload(obj, |body| {
-        (!body.shape.is_null()).then(|| string_keys_in_shape_order(heap, body))
+        (!body.is_dictionary()).then(|| string_keys_in_shape_order(heap, body))
     })
 }
 
@@ -6925,7 +7114,7 @@ fn slot_metas_for_shape_transition(
         return None;
     }
     heap.read_payload(obj, |body| {
-        (!body.shape.is_null()).then(|| materialized_slot_metas(heap, body))
+        (!body.is_dictionary()).then(|| materialized_slot_metas(heap, body))
     })
 }
 
@@ -7055,7 +7244,7 @@ mod tests {
     fn jit_semantic_guard_layout_is_frozen() {
         assert_eq!(OBJECT_CELL_FLAGS_BYTE, 2);
         assert_eq!(OBJECT_CELL_INLINE_CAPACITY_BYTE, 3);
-        assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 12);
+        assert_eq!(OBJECT_BODY_EXOTIC_HANDLE_OFFSET, 8);
         assert_eq!(std::mem::size_of::<ExoticHandle>(), 4);
         let bits = [
             ObjectFlags::EXTENSIBLE,
@@ -7073,7 +7262,7 @@ mod tests {
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(is_empty(o, &heap));
         assert_eq!(len(o, &heap), 0);
-        assert!(shape(o, &heap).is_null());
+        assert_eq!(shape(o, &heap), shape_body::null_root(&heap));
     }
 
     #[test]
@@ -7083,7 +7272,7 @@ mod tests {
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
 
-        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+        assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
     }
 
     #[test]
@@ -7147,7 +7336,7 @@ mod tests {
                 .set_property(o, &key, Value::number_i32(i as i32))
                 .expect("set fast property");
         }
-        assert!(!shape(o, interp.gc_heap()).is_null());
+        assert!(!is_dictionary(o, interp.gc_heap()));
 
         set(
             &mut o,
@@ -7156,7 +7345,7 @@ mod tests {
             Value::boolean(true),
         );
 
-        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
             get_own(o, interp.gc_heap(), "p0"),
             Some(Value::number_i32(0))
@@ -7185,7 +7374,7 @@ mod tests {
             .string_prototype()
             .expect("realm String.prototype");
         assert!(
-            shape(prototype, interp.gc_heap()).is_null(),
+            is_dictionary(prototype, interp.gc_heap()),
             "a String wrapper prototype stays in dictionary mode"
         );
         let original = shape_id(prototype, interp.gc_heap());
@@ -7231,12 +7420,6 @@ mod tests {
             .gc_heap()
             .read_payload(shape_handle, shape_body::ShapeBody::id);
         assert_eq!(shape_id(o, interp.gc_heap()), installed_shape_id);
-        assert_ne!(
-            shape_id(o, interp.gc_heap()),
-            interp
-                .gc_heap()
-                .read_payload(o, ObjectBody::dictionary_shape_id)
-        );
     }
 
     #[test]
@@ -7328,7 +7511,7 @@ mod tests {
 
         assert!(delete(o, interp.gc_heap_mut(), "a"));
 
-        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(is_dictionary(o, interp.gc_heap()));
         assert!(get(o, interp.gc_heap(), "a").is_none());
         assert!(get(o, interp.gc_heap(), "b").is_some_and(|v| v.is_null()));
     }
@@ -7352,7 +7535,7 @@ mod tests {
         )
         .expect("transition install");
 
-        assert!(shape(first, interp.gc_heap()).is_null());
+        assert!(is_dictionary(first, interp.gc_heap()));
         assert_eq!(
             get_own(first, interp.gc_heap(), "x"),
             Some(Value::boolean(true))
@@ -7361,7 +7544,10 @@ mod tests {
         let second = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("second object");
-        assert_eq!(shape(second, interp.gc_heap()), interp.shape_root());
+        assert_eq!(
+            shape(second, interp.gc_heap()),
+            interp.null_prototype_root()
+        );
 
         assert_eq!(
             replay_store_property_transition(
@@ -7375,7 +7561,7 @@ mod tests {
             Some(())
         );
 
-        assert!(shape(second, interp.gc_heap()).is_null());
+        assert!(is_dictionary(second, interp.gc_heap()));
         assert_eq!(get_own(second, interp.gc_heap(), "x"), Some(Value::null()));
     }
 
@@ -7385,11 +7571,11 @@ mod tests {
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
-        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+        assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
         set(&mut o, interp.gc_heap_mut(), "x", Value::boolean(true));
 
-        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
             Some(Value::boolean(true))
@@ -7402,7 +7588,7 @@ mod tests {
         let o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
-        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+        assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
         assert!(ordinary_set_data_property(
             o,
@@ -7411,7 +7597,7 @@ mod tests {
             Value::boolean(true)
         ));
 
-        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
             Some(Value::boolean(true))
@@ -7424,7 +7610,7 @@ mod tests {
         let o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
-        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+        assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
         assert!(define_own_property(
             o,
@@ -7433,7 +7619,7 @@ mod tests {
             PropertyDescriptor::data(Value::boolean(true), true, true, true),
         ));
 
-        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
             Some(Value::boolean(true))
@@ -7446,7 +7632,7 @@ mod tests {
         let mut o = interp
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
-        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+        assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
         let descriptor = PartialPropertyDescriptor {
             value: Some(Value::boolean(true)),
             writable: Some(true),
@@ -7462,7 +7648,7 @@ mod tests {
             descriptor,
         ));
 
-        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(is_dictionary(o, interp.gc_heap()));
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
             Some(Value::boolean(true))
@@ -7574,8 +7760,10 @@ mod tests {
     fn raw_atom_add_transition_rejects_unshared_dictionary_shape() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
+        // A raw key store moves each receiver to its own dictionary layout.
+        set(&mut first, &mut heap, "own", Value::null());
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7588,8 +7776,9 @@ mod tests {
             StorePropertyTransitionKind::PrototypeChainMissing { .. }
         ));
 
-        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
+        set(&mut second, &mut heap, "own", Value::null());
 
         assert_eq!(
             replay_store_property_transition(
@@ -7679,8 +7868,10 @@ mod tests {
         let mut heap = fresh_heap();
         let mut proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(&mut proto, &mut heap, "x", Value::boolean(true));
-        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
+        // A raw key store moves each receiver to its own dictionary layout.
+        set(&mut first, &mut heap, "own", Value::null());
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
             "x",
@@ -7693,8 +7884,9 @@ mod tests {
             StorePropertyTransitionKind::DirectPrototypeWritableData { .. }
         ));
 
-        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let mut second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
+        set(&mut second, &mut heap, "own", Value::null());
 
         assert_eq!(
             replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),)

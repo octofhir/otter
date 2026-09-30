@@ -1068,9 +1068,18 @@ impl Interpreter {
     fn arguments_object_direct_list(&self, value: Value) -> Option<SmallVec<[Value; 8]>> {
         let obj = value.as_object()?;
         let (shape, argc) = crate::object::arguments_direct_snapshot(obj, &self.gc_heap)?;
+        // The cached shapes grow from `%Object.prototype%` roots, which the
+        // prototype itself caches.
+        let crate::object::shape_body::ShapePrototype::Object(prototype) =
+            crate::object::shape_body::prototype_of(shape)
+        else {
+            return None;
+        };
+        let root = crate::object::cached_instance_root(prototype, &self.gc_heap)?;
+        let root_id = crate::object::shape_body::id_of(root);
         let canonical = [true, false].into_iter().any(|mapped| {
             self.arguments_shape_cache
-                .get(&(argc as u32, mapped))
+                .get(&(argc as u32, mapped, root_id))
                 .is_some_and(|cached| cached.offset() == shape.offset())
         });
         if !canonical {

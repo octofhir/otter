@@ -1137,8 +1137,10 @@ impl Interpreter {
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     p_value.trace_value_slots(visitor);
                 };
-                let bag =
-                    crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+                let bag = crate::object::alloc_dictionary_object_with_roots(
+                    &mut self.gc_heap,
+                    &mut external_visit,
+                )?;
                 p.set_expando(&mut self.gc_heap, bag);
                 bag
             };

@@ -130,7 +130,7 @@ impl PropertyLookupCache {
         heap: &otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<Entry> {
-        if object::shape(obj, heap).is_null() {
+        if object::is_dictionary(obj, heap) {
             return None;
         }
         let receiver_shape = object::shape_id(obj, heap);
@@ -207,7 +207,7 @@ impl PropertyLookupCache {
         key: AtomizedPropertyKey<'_>,
         resolved: Option<&cache_ir::ResolvedDataSlot>,
     ) {
-        if object::shape(obj, heap).is_null() {
+        if object::is_dictionary(obj, heap) {
             return;
         }
         let receiver_shape = object::shape_id(obj, heap);
@@ -228,16 +228,25 @@ impl PropertyLookupCache {
     }
 }
 
-/// Direct-mapped `(receiver shape, prototype shape, atom)` → add-property
+/// Sets in the add-property transition table. Power of two so the index is a
+/// mask.
+const TRANSITION_SETS: usize = 512;
+/// Ways per transition set, most recently recorded first.
+const TRANSITION_WAYS: usize = 4;
+
+/// Set-associative `(receiver shape, prototype shape, atom)` → add-property
 /// transition table.
 ///
 /// A store site that has gone megamorphic stops installing its own
 /// transitions; without this table every property-adding store at such a site
 /// would repeat the complete `[[Set]]` walk. Sites share the entries, exactly
 /// as V8's megamorphic stub cache shares transition handlers. A hidden class
-/// here does not fix the prototype, unlike a V8 map, so the direct
-/// prototype's class joins the key: sibling subclasses sharing one receiver
-/// layout would otherwise evict each other's prototype-chain guards.
+/// fixes its prototype, so class hierarchies give every subclass its own
+/// receiver lineage and one base-constructor store site sees as many keys as
+/// there are subclasses; the ways absorb the index collisions a direct-mapped
+/// table would thrash on (V8 backs its primary stub cache with a secondary
+/// table for the same reason). The direct prototype's class stays in the key:
+/// it is what the recorded missing-key chain was proven against.
 #[derive(Debug)]
 pub(crate) struct StoreTransitionCache {
     ways: Box<[Option<(ShapeId, object::StorePropertyTransition)>]>,
@@ -301,9 +310,10 @@ impl StoreTransitionJitEntry {
 
 impl Default for StoreTransitionCache {
     fn default() -> Self {
+        let entries = TRANSITION_SETS * TRANSITION_WAYS;
         Self {
-            ways: (0..CAPACITY).map(|_| None).collect(),
-            jit_ways: (0..CAPACITY)
+            ways: (0..entries).map(|_| None).collect(),
+            jit_ways: (0..entries)
                 .map(|_| Cell::new(StoreTransitionJitEntry::EMPTY))
                 .collect(),
         }
@@ -311,14 +321,34 @@ impl Default for StoreTransitionCache {
 }
 
 impl StoreTransitionCache {
-    fn index(receiver_shape: ShapeId, prototype_shape: ShapeId, atom: AtomId) -> usize {
+    /// First entry of the set a key hashes to.
+    fn set_start(receiver_shape: ShapeId, prototype_shape: ShapeId, atom: AtomId) -> usize {
         let mixed = receiver_shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
             ^ prototype_shape
                 .raw()
                 .wrapping_mul(HASH_ATOM_MULTIPLIER)
                 .rotate_left(17)
             ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
-        ((mixed >> HASH_SHIFT) as usize) & (CAPACITY - 1)
+        (((mixed >> HASH_SHIFT) as usize) & (TRANSITION_SETS - 1)) * TRANSITION_WAYS
+    }
+
+    /// The entry recording this key, if its set holds one.
+    fn find(
+        &self,
+        receiver_shape: ShapeId,
+        prototype_shape: ShapeId,
+        atom: AtomId,
+    ) -> Option<&object::StorePropertyTransition> {
+        let start = Self::set_start(receiver_shape, prototype_shape, atom);
+        self.ways[start..start + TRANSITION_WAYS]
+            .iter()
+            .flatten()
+            .find(|(recorded_prototype, transition)| {
+                transition.from_shape_id == receiver_shape
+                    && transition.atom_id == atom
+                    && *recorded_prototype == prototype_shape
+            })
+            .map(|(_, transition)| transition)
     }
 
     /// Replay the recorded transition for this receiver class, prototype
@@ -333,39 +363,57 @@ impl StoreTransitionCache {
         key: AtomizedPropertyKey<'_>,
         value: &crate::Value,
     ) -> Result<Option<()>, otter_gc::OutOfMemory> {
-        if object::shape(obj, heap).is_null() {
+        if object::is_dictionary(obj, heap) {
             return Ok(None);
         }
         let receiver_shape = object::shape_id(obj, heap);
         let prototype_shape = proto_shape_id(obj, heap);
         let atom = key.atom().id();
-        match &self.ways[Self::index(receiver_shape, prototype_shape, atom)] {
-            Some((recorded_prototype, transition))
-                if transition.from_shape_id == receiver_shape
-                    && transition.atom_id == atom
-                    && *recorded_prototype == prototype_shape =>
-            {
+        match self.find(receiver_shape, prototype_shape, atom) {
+            Some(transition) => {
                 object::replay_store_property_transition(obj, heap, key, transition, value)
             }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
-    /// Record one transition captured on `obj` before the store, displacing
-    /// whatever shared its index.
+    /// Record one transition captured on `obj` before the store as its set's
+    /// most recent way: an entry for the same key is replaced, and a full set
+    /// drops its least recently recorded way.
     pub(crate) fn record(
         &mut self,
         prototype_shape: ShapeId,
         transition: object::StorePropertyTransition,
     ) {
-        let index = Self::index(
+        let start = Self::set_start(
             transition.from_shape_id,
             prototype_shape,
             transition.atom_id,
         );
+        let same_key = |entry: &Option<(ShapeId, object::StorePropertyTransition)>| {
+            entry
+                .as_ref()
+                .is_some_and(|(recorded_prototype, recorded)| {
+                    recorded.from_shape_id == transition.from_shape_id
+                        && recorded.atom_id == transition.atom_id
+                        && *recorded_prototype == prototype_shape
+                })
+        };
+        // The way to vacate: the key's own entry, else the first empty one,
+        // else the least recently recorded.
+        let set = &self.ways[start..start + TRANSITION_WAYS];
+        let vacate = set
+            .iter()
+            .position(same_key)
+            .or_else(|| set.iter().position(Option::is_none))
+            .unwrap_or(TRANSITION_WAYS - 1);
+        for way in (start + 1..=start + vacate).rev() {
+            self.ways[way] = self.ways[way - 1].take();
+            self.jit_ways[way].set(self.jit_ways[way - 1].get());
+        }
         let jit = StoreTransitionJitEntry::from_transition(prototype_shape, &transition);
-        self.ways[index] = Some((prototype_shape, transition));
-        self.jit_ways[index].set(jit);
+        self.ways[start] = Some((prototype_shape, transition));
+        self.jit_ways[start].set(jit);
     }
 
     /// Visit the target shapes the recorded transitions keep alive.

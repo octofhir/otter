@@ -90,7 +90,6 @@ impl FunctionKindPrototypes {
 
     pub(crate) fn build_post_bootstrap(
         heap: &mut otter_gc::GcHeap,
-        mut shape_root: object::ShapeHandle,
         function_proto: JsObject,
         function_ctor: Option<Value>,
         well_known: &crate::symbol::WellKnownSymbols,
@@ -107,9 +106,6 @@ impl FunctionKindPrototypes {
         // SAFETY: every canonical slot is declared before the scope and stays
         // stationary until the completed cache is returned.
         unsafe {
-            roots.add_raw_slot(
-                (&mut shape_root as *mut object::ShapeHandle).cast::<otter_gc::raw::RawGc>(),
-            );
             roots.add_value(&mut function_proto_value);
             roots.add_value(&mut function_ctor_value);
             roots.add_value(&mut generator_ctor_root);
@@ -140,21 +136,16 @@ impl FunctionKindPrototypes {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                 };
+                let root = object::root_for_prototype(heap, function_proto_value.as_object())
+                    .map_err(|_| JsSurfaceError::OutOfMemory)?;
                 object::alloc_object_with_shape_roots(
                     heap,
-                    shape_root,
+                    root,
                     crate::object::DEFAULT_INLINE_CAPACITY,
                     &mut visit,
                 )
                 .map_err(|_| JsSurfaceError::OutOfMemory)?
             });
-            let proto = proto_root
-                .as_object()
-                .expect("function-kind prototype stays rooted");
-            let function_proto = function_proto_value
-                .as_object()
-                .expect("Function.prototype stays rooted");
-            object::set_prototype(proto, heap, Some(function_proto));
             let tag_sym_root = tag_sym;
             let tag_string = {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -185,9 +176,10 @@ impl FunctionKindPrototypes {
                     function_proto_value.trace_value_slots(visitor);
                     proto_root.trace_value_slots(visitor);
                 };
+                let root = object::shape_body::null_root(heap);
                 object::alloc_object_with_shape_roots(
                     heap,
-                    shape_root,
+                    root,
                     crate::object::DEFAULT_INLINE_CAPACITY,
                     &mut visit,
                 )
@@ -364,12 +356,10 @@ impl Interpreter {
         let Some(function_proto) = self.function_prototype_object().ok() else {
             return;
         };
-        let shape_root = self.shape_runtime.root();
         let function_ctor = object::get(*self.global_this(), &self.gc_heap, "Function")
             .filter(|v| v.is_object_type());
         self.function_kind_prototypes = FunctionKindPrototypes::build_post_bootstrap(
             &mut self.gc_heap,
-            shape_root,
             function_proto,
             function_ctor,
             &self.well_known_symbols,
@@ -461,11 +451,11 @@ impl Interpreter {
                 iteration_roots.add_value(&mut parent_value);
                 iteration_roots.add_value(&mut shared_value);
             }
-            let Ok(shared) = ({
+            let Ok(shared) = self.object_root(parent_value.as_object()).and_then(|root| {
                 let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
                 object::alloc_object_with_shape_roots(
                     &mut self.gc_heap,
-                    self.shape_runtime.root(),
+                    root,
                     crate::object::DEFAULT_INLINE_CAPACITY,
                     &mut visit,
                 )
@@ -473,9 +463,6 @@ impl Interpreter {
                 continue;
             };
             shared_value = Value::object(shared);
-            if let Some(parent) = parent_value.as_object() {
-                object::set_prototype(shared, &mut self.gc_heap, Some(parent));
-            }
             // §27.5.1.2-5 / §27.6.1.2-4 — own `next` / `return` /
             // `throw`, each with `length = 1`, { [[Writable]]: true,
             // [[Enumerable]]: false, [[Configurable]]: true }.
@@ -565,19 +552,16 @@ impl Interpreter {
             roots.add_value(&mut native_root);
         }
         proto_root = Value::object({
+            let root = self.object_root(object_proto_root.as_object()).ok()?;
             let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
             object::alloc_object_with_shape_roots(
                 &mut self.gc_heap,
-                self.shape_runtime.root(),
+                root,
                 crate::object::DEFAULT_INLINE_CAPACITY,
                 &mut visit,
             )
             .ok()?
         });
-        let proto = proto_root.as_object()?;
-        if let Some(object_proto) = object_proto_root.as_object() {
-            object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
-        }
         native_root = Value::native_function(
             crate::intrinsics::shared::native_static_with_value_roots(
                 &mut self.gc_heap,

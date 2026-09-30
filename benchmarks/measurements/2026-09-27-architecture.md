@@ -1287,6 +1287,30 @@ instructions). Reduced targets are still only residual calls in a splice.
 Admitting them as inline candidates is the next step for `_super.call`
 chains.
 
+
+### Int32 remainder
+The ast_ctor profile after the loaded form showed `fmod`: Machine lowered
+every `%` as a Float64 call, even with Int32-only feedback. `%` is now a
+speculative `IntegerRem` when both operands are Int32 and the site's
+feedback is Int32. It follows V8's `Int32ModulusWithOverflow`:
+- The result takes the dividend's sign.
+- The divisor's magnitude and an unsigned division of the dividend's
+  magnitude cover every Int32, including `INT32_MIN % -1` and
+  `INT32_MIN % INT32_MIN`, with no `idiv` trap on x86-64.
+- A power-of-two divisor of a non-negative dividend is a mask.
+- A zero divisor (NaN) exits as Int32 overflow, and a zero result of a
+  negative dividend (−0) exits as negative zero. Both widen the site
+  through the existing arithmetic-exit policy, like `IntegerMul`.
+
+AArch64 uses its emitter scratch (x15–x17). x86-64 divides through
+`edx:eax`, declared as the new `IntegerRemainder` clobber set. A
+Machine test executes both targets' code for every sign combination and
+both exits, and the corpus `int32_remainder` pins the edge cases against
+Node in every tier.
+
+ast_ctor −4% instructions (6.39G → 6.13G, 0.33 s), ts −0.5%, others
+unchanged.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

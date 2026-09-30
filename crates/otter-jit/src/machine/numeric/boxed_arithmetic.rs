@@ -190,9 +190,16 @@ pub(super) fn visit_inputs(
         ConstructReceiver { source, .. }
         | ConstructReceiverHit(source)
         | InlineConstructGuard { source, .. }
-        | InlineCallGuard { source, .. }
         | InlineMethodGuard { source, .. }
         | BoxTagged(source) => visit(source, true),
+        InlineCallGuard {
+            source, receiver, ..
+        } => {
+            visit(source, true);
+            if let Some(receiver) = receiver {
+                visit(receiver, true);
+            }
+        }
         ElementLoad {
             receiver, index, ..
         }

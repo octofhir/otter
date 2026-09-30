@@ -158,3 +158,26 @@ Function.prototype.call = originalCall;
 let loadedAgain = 0;
 for (let i = 0; i < 2500; i++) loadedAgain += viaLoaded(sum3, { base: 0 }, i);
 console.log(loadedAgain);
+
+// Spliced reduced calls bind the explicit receiver: a sloppy callee binds an
+// object itself, the global object for nullish, and boxes a primitive; a
+// strict callee takes it as is; an arrow keeps its lexical `this`.
+function sloppyKind() {
+  return typeof this === "object" ? (this === globalThis ? "global" : "object") : typeof this;
+}
+function strictKind() {
+  "use strict";
+  return this === null ? "null" : typeof this;
+}
+function kinds(self) {
+  return sloppyKind.call(self) + "/" + strictKind.call(self);
+}
+const lexical = (() => {
+  const arrow = () => this === undefined;
+  return function (self) {
+    return arrow.call(self);
+  };
+})();
+let kindCount = 0;
+for (let i = 0; i < 5000; i++) if (kinds({}) === "object/object" && lexical({})) kindCount++;
+console.log(kindCount, kinds(null), kinds(undefined), kinds(5), kinds("s"), kinds(true), lexical(3));

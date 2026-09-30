@@ -76,3 +76,53 @@ function sumPoints(n) {
 let p = 0;
 for (let i = 0; i < 20000; i++) p += sumPoints(i);
 console.log(p);
+
+// Committed property loads and stores inside spliced bodies: a getter or
+// setter that captures or throws a stack sees the spliced parents. Only the
+// named callers are compared: accessor frame names and member-expression
+// columns are reported differently from Node.
+function callers(stack) {
+  const known = ["readDeep", "midRead", "writeDeep", "midWrite"];
+  return stack
+    .split("\n")
+    .map((line) => known.find((name) => line.includes(" " + name + " ")))
+    .filter(Boolean)
+    .join(",");
+}
+let captureStack = false;
+const traced = {
+  get deep() {
+    return captureStack ? callers(new Error("g").stack) : 0;
+  },
+  set deep(v) {
+    if (v === 2998) throw new Error("s" + v);
+  },
+};
+function readDeep(o) {
+  return o.deep;
+}
+function midRead(o) {
+  return readDeep(o);
+}
+function writeDeep(o, v) {
+  o.deep = v;
+  return v;
+}
+function midWrite(o, v) {
+  return writeDeep(o, v) + 1;
+}
+let lastRead = "";
+let writes = 0;
+let thrown = "";
+for (let i = 0; i < 3000; i++) {
+  captureStack = i === 2997;
+  const receiver = i % 3 === 0 ? traced : { deep: i };
+  const r = midRead(receiver);
+  if (typeof r === "string") lastRead = r;
+  try {
+    writes += midWrite(i % 2 === 0 ? traced : {}, i);
+  } catch (e) {
+    thrown = e.message + ":" + callers(e.stack);
+  }
+}
+console.log(lastRead, writes, thrown);

@@ -10,8 +10,11 @@
 //! - Every descendant value comes from its exact allocator root save slot.
 //! - Source PCs belong to each frame's function, independently of property facts.
 //! - Only suspended parents adjust an after-call PC back to its call site.
-//! - Generated calls mark their recipe virtual in the same record; runtime
-//!   decoding publishes only a committed runtime call's descendants.
+//! - Generated calls and committed property loads and stores mark their
+//!   recipe virtual in the same record, with the outermost frame's suspended
+//!   call PC: their parents exist only for stack walks. Runtime decoding
+//!   publishes only the descendants of the other committed runtime calls,
+//!   whose semantics read the innermost activation.
 
 use super::*;
 use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry};
@@ -75,17 +78,20 @@ pub(super) fn prepare_safepoints(
     sequence: &InstructionSequence,
     safepoints: &mut super::super::MachineSafepointTable,
 ) -> Result<(), Unsupported> {
-    // Every generated JavaScript call names its position in the code
-    // object's own function; with inline parents that is the outermost
-    // frame's suspended call.
+    // Every generated JavaScript call, and every virtual-recipe runtime call,
+    // names its position in the code object's own function; with inline
+    // parents that is the outermost frame's suspended call.
     for (index, call) in sequence.instructions().iter().enumerate() {
         let MachineOpcode::Call(descriptor) = call.opcode else {
             continue;
         };
-        let CallTarget::Direct { logical_pc, .. } =
-            sequence.call_descriptors()[descriptor as usize].target
-        else {
-            continue;
+        let target = &sequence.call_descriptors()[descriptor as usize].target;
+        let logical_pc = match target {
+            CallTarget::Direct { logical_pc, .. } => *logical_pc,
+            _ if virtual_recipe(target) && !call.inline_frames.is_empty() => {
+                otter_vm::native_abi::NO_CALL_PC
+            }
+            _ => continue,
         };
         let Some(site) = safepoints.site(MachineInstructionId(index as u32)) else {
             continue;
@@ -163,9 +169,23 @@ pub(super) fn prepare_safepoints(
             .ok_or(Unsupported::OperandShape("inline reentry record"))?;
         record.inline_frames = frames;
         record.inline_frames_virtual = matches!(cold.opcode, MachineOpcode::Call(descriptor)
-            if matches!(sequence.call_descriptors()[descriptor as usize].target, CallTarget::Direct { .. }));
+            if virtual_recipe(&sequence.call_descriptors()[descriptor as usize].target));
     }
     Ok(())
+}
+
+/// Whether a call's inline parents stay in its recipe: a generated call, or a
+/// committed property load or store, whose semantics name their own
+/// function and PC and never read the innermost activation.
+fn virtual_recipe(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Direct { .. } => true,
+        CallTarget::CommittedRuntime { target, .. } => {
+            *target == otter_vm::native_abi::STUB_JIT_LOAD_PROPERTY
+                || *target == otter_vm::native_abi::STUB_JIT_STORE_PROPERTY
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

@@ -1554,6 +1554,32 @@ fn emit_with_reach(
                 structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
             }
             MachineOpcode::GuardCallTarget {
+                guard:
+                    MachineCallGuard::Explicit {
+                        function_id,
+                        this_mode,
+                    },
+            } => {
+                let start = ops.offset().0;
+                let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
+                // Either input may live in the identity proof's scratch, so the
+                // receiver waits in x15, outside the allocation file.
+                emit_load_allocated_tagged(&mut ops, frame, locations[1], 15, 0)?;
+                emit_load_allocated_tagged(&mut ops, frame, locations[0], 9, 0)?;
+                crate::arm64::inline_guard::emit_inline_identity(&mut ops, view, function_id, miss);
+                dynasm!(ops ; .arch aarch64 ; mov x12, x15);
+                crate::arm64::inline_guard::emit_inline_explicit_this(
+                    &mut ops,
+                    view,
+                    this_mode,
+                    &mut relocations,
+                    19,
+                    miss,
+                );
+                emit_store_allocated_tagged(&mut ops, frame, locations[2], 12, 0)?;
+                structural_regions.push(("machineCallTargetGuard", None, start, ops.offset().0));
+            }
+            MachineOpcode::GuardCallTarget {
                 guard: MachineCallGuard::Construct { function_id },
             } => {
                 let miss = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;

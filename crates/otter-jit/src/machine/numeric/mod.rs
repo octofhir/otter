@@ -1128,6 +1128,48 @@ fn select_with_loop_entries(
                 source,
                 function_id,
                 this_mode,
+                receiver: Some(receiver),
+            } = node
+            {
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                let mut guard = MachineInstruction::plain(
+                    MachineOpcode::GuardCallTarget {
+                        guard: MachineCallGuard::Explicit {
+                            function_id,
+                            this_mode,
+                        },
+                    },
+                    vec![
+                        MachineOperand::register_input(machine_value(&values, source)),
+                        MachineOperand::register_input(receiver),
+                        MachineOperand::register_output(result),
+                    ],
+                );
+                guard.clobbers = target_spec
+                    .clobbers(TargetClobberSet::InlineCallGuard)
+                    .to_vec();
+                let point = NumericFramePoint::Node(node_value);
+                attach_frame_state(
+                    hir,
+                    &values,
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &mut guard,
+                );
+                instructions.push(guard);
+                continue;
+            }
+            if let NumericNode::InlineCallGuard {
+                source,
+                function_id,
+                this_mode,
+                receiver: None,
             } = node
             {
                 let guarded = push_value(&mut representations, MachineRepresentation::Tagged);

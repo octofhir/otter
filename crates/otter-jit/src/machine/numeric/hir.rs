@@ -236,10 +236,13 @@ pub(super) enum NumericNode {
         source: NumericValue,
         function_id: u32,
     },
+    /// `receiver` is the explicit `this` of a reduced `f.call(this, ...)`;
+    /// `None` for a plain call, whose `this` comes from the callee's mode.
     InlineCallGuard {
         source: NumericValue,
         function_id: u32,
         this_mode: otter_vm::JitDirectCallThisMode,
+        receiver: Option<NumericValue>,
     },
     /// Complete nursery receiver, or undefined when no allocation was committed.
     ConstructReceiver {

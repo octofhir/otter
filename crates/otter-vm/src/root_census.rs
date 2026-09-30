@@ -282,6 +282,14 @@ impl Interpreter {
             }),
         );
         push(
+            "function_prototype_slots",
+            count(|v| {
+                for value in self.function_prototype_slots_for_trace() {
+                    value.trace_value_slots(v);
+                }
+            }),
+        );
+        push(
             "iterator_prototypes",
             count(|v| self.trace_iterator_prototypes(v)),
         );

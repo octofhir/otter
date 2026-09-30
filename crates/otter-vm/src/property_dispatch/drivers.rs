@@ -289,9 +289,8 @@ impl Interpreter {
                     .ok()
                     .flatten()
                     .is_some();
-                let prototype_implicit = name == "prototype"
-                    && context.function_has_prototype_property(fid)
-                    && !self.function_deleted_metadata.contains(&(fid, "prototype"));
+                let prototype_implicit =
+                    name == "prototype" && context.function_has_prototype_property(fid);
                 bag_has || metadata_has || prototype_implicit
             } else if let Some(c) = receiver.as_class_constructor() {
                 // Class constructors expose `prototype` / `name` /
@@ -1144,9 +1143,8 @@ impl Interpreter {
                     .ok()
                     .flatten()
                     .is_some();
-                let prototype_implicit = name == "prototype"
-                    && context.function_has_prototype_property(fid)
-                    && !self.function_deleted_metadata.contains(&(fid, "prototype"));
+                let prototype_implicit =
+                    name == "prototype" && context.function_has_prototype_property(fid);
                 bag_has || metadata_has || prototype_implicit
             } else if let Some(c) = receiver.as_class_constructor() {
                 // Class constructors expose `prototype` / `name` /

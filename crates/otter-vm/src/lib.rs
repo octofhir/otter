@@ -124,6 +124,7 @@ mod function_kind;
 pub mod function_metadata;
 mod function_ops;
 pub mod function_prototype;
+mod function_prototype_slot;
 pub mod gc_trace;
 pub mod generator;
 pub mod global_functions;
@@ -1418,6 +1419,10 @@ pub struct Interpreter {
     /// `new Subclass extends Function` returns a fresh ordinary
     /// function whose internal prototype is `new.target.prototype`.
     function_prototype_overrides: std::collections::HashMap<u32, Value>,
+    /// `prototype` slots of bare function values (closures keep theirs in
+    /// the rare record): the value (the hole until allocated) and whether it
+    /// is writable. See [`function_prototype_slot`].
+    function_prototype_slots: std::collections::HashMap<u32, (Value, bool)>,
     /// Function ids whose ordinary function object has had
     /// `[[PreventExtensions]]` applied. Kept separate from the
     /// lazy user bag so materialising spec-existing virtual

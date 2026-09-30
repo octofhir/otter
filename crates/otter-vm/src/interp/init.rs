@@ -303,6 +303,7 @@ impl Interpreter {
             module_sources: source_registry::SourceRegistry::default(),
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),
+            function_prototype_slots: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
             iterator_prototype_overrides: None,

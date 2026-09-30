@@ -1120,6 +1120,84 @@ spread thinly: callable guard, entry-cell loads, frame-size and stack
 checks, header copy, depth check and link, root homes, callee prologue.
 The next larger levers are outside the call contract.
 
+## 16. `f.call` and the function `prototype` slot
+
+ast_ctor (TypeScript-style `__extends` classes) spent 82% of its samples
+outside generated code. Every `_super.call(this, …)` went through the generic
+method stub: `call` was looked up by spelling, the intrinsic
+`Function.prototype.call` was entered through Rust, and that call then made
+the same call again one Rust frame deeper. The root cause is `F.prototype = x`.
+Before this change the assignment created a dictionary-mode property bag on the
+closure, and a closure with a bag fails the exact-`ORDINARY` guard of the
+closure CacheIR program, so no named lookup on it had an IC. The construct
+and `instanceof` proofs had to walk closure → rare → bag → shape → slot. A
+dictionary layout epoch starts at 1 in every object, so no bag proof could
+tell two closures apart.
+
+### How the reference engines do it
+- **V8** keeps `prototype` out of the property backing store entirely:
+  `JSFunction::prototype_or_initial_map` is a field of the function, and the
+  `prototype` property is an accessor-info that reads it. Assigning it never
+  changes the function's map. `JSCallReducer::ReduceFunctionPrototypeCall`
+  rewrites `JSCall(%Function.prototype.call%, f, this, args…)` into
+  `JSCall(f, this, args…)` once feedback shows the target is the intrinsic.
+- **JSC**: the bytecode generator emits a guard for `f.call(…)`
+  (`CallFunctionCallDotNode`): if `f.call` is the intrinsic, it makes a
+  direct call with a shifted receiver; otherwise it makes the generic call.
+  The prototype sits in the function's rare data (`FunctionRareData`,
+  together with the allocation profile).
+- **SpiderMonkey**: `CallIRGenerator::tryAttachFunCall` guards on the callee
+  being `fun_call` and calls `this` as the target with shifted arguments, and
+  Warp transpiles it. `prototype` is a lazily resolved own data property of
+  the function object.
+
+Otter follows V8 for storage (a slot, not the bag) and V8/SM for the call
+(recognize the intrinsic at the site, call the receiver directly).
+
+### Stage A landed (596d2c1c): direct call from the method-call stub
+A generated `CallMethodValue` whose method resolves to the intrinsic calls
+the receiver with the first argument as `this` instead of entering the
+intrinsic. ast_ctor −2.7% instructions.
+
+### F1 landed: `prototype` in the closure's rare record
+`ClosureRareBody` has a `prototype` value (the hole until the default object
+is allocated) and a `prototype_writable` bit. Bare function values keep the
+same pair in an interpreter side table. The property is
+`{writable, enumerable: false, configurable: false}` from creation for every
+kind that owns one. It is materialized once, can only go from writable to
+non-writable, and never enters the bag, so `F.prototype = x` leaves the
+closure's lookups ordinary. The construct receiver allocation (both JIT
+tiers) and the `instanceof` probe load one word from the rare record; the
+hole fails their cell test. Kinds without an implicit `prototype` (arrows,
+methods) keep a user-created one in the bag as before.
+
+The move also fixed three spec bugs that came from lazily materializing the
+property into the bag:
+- `'prototype' in F` was false before the first read.
+- `Reflect.ownKeys(F)` put `prototype` after later-added keys.
+- `Object.defineProperty(F, 'prototype', {value})` reset `writable` to false.
+  An attributes-only redefinition also lost the value; descriptor
+  completion now covers the slot as it does `name` and `length`.
+The difftest corpus `function_prototype_slot` pins all three, together with
+assignment across tiers, per-closure slots and freezing.
+
+| Workload | instr at C6 | after A + F1 | wall at C6 | after A + F1 |
+|---|---:|---:|---:|---:|
+| ast_ctor | 21.43G | 17.11G (−20.2%) | 1.396s | 1.105s (−20.8%) |
+| earley-boyer | 104.6G | 101.4G (−3.1%) | 6.19s | 6.04s |
+| ts-fixed | 168.9G | 167.5G (−0.8%) | 17.00s | 16.76s |
+| crypto | 13.45G | 13.40G (−0.4%) | 0.805s | 0.805s |
+| fib / zlib / mega_method | unchanged | | | |
+
+### Next: guarded direct `f.call` in generated code
+With the closure program intact, a `CallMethodValue` site whose method
+feedback is the intrinsic `call` can lower to a guarded `CallWithThis` on
+the receiver. The guards are the closure program (exact `ORDINARY`, so there
+is no own `call`), the %Function.prototype% shape, and the `call` slot
+holding the intrinsic. The site's call feedback then records the receiver's
+target, so the call becomes direct and inlinable, as it does after V8's
+reduction.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

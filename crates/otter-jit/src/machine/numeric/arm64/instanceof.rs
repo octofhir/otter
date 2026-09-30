@@ -5,14 +5,14 @@
 //!   override) whose own bag carries no symbol properties, so
 //!   `@@hasInstance` resolves to the non-writable, non-configurable
 //!   `%Function.prototype%[@@hasInstance]`, i.e. OrdinaryHasInstance.
-//! - `target.prototype` read through the closure's cached bag shape and slot,
-//!   the same proof generated construction uses.
+//! - `target.prototype` read from the closure's rare-record slot, the same
+//!   slot generated construction reads.
 //! - A bounded walk of an ordinary object's `[[Prototype]]` chain; primitive
 //!   values answer `false`.
 //!
 //! # Invariants
 //! - No allocation, VM transition, deopt or user code occurs inside the probe.
-//!   Proxies, opaque chain links, exotic receivers, a missing prototype proof
+//!   Proxies, opaque chain links, exotic receivers, an unallocated prototype
 //!   and chains longer than [`MAX_CHAIN`] miss into the committed operation.
 //! - Both inputs are copied into the reserved `x15`/`x16` before any scratch
 //!   register is written; outputs are written last.
@@ -53,7 +53,7 @@ pub(super) fn emit(
     let step = ops.new_dynamic_label();
     // x15/x16 lie outside the allocation file, so neither input can be there.
     dynasm!(ops ; .arch aarch64 ; mov x15, X(value) ; mov x16, X(target));
-    if view.cage_base == 0 || view.closure_call_layout.prototype_shape_byte == 0 {
+    if view.cage_base == 0 || view.closure_call_layout.prototype_byte == 0 {
         dynasm!(ops ; .arch aarch64 ; b =>miss);
     } else {
         let layout = view.closure_call_layout;
@@ -77,41 +77,25 @@ pub(super) fn emit(
             ; and w9, w9, !u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
             ; cmp w9, u32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
             ; b.ne =>miss
-            // `prototype` lives in the bag once observed; without a bag it is
-            // still virtual and the committed operation materializes it. The
-            // bag and its slot proof live in the rare record (`x16` from here).
+            // `prototype` lives in the rare record's slot (`x16` from here);
+            // without a record, or while the slot holds the hole, the
+            // committed operation allocates the default object.
             ; ldr w13, [x16, layout.rare_byte]
             ; cbz w13, =>miss
             ; add x16, x11, x13
+            // Symbol-keyed own properties live in the bag's exotic sidecar
+            // table; none may exist, so the function cannot own
+            // `@@hasInstance`.
             ; ldr w10, [x16, layout.own_props_byte]
-            ; cbz w10, =>miss
+            ; cbz w10, >symbols_absent
             ; add x10, x11, x10
-            // Symbol-keyed own properties live in the exotic sidecar's table;
-            // none may exist, so the bag cannot own `@@hasInstance`.
             ; ldr w9, [x10, view.object_exotic_handle_byte]
             ; cbz w9, >symbols_absent
             ; add x9, x11, x9
             ; ldr w9, [x9, otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE]
             ; cbnz w9, =>miss
             ; symbols_absent:
-            ; ldr w12, [x16, layout.prototype_shape_byte]
-            ; cbz w12, =>miss
-            ; ldr w9, [x10, view.object_shape_byte]
-            ; cmp w9, w12
-            ; b.ne =>miss
-            // The bag's shape names the prototype slot, so the slot is live.
-            ; ldr w12, [x16, layout.prototype_slot_byte]
-            // The bag's slot base: in-object until it spills, then its
-            // slab's words (`x11` holds the cage base).
-            ; ldr w13, [x10, view.object_slab_handle_byte]
-            ; cbz w13, >bag_inline
-            ; add x13, x11, x13
-            ; add x13, x13, view.object_slab_words_byte
-            ; b >bag_ready
-            ; bag_inline:
-            ; add x13, x10, view.object_inline_values_byte
-            ; bag_ready:
-            ; ldr x12, [x13, x12, lsl #3]
+            ; ldr x12, [x16, layout.prototype_byte]
         );
         // The prototype must be an ordinary object; anything else throws.
         emit_cell_test(ops, 12, 9, CellTest::IsNotCell, miss);

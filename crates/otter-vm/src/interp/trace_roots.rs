@@ -36,6 +36,7 @@ impl Interpreter {
             .values()
             .filter_map(|record| record.evaluation_error.as_ref())
             .chain(self.function_prototype_overrides.values())
+            .chain(self.function_prototype_slots_for_trace())
             .chain(self.pending_generator_throw.iter())
             .chain(self.pending_uncaught_throw.iter())
             .chain(std::iter::once(&self.async_context))
@@ -157,6 +158,13 @@ impl Interpreter {
     /// dynamic functions can retain user-created prototype objects.
     pub fn function_prototype_overrides_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.function_prototype_overrides.values()
+    }
+
+    /// Iterator over bare function values' `prototype` slot values.
+    pub fn function_prototype_slots_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.function_prototype_slots
+            .values()
+            .map(|(value, _)| value)
     }
 
     pub(crate) fn set_function_prototype_override(&mut self, value: &Value, proto: Option<Value>) {

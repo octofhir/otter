@@ -164,6 +164,9 @@ impl<'a> RuntimeState<'a> {
         for value in interp.function_prototype_overrides_for_trace() {
             value.trace_value_slots(visitor);
         }
+        for value in interp.function_prototype_slots_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         interp.trace_iterator_prototypes(visitor);
         interp.trace_function_kind_roots(visitor);
         interp.trace_iterator_side_tables(visitor);

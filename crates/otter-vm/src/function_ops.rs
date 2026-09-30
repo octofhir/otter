@@ -1506,20 +1506,9 @@ impl Interpreter {
         function_id: u32,
         key: &str,
     ) -> Result<bool, VmError> {
-        if self
+        Ok(self
             .ordinary_function_own_property_descriptor(Some(context), owner, function_id, key)?
-            .is_some()
-        {
-            return Ok(true);
-        }
-        let owner_context = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        Ok(key == "prototype"
-            && owner_context.function_has_prototype_property(function_id)
-            && !self
-                .function_deleted_metadata
-                .contains(&(function_id, "prototype")))
+            .is_some())
     }
 
     pub(crate) fn ordinary_function_has_own_symbol_property_for_extensibility(
@@ -1556,10 +1545,9 @@ impl Interpreter {
         function_id: u32,
     ) -> Vec<String> {
         let mut keys = Vec::new();
-        let has_prototype = context
-            .for_function(function_id)
-            .ok()
-            .is_some_and(|owner| owner.function_has_prototype_property(function_id));
+        let has_prototype = self
+            .function_prototype_slot(context, owner, function_id)
+            .is_some();
         let deleted = |key: &'static str| self.ordinary_metadata_deleted(owner, function_id, key);
         if !deleted("length") {
             keys.push("length".to_string());
@@ -1567,22 +1555,20 @@ impl Interpreter {
         if !deleted("name") {
             keys.push("name".to_string());
         }
-        let mut bag_has_prototype = false;
+        // §10.2.5 MakeConstructor defines `prototype` at creation, before any
+        // user property.
+        if has_prototype {
+            keys.push("prototype".to_string());
+        }
         if let Some(bag) = self.callable_bag_read(owner, function_id) {
             crate::object::with_properties(bag, &self.gc_heap, |p| {
                 for k in p.keys() {
                     if k == "length" || k == "name" {
                         continue;
                     }
-                    if k == "prototype" {
-                        bag_has_prototype = true;
-                    }
                     keys.push(k.to_string());
                 }
             });
-        }
-        if has_prototype && !bag_has_prototype && !deleted("prototype") {
-            keys.push("prototype".to_string());
         }
         keys
     }
@@ -1681,6 +1667,18 @@ impl Interpreter {
         {
             return Ok(Some(desc));
         }
+        // The implicit `prototype` slot. Its value is the hole until the
+        // default object is allocated: callers that expose the value read it
+        // through `function_prototype_value` first.
+        if key == "prototype"
+            && let Some(context) = context
+            && let Some((value, writable)) =
+                self.function_prototype_slot(context, owner, function_id)
+        {
+            return Ok(Some(object::PropertyDescriptor::data(
+                value, writable, false, false,
+            )));
+        }
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
             return Ok(None);
         };
@@ -1742,6 +1740,22 @@ impl Interpreter {
                 ),
             };
         let outcome = (|this: &mut Self| {
+            // The implicit `prototype` slot validates against its real value:
+            // allocate the default object first.
+            let prototype_slot = context.filter(|_| key == "prototype").and_then(|context| {
+                this.function_prototype_slot(
+                    context,
+                    this.iteration_anchor(owner_slot).as_closure(&this.gc_heap),
+                    function_id,
+                )
+            });
+            if let (Some((value, _)), Some(context)) = (prototype_slot, context)
+                && value.is_hole()
+            {
+                let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
+                let receiver = owner.map(Value::closure);
+                this.function_prototype_value(stack, context, owner, function_id, receiver)?;
+            }
             let existing = this.ordinary_function_own_property_descriptor(
                 context,
                 this.iteration_anchor(owner_slot).as_closure(&this.gc_heap),
@@ -1771,22 +1785,23 @@ impl Interpreter {
             };
             let descriptor = match existing {
                 Some(existing) => {
-                    let incoming =
-                        if function_metadata::ordinary_function_metadata_key(key).is_some() {
-                            match desc_obj_slot {
-                                Some(slot) => complete_descriptor_defaults_from_object(
-                                    this.iteration_anchor(slot)
-                                        .as_object()
-                                        .ok_or(VmError::TypeMismatch)?,
-                                    &this.gc_heap,
-                                    incoming,
-                                    &existing,
-                                ),
-                                None => incoming,
-                            }
-                        } else {
-                            incoming
-                        };
+                    let incoming = if prototype_slot.is_some()
+                        || function_metadata::ordinary_function_metadata_key(key).is_some()
+                    {
+                        match desc_obj_slot {
+                            Some(slot) => complete_descriptor_defaults_from_object(
+                                this.iteration_anchor(slot)
+                                    .as_object()
+                                    .ok_or(VmError::TypeMismatch)?,
+                                &this.gc_heap,
+                                incoming,
+                                &existing,
+                            ),
+                            None => incoming,
+                        }
+                    } else {
+                        incoming
+                    };
                     match object::validate_descriptor_update(&existing, &incoming, &this.gc_heap) {
                         Some(merged) => merged,
                         None => return Ok(false),
@@ -1798,23 +1813,27 @@ impl Interpreter {
                     // boundary; recover the collector-rewritten owner from
                     // the anchor before consulting instance state.
                     let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
-                    let has_virtual_prototype = context.is_some_and(|context| {
-                        key == "prototype"
-                            && context.for_function(function_id).ok().is_some_and(|owner| {
-                                owner.function_has_prototype_property(function_id)
-                            })
-                            && !this
-                                .function_deleted_metadata
-                                .contains(&(function_id, "prototype"))
-                    });
-                    if !has_virtual_prototype
-                        && !this.ordinary_function_is_extensible(owner, function_id)
-                    {
+                    if !this.ordinary_function_is_extensible(owner, function_id) {
                         return Ok(false);
                     }
                     incoming
                 }
             };
+            // A validated update of the implicit `prototype` stays in its
+            // slot: the property is non-configurable, so it is still data.
+            if prototype_slot.is_some() {
+                let object::DescriptorKind::Data { value } = descriptor.kind else {
+                    return Ok(false);
+                };
+                let writable = descriptor.flags.writable();
+                let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
+                this.store_function_prototype(Some(stack), owner, function_id, value)?;
+                if !writable {
+                    let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
+                    this.freeze_function_prototype(Some(stack), owner, function_id)?;
+                }
+                return Ok(true);
+            }
             // Validation can replace the incoming descriptor with a merged
             // one. Root that exact result before allocating the property bag
             // or any of its side tables.
@@ -1875,17 +1894,8 @@ impl Interpreter {
         has_prototype_property: bool,
     ) -> bool {
         // §10.2.4 — an ordinary function's implicit `prototype` slot is
-        // writable but non-configurable: [[Delete]] refuses it unless a
-        // user bag entry (materialized by defineProperty) shadows the
-        // virtual slot, in which case the bag's own flags decide.
-        if key == "prototype"
-            && has_prototype_property
-            && self
-                .callable_bag_read(owner, function_id)
-                .is_none_or(|bag| {
-                    crate::object::get_own_descriptor(bag, &self.gc_heap, key).is_none()
-                })
-        {
+        // non-configurable: [[Delete]] refuses it.
+        if key == "prototype" && has_prototype_property {
             return false;
         }
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
@@ -2161,13 +2171,23 @@ impl Interpreter {
                         };
                         crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
                     }
-                    (Some(function_id), _) => self.ordinary_function_own_property_descriptor(
-                        context,
-                        owner,
-                        function_id,
-                        key.string_name()
-                            .expect("non-symbol key has string spelling"),
-                    )?,
+                    (Some(function_id), _) => {
+                        let desc = self.ordinary_function_own_property_descriptor(
+                            context,
+                            owner,
+                            function_id,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                        )?;
+                        // An unallocated default `prototype` takes the
+                        // generic path, which allocates it.
+                        if desc.as_ref().is_some_and(|desc| {
+                            matches!(desc.kind, object::DescriptorKind::Data { value } if value.is_hole())
+                        }) {
+                            return Ok(None);
+                        }
+                        desc
+                    }
                     (None, VmPropertyKey::Symbol(_)) => None,
                     (None, _) => {
                         let Some(bound) = target.as_bound_function() else {
@@ -2638,11 +2658,15 @@ impl Interpreter {
                 name,
             );
         }
-        // A user-installed own `prototype` (data or accessor, e.g. via
-        // Object.defineProperty) shadows the implicit one. An accessor
-        // must fire its getter with the function as receiver — §7.3.12
-        // Get(C, "prototype") in OrdinaryHasInstance — so a poisoned
-        // getter propagates instead of reading back `undefined`.
+        // §10.2.5 — the implicit property lives in its own slot, never in the
+        // bag.
+        if context.function_has_prototype_property(function_id) {
+            return self.function_prototype_value(stack, context, owner, function_id, receiver);
+        }
+        // Arrows, methods and async (non-generator) functions have no implicit
+        // `prototype`; a user-created one is an ordinary bag property, and an
+        // accessor fires its getter with the function as receiver (§7.3.12
+        // Get(C, "prototype") in OrdinaryHasInstance).
         if let Some(bag) = self.callable_bag_read(owner, function_id) {
             match crate::object::lookup_own(bag, &self.gc_heap, name) {
                 crate::object::PropertyLookup::Data { value, .. } => return Ok(value),
@@ -2658,116 +2682,10 @@ impl Interpreter {
                 crate::object::PropertyLookup::Absent => {}
             }
         }
-        // §10.2.5 — arrows, methods, and async (non-generator)
-        // functions have no `prototype` property at all, so there is
-        // nothing to materialize.
-        if !context.function_has_prototype_property(function_id) {
-            return Ok(Value::undefined());
-        }
-
-        // Every allocation below may move the closure, its bag and the new
-        // prototype, so each lives in a handle and is re-read after every
-        // step instead of riding in a Rust local.
-        self.with_handle_scope(|interp, scope| -> Result<Value, VmError> {
-            let function_root = Value::function(function_id);
-            let constructor_handle = interp.scoped_value(scope, receiver.unwrap_or(function_root));
-            let owner_handle = owner.map(|owner| interp.scoped_value(scope, Value::closure(owner)));
-            let owner_now = |interp: &Self| {
-                owner_handle
-                    .and_then(|handle| interp.escape_scoped(handle).as_closure(&interp.gc_heap))
-            };
-            let bag = interp.function_user_bag(stack, owner_now(interp), function_id, &[])?;
-            if let Some(existing) = crate::object::get(bag, &interp.gc_heap, "prototype") {
-                return Ok(existing);
-            }
-            let bag_handle = interp.scoped_value(scope, Value::object(bag));
-            let proto = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
-            let proto_handle = interp.scoped_value(scope, Value::object(proto));
-            let proto_now = |interp: &Self| {
-                interp
-                    .escape_scoped(proto_handle)
-                    .as_object()
-                    .expect("prototype handle holds an object")
-            };
-            if let Some(object_proto) = interp.realm_intrinsics.object_prototype().or_else(|| {
-                crate::object::get(interp.global_this, &interp.gc_heap, "Object")
-                    .and_then(|v| v.as_object())
-                    .and_then(|object_ctor| {
-                        crate::object::get(object_ctor, &interp.gc_heap, "prototype")
-                            .and_then(|v| v.as_object())
-                    })
-            }) {
-                crate::object::set_prototype(
-                    proto_now(interp),
-                    &mut interp.gc_heap,
-                    Some(object_proto),
-                );
-            }
-            let is_generator = context
-                .function(function_id)
-                .is_some_and(|function| function.is_generator);
-            if is_generator {
-                let is_async = context
-                    .function(function_id)
-                    .is_some_and(|function| function.is_async_generator);
-                if let Some(shared) = interp.shared_generator_object_prototype(is_async) {
-                    // §27.5.1 / §27.6.1 — generator-function `.prototype`
-                    // objects inherit from the one shared
-                    // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
-                    object::set_prototype(proto_now(interp), &mut interp.gc_heap, Some(shared));
-                } else {
-                    let parent = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
-                    let proto = proto_now(interp);
-                    interp.finish_generator_function_prototype(
-                        context,
-                        function_id,
-                        proto,
-                        parent,
-                    )?;
-                }
-            }
-            // Install `prototype` on the function's property bag first, so the
-            // bag's slot tracks the prototype before the shape-advancing
-            // constructor define below can move the heap.
-            let bag = interp
-                .escape_scoped(bag_handle)
-                .as_object()
-                .expect("function bag handle holds an object");
-            let prototype_desc = object::PropertyDescriptor::data(
-                Value::object(proto_now(interp)),
-                true,
-                false,
-                false,
-            );
-            let _ =
-                object::define_own_property(bag, &mut interp.gc_heap, "prototype", prototype_desc);
-            // §27.5.1 — a generator function's `.prototype` object has NO own
-            // properties (no back-pointing `constructor`); ordinary functions
-            // get the §10.2.5 MakeConstructor pair. The install goes through
-            // the hidden-class-advancing define rather than the dictionary-mode
-            // `object::define_own_property` (which nulls the shape), so the
-            // prototype keeps a fast shape and prototype-style method
-            // definitions land in shape slots.
-            if !is_generator {
-                let constructor_desc = object::PartialPropertyDescriptor {
-                    value: Some(interp.escape_scoped(constructor_handle)),
-                    writable: Some(true),
-                    enumerable: Some(false),
-                    configurable: Some(true),
-                    ..Default::default()
-                };
-                let mut proto = proto_now(interp);
-                let _ = interp.define_own_property_partial(
-                    &mut proto,
-                    "constructor",
-                    constructor_desc,
-                )?;
-            }
-            Ok(interp.escape_scoped(proto_handle))
-        })
+        Ok(Value::undefined())
     }
 
-    fn finish_generator_function_prototype(
+    pub(crate) fn finish_generator_function_prototype(
         &mut self,
         context: &ExecutionContext,
         function_id: u32,

@@ -505,7 +505,9 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
             value,
             ..
         } => inputs.extend([object, value]),
-        N::PropertyLoad { receiver, .. } | N::PropertyShapeLoad { receiver, .. } => {
+        N::PropertyLoad { receiver, .. }
+        | N::PropertyShapeLoad { receiver, .. }
+        | N::FunctionCallProof { receiver, .. } => {
             inputs.push(receiver);
         }
         N::ElementLoad {
@@ -715,7 +717,9 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
             replacement(object);
             replacement(value);
         }
-        N::PropertyLoad { receiver, .. } | N::PropertyShapeLoad { receiver, .. } => {
+        N::PropertyLoad { receiver, .. }
+        | N::PropertyShapeLoad { receiver, .. }
+        | N::FunctionCallProof { receiver, .. } => {
             replacement(receiver);
         }
         N::NativeCall {

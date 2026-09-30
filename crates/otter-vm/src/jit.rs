@@ -573,6 +573,11 @@ pub struct JitCompileSnapshot {
     /// ([`JitInstructionMetadata::note_optimized_exit`]).
     pub optimized_exit_reasons:
         std::collections::BTreeMap<u32, std::collections::BTreeSet<crate::native_abi::ExitReason>>,
+    /// Widest value each parameter was seen to hold when an optimized entry's
+    /// parameter guards failed, indexed by parameter; empty when none did.
+    /// Entry representations are capped by it, as JSC's argument value
+    /// profiles widen from the exit's own values.
+    pub parameter_widening: Box<[JitParameterWidening]>,
     /// How the indexed-element program addresses each site's receiver, keyed by
     /// the site's byte-PC. Generated code reads only this; the family's body
     /// layout never reaches the emitter, so a second element-bearing family
@@ -732,6 +737,11 @@ pub struct JitCompileSnapshot {
     pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
     /// Guarded method calls into a declared native entry, keyed by call byte PC.
     pub guarded_method_calls: rustc_hash::FxHashMap<u32, JitGuardedMethodCall>,
+    /// `Op::CallMethodValue` sites of `f.call(...)` keyed by byte PC. With the
+    /// site's single [`Self::direct_callees`] target, generated code proves
+    /// the method is `%Function.prototype.call%` and calls the receiver
+    /// directly with the first argument as `this`.
+    pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCall>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -959,6 +969,51 @@ pub struct JitGuardedMethodCall {
     pub safepoint_id: crate::native_abi::SafepointId,
     /// Exact JavaScript argument count the entry implements.
     pub argument_count: u8,
+}
+
+/// Widest representation a parameter held at a failed optimized entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JitParameterWidening {
+    /// No exit showed anything wider than Int32.
+    #[default]
+    Int32,
+    /// An exit showed a non-Int32 Number.
+    Number,
+    /// An exit showed a non-Number.
+    Tagged,
+}
+
+impl JitParameterWidening {
+    /// The representation `value` needs.
+    #[must_use]
+    pub fn of(value: crate::Value) -> Self {
+        if value.is_int32() {
+            Self::Int32
+        } else if value.is_number() {
+            Self::Number
+        } else {
+            Self::Tagged
+        }
+    }
+}
+
+/// Proof that a closure receiver's `call` is `%Function.prototype.call%`.
+///
+/// The receiver half is the closure property program's: an exact ordinary
+/// closure of the active realm, whose named lookups resolve on the pinned
+/// `%Function.prototype%`. The holder's shape pins the `call` slot, and the
+/// slot's live value must carry the intrinsic's external-reference identity,
+/// so a replaced or redefined `call` fails the proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitFunctionPrototypeCall {
+    /// Closure receiver proof naming the pinned `%Function.prototype%`.
+    pub receiver: JitIntrinsicPrototype,
+    /// Hidden class of `%Function.prototype%` when the site was compiled.
+    pub holder_shape: u32,
+    /// Byte offset of the `call` slot inside the holder's value slab.
+    pub call_value_byte: u32,
+    /// External-reference index of `%Function.prototype.call%`.
+    pub call_native_ref: u32,
 }
 
 /// A callee the compiler may splice into a caller's `Op::Call` site.
@@ -1787,6 +1842,7 @@ impl JitCompileSnapshot {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
+            function_prototype_calls: rustc_hash::FxHashMap::default(),
             property_programs: rustc_hash::FxHashMap::default(),
             property_lookup_cache: None,
             store_transition_cache: None,
@@ -1796,6 +1852,7 @@ impl JitCompileSnapshot {
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
+            parameter_widening: Box::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

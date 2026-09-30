@@ -151,6 +151,27 @@ pub enum VmIntrinsicFunction {
     FunctionPrototypeSymbolHasInstance,
 }
 
+impl VmIntrinsicFunction {
+    /// Address naming this intrinsic in the isolate's external-reference
+    /// table. An intrinsic has no entry point of its own, so each one owns a
+    /// distinct byte of an immutable table instead: generated identity guards
+    /// then compare its `native_ref` exactly as they compare a static
+    /// builtin's.
+    fn identity_address(self) -> usize {
+        // One byte per variant; the last variant bounds the table.
+        const COUNT: usize = VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance as usize + 1;
+        static IDENTITIES: [u8; COUNT] = [0; COUNT];
+        std::ptr::from_ref(&IDENTITIES[self as usize]) as usize
+    }
+
+    /// External-reference index of this intrinsic in `heap`, or `None` when
+    /// the isolate never installed it.
+    #[must_use]
+    pub(crate) fn native_ref(self, heap: &otter_gc::GcHeap) -> Option<u32> {
+        heap.external_refs().lookup(self.identity_address())
+    }
+}
+
 /// Native callable storage.
 ///
 /// Static specs should use [`NativeCall::Static`]. Dynamic closures
@@ -223,10 +244,11 @@ impl std::fmt::Debug for NativeCall {
 pub struct NativeFunctionBody {
     /// Machine-readable static function identity for JIT builtin guards.
     ///
-    /// [`otter_gc::NO_EXTERNAL_REF`] means the callable is not backed by
-    /// [`NativeCallStorage::Static`]. Static builtins store their index in
-    /// the isolate's [`otter_gc::ExternalRefTable`], so generated code can
-    /// validate prototype method slots without decoding the Rust enum. Opaque
+    /// [`otter_gc::NO_EXTERNAL_REF`] means the callable is a dynamic
+    /// closure. Static builtins store the index of their entry point in the
+    /// isolate's [`otter_gc::ExternalRefTable`], and VM intrinsics the index of
+    /// their identity address, so generated code can validate prototype
+    /// method slots without decoding the Rust enum. Opaque
     /// snapshot restore is same-process, so the call slot's static entry point
     /// remains valid without serializing or translating it.
     #[pelt(skip)]
@@ -444,9 +466,8 @@ impl NativeFunction {
         let native_ref = heap.intern_external_ref(match &call {
             NativeCallStorage::Static(f) => *f as *const () as usize,
             NativeCallStorage::StaticWithCaptures(f) => *f as *const () as usize,
-            NativeCallStorage::VmIntrinsic(_)
-            | NativeCallStorage::Dynamic(_)
-            | NativeCallStorage::LocalDynamic(_) => 0,
+            NativeCallStorage::VmIntrinsic(intrinsic) => intrinsic.identity_address(),
+            NativeCallStorage::Dynamic(_) | NativeCallStorage::LocalDynamic(_) => 0,
         });
         // A dynamic closure's Arc moves into the isolate's host-ref
         // table here, through the same single funnel: the body stores
@@ -1280,9 +1301,8 @@ impl NativeFunction {
         })
     }
 
-    /// External-reference index identifying this callable's static entry
-    /// for JIT builtin guards. `None` when the callable is not
-    /// static-backed.
+    /// External-reference index identifying this callable's static entry or
+    /// VM intrinsic for JIT builtin guards. `None` for a dynamic closure.
     #[must_use]
     pub(crate) fn native_ref(&self, heap: &otter_gc::GcHeap) -> Option<u32> {
         heap.read_payload(self.inner, |body| {

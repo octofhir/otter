@@ -55,6 +55,11 @@
 //!   `property_speculation::speculated_load` is instead one
 //!   `PropertyShapeLoad` node with an exact pre-operation state; it does not
 //!   end its block.
+//! - A method call whose method is `%Function.prototype.call%` on an ordinary
+//!   closure receiver, with a baked proof and one recorded target, is a
+//!   [`NumericNode::FunctionCallProof`] with an exact pre-operation exit and
+//!   then a direct explicit-receiver call of the receiver itself (V8's
+//!   `ReduceFunctionPrototypeCall`).
 //! - Every schema-owned binding read, write, and delete remains one typed HIR
 //!   family. Structurally proven global-this, global lexical, global-object
 //!   and checked context-slot targets retain a generated sibling; lookup and
@@ -333,6 +338,15 @@ pub(super) enum NumericNode {
         value_byte: u32,
         ordinary: bool,
     },
+    /// Proof that `receiver.call` is `%Function.prototype.call%`: an
+    /// ordinary closure of the active realm whose `%Function.prototype%`
+    /// keeps its shape and whose `call` slot holds the intrinsic. A failed
+    /// proof exits before the method call; the value is `undefined`.
+    FunctionCallProof {
+        receiver: NumericValue,
+        call: otter_vm::JitFunctionPrototypeCall,
+        byte_pc: u32,
+    },
     PropertyStore {
         receiver: NumericValue,
         value: NumericValue,
@@ -596,6 +610,41 @@ fn method_direct_call_target(
     })
 }
 
+/// The proof and recorded target of a `Function.prototype.call` method site,
+/// unless it sits in a local handler or an earlier generation's identity
+/// proof failed there.
+fn function_prototype_call(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    logical_pc: u32,
+    exceptional_edge: Option<usize>,
+) -> Option<(
+    otter_vm::JitFunctionPrototypeCall,
+    otter_vm::JitDirectCallee,
+)> {
+    if exceptional_edge.is_some()
+        || view.cage_base == 0
+        || view.native_ref_byte == 0
+        || view
+            .optimized_exit_reasons
+            .get(&logical_pc)
+            .is_some_and(|reasons| {
+                reasons.contains(&otter_vm::native_abi::ExitReason::IdentityGuard)
+            })
+    {
+        return None;
+    }
+    let call = view
+        .function_prototype_calls
+        .get(&byte_pc)
+        .copied()
+        .filter(|call| call.receiver.is_generated_receiver())?;
+    let [callee] = view.direct_callees.get(&byte_pc)?.as_slice() else {
+        return None;
+    };
+    Some((call, *callee))
+}
+
 fn generic_method_call_target() -> NumericDirectCallTarget {
     NumericDirectCallTarget {
         kind: NumericDirectCallKind::Method,
@@ -709,6 +758,7 @@ impl NumericNode {
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyLoad { .. }
             | Self::PropertyShapeLoad { .. }
+            | Self::FunctionCallProof { .. }
             | Self::PropertyStore { .. }
             | Self::ElementStore { .. }
             | Self::ElementGuardedStore { .. }
@@ -806,6 +856,7 @@ impl NumericNode {
             | Self::ClassSuperConstructor(..)
             | Self::ConstructorFieldStore { .. }
             | Self::PropertyShapeLoad { .. }
+            | Self::FunctionCallProof { .. }
             | Self::ElementGuardedLoad { .. }
             | Self::ElementGuardedStore { .. }
             | Self::BindingGuardedRead { .. }
@@ -1754,16 +1805,29 @@ fn infer_parameter_types(
             }
         }
         if !changed {
+            // Uses on paths the profile never took also type a parameter, so
+            // the values seen at failed entry guards cap each one.
+            let widening = |parameter: u16| {
+                view.parameter_widening
+                    .get(usize::from(parameter))
+                    .copied()
+                    .unwrap_or_default()
+            };
             return Some(
                 (0..parameter_count)
-                    .map(|parameter| {
-                        if int32_parameters.contains(&parameter) {
+                    .map(|parameter| match widening(parameter) {
+                        otter_vm::JitParameterWidening::Tagged => NumericType::Tagged,
+                        _ if int32_parameters.contains(&parameter)
+                            && widening(parameter) == otter_vm::JitParameterWidening::Int32 =>
+                        {
                             NumericType::Int32
-                        } else if number_parameters.contains(&parameter) {
-                            NumericType::Number
-                        } else {
-                            NumericType::Tagged
                         }
+                        _ if int32_parameters.contains(&parameter)
+                            || number_parameters.contains(&parameter) =>
+                        {
+                            NumericType::Number
+                        }
+                        _ => NumericType::Tagged,
                     })
                     .collect(),
             );
@@ -3897,6 +3961,73 @@ fn lower_instruction(
                         argument_start,
                         logical_pc,
                         byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(value);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(value),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                return write(
+                    registers,
+                    register(instruction, code, 0)?,
+                    RegisterState::Value(value),
+                );
+            }
+            // `f.call(this, ...)` on a proven ordinary closure is the direct
+            // explicit-receiver call of `f`: its argument words are already
+            // `[this, ...]`, and `f.call()` passes `undefined`.
+            if let Some((call, callee)) =
+                function_prototype_call(view, instruction.byte_pc, logical_pc, exceptional_edge)
+            {
+                let proof = push(
+                    nodes,
+                    NumericNode::FunctionCallProof {
+                        receiver: source,
+                        call,
+                        byte_pc: instruction.byte_pc,
+                    },
+                );
+                block_nodes.push(proof);
+                push_frame_state(
+                    frame_states,
+                    NumericFramePoint::Node(proof),
+                    function_id,
+                    instruction.byte_pc,
+                    registers,
+                    live_in,
+                );
+                let mut arguments = arguments;
+                if arguments.is_empty() {
+                    let this = push(
+                        nodes,
+                        NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+                    );
+                    block_nodes.push(this);
+                    arguments.push(this);
+                }
+                let (argument_start, argument_count) =
+                    append_operand_values(operand_values, arguments)?;
+                let target = intern_direct_call_target(
+                    direct_call_targets,
+                    monomorphic_direct_call_target(NumericDirectCallKind::CallWithThis, callee),
+                )?;
+                let value = push(
+                    nodes,
+                    NumericNode::DirectCall {
+                        source,
+                        target,
+                        arguments: NumericDirectCallArguments::Fixed {
+                            start: argument_start,
+                            count: argument_count,
+                        },
+                        logical_pc,
+                        byte_pc: instruction.byte_pc,
+                        exceptional_edge: None,
                     },
                 );
                 block_nodes.push(value);

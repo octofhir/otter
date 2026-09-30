@@ -5,6 +5,7 @@
 //! - Selection eligibility from existing method and static-native snapshots.
 //! - Ordinary CacheIR receiver/holder/slot proofs, pinned intrinsic-prototype
 //!   proofs for exotic receivers, and native identity probes.
+//! - [`select_function_call_proof`] — the `Function.prototype.call` proof.
 //! - [`HitKind`]: a pure Int32 Math hit or a bounded no-allocation leaf hit,
 //!   joined with the canonical boxed completion.
 //!
@@ -20,6 +21,9 @@
 //!   rejects any slot that no longer holds the declared data function.
 //! - Resolved calls consume their loaded callee after argument evaluation; a
 //!   cold miss never repeats the property lookup that produced it.
+//! - A `Function.prototype.call` proof composes the same exotic-receiver,
+//!   holder and identity probes but ends in an exact pre-operation exit
+//!   instead of a cold sibling: the direct call after it is the operation.
 //! - Only the cold sibling publishes roots, a frame state or a safepoint and
 //!   enters the VM. A leaf hit calls a declared entry that cannot allocate,
 //!   collect, throw or reenter JavaScript, so its operands need no roots.
@@ -450,15 +454,101 @@ fn select_method_lookup(
             hit
         }
     };
-    Ok(load_method(
+    Ok(load_slot(
         target_spec,
-        call,
+        call.method_value_byte,
         byte_pc,
         holder,
         hit,
         representations,
         instructions,
     ))
+}
+
+/// Select a [`NumericNode::FunctionCallProof`]: the closure receiver and its
+/// pinned `%Function.prototype%` proven exactly as a method site proves an
+/// exotic receiver, the `call` slot read, and the builtin identity guard
+/// naming the intrinsic, then one exact pre-operation exit.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_function_call_proof(
+    target_spec: &TargetSpec,
+    hir: &NumericFunction,
+    receiver: MachineValue,
+    result: MachineValue,
+    byte_pc: u32,
+    call: otter_vm::JitFunctionPrototypeCall,
+    state_index: usize,
+    exits: Box<[MachineExit]>,
+    machine_values: &[MachineValue],
+    representations: &mut Vec<MachineRepresentation>,
+    instructions: &mut Vec<MachineInstruction>,
+) {
+    let active = boolean(representations);
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::BooleanConstant(true),
+        vec![MachineOperand::register_output(active)],
+    ));
+    let holder = tagged(representations);
+    let receiver_hit = boolean(representations);
+    push_probe(
+        target_spec,
+        instructions,
+        MachineOpcode::CacheIrLoadIntrinsicPrototype {
+            byte_pc,
+            target: call.receiver,
+        },
+        vec![
+            MachineOperand::location_input(receiver),
+            MachineOperand::register_input(active),
+            MachineOperand::register_output(holder),
+            MachineOperand::register_output(receiver_hit),
+        ],
+    );
+    let holder_hit = guard_shaped(
+        target_spec,
+        holder,
+        receiver_hit,
+        call.holder_shape,
+        byte_pc,
+        representations,
+        instructions,
+    );
+    let (method, field_hit) = load_slot(
+        target_spec,
+        call.call_value_byte,
+        byte_pc,
+        holder,
+        holder_hit,
+        representations,
+        instructions,
+    );
+    let proven = boolean(representations);
+    push_probe(
+        target_spec,
+        instructions,
+        MachineOpcode::NativeLeafIdentity {
+            byte_pc,
+            builtin_native_ref: call.call_native_ref,
+        },
+        vec![
+            MachineOperand::location_input(method),
+            MachineOperand::location_input(field_hit),
+            MachineOperand::register_output(proven),
+        ],
+    );
+    let mut require = MachineInstruction::plain(
+        MachineOpcode::GuardCondition,
+        vec![MachineOperand::register_input(proven)],
+    );
+    require.clobbers = target_spec
+        .clobbers(TargetClobberSet::StatusScratch)
+        .to_vec();
+    attach_frame_state(hir, machine_values, state_index, exits, &mut require);
+    instructions.push(require);
+    instructions.push(MachineInstruction::plain(
+        MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+        vec![MachineOperand::register_output(result)],
+    ));
 }
 
 /// Prove a fast object's hidden class and that its shape authorizes named
@@ -497,10 +587,10 @@ fn guard_shaped(
     state_hit
 }
 
-/// Read the method slot from an already-proven holder.
-fn load_method(
+/// Read a method slot from an already-proven holder.
+fn load_slot(
     target_spec: &TargetSpec,
-    call: otter_vm::JitGuardedMethodCall,
+    value_byte: u32,
     byte_pc: u32,
     holder: MachineValue,
     hit: MachineValue,
@@ -514,7 +604,7 @@ fn load_method(
         instructions,
         MachineOpcode::CacheIrLoadField {
             byte_pc,
-            value_byte: call.method_value_byte,
+            value_byte,
         },
         vec![
             MachineOperand::location_input(holder),

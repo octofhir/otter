@@ -723,6 +723,29 @@ impl Interpreter {
         }
     }
 
+    /// Widen the parameter profile of `fid` from the actual parameter values
+    /// of an optimized entry whose type guards failed before its first
+    /// instruction. The next generation's entry representations cannot
+    /// repeat the failed parameter speculation, while parameters that held
+    /// their representation keep it.
+    pub(crate) fn widen_exited_parameters(
+        &mut self,
+        fid: u32,
+        exit: native_abi::SideExit,
+        parameters: &[Value],
+    ) {
+        if exit.logical_pc() != 0 || exit.reason() != native_abi::ExitReason::TypeMismatch {
+            return;
+        }
+        let widening = self
+            .jit_parameter_widening
+            .entry(fid)
+            .or_insert_with(|| vec![jit::JitParameterWidening::Int32; parameters.len()].into());
+        for (slot, &value) in widening.iter_mut().zip(parameters) {
+            *slot = (*slot).max(jit::JitParameterWidening::of(value));
+        }
+    }
+
     /// Record one optimizing-tier deoptimization and self-correct the
     /// speculation that caused it.
     ///
@@ -1126,6 +1149,12 @@ impl Interpreter {
         let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let outcome = code.run_optimized_entry(activation)?;
         if let jit::JitExecOutcome::Bailed(exit) = outcome {
+            let parameters = stack[top_idx]
+                .registers
+                .get(..param_count)
+                .map(<[Value]>::to_vec)
+                .unwrap_or_default();
+            self.widen_exited_parameters(fid, exit, &parameters);
             self.note_jit_optimized_bail(context, fid, exit);
         }
         Some(outcome)

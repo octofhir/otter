@@ -64,7 +64,7 @@ impl Interpreter {
     /// `f.call(...)`. The named-lookup byte excludes bags, prototype
     /// overrides and generator/async kinds; the realm id pins which
     /// `%Function.prototype%` the program read.
-    fn closure_property_program(
+    pub(crate) fn closure_property_program(
         &mut self,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<JitCacheIrProgram> {

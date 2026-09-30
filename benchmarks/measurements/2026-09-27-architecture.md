@@ -1101,6 +1101,25 @@ and stayed in Template.
 outgrow the 4 MB young space; after the 16-byte object body they no longer
 do. It now allocates a 32-element array per iteration.
 
+### Where the call contract stands
+Since the start of §15: fib −17.9% instructions (0.230 → 0.189 s), earley
+−6.2% (6.72 → 6.19 s), ts −2.8% (17.5 → 17.0 s). Remaining stages measured
+or judged against wall time:
+- **Caller tier counting for optimizing callees** (skipping it by the
+  entry cell's tier flag): fib −2.8% instructions but only −2% wall,
+  earley −0.9% / −0.1%, crypto −0.8% / −0.6%; its sample share in fib was
+  skid from neighbouring loads. Not taken: optimizing-entry counts feed the
+  generated-call statistics, bytecode-call accounting and tests.
+- **Frame pointer in optimized code (C4)**: walks use the record chain, so
+  it only helps native profilers; it costs a register (the back-edge
+  countdown lives in x29/ebp). Deferred.
+- **Value-only JS returns (C5)**: status after a JS call is one `cbnz`; an
+  unwinder would save it and the callee's status write. Deferred.
+The generated call is now ~360 instructions per fib invocation (V8 ~114),
+spread thinly: callable guard, entry-cell loads, frame-size and stack
+checks, header copy, depth check and link, root homes, callee prologue.
+The next larger levers are outside the call contract.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

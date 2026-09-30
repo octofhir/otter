@@ -28,6 +28,7 @@ pub(super) fn verify(sequence: &InstructionSequence) -> Result<(), VerificationE
             kind: DirectCallKind::Plain
                 | DirectCallKind::Method
                 | DirectCallKind::CallWithThis
+                | DirectCallKind::FunctionCall
                 | DirectCallKind::Construct,
             argument_mode: DirectCallArgumentMode::Fixed,
             candidates,

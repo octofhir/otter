@@ -465,10 +465,11 @@ fn select_method_lookup(
     ))
 }
 
-/// Select a [`NumericNode::FunctionCallProof`]: the closure receiver and its
-/// pinned `%Function.prototype%` proven exactly as a method site proves an
-/// exotic receiver, the `call` slot read, and the builtin identity guard
-/// naming the intrinsic, then one exact pre-operation exit.
+/// Select a [`NumericNode::FunctionCallProof`]: for a method call, the
+/// closure receiver and its pinned `%Function.prototype%` proven exactly as a
+/// method site proves an exotic receiver and the `call` slot read; then the
+/// builtin identity guard naming the intrinsic on that slot's value (or on the
+/// loaded callee), and one exact pre-operation exit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_function_call_proof(
     target_spec: &TargetSpec,
@@ -488,40 +489,45 @@ pub(super) fn select_function_call_proof(
         MachineOpcode::BooleanConstant(true),
         vec![MachineOperand::register_output(active)],
     ));
-    let holder = tagged(representations);
-    let receiver_hit = boolean(representations);
-    push_probe(
-        target_spec,
-        instructions,
-        MachineOpcode::CacheIrLoadIntrinsicPrototype {
-            byte_pc,
-            target: call.receiver,
-        },
-        vec![
-            MachineOperand::location_input(receiver),
-            MachineOperand::register_input(active),
-            MachineOperand::register_output(holder),
-            MachineOperand::register_output(receiver_hit),
-        ],
-    );
-    let holder_hit = guard_shaped(
-        target_spec,
-        holder,
-        receiver_hit,
-        call.holder_shape,
-        byte_pc,
-        representations,
-        instructions,
-    );
-    let (method, field_hit) = load_slot(
-        target_spec,
-        call.call_value_byte,
-        byte_pc,
-        holder,
-        holder_hit,
-        representations,
-        instructions,
-    );
+    let (method, field_hit) = match call.lookup {
+        None => (receiver, active),
+        Some(lookup) => {
+            let holder = tagged(representations);
+            let receiver_hit = boolean(representations);
+            push_probe(
+                target_spec,
+                instructions,
+                MachineOpcode::CacheIrLoadIntrinsicPrototype {
+                    byte_pc,
+                    target: lookup.receiver,
+                },
+                vec![
+                    MachineOperand::location_input(receiver),
+                    MachineOperand::register_input(active),
+                    MachineOperand::register_output(holder),
+                    MachineOperand::register_output(receiver_hit),
+                ],
+            );
+            let holder_hit = guard_shaped(
+                target_spec,
+                holder,
+                receiver_hit,
+                lookup.holder_shape,
+                byte_pc,
+                representations,
+                instructions,
+            );
+            load_slot(
+                target_spec,
+                lookup.call_value_byte,
+                byte_pc,
+                holder,
+                holder_hit,
+                representations,
+                instructions,
+            )
+        }
+    };
     let proven = boolean(representations);
     push_probe(
         target_spec,

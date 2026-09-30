@@ -510,7 +510,6 @@ impl Interpreter {
             EAGER_DIRECT_TARGET_DEPTH,
         );
         self.bake_guarded_method_calls(&mut snapshot);
-        self.bake_function_prototype_calls(&mut snapshot, context);
         self.bake_element_accesses(&mut snapshot);
         self.bake_constructor_field_transitions(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
@@ -766,7 +765,6 @@ impl Interpreter {
             eager_direct_target_depth,
         );
         self.bake_guarded_method_calls(&mut view);
-        self.bake_function_prototype_calls(&mut view, context);
         self.bake_element_accesses(&mut view);
         self.bake_constructor_field_transitions(&mut view);
         Self::bake_context_allocations(&mut view);
@@ -1367,71 +1365,60 @@ impl Interpreter {
     /// prototype hop rather than a second description of the same access. An
     /// entry that may collect reserves its safepoint here, at the site that
     /// will publish it.
-    /// `f.call(...)` sites (V8's `ReduceFunctionPrototypeCall`): a method call
-    /// named `call` whose recorded target the call-site pass planned, while
-    /// `%Function.prototype.call%` still holds the intrinsic. The proof is the
-    /// closure receiver program for `call`; generated code re-proves it and
-    /// the intrinsic's identity before calling the receiver directly.
-    fn bake_function_prototype_calls(
+    /// Proof for an `f.call(...)` site (V8's `ReduceFunctionPrototypeCall`)
+    /// whose feedback recorded the function `%Function.prototype.call%` ran.
+    /// A method call named `call` proves its lookup through the closure
+    /// property program while the intrinsic still occupies the slot; an
+    /// explicit-receiver call proves only its loaded callee. Generated code
+    /// re-proves the intrinsic's identity before calling the function.
+    fn function_prototype_call_proof(
         &mut self,
-        view: &mut jit::JitCompileSnapshot,
+        view: &jit::JitCompileSnapshot,
         context: &ExecutionContext,
-    ) {
-        let sites: Vec<_> = view
-            .instructions
-            .iter()
-            .filter(|instr| {
-                instr.op(&view.code_block) == Op::CallMethodValue
-                    && view.direct_callees.contains_key(&instr.byte_pc)
-            })
-            .filter_map(|instr| Some((instr.byte_pc, instr.const_index(&view.code_block, 2)?)))
-            .collect();
-        if sites.is_empty() {
-            return;
-        }
+        op: Op,
+        instruction_pc: u32,
+    ) -> Option<jit::JitFunctionPrototypeCall> {
         let intrinsic = crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall;
-        let Some(call_native_ref) = intrinsic.native_ref(&self.gc_heap) else {
-            return;
-        };
-        let holds_intrinsic = self
-            .realm_intrinsics
-            .function_prototype()
-            .and_then(|prototype| object::get(prototype, &self.gc_heap, "call"))
-            .and_then(|value| value.as_native_function())
-            .is_some_and(|native| native.is_vm_intrinsic(&self.gc_heap, intrinsic));
-        if !holds_intrinsic {
-            return;
-        }
-        for (byte_pc, name_index) in sites {
-            let Some(key) = context.property_atom_for_function(view.code_block.id, name_index)
-            else {
-                continue;
-            };
-            if key.name() != "call" {
-                continue;
-            }
-            let Some(program) = self.closure_property_program(key) else {
-                continue;
-            };
-            let [
-                jit::JitCacheIrOp::LoadIntrinsicPrototype { target, .. },
-                jit::JitCacheIrOp::GuardShape { shape, .. },
-                _,
-                jit::JitCacheIrOp::LoadField { value_byte, .. },
-            ] = *program.ops
-            else {
-                continue;
-            };
-            view.function_prototype_calls.insert(
-                byte_pc,
-                jit::JitFunctionPrototypeCall {
+        let call_native_ref = intrinsic.native_ref(&self.gc_heap)?;
+        let lookup = match op {
+            Op::CallWithThis => None,
+            Op::CallMethodValue => {
+                let name_index = view
+                    .instructions
+                    .get(instruction_pc as usize)?
+                    .const_index(&view.code_block, 2)?;
+                let key = context.property_atom_for_function(view.code_block.id, name_index)?;
+                let holds_intrinsic = self
+                    .realm_intrinsics
+                    .function_prototype()
+                    .and_then(|prototype| object::get(prototype, &self.gc_heap, "call"))
+                    .and_then(|value| value.as_native_function())
+                    .is_some_and(|native| native.is_vm_intrinsic(&self.gc_heap, intrinsic));
+                if key.name() != "call" || !holds_intrinsic {
+                    return None;
+                }
+                let program = self.closure_property_program(key)?;
+                let [
+                    jit::JitCacheIrOp::LoadIntrinsicPrototype { target, .. },
+                    jit::JitCacheIrOp::GuardShape { shape, .. },
+                    _,
+                    jit::JitCacheIrOp::LoadField { value_byte, .. },
+                ] = *program.ops
+                else {
+                    return None;
+                };
+                Some(jit::JitFunctionCallLookup {
                     receiver: target,
                     holder_shape: shape,
                     call_value_byte: value_byte,
-                    call_native_ref,
-                },
-            );
-        }
+                })
+            }
+            _ => return None,
+        };
+        Some(jit::JitFunctionPrototypeCall {
+            lookup,
+            call_native_ref,
+        })
     }
 
     pub(crate) fn bake_guarded_method_calls(&mut self, view: &mut jit::JitCompileSnapshot) {
@@ -1986,7 +1973,6 @@ impl Interpreter {
             self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
             self.bake_guarded_method_calls(&mut body);
-            self.bake_function_prototype_calls(&mut body, context);
             self.bake_element_accesses(&mut body);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
@@ -2152,8 +2138,13 @@ impl Interpreter {
             let target_count = targets.len() as u32;
             for (target_index, target) in targets.into_iter().enumerate() {
                 let target_index = target_index as u32;
+                let function_prototype_call = matches!(
+                    target.target,
+                    feedback::OrdinaryCallTarget::FunctionPrototypeCall(_)
+                );
                 let callee_fid = match target.target {
-                    feedback::OrdinaryCallTarget::Bytecode(callee_fid) => callee_fid,
+                    feedback::OrdinaryCallTarget::Bytecode(callee_fid)
+                    | feedback::OrdinaryCallTarget::FunctionPrototypeCall(callee_fid) => callee_fid,
                     feedback::OrdinaryCallTarget::StaticNative(stub_id) => {
                         let name = crate::native_abi::runtime_stub_name(stub_id);
                         let declaration = crate::jit_static_native::jit_leaf_builtin(stub_id)
@@ -2292,6 +2283,15 @@ impl Interpreter {
                     };
                     if is_construct {
                         view.direct_constructs.insert(call_byte_pc, callee);
+                    } else if function_prototype_call {
+                        if let Some(proof) =
+                            self.function_prototype_call_proof(view, context, op, instruction_pc)
+                        {
+                            view.function_prototype_calls.insert(
+                                call_byte_pc,
+                                jit::JitFunctionPrototypeCallSite { proof, callee },
+                            );
+                        }
                     } else {
                         view.direct_callees
                             .entry(call_byte_pc)
@@ -2355,7 +2355,7 @@ impl Interpreter {
                 {
                     continue;
                 }
-                if inline_ineligible || target_count != 1 {
+                if inline_ineligible || target_count != 1 || function_prototype_call {
                     continue;
                 }
                 let Some(body) = self.bake_inline_body(&callee_context, callee_fid, tier, budget)

@@ -180,6 +180,7 @@ fn splice_tree(
                             NumericDirectCallKind::Plain
                                 | NumericDirectCallKind::Method
                                 | NumericDirectCallKind::CallWithThis
+                                | NumericDirectCallKind::FunctionCall
                                 | NumericDirectCallKind::Construct
                         ) || target.candidates.len() != 1
                     }),

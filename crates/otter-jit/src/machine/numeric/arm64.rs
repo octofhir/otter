@@ -3573,7 +3573,10 @@ fn emit_with_reach(
                     // An explicit-receiver call carries its receiver as
                     // operand one; the linkage takes it through the call form
                     // rather than the argument list.
-                    let first_argument = if *kind == DirectCallKind::CallWithThis {
+                    let first_argument = if matches!(
+                        kind,
+                        DirectCallKind::CallWithThis | DirectCallKind::FunctionCall
+                    ) {
                         2
                     } else {
                         1
@@ -3641,10 +3644,12 @@ fn emit_with_reach(
                                 ));
                             }
                             DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
-                            DirectCallKind::CallWithThis => DirectCallForm::CallWithThis {
-                                callable: 0,
-                                receiver: 1,
-                            },
+                            DirectCallKind::CallWithThis | DirectCallKind::FunctionCall => {
+                                DirectCallForm::CallWithThis {
+                                    callable: 0,
+                                    receiver: 1,
+                                }
+                            }
                             DirectCallKind::Method => {
                                 let guard = candidate.guard.as_ref().ok_or(
                                     Unsupported::OperandShape("scalar method candidate guard"),

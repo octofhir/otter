@@ -269,7 +269,10 @@ pub(super) fn emit(
     }
     if matches!(
         kind,
-        DirectCallKind::Plain | DirectCallKind::CallWithThis | DirectCallKind::Method
+        DirectCallKind::Plain
+            | DirectCallKind::CallWithThis
+            | DirectCallKind::FunctionCall
+            | DirectCallKind::Method
     ) {
         if descriptor.exceptional == ExceptionalEdge::None
             || (argument_mode == DirectCallArgumentMode::Spread && kind != DirectCallKind::Plain)
@@ -344,7 +347,10 @@ pub(super) fn emit(
             return Ok(());
         }
         if candidates.len() == 1 {
-            return emit_generated_value_call(
+            // A reduced `f.call` has no generic completion of its own: any
+            // miss exits, and the interpreter performs the original call.
+            let exit_miss = (kind == DirectCallKind::FunctionCall).then(|| ops.new_dynamic_label());
+            emit_generated_value_call(
                 ops,
                 relocations,
                 view,
@@ -361,12 +367,23 @@ pub(super) fn emit(
                 logical_pc,
                 byte_pc,
                 false,
-                None,
+                exit_miss,
                 fatal,
                 throw_value,
                 done,
                 regions,
-            );
+            )?;
+            if let Some(exit_miss) = exit_miss {
+                dynasm!(ops ; .arch x64 ; =>exit_miss);
+                reload_roots(ops, frame, site)?;
+                dynasm!(ops ; .arch x64 ; jmp =>deopt);
+            }
+            return Ok(());
+        }
+        if kind == DirectCallKind::FunctionCall {
+            return Err(Unsupported::OperandShape(
+                "x86-64 reduced f.call without its target",
+            ));
         }
         if argument_mode == DirectCallArgumentMode::Spread {
             return Err(Unsupported::OperandShape(
@@ -949,7 +966,10 @@ fn emit_generated_value_call(
     let result = *locations
         .get(result_index)
         .ok_or(Unsupported::OperandShape("x86-64 direct-call result"))?;
-    let argument_start = if kind == DirectCallKind::CallWithThis {
+    let argument_start = if matches!(
+        kind,
+        DirectCallKind::CallWithThis | DirectCallKind::FunctionCall
+    ) {
         2
     } else {
         1
@@ -1003,46 +1023,48 @@ fn emit_generated_value_call(
         DirectCallKind::Method => {
             load_saved_root(ops, frame, site, instruction.operands[0].value, 12)?;
         }
-        DirectCallKind::Plain | DirectCallKind::CallWithThis => match target.plan.this_mode {
-            otter_vm::JitDirectCallThisMode::StrictOrLexical => {
-                if kind == DirectCallKind::CallWithThis {
-                    load_saved_root(ops, frame, site, instruction.operands[1].value, 12)?;
-                } else {
-                    load64(ops, 12, VALUE_UNDEFINED);
+        DirectCallKind::Plain | DirectCallKind::CallWithThis | DirectCallKind::FunctionCall => {
+            match target.plan.this_mode {
+                otter_vm::JitDirectCallThisMode::StrictOrLexical => {
+                    if kind != DirectCallKind::Plain {
+                        load_saved_root(ops, frame, site, instruction.operands[1].value, 12)?;
+                    } else {
+                        load64(ops, 12, VALUE_UNDEFINED);
+                    }
+                }
+                otter_vm::JitDirectCallThisMode::SloppyGlobal => {
+                    if kind != DirectCallKind::Plain {
+                        load_saved_root(ops, frame, site, instruction.operands[1].value, 12)?;
+                        load64(ops, 10, Value::null().to_bits());
+                        dynasm!(ops ; .arch x64 ; cmp r12, r10 ; je >global_this);
+                        load64(ops, 10, VALUE_UNDEFINED);
+                        dynasm!(ops ; .arch x64 ; cmp r12, r10 ; jne =>guard_fail ; global_this:);
+                    }
+                    dynasm!(ops
+                        ; .arch x64
+                        ; mov r10, [r15 + GLOBAL_THIS_OFFSET_PTR_OFFSET as i32]
+                        ; test r10, r10
+                        ; jz =>guard_fail
+                        ; mov r12d, [r10]
+                        ; test r12d, r12d
+                        ; jz =>guard_fail
+                    );
+                    symbolic(
+                        ops,
+                        relocations,
+                        11,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    dynasm!(ops ; .arch x64 ; add r12, r11);
+                }
+                _ => {
+                    return Err(Unsupported::OperandShape(
+                        "x86-64 generated value-call receiver mode",
+                    ));
                 }
             }
-            otter_vm::JitDirectCallThisMode::SloppyGlobal => {
-                if kind == DirectCallKind::CallWithThis {
-                    load_saved_root(ops, frame, site, instruction.operands[1].value, 12)?;
-                    load64(ops, 10, Value::null().to_bits());
-                    dynasm!(ops ; .arch x64 ; cmp r12, r10 ; je >global_this);
-                    load64(ops, 10, VALUE_UNDEFINED);
-                    dynasm!(ops ; .arch x64 ; cmp r12, r10 ; jne =>guard_fail ; global_this:);
-                }
-                dynasm!(ops
-                    ; .arch x64
-                    ; mov r10, [r15 + GLOBAL_THIS_OFFSET_PTR_OFFSET as i32]
-                    ; test r10, r10
-                    ; jz =>guard_fail
-                    ; mov r12d, [r10]
-                    ; test r12d, r12d
-                    ; jz =>guard_fail
-                );
-                symbolic(
-                    ops,
-                    relocations,
-                    11,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                dynasm!(ops ; .arch x64 ; add r12, r11);
-            }
-            _ => {
-                return Err(Unsupported::OperandShape(
-                    "x86-64 generated value-call receiver mode",
-                ));
-            }
-        },
+        }
         _ => unreachable!("value-call helper receives ordinary calls"),
     }
 
@@ -1341,7 +1363,8 @@ fn emit_generic_value_call(
         DirectCallKind::Forward => otter_vm::native_abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
         DirectCallKind::DerivedConstruct
         | DirectCallKind::SuperConstruct
-        | DirectCallKind::DerivedSuperConstruct => {
+        | DirectCallKind::DerivedSuperConstruct
+        | DirectCallKind::FunctionCall => {
             return Err(Unsupported::OperandShape("x86-64 generic direct-call kind"));
         }
     };
@@ -1378,9 +1401,10 @@ fn direct_call_artifact(
         .ok_or(Unsupported::OperandShape("x86-64 direct target frame"))?;
     Ok(DirectCallArtifact {
         call_kind: match kind {
-            DirectCallKind::Plain | DirectCallKind::CallWithThis | DirectCallKind::Forward => {
-                DirectCallKindArtifact::Plain
-            }
+            DirectCallKind::Plain
+            | DirectCallKind::CallWithThis
+            | DirectCallKind::FunctionCall
+            | DirectCallKind::Forward => DirectCallKindArtifact::Plain,
             DirectCallKind::Method => DirectCallKindArtifact::Method,
             DirectCallKind::Construct => DirectCallKindArtifact::Construct,
             DirectCallKind::DerivedConstruct => DirectCallKindArtifact::DerivedConstruct,
@@ -1410,19 +1434,21 @@ fn direct_call_artifact(
             DirectCallKind::DerivedConstruct | DirectCallKind::DerivedSuperConstruct => {
                 DirectCallThisModeArtifact::DerivedConstructor
             }
-            DirectCallKind::Plain | DirectCallKind::CallWithThis => match target.this_mode {
-                otter_vm::JitDirectCallThisMode::StrictOrLexical => {
-                    DirectCallThisModeArtifact::StrictOrLexical
+            DirectCallKind::Plain | DirectCallKind::CallWithThis | DirectCallKind::FunctionCall => {
+                match target.this_mode {
+                    otter_vm::JitDirectCallThisMode::StrictOrLexical => {
+                        DirectCallThisModeArtifact::StrictOrLexical
+                    }
+                    otter_vm::JitDirectCallThisMode::SloppyGlobal => {
+                        DirectCallThisModeArtifact::SloppyGlobal
+                    }
+                    _ => {
+                        return Err(Unsupported::OperandShape(
+                            "x86-64 direct-call receiver artifact",
+                        ));
+                    }
                 }
-                otter_vm::JitDirectCallThisMode::SloppyGlobal => {
-                    DirectCallThisModeArtifact::SloppyGlobal
-                }
-                _ => {
-                    return Err(Unsupported::OperandShape(
-                        "x86-64 direct-call receiver artifact",
-                    ));
-                }
-            },
+            }
             DirectCallKind::Forward => DirectCallThisModeArtifact::StrictOrLexical,
         },
         callee_native_frame_bytes,

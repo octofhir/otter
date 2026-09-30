@@ -737,11 +737,11 @@ pub struct JitCompileSnapshot {
     pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
     /// Guarded method calls into a declared native entry, keyed by call byte PC.
     pub guarded_method_calls: rustc_hash::FxHashMap<u32, JitGuardedMethodCall>,
-    /// `Op::CallMethodValue` sites of `f.call(...)` keyed by byte PC. With the
-    /// site's single [`Self::direct_callees`] target, generated code proves
-    /// the method is `%Function.prototype.call%` and calls the receiver
-    /// directly with the first argument as `this`.
-    pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCall>,
+    /// `f.call(...)` sites keyed by byte PC: an `Op::CallMethodValue` named
+    /// `call`, or an `Op::CallWithThis` whose loaded callee was
+    /// `%Function.prototype.call%`. Generated code proves the intrinsic and
+    /// calls the function it ran directly, with the first argument as `this`.
+    pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCallSite>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -997,23 +997,40 @@ impl JitParameterWidening {
     }
 }
 
-/// Proof that a closure receiver's `call` is `%Function.prototype.call%`.
-///
-/// The receiver half is the closure property program's: an exact ordinary
-/// closure of the active realm, whose named lookups resolve on the pinned
-/// `%Function.prototype%`. The holder's shape pins the `call` slot, and the
-/// slot's live value must carry the intrinsic's external-reference identity,
-/// so a replaced or redefined `call` fails the proof.
+/// Lookup half of a method-call `f.call` proof: the closure property
+/// program's receiver proof (an exact ordinary closure of the active realm,
+/// whose named lookups resolve on the pinned `%Function.prototype%`) and the
+/// holder shape that pins the `call` slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JitFunctionPrototypeCall {
+pub struct JitFunctionCallLookup {
     /// Closure receiver proof naming the pinned `%Function.prototype%`.
     pub receiver: JitIntrinsicPrototype,
     /// Hidden class of `%Function.prototype%` when the site was compiled.
     pub holder_shape: u32,
     /// Byte offset of the `call` slot inside the holder's value slab.
     pub call_value_byte: u32,
+}
+
+/// Proof that a site's callee is `%Function.prototype.call%`: the method a
+/// lookup reads (for a method call) or the loaded callee (for an explicit
+/// receiver call) must carry the intrinsic's external-reference identity, so
+/// a replaced or redefined `call` fails it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitFunctionPrototypeCall {
+    /// How a method call reads `call` from its receiver; `None` when the site
+    /// already holds the callee.
+    pub lookup: Option<JitFunctionCallLookup>,
     /// External-reference index of `%Function.prototype.call%`.
     pub call_native_ref: u32,
+}
+
+/// One `f.call(...)` site: its proof and the function `f` the call ran.
+#[derive(Debug, Clone, Copy)]
+pub struct JitFunctionPrototypeCallSite {
+    /// Proof that the callee is the intrinsic.
+    pub proof: JitFunctionPrototypeCall,
+    /// Current entry generation of the function the intrinsic runs.
+    pub callee: JitDirectCallee,
 }
 
 /// A callee the compiler may splice into a caller's `Op::Call` site.

@@ -106,10 +106,8 @@ impl RuntimeCall<'_> {
 
     /// Complete the exact published explicit-receiver call from boxed SSA
     /// values: `values[0]` is the callee, `values[1]` the receiver, and the
-    /// rest every actual argument. The site is a `CallWithThis`, a plain
-    /// `Call` whose generated caller supplies `undefined` as the receiver, or
-    /// a `CallMethodValue` reduced from `f.call(this, ...)`, whose first
-    /// actual argument became the receiver (`undefined` when it had none); the
+    /// rest every actual argument. The site is a `CallWithThis`, or a plain
+    /// `Call` whose generated caller supplies `undefined` as the receiver; the
     /// callee's own binding rules apply either way.
     pub fn call_with_this_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (callee, rest) = values.split_first().ok_or(VmError::InvalidOperand)?;
@@ -123,10 +121,9 @@ impl RuntimeCall<'_> {
         let instruction = function
             .instr_at_index(call_pc as usize)
             .ok_or(VmError::InvalidOperand)?;
-        let (count_operand, receiver_argument) = match function.op(instruction) {
-            otter_bytecode::Op::CallWithThis => (3, false),
-            otter_bytecode::Op::Call => (2, false),
-            otter_bytecode::Op::CallMethodValue => (3, true),
+        let count_operand = match function.op(instruction) {
+            otter_bytecode::Op::CallWithThis => 3,
+            otter_bytecode::Op::Call => 2,
             _ => return Err(VmError::InvalidOperand),
         };
         if instruction.instruction_pc != call_pc {
@@ -136,11 +133,6 @@ impl RuntimeCall<'_> {
             .const_index(instruction, count_operand)
             .and_then(|count| usize::try_from(count).ok())
             .ok_or(VmError::InvalidOperand)?;
-        let argument_count = if receiver_argument {
-            argument_count.saturating_sub(1)
-        } else {
-            argument_count
-        };
         if args.len() != argument_count {
             return Err(VmError::InvalidOperand);
         }

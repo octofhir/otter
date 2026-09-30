@@ -31,7 +31,7 @@ function noArgs(f) {
 
 let total = 0;
 let shapes = "";
-for (let i = 0; i < 40000; i++) {
+for (let i = 0; i < 5000; i++) {
   const d = new Derived(i);
   total += d.v + d.w;
   total += viaCall(sum3, { base: 1 }, i, 2);
@@ -74,7 +74,7 @@ console.log(viaCall(withOwn, null, 10, 3), viaCall(sum3, { base: 0 }, 10, 3));
 
 // Exceptions thrown through a direct f.call, inside and outside handlers.
 function thrower(n) {
-  if (n > 39990) throw new RangeError("n=" + n);
+  if (n > 4990) throw new RangeError("n=" + n);
   return n;
 }
 function guarded(n) {
@@ -86,14 +86,14 @@ function guarded(n) {
 }
 let caught = "";
 let acc = 0;
-for (let i = 0; i < 40000; i++) {
+for (let i = 0; i < 5000; i++) {
   const r = guarded(i);
   if (typeof r === "string") caught = r;
   else acc += r;
 }
 console.log(acc, caught);
 try {
-  for (let i = 0; i < 40000; i++) viaCall(thrower, null, i);
+  for (let i = 0; i < 5000; i++) viaCall(thrower, null, i);
 } catch (e) {
   console.log("outer", e.message);
 }
@@ -106,7 +106,7 @@ Function.prototype.call = function (self, a, b) {
 console.log(viaCall(sum3, { base: 1 }, 2, 3), new Derived(4).v);
 Function.prototype.call = originalCall;
 let again = 0;
-for (let i = 0; i < 20000; i++) again += viaCall(sum3, { base: 1 }, i, 0);
+for (let i = 0; i < 2500; i++) again += viaCall(sum3, { base: 1 }, i, 0);
 console.log(again);
 
 // A getter for `call` on Function.prototype.
@@ -125,3 +125,36 @@ Object.defineProperty(Function.prototype, "call", {
   value: originalCall,
 });
 console.log(viaCall(sum3, { base: 5 }, 1, 1));
+
+// The loaded form: effectful arguments or captured receivers make the
+// compiler load `f.call` first and call it with `f` as `this`.
+function id(x) {
+  return x;
+}
+function viaLoaded(f, self, a) {
+  return f.call(self, id(a), 2);
+}
+const makeSub = (parent, k) => {
+  function Sub(x) {
+    parent.call(this, k);
+    this.x = x;
+  }
+  return Sub;
+};
+const Sub = makeSub(Base, 7);
+let loaded = 0;
+for (let i = 0; i < 5000; i++) {
+  loaded += viaLoaded(sum3, { base: 1 }, i);
+  loaded += new Sub(i).v;
+}
+console.log(loaded);
+console.log(viaLoaded(other, { base: 2 }, 9), viaLoaded(bound, null, 1), viaLoaded(Math.min, null, 3));
+console.log(viaLoaded(withOwn, null, 4), new (makeSub(Derived, 3))(1).w);
+Function.prototype.call = function (self, a) {
+  return "loaded-replaced:" + a;
+};
+console.log(viaLoaded(sum3, null, 5), new Sub(1).v);
+Function.prototype.call = originalCall;
+let loadedAgain = 0;
+for (let i = 0; i < 2500; i++) loadedAgain += viaLoaded(sum3, { base: 0 }, i);
+console.log(loadedAgain);

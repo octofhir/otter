@@ -207,6 +207,13 @@ impl Interpreter {
                 )
             }) && interp.is_callable_runtime(&receiver)
             {
+                if let Some(target) = interp.function_prototype_call_target(method, receiver) {
+                    let transition =
+                        interp.record_ordinary_call_feedback(function, call_pc, target);
+                    if transition.evict_for_reopt() {
+                        interp.evict_compiled_for_reopt(function_id);
+                    }
+                }
                 let this = if rooted_args.is_empty() {
                     Value::undefined()
                 } else {
@@ -250,7 +257,7 @@ impl Interpreter {
             .jit_runtime_stats
             .jit_to_rust_call_transitions
             .saturating_add(1);
-        self.record_resolved_call_feedback(function, call_pc, function_id, callee);
+        self.record_resolved_call_feedback(function, call_pc, function_id, callee, receiver);
         self.note_generic_call_target(context, function_id, callee);
         self.run_rooted_call_values(stack, context, callee, receiver, args)
     }

@@ -69,24 +69,53 @@ impl Interpreter {
         changed
     }
 
+    /// The function a call of `callee` with `receiver` as `this` runs when
+    /// `callee` is `%Function.prototype.call%` and `receiver` a bytecode
+    /// function.
+    pub(crate) fn function_prototype_call_target(
+        &self,
+        callee: crate::Value,
+        receiver: crate::Value,
+    ) -> Option<OrdinaryCallTarget> {
+        let is_call = callee.as_native_function().is_some_and(|native| {
+            native.is_vm_intrinsic(
+                &self.gc_heap,
+                crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall,
+            )
+        });
+        if !is_call {
+            return None;
+        }
+        receiver
+            .as_function()
+            .or_else(|| {
+                receiver
+                    .as_closure(&self.gc_heap)
+                    .map(|closure| closure.function_id())
+            })
+            .map(OrdinaryCallTarget::FunctionPrototypeCall)
+    }
+
     /// Publish an already-resolved callable at a generated call site.
     /// This leaf observation never allocates in the GC heap or invokes user
-    /// code. Only exact declared bootstrap natives have a static-native target.
+    /// code. Only exact declared bootstrap natives have a static-native target,
+    /// and `%Function.prototype.call%` records the function it runs.
     pub(crate) fn record_resolved_call_feedback(
         &mut self,
         code_block: &CodeBlock,
         instruction_pc: u32,
         caller_function_id: u32,
         callee: crate::Value,
+        receiver: crate::Value,
     ) {
-        let target = callee
-            .as_function()
+        let target = self
+            .function_prototype_call_target(callee, receiver)
+            .or_else(|| callee.as_function().map(OrdinaryCallTarget::Bytecode))
             .or_else(|| {
                 callee
                     .as_closure(&self.gc_heap)
-                    .map(|closure| closure.function_id())
+                    .map(|closure| OrdinaryCallTarget::Bytecode(closure.function_id()))
             })
-            .map(OrdinaryCallTarget::Bytecode)
             .or_else(|| {
                 callee
                     .as_native_function()

@@ -4396,6 +4396,7 @@ fn direct_call_descriptor(
             kind: match target.kind {
                 NumericDirectCallKind::Plain => DirectCallKind::Plain,
                 NumericDirectCallKind::CallWithThis => DirectCallKind::CallWithThis,
+                NumericDirectCallKind::FunctionCall => DirectCallKind::FunctionCall,
                 NumericDirectCallKind::Forward => DirectCallKind::Forward,
                 NumericDirectCallKind::Method => DirectCallKind::Method,
                 NumericDirectCallKind::Construct => DirectCallKind::Construct,

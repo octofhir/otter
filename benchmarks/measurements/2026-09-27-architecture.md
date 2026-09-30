@@ -1250,9 +1250,42 @@ Corpora: `function_prototype_call_sites` covers:
 | ts-fixed | 167.5G | 160.5G (−4.2%) | 16.76s | 16.37s |
 | earley / crypto / zlib / fib / mega_method | unchanged | | | |
 
-Since §16 began, ast_ctor has gone from 1.40 s to 0.64 s. CallWithThis
-targets are still only residual calls in a splice. Admitting them as
-inline candidates is the next step for `_super.call` chains.
+### The loaded form and exact feedback
+A profile after stage B still showed most of ast_ctor's samples in the
+generic explicit-receiver stub. `_super.call(this, k)` with a captured `k`
+compiles to the loaded form (`LoadProperty _super.call` plus `CallWithThis`
+whose callee is the intrinsic). There the intrinsic ran synchronously and
+the site recorded nothing.
+
+Call feedback now has a third target kind, `FunctionPrototypeCall(fid)`:
+`%Function.prototype.call%` ran function `fid`. The interpreter and both
+generic JIT stubs record it for either form, so an ordinary call of the same
+function stays a distinct target. The kind also carries the plan: the
+function's entry becomes the site's reduced callee, never an ordinary direct
+callee that a tier would guard against the intrinsic value.
+
+The loaded form proves only its callee's identity: no lookup, the same
+`FunctionCallProof` node. The reduced call is a new Machine call kind,
+`FunctionCall`. It uses explicit-receiver linkage with exactly one candidate,
+and every miss exits instead of completing generically:
+- On arm64, a miss takes the candidate bail.
+- On x86-64, the generated-call miss reloads the roots and deoptimizes.
+
+The interpreter then performs the site's own operation, and the recompile
+keeps the generic call. A miss is therefore never a generic call whose
+feedback or argument shape differs from the site's own. The generic
+explicit-receiver stub again admits only `Call` and `CallWithThis`.
+
+| Workload | instr after B | after loaded form | wall |
+|---|---:|---:|---:|
+| ast_ctor | 10.94G | 6.39G (−41%) | 0.638 → 0.385s |
+| ts-fixed | 160.5G | 158.2G (−1.4%) | 16.4s |
+| earley / crypto / zlib / fib / mega_method | unchanged | | |
+
+Since §16 began, ast_ctor has gone from 1.40 s to 0.385 s (21.4G → 6.4G
+instructions). Reduced targets are still only residual calls in a splice.
+Admitting them as inline candidates is the next step for `_super.call`
+chains.
 
 ## Checkpoint
 

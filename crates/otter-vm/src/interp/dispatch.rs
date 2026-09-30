@@ -299,6 +299,19 @@ impl Interpreter {
                         );
                     }
                     let depth_before = stack.len();
+                    // `f.call(this, ...)` loaded as a value runs `f`: the site
+                    // records that function, read before the call can collect.
+                    let function_call_target = (jit_installed && op == Op::CallWithThis)
+                        .then(|| {
+                            let frame = stack.get(top_idx)?;
+                            let register = |index| {
+                                register_operand(function.operand(instr, index))
+                                    .ok()
+                                    .and_then(|r| frame.registers.get(r as usize).copied())
+                            };
+                            self.function_prototype_call_target(register(1)?, register(2)?)
+                        })
+                        .flatten();
                     let static_native_target = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -341,7 +354,9 @@ impl Interpreter {
                     // unchanged.
                     let bytecode_pushed = stack.len() > depth_before;
                     if jit_installed
-                        && let Some(target) = if bytecode_pushed {
+                        && let Some(target) = if function_call_target.is_some() {
+                            function_call_target
+                        } else if bytecode_pushed {
                             Some(crate::feedback::OrdinaryCallTarget::Bytecode(
                                 stack[stack.len() - 1].function_id,
                             ))
@@ -449,12 +464,20 @@ impl Interpreter {
                                 .get(top_idx)
                                 .and_then(|f| f.registers.get(r as usize).copied())
                         });
-                    // The function a `Function.prototype.call` / `apply`
-                    // invocation runs is the receiver itself; its id is read
-                    // now, while the receiver handle is still valid.
+                    // The function `f.call(...)` runs is the receiver itself;
+                    // its id is read now, while the receiver handle is still
+                    // valid.
                     let receiver_function_id = receiver_value
                         .and_then(|value| value.as_closure(&self.gc_heap))
-                        .map(crate::closure::JsClosure::function_id);
+                        .map(crate::closure::JsClosure::function_id)
+                        .filter(|_| {
+                            const_operand(function.operand(instr, 2))
+                                .ok()
+                                .and_then(|name| {
+                                    context.property_atom_for_function(function_id, name)
+                                })
+                                .is_some_and(|key| key.name() == "call")
+                        });
                     let mut receiver = receiver_value.filter(|_| capture);
                     let name_idx = const_operand(function.operand(instr, 2)).ok();
                     // The receiver is refreshed in place: resolving the site can
@@ -494,7 +517,9 @@ impl Interpreter {
                             let transition = self.record_ordinary_call_feedback(
                                 function,
                                 instr.instruction_pc,
-                                crate::feedback::OrdinaryCallTarget::Bytecode(method_fid),
+                                crate::feedback::OrdinaryCallTarget::FunctionPrototypeCall(
+                                    method_fid,
+                                ),
                             );
                             if transition.evict_for_reopt() {
                                 self.evict_compiled_for_reopt(function_id);

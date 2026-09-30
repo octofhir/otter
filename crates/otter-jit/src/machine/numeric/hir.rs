@@ -55,10 +55,11 @@
 //!   `property_speculation::speculated_load` is instead one
 //!   `PropertyShapeLoad` node with an exact pre-operation state; it does not
 //!   end its block.
-//! - A method call whose method is `%Function.prototype.call%` on an ordinary
-//!   closure receiver, with a baked proof and one recorded target, is a
+//! - A call whose callee is `%Function.prototype.call%` — a method call on an
+//!   ordinary closure receiver, or an explicit-receiver call of a loaded
+//!   `f.call` — with a baked proof and one recorded target, is a
 //!   [`NumericNode::FunctionCallProof`] with an exact pre-operation exit and
-//!   then a direct explicit-receiver call of the receiver itself (V8's
+//!   then a direct explicit-receiver call of `f` itself (V8's
 //!   `ReduceFunctionPrototypeCall`).
 //! - Every schema-owned binding read, write, and delete remains one typed HIR
 //!   family. Structurally proven global-this, global lexical, global-object
@@ -338,10 +339,11 @@ pub(super) enum NumericNode {
         value_byte: u32,
         ordinary: bool,
     },
-    /// Proof that `receiver.call` is `%Function.prototype.call%`: an
-    /// ordinary closure of the active realm whose `%Function.prototype%`
-    /// keeps its shape and whose `call` slot holds the intrinsic. A failed
-    /// proof exits before the method call; the value is `undefined`.
+    /// Proof that a callee is `%Function.prototype.call%`: `receiver` is the
+    /// method call's closure receiver, whose `%Function.prototype%` keeps its
+    /// shape and whose `call` slot holds the intrinsic, or the loaded callee
+    /// itself when the proof has no lookup. A failed proof exits before the
+    /// call; the value is `undefined`.
     FunctionCallProof {
         receiver: NumericValue,
         call: otter_vm::JitFunctionPrototypeCall,
@@ -505,6 +507,10 @@ pub(super) enum NumericDirectCallKind {
     /// Explicit receiver in argument word zero; at most one identity-guarded
     /// candidate, otherwise the generic value call.
     CallWithThis,
+    /// A reduced `f.call(this, ...)`: explicit-receiver linkage of exactly one
+    /// identity-guarded candidate whose miss exits, so the recompile keeps the
+    /// site's own generic call.
+    FunctionCall,
     /// Method/callee/receiver plus mapped bindings; actual arity stays dynamic.
     Forward,
     Method,
@@ -610,18 +616,17 @@ fn method_direct_call_target(
     })
 }
 
-/// The proof and recorded target of a `Function.prototype.call` method site,
-/// unless it sits in a local handler or an earlier generation's identity
-/// proof failed there.
+/// The `f.call(...)` site at `byte_pc` when `op` may reduce it: a method call
+/// proves its lookup, an explicit-receiver call only its loaded callee. A site
+/// in a local handler, or one whose earlier generation failed an identity
+/// proof, keeps its generic call.
 fn function_prototype_call(
     view: &JitCompileSnapshot,
+    op: Op,
     byte_pc: u32,
     logical_pc: u32,
     exceptional_edge: Option<usize>,
-) -> Option<(
-    otter_vm::JitFunctionPrototypeCall,
-    otter_vm::JitDirectCallee,
-)> {
+) -> Option<otter_vm::JitFunctionPrototypeCallSite> {
     if exceptional_edge.is_some()
         || view.cage_base == 0
         || view.native_ref_byte == 0
@@ -634,15 +639,95 @@ fn function_prototype_call(
     {
         return None;
     }
-    let call = view
-        .function_prototype_calls
-        .get(&byte_pc)
-        .copied()
-        .filter(|call| call.receiver.is_generated_receiver())?;
-    let [callee] = view.direct_callees.get(&byte_pc)?.as_slice() else {
-        return None;
+    let site = view.function_prototype_calls.get(&byte_pc).copied()?;
+    let admitted = match (op, site.proof.lookup) {
+        (Op::CallMethodValue, Some(lookup)) => lookup.receiver.is_generated_receiver(),
+        (Op::CallWithThis, None) => true,
+        _ => false,
     };
-    Some((call, *callee))
+    admitted.then_some(site)
+}
+
+/// Lower a reduced `f.call(this, ...)`: the proof on `proof_input` (the
+/// method call's receiver, or the loaded callee) with an exact pre-operation
+/// exit, then the direct explicit-receiver call of `function`. The call's
+/// argument words are already `[this, ...]`; `f.call()` passes `undefined`.
+#[allow(clippy::too_many_arguments)]
+fn lower_function_prototype_call(
+    site: otter_vm::JitFunctionPrototypeCallSite,
+    proof_input: NumericValue,
+    function: NumericValue,
+    mut arguments: Vec<NumericValue>,
+    instruction: &JitInstructionMetadata,
+    code: &otter_vm::CodeBlock,
+    registers: &mut [RegisterState],
+    nodes: &mut Vec<NumericNode>,
+    block_nodes: &mut Vec<NumericValue>,
+    frame_states: &mut Vec<NumericFrameState>,
+    function_id: u32,
+    logical_pc: u32,
+    live_in: &[bool],
+    direct_call_targets: &mut Vec<NumericDirectCallTarget>,
+    operand_values: &mut Vec<NumericValue>,
+) -> Option<()> {
+    let proof = push(
+        nodes,
+        NumericNode::FunctionCallProof {
+            receiver: proof_input,
+            call: site.proof,
+            byte_pc: instruction.byte_pc,
+        },
+    );
+    block_nodes.push(proof);
+    push_frame_state(
+        frame_states,
+        NumericFramePoint::Node(proof),
+        function_id,
+        instruction.byte_pc,
+        registers,
+        live_in,
+    );
+    if arguments.is_empty() {
+        let this = push(
+            nodes,
+            NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
+        );
+        block_nodes.push(this);
+        arguments.push(this);
+    }
+    let (argument_start, argument_count) = append_operand_values(operand_values, arguments)?;
+    let target = intern_direct_call_target(
+        direct_call_targets,
+        monomorphic_direct_call_target(NumericDirectCallKind::FunctionCall, site.callee),
+    )?;
+    let value = push(
+        nodes,
+        NumericNode::DirectCall {
+            source: function,
+            target,
+            arguments: NumericDirectCallArguments::Fixed {
+                start: argument_start,
+                count: argument_count,
+            },
+            logical_pc,
+            byte_pc: instruction.byte_pc,
+            exceptional_edge: None,
+        },
+    );
+    block_nodes.push(value);
+    push_frame_state(
+        frame_states,
+        NumericFramePoint::Node(value),
+        function_id,
+        instruction.byte_pc,
+        registers,
+        live_in,
+    );
+    write(
+        registers,
+        register(instruction, code, 0)?,
+        RegisterState::Value(value),
+    )
 }
 
 fn generic_method_call_target() -> NumericDirectCallTarget {
@@ -3631,6 +3716,36 @@ fn lower_instruction(
                     )
                 })
                 .collect::<Option<Vec<_>>>()?;
+            // A loaded `f.call` called with `f` as `this` is the direct
+            // explicit-receiver call of `f`.
+            if explicit_receiver
+                && let Some(site) = function_prototype_call(
+                    view,
+                    op,
+                    instruction.byte_pc,
+                    logical_pc,
+                    exceptional_edge,
+                )
+            {
+                let function = read_value(registers, register(instruction, code, 2)?)?;
+                return lower_function_prototype_call(
+                    site,
+                    source,
+                    function,
+                    arguments,
+                    instruction,
+                    code,
+                    registers,
+                    nodes,
+                    block_nodes,
+                    frame_states,
+                    function_id,
+                    logical_pc,
+                    live_in,
+                    direct_call_targets,
+                    operand_values,
+                );
+            }
             if explicit_receiver
                 && exceptional_edge.is_none()
                 && let Some(call) = view.static_native_calls.get(&instruction.byte_pc).copied()
@@ -3979,70 +4094,26 @@ fn lower_instruction(
                 );
             }
             // `f.call(this, ...)` on a proven ordinary closure is the direct
-            // explicit-receiver call of `f`: its argument words are already
-            // `[this, ...]`, and `f.call()` passes `undefined`.
-            if let Some((call, callee)) =
-                function_prototype_call(view, instruction.byte_pc, logical_pc, exceptional_edge)
+            // explicit-receiver call of `f`.
+            if let Some(site) =
+                function_prototype_call(view, op, instruction.byte_pc, logical_pc, exceptional_edge)
             {
-                let proof = push(
-                    nodes,
-                    NumericNode::FunctionCallProof {
-                        receiver: source,
-                        call,
-                        byte_pc: instruction.byte_pc,
-                    },
-                );
-                block_nodes.push(proof);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(proof),
-                    function_id,
-                    instruction.byte_pc,
+                return lower_function_prototype_call(
+                    site,
+                    source,
+                    source,
+                    arguments,
+                    instruction,
+                    code,
                     registers,
+                    nodes,
+                    block_nodes,
+                    frame_states,
+                    function_id,
+                    logical_pc,
                     live_in,
-                );
-                let mut arguments = arguments;
-                if arguments.is_empty() {
-                    let this = push(
-                        nodes,
-                        NumericNode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
-                    );
-                    block_nodes.push(this);
-                    arguments.push(this);
-                }
-                let (argument_start, argument_count) =
-                    append_operand_values(operand_values, arguments)?;
-                let target = intern_direct_call_target(
                     direct_call_targets,
-                    monomorphic_direct_call_target(NumericDirectCallKind::CallWithThis, callee),
-                )?;
-                let value = push(
-                    nodes,
-                    NumericNode::DirectCall {
-                        source,
-                        target,
-                        arguments: NumericDirectCallArguments::Fixed {
-                            start: argument_start,
-                            count: argument_count,
-                        },
-                        logical_pc,
-                        byte_pc: instruction.byte_pc,
-                        exceptional_edge: None,
-                    },
-                );
-                block_nodes.push(value);
-                push_frame_state(
-                    frame_states,
-                    NumericFramePoint::Node(value),
-                    function_id,
-                    instruction.byte_pc,
-                    registers,
-                    live_in,
-                );
-                return write(
-                    registers,
-                    register(instruction, code, 0)?,
-                    RegisterState::Value(value),
+                    operand_values,
                 );
             }
             let target = match direct_methods.get(&instruction.byte_pc) {

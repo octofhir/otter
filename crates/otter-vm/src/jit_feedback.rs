@@ -123,6 +123,9 @@ pub(crate) enum OrdinaryCallTarget {
     /// Original bootstrap native reached through a declared leaf entry,
     /// identified by that entry's id.
     StaticNative(crate::native_abi::RuntimeStubId),
+    /// `%Function.prototype.call%` invoked with this bytecode function as
+    /// its receiver: the function the call actually ran.
+    FunctionPrototypeCall(u32),
 }
 
 /// One observed call target and its saturating execution count.
@@ -233,11 +236,13 @@ const CALL_DISTRIBUTION_POLY: u8 = 2;
 const CALL_DISTRIBUTION_MEGAMORPHIC: u8 = 3;
 const CALL_TARGET_BYTECODE: u8 = 0;
 const CALL_TARGET_STATIC_NATIVE: u8 = 1;
+const CALL_TARGET_FUNCTION_PROTOTYPE_CALL: u8 = 2;
 
 const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
     match target {
         OrdinaryCallTarget::Bytecode(_) => CALL_TARGET_BYTECODE,
         OrdinaryCallTarget::StaticNative(_) => CALL_TARGET_STATIC_NATIVE,
+        OrdinaryCallTarget::FunctionPrototypeCall(_) => CALL_TARGET_FUNCTION_PROTOTYPE_CALL,
     }
 }
 
@@ -245,6 +250,7 @@ const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
     match target {
         OrdinaryCallTarget::Bytecode(fid) => fid,
         OrdinaryCallTarget::StaticNative(stub_id) => stub_id,
+        OrdinaryCallTarget::FunctionPrototypeCall(fid) => fid,
     }
 }
 
@@ -263,6 +269,7 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
             );
             OrdinaryCallTarget::StaticNative(payload)
         }
+        CALL_TARGET_FUNCTION_PROTOTYPE_CALL => OrdinaryCallTarget::FunctionPrototypeCall(payload),
         _ => unreachable!("invalid atomic call target kind"),
     };
     CallTargetCount {
@@ -405,9 +412,10 @@ impl AtomicCallFeedback {
 /// CodeBlock is built. Property payloads own bounded IC programs and may retain
 /// traced transition shapes; call payloads remain fixed atomic records.
 ///
-/// A method call owns both: the load of its method, and the ordinary call
-/// target of a `Function.prototype.call` invocation — the receiver function
-/// the call actually ran, which a generated site calls directly.
+/// A method call owns both: the load of its method, and the call targets it
+/// ran, where `f.call(...)` records
+/// [`OrdinaryCallTarget::FunctionPrototypeCall`] for the receiver `f`, which a
+/// generated site calls directly.
 #[derive(Debug)]
 enum TypedFeedbackSlot {
     None,
@@ -1370,16 +1378,21 @@ mod tests {
         assert!(vector.is_method_slot(0));
         assert!(vector.property_slot(0, PropertyIcKind::Load).is_some());
         assert_eq!(
-            vector.record_call(0, OrdinaryCallTarget::Bytecode(41)),
+            vector.record_call(0, OrdinaryCallTarget::FunctionPrototypeCall(41)),
             CallTargetTransition::BecameMonomorphic
         );
         assert!(matches!(
             vector.call_slot(0).and_then(|slot| slot.distribution()),
             Some(CallSiteDistribution::Mono(CallTargetCount {
-                target: OrdinaryCallTarget::Bytecode(41),
+                target: OrdinaryCallTarget::FunctionPrototypeCall(41),
                 hits: 1,
             }))
         ));
+        // The same function called directly is a different target.
+        assert_eq!(
+            vector.record_call(0, OrdinaryCallTarget::Bytecode(41)),
+            CallTargetTransition::BecamePolymorphic
+        );
     }
 
     #[test]

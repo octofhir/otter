@@ -466,6 +466,10 @@ pub enum DirectCallKind {
     /// candidate, and every guard miss or absent candidate completes through
     /// the generic explicit-receiver value call.
     CallWithThis,
+    /// Reduced `f.call(this, ...)`: the explicit-receiver linkage of exactly
+    /// one identity-guarded candidate whose miss exits instead of completing
+    /// generically.
+    FunctionCall,
     /// Intrinsic apply forwarding with explicit method/callee/receiver and live
     /// register bindings; runtime selection follows the permanent entry cell.
     Forward,
@@ -4044,6 +4048,8 @@ impl InstructionSequence {
                                     && *argument_mode == DirectCallArgumentMode::Fixed
                             } else if *kind == DirectCallKind::CallWithThis {
                                 descriptor.arguments.len() >= 2 && count <= 1
+                            } else if *kind == DirectCallKind::FunctionCall {
+                                descriptor.arguments.len() >= 2 && count == 1
                             } else if *kind == DirectCallKind::Construct {
                                 count <= 1
                             } else {

@@ -197,6 +197,29 @@ impl Interpreter {
             for index in args_start..args_start + args_len {
                 rooted_args.push(interp.iteration_anchor(index));
             }
+            // `f.call(thisArg, ...args)` with the intrinsic `call`: invoke `f`
+            // itself (§20.2.3.3) instead of entering the intrinsic, which
+            // would only repeat this call one Rust frame deeper.
+            if method.as_native_function().is_some_and(|native| {
+                native.is_vm_intrinsic(
+                    &interp.gc_heap,
+                    crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall,
+                )
+            }) && interp.is_callable_runtime(&receiver)
+            {
+                let this = if rooted_args.is_empty() {
+                    Value::undefined()
+                } else {
+                    rooted_args.remove(0)
+                };
+                return interp.run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &receiver,
+                    this,
+                    rooted_args,
+                );
+            }
             interp.run_callable_sync_rooted(stack, context, &method, receiver, rooted_args)
         };
         let result = call(self, stack);

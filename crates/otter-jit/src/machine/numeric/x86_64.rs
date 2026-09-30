@@ -26,8 +26,6 @@ use std::collections::BTreeSet;
 
 #[path = "x86_64/direct_call.rs"]
 mod direct_call;
-#[path = "x86_64/inline_calls.rs"]
-mod inline_calls;
 #[path = "x86_64/instanceof.rs"]
 mod instanceof;
 #[path = "x86_64/loose_equality.rs"]
@@ -2388,31 +2386,6 @@ pub(super) fn emit(
                     let exit = deopt(instruction.deopt_id(), &deopts)?;
                     let direct_throw = ops.new_dynamic_label();
                     let direct_done = ops.new_dynamic_label();
-                    let publish_inline = *kind == super::super::DirectCallKind::Construct
-                        && candidates.len() == 1
-                        && !instruction.inline_frames.is_empty();
-                    let inline_throw = ops.new_dynamic_label();
-                    let inline_done = ops.new_dynamic_label();
-                    let inline_finish_error = ops.new_dynamic_label();
-                    let inline_fatal = ops.new_dynamic_label();
-                    let inline_publication_fail = ops.new_dynamic_label();
-                    let packet = super::value_packet_frame(sequence)?;
-                    let inline_start = packet.raw_start.checked_add(packet.raw_words).ok_or(
-                        Unsupported::OperandShape("x86-64 inline native frame start"),
-                    )?;
-                    if publish_inline {
-                        save_roots(&mut ops, frame, site)?;
-                        stamp_call_site(&mut ops, site);
-                        inline_calls::enter(
-                            &mut ops,
-                            view,
-                            frame,
-                            instruction,
-                            site,
-                            inline_start,
-                            inline_publication_fail,
-                        )?;
-                    }
                     let start = ops.offset().0;
                     let mut direct_regions = direct_call::DirectCallRegions::default();
                     direct_call::emit(
@@ -2432,39 +2405,14 @@ pub(super) fn emit(
                         *caller_function_id,
                         *logical_pc,
                         *byte_pc,
-                        publish_inline,
+                        false,
                         exit,
-                        if publish_inline {
-                            inline_finish_error
-                        } else {
-                            finish_error
-                        },
-                        if publish_inline { inline_fatal } else { fatal },
-                        if publish_inline {
-                            inline_throw
-                        } else {
-                            direct_throw
-                        },
-                        if publish_inline {
-                            inline_done
-                        } else {
-                            direct_done
-                        },
+                        finish_error,
+                        fatal,
+                        direct_throw,
+                        direct_done,
                         &mut direct_regions,
                     )?;
-                    if publish_inline {
-                        dynasm!(ops ; .arch x64 ; =>inline_throw);
-                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
-                        dynasm!(ops ; .arch x64 ; jmp =>direct_throw ; =>inline_done);
-                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
-                        dynasm!(ops ; .arch x64 ; jmp =>direct_done ; =>inline_finish_error);
-                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
-                        dynasm!(ops ; .arch x64 ; jmp =>finish_error ; =>inline_fatal);
-                        inline_calls::leave(&mut ops, frame, instruction, inline_start)?;
-                        dynasm!(ops ; .arch x64 ; jmp =>fatal ; =>inline_publication_fail);
-                        reload_roots(&mut ops, frame, site)?;
-                        dynasm!(ops ; .arch x64 ; jmp =>exit);
-                    }
                     dynasm!(ops ; .arch x64 ; =>direct_throw);
                     match descriptor.exceptional {
                         super::super::ExceptionalEdge::Propagate => {

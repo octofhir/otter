@@ -32,7 +32,8 @@ use crate::{
 
 impl Interpreter {
     /// A source caller may be an inline descendant of the active generation.
-    /// In that case both its exact safepoint and published parent must agree.
+    /// Its parents are virtual: the callee's physical caller names the call
+    /// site whose recipe ends in that source function at that call.
     fn generated_caller_matches(
         &self,
         context: &ExecutionContext,
@@ -50,73 +51,34 @@ impl Interpreter {
         if owner == function_id {
             return true;
         }
-        // The physical caller is the first frame above the callee that names
-        // a call site; published inline parents between them name none.
-        // SAFETY: generated linkage keeps the whole chain published until
-        // after this non-reentrant check.
-        let Some(call_site) = self
-            .jit_native_frames()
-            .skip(1)
-            .map(|frame| unsafe { &*frame })
-            .find(|frame| frame.call_site != crate::native_abi::NO_SAFEPOINT)
-            .filter(|frame| u64::from(frame.code_object_id) == code_object_id)
-            .map(|frame| frame.call_site)
-        else {
+        // SAFETY: generated linkage keeps the callee and its caller published
+        // until after this non-reentrant check.
+        let Some(root) = (unsafe { callee.caller_frame().as_ref() }) else {
             return false;
         };
+        if root.header.function_id != owner
+            || u64::from(root.code_object_id) != code_object_id
+            || root.call_site == crate::native_abi::NO_SAFEPOINT
+        {
+            return false;
+        }
         let Some(record) = self
             .jit_code_registry
-            .safepoint_record(code_object_id, call_site)
+            .safepoint_record(code_object_id, root.call_site)
         else {
             return false;
         };
-        if !record.inline_frames_published || record.id != call_site {
+        if !record.inline_frames_virtual || record.id != root.call_site {
             return false;
         }
         let Some(source) = record.inline_frames.last() else {
             return false;
         };
-        if source.function_id != function_id {
-            return false;
-        }
-        // The callee is innermost; its callers are the published inline
-        // parents, callee-most first, then the physical root frame.
-        let active: Vec<_> = self
-            .jit_native_frames()
-            .take(record.inline_frames.len() + 2)
-            .collect();
-        if active.len() != record.inline_frames.len() + 2 || !std::ptr::eq(active[0], callee) {
-            return false;
-        }
-        // SAFETY: published frames stay live throughout the cold check.
-        let Some(root) = (unsafe { active[active.len() - 1].as_ref() }) else {
+        let Some(function) = context.exec_function(function_id) else {
             return false;
         };
-        if root.header.function_id != owner {
-            return false;
-        }
-        for (index, source) in record.inline_frames.iter().enumerate() {
-            // SAFETY: all published parents remain live throughout the cold check.
-            let Some(parent) = (unsafe { active[active.len() - 2 - index].as_ref() }) else {
-                return false;
-            };
-            let Some(function) = context.exec_function(source.function_id) else {
-                return false;
-            };
-            if parent.header.function_id != source.function_id
-                || function.instruction_byte_pc(parent.header.pc as usize) != Some(source.byte_pc)
-                || parent.header.register_count != function.register_count
-                || usize::from(parent.header.register_count) != source.slots.len()
-                || !parent
-                    .header
-                    .flags
-                    .contains(NativeFrameFlags::STACK_REGISTERS)
-                || (index + 1 == record.inline_frames.len() && parent.header.pc != call_pc)
-            {
-                return false;
-            }
-        }
-        true
+        source.function_id == function_id
+            && function.instruction_byte_pc(call_pc as usize) == Some(source.byte_pc)
     }
 
     /// Record one exact generated-call deopt and apply baseline bail policy.

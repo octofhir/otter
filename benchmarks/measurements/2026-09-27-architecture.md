@@ -1073,6 +1073,34 @@ Callee-side tier budget is not done: optimizing-callee entry counts feed
 the generated-call statistics and bytecode-call accounting, so dropping
 them changes observable counters, not only speed.
 
+### C6 landed: inline parents described by the call site
+Generated code no longer builds NativeFrames for spliced parents around a
+call. A generated call's safepoint record carries the recipe
+(`inline_frames_virtual`) and the call's PC in the code object's own
+function (`call_pc`); stack snapshots read both from the physical caller's
+call site, the callee-deopt caller check validates the physical caller's
+recipe, and nothing is copied per call. Spliced bodies may therefore keep
+monomorphic residual plain, method, explicit-receiver and construct calls
+(previously only constructs, with physical publication). The record's
+`call_pc` also fixes a stale-position bug: arm64 Machine direct calls never
+stored their PC, so a trace through an optimized (e.g. OSR'd) caller showed
+its entry or loop-header position; the new difftest corpus
+`inline_residual_calls` pins positions against Node in every tier.
+The first build regressed earley +5%: the Machine verifier still admitted
+recipes only on construct calls, so four hot functions failed verification
+and stayed in Template.
+
+| Workload | instr after C3 | after C6 | wall after C3 | after C6 |
+|---|---:|---:|---:|---:|
+| ts-fixed | 170.8G | 168.9G (−1.1%; −2.8% vs start) | 17.08s | 17.00s |
+| earley-boyer | 104.8G | 104.6G (−0.2%; −6.2%) | 6.20s | 6.19s |
+| crypto | 13.49G | 13.45G (−0.3%) | 0.798s | 0.805s |
+| fib / zlib / ast_ctor / mega_method | unchanged | | | |
+
+`jit_machine_call_chain`'s rooting test assumed 200k two-field objects
+outgrow the 4 MB young space; after the 16-byte object body they no longer
+do. It now allocates a 32-element array per iteration.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

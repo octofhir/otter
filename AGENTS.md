@@ -515,13 +515,13 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     bodies can be spliced into Machine SSA. Their cold instructions expose
     `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure/new.target
     values are boxed only in cold CFG and retained as explicit safepoint roots.
-    Enclosing helper splices retain fixed generated construct cold siblings.
-    Their `safepoints.json` records set `inlineFramesPublished`: generated code
-    publishes canonical parent NativeFrames in the owning Machine stack area,
-    and runtime decoders must not reconstruct those same frames again. The
-    direct-call source function can differ from its code-object owner. Callee
-    deopt validates the exact owner safepoint and published source-frame chain,
-    including source byte PCs and register windows, before changing policy.
+    Enclosing helper splices keep residual generated calls. Their
+    `safepoints.json` records set `inlineFramesVirtual`: the parents are never
+    published as NativeFrames; stack walks describe them from the call site's
+    recipe, and runtime decoders do not reconstruct them. The direct-call
+    source function can differ from its code-object owner. Callee deopt
+    validates the physical caller's call site and the recipe's source chain,
+    including the innermost parent's call byte PC, before changing policy.
     The code-owned safepoint record owns root-index recipes tied to the code
     generation and safepoint. The fixed property boundary reads the current published roots,
     publishes canonical callee NativeFrames, and normalizes throws before scope

@@ -9,6 +9,9 @@
 //!   interpreter PCs need the usual one-instruction adjustment.
 //! - Cold materialization supplies exact identity, never a function-name guess.
 //! - An OSR frame updates its materialized owner instead of duplicating it.
+//! - A frame making a generated call reports its call site's recorded PC,
+//!   followed by the inline parents that call site's recipe describes; the
+//!   parents have no frames.
 //! - The walk reads scalar metadata only, neither collecting nor invoking JS.
 //!
 //! # See also
@@ -30,10 +33,20 @@ impl Interpreter {
         let mut sites = Vec::with_capacity(stack.len() + natives.len());
         let mut owners = vec![None; stack.len()];
         let mut cursor = 0;
-        for address in natives {
+        let native_count = natives.len();
+        for (position, address) in natives.into_iter().enumerate() {
             // SAFETY: publication keeps this header live through the complete
             // metadata-only walk. No managed window is borrowed or dereferenced.
             let native = unsafe { &*address };
+            // A frame with an inner native frame is making a generated call:
+            // its call site names the call's PC and any inline parents.
+            let call = (position + 1 < native_count)
+                .then(|| self.generated_call_record(native))
+                .flatten();
+            let native_pc = call
+                .map(|record| record.call_pc)
+                .filter(|&pc| pc != crate::native_abi::NO_CALL_PC)
+                .unwrap_or(native.header.pc);
             let transferred =
                 self.jit_materialized_generated_calls
                     .iter()
@@ -64,7 +77,7 @@ impl Interpreter {
                     let frame = &stack[index];
                     (frame.function_id, frame.pc, false)
                 } else {
-                    (native.header.function_id, native.header.pc, true)
+                    (native.header.function_id, native_pc, true)
                 };
                 if let Some(position) = owners[index] {
                     sites[position] = site;
@@ -74,7 +87,10 @@ impl Interpreter {
                 }
                 cursor = cursor.max(index + 1);
             } else {
-                sites.push((native.header.function_id, native.header.pc, true));
+                sites.push((native.header.function_id, native_pc, true));
+            }
+            if let Some(record) = call.filter(|record| record.inline_frames_virtual) {
+                push_virtual_inline_sites(context, record, &mut sites);
             }
         }
         for frame in stack.iter().skip(cursor) {
@@ -98,5 +114,34 @@ impl Interpreter {
             });
         }
         result
+    }
+
+    fn generated_call_record(
+        &self,
+        native: &crate::native_abi::NativeFrame,
+    ) -> Option<&crate::native_abi::SafepointRecord> {
+        if native.call_site == crate::native_abi::NO_SAFEPOINT {
+            return None;
+        }
+        self.jit_code_registry
+            .safepoint_record(u64::from(native.code_object_id), native.call_site)
+    }
+}
+
+fn push_virtual_inline_sites(
+    context: &ExecutionContext,
+    record: &crate::native_abi::SafepointRecord,
+    sites: &mut Vec<(u32, u32, bool)>,
+) {
+    for frame in &record.inline_frames {
+        let Some(function) = context.exec_function(frame.function_id) else {
+            continue;
+        };
+        if let Some(pc) = (0..function.code.len())
+            .find(|&index| function.instruction_byte_pc(index) == Some(frame.byte_pc))
+            .and_then(|index| u32::try_from(index).ok())
+        {
+            sites.push((frame.function_id, pc, true));
+        }
     }
 }

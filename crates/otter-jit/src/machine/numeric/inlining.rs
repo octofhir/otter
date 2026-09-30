@@ -7,10 +7,12 @@
 //! # Invariants
 //! - Scalar, guarded-element, global-read and named-property bodies, including bounded fully spliced helper
 //!   chains, are admitted. Base construction probes the shared nursery allocator;
-//!   misses retain full construct linkage in an explicit sibling. Enclosing helpers
-//!   retain that sibling with source-owned arguments and native parent publication. Other allocations
-//!   and residual JavaScript calls retain ordinary call linkage. Named-property cold
-//!   calls publish exact inline frames without replaying completed effects.
+//!   misses retain full construct linkage in an explicit sibling. Monomorphic
+//!   residual plain, method, explicit-receiver and construct calls keep
+//!   generated linkage; their spliced parents are never published, the call
+//!   site's recipe describes them to stack walks. Other allocations keep
+//!   ordinary call linkage. Named-property cold calls publish exact inline
+//!   frames without replaying completed effects.
 //! - A site whose earlier generation failed an identity guard is not spliced
 //!   again; it keeps its generated call.
 //! - A spliced body has no native frame: its SELF is the guarded callable of
@@ -165,17 +167,25 @@ fn splice_tree(
             }) {
                 return Err(format!("unsupported callee operation: {node:?}"));
             }
+            // A residual call keeps generated linkage; its spliced parents are
+            // described by the call site's recipe, so only monomorphic plain,
+            // method, explicit-receiver and base-construct calls qualify.
             if body.nodes.iter().any(|node| match node {
                 NumericNode::DirectCall { target, .. } => body
                     .direct_call_targets
                     .get(*target as usize)
                     .is_none_or(|target| {
-                        target.kind != NumericDirectCallKind::Construct
-                            || target.candidates.len() != 1
+                        !matches!(
+                            target.kind,
+                            NumericDirectCallKind::Plain
+                                | NumericDirectCallKind::Method
+                                | NumericDirectCallKind::CallWithThis
+                                | NumericDirectCallKind::Construct
+                        ) || target.candidates.len() != 1
                     }),
                 _ => false,
             }) {
-                return Err("residual call requires inline activation publication".into());
+                return Err("residual call is not a monomorphic generated call".into());
             }
             if body.blocks.iter().enumerate().any(|(i, b)| {
                 b.successors.iter().any(|&s| s <= i)

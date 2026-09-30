@@ -1441,6 +1441,173 @@ corpora 48/48 each; otter-vm lib 990, otter-jit lib 303, x86 machine 194.
 without stress: field initialization after an arrow/eval `super()` is the
 open compiler item from the E1 checkpoint below, not a shape effect.
 
+## 18. Prototype-chain validity cells
+
+Design recorded before implementation, 2026-09-30, on `main` after
+`d553b97d` put prototype identity in the hidden class.
+
+### Reference mechanisms
+
+- V8's [Map::GetOrCreatePrototypeChainValidityCell](https://github.com/v8/v8/blob/main/src/objects/map.cc)
+  reuses a valid cell and allocates a new cell after invalidation. It first
+  registers prototype users. [JSObject::InvalidatePrototypeChains](https://github.com/v8/v8/blob/main/src/objects/js-objects.cc)
+  invalidates cells through those registrations when a prototype changes.
+  The cell is held by a prototype map; `PrototypeInfo` records its users.
+- JSC's [ObjectPropertyConditionSet](https://github.com/WebKit/WebKit/blob/main/Source/JavaScriptCore/bytecode/ObjectPropertyConditionSet.h)
+  represents presence, absence and equivalence conditions. Its
+  [watchpoint design](https://webkit.org/blog/10308/speculation-in-javascriptcore/)
+  moves checks to mutation, validates dependencies before installation and
+  invalidates compiled assumptions when a watched condition changes.
+- SpiderMonkey's [CacheIR shape teleporting](https://github.com/mozilla-firefox/firefox/blob/main/js/src/jit/CacheIR.cpp)
+  omits intermediate prototype guards while its mutation protocol supports
+  that proof. [Watchtower](https://github.com/mozilla-firefox/firefox/blob/main/js/src/vm/Watchtower.h)
+  observes property additions, removal, descriptor changes and prototype
+  changes on watched objects. It is a mutation-driven proof, rather than
+  V8's literal shared-cell representation.
+
+### Chosen contract
+
+One address-stable, monotonically invalidated cell proves an ordinary
+prototype chain. Every receiver shape already identifies the first
+prototype. The first prototype owns the current cell; every prototype in
+the chain subscribes to it through weak registrations. A structural or
+property-value mutation invalidates all subscribed cells before publishing
+the change. Revalidation allocates a new cell; an invalid cell never becomes
+valid again. Thus there is no generation wraparound or stale-proof revival.
+
+The cell and its registrations carry no moving object addresses. IC records
+and installed code retain the cells they reference. A holder is reached
+through its rooted, pinned instance-root shape, whose traced prototype field
+is updated by moving GC. This gives a constant-size proof and holder load
+without keeping a raw moving object pointer in generated code.
+
+VM ICs, CacheIR, method guards, constructor field transitions, receiver
+allocation and the shared megamorphic transition table all consume this
+contract. `MethodProtoChain`, prototype-shape arrays and the transition
+table's `chain[8]` are removed. ARM64 and x86-64 emit the same cell check.
+Generated stores into watched prototypes enter the canonical mutation
+boundary before any effect, where dependent cells are invalidated. Ordinary
+instance stores keep their generated path. Proxy/exotic chains cannot
+establish an ordinary-chain proof and use the existing semantic operation.
+
+No assumption may cross JavaScript reentry without a fresh validity check.
+Compiler dependency ownership must also preserve cells for an executing
+generation after its entry has been unlinked. Compile/install validation
+will use the same cell contract when concurrent compilation is introduced.
+
+Snapshot dependencies obey the same isolate ownership rule. V8's
+[ContextSerializer](https://github.com/v8/v8/blob/main/src/snapshot/context-serializer.cc)
+clears feedback slots when capturing a context. Otter's captured code directory
+will preserve admitted bytecode and function/site ranges, while each restore
+owns fresh CodeBlocks, feedback, atom tables and registry topology. Sharing
+the donor's mutable `CodeSpace` would retain foreign transition shapes and
+validity cells; that sharing is removed. Sidecar watchpoints start empty.
+
+### Before measurement
+
+`scripts/dev/fixed-work.py`, production release executable, sequential runs;
+exact commands and executable/script hashes are in
+`benchmarks/results/prototype-validity-2026-09-30-before-counters/`.
+
+| Workload | Instructions before |
+| --- | ---: |
+| earley-boyer | 101,610,303,208 |
+| ts | 153,817,567,165 |
+| crypto | 13,522,144,158 |
+| zlib | 154,602,584,918 |
+| fib | 3,003,891,245 |
+| ast_ctor | 8,596,244,899 |
+| mega_method | 7,392,419,928 |
+
+### Implementation findings
+
+- Prototype preparation now walks the complete chain with rooted receiver and
+  cursor handles. The former eight-hop preparation limit was a dependency of
+  the deleted guard-array mechanism. The ordinary lookup safety bound remains.
+- Empty objects made by heap-only `Object.create` paths could have unregistered
+  receiver shape IDs. A shallow inherited load happened to register that shape
+  while registering its holder root; a deeper holder has a different root.
+  Capturing a property or method proof now registers both identities. The
+  runtime regression asserts actual validity-cell relocations in Template and
+  optimizing code, then mutates and shadows the inherited property.
+- Admitting deep method proofs exposed a cold-call source bug in an inlined
+  helper. Its guard miss decoded the method opcode using the physical outer
+  function's identity. Boxed calls now resolve their source through the exact
+  generation's safepoint recipe. Both emitters retain the enclosing call PC in
+  the physical frame. No caller is copied, interpreted, or replayed.
+- The new mutation corpus covers deep loads/methods, shadowing, deletion,
+  accessors, prototype replacement, generated stores into watched prototypes,
+  megamorphic reads, constructor transitions and global-object binding writes.
+  Debug regression tests pass at GC strides 1–16 after the cold-call fix.
+- Constructor closures can share a function ID while owning different
+  prototype objects. A function-pair-only proof cache replaced its chain on
+  each alternating closure and repeated constructor analysis. Proofs now use
+  the prototype lineage as part of their key. Empty receiver allocation uses
+  the live prototype root without an absence dependency; only preinitialized
+  fields need an exact chain proof. Subsequent stores retain their own guards.
+  The regression test checks distinct live roots and generated allocation.
+- Heap snapshot restore must sever the sidecar's Rust-owned watchpoints.
+  Copying their Mutex/Arc bytes would give restored isolates ownership of the
+  donor's allocations. Restored sidecars now start with empty watchpoints;
+  a regression captures an established proof, restores three isolates and
+  checks that their mutations and destruction leave the donor proof valid.
+- Restores also shared the donor's mutable code directory. Warm property ICs
+  retained transition shapes from the donor heap, which failed under restored
+  allocation pressure. Capture now freezes the code ranges and admitted code;
+  each restore creates its own directory, CodeBlocks, empty feedback and
+  resolved atom tables. A regression drops the donor, mutates one restore,
+  collects another, and checks that its inherited values remain independent.
+
+### Fixed-work measurements
+
+Same seven workloads, sequential production runs through
+`scripts/dev/fixed-work.py`. The after executable and commands are recorded in
+`benchmarks/results/prototype-validity-2026-09-30-sealed-after-counters/`.
+
+| Workload | Instructions before | Instructions after | Change |
+| --- | ---: | ---: | ---: |
+| earley-boyer | 101,610,303,208 | 100,148,068,574 | -1.44% |
+| ts | 153,817,567,165 | 154,835,579,302 | +0.66% |
+| crypto | 13,522,144,158 | 13,368,820,694 | -1.13% |
+| zlib | 154,602,584,918 | 154,180,519,765 | -0.27% |
+| fib | 3,003,891,245 | 2,999,652,229 | -0.14% |
+| ast_ctor | 8,596,244,899 | 5,811,091,495 | -32.40% |
+| mega_method | 7,392,419,928 | 7,404,560,244 | +0.16% |
+
+The first after run exposed the constructor proof-key error: `ast_ctor`
+reached 18,321,810,407 instructions. Sampling attributed the added work to
+repeated receiver preparation and constructor analysis. Correct chain
+ownership and live-root empty allocation remove that regression without
+sharing shapes across prototypes. The other workloads were not tuned.
+
+### Gates
+
+The final executable is retained with SHA-256 hashes in
+`benchmarks/results/prototype-validity-sealed-binaries/`.
+
+- Difftest: 91/91.
+- GC stress: 528/528 Node comparisons across 11 corpora, all three tiers,
+  strides 1–16. The five runtime regressions also pass at every stride.
+- VM library: 995/995; JIT library: 303/303; x86 Machine: 194/194.
+- Runtime regressions: 5/5 on ARM64 and x86 under Rosetta. Snapshot suite:
+  8/8, plus ten consecutive successful pressure-suite runs.
+- `cargo clippy --all-targets --all-features -- -D warnings`, formatting
+  and diff checks pass.
+- Test262 `language/`: 24,077 passed, 495 skipped; no failures, crashes,
+  timeouts or OOM. `built-ins/`: 23,520 passed, 536 skipped, two failures;
+  no crashes, timeouts or OOM. Both use `--timeout 30000` and `--jobs 1`,
+  sequentially through one runner.
+
+The two RegExp backtrack-budget failures (`RGI_Emoji.js` and
+`RGI_Emoji_ZWJ_Sequence.js`) reproduce on the preserved pre-change executable
+with the identical error. Exact
+commands, harnesses and output are in
+`benchmarks/results/prototype-validity-regexp-comparison/`.
+
+All seven fixed-work runs exited successfully. The initial sandboxed baseline
+could not read macOS resource counters; the table uses the successful run
+with access to those counters.
+
 ## Checkpoint
 
 Series E1 (environments), state at the time of writing (2026-09-29):

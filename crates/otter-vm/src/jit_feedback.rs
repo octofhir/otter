@@ -601,6 +601,9 @@ impl PropertyFeedbackSlot<'_> {
     pub(crate) fn jit_programs(
         self,
         mut resolve_shape: impl FnMut(crate::object::ShapeId) -> Option<u32>,
+        mut resolve_validity: impl FnMut(
+            &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
+        ) -> Option<crate::jit::JitPrototypeValidity>,
     ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
         self.feedback.snapshot(|entry| {
             let stubs = entry.entries();
@@ -609,7 +612,7 @@ impl PropertyFeedbackSlot<'_> {
             }
             stubs
                 .iter()
-                .map(|stub| stub.snapshot_for_jit(&mut resolve_shape))
+                .map(|stub| stub.snapshot_for_jit(&mut resolve_shape, &mut resolve_validity))
                 .collect()
         })
     }

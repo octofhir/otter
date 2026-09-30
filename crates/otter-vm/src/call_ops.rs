@@ -881,16 +881,13 @@ impl Interpreter {
         root: crate::object::ShapeHandle,
         roots: &SyncJsCallRoots,
     ) -> Result<usize, VmError> {
-        const MAX_PROTOTYPE_HOPS: usize = 64;
         // Class wrappers and an exact ordinary `new.target` both provide the
         // stable constructor identity generated linkage needs. The latter is
         // important for non-simple function constructors: their first
         // `this.x = value` is an add-property transition, not an existing-slot
         // StoreProperty IC, so leaving it out would compile a body that exits
-        // at that store on every generated entry. A distinct ordinary
-        // `new.target` (for example Reflect.construct with another target)
-        // keeps the canonical path because the `(base, base)` cache key could
-        // not distinguish its prototype contract.
+        // at that store on every generated entry. Distinct ordinary
+        // `new.target` calls keep the canonical Reflect.construct preparation.
         let class_new_target = new_target.is_class_constructor();
         let callable_new_target = new_target
             .as_class_constructor()
@@ -920,7 +917,14 @@ impl Interpreter {
             base_function_id,
             derived_function_id.unwrap_or(base_function_id),
         );
-        if let Some(&capacity) = self.constructor_field_capacity_cache.get(&chain_key) {
+        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
+        let proof_key = (chain_key.0, chain_key.1, root_id);
+        if let Some(&capacity) = self.constructor_field_capacity_cache.get(&chain_key)
+            && self
+                .constructor_prototype_validity_cache
+                .get(&proof_key)
+                .is_some_and(|validity| validity.is_valid())
+        {
             return Ok(capacity);
         }
         let Some(mut prototype_object) = prototype.as_object() else {
@@ -932,24 +936,11 @@ impl Interpreter {
         // recording it. The migration roots and refreshes `prototype_object`.
         self.migrate_slow_to_fast(&mut prototype_object);
         roots.scratch_0.set(Value::object(prototype_object));
-        let mut prototype_shapes = Vec::new();
-        let mut current = Some(Value::object(prototype_object));
-        while let Some(value) = current {
-            let Some(object) = value.as_object() else {
-                return Ok(0);
-            };
-            if !crate::object::supports_fast_property_ic(object, &self.gc_heap)
-                || prototype_shapes.len() == MAX_PROTOTYPE_HOPS
-            {
-                return Ok(0);
-            }
-            if crate::object::is_dictionary(object, &self.gc_heap) {
-                return Ok(0);
-            }
-            let shape = crate::object::shape_id(object, &self.gc_heap);
-            prototype_shapes.push(shape);
-            current = crate::object::prototype_value(object, &self.gc_heap);
-        }
+        let Some(prototype_validity) =
+            crate::object::prototype_validity::chain_validity(prototype_object, &self.gc_heap)
+        else {
+            return Ok(0);
+        };
 
         let mut functions = smallvec::SmallVec::<[u32; 2]>::new();
         functions.push(base_function_id);
@@ -1017,7 +1008,7 @@ impl Interpreter {
                 let transition = crate::jit::JitConstructorFieldTransitionPlan {
                     from_shape: self.shape_runtime.id_for_handle(&self.gc_heap, from_shape),
                     to_shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
-                    prototype_shapes: prototype_shapes.clone(),
+                    prototype_validity: prototype_validity.clone(),
                     slot,
                 };
                 if !receiver_is_pre_shaped {
@@ -1025,10 +1016,11 @@ impl Interpreter {
                         .constructor_field_transition_cache
                         .entry(function_id)
                         .or_default();
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        transitions.entry(store.byte_pc)
-                    {
-                        entry.insert(transition);
+                    let stale = transitions
+                        .get(&store.byte_pc)
+                        .is_none_or(|existing| !existing.prototype_validity.is_valid());
+                    if stale {
+                        transitions.insert(store.byte_pc, transition);
                         self.jit_runtime_stats.constructor_field_transition_installs = self
                             .jit_runtime_stats
                             .constructor_field_transition_installs
@@ -1055,9 +1047,11 @@ impl Interpreter {
         // entry recompiles against the richer transition snapshot.
         let capacity = usize::from(slot);
         self.constructor_field_capacity_cache
-            .insert(chain_key, capacity);
-        self.constructor_prototype_shape_cache
-            .insert(chain_key, prototype_shapes);
+            .entry(chain_key)
+            .and_modify(|reserved| *reserved = (*reserved).max(capacity))
+            .or_insert(capacity);
+        self.constructor_prototype_validity_cache
+            .insert(proof_key, prototype_validity);
         for function_id in reopt_functions {
             self.evict_compiled_for_reopt(function_id);
         }

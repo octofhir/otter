@@ -34,6 +34,8 @@
 //!   bytecode JSON dump stays unchanged.
 //! - A tier-neutral [`crate::feedback::FeedbackVector`] owns both dense
 //!   instruction cells and their monotonic material-transition epoch.
+//! - Execution feedback belongs to one isolate. Snapshot copies preserve
+//!   admitted code while creating empty feedback through `executable_snapshot`.
 //!
 //! # See also
 //! - [`crate::execution_context`]
@@ -41,6 +43,8 @@
 
 #[path = "code_block_cfg.rs"]
 pub(crate) mod code_block_cfg;
+#[path = "executable_snapshot.rs"]
+mod executable_snapshot;
 
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, Function, FunctionCode, FunctionCodeBuilder, Op,

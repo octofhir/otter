@@ -4060,8 +4060,11 @@ fn select_cache_ir_property_programs(
                     instructions.push(guard);
                     active = next;
                 }
-                otter_vm::JitCacheIrOp::LoadPrototype { object, result }
-                | otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { object, result, .. } => {
+                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype {
+                    object,
+                    result,
+                    target,
+                } => {
                     if stored.is_some()
                         && matches!(op, otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
                     {
@@ -4071,16 +4074,9 @@ fn select_cache_ir_property_programs(
                     let prototype = push_value(representations, MachineRepresentation::Tagged);
                     let next = push_value(representations, MachineRepresentation::Boolean);
                     let mut load = MachineInstruction::plain(
-                        match *op {
-                            otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { target, .. } => {
-                                MachineOpcode::CacheIrLoadIntrinsicPrototype {
-                                    byte_pc: source.byte_pc,
-                                    target,
-                                }
-                            }
-                            _ => MachineOpcode::CacheIrLoadPrototype {
-                                byte_pc: source.byte_pc,
-                            },
+                        MachineOpcode::CacheIrLoadIntrinsicPrototype {
+                            byte_pc: source.byte_pc,
+                            target,
                         },
                         vec![
                             MachineOperand::location_input(object),
@@ -4108,6 +4104,43 @@ fn select_cache_ir_property_programs(
                         },
                         vec![
                             MachineOperand::location_input(object),
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    guard.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(guard);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result } => {
+                    let holder = push_value(representations, MachineRepresentation::Tagged);
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut load = MachineInstruction::plain(
+                        MachineOpcode::CacheIrLoadPrototypeHolder {
+                            byte_pc: source.byte_pc,
+                            root,
+                        },
+                        vec![
+                            MachineOperand::register_input(active),
+                            MachineOperand::register_output(holder),
+                            MachineOperand::register_output(next),
+                        ],
+                    );
+                    load.clobbers = property_load_clobbers(target_spec);
+                    instructions.push(load);
+                    *objects
+                        .get_mut(result as usize)
+                        .ok_or(cache_ir_signature_error(instructions.len()))? = Some(holder);
+                    active = next;
+                }
+                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
+                    let next = push_value(representations, MachineRepresentation::Boolean);
+                    let mut guard = MachineInstruction::plain(
+                        MachineOpcode::CacheIrGuardPrototypeValidity {
+                            byte_pc: source.byte_pc,
+                            validity,
+                        },
+                        vec![
                             MachineOperand::register_input(active),
                             MachineOperand::register_output(next),
                         ],
@@ -5682,7 +5715,11 @@ mod tests {
                             guard: Some(JitMethodGuard {
                                 method_fid: function_id,
                                 recv_shape: 20 + target_index,
-                                proto_chain: vec![30 + target_index],
+                                prototype_validity: Some(otter_vm::jit::JitPrototypeValidity {
+                                    address: 1,
+                                    identity: u64::from(target_index),
+                                }),
+                                holder_root: 30 + target_index,
                                 method_value_byte: 40 + target_index * 8,
                             }),
                             callee: selection_direct_callee(function_id),
@@ -8795,7 +8832,10 @@ mod tests {
         let transition = otter_vm::jit::JitConstructorFieldTransition {
             from_shape: 7,
             to_shape: 11,
-            prototype_shapes: vec![13],
+            prototype_validity: otter_vm::jit::JitPrototypeValidity {
+                address: 1,
+                identity: 13,
+            },
             slot: 0,
         };
         hir.constructor_field_sites
@@ -8814,7 +8854,7 @@ mod tests {
                     value_byte: 0,
                     transition: Some(transition),
                 }] if transition.child_shape == 11
-                    && transition.prototype_shapes.as_ref() == [13])
+                    && transition.prototype_validity.map(|cell| cell.identity) == Some(13))
         )));
         assert!(sequence.instructions().iter().any(|instruction| {
             instruction.opcode == MachineOpcode::GuardCondition && instruction.frame_state.is_some()

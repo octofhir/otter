@@ -1,6 +1,9 @@
 //! Construct an interpreter from an isolate snapshot instead of
 //! running the bootstrap.
 //!
+//! # Contents
+//! Restore heap pages, interpreter roots, code directories and keyed state.
+//!
 //! The restore is the mirror of `snapshot::IsolateSnapshot`'s three
 //! parts: put the old-space pages back (relocated), write the fixed
 //! root walk's handles into a shell interpreter, and replay the keyed
@@ -15,10 +18,12 @@
 //! # Invariants
 //!
 //! - In-process only: static native bodies carry entry
-//!   addresses verbatim (valid within the process), the code space is
+//!   addresses verbatim (valid within the process), admitted bytecode is
 //!   shared by `Arc`, and dynamic closures are Arc-clones at their
 //!   captured host-ref indices. No byte decoder or cross-process restore
 //!   path exists.
+//! - Each restored code directory owns fresh feedback and atom tables.
+//!   IC shapes and validity cells never refer to the donor's heap.
 //! - The fixed root walk must consume exactly the captured sequence;
 //!   a length mismatch is a layout drift between capture and restore
 //!   builds and panics rather than mis-rooting.
@@ -129,7 +134,7 @@ impl Interpreter {
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             jit_backedge_fuel_window: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
-            code_space: std::sync::Arc::clone(&snapshot.code_space),
+            code_space: snapshot.code_space.restore(&names),
             code_eviction_high_water_bytes: Self::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES,
             code_eviction_stats: crate::CodeEvictionStats::default(),
             names,
@@ -144,7 +149,7 @@ impl Interpreter {
             constructor_field_capacity_cache: rustc_hash::FxHashMap::default(),
             constructor_instance_profiles: rustc_hash::FxHashMap::default(),
             pending_constructor_samples: std::cell::RefCell::new(Vec::new()),
-            constructor_prototype_shape_cache: rustc_hash::FxHashMap::default(),
+            constructor_prototype_validity_cache: rustc_hash::FxHashMap::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
@@ -192,7 +197,7 @@ impl Interpreter {
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_runtime_stats: crate::JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
-            jit_compile_shapes: std::cell::RefCell::default(),
+            jit_compile_roots: std::cell::RefCell::default(),
             runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,

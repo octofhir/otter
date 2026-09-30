@@ -1132,6 +1132,12 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
                 ordinary_lookup_state_guard(&mut ops, view, miss);
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::CacheIrGuardAtomSlot { writable: true, .. }
+                ) {
+                    dynasm!(ops ; .arch x64 ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE as i8 ; jnz =>miss);
+                }
                 dynasm!(ops
                     ; .arch x64
                     ; mov r10d, 1
@@ -1188,40 +1194,6 @@ pub(super) fn emit(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::CacheIrLoadPrototype { byte_pc } => {
-                let start = ops.offset().0;
-                let miss = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                load_integer(&mut ops, frame, loc[1], 10)?;
-                load64(&mut ops, 8, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch x64 ; xor r9d, r9d);
-                dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
-                object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
-                symbolic(
-                    &mut ops,
-                    &mut relocations,
-                    10,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                crate::template::x86_64::emit_x64_load_prototype(&mut ops, view, 8, 11, 10);
-                dynasm!(ops
-                    ; .arch x64
-                    ; test r8d, r8d
-                    ; jz =>miss
-                    ; mov r9d, 1
-                    ; =>miss
-                    ; =>done
-                );
-                store_integer(&mut ops, frame, loc[2], 8)?;
-                store_integer(&mut ops, frame, loc[3], 9)?;
-                structural_regions.push((
-                    "machineCacheIrLoadPrototype",
-                    Some(byte_pc),
-                    start,
-                    ops.offset().0,
-                ));
-            }
             MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc } => {
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
@@ -1246,6 +1218,54 @@ pub(super) fn emit(
                 store_integer(&mut ops, frame, loc[1], 10)?;
                 structural_regions.push((
                     "machineCacheIrGuardArrayIndexProtector",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrLoadPrototypeHolder { byte_pc, root } => {
+                let start = ops.offset().0;
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[0], 9)?;
+                dynasm!(ops ; .arch x64 ; xor r10d, r10d ; test r9d, r9d ; jz =>done);
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    11,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                load64(&mut ops, 10, u64::from(root));
+                dynasm!(ops ; .arch x64 ; mov r10d, [r11 + r10 + view.shape_prototype_byte as i32] ; =>done);
+                store_integer(&mut ops, frame, loc[1], 10)?;
+                store_integer(&mut ops, frame, loc[2], 9)?;
+                structural_regions.push((
+                    "machineCacheIrLoadPrototypeHolder",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrGuardPrototypeValidity { byte_pc, validity } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_integer(&mut ops, frame, loc[0], 10)?;
+                dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
+                symbolic(
+                    &mut ops,
+                    &mut relocations,
+                    11,
+                    validity.address as u64,
+                    RelocationTarget::PrototypeValidityCell {
+                        identity: validity.identity,
+                    },
+                );
+                dynasm!(ops ; .arch x64 ; cmp DWORD [r11], 0 ; je =>miss
+                    ; mov r10d, 1 ; jmp =>done ; =>miss ; xor r10d, r10d ; =>done);
+                store_integer(&mut ops, frame, loc[1], 10)?;
+                structural_regions.push((
+                    "machineCacheIrGuardPrototypeValidity",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
@@ -1427,6 +1447,7 @@ pub(super) fn emit(
                     ; mov r9d, [r11 + view.object_shape_byte as i32]
                     ; mov rsi, r11
                 );
+                dynasm!(ops ; .arch x64 ; test BYTE [rsi + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE as i8 ; jnz =>miss);
                 let labels = cases
                     .iter()
                     .map(|_| ops.new_dynamic_label())
@@ -1438,31 +1459,17 @@ pub(super) fn emit(
                 for (case, &label) in cases.iter().zip(&labels) {
                     dynasm!(ops ; .arch x64 ; =>label);
                     if let Some(transition) = &case.transition {
-                        for &prototype in transition.prototype_shapes.iter() {
+                        if let Some(validity) = transition.prototype_validity {
                             symbolic(
                                 &mut ops,
                                 &mut relocations,
-                                8,
-                                view.cage_base as u64,
-                                RelocationTarget::GcCageBase,
+                                10,
+                                validity.address as u64,
+                                RelocationTarget::PrototypeValidityCell {
+                                    identity: validity.identity,
+                                },
                             );
-                            crate::template::x86_64::emit_x64_load_prototype(
-                                &mut ops, view, 10, 11, 8,
-                            );
-                            dynasm!(ops
-                                ; .arch x64
-                                ; test r10d, r10d
-                                ; jz =>miss
-                                ; lea r11, [r8 + r10]
-                                ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
-                                ; jne =>miss
-                            );
-                            shape_state_guard(&mut ops, view, miss);
-                            dynasm!(ops
-                                ; .arch x64
-                                ; cmp DWORD [r11 + view.object_shape_byte as i32], prototype as i32
-                                ; jne =>miss
-                            );
+                            dynasm!(ops ; .arch x64 ; cmp DWORD [r10], 0 ; je =>miss);
                         }
                         let slot = case.value_byte / 8;
                         let inline_storage = ops.new_dynamic_label();
@@ -1474,11 +1481,8 @@ pub(super) fn emit(
                             view.cage_base as u64,
                             RelocationTarget::GcCageBase,
                         );
-                        crate::template::x86_64::emit_x64_load_prototype(&mut ops, view, 10, 11, 8);
                         dynasm!(ops
                             ; .arch x64
-                            ; test r10d, r10d
-                            ; jnz =>miss
                             ; mov r11, rsi
                             ; mov r9d, [r11 + view.object_slab_handle_byte as i32]
                             ; test r9d, r9d
@@ -1583,6 +1587,8 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; test r10d, r10d ; jz =>miss);
                 object_header(&mut ops, &mut relocations, view, frame, loc[0], miss)?;
                 ordinary_lookup_state_guard(&mut ops, view, miss);
+                dynasm!(ops ; .arch x64 ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE as i8 ; jnz =>miss);
+
                 dynasm!(ops
                     ; .arch x64
                     ; mov r10d, value_byte as i32
@@ -3746,6 +3752,9 @@ fn binding_guard(
                 RelocationTarget::GcCageBase,
             );
             dynasm!(ops ; .arch x64 ; add r11, r10);
+            if matches!(semantics, BindingSemantics::Write(_)) {
+                dynasm!(ops ; .arch x64 ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE as i8 ; jnz =>miss);
+            }
             if dictionary {
                 symbolic(
                     ops,
@@ -4749,19 +4758,23 @@ fn emit_inline_method_guard(
         ; cmp DWORD [r11 + view.object_shape_byte as i32], guard.recv_shape as i32
         ; jne =>miss
     );
-    for &shape in &guard.proto_chain {
-        crate::template::x86_64::emit_x64_load_prototype(ops, view, 10, 11, 0);
-        dynasm!(ops
-            ; .arch x64
-            ; test r10d, r10d
-            ; jz =>miss
-            ; add r10, rax
-            ; mov r11, r10
-            ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
-            ; jne =>miss
-            ; cmp DWORD [r11 + view.object_shape_byte as i32], shape as i32
-            ; jne =>miss
+    dynasm!(ops ; .arch x64
+        ; test BYTE [r11 + view.object_flags_byte as i32], (otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN | otter_vm::jit::JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE | otter_vm::jit::JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE) as i8
+        ; jnz =>miss);
+    if let Some(validity) = guard.prototype_validity {
+        symbolic(
+            ops,
+            relocations,
+            10,
+            validity.address as u64,
+            RelocationTarget::PrototypeValidityCell {
+                identity: validity.identity,
+            },
         );
+        dynasm!(ops ; .arch x64 ; cmp DWORD [r10], 0 ; je =>miss);
+        load64(ops, 10, u64::from(guard.holder_root));
+        dynasm!(ops ; .arch x64 ; mov r11d, [rax + r10 + view.shape_prototype_byte as i32]
+            ; add r11, rax);
     }
     slab_base(ops, relocations, view);
     dynasm!(ops ; .arch x64 ; mov r9, [r8 + guard.method_value_byte as i32]);

@@ -498,7 +498,7 @@ impl Interpreter {
         // freshly installed monomorphic candidate) the per-call string `[[Get]]`
         // walk — `has_plain_builtin_method` + `ordinary_get_value` + atom
         // comparison up the chain — is skipped entirely. A non-cacheable
-        // shape (accessor method, deep prototype, absent) returns `None` and
+        // shape (accessor method, opaque chain, absent) returns `None` and
         // falls through to the full resolution below. Only an `ObjectBody`
         // receiver reaches here (`as_object` is `None` for arrays / Map / Set),
         // so this probes ahead of the array/collection call ICs: an ordinary
@@ -1674,10 +1674,10 @@ impl Interpreter {
     /// Resolve a method by receiver shape through the call site's load IC.
     ///
     /// Returns the method value on an IC hit or a freshly installed
-    /// monomorphic data-slot candidate (own or direct-prototype), exactly the
+    /// monomorphic data-slot candidate (own or inherited), exactly the
     /// values [`Self::drive_load_property`] caches. Returns `None` when the
-    /// property is not an IC-cacheable data slot — an accessor, a deeper
-    /// prototype hop, or absent — so the caller falls back to the full
+    /// property is not an IC-cacheable data slot — an accessor, an opaque
+    /// prototype chain, or absent — so the caller falls back to the full
     /// `[[Get]]` method-resolution path that handles those cases.
     /// Well-known prototype object whose own-data method slots back a primitive
     /// receiver's builtin methods: `%String.prototype%` for a string,

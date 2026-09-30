@@ -1275,19 +1275,23 @@ fn emit_method_guard(
         ; cmp DWORD [r11 + view.object_shape_byte as i32], guard.recv_shape as i32
         ; jne =>miss
     );
-    for &shape in &guard.proto_chain {
-        super::emit_x64_load_prototype(ops, view, 10, 11, 12);
-        dynasm!(ops
-            ; .arch x64
-            ; test r10d, r10d
-            ; jz =>miss
-            ; add r10, r12
-            ; mov r11, r10
-            ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
-            ; jne =>miss
-            ; cmp DWORD [r11 + view.object_shape_byte as i32], shape as i32
-            ; jne =>miss
+    dynasm!(ops ; .arch x64
+        ; test BYTE [r11 + view.object_flags_byte as i32], (otter_vm::jit::JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN | otter_vm::jit::JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE | otter_vm::jit::JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE) as i8
+        ; jnz =>miss);
+    if let Some(validity) = guard.prototype_validity {
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            10,
+            validity.address as u64,
+            RelocationTarget::PrototypeValidityCell {
+                identity: validity.identity,
+            },
         );
+        dynasm!(ops ; .arch x64 ; cmp DWORD [r10], 0 ; je =>miss);
+        emit_load_u64(ops, 10, u64::from(guard.holder_root));
+        dynasm!(ops ; .arch x64 ; mov r11d, [r12 + r10 + view.shape_prototype_byte as i32]
+            ; add r11, r12);
     }
     emit_template_slab_base(ops, relocations, view, 11, 8, 10);
     dynasm!(ops ; .arch x64 ; mov r9, [r8 + guard.method_value_byte as i32]);

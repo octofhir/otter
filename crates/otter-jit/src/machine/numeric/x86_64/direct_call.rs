@@ -21,6 +21,8 @@
 //!   relocation schema used by the AArch64 encoder.
 //! - Forwarding source admission is pre-effect; a native miss reaches one
 //!   committed cold sibling, and a started generated call is never replayed.
+//! - A cold inline call retains its physical parent's PC; its safepoint recipe
+//!   names the descendant operation independently.
 //!
 //! # See also
 //! - `crate::arm64::direct_call` — peer target implementation.
@@ -251,6 +253,7 @@ pub(super) fn emit(
         save_roots(ops, frame, site)?;
         stamp_call_site(ops, site);
         return emit_generic_value_call(
+            view,
             ops,
             relocations,
             transitions,
@@ -328,6 +331,7 @@ pub(super) fn emit(
             dynasm!(ops ; .arch x64 ; =>final_miss);
             let start = ops.offset().0;
             emit_generic_value_call(
+                view,
                 ops,
                 relocations,
                 transitions,
@@ -394,6 +398,7 @@ pub(super) fn emit(
         stamp_call_site(ops, site);
         let start = ops.offset().0;
         emit_generic_value_call(
+            view,
             ops,
             relocations,
             transitions,
@@ -439,6 +444,7 @@ pub(super) fn emit(
         save_roots(ops, frame, site)?;
         stamp_call_site(ops, site);
         return emit_generic_construct(
+            view,
             ops,
             relocations,
             transitions,
@@ -881,6 +887,7 @@ pub(super) fn emit(
         );
     }
     emit_generic_construct(
+        view,
         ops,
         relocations,
         transitions,
@@ -906,6 +913,7 @@ pub(super) fn emit(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_generic_construct(
+    view: &JitCompileSnapshot,
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
@@ -920,6 +928,7 @@ fn emit_generic_construct(
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_generic_value_call(
+        view,
         ops,
         relocations,
         transitions,
@@ -1242,6 +1251,7 @@ fn emit_generated_value_call(
     } else {
         let start = ops.offset().0;
         emit_generic_value_call(
+            view,
             ops,
             relocations,
             transitions,
@@ -1266,6 +1276,7 @@ fn emit_generated_value_call(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_generic_value_call(
+    view: &JitCompileSnapshot,
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
@@ -1281,6 +1292,13 @@ fn emit_generic_value_call(
     fatal: DynamicLabel,
     done: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    let logical_pc = if let Some(parent) = instruction.inline_frames.first() {
+        super::super::frame_state::suspended_call_pc(view, parent.function_id, parent.byte_pc)
+            .ok_or(Unsupported::OperandShape("inline caller publication PC"))?
+            .0
+    } else {
+        logical_pc
+    };
     let source_count = descriptor.arguments.len();
     let inserts_receiver = kind == DirectCallKind::Plain;
     let packet_count = source_count + usize::from(inserts_receiver);

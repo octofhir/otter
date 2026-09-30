@@ -55,6 +55,8 @@
 //!   drops the physical tables and the charge in the same operation.
 //! - IC-site bases keep dense property-IC ids globally unique, so two
 //!   chunks never alias one interpreter IC slot.
+//! - Snapshot restore owns a new directory and fresh mutable execution state.
+//!   Only immutable compiler bytecode may be shared across isolates.
 //!
 //! # See also
 //!
@@ -72,6 +74,9 @@ use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLeas
 use crate::ExecutionContext;
 use crate::executable::ExecutableModule;
 use crate::property_atom::AtomTable;
+
+#[path = "code_space_snapshot.rs"]
+pub(crate) mod snapshot;
 
 /// One live chunk's tables and exact retained-byte ownership.
 ///

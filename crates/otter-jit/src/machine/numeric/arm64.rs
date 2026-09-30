@@ -849,6 +849,9 @@ fn emit_binding_guard(
                 ; mov X(owner), x13
                 ; ldr w14, [x13, view.object_shape_byte]
             );
+            if matches!(semantics, BindingSemantics::Write(_)) {
+                dynasm!(ops ; .arch aarch64 ; ldrb w15, [x13, view.object_flags_byte] ; tbnz w15, 4, =>miss);
+            }
             if dictionary {
                 emit_load_symbolic_u64(
                     ops,
@@ -2456,6 +2459,12 @@ fn emit_with_reach(
                     miss,
                 )?;
                 emit_ordinary_lookup_state_guard(&mut ops, view, 13, miss);
+                if matches!(
+                    instruction.opcode,
+                    MachineOpcode::CacheIrGuardAtomSlot { writable: true, .. }
+                ) {
+                    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
+                }
                 emit_load_u64(&mut ops, 9, 1);
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                 emit_load_u64(&mut ops, 9, 0);
@@ -2504,42 +2513,6 @@ fn emit_with_reach(
                     ops.offset().0,
                 ));
             }
-            MachineOpcode::CacheIrLoadPrototype { byte_pc } => {
-                let start = ops.offset().0;
-                let miss = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                emit_load_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
-                emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
-                emit_load_u64(&mut ops, 11, 0);
-                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
-                emit_load_object_header(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
-                    13,
-                    miss,
-                )?;
-                emit_load_symbolic_u64(
-                    &mut ops,
-                    &mut relocations,
-                    12,
-                    view.cage_base as u64,
-                    RelocationTarget::GcCageBase,
-                );
-                crate::template::arm64::values::emit_load_prototype(&mut ops, view, 10, 13, 12);
-                dynasm!(ops ; .arch aarch64 ; cbz w10, =>miss);
-                emit_load_u64(&mut ops, 11, 1);
-                dynasm!(ops ; .arch aarch64 ; =>miss ; =>done);
-                emit_store_allocated_tagged(&mut ops, frame, locations[2], 10, 0)?;
-                emit_store_allocated_integer(&mut ops, frame, locations[3], 11, 0)?;
-                structural_regions.push((
-                    "machineCacheIrLoadPrototype",
-                    Some(byte_pc),
-                    start,
-                    ops.offset().0,
-                ));
-            }
             MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc } => {
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
@@ -2561,6 +2534,56 @@ fn emit_with_reach(
                 emit_store_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
                 structural_regions.push((
                     "machineCacheIrGuardArrayIndexProtector",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrLoadPrototypeHolder { byte_pc, root } => {
+                let start = ops.offset().0;
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                emit_load_u64(&mut ops, 10, 0);
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>done);
+                emit_load_symbolic_u64(
+                    &mut ops,
+                    &mut relocations,
+                    11,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                emit_load_u64(&mut ops, 10, u64::from(root));
+                dynasm!(ops ; .arch aarch64 ; add x10, x11, x10
+                    ; ldr w10, [x10, view.shape_prototype_byte] ; =>done);
+                emit_store_allocated_tagged(&mut ops, frame, locations[1], 10, 0)?;
+                emit_store_allocated_integer(&mut ops, frame, locations[2], 9, 0)?;
+                structural_regions.push((
+                    "machineCacheIrLoadPrototypeHolder",
+                    Some(byte_pc),
+                    start,
+                    ops.offset().0,
+                ));
+            }
+            MachineOpcode::CacheIrGuardPrototypeValidity { byte_pc, validity } => {
+                let start = ops.offset().0;
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                emit_load_allocated_integer(&mut ops, frame, locations[0], 9, 0)?;
+                dynasm!(ops ; .arch aarch64 ; cbz w9, =>miss);
+                crate::template::arm64::values::emit_prototype_validity_guard(
+                    &mut ops,
+                    &mut relocations,
+                    validity,
+                    10,
+                    miss,
+                );
+                emit_load_u64(&mut ops, 9, 1);
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+                emit_load_u64(&mut ops, 9, 0);
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                emit_store_allocated_integer(&mut ops, frame, locations[1], 9, 0)?;
+                structural_regions.push((
+                    "machineCacheIrGuardPrototypeValidity",
                     Some(byte_pc),
                     start,
                     ops.offset().0,
@@ -2819,6 +2842,7 @@ fn emit_with_reach(
                     ; ldr w15, [x13, view.object_shape_byte]
                     ; mov x12, x13
                 );
+                dynasm!(ops ; .arch aarch64 ; ldrb w14, [x12, view.object_flags_byte] ; tbnz w14, 4, =>miss);
                 let labels = cases
                     .iter()
                     .map(|_| ops.new_dynamic_label())
@@ -2831,41 +2855,15 @@ fn emit_with_reach(
                 for (case, &label) in cases.iter().zip(&labels) {
                     dynasm!(ops ; .arch aarch64 ; =>label);
                     if let Some(transition) = &case.transition {
-                        // Missing-key proof: each prototype keeps its shape and
-                        // chain-link state, and the chain ends in null.
-                        dynasm!(ops ; .arch aarch64 ; mov x11, x12);
-                        emit_load_symbolic_u64(
-                            &mut ops,
-                            &mut relocations,
-                            13,
-                            view.cage_base as u64,
-                            RelocationTarget::GcCageBase,
-                        );
-                        for &prototype in transition.prototype_shapes.iter() {
-                            crate::template::arm64::values::emit_load_prototype(
-                                &mut ops, view, 14, 11, 13,
-                            );
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; cbz w14, =>miss
-                                ; add x11, x13, x14
-                                ; ldrb w14, [x11]
-                                ; cmp w14, u32::from(otter_vm::object::OBJECT_BODY_TYPE_TAG)
-                                ; b.ne =>miss
-                            );
-                            emit_shape_state_guard(&mut ops, view, 11, miss);
-                            emit_load_u64(&mut ops, 16, u64::from(prototype));
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; ldr w14, [x11, view.object_shape_byte]
-                                ; cmp w14, w16
-                                ; b.ne =>miss
+                        if let Some(validity) = transition.prototype_validity {
+                            crate::template::arm64::values::emit_prototype_validity_guard(
+                                &mut ops,
+                                &mut relocations,
+                                validity,
+                                14,
+                                miss,
                             );
                         }
-                        crate::template::arm64::values::emit_load_prototype(
-                            &mut ops, view, 14, 11, 13,
-                        );
-                        dynasm!(ops ; .arch aarch64 ; cbnz w14, =>miss);
                         // Exact append into existing capacity of an
                         // extensible receiver.
                         let slot = case.value_byte / 8;
@@ -2989,6 +2987,7 @@ fn emit_with_reach(
                     13,
                     miss,
                 )?;
+                dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
                 emit_load_u64(&mut ops, 17, u64::from(value_byte));
                 dynasm!(ops
                     ; .arch aarch64
@@ -4000,7 +3999,8 @@ fn emit_with_reach(
                                     .iter()
                                     .map(|operand| operand.value),
                             )?;
-                            emit_load_u64(&mut ops, 15, u64::from(*logical_pc));
+                            let published_pc = safepoints.records()[site.id.0 as usize].call_pc;
+                            emit_load_u64(&mut ops, 15, u64::from(published_pc));
                             dynasm!(ops
                                 ; .arch aarch64
                                 ; ldr x16, [x19, NATIVE_FRAME_OFFSET]

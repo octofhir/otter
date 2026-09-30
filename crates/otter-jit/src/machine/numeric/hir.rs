@@ -5144,7 +5144,11 @@ mod tests {
             guard: JitMethodGuard {
                 method_fid: function_id,
                 recv_shape: 10 + target_index,
-                proto_chain: vec![20 + target_index],
+                prototype_validity: Some(otter_vm::jit::JitPrototypeValidity {
+                    address: 1,
+                    identity: u64::from(target_index),
+                }),
+                holder_root: 20 + target_index,
                 method_value_byte: 32 + target_index * 8,
             },
             callee: direct_callee(function_id),
@@ -7889,7 +7893,10 @@ mod tests {
             JitConstructorFieldTransition {
                 from_shape: 1,
                 to_shape: 2,
-                prototype_shapes: vec![3],
+                prototype_validity: otter_vm::jit::JitPrototypeValidity {
+                    address: 1,
+                    identity: 3,
+                },
                 slot: 0,
             },
         );

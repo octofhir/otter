@@ -58,11 +58,9 @@ struct RegisteredCode {
     code: Arc<dyn JitFunctionCode>,
     dependencies: Box<[CodeDependency]>,
     state: CodeLifetimeState,
-    /// Hidden classes the machine code names as immediates. Shapes are
-    /// collectable, and the code compares and publishes these handles until
-    /// it retires — invalidation alone does not stop it running — so the
-    /// registration keeps them alive.
-    shapes: Box<[crate::object::ShapeHandle]>,
+    /// Shapes and validity cells embedded by this generation. Invalidated
+    /// code may still execute, so these live until physical retirement.
+    roots: Box<[crate::jit_roots::CompilationRoot]>,
     /// Exact `GeneratedCodeBytes` charge for the executable mapping and its
     /// owned metadata. Released when the retired object is physically
     /// dropped from the registry.
@@ -285,7 +283,7 @@ impl JitCodeRegistry {
                 code,
                 dependencies,
                 state: CodeLifetimeState::Installed,
-                shapes: Box::new([]),
+                roots: Box::new([]),
                 _generated_code_lease: generated_code_lease,
             },
         );
@@ -565,6 +563,27 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
+    /// Retain every heap assumption embedded by an installed generation.
+    pub(crate) fn retain_roots(
+        &mut self,
+        code_object_id: u64,
+        roots: Box<[crate::jit_roots::CompilationRoot]>,
+    ) {
+        if let Some(registered) = self.codes.get_mut(&code_object_id) {
+            registered.roots = roots;
+        }
+    }
+
+    /// Visit every hidden class a registered (not yet retired) code object
+    /// embeds, as strong roots.
+    pub(crate) fn trace_retained_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for registered in self.codes.values() {
+            for shape in &*registered.roots {
+                shape.trace(visitor);
+            }
+        }
+    }
+
     /// Retire invalid code whose last `Arc` owner is the registry and whose
     /// unlinked entry cell has no explicit active lease.
     ///
@@ -574,32 +593,6 @@ impl JitCodeRegistry {
     /// executing until that boundary.
     ///
     /// Returns how many objects retired.
-    /// Record the hidden classes an installed code object embeds.
-    pub(crate) fn retain_shapes(
-        &mut self,
-        code_object_id: u64,
-        shapes: Box<[crate::object::ShapeHandle]>,
-    ) {
-        if let Some(registered) = self.codes.get_mut(&code_object_id) {
-            registered.shapes = shapes;
-        }
-    }
-
-    /// Visit every hidden class a registered (not yet retired) code object
-    /// embeds, as strong roots.
-    pub(crate) fn trace_retained_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        for registered in self.codes.values() {
-            for shape in &*registered.shapes {
-                // Shapes never move, so the slot is never rewritten.
-                visitor(
-                    std::ptr::from_ref(shape)
-                        .cast_mut()
-                        .cast::<otter_gc::raw::RawGc>(),
-                );
-            }
-        }
-    }
-
     pub(crate) fn retire_unreferenced(&mut self) -> usize {
         let before = self.codes.len();
         let entry_cells = &self.entry_cells;

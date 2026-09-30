@@ -161,6 +161,7 @@ mod jit_iterator_ops;
 mod jit_module_ops;
 mod jit_private_ops;
 pub mod jit_registry;
+mod jit_roots;
 mod jit_runtime_ops;
 mod jit_spread_call_ops;
 mod jit_static_call_ops;
@@ -717,68 +718,17 @@ pub struct JitCollectionMethodIcStats {
 /// baked shapes are walked), so raising it only helps wider sites.
 pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 
-/// Longest prototype chain a method-call site's inline identity guard walks
-/// from the receiver to the object holding the method slot. Deeper
-/// resolutions stay uninlined (a chain this long is already rare; each hop
-/// costs one shape-prototype chase plus shape compare per call).
-pub(crate) const MAX_METHOD_PROTO_CHAIN: usize = 4;
-
-/// Stable shape identities for each prototype hopped from the receiver to the method holder,
-/// in hop order — the last entry is the holder's shape. Empty when the
-/// method slot is an own property of the receiver. Each level's shape check
-/// both pins that object's layout (an own-property insertion that would
-/// shadow the method changes the shape) and validates the slot offset baked
-/// for the holder.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MethodProtoChain {
-    len: u8,
-    shapes: [object::ShapeId; MAX_METHOD_PROTO_CHAIN],
-}
-
-impl MethodProtoChain {
-    /// Chain for a method living directly on the receiver.
-    pub(crate) fn own() -> Self {
-        Self {
-            len: 0,
-            shapes: [object::ShapeId::UNASSIGNED; MAX_METHOD_PROTO_CHAIN],
-        }
-    }
-
-    /// Append one hopped prototype's shape; `false` when the chain is full
-    /// (the site must stay uninlined).
-    pub(crate) fn push(&mut self, shape: object::ShapeId) -> bool {
-        if (self.len as usize) == MAX_METHOD_PROTO_CHAIN {
-            return false;
-        }
-        self.shapes[self.len as usize] = shape;
-        self.len += 1;
-        true
-    }
-
-    pub(crate) fn as_slice(&self) -> &[object::ShapeId] {
-        &self.shapes[..self.len as usize]
-    }
-
-    /// Whether both chains walk the same stable shape identities.
-    pub(crate) fn same(&self, other: &Self) -> bool {
-        self.len == other.len
-            && self
-                .as_slice()
-                .iter()
-                .zip(other.as_slice())
-                .all(|(a, b)| a == b)
-    }
-}
+use object::prototype_validity::MethodLookupProof;
 
 /// One observed `(receiver shape, resolved method)` target at a polymorphic
 /// method-call site. Same layout data the baseline bakes for a monomorphic
 /// inline guard ([`MethodCallFeedback::Mono`]), plus a `hits` counter so the
 /// emitter can order the guard chain most-frequent-first.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct PolyMethodTarget {
     pub(crate) method_fid: u32,
     pub(crate) recv_shape: object::ShapeId,
-    pub(crate) proto_chain: MethodProtoChain,
+    pub(crate) prototype: MethodLookupProof,
     pub(crate) method_value_byte: u32,
     /// Observations that resolved to exactly this target. Used only to order
     /// the emitted guard chain; not a correctness input.
@@ -791,7 +741,7 @@ impl PolyMethodTarget {
     fn matches(&self, method_fid: u32, site: &MethodSite) -> bool {
         self.method_fid == method_fid
             && self.recv_shape == site.recv_shape
-            && self.proto_chain.same(&site.proto_chain)
+            && self.prototype.same(&site.prototype)
             && self.method_value_byte == site.method_value_byte
     }
 }
@@ -800,17 +750,13 @@ impl PolyMethodTarget {
 pub(crate) enum MethodCallFeedback {
     /// One method function id and one receiver shape observed so far.
     ///
-    /// `proto_chain` holds the shape of each prototype hopped to reach the
-    /// object holding the method slot, and `method_value_byte` is that slot's
-    /// byte offset within the holder's value slab — both captured at record
-    /// time from the live receiver so the baseline can bake a fully-inline
-    /// identity guard (chase the shape's prototype per hop, guard each shape,
-    /// load the slot, compare the closure's `function_id`) with no per-call
-    /// runtime resolution.
+    /// `prototype` holds the shared validity proof and holder root identity;
+    /// `method_value_byte` names the current callable slot. The generated
+    /// guard validates the cell and callable before any method effect.
     Mono {
         method_fid: u32,
         recv_shape: object::ShapeId,
-        proto_chain: MethodProtoChain,
+        prototype: MethodLookupProof,
         method_value_byte: u32,
     },
     /// Two-to-[`MAX_POLY_METHOD_TARGETS`] distinct inlinable targets observed
@@ -834,7 +780,7 @@ pub(crate) enum MethodCallFeedback {
     MonoNativeLeaf {
         stub_id: native_abi::RuntimeStubId,
         recv_shape: object::ShapeId,
-        proto_chain: MethodProtoChain,
+        prototype: MethodLookupProof,
         method_value_byte: u32,
     },
     /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
@@ -847,13 +793,13 @@ pub(crate) enum MethodCallFeedback {
 /// move during the call, so its prototype shape and method slot offset are
 /// resolved while it is still valid). Folded into [`MethodCallFeedback`] once
 /// the resolved method id is known.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct MethodSite {
     /// Stable receiver hidden-class identity.
     recv_shape: object::ShapeId,
     /// Stable identities of prototypes hopped to the method holder;
     /// empty when the method slot lives directly on the receiver.
-    proto_chain: MethodProtoChain,
+    prototype: MethodLookupProof,
     /// Byte offset of the method slot within the holder's value slab.
     method_value_byte: u32,
 }
@@ -1024,8 +970,12 @@ pub struct Interpreter {
     /// chain. Plans remain guarded at their original stores, so repeated
     /// receiver allocation need not rescan the prototype graph.
     constructor_field_capacity_cache: rustc_hash::FxHashMap<(u32, u32), usize>,
-    /// Ordinary prototype-chain shapes for each planned class allocation.
-    constructor_prototype_shape_cache: rustc_hash::FxHashMap<(u32, u32), Vec<object::ShapeId>>,
+    /// Shared proof per constructor pair and prototype lineage. Closures
+    /// sharing a function body can own different prototype objects.
+    constructor_prototype_validity_cache: rustc_hash::FxHashMap<
+        (u32, u32, object::ShapeId),
+        std::sync::Arc<object::prototype_validity::PrototypeValidity>,
+    >,
     /// Instance size learned per exact constructor / `new.target` pair from
     /// the receivers the runtime prepared for it, so a body that grows its
     /// receiver outside the baked transition program (an `initialize` reached
@@ -1270,10 +1220,10 @@ pub struct Interpreter {
     /// published safepoint-resolver view; entries are registered at compile
     /// install and retained while any native frame can name them.
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
-    /// Hidden classes named by the compilations in progress (a stack: a
+    /// Shapes and validity cells held by in-progress compilations (a stack: a
     /// compile can start a nested one). A root until the code object that
     /// embeds them is registered and takes them over.
-    jit_compile_shapes: std::cell::RefCell<Vec<object::ShapeHandle>>,
+    jit_compile_roots: std::cell::RefCell<Vec<jit_roots::CompilationRoot>>,
     /// Nesting depth of [`Self::with_runtime_turn`]; shapes created during a
     /// turn stay pinned until the outermost one ends.
     runtime_turn_depth: u32,

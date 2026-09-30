@@ -15,7 +15,7 @@
 //! - ICs are performance hints only; every miss falls back to ordinary
 //!   ECMAScript property semantics.
 //! - Proxies, accessors, symbols, computed keys, dictionary-compatible
-//!   objects, and deep prototype hits are not cached.
+//!   objects are not cached. Ordinary inherited data uses a chain validity cell.
 //! - Cache guards include both shape identity and atom id.
 //! - PIC capacity is derived from the checked-in tier census. A new shape that
 //!   cannot fit transitions directly to [`PropertyIcEntry::Megamorphic`];
@@ -389,6 +389,90 @@ mod tests {
     }
 
     #[test]
+    fn deep_prototype_proof_is_shared_and_retires_on_shadowing() {
+        let mut heap = fresh_heap();
+        let mut holder = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut holder, &mut heap, "x", Value::boolean(true));
+        let mut first = holder;
+        let mut middle = holder;
+        for depth in 0..12 {
+            let next = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+            object::set_prototype(next, &mut heap, Some(first));
+            first = next;
+            if depth == 5 {
+                middle = next;
+            }
+        }
+        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let sibling = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set_prototype(receiver, &mut heap, Some(first));
+        object::set_prototype(sibling, &mut heap, Some(first));
+        let resolved = crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).unwrap();
+        let shared = crate::cache_ir::resolve_atom_data_slot(sibling, &heap, key("x")).unwrap();
+        let old = resolved.validity.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            old,
+            shared.validity.as_ref().unwrap()
+        ));
+        let ic = crate::cache_ir::CacheStub::from_resolved_load(
+            object::shape_id(receiver, &heap),
+            &resolved,
+        );
+        assert_eq!(
+            ic.run_load(receiver, &heap, key("x")),
+            Some(Value::boolean(true))
+        );
+        object::set(&mut middle, &mut heap, "x", Value::boolean(false));
+        assert!(!old.is_valid());
+        assert_eq!(ic.run_load(receiver, &heap, key("x")), None);
+        // The proof can be rebuilt even when the mutated link has dictionary storage.
+        let rebuilt = object::prototype_validity::chain_validity(first, &heap).unwrap();
+        assert!(rebuilt.is_valid());
+        assert_ne!(old.address(), rebuilt.address());
+        assert_eq!(
+            object::get(receiver, &heap, "x"),
+            Some(Value::boolean(false))
+        );
+    }
+
+    #[test]
+    fn prototype_mutations_retire_dependents_but_preserve_unrelated_chains() {
+        let mut heap = fresh_heap();
+        let mut prototype = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set(&mut prototype, &mut heap, "x", Value::boolean(true));
+        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set_prototype(receiver, &mut heap, Some(prototype));
+        let unrelated = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        let unrelated_receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
+        object::set_prototype(unrelated_receiver, &mut heap, Some(unrelated));
+        let stable = object::prototype_validity::chain_validity(unrelated, &heap).unwrap();
+        for mutation in 0..4 {
+            let proof = object::prototype_validity::chain_validity(prototype, &heap).unwrap();
+            match mutation {
+                0 => {
+                    object::set(&mut prototype, &mut heap, "x", Value::boolean(false));
+                }
+                1 => {
+                    assert!(object::define_own_property(
+                        prototype,
+                        &mut heap,
+                        "x",
+                        PropertyDescriptor::data(Value::boolean(false), false, true, true)
+                    ));
+                }
+                2 => {
+                    assert!(object::delete(prototype, &mut heap, "x"));
+                }
+                _ => {
+                    object::set_prototype(prototype, &mut heap, Some(unrelated));
+                }
+            }
+            assert!(!proof.is_valid(), "mutation {mutation}");
+            assert!(stable.is_valid(), "unrelated chain on mutation {mutation}");
+        }
+    }
+
+    #[test]
     fn existing_own_store_candidate_rejects_non_writable_data() {
         let mut heap = fresh_heap();
         let obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
@@ -402,6 +486,15 @@ mod tests {
         assert!(crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x")).is_none());
     }
 
+    fn proof_for_test(
+        cell: &std::sync::Arc<object::prototype_validity::PrototypeValidity>,
+    ) -> Option<crate::jit::JitPrototypeValidity> {
+        cell.is_valid().then_some(crate::jit::JitPrototypeValidity {
+            address: cell.address(),
+            identity: cell.identity(),
+        })
+    }
+
     #[test]
     fn cache_ir_snapshot_preserves_own_load_and_store_programs() {
         let mut heap = fresh_heap();
@@ -412,7 +505,7 @@ mod tests {
         let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key("x")).unwrap();
 
         let load = crate::cache_ir::CacheStub::from_resolved_load(shape_id, &resolved)
-            .snapshot_for_jit(|id| (id == shape_id).then_some(shape))
+            .snapshot_for_jit(|id| (id == shape_id).then_some(shape), proof_for_test)
             .expect("complete own-load snapshot");
         assert_eq!(
             load.ops.as_ref(),
@@ -433,7 +526,7 @@ mod tests {
 
         let store = crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x"))
             .unwrap()
-            .snapshot_for_jit(|id| (id == shape_id).then_some(shape))
+            .snapshot_for_jit(|id| (id == shape_id).then_some(shape), proof_for_test)
             .expect("complete own-store snapshot");
         assert_eq!(
             store.ops.as_ref(),
@@ -462,15 +555,22 @@ mod tests {
         object::set_prototype(receiver, &mut heap, Some(proto));
         let receiver_id = object::shape_id(receiver, &heap);
         let receiver_shape = 101;
-        let holder_id = object::shape_id(proto, &heap);
-        let holder_shape = 202;
+        let holder_id = heap.read_payload(
+            object::cached_instance_root(proto, &heap).unwrap(),
+            object::ShapeBody::id,
+        );
+        let holder_shape = receiver_shape;
+        assert_eq!(holder_id, receiver_id);
         let resolved = crate::cache_ir::resolve_atom_data_slot(receiver, &heap, key("x")).unwrap();
         let program = crate::cache_ir::CacheStub::from_resolved_load(receiver_id, &resolved)
-            .snapshot_for_jit(|id| match id {
-                id if id == receiver_id => Some(receiver_shape),
-                id if id == holder_id => Some(holder_shape),
-                _ => None,
-            })
+            .snapshot_for_jit(
+                |id| match id {
+                    id if id == receiver_id => Some(receiver_shape),
+                    id if id == holder_id => Some(holder_shape),
+                    _ => None,
+                },
+                proof_for_test,
+            )
             .expect("complete prototype-load snapshot");
         assert_eq!(
             program.ops.as_ref(),
@@ -479,19 +579,12 @@ mod tests {
                     object: 0,
                     shape: receiver_shape,
                 },
-                JitCacheIrOp::LoadPrototype {
-                    object: 0,
-                    result: 1,
+                JitCacheIrOp::GuardPrototypeValidity {
+                    validity: proof_for_test(resolved.validity.as_ref().unwrap()).unwrap()
                 },
-                JitCacheIrOp::GuardShape {
-                    object: 1,
-                    shape: holder_shape,
-                },
-                JitCacheIrOp::GuardAtomSlot {
-                    object: 1,
-                    atom: 7,
-                    value_byte: 0,
-                    writable: false,
+                JitCacheIrOp::LoadPrototypeHolder {
+                    root: holder_shape,
+                    result: 1
                 },
                 JitCacheIrOp::LoadField {
                     object: 1,
@@ -513,7 +606,7 @@ mod tests {
         )
         .expect("store transition");
         let stub = crate::cache_ir::CacheStub::store_transition(transition);
-        assert!(stub.snapshot_for_jit(|_| None).is_none());
+        assert!(stub.snapshot_for_jit(|_| None, proof_for_test).is_none());
     }
 
     #[test]
@@ -529,11 +622,14 @@ mod tests {
             slot: 1,
         };
         let program = crate::cache_ir::CacheStub::store_transition(transition)
-            .snapshot_for_jit(|id| match id {
-                id if id == from => Some(101),
-                id if id == to => Some(202),
-                _ => None,
-            })
+            .snapshot_for_jit(
+                |id| match id {
+                    id if id == from => Some(101),
+                    id if id == to => Some(202),
+                    _ => None,
+                },
+                proof_for_test,
+            )
             .expect("complete add-transition snapshot");
         assert_eq!(
             program.ops.as_ref(),

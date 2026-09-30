@@ -128,8 +128,8 @@ impl Interpreter {
             .retain(|(id, _), _| outside(id));
         self.constructor_instance_profiles
             .retain(|(id, _), _| outside(id));
-        self.constructor_prototype_shape_cache
-            .retain(|(id, _), _| outside(id));
+        self.constructor_prototype_validity_cache
+            .retain(|(id, _, _), _| outside(id));
         self.global_lexical_load_ic.retain(|(id, _), _| outside(id));
         self.global_object_load_ic.retain(|(id, _), _| outside(id));
         self.function_realm_ids.retain(|id, _| outside(id));

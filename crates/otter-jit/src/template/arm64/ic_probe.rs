@@ -38,24 +38,14 @@
 //!   proven operation may instead continue into equivalent machine lowering.
 //!   The preserving method form keeps a raw body pointer only across the same
 //!   allocation-free guard sequence and never across a transition.
-//! - Way stride is [`WHISKER_IC_WAY_BYTES`], asserted against the cell's own
-//!   layout where the cell is defined.
-//! - Register contract on entry: `x15` holds the cell address, `w14` the
-//!   receiver shape handle, `x13` the receiver's `GcHeader`. On a matched way
-//!   `w17` holds the slot byte offset, `w7` the guarded holder shape, and `w6`
-//!   the transition child shape while the probe runs; `w10` carries the
-//!   prototype proof kind until the transition guard consumes it. A store
-//!   probe returns that child in non-allocatable `w16` (`0` for an existing-slot program);
-//!   after [`emit_resolve_holder`], `x13` is the holder's header and `w14` its
-//!   shape.
-//! - The hop reads the receiver's `[[Prototype]]` at run time. The receiver
-//!   shape cannot stand in for it: the prototype lives in the object body, so
-//!   `setPrototypeOf` changes it while the shape stays put.
-//! - A matching shape is insufficient by itself. Receiver and data-holder
-//!   guards also prove live fast mode and no overridden slot metadata.
-//!   Property and native-method probes admit benign symbol/native metadata
-//!   while rejecting opaque host-backed or virtual lookup. Missing-key chain
-//!   links use their narrower absence proof.
+//! - Inherited slots are authorized by one validity cell. Their holders are
+//!   loaded through GC-traced prototype words in retained root shapes.
+//! - Generated stores reject watched prototype receivers before any effect;
+//!   canonical mutation invalidates every subscribed chain.
+//!
+//! # See also
+//! - `otter_vm::cache_ir` owns the runtime proof and immutable snapshot.
+//! - `otter_vm::object::prototype_validity` owns proof invalidation.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
@@ -158,43 +148,6 @@ fn emit_chain_link_state_guard(
     miss: DynamicLabel,
 ) {
     emit_shape_state_guard(ops, view, header, miss);
-}
-
-/// Resolve the object that owns the slot.
-///
-/// A way with holder shape `0` owns its slot on the receiver and this is a
-/// single branch. Otherwise the receiver's `[[Prototype]]` is loaded and its
-/// shape guarded before the caller touches the slab.
-pub(crate) fn emit_resolve_holder(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    miss: DynamicLabel,
-) {
-    let shape_byte = view.object_shape_byte;
-    let resolved = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; cbz w7, =>resolved);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        14,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    super::values::emit_load_prototype(ops, view, 12, 13, 14);
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz w12, =>miss
-        ; add x13, x14, x12          // x13 = prototype GcHeader ptr
-        ; ldrb w14, [x13]
-        ; cmp w14, OBJECT_BODY_TYPE_TAG
-        ; b.ne =>miss
-        ; ldr w14, [x13, shape_byte] // holder shape handle
-        ; cmp w14, w7
-        ; b.ne =>miss
-    );
-    emit_ordinary_lookup_state_guard(ops, view, 13, miss);
-    dynasm!(ops ; .arch aarch64 ; =>resolved);
 }
 
 /// Prove the receiver is an ordinary object cell with a non-empty hidden
@@ -448,6 +401,30 @@ where
                         "CacheIR intrinsic prototype operands",
                     ));
                 }
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        14,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    emit_load_u64(ops, 15, u64::from(root));
+                    dynasm!(ops ; .arch aarch64 ; add x15, x14, x15
+                        ; ldr w15, [x15, view.shape_prototype_byte] ; add x15, x14, x15);
+                }
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { .. } => {
+                    return Err(Unsupported::OperandShape("CacheIR holder operand"));
+                }
+                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
+                    super::values::emit_prototype_validity_guard(
+                        ops,
+                        relocations,
+                        validity,
+                        14,
+                        next,
+                    );
+                }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = match object {
                         0 => 13,
@@ -482,24 +459,6 @@ where
                     return Err(Unsupported::OperandShape(
                         "writable atom-slot guard in load CacheIR",
                     ));
-                }
-                otter_vm::JitCacheIrOp::LoadPrototype {
-                    object: 0,
-                    result: 1,
-                } => {
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        14,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    super::values::emit_load_prototype(ops, view, 12, 13, 14);
-                    dynasm!(ops ; .arch aarch64 ; cbz w12, =>next ; add x15, x14, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
-                    emit_ordinary_lookup_state_guard(ops, view, 15, next);
-                }
-                otter_vm::JitCacheIrOp::LoadPrototype { .. } => {
-                    return Err(Unsupported::OperandShape("CacheIR prototype operands"));
                 }
                 otter_vm::JitCacheIrOp::LoadField { object, value_byte } => {
                     let header = match object {
@@ -563,6 +522,7 @@ where
         return Ok(());
     };
     emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
+    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
     let matched = ops.new_dynamic_label();
     let existing = ops.new_dynamic_label();
     for program in programs {
@@ -577,6 +537,30 @@ where
         });
         for (index, op) in program.ops.iter().enumerate() {
             match *op {
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        14,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    emit_load_u64(ops, 15, u64::from(root));
+                    dynasm!(ops ; .arch aarch64 ; add x15, x14, x15
+                        ; ldr w15, [x15, view.shape_prototype_byte] ; add x15, x14, x15);
+                }
+                otter_vm::JitCacheIrOp::LoadPrototypeHolder { .. } => {
+                    return Err(Unsupported::OperandShape("CacheIR holder operand"));
+                }
+                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
+                    super::values::emit_prototype_validity_guard(
+                        ops,
+                        relocations,
+                        validity,
+                        14,
+                        next,
+                    );
+                }
                 otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
                     let header = match object {
                         0 => 13,
@@ -604,31 +588,6 @@ where
                     // atom/slot mapping and the live override state together.
                     if object > 1 {
                         return Err(Unsupported::OperandShape("store CacheIR atom-slot object"));
-                    }
-                }
-                otter_vm::JitCacheIrOp::LoadPrototype { object, result: 1 } => {
-                    let header = match object {
-                        0 => 13,
-                        1 => 15,
-                        _ => {
-                            return Err(Unsupported::OperandShape(
-                                "store CacheIR prototype object",
-                            ));
-                        }
-                    };
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        14,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    super::values::emit_load_prototype(ops, view, 12, header, 14);
-                    dynasm!(ops ; .arch aarch64 ; cbz w12, =>next ; add x15, x14, x12 ; ldrb w14, [x15] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>next);
-                    if add_transition {
-                        emit_chain_link_state_guard(ops, view, 15, next);
-                    } else {
-                        emit_ordinary_lookup_state_guard(ops, view, 15, next);
                     }
                 }
                 otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
@@ -694,7 +653,6 @@ where
                     // append.
                 }
                 otter_vm::JitCacheIrOp::GuardAtomSlot { .. }
-                | otter_vm::JitCacheIrOp::LoadPrototype { .. }
                 | otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. }
                 | otter_vm::JitCacheIrOp::GuardExtensible { .. } => {
                     return Err(Unsupported::OperandShape("store CacheIR guard operands"));
@@ -1825,12 +1783,29 @@ fn emit_guarded_method_guard_impl(
             // young prototype moves.
             match call.holder {
                 JitMethodHolder::Receiver => {}
-                JitMethodHolder::Shape(holder_shape) => {
-                    emit_load_u64(ops, 7, u64::from(holder_shape));
-                    emit_resolve_holder(ops, relocations, view, miss);
+                JitMethodHolder::Prototype { root, validity } => {
+                    super::values::emit_prototype_validity_guard(
+                        ops,
+                        relocations,
+                        validity,
+                        14,
+                        miss,
+                    );
+                    emit_load_symbol_u64(
+                        ops,
+                        relocations,
+                        14,
+                        view.cage_base as u64,
+                        RelocationTarget::GcCageBase,
+                    );
+                    emit_load_u64(ops, 13, u64::from(root));
+                    dynasm!(ops ; .arch aarch64 ; add x13, x14, x13
+                        ; ldr w13, [x13, view.shape_prototype_byte] ; add x13, x14, x13);
                 }
-                JitMethodHolder::Dictionary(_) => {
-                    return Err(Unsupported::OperandShape("dictionary method prototype hop"));
+                JitMethodHolder::Shape(_) | JitMethodHolder::Dictionary(_) => {
+                    return Err(Unsupported::OperandShape(
+                        "ordinary method requires chain validity",
+                    ));
                 }
             }
             super::values::emit_slab_base(ops, relocations, view, 13, 14);
@@ -2048,7 +2023,7 @@ pub(crate) fn emit_prototype_guard(
         JitMethodHolder::Dictionary(layout) => {
             emit_dictionary_layout_guard(ops, relocations, view, 15, layout, miss);
         }
-        JitMethodHolder::Receiver => {
+        JitMethodHolder::Receiver | JitMethodHolder::Prototype { .. } => {
             return Err(Unsupported::OperandShape(
                 "exotic method without a prototype",
             ));

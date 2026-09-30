@@ -469,20 +469,20 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        let shapes_start = self.jit_compile_shapes.borrow().len();
-        let code = self.compile_optimized_jit_function_session(context, fid, osr_pc, shapes_start);
-        self.jit_compile_shapes.borrow_mut().truncate(shapes_start);
+        let roots_start = self.jit_compile_roots.borrow().len();
+        let code = self.compile_optimized_jit_function_session(context, fid, osr_pc, roots_start);
+        self.jit_compile_roots.borrow_mut().truncate(roots_start);
         code
     }
 
     /// [`Self::compile_optimized_jit_function`] inside one compile-shape
-    /// session starting at `shapes_start`.
+    /// session starting at `roots_start`.
     fn compile_optimized_jit_function_session(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         osr_pc: Option<u32>,
-        shapes_start: usize,
+        roots_start: usize,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let hook = self.jit_hook.as_ref()?.clone();
         if !hook.optimizing_tier_enabled() {
@@ -585,7 +585,7 @@ impl Interpreter {
                     &function,
                 );
                 if installed {
-                    self.retain_compiled_shapes(code_object_id, shapes_start);
+                    self.retain_compiled_roots(code_object_id, roots_start);
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                 }
@@ -711,27 +711,27 @@ impl Interpreter {
         osr_pc: Option<u32>,
         eager_direct_target_depth: u8,
     ) -> TemplateCompileOutcome {
-        let shapes_start = self.jit_compile_shapes.borrow().len();
+        let roots_start = self.jit_compile_roots.borrow().len();
         let outcome = self.compile_jit_function_session(
             context,
             fid,
             osr_pc,
             eager_direct_target_depth,
-            shapes_start,
+            roots_start,
         );
-        self.jit_compile_shapes.borrow_mut().truncate(shapes_start);
+        self.jit_compile_roots.borrow_mut().truncate(roots_start);
         outcome
     }
 
     /// [`Self::compile_jit_function_with_direct_targets_unchecked`] inside one
-    /// compile-shape session starting at `shapes_start`.
+    /// compile-shape session starting at `roots_start`.
     fn compile_jit_function_session(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         osr_pc: Option<u32>,
         eager_direct_target_depth: u8,
-        shapes_start: usize,
+        roots_start: usize,
     ) -> TemplateCompileOutcome {
         let Some(hook) = self.jit_hook.as_ref().cloned() else {
             return TemplateCompileOutcome::Deferred;
@@ -839,7 +839,7 @@ impl Interpreter {
                     &function,
                 );
                 if installed {
-                    self.retain_compiled_shapes(code_object_id, shapes_start);
+                    self.retain_compiled_roots(code_object_id, roots_start);
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                     self.optimizing_tier_policy.observe_template_generation(
@@ -862,10 +862,29 @@ impl Interpreter {
     /// Name `shape` in the code being compiled and return the compressed
     /// handle generated code compares or publishes. Hidden classes are
     /// collectable, so the compilation keeps the shape alive and the
-    /// installed code object takes it over ([`Self::retain_compiled_shapes`]).
+    /// installed code object takes it over ([`Self::retain_compiled_roots`]).
     pub(crate) fn bake_shape(&self, shape: crate::object::ShapeHandle) -> u32 {
-        self.jit_compile_shapes.borrow_mut().push(shape);
+        self.jit_compile_roots
+            .borrow_mut()
+            .push(crate::jit_roots::CompilationRoot::Shape(shape));
         shape.offset()
+    }
+
+    /// Retain a valid chain proof for the generation being compiled.
+    pub(crate) fn bake_prototype_validity(
+        &self,
+        cell: &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
+    ) -> Option<jit::JitPrototypeValidity> {
+        if !cell.is_valid() {
+            return None;
+        }
+        self.jit_compile_roots
+            .borrow_mut()
+            .push(crate::jit_roots::CompilationRoot::Prototype(cell.clone()));
+        Some(jit::JitPrototypeValidity {
+            address: cell.address(),
+            identity: cell.identity(),
+        })
     }
 
     /// [`Self::bake_shape`] for a shape feedback names by id; `None` when
@@ -890,14 +909,13 @@ impl Interpreter {
             .map(|layout| jit::JitMethodHolder::Dictionary(u64::from(layout)))
     }
 
-    /// Hand the shapes baked since `shapes_start` to the installed code
-    /// object `code_object_id`, which keeps them alive until it retires.
-    fn retain_compiled_shapes(&mut self, code_object_id: u64, shapes_start: usize) {
-        let mut shapes = self.jit_compile_shapes.borrow()[shapes_start..].to_vec();
-        shapes.sort_unstable_by_key(|shape| shape.offset());
-        shapes.dedup();
+    /// Retain all assumptions baked since this compile session began.
+    fn retain_compiled_roots(&mut self, code_object_id: u64, roots_start: usize) {
+        let mut roots = self.jit_compile_roots.borrow()[roots_start..].to_vec();
+        roots.sort_unstable_by_key(crate::jit_roots::CompilationRoot::key);
+        roots.dedup_by_key(|root| root.key());
         self.jit_code_registry
-            .retain_shapes(code_object_id, shapes.into_boxed_slice());
+            .retain_roots(code_object_id, roots.into_boxed_slice());
     }
 
     /// Plan inline context allocation for every scope of this function and
@@ -1044,7 +1062,10 @@ impl Interpreter {
                 continue;
             }
             let mut programs = slot
-                .jit_programs(|shape_id| self.bake_shape_id(shape_id).filter(|&offset| offset != 0))
+                .jit_programs(
+                    |shape_id| self.bake_shape_id(shape_id).filter(|&offset| offset != 0),
+                    |cell| self.bake_prototype_validity(cell),
+                )
                 .unwrap_or_default();
             if op == Op::LoadProperty
                 && let Some(key) = name_index.and_then(|name_index| {
@@ -1073,17 +1094,14 @@ impl Interpreter {
                 .filter_map(|(&byte_pc, transition)| {
                     let from_shape = self.bake_shape_id(transition.from_shape)?;
                     let to_shape = self.bake_shape_id(transition.to_shape)?;
-                    let prototype_shapes = transition
-                        .prototype_shapes
-                        .iter()
-                        .map(|&shape| self.bake_shape_id(shape))
-                        .collect::<Option<Vec<_>>>()?;
+                    let prototype_validity =
+                        self.bake_prototype_validity(&transition.prototype_validity)?;
                     Some((
                         byte_pc,
                         jit::JitConstructorFieldTransition {
                             from_shape,
                             to_shape,
-                            prototype_shapes,
+                            prototype_validity,
                             slot: transition.slot,
                         },
                     ))
@@ -1468,7 +1486,7 @@ impl Interpreter {
                 stub_id,
                 method_value_byte,
                 recv_shape,
-                proto_chain,
+                prototype,
             }) = self.method_target_feedback(site)
             else {
                 continue;
@@ -1478,12 +1496,17 @@ impl Interpreter {
             let Some(recv_shape_handle) = self.shape_runtime.handle_for_id(recv_shape) else {
                 continue;
             };
-            let holder = match proto_chain.as_slice().last() {
+            let holder = match &prototype.validity {
                 None => jit::JitMethodHolder::Receiver,
-                Some(&holder_id) => match self.bake_shape_id(holder_id) {
-                    Some(holder) => jit::JitMethodHolder::Shape(holder),
-                    None => continue,
-                },
+                Some(cell) => {
+                    let Some(validity) = self.bake_prototype_validity(cell) else {
+                        continue;
+                    };
+                    let Some(root) = self.bake_shape_id(prototype.holder_root) else {
+                        continue;
+                    };
+                    jit::JitMethodHolder::Prototype { validity, root }
+                }
             };
             let Some(declaration) = crate::jit_static_native::jit_leaf_builtin(stub_id)
                 .filter(|declaration| !declaration.this_operand)
@@ -1535,33 +1558,22 @@ impl Interpreter {
             return None;
         }
         let recv_shape = crate::object::shape_id(recv, &self.gc_heap);
-        let slot_byte = |slot: u32| slot * std::mem::size_of::<crate::Value>() as u32;
-        if let Some(slot) = self.shape_offset_of(recv_shape_handle, name.name()) {
-            return Some(MethodSite {
-                recv_shape,
-                proto_chain: crate::MethodProtoChain::own(),
-                method_value_byte: slot_byte(slot),
-            });
+        let resolved = crate::cache_ir::resolve_atom_data_slot(recv, &self.gc_heap, name)?;
+        self.shape_runtime
+            .register_root(&self.gc_heap, recv_shape_handle);
+        if !resolved.holder_root.is_null() {
+            self.shape_runtime
+                .register_root(&self.gc_heap, resolved.holder_root);
         }
-        // Walk the prototype chain, recording each hopped object's shape; the
-        // baked guard checks exactly this chain (shape-prototype chase + shape
-        // compare per hop) before trusting the holder's slot offset.
-        let mut proto_chain = crate::MethodProtoChain::own();
-        let mut cur = recv;
-        loop {
-            cur = crate::object::prototype(cur, &self.gc_heap)?;
-            let shape = crate::object::keyed_shape(cur, &self.gc_heap);
-            if shape.is_null() || !proto_chain.push(crate::object::shape_id(cur, &self.gc_heap)) {
-                return None;
-            }
-            if let Some(slot) = self.shape_offset_of(shape, name.name()) {
-                return Some(MethodSite {
-                    recv_shape,
-                    proto_chain,
-                    method_value_byte: slot_byte(slot),
-                });
-            }
-        }
+        Some(MethodSite {
+            recv_shape,
+            prototype: crate::MethodLookupProof {
+                validity: resolved.validity,
+                holder_root: resolved.holder_root_id,
+            },
+            method_value_byte: u32::from(resolved.hit.slot)
+                * std::mem::size_of::<crate::Value>() as u32,
+        })
     }
 
     /// Drop any compiled body for `fid` (and re-arm its OSR headers) so the next
@@ -2409,7 +2421,7 @@ impl Interpreter {
                         MethodCallFeedback::Mono {
                             method_fid,
                             recv_shape,
-                            proto_chain,
+                            prototype,
                             method_value_byte,
                         } => {
                             let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
@@ -2417,7 +2429,7 @@ impl Interpreter {
                             targets.push(PolyMethodTarget {
                                 method_fid,
                                 recv_shape,
-                                proto_chain,
+                                prototype,
                                 method_value_byte,
                                 hits: 1,
                             });
@@ -2550,16 +2562,18 @@ impl Interpreter {
     /// knowledge on the VM side.
     fn bake_method_guard(&self, target: &PolyMethodTarget) -> Option<jit::JitMethodGuard> {
         let recv_shape = self.bake_shape_id(target.recv_shape)?;
-        let proto_chain = target
-            .proto_chain
-            .as_slice()
-            .iter()
-            .map(|shape_id| self.bake_shape_id(*shape_id))
-            .collect::<Option<Vec<_>>>()?;
+        let (prototype_validity, holder_root) = match &target.prototype.validity {
+            Some(cell) => (
+                Some(self.bake_prototype_validity(cell)?),
+                self.bake_shape_id(target.prototype.holder_root)?,
+            ),
+            None => (None, 0),
+        };
         Some(jit::JitMethodGuard {
             method_fid: target.method_fid,
             recv_shape,
-            proto_chain,
+            prototype_validity,
+            holder_root,
             method_value_byte: target.method_value_byte,
         })
     }
@@ -2634,34 +2648,43 @@ impl Interpreter {
             .get(&key)
             .copied()
             .unwrap_or(0);
-        if capacity == 0 {
+        if capacity > crate::object::MAX_INLINE_CAPACITY {
+            return None;
+        }
+        let simple_init = self
+            .simple_constructor_init_cache
+            .get(&base_function_id)
+            .and_then(Option::as_ref);
+        let mut proofs = self
+            .constructor_prototype_validity_cache
+            .iter()
+            .filter(|((base, target, _), cell)| (*base, *target) == key && cell.is_valid());
+        let single_proof = proofs.next().filter(|_| proofs.next().is_none());
+        // An empty receiver adopts the live prototype's root and needs no
+        // absence proof. Only publishing preinitialized fields depends on an
+        // exact chain; each later store owns its own semantic guard.
+        if capacity == 0 || simple_init.is_none() || single_proof.is_none() {
             return Some(jit::JitReceiverAllocationPlan {
                 new_target_function_id,
                 class_allocation,
                 receiver_shape: 0,
                 initial_field_count: 0,
-                inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(learned))
-                    .ok()?,
-                prototype_shape_count: 0,
-                prototype_shapes: [0; jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP],
+                inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(
+                    capacity.max(learned),
+                ))
+                .ok()?,
+                prototype_validity: None,
+                prototype_root: 0,
             });
         };
-        if capacity > crate::object::MAX_INLINE_CAPACITY {
-            return None;
-        }
-        let prototype_ids = self.constructor_prototype_shape_cache.get(&key)?;
-        if prototype_ids.is_empty() || prototype_ids.len() > jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP {
-            return None;
-        }
-        let mut prototype_shapes = [0; jit::JIT_RECEIVER_PROTOTYPE_GUARD_CAP];
-        for (destination, shape_id) in prototype_shapes.iter_mut().zip(prototype_ids) {
-            *destination = self.bake_shape_id(*shape_id)?;
-        }
+        let ((_, _, prototype_root_id), cell) = single_proof?;
+        let prototype_root = self.bake_shape_id(*prototype_root_id)?;
+        let prototype_validity = self.bake_prototype_validity(cell)?;
         let (receiver_shape, initial_field_count) = match (
-            self.simple_constructor_init_cache
-                .get(&base_function_id)
-                .and_then(Option::as_ref),
-            self.simple_constructor_shape_for(base_function_id, prototype_ids[0]),
+            simple_init,
+            self.simple_constructor_shape_cache
+                .get(&(base_function_id, *prototype_root_id))
+                .copied(),
         ) {
             (Some(init), Some(shape)) if init.fields.len() <= capacity => {
                 // Generated allocation derives the slot count from this
@@ -2687,30 +2710,9 @@ impl Interpreter {
                 capacity.max(learned),
             ))
             .ok()?,
-            prototype_shape_count: u8::try_from(prototype_ids.len()).ok()?,
-            prototype_shapes,
+            prototype_validity: Some(prototype_validity),
+            prototype_root,
         })
-    }
-
-    /// The simple-constructor shape of `function_id`'s receivers whose
-    /// prototype currently has the hidden class `prototype_shape`.
-    fn simple_constructor_shape_for(
-        &self,
-        function_id: u32,
-        prototype_shape: crate::object::ShapeId,
-    ) -> Option<crate::object::ShapeHandle> {
-        self.simple_constructor_shape_cache
-            .iter()
-            .filter(|((id, _), _)| *id == function_id)
-            .map(|(_, shape)| *shape)
-            .find(
-                |&shape| match crate::object::shape_body::prototype_of(shape) {
-                    crate::object::shape_body::ShapePrototype::Object(prototype) => {
-                        crate::object::shape_id(prototype, &self.gc_heap) == prototype_shape
-                    }
-                    _ => false,
-                },
-            )
     }
 
     /// Bake one inline-method candidate body for a `(method, receiver shape)`

@@ -48,7 +48,7 @@ pub(super) fn select(
                 shape: transition.from_shape,
                 value_byte: u32::from(transition.slot) * 8,
                 transition: Some(super::super::PropertyStoreTransition {
-                    prototype_shapes: transition.prototype_shapes.clone().into_boxed_slice(),
+                    prototype_validity: Some(transition.prototype_validity),
                     child_shape: transition.to_shape,
                 }),
             }]),

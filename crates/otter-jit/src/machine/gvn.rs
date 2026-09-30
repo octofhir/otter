@@ -588,11 +588,20 @@ fn canonical_opcode(opcode: &MachineOpcode) -> MachineOpcode {
             value_byte: *value_byte,
             writable: *writable,
         },
-        MachineOpcode::CacheIrLoadPrototype { .. } => {
-            MachineOpcode::CacheIrLoadPrototype { byte_pc: 0 }
+        MachineOpcode::CacheIrLoadPrototypeHolder { root, .. } => {
+            MachineOpcode::CacheIrLoadPrototypeHolder {
+                byte_pc: 0,
+                root: *root,
+            }
         }
         MachineOpcode::CacheIrGuardPrototypeNull { .. } => {
             MachineOpcode::CacheIrGuardPrototypeNull { byte_pc: 0 }
+        }
+        MachineOpcode::CacheIrGuardPrototypeValidity { validity, .. } => {
+            MachineOpcode::CacheIrGuardPrototypeValidity {
+                byte_pc: 0,
+                validity: *validity,
+            }
         }
         MachineOpcode::CacheIrGuardArrayIndexProtector { .. } => {
             MachineOpcode::CacheIrGuardArrayIndexProtector { byte_pc: 0 }

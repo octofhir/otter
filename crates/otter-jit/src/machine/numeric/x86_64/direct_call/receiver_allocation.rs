@@ -185,31 +185,20 @@ fn emit_receiver_candidate(
         ; =>prototype_ready
     );
 
-    for (index, &shape) in plan
-        .prototype_shapes
-        .iter()
-        .take(usize::from(plan.prototype_shape_count))
-        .enumerate()
-    {
-        dynasm!(ops
-            ; .arch x64
-            ; cmp BYTE [r9], OBJECT_BODY_TYPE_TAG as i8
-            ; jne =>guard_miss
-            ; cmp DWORD [r9 + view.object_shape_byte as i32], shape as i32
-            ; jne =>guard_miss
+    if let Some(validity) = plan.prototype_validity {
+        symbolic(
+            ops,
+            relocations,
+            11,
+            validity.address as u64,
+            RelocationTarget::PrototypeValidityCell {
+                identity: validity.identity,
+            },
         );
-        crate::template::x86_64::emit_x64_load_prototype(ops, view, 10, 9, 8);
-        if index + 1 != usize::from(plan.prototype_shape_count) {
-            dynasm!(ops
-                ; .arch x64
-                ; test r10d, r10d
-                ; jz =>guard_miss
-                ; lea r9, [r8 + r10]
-            );
-        }
-    }
-    if plan.prototype_shape_count != 0 {
-        dynasm!(ops ; .arch x64 ; test r10d, r10d ; jnz =>guard_miss);
+        dynasm!(ops ; .arch x64 ; cmp DWORD [r11], 0 ; je =>guard_miss);
+        load64(ops, 11, u64::from(plan.prototype_root));
+        dynasm!(ops ; .arch x64 ; cmp esi, [r8 + r11 + view.shape_prototype_byte as i32]
+            ; jne =>guard_miss);
     }
     // The receiver's shape, into `esi` (the live prototype is no longer
     // needed once its lineage is proven).

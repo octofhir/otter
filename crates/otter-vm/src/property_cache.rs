@@ -1,45 +1,33 @@
 //! Isolate-wide `(receiver shape, property atom)` property cache.
 //!
-//! One direct-mapped table shares resolved own/direct-prototype data slots
-//! across property sites. Runtime loads consult it when a per-site program
-//! misses; generated megamorphic accesses probe the same entries before
-//! entering their committed cold sibling. Every hit validates live state and
-//! reads or writes the current slot rather than caching a JavaScript value.
+//! One direct-mapped table shares resolved own and inherited data slots across
+//! sites. Runtime misses and generated megamorphic accesses use the same
+//! entries, reading each slot's live value.
 //!
 //! # Contents
-//! - [`PropertyLookupCache`] — the direct-mapped table.
-//! - [`StoreTransitionCache`] — the add-a-property counterpart: shared
-//!   `(receiver shape, prototype shape, atom)` hidden-class transitions for
-//!   megamorphic stores.
-//! - [`jit`] — owned scalar table layouts for generated probes.
+//! - [`PropertyLookupCache`] stores `(receiver shape, atom)` resolutions.
+//! - [`StoreTransitionCache`] stores add-property transitions with the same key.
+//! - [`jit`] exposes the owned scalar layouts to generated probes.
 //!
 //! # Invariants
-//! - A shape's own-key set never changes, so an entry keyed by receiver shape
-//!   never needs invalidating: it either still matches the receiver's shape or
-//!   it does not.
-//! - A one-hop entry re-reads the live prototype and revalidates the holder's
-//!   shape on every hit, exactly like [`crate::cache_ir::CacheStub`]'s
-//!   direct-prototype program. Receiver-shape identity proves the receiver has
-//!   no own slot shadowing it.
-//! - Positive resolutions require fast-IC-compatible receivers. Entries are
-//!   keyed only by nonnull receiver shapes, never dictionary-mode identities.
-//! - A positive entry's atom and data-slot metadata come from one resolution
-//!   of that exact key. The receiver shape proves own-key presence/absence;
-//!   generated hits also require a nonnull cached holder shape fixing the
-//!   slot's key and descriptor kind, with no live descriptor overrides.
-//! - The table is derived data: dropping any entry is always sound.
-//! - A shared transition carries the complete replay guard of a per-site
-//!   add-transition stub (receiver shape, extensibility, and every recorded
-//!   prototype shape), so a hit commits exactly the store `[[Set]]` would.
-//! - Boxed tables never resize or move during their interpreter's lifetime.
-//!   The compact JIT transition entry and its rooted replay record use the
-//!   same index and are replaced together by the owning VM thread.
+//! - Receiver shape identity fixes own keys and the first prototype.
+//! - Inherited entries retain one validity cell covering the complete chain.
+//!   A holder is loaded through its root shape's traced prototype word.
+//! - Canonical prototype mutation invalidates cells before effects; generated
+//!   stores to watched prototypes enter that mutation boundary.
+//! - Table shape references are weak and cleared before shape collection.
+//! - Transition entries and their owning replay records share one index and
+//!   are replaced together on the mutator. Tables never resize or move.
+//! - Every access checks the complete key and ordinary receiver state before
+//!   trusting a slot. A miss enters the canonical property operation.
 //!
 //! # See also
 //! - [`crate::cache_ir`]
 //! - [`crate::property_ic`]
 
-use std::cell::Cell;
+use crate::object::prototype_validity::PrototypeValidity;
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use crate::cache_ir;
 use crate::object::{self, AtomOwnPropertyHit, JsObject, ShapeId};
@@ -57,28 +45,34 @@ const HASH_SHIFT: u8 = 32;
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct Entry {
+    validity: usize,
+    holder_root: object::ShapeHandle,
+    holder_root_id: ShapeId,
     /// Receiver hidden class this answer was resolved under.
     /// [`ShapeId::UNASSIGNED`] marks an empty way.
     receiver_shape: ShapeId,
     /// Property name this answer is for.
     atom: AtomId,
-    /// `0` when the receiver owns the slot, `1` when its direct prototype
+    /// `0` when the receiver owns the slot, `1` when an inherited holder
     /// does, [`Entry::UNRESOLVABLE`] when no data slot describes this pair.
     hops: u8,
     /// Whether the resolved data descriptor was writable.
     is_writable: bool,
-    /// The holder's own-slot hit, revalidated on every read.
+    /// Own-slot metadata, protected by receiver shape or the inherited proof.
     hit: AtomOwnPropertyHit,
 }
 
 impl Entry {
-    /// Recorded when the walk found no cacheable data slot — an accessor, a
-    /// deeper holder, or nothing at all. Purely a hint: acting on it only ever
+    /// Recorded when the walk found no cacheable data slot — an accessor or
+    /// nothing at all. Purely a hint: acting on it only ever
     /// means "take the full ladder", which is always correct, so a prototype
     /// that later grows the property costs a slow read, never a wrong one.
     const UNRESOLVABLE: u8 = u8::MAX;
 
     const EMPTY: Self = Self {
+        validity: 0,
+        holder_root: object::ShapeHandle::null(),
+        holder_root_id: ShapeId::UNASSIGNED,
         receiver_shape: ShapeId::UNASSIGNED,
         atom: AtomId::NONE,
         hops: 0,
@@ -102,12 +96,14 @@ pub(crate) enum PropertyProbe {
 #[derive(Debug)]
 pub(crate) struct PropertyLookupCache {
     ways: Box<[Cell<Entry>]>,
+    proofs: Box<[RefCell<Option<Arc<PrototypeValidity>>>]>,
 }
 
 impl Default for PropertyLookupCache {
     fn default() -> Self {
         Self {
             ways: (0..CAPACITY).map(|_| Cell::new(Entry::EMPTY)).collect(),
+            proofs: (0..CAPACITY).map(|_| RefCell::new(None)).collect(),
         }
     }
 }
@@ -154,30 +150,42 @@ impl PropertyLookupCache {
         let Some(entry) = self.entry_for(obj, heap, key) else {
             return PropertyProbe::Unknown;
         };
-        let holder = match entry.hops {
-            0 => obj,
-            // A negative answer depends on the prototype as well as the
-            // receiver's class, and only the receiver's class is in the key.
-            // Pinning the prototype's own class makes the answer expire the
-            // moment that prototype grows the property.
-            Entry::UNRESOLVABLE => {
-                return if entry.hit.shape_id == proto_shape_id(obj, heap) {
-                    PropertyProbe::Unresolvable
-                } else {
-                    PropertyProbe::Unknown
-                };
+        if !object::supports_fast_property_ic(obj, heap) {
+            return PropertyProbe::Unknown;
+        }
+        let validity = self.proofs[Self::index(entry.receiver_shape, entry.atom)]
+            .borrow()
+            .clone();
+        if entry.hops == Entry::UNRESOLVABLE {
+            return if validity.as_ref().is_none_or(|cell| cell.is_valid()) {
+                PropertyProbe::Unresolvable
+            } else {
+                PropertyProbe::Unknown
+            };
+        }
+        let value = if entry.hops == 0 {
+            object::load_own_data_slot_atom(obj, heap, key, entry.hit)
+        } else if validity.as_ref().is_some_and(|cell| cell.is_valid())
+            && !heap.read_payload(obj, |body| body.chain_link_opaque())
+        {
+            match object::shape_body::prototype_of(entry.holder_root) {
+                object::shape_body::ShapePrototype::Object(holder) => {
+                    Some(object::load_proven_data_slot(holder, heap, entry.hit.slot))
+                }
+                _ => None,
             }
-            _ => match object::prototype(obj, heap) {
-                Some(proto) if object::supports_fast_property_ic(proto, heap) => proto,
-                _ => return PropertyProbe::Unknown,
-            },
+        } else {
+            None
         };
-        match object::load_own_data_slot_atom(holder, heap, key, entry.hit) {
+        match value {
             Some(value) => PropertyProbe::Resolved(cache_ir::ResolvedDataSlot {
                 hops: entry.hops,
                 hit: entry.hit,
                 value,
                 is_writable: entry.is_writable,
+                validity,
+                holder_root: entry.holder_root,
+                holder_root_id: entry.holder_root_id,
             }),
             None => PropertyProbe::Unknown,
         }
@@ -188,10 +196,13 @@ impl PropertyLookupCache {
     /// reused, but generated megamorphic probes compare the holder's shape
     /// handle, which a later shape could reuse.
     pub(crate) fn forget_shapes(&self, dead: &rustc_hash::FxHashSet<u32>) {
-        for way in &*self.ways {
+        for (index, way) in self.ways.iter().enumerate() {
             let entry = way.get();
-            if !entry.hit.shape.is_null() && dead.contains(&entry.hit.shape.offset()) {
+            if dead.contains(&entry.hit.shape.offset())
+                || dead.contains(&entry.holder_root.offset())
+            {
                 way.set(Entry::EMPTY);
+                *self.proofs[index].borrow_mut() = None;
             }
         }
     }
@@ -212,19 +223,32 @@ impl PropertyLookupCache {
         }
         let receiver_shape = object::shape_id(obj, heap);
         let atom = key.atom().id();
-        self.ways[Self::index(receiver_shape, atom)].set(Entry {
+        let index = Self::index(receiver_shape, atom);
+        let validity = if let Some(resolved) = resolved {
+            resolved.validity.clone()
+        } else if let Some(first) = object::prototype(obj, heap) {
+            let Some(cell) = object::prototype_validity::chain_validity(first, heap) else {
+                return;
+            };
+            Some(cell)
+        } else if object::prototype_value(obj, heap).is_none() {
+            None
+        } else {
+            return;
+        };
+        self.ways[index].set(Entry {
+            validity: validity.as_ref().map_or(0, |cell| cell.address()),
+            holder_root: resolved
+                .map_or(object::ShapeHandle::null(), |resolved| resolved.holder_root),
+            holder_root_id: resolved
+                .map_or(ShapeId::UNASSIGNED, |resolved| resolved.holder_root_id),
             receiver_shape,
             atom,
             hops: resolved.map_or(Entry::UNRESOLVABLE, |resolved| resolved.hops),
             is_writable: resolved.is_some_and(|resolved| resolved.is_writable),
-            hit: resolved.map_or(
-                AtomOwnPropertyHit {
-                    shape_id: proto_shape_id(obj, heap),
-                    ..AtomOwnPropertyHit::PLACEHOLDER
-                },
-                |resolved| resolved.hit,
-            ),
+            hit: resolved.map_or(AtomOwnPropertyHit::PLACEHOLDER, |resolved| resolved.hit),
         });
+        *self.proofs[index].borrow_mut() = validity;
     }
 }
 
@@ -234,7 +258,7 @@ const TRANSITION_SETS: usize = 512;
 /// Ways per transition set, most recently recorded first.
 const TRANSITION_WAYS: usize = 4;
 
-/// Set-associative `(receiver shape, prototype shape, atom)` → add-property
+/// Set-associative `(receiver shape, atom)` → add-property
 /// transition table.
 ///
 /// A store site that has gone megamorphic stops installing its own
@@ -245,11 +269,11 @@ const TRANSITION_WAYS: usize = 4;
 /// receiver lineage and one base-constructor store site sees as many keys as
 /// there are subclasses; the ways absorb the index collisions a direct-mapped
 /// table would thrash on (V8 backs its primary stub cache with a secondary
-/// table for the same reason). The direct prototype's class stays in the key:
-/// it is what the recorded missing-key chain was proven against.
+/// table for the same reason). Each handler retains the shared validity cell
+/// proving inherited absence or writable data.
 #[derive(Debug)]
 pub(crate) struct StoreTransitionCache {
-    ways: Box<[Option<(ShapeId, object::StorePropertyTransition)>]>,
+    ways: Box<[Option<object::StorePropertyTransition>]>,
     jit_ways: Box<[Cell<StoreTransitionJitEntry>]>,
 }
 
@@ -259,52 +283,36 @@ pub(crate) struct StoreTransitionCache {
 #[repr(C)]
 struct StoreTransitionJitEntry {
     receiver_shape: u64,
-    prototype_shape: u64,
+    validity: usize,
     atom: u32,
     target_shape: u32,
     slot: u16,
-    chain_len: u8,
-    _padding: u8,
-    chain: [u64; 8],
 }
 
 impl StoreTransitionJitEntry {
     const EMPTY: Self = Self {
         receiver_shape: 0,
-        prototype_shape: 0,
+        validity: 0,
         atom: 0,
         target_shape: 0,
         slot: 0,
-        chain_len: 0,
-        _padding: 0,
-        chain: [0; 8],
     };
 
-    fn from_transition(
-        prototype_shape: ShapeId,
-        transition: &object::StorePropertyTransition,
-    ) -> Self {
-        let mut entry = Self {
+    fn from_transition(transition: &object::StorePropertyTransition) -> Self {
+        let validity = match &transition.kind {
+            object::StorePropertyTransitionKind::OwnAdd => 0,
+            object::StorePropertyTransitionKind::PrototypeChainMissing { validity }
+            | object::StorePropertyTransitionKind::DirectPrototypeWritableData { validity } => {
+                validity.address()
+            }
+        };
+        Self {
             receiver_shape: transition.from_shape_id.raw(),
-            prototype_shape: prototype_shape.raw(),
+            validity,
             atom: transition.atom_id.raw(),
             target_shape: transition.to_shape.get().offset(),
             slot: transition.slot,
-            ..Self::EMPTY
-        };
-        match &transition.kind {
-            object::StorePropertyTransitionKind::OwnAdd => {}
-            object::StorePropertyTransitionKind::PrototypeChainMissing { chain } => {
-                entry.chain_len = chain.len() as u8;
-                for (dst, shape) in entry.chain.iter_mut().zip(chain) {
-                    *dst = shape.raw();
-                }
-            }
-            object::StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => {
-                entry.target_shape = 0;
-            }
         }
-        entry
     }
 }
 
@@ -322,12 +330,8 @@ impl Default for StoreTransitionCache {
 
 impl StoreTransitionCache {
     /// First entry of the set a key hashes to.
-    fn set_start(receiver_shape: ShapeId, prototype_shape: ShapeId, atom: AtomId) -> usize {
+    fn set_start(receiver_shape: ShapeId, atom: AtomId) -> usize {
         let mixed = receiver_shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
-            ^ prototype_shape
-                .raw()
-                .wrapping_mul(HASH_ATOM_MULTIPLIER)
-                .rotate_left(17)
             ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
         (((mixed >> HASH_SHIFT) as usize) & (TRANSITION_SETS - 1)) * TRANSITION_WAYS
     }
@@ -336,19 +340,15 @@ impl StoreTransitionCache {
     fn find(
         &self,
         receiver_shape: ShapeId,
-        prototype_shape: ShapeId,
         atom: AtomId,
     ) -> Option<&object::StorePropertyTransition> {
-        let start = Self::set_start(receiver_shape, prototype_shape, atom);
+        let start = Self::set_start(receiver_shape, atom);
         self.ways[start..start + TRANSITION_WAYS]
             .iter()
             .flatten()
-            .find(|(recorded_prototype, transition)| {
-                transition.from_shape_id == receiver_shape
-                    && transition.atom_id == atom
-                    && *recorded_prototype == prototype_shape
+            .find(|transition| {
+                transition.from_shape_id == receiver_shape && transition.atom_id == atom
             })
-            .map(|(_, transition)| transition)
     }
 
     /// Replay the recorded transition for this receiver class, prototype
@@ -367,9 +367,8 @@ impl StoreTransitionCache {
             return Ok(None);
         }
         let receiver_shape = object::shape_id(obj, heap);
-        let prototype_shape = proto_shape_id(obj, heap);
         let atom = key.atom().id();
-        match self.find(receiver_shape, prototype_shape, atom) {
+        match self.find(receiver_shape, atom) {
             Some(transition) => {
                 object::replay_store_property_transition(obj, heap, key, transition, value)
             }
@@ -380,24 +379,13 @@ impl StoreTransitionCache {
     /// Record one transition captured on `obj` before the store as its set's
     /// most recent way: an entry for the same key is replaced, and a full set
     /// drops its least recently recorded way.
-    pub(crate) fn record(
-        &mut self,
-        prototype_shape: ShapeId,
-        transition: object::StorePropertyTransition,
-    ) {
-        let start = Self::set_start(
-            transition.from_shape_id,
-            prototype_shape,
-            transition.atom_id,
-        );
-        let same_key = |entry: &Option<(ShapeId, object::StorePropertyTransition)>| {
-            entry
-                .as_ref()
-                .is_some_and(|(recorded_prototype, recorded)| {
-                    recorded.from_shape_id == transition.from_shape_id
-                        && recorded.atom_id == transition.atom_id
-                        && *recorded_prototype == prototype_shape
-                })
+    pub(crate) fn record(&mut self, transition: object::StorePropertyTransition) {
+        let start = Self::set_start(transition.from_shape_id, transition.atom_id);
+        let same_key = |entry: &Option<object::StorePropertyTransition>| {
+            entry.as_ref().is_some_and(|recorded| {
+                recorded.from_shape_id == transition.from_shape_id
+                    && recorded.atom_id == transition.atom_id
+            })
         };
         // The way to vacate: the key's own entry, else the first empty one,
         // else the least recently recorded.
@@ -411,29 +399,17 @@ impl StoreTransitionCache {
             self.ways[way] = self.ways[way - 1].take();
             self.jit_ways[way].set(self.jit_ways[way - 1].get());
         }
-        let jit = StoreTransitionJitEntry::from_transition(prototype_shape, &transition);
-        self.ways[start] = Some((prototype_shape, transition));
+        let jit = StoreTransitionJitEntry::from_transition(&transition);
+        self.ways[start] = Some(transition);
         self.jit_ways[start].set(jit);
     }
 
     /// Visit the target shapes the recorded transitions keep alive.
     pub(crate) fn trace_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        for (_, transition) in self.ways.iter().flatten() {
+        for transition in self.ways.iter().flatten() {
             transition.trace_roots(visitor);
         }
     }
-}
-
-/// The class of `obj`'s prototype, or [`ShapeId::UNASSIGNED`] when it has none.
-#[must_use]
-pub(crate) fn prototype_shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
-    proto_shape_id(obj, heap)
-}
-
-/// The class of `obj`'s prototype, or [`ShapeId::UNASSIGNED`] when it has none.
-#[must_use]
-fn proto_shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
-    object::prototype(obj, heap).map_or(ShapeId::UNASSIGNED, |proto| object::shape_id(proto, heap))
 }
 
 impl crate::Interpreter {
@@ -461,6 +437,14 @@ impl crate::Interpreter {
             PropertyProbe::Unknown => {}
         }
         let resolved = cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key);
+        if let Some(resolved) = &resolved {
+            self.shape_runtime
+                .register_root(&self.gc_heap, object::shape(obj, &self.gc_heap));
+            if !resolved.holder_root.is_null() {
+                self.shape_runtime
+                    .register_root(&self.gc_heap, resolved.holder_root);
+            }
+        }
         self.property_cache
             .record(obj, &self.gc_heap, key, resolved.as_ref());
         resolved

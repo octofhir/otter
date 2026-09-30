@@ -163,7 +163,8 @@ mod tests {
             guard: JitMethodGuard {
                 method_fid: function_id,
                 recv_shape: 0,
-                proto_chain: vec![],
+                prototype_validity: None,
+                holder_root: 0,
                 method_value_byte: 0,
             },
             prop_offsets: Default::default(),

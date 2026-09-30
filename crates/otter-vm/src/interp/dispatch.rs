@@ -492,7 +492,7 @@ impl Interpreter {
                     // A declared native leaf completes synchronously and pushes
                     // no frame, so its identity has to be classified here, while
                     // the receiver is still live, or the site records nothing.
-                    let native_leaf = match (receiver, name_idx, method_site) {
+                    let native_leaf = match (receiver, name_idx, method_site.as_ref()) {
                         (Some(recv), Some(name_idx), Some(_)) => {
                             const_operand(function.operand(instr, 3))
                                 .ok()

@@ -106,23 +106,17 @@ pub(super) fn emit(
         view.cage_base as u64,
         RelocationTarget::GcCageBase,
     );
-    crate::template::x86_64::emit_x64_load_prototype(ops, view, 11, 11, 10);
     dynasm!(ops
         ; .arch x64
-        ; test r11d, r11d
+        ; mov rax, [r8 + cache.validity_byte as i32]
+        ; test rax, rax
         ; jz =>miss
+        ; cmp DWORD [rax], 0
+        ; je =>miss
+        ; mov eax, [r8 + cache.holder_root_byte as i32]
+        ; mov r11d, [r10 + rax + view.shape_prototype_byte as i32]
         ; add r11, r10
-        ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
-        ; jne =>miss
-    );
-    ordinary_lookup_state_guard(ops, view, miss);
-    dynasm!(ops
-        ; .arch x64
         ; =>holder
-        // A cached holder shape is keyed, never a dictionary shape.
-        ; mov eax, [r11 + view.object_shape_byte as i32]
-        ; cmp eax, [r8 + cache.holder_shape_byte as i32]
-        ; jne =>miss
         // The matched holder shape names the slot, so the slot is live.
         ; movzx edx, WORD [r8 + cache.slot_byte as i32]
         ; mov r10d, [r11 + view.object_slab_handle_byte as i32]
@@ -186,6 +180,7 @@ pub(super) fn emit_store(
 
     object_header(ops, relocations, view, frame, *receiver, miss)?;
     ordinary_lookup_state_guard(ops, view, miss);
+    dynasm!(ops ; .arch x64 ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE as i8 ; jnz =>miss);
     dynasm!(ops
         ; .arch x64
         ; mov eax, [r11 + view.object_shape_byte as i32]
@@ -317,8 +312,6 @@ fn emit_transition_store(
     {
         return Err(Unsupported::OperandShape("shared store transition table"));
     }
-    let proto_ready = ops.new_dynamic_label();
-    let chain_loop = ops.new_dynamic_label();
     let chain_done = ops.new_dynamic_label();
     let inline = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
@@ -346,43 +339,9 @@ fn emit_transition_store(
         ; mov r9, [rax + cache.shape_id_byte as i32]
         ; xor edx, edx
     );
-    crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 11, 10);
-    dynasm!(ops
-        ; .arch x64
-        ; test eax, eax
-        ; jz =>proto_ready
-        ; add rax, r10
-        ; mov r11, rax
-        ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
-        ; jne =>miss
-    );
-    shape_state_guard(ops, view, miss);
-    dynasm!(ops
-        ; .arch x64
-        ; mov eax, [r11 + view.object_shape_byte as i32]
-    );
-    symbolic(
-        ops,
-        relocations,
-        10,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; add rax, r10
-        // A dictionary shape is shared by its lineage's dictionary objects
-        // whatever their keys; no cache entry names one.
-        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
-        ; jnz =>miss
-        ; mov rdx, [rax + cache.shape_id_byte as i32]
-        ; =>proto_ready
-        ; mov rax, r9
-    );
+    dynasm!(ops ; .arch x64 ; mov rax, r9);
     load64(ops, 10, cache.hash_shape_multiplier);
     dynasm!(ops ; .arch x64 ; imul rax, r10);
-    load64(ops, 10, cache.hash_atom_multiplier);
-    dynasm!(ops ; .arch x64 ; imul r10, rdx ; rol r10, 17 ; xor rax, r10);
     load64(
         ops,
         10,
@@ -413,8 +372,6 @@ fn emit_transition_store(
         ; =>way
         ; cmp QWORD [r8 + cache.receiver_shape_byte as i32], r9
         ; jne =>next_way
-        ; cmp QWORD [r8 + cache.prototype_shape_byte as i32], rdx
-        ; jne =>next_way
         ; cmp DWORD [r8 + cache.atom_byte as i32], atom as i32
         ; je =>found
         ; =>next_way
@@ -425,72 +382,15 @@ fn emit_transition_store(
         ; =>found
         ; cmp DWORD [r8 + cache.target_shape_byte as i32], 0
         ; je =>miss
-        ; movzx edx, BYTE [r8 + cache.chain_len_byte as i32]
-        ; cmp edx, 8
-        ; ja =>miss
-        ; mov r11, rsi
-        ; xor r9d, r9d
-        ; test edx, edx
+        ; mov rax, [r8 + cache.validity_byte as i32]
+        ; test rax, rax
         ; jz =>chain_done
-        ; =>chain_loop
-    );
-    symbolic(
-        ops,
-        relocations,
-        10,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 11, 10);
-    dynasm!(ops
-        ; .arch x64
-        ; test eax, eax
-        ; jz =>miss
-        ; add rax, r10
-        ; mov r11, rax
-        ; cmp BYTE [r11], OBJECT_BODY_TYPE_TAG as i8
-        ; jne =>miss
-    );
-    shape_state_guard(ops, view, miss);
-    dynasm!(ops
-        ; .arch x64
-        ; mov eax, [r11 + view.object_shape_byte as i32]
-    );
-    symbolic(
-        ops,
-        relocations,
-        10,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; add rax, r10
-        // A dictionary shape is shared by its lineage's dictionary objects
-        // whatever their keys; no cache entry names one.
-        ; test BYTE [rax + view.shape_kind_byte as i32], otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY as i8
-        ; jnz =>miss
-        ; mov rax, [rax + cache.shape_id_byte as i32]
-        ; cmp rax, [r8 + r9 * 8 + cache.chain_byte as i32]
-        ; jne =>miss
-        ; inc r9d
-        ; cmp r9d, edx
-        ; jb =>chain_loop
+        ; cmp DWORD [rax], 0
+        ; je =>miss
         ; =>chain_done
-    );
-    symbolic(
-        ops,
-        relocations,
-        10,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    crate::template::x86_64::emit_x64_load_prototype(ops, view, 0, 11, 10);
-    dynasm!(ops
-        ; .arch x64
-        ; test eax, eax
-        ; jnz =>miss
         ; mov r11, rsi
+        ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE as i8
+        ; jnz =>miss
         ; test BYTE [r11 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE as i8
         ; jz =>miss
         // The matched receiver shape has exactly `slot` slots: the append

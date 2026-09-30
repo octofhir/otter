@@ -93,7 +93,7 @@ pub(super) fn method_hit(
     let receiver_word = match (call.receiver, call.holder) {
         (
             otter_vm::JitGuardedReceiver::Shape { shape },
-            JitMethodHolder::Receiver | JitMethodHolder::Shape(_),
+            JitMethodHolder::Receiver | JitMethodHolder::Prototype { .. },
         ) if shape != 0 => 0,
         (
             otter_vm::JitGuardedReceiver::Exotic(target),
@@ -394,21 +394,34 @@ fn select_method_lookup(
             );
             if call.holder == otter_vm::JitMethodHolder::Receiver {
                 (receiver, hit)
-            } else {
-                let holder = tagged(representations);
-                let prototype_hit = boolean(representations);
+            } else if let otter_vm::JitMethodHolder::Prototype { validity, root } = call.holder {
+                let valid = boolean(representations);
                 push_probe(
                     target_spec,
                     instructions,
-                    MachineOpcode::CacheIrLoadPrototype { byte_pc },
+                    MachineOpcode::CacheIrGuardPrototypeValidity { byte_pc, validity },
                     vec![
-                        MachineOperand::location_input(receiver),
                         MachineOperand::register_input(hit),
-                        MachineOperand::register_output(holder),
-                        MachineOperand::register_output(prototype_hit),
+                        MachineOperand::register_output(valid),
                     ],
                 );
-                (holder, prototype_hit)
+                let holder = tagged(representations);
+                let loaded = boolean(representations);
+                push_probe(
+                    target_spec,
+                    instructions,
+                    MachineOpcode::CacheIrLoadPrototypeHolder { byte_pc, root },
+                    vec![
+                        MachineOperand::register_input(valid),
+                        MachineOperand::register_output(holder),
+                        MachineOperand::register_output(loaded),
+                    ],
+                );
+                (holder, loaded)
+            } else {
+                return Err(super::super::VerificationError::OpcodeSignatureMismatch(
+                    super::super::MachineInstructionId(instructions.len() as u32),
+                ));
             }
         }
         otter_vm::JitGuardedReceiver::Exotic(target) => {
@@ -429,7 +442,7 @@ fn select_method_lookup(
         }
     };
     let hit = match call.holder {
-        otter_vm::JitMethodHolder::Receiver => active,
+        otter_vm::JitMethodHolder::Receiver | otter_vm::JitMethodHolder::Prototype { .. } => active,
         otter_vm::JitMethodHolder::Shape(shape) => guard_shaped(
             target_spec,
             holder,

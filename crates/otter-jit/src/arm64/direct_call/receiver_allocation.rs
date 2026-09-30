@@ -144,37 +144,18 @@ fn emit_receiver_candidate(
         ; mov x13, x4 ; mov w4, w4
         ; =>prototype_ready
     );
-    let prototype_count = usize::from(plan.prototype_shape_count);
-    for (index, &shape) in plan
-        .prototype_shapes
-        .iter()
-        .take(prototype_count)
-        .enumerate()
-    {
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldrb w14, [x13]
-            ; cmp w14, OBJECT_BODY_TYPE_TAG
-            ; b.ne =>guard_miss
-            ; ldr w14, [x13, view.object_shape_byte]
+    if let Some(validity) = plan.prototype_validity {
+        crate::template::arm64::values::emit_prototype_validity_guard(
+            ops,
+            relocations,
+            validity,
+            14,
+            guard_miss,
         );
-        emit_load_u64(ops, 15, u64::from(shape));
-        dynasm!(ops
-            ; .arch aarch64
-            ; cmp w14, w15
-            ; b.ne =>guard_miss
-        );
-        crate::template::arm64::values::emit_load_prototype(ops, view, 14, 13, 12);
-        if index + 1 != prototype_count {
-            dynasm!(ops
-                ; .arch aarch64
-                ; cbz w14, =>guard_miss
-                ; add x13, x12, x14
-            );
-        }
-    }
-    if prototype_count != 0 {
-        dynasm!(ops ; .arch aarch64 ; cbnz w14, =>guard_miss);
+        emit_load_u64(ops, 14, u64::from(plan.prototype_root));
+        dynasm!(ops ; .arch aarch64 ; add x14, x12, x14
+            ; ldr w14, [x14, view.shape_prototype_byte]
+            ; cmp w14, w4 ; b.ne =>guard_miss);
     }
     // The receiver's shape, into `w4` (the live prototype is no longer needed
     // once its lineage is proven).

@@ -285,15 +285,10 @@ impl Interpreter {
     /// Keep alive the hidden classes compiled code embeds: those of every
     /// registered code object and of the compilations in progress.
     pub(crate) fn trace_compiled_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        self.jit_code_registry.trace_retained_shapes(visitor);
-        let compiling = self.jit_compile_shapes.borrow();
-        for shape in compiling.iter() {
-            // Shapes never move, so the slot is never rewritten.
-            visitor(
-                std::ptr::from_ref(shape)
-                    .cast_mut()
-                    .cast::<otter_gc::raw::RawGc>(),
-            );
+        self.jit_code_registry.trace_retained_roots(visitor);
+        let compiling = self.jit_compile_roots.borrow();
+        for root in compiling.iter() {
+            root.trace(visitor);
         }
     }
 

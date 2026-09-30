@@ -70,10 +70,9 @@ pub(crate) enum DynamicNativePayload {
 pub struct IsolateSnapshot {
     /// The old generation, verbatim.
     pub(crate) image: otter_gc::HeapImage,
-    /// The isolate's code space, shared by reference. Restored closure
-    /// bodies name their bytecode by function id inside it. In-process
-    /// only.
-    pub(crate) code_space: std::sync::Arc<crate::code_space::CodeSpace>,
+    /// Frozen admitted code and ranges. Restores own fresh execution state;
+    /// captured closures retain their function IDs within that directory.
+    pub(crate) code_space: crate::code_space::snapshot::CodeSpaceSnapshot,
     /// Dynamic-native closures at their host-ref indices.
     pub(crate) dynamic_natives: Vec<(u32, DynamicNativePayload)>,
     /// Heap handles from the fixed-shape root walk, in walk order.

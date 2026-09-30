@@ -215,7 +215,7 @@ fn record_method_native_leaf_distribution(
             *feedback = Some(MethodCallFeedback::MonoNativeLeaf {
                 stub_id,
                 recv_shape: method_site.recv_shape,
-                proto_chain: method_site.proto_chain,
+                prototype: method_site.prototype,
                 method_value_byte: method_site.method_value_byte,
             });
             true
@@ -223,13 +223,13 @@ fn record_method_native_leaf_distribution(
         Some(MethodCallFeedback::MonoNativeLeaf {
             stub_id: seen_stub,
             recv_shape,
-            proto_chain,
+            prototype,
             method_value_byte,
             ..
         }) => {
             if *seen_stub != stub_id
                 || *recv_shape != method_site.recv_shape
-                || !proto_chain.same(&method_site.proto_chain)
+                || !prototype.same(&method_site.prototype)
                 || *method_value_byte != method_site.method_value_byte
             {
                 *feedback = Some(MethodCallFeedback::Megamorphic);
@@ -256,7 +256,7 @@ fn record_method_distribution(
     let new_target = PolyMethodTarget {
         method_fid,
         recv_shape: site.recv_shape,
-        proto_chain: site.proto_chain,
+        prototype: site.prototype.clone(),
         method_value_byte: site.method_value_byte,
         hits: 1,
     };
@@ -265,7 +265,7 @@ fn record_method_distribution(
             *feedback = Some(MethodCallFeedback::Mono {
                 method_fid,
                 recv_shape: site.recv_shape,
-                proto_chain: site.proto_chain,
+                prototype: site.prototype.clone(),
                 method_value_byte: site.method_value_byte,
             });
             true
@@ -273,18 +273,18 @@ fn record_method_distribution(
         Some(MethodCallFeedback::Mono {
             method_fid: seen_fid,
             recv_shape: seen_shape,
-            proto_chain: seen_proto_chain,
+            prototype: seen_prototype,
             method_value_byte: seen_value_byte,
         }) => {
             let same = *seen_fid == method_fid
                 && *seen_shape == site.recv_shape
-                && seen_proto_chain.same(&site.proto_chain)
+                && seen_prototype.same(&site.prototype)
                 && *seen_value_byte == site.method_value_byte;
             if !same {
                 let prior = PolyMethodTarget {
                     method_fid: *seen_fid,
                     recv_shape: *seen_shape,
-                    proto_chain: *seen_proto_chain,
+                    prototype: seen_prototype.clone(),
                     method_value_byte: *seen_value_byte,
                     hits: 1,
                 };
@@ -377,12 +377,12 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MethodProtoChain, object::ShapeId};
+    use crate::{MethodLookupProof, object::ShapeId};
 
     fn method_site(raw: u64) -> MethodSite {
         MethodSite {
             recv_shape: ShapeId::for_test(raw),
-            proto_chain: MethodProtoChain::own(),
+            prototype: MethodLookupProof::own(),
             method_value_byte: raw as u32 * 8,
         }
     }
@@ -432,7 +432,7 @@ mod tests {
         assert!(record_method_native_leaf_distribution(
             &mut feedback,
             7,
-            native_site
+            native_site.clone()
         ));
         assert!(!record_method_native_leaf_distribution(
             &mut feedback,

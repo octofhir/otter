@@ -325,16 +325,12 @@ fn warmed_math_runtime(selection: JitSelection) -> Runtime {
             );
             assert_eq!(
                 code_map.matches("machineCacheIrGuardOrdinaryState").count(),
-                if name == "guardedInt32InheritedAbs" {
-                    2
-                } else {
-                    1
-                },
+                1,
                 "every receiver and holder must prove ordinary descriptor state: {name}: {code_map}"
             );
             if name == "guardedInt32InheritedAbs" {
                 assert!(
-                    code_map.contains("machineCacheIrLoadPrototype"),
+                    code_map.contains("machineCacheIrGuardPrototypeValidity"),
                     "the inherited site must guard its holder before replacement: {code_map}"
                 );
             }
@@ -451,7 +447,8 @@ fn guarded_math_method_cold_misses_rejoin_without_deopt() {
         &mut runtime,
         "guardedInt32InheritedAbs(guardedInheritedMath, -7);",
         "7",
-        false,
+        // Restoring a value cannot revive this generation's invalidated cell.
+        true,
     );
 }
 

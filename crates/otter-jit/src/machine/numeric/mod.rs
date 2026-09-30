@@ -1440,6 +1440,35 @@ fn select_with_loop_entries(
                 )?;
                 continue;
             }
+            if let NumericNode::FunctionCallProof {
+                receiver,
+                call,
+                byte_pc,
+            } = node
+            {
+                let receiver = tagged_call_argument(
+                    hir,
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                    receiver,
+                );
+                let point = NumericFramePoint::Node(node_value);
+                native_call_cfg::select_function_call_proof(
+                    target_spec,
+                    hir,
+                    receiver,
+                    machine_value(&values, node_value),
+                    byte_pc,
+                    call,
+                    frame_state_indices[&point],
+                    exit_specs[&point].clone(),
+                    &values,
+                    &mut representations,
+                    &mut instructions,
+                );
+                continue;
+            }
             if let NumericNode::PropertyShapeLoad {
                 receiver,
                 byte_pc,
@@ -2390,8 +2419,10 @@ fn select_with_loop_entries(
                 NumericNode::ConstructorFieldStore { .. } => {
                     unreachable!("constructor effects select before ordinary nodes")
                 }
-                NumericNode::PropertyShapeLoad { .. } => {
-                    unreachable!("speculative property loads select before ordinary nodes")
+                NumericNode::PropertyShapeLoad { .. } | NumericNode::FunctionCallProof { .. } => {
+                    unreachable!(
+                        "speculative property loads and proofs select before ordinary nodes"
+                    )
                 }
                 NumericNode::ElementLoad { .. } | NumericNode::ElementStore { .. } => {
                     unreachable!("element nodes select their explicit CFG before ordinary nodes")
@@ -4617,6 +4648,7 @@ fn frame_state_exits(
             NumericNode::InlineConstructGuard { .. }
             | NumericNode::InlineCallGuard { .. }
             | NumericNode::InlineMethodGuard { .. }
+            | NumericNode::FunctionCallProof { .. }
             | NumericNode::ColdCallExit { .. }
             | NumericNode::NativeLeaf { .. } => {
                 &[(ExitReason::IdentityGuard, ExitAction::Recompile)]

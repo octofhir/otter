@@ -147,6 +147,29 @@ impl Interpreter {
         // an entry like any other, so it charges the same bounded
         // reoptimization budget the interpreter's entry paths do.
         if state.tier == NativeFrameKind::Optimizing {
+            // An entry-guard exit leaves the actual parameters in the callee's
+            // published window.
+            let param_count = context
+                .for_function(callee_function_id)
+                .ok()
+                .and_then(|owner| {
+                    owner
+                        .exec_function(callee_function_id)
+                        .map(|f| f.param_count)
+                })
+                .map_or(0, usize::from)
+                .min(usize::from(callee.header.register_count));
+            let parameters = (0..param_count)
+                .map(|index| {
+                    // SAFETY: the stack-owned callee window is live and
+                    // initialized for `register_count` tagged slots until the
+                    // deoptimizer consumes it.
+                    crate::Value::from_bits(unsafe {
+                        std::ptr::read((callee.register_base as *const u64).add(index))
+                    })
+                })
+                .collect::<smallvec::SmallVec<[crate::Value; 8]>>();
+            self.widen_exited_parameters(callee_function_id, exit, &parameters);
             // The shared optimizing-exit owner also applies the one-way
             // arithmetic widening, so a later generation cannot repeat an
             // overflow or negative-zero speculation.

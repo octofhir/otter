@@ -883,6 +883,15 @@ fn map_body_node(
             value_byte,
             ordinary,
         },
+        FunctionCallProof {
+            receiver,
+            call,
+            byte_pc,
+        } => FunctionCallProof {
+            receiver: map(receiver),
+            call,
+            byte_pc,
+        },
         BlockParameter(_) | TaggedConstant(_) | IntegerConstant(_) | BooleanConstant(_)
         | Constant(_) => node,
         TaggedToNumber(value) => TaggedToNumber(map(value)),

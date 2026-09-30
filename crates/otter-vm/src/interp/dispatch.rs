@@ -441,7 +441,7 @@ impl Interpreter {
                     let capture = jit_installed
                         && feedback_site
                             .is_some_and(|site| !self.method_site_feedback_saturated(site));
-                    let mut receiver = capture
+                    let receiver_value = jit_installed
                         .then(|| register_operand(function.operand(instr, 1)).ok())
                         .flatten()
                         .and_then(|r| {
@@ -449,6 +449,13 @@ impl Interpreter {
                                 .get(top_idx)
                                 .and_then(|f| f.registers.get(r as usize).copied())
                         });
+                    // The function a `Function.prototype.call` / `apply`
+                    // invocation runs is the receiver itself; its id is read
+                    // now, while the receiver handle is still valid.
+                    let receiver_function_id = receiver_value
+                        .and_then(|value| value.as_closure(&self.gc_heap))
+                        .map(crate::closure::JsClosure::function_id);
+                    let mut receiver = receiver_value.filter(|_| capture);
                     let name_idx = const_operand(function.operand(instr, 2)).ok();
                     // The receiver is refreshed in place: resolving the site can
                     // migrate a dictionary-mode receiver onto the shaped path,
@@ -483,6 +490,16 @@ impl Interpreter {
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.
                     if jit_installed && stack.len() > depth_before {
                         let method_fid = stack[stack.len() - 1].function_id;
+                        if receiver_function_id == Some(method_fid) {
+                            let transition = self.record_ordinary_call_feedback(
+                                function,
+                                instr.instruction_pc,
+                                crate::feedback::OrdinaryCallTarget::Bytecode(method_fid),
+                            );
+                            if transition.evict_for_reopt() {
+                                self.evict_compiled_for_reopt(function_id);
+                            }
+                        }
                         if let (Some(feedback_site), Some(site)) = (feedback_site, method_site) {
                             let changed = self.note_method_target(feedback_site, method_fid, site);
                             self.commit_method_call_feedback_transition(

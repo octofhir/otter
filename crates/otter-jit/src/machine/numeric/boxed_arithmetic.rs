@@ -167,7 +167,9 @@ pub(super) fn visit_inputs(
             visit(receiver, true);
             visit(value, true);
         }
-        PropertyLoad { receiver, .. } | PropertyShapeLoad { receiver, .. } => {
+        PropertyLoad { receiver, .. }
+        | PropertyShapeLoad { receiver, .. }
+        | FunctionCallProof { receiver, .. } => {
             visit(receiver, true);
         }
         BaseConstructResult { result, receiver } => {

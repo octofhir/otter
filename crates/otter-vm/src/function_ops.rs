@@ -2602,24 +2602,42 @@ impl Interpreter {
                 );
             }
         }
-        // A user-mutated [[Prototype]] replaces the intrinsic chain:
-        // continue the ordinary walk from the override.
-        if let Some(over) = self.ordinary_function_prototype_override(owner, function_id) {
-            if over.is_null() {
-                return Ok(Value::undefined());
-            }
+        // §10.1.8 OrdinaryGet continues at [[Prototype]] — a user-mutated
+        // one, the kind's intrinsic prototype, or %Function.prototype% — with
+        // the function itself as the receiver an inherited getter sees.
+        let parent = match self.ordinary_function_prototype_override(owner, function_id) {
+            Some(over) if over.is_null() => return Ok(Value::undefined()),
+            Some(over) => Some(over),
+            None => self
+                .function_kind_prototype_for(context, function_id)
+                .or_else(|| self.realm_intrinsics.function_prototype())
+                .map(Value::object),
+        };
+        if let Some(parent) = parent {
+            let receiver = owner
+                .map(Value::closure)
+                .unwrap_or_else(|| Value::function(function_id));
             let key = VmPropertyKey::OwnedString(name.to_string());
-            return match self.ordinary_get_value(stack, context, over, over, &key, 0)? {
-                VmGetOutcome::Value(v) => Ok(v),
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync_rooted(stack, context, &getter, over, SmallVec::new())
+            // A proxy on the chain runs JavaScript, so the receiver the getter
+            // sees is re-read from its handle after the walk.
+            return self.with_handle_scope(|interp, scope| {
+                let receiver_handle = interp.scoped_value(scope, receiver);
+                let outcome =
+                    interp.ordinary_get_value(stack, context, parent, receiver, &key, 0)?;
+                match outcome {
+                    VmGetOutcome::Value(v) => Ok(v),
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let receiver = interp.escape_scoped(receiver_handle);
+                        interp.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            receiver,
+                            SmallVec::new(),
+                        )
+                    }
                 }
-            };
-        }
-        if let Some(proto) = self.function_kind_prototype_for(context, function_id)
-            && let Some(value) = object::get(proto, &self.gc_heap, name)
-        {
-            return Ok(value);
+            });
         }
         if let Some(value) = self
             .load_function_prototype_method(name)

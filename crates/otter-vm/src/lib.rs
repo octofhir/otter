@@ -299,10 +299,10 @@ pub use jit::{
     JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionLayout, JitCompileError,
     JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitDirectCallKind,
     JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase, JitElementFamily,
-    JitElementRepr, JitExecOutcome, JitFunctionCode, JitGuardWidth, JitGuardedMethodCall,
-    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitMapTableLayout, JitMethodHolder, JitRuntimeStubBinding, JitStaticNativeCall,
-    JitStringLayout, VmRuntimeActivation,
+    JitElementRepr, JitExecOutcome, JitFunctionCode, JitFunctionPrototypeCall, JitGuardWidth,
+    JitGuardedMethodCall, JitGuardedReceiver, JitInlineCallee, JitInlineMethod,
+    JitInstructionMetadata, JitMapTableLayout, JitMethodHolder, JitParameterWidening,
+    JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,
@@ -1243,6 +1243,9 @@ pub struct Interpreter {
     /// The same record owns the requested policy and current-generation count.
     jit_optimized_exit_profiles:
         std::collections::BTreeMap<(u32, u32, native_abi::ExitReason), jit::JitExitProfile>,
+    /// Per-function parameter widening learned from failed optimized entry
+    /// guards; see [`jit::JitCompileSnapshot::parameter_widening`].
+    jit_parameter_widening: rustc_hash::FxHashMap<u32, Box<[jit::JitParameterWidening]>>,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot

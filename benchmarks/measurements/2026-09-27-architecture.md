@@ -1189,14 +1189,70 @@ assignment across tiers, per-closure slots and freezing.
 | crypto | 13.45G | 13.40G (−0.4%) | 0.805s | 0.805s |
 | fib / zlib / mega_method | unchanged | | | |
 
-### Next: guarded direct `f.call` in generated code
-With the closure program intact, a `CallMethodValue` site whose method
-feedback is the intrinsic `call` can lower to a guarded `CallWithThis` on
-the receiver. The guards are the closure program (exact `ORDINARY`, so there
-is no own `call`), the %Function.prototype% shape, and the `call` slot
-holding the intrinsic. The site's call feedback then records the receiver's
-target, so the call becomes direct and inlinable, as it does after V8's
-reduction.
+### Stage B landed: `f.call(this, …)` as a direct call in the optimizing tier
+A `CallMethodValue` site now also owns ordinary call feedback. When a call
+on a closure receiver runs the receiver itself (`g.call` / `g.apply`), the
+interpreter records the receiver's function there. For a `call` site with
+one recorded target, the bake stores the closure program's proof:
+- the receiver proof (exact ordinary closure of the active realm);
+- the `%Function.prototype%` shape;
+- the `call` slot;
+- the intrinsic's identity.
+
+VM intrinsics now own an external-reference identity (a byte of a static
+table), so the builtin identity probe can name them exactly as it names a
+static builtin.
+
+Machine lowers the site as V8's `ReduceFunctionPrototypeCall` does:
+- A `FunctionCallProof` node composes the existing intrinsic-prototype,
+  shape, slot and identity probes and ends in one pre-operation exit.
+- A direct `CallWithThis` of the receiver follows. Its argument words are
+  already `[this, …]`; `f.call()` passes `undefined`.
+
+The callee identity guard covers another target, and its miss completes
+through the generic explicit-receiver call. That stub now admits a reduced
+`CallMethodValue`: the first actual argument became the receiver. A failed
+proof (own `call`, replaced or redefined intrinsic, non-closure receiver)
+exits once, and the recompile keeps the generic method call.
+
+Three defects surfaced on the way and are fixed:
+- **Parameter speculation storm.** Machine infers entry parameter
+  representations from the uses a parameter reaches, including uses on
+  untaken paths (`c === undefined ? 0 : c` typed `c` Int32). An
+  under-applied call then failed the entry guard, and every recompile
+  repeated the speculation: nine deopts for one call site until the budget
+  ran out. The failed guard's actual parameter values now widen a
+  per-function parameter profile, which caps the next generation's entry
+  representations for that parameter only. This follows JSC's argument
+  value profiles updated from exit values. Disabling all parameter
+  speculation after any entry exit was tried first. It made crypto bimodal
+  (13.4G / 17G): one incidental `am3` entry exit untyped its hot
+  parameters.
+- **Inherited accessors on functions.** `f.m()`, where `m` is an accessor
+  on `%Function.prototype%` (or a kind prototype), read only data
+  properties and threw "not a function". Inherited lookup now walks
+  OrdinaryGet from the function's `[[Prototype]]` with the function as
+  receiver; the override path previously passed the override as `this`.
+- The generic explicit-receiver stub rejected the reduced site (the
+  `InvalidOperand` above was the first symptom).
+
+Corpora: `function_prototype_call_sites` covers:
+- targets and receivers;
+- own `call`;
+- replaced and getter `call`;
+- throws inside and outside handlers.
+
+`parameter_entry_widening` covers under-application and widening.
+
+| Workload | instr after F1 | after B | wall after F1 | after B |
+|---|---:|---:|---:|---:|
+| ast_ctor | 17.11G | 10.94G (−36%) | 1.105s | 0.638s (−42%) |
+| ts-fixed | 167.5G | 160.5G (−4.2%) | 16.76s | 16.37s |
+| earley / crypto / zlib / fib / mega_method | unchanged | | | |
+
+Since §16 began, ast_ctor has gone from 1.40 s to 0.64 s. CallWithThis
+targets are still only residual calls in a splice. Admitting them as
+inline candidates is the next step for `_super.call` chains.
 
 ## Checkpoint
 

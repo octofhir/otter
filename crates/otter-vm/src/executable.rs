@@ -488,6 +488,7 @@ impl CodeBlock {
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
+            function_prototype_calls: rustc_hash::FxHashMap::default(),
             property_programs: rustc_hash::FxHashMap::default(),
             property_lookup_cache: None,
             store_transition_cache: None,
@@ -497,6 +498,7 @@ impl CodeBlock {
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
+            parameter_widening: Box::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

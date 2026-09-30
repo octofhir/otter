@@ -510,6 +510,7 @@ impl Interpreter {
             EAGER_DIRECT_TARGET_DEPTH,
         );
         self.bake_guarded_method_calls(&mut snapshot);
+        self.bake_function_prototype_calls(&mut snapshot, context);
         self.bake_element_accesses(&mut snapshot);
         self.bake_constructor_field_transitions(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
@@ -765,6 +766,7 @@ impl Interpreter {
             eager_direct_target_depth,
         );
         self.bake_guarded_method_calls(&mut view);
+        self.bake_function_prototype_calls(&mut view, context);
         self.bake_element_accesses(&mut view);
         self.bake_constructor_field_transitions(&mut view);
         Self::bake_context_allocations(&mut view);
@@ -1365,6 +1367,73 @@ impl Interpreter {
     /// prototype hop rather than a second description of the same access. An
     /// entry that may collect reserves its safepoint here, at the site that
     /// will publish it.
+    /// `f.call(...)` sites (V8's `ReduceFunctionPrototypeCall`): a method call
+    /// named `call` whose recorded target the call-site pass planned, while
+    /// `%Function.prototype.call%` still holds the intrinsic. The proof is the
+    /// closure receiver program for `call`; generated code re-proves it and
+    /// the intrinsic's identity before calling the receiver directly.
+    fn bake_function_prototype_calls(
+        &mut self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+    ) {
+        let sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter(|instr| {
+                instr.op(&view.code_block) == Op::CallMethodValue
+                    && view.direct_callees.contains_key(&instr.byte_pc)
+            })
+            .filter_map(|instr| Some((instr.byte_pc, instr.const_index(&view.code_block, 2)?)))
+            .collect();
+        if sites.is_empty() {
+            return;
+        }
+        let intrinsic = crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall;
+        let Some(call_native_ref) = intrinsic.native_ref(&self.gc_heap) else {
+            return;
+        };
+        let holds_intrinsic = self
+            .realm_intrinsics
+            .function_prototype()
+            .and_then(|prototype| object::get(prototype, &self.gc_heap, "call"))
+            .and_then(|value| value.as_native_function())
+            .is_some_and(|native| native.is_vm_intrinsic(&self.gc_heap, intrinsic));
+        if !holds_intrinsic {
+            return;
+        }
+        for (byte_pc, name_index) in sites {
+            let Some(key) = context.property_atom_for_function(view.code_block.id, name_index)
+            else {
+                continue;
+            };
+            if key.name() != "call" {
+                continue;
+            }
+            let Some(program) = self.closure_property_program(key) else {
+                continue;
+            };
+            let [
+                jit::JitCacheIrOp::LoadIntrinsicPrototype { target, .. },
+                jit::JitCacheIrOp::GuardShape { shape, .. },
+                _,
+                jit::JitCacheIrOp::LoadField { value_byte, .. },
+            ] = *program.ops
+            else {
+                continue;
+            };
+            view.function_prototype_calls.insert(
+                byte_pc,
+                jit::JitFunctionPrototypeCall {
+                    receiver: target,
+                    holder_shape: shape,
+                    call_value_byte: value_byte,
+                    call_native_ref,
+                },
+            );
+        }
+    }
+
     pub(crate) fn bake_guarded_method_calls(&mut self, view: &mut jit::JitCompileSnapshot) {
         let sites: Vec<_> = view
             .instructions
@@ -1917,6 +1986,7 @@ impl Interpreter {
             self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, 0, budget);
             self.bake_guarded_method_calls(&mut body);
+            self.bake_function_prototype_calls(&mut body, context);
             self.bake_element_accesses(&mut body);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
@@ -1934,6 +2004,11 @@ impl Interpreter {
     /// caller splicing this body inline — does not emit the speculation that
     /// already exited.
     fn bake_optimized_exit_profile(&self, snapshot: &mut jit::JitCompileSnapshot, fid: u32) {
+        snapshot.parameter_widening = self
+            .jit_parameter_widening
+            .get(&fid)
+            .cloned()
+            .unwrap_or_default();
         snapshot.optimized_exit_reasons = self
             .jit_optimized_exit_profiles
             .keys()

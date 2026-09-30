@@ -404,11 +404,15 @@ impl AtomicCallFeedback {
 /// Opcode-selected feedback storage. Boxes are allocated once while the
 /// CodeBlock is built. Property payloads own bounded IC programs and may retain
 /// traced transition shapes; call payloads remain fixed atomic records.
+///
+/// A method call owns both: the load of its method, and the ordinary call
+/// target of a `Function.prototype.call` invocation — the receiver function
+/// the call actually ran, which a generated site calls directly.
 #[derive(Debug)]
 enum TypedFeedbackSlot {
     None,
     Property(Box<CodeBlockPropertyFeedback>),
-    Method(Box<CodeBlockPropertyFeedback>),
+    Method(Box<CodeBlockPropertyFeedback>, Box<AtomicCallFeedback>),
     Call(Box<AtomicCallFeedback>),
 }
 
@@ -421,9 +425,10 @@ impl TypedFeedbackSlot {
             Op::StoreProperty | Op::StorePropertyStrict => Self::Property(Box::new(
                 CodeBlockPropertyFeedback::new(PropertyIcKind::Store),
             )),
-            Op::CallMethodValue => Self::Method(Box::new(CodeBlockPropertyFeedback::new(
-                PropertyIcKind::Load,
-            ))),
+            Op::CallMethodValue => Self::Method(
+                Box::new(CodeBlockPropertyFeedback::new(PropertyIcKind::Load)),
+                Box::default(),
+            ),
             Op::Call
             | Op::CallWithThis
             | Op::CallForwardArguments
@@ -913,8 +918,13 @@ impl FeedbackVector {
         for slot in &self.typed_slots {
             total = total.saturating_add(match slot {
                 TypedFeedbackSlot::None => 0,
-                TypedFeedbackSlot::Property(payload) | TypedFeedbackSlot::Method(payload) => {
+                TypedFeedbackSlot::Property(payload) => {
                     std::mem::size_of_val::<CodeBlockPropertyFeedback>(payload) as u64
+                }
+                TypedFeedbackSlot::Method(payload, call) => {
+                    (std::mem::size_of_val::<CodeBlockPropertyFeedback>(payload)
+                        + std::mem::size_of_val::<AtomicCallFeedback>(call))
+                        as u64
                 }
                 TypedFeedbackSlot::Call(payload) => {
                     std::mem::size_of_val::<AtomicCallFeedback>(payload) as u64
@@ -979,7 +989,9 @@ impl FeedbackVector {
         kind: PropertyIcKind,
     ) -> Option<PropertyFeedbackSlot<'_>> {
         let feedback = match self.typed_slots.get(index)? {
-            TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback) => feedback,
+            TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
+                feedback
+            }
             _ => return None,
         };
         (feedback.kind == kind).then_some(PropertyFeedbackSlot {
@@ -995,15 +1007,17 @@ impl FeedbackVector {
     pub(crate) fn is_method_slot(&self, index: usize) -> bool {
         matches!(
             self.typed_slots.get(index),
-            Some(TypedFeedbackSlot::Method(_))
+            Some(TypedFeedbackSlot::Method(..))
         )
     }
 
     /// Ordinary-call payload for one `Call`, `New`, or `SuperConstruct`
-    /// instruction.
+    /// instruction, or the `Function.prototype.call` target of a method call.
     #[must_use]
     pub(crate) fn call_slot(&self, index: usize) -> Option<CallFeedbackSlot<'_>> {
-        let TypedFeedbackSlot::Call(feedback) = self.typed_slots.get(index)? else {
+        let (TypedFeedbackSlot::Call(feedback) | TypedFeedbackSlot::Method(_, feedback)) =
+            self.typed_slots.get(index)?
+        else {
             return None;
         };
         Some(CallFeedbackSlot { feedback })
@@ -1046,7 +1060,7 @@ impl FeedbackVector {
         let mut stats = crate::property_ic::PropertyIcStats::default();
         for slot in &self.typed_slots {
             let feedback = match slot {
-                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback) => {
+                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
                     feedback
                 }
                 _ => continue,
@@ -1084,7 +1098,7 @@ impl FeedbackVector {
         self.typed_slots
             .iter()
             .filter_map(|slot| match slot {
-                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback)
+                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _)
                     if feedback.kind == kind =>
                 {
                     Some(feedback.entry())
@@ -1098,7 +1112,7 @@ impl FeedbackVector {
     pub(crate) fn trace_property_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         for slot in &self.typed_slots {
             let feedback = match slot {
-                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback) => {
+                TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
                     feedback
                 }
                 _ => continue,
@@ -1348,6 +1362,24 @@ mod tests {
                 hits: 1,
             }))
         );
+    }
+
+    #[test]
+    fn method_call_owns_function_call_target_feedback() {
+        let vector = FeedbackVector::for_instruction_ops([Op::CallMethodValue]);
+        assert!(vector.is_method_slot(0));
+        assert!(vector.property_slot(0, PropertyIcKind::Load).is_some());
+        assert_eq!(
+            vector.record_call(0, OrdinaryCallTarget::Bytecode(41)),
+            CallTargetTransition::BecameMonomorphic
+        );
+        assert!(matches!(
+            vector.call_slot(0).and_then(|slot| slot.distribution()),
+            Some(CallSiteDistribution::Mono(CallTargetCount {
+                target: OrdinaryCallTarget::Bytecode(41),
+                hits: 1,
+            }))
+        ));
     }
 
     #[test]

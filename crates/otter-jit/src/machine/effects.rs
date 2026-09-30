@@ -238,6 +238,7 @@ impl MachineOpcode {
             | Self::IntegerAdd
             | Self::IntegerSub
             | Self::IntegerMul
+            | Self::IntegerRem
             | Self::IntegerNeg
             | Self::IntegerAddImmediate(_)
             | Self::IntegerSubImmediate(_)

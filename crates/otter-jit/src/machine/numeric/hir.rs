@@ -453,6 +453,8 @@ pub(super) enum NumericNode {
     IntegerAdd(NumericValue, NumericValue),
     IntegerSub(NumericValue, NumericValue),
     IntegerMul(NumericValue, NumericValue),
+    /// Speculative Int32 `%`: exits on a zero divisor or a negative zero.
+    IntegerRem(NumericValue, NumericValue),
     IntegerNeg(NumericValue),
     IntegerAddImmediate(NumericValue, i32),
     IntegerSubImmediate(NumericValue, i32),
@@ -865,6 +867,7 @@ impl NumericNode {
             | Self::IntegerAdd(..)
             | Self::IntegerSub(..)
             | Self::IntegerMul(..)
+            | Self::IntegerRem(..)
             | Self::IntegerNeg(..)
             | Self::IntegerAddImmediate(..)
             | Self::IntegerSubImmediate(..)
@@ -960,6 +963,7 @@ impl NumericNode {
             | Self::IntegerAdd(..)
             | Self::IntegerSub(..)
             | Self::IntegerMul(..)
+            | Self::IntegerRem(..)
             | Self::IntegerNeg(..)
             | Self::IntegerAddImmediate(..)
             | Self::IntegerSubImmediate(..) => Some(NumericFrameStatePurpose::ExactDeopt),
@@ -4290,7 +4294,10 @@ fn lower_instruction(
             }
             let tagged_decode = if matches!(
                 operation,
-                NumericBinaryOp::Add | NumericBinaryOp::Sub | NumericBinaryOp::Mul
+                NumericBinaryOp::Add
+                    | NumericBinaryOp::Sub
+                    | NumericBinaryOp::Mul
+                    | NumericBinaryOp::Rem
             ) && feedback.is_int32_only()
             {
                 TaggedNumericDecode::Int32
@@ -4316,7 +4323,10 @@ fn lower_instruction(
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
             if matches!(
                 operation,
-                NumericBinaryOp::Add | NumericBinaryOp::Sub | NumericBinaryOp::Mul
+                NumericBinaryOp::Add
+                    | NumericBinaryOp::Sub
+                    | NumericBinaryOp::Mul
+                    | NumericBinaryOp::Rem
             ) && feedback.is_int32_only()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
@@ -4325,6 +4335,7 @@ fn lower_instruction(
                     NumericBinaryOp::Add => NumericNode::IntegerAdd(left, right),
                     NumericBinaryOp::Sub => NumericNode::IntegerSub(left, right),
                     NumericBinaryOp::Mul => NumericNode::IntegerMul(left, right),
+                    NumericBinaryOp::Rem => NumericNode::IntegerRem(left, right),
                     _ => unreachable!("matched checked int32 arithmetic"),
                 }
             } else {
@@ -4677,6 +4688,7 @@ fn lower_instruction(
         NumericNode::IntegerAdd(..)
             | NumericNode::IntegerSub(..)
             | NumericNode::IntegerMul(..)
+            | NumericNode::IntegerRem(..)
             | NumericNode::IntegerNeg(..)
             | NumericNode::IntegerAddImmediate(..)
             | NumericNode::IntegerSubImmediate(..)

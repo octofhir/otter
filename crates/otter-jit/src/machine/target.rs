@@ -86,6 +86,9 @@ pub enum TargetClobberSet {
     /// Context word loads and stores, SELF reads and hole tests: at most one
     /// immediate or frame-pointer scratch outside the allocation file.
     ContextAccess,
+    /// Speculative Int32 remainder: x86-64 divides through `edx:eax`, AArch64
+    /// uses its emitter scratch.
+    IntegerRemainder,
 }
 
 /// Target legalization features admitted by neutral instruction selection.
@@ -296,7 +299,7 @@ pub struct TargetSpec {
     registers: TargetRegisterFile,
     calls: TargetCallConvention,
     frame: TargetFrameSpec,
-    clobbers: [Box<[PhysicalRegister]>; 21],
+    clobbers: [Box<[PhysicalRegister]>; 22],
     capabilities: [bool; 4],
 }
 
@@ -368,6 +371,8 @@ impl TargetSpec {
                 vec![integer(16)].into_boxed_slice(),
                 [9, 10, 15, 16, 17].map(integer).into(),
                 vec![integer(16)].into_boxed_slice(),
+                // x15..x17 lie outside the scalar allocation file.
+                Box::new([]),
             ],
             capabilities: [true; 4],
         }
@@ -424,6 +429,10 @@ impl TargetSpec {
                         .into_iter()
                         .chain([float(14), float(15)])
                         .collect()
+                } else if set == TargetClobberSet::IntegerRemainder as usize {
+                    // `div` takes its dividend in eax and leaves the remainder
+                    // in edx.
+                    [0, 2].map(integer).into()
                 } else if set == TargetClobberSet::ArgumentsProbe as usize {
                     [8, 9, 10, 11].map(integer).into()
                 } else if set == TargetClobberSet::ContextAccess as usize {

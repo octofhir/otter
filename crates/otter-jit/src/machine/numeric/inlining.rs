@@ -931,6 +931,7 @@ fn map_body_node(
         IntegerSubWrapping(left, right) => IntegerSubWrapping(map(left), map(right)),
         IntegerSub(left, right) => IntegerSub(map(left), map(right)),
         IntegerMul(left, right) => IntegerMul(map(left), map(right)),
+        IntegerRem(left, right) => IntegerRem(map(left), map(right)),
         IntegerAnd(left, right) => IntegerAnd(map(left), map(right)),
         IntegerOr(left, right) => IntegerOr(map(left), map(right)),
         IntegerXor(left, right) => IntegerXor(map(left), map(right)),

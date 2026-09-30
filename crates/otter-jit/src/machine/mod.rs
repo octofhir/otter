@@ -915,6 +915,9 @@ pub enum MachineOpcode {
     IntegerSub,
     /// Integer multiplication with overflow and negative-zero exits.
     IntegerMul,
+    /// Int32 remainder (V8's `Int32ModulusWithOverflow`): a zero divisor
+    /// exits as overflow and a negative zero result as negative zero.
+    IntegerRem,
     /// Integer negation with overflow and negative-zero exits.
     IntegerNeg,
     /// Integer addition with a baked right operand and overflow exit.

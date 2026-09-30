@@ -2565,6 +2565,20 @@ fn select_with_loop_entries(
                         MachineOperand::register_output(result),
                     ],
                 ),
+                NumericNode::IntegerRem(left, right) => {
+                    let mut remainder = MachineInstruction::plain(
+                        MachineOpcode::IntegerRem,
+                        vec![
+                            MachineOperand::register_input(machine_value(&values, left)),
+                            MachineOperand::register_input(machine_value(&values, right)),
+                            MachineOperand::register_output(result),
+                        ],
+                    );
+                    remainder.clobbers = target_spec
+                        .clobbers(TargetClobberSet::IntegerRemainder)
+                        .to_vec();
+                    remainder
+                }
                 NumericNode::IntegerNeg(source) => MachineInstruction::plain(
                     MachineOpcode::IntegerNeg,
                     vec![
@@ -4628,7 +4642,9 @@ fn frame_state_exits(
     let specs: &[(ExitReason, ExitAction)] = match state.point {
         NumericFramePoint::Backedge { .. } => &[(ExitReason::Interrupt, ExitAction::Resume)],
         NumericFramePoint::Node(node) => match hir.nodes[node.0] {
-            NumericNode::IntegerMul(..) | NumericNode::IntegerNeg(..) => &[
+            NumericNode::IntegerMul(..)
+            | NumericNode::IntegerRem(..)
+            | NumericNode::IntegerNeg(..) => &[
                 (ExitReason::Int32Overflow, ExitAction::Recompile),
                 (ExitReason::NegativeZero, ExitAction::Recompile),
             ],
@@ -6879,7 +6895,7 @@ mod tests {
     }
 
     fn checked_binary_view(op: Op, left: i32, right: i32) -> JitCompileSnapshot {
-        assert!(matches!(op, Op::Add | Op::Sub | Op::Mul));
+        assert!(matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Rem));
         let mut view = numeric_view(
             0,
             3,
@@ -12684,6 +12700,61 @@ mod tests {
             assert_eq!(
                 result.validate(NativeResultDomain::Compiled),
                 Some(NativeResultStatus::SideExit)
+            );
+            assert_eq!(pc, 2);
+            assert_eq!(
+                frame,
+                [
+                    tag::box_int32(left),
+                    tag::box_int32(right),
+                    Value::undefined().to_bits()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn checked_integer_remainder_matches_ecmascript_and_deopts() {
+        for (left, right, expected) in [
+            (7, 3, 1),
+            (-7, 3, -1),
+            (7, -3, 1),
+            (-7, -3, -1),
+            (8, 4, 0),
+            (13, 8, 5),
+            (-13, 8, -5),
+            (0, 5, 0),
+            (i32::MAX, i32::MIN, i32::MAX),
+            (i32::MIN, 3, -2),
+            (i32::MIN, i32::MAX, -1),
+            (123_456, 1024, 576),
+        ] {
+            let code = compile_output(&checked_binary_view(Op::Rem, left, right), None).code;
+            let (result, _, _) = execute(&code, &[], 0);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::Success),
+                "{left} % {right}"
+            );
+            assert_eq!(
+                compiled_payload_bits(result),
+                tag::box_int32(expected),
+                "{left} % {right}"
+            );
+        }
+
+        // A zero divisor (NaN) and a zero result of a negative dividend (-0)
+        // exit before the result is written.
+        let interrupt = 0_u8;
+        for (left, right) in [(5, 0), (0, 0), (-8, 4), (i32::MIN, -1), (i32::MIN, i32::MIN)] {
+            let code = compile_output(&checked_binary_view(Op::Rem, left, right), None).code;
+            let mut fuel = i64::MAX as u64;
+            let (result, frame, pc) =
+                execute_with_poll_cells(&code, &[], 0, std::ptr::addr_of!(interrupt), &mut fuel);
+            assert_eq!(
+                result.validate(NativeResultDomain::Compiled),
+                Some(NativeResultStatus::SideExit),
+                "{left} % {right}"
             );
             assert_eq!(pc, 2);
             assert_eq!(

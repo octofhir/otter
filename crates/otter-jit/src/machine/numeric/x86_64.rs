@@ -685,6 +685,7 @@ pub(super) fn emit(
                 dynasm!(ops ; .arch x64 ; jo =>exit ; mov Rd(dst), r11d);
             }
             MachineOpcode::IntegerMul => emit_mul(&mut ops, loc, instruction, &deopts)?,
+            MachineOpcode::IntegerRem => emit_rem(&mut ops, loc, instruction, &deopts)?,
             MachineOpcode::IntegerNeg => emit_neg(&mut ops, loc, instruction, &deopts)?,
             MachineOpcode::IntegerAnd
             | MachineOpcode::IntegerOr
@@ -3021,6 +3022,58 @@ fn emit_mul(
         ; js =>negative_zero
         ; =>done
         ; mov Rd(dst), r11d
+    );
+    Ok(())
+}
+
+/// V8's Int32ModulusWithOverflow through `div`: the divisor's magnitude in
+/// r11, the dividend's magnitude in eax, the remainder in edx (both declared
+/// clobbers). The result takes the dividend's sign; a zero divisor and a zero
+/// result of a negative dividend exit.
+fn emit_rem(
+    ops: &mut Assembler,
+    loc: &[AllocatedLocation],
+    instruction: &super::super::MachineInstruction,
+    labels: &[DynamicLabel],
+) -> Result<(), Unsupported> {
+    let (left, right, dst) = (ireg(loc[0])?, ireg(loc[1])?, ireg(loc[2])?);
+    let overflow = deopt(instruction.exit_id(ExitReason::Int32Overflow), labels)?;
+    let negative_zero = deopt(instruction.exit_id(ExitReason::NegativeZero), labels)?;
+    let divisor_ready = ops.new_dynamic_label();
+    let non_negative = ops.new_dynamic_label();
+    let general = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; mov r11d, Rd(right)
+        ; mov eax, Rd(left)
+        ; test r11d, r11d
+        ; jg =>divisor_ready
+        ; neg r11d
+        ; je =>overflow
+        ; =>divisor_ready
+        ; test eax, eax
+        ; jns =>non_negative
+        ; neg eax
+        ; xor edx, edx
+        ; div r11d
+        ; test edx, edx
+        ; je =>negative_zero
+        ; neg edx
+        ; mov Rd(dst), edx
+        ; jmp =>done
+        ; =>non_negative
+        ; lea edx, [r11 - 1]
+        ; test edx, r11d
+        ; jne =>general
+        ; and eax, edx
+        ; mov Rd(dst), eax
+        ; jmp =>done
+        ; =>general
+        ; xor edx, edx
+        ; div r11d
+        ; mov Rd(dst), edx
+        ; =>done
     );
     Ok(())
 }

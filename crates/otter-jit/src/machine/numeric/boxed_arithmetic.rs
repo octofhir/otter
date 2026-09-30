@@ -305,6 +305,7 @@ pub(super) fn visit_inputs(
         | IntegerAdd(left, right)
         | IntegerSub(left, right)
         | IntegerMul(left, right)
+        | IntegerRem(left, right)
         | IntegerAnd(left, right)
         | IntegerOr(left, right)
         | IntegerXor(left, right)

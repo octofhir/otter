@@ -1837,6 +1837,60 @@ fn emit_with_reach(
                     ; mov W(destination), w16
                 );
             }
+            MachineOpcode::IntegerRem => {
+                let left = integer_register(locations[0])?;
+                let right = integer_register(locations[1])?;
+                let destination = integer_register(locations[2])?;
+                let overflow = instruction_deopt_label(
+                    instruction.exit_id(ExitReason::Int32Overflow),
+                    &deopt_targets,
+                )?;
+                let negative_zero = instruction_deopt_label(
+                    instruction.exit_id(ExitReason::NegativeZero),
+                    &deopt_targets,
+                )?;
+                let divisor_ready = ops.new_dynamic_label();
+                let non_negative = ops.new_dynamic_label();
+                let nonzero = ops.new_dynamic_label();
+                let general = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                // V8's Int32ModulusWithOverflow: the result takes the
+                // dividend's sign, so the divisor's magnitude and an unsigned
+                // division of the dividend's magnitude cover every Int32,
+                // INT32_MIN included. A zero divisor (NaN) and a zero result
+                // of a negative dividend (-0) exit through unconditional
+                // branches that reach any deopt trampoline.
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov w16, W(right)
+                    ; mov w17, W(left)
+                    ; cmp w16, #0
+                    ; b.gt =>divisor_ready
+                    ; neg w16, w16
+                    ; cbnz w16, =>divisor_ready
+                    ; b =>overflow
+                    ; =>divisor_ready
+                    ; tbz w17, #31, =>non_negative
+                    ; neg w17, w17
+                    ; udiv w15, w17, w16
+                    ; msub w15, w15, w16, w17
+                    ; cbnz w15, =>nonzero
+                    ; b =>negative_zero
+                    ; =>nonzero
+                    ; neg W(destination), w15
+                    ; b =>done
+                    ; =>non_negative
+                    ; sub w15, w16, #1
+                    ; tst w16, w15
+                    ; b.ne =>general
+                    ; and W(destination), w17, w15
+                    ; b =>done
+                    ; =>general
+                    ; udiv w15, w17, w16
+                    ; msub W(destination), w15, w16, w17
+                    ; =>done
+                );
+            }
             MachineOpcode::IntegerNeg => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;

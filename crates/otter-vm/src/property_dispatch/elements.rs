@@ -15,8 +15,7 @@ use super::{canonical_numeric_index_string, typed_array_valid_index};
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, binary, descriptor_value, read_register, rooting::RootScopeExt, symbol,
-    write_register,
+    abstract_ops, binary, read_register, rooting::RootScopeExt, symbol, write_register,
 };
 
 impl Interpreter {
@@ -266,23 +265,20 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(fid) = recv
-            .as_function()
-            .or_else(|| recv.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
-            let owner = recv.as_closure(&self.gc_heap);
-            if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                match self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    owner,
-                    fid,
-                    &key.to_lossy_string(&self.gc_heap),
-                )? {
-                    Some(desc) => descriptor_value(&desc),
-                    None => Value::undefined(),
-                }
-            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let key = VmPropertyKey::Symbol(sym);
+        } else if recv.as_function().is_some() || recv.as_closure(&self.gc_heap).is_some() {
+            // Computed keys walk the ordinary [[Get]] ladder like dotted
+            // access: own slots (allocating a default `prototype`), then the
+            // function's prototype chain.
+            let key = if let Some(key) = idx_value.as_string(&self.gc_heap) {
+                Some(VmPropertyKey::OwnedString(
+                    key.to_lossy_string(&self.gc_heap),
+                ))
+            } else {
+                idx_value
+                    .as_symbol(&self.gc_heap)
+                    .map(VmPropertyKey::Symbol)
+            };
+            if let Some(key) = key {
                 match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {

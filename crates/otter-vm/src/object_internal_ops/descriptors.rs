@@ -354,7 +354,7 @@ impl Interpreter {
                 .expect("non-symbol key has string spelling");
             if key == "prototype" {
                 // Materializing the implicit prototype allocates and can move
-                // the closure: read its bag through the closure's new home.
+                // the closure: read the slot through the closure's new home.
                 return self.with_handle_scope(|interp, scope| {
                     let target_handle = interp.scoped_value(scope, target);
                     let _ = interp.function_property_get_with_receiver(
@@ -368,10 +368,12 @@ impl Interpreter {
                     let owner = interp
                         .escape_scoped(target_handle)
                         .as_closure(&interp.gc_heap);
-                    let Some(bag) = interp.callable_bag_read(owner, function_id) else {
-                        return Ok(None);
-                    };
-                    Ok(object::get_own_descriptor(bag, &interp.gc_heap, key))
+                    interp.ordinary_function_own_property_descriptor(
+                        Some(context),
+                        owner,
+                        function_id,
+                        key,
+                    )
                 });
             }
             return self.ordinary_function_own_property_descriptor(

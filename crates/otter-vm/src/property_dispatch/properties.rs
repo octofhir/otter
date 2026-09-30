@@ -854,26 +854,20 @@ impl Interpreter {
                 context, owner, fid, name,
             )?;
 
-            let prototype_in_bag = name == "prototype"
-                && self.callable_bag_read(owner, fid).is_some_and(|bag| {
-                    !matches!(
-                        crate::object::lookup_own(bag, &self.gc_heap, name),
-                        object::PropertyLookup::Absent
-                    )
-                });
+            // §10.2.5 — the implicit `prototype` is an own data property from
+            // creation; an assignment writes its slot, never the bag.
             if name == "prototype"
-                && !prototype_in_bag
-                && context.function_has_prototype_property(fid)
+                && let Some((_, writable)) = self.function_prototype_slot(context, owner, fid)
             {
-                // §10.2.5 OrdinaryFunctionCreate — the implicit
-                // `prototype` slot is {writable, non-enumerable,
-                // non-configurable}. Assigning before the slot
-                // materializes must install those attributes, not the
-                // generic {enumerable, configurable} create-on-set.
-                let bag = self.function_user_bag_for_register(stack, top_idx, obj_reg, src, fid)?;
-                let value = *read_register(&stack[top_idx], src)?;
-                let desc = object::PropertyDescriptor::data(value, true, false, false);
-                crate::object::define_own_property(bag, &mut self.gc_heap, name, desc);
+                if writable {
+                    let value = *read_register(&stack[top_idx], src)?;
+                    self.store_function_prototype(Some(stack), owner, fid, value)?;
+                } else {
+                    self.failed_set_result(
+                        strict,
+                        "Cannot assign to read-only property 'prototype' of function".to_string(),
+                    )?;
+                }
                 stack[top_idx].advance_pc()?;
                 return Ok(());
             }

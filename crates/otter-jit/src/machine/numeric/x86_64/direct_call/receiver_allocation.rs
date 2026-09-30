@@ -139,9 +139,9 @@ fn emit_receiver_candidate(
         ; cmp DWORD [rdx + view.closure_call_layout.function_id_byte as i32], plan.new_target_function_id as i32
         ; jne =>guard_miss
     );
-    // The learned size, the bag and the prototype slot proof live in the
-    // closure's rare record (`rcx`, free until the nursery reservation); a
-    // closure without one was never prepared as a constructor.
+    // The learned size and the `prototype` slot live in the closure's rare
+    // record (`rcx`, free until the nursery reservation); a closure without
+    // one was never prepared as a constructor.
     dynasm!(ops
         ; .arch x64
         ; mov ecx, [rdx + view.closure_call_layout.rare_byte as i32]
@@ -168,48 +168,9 @@ fn emit_receiver_candidate(
         ; cmp r11d, i32::from(plan.inline_capacity)
         ; ja =>guard_miss
         ; mov [rcx + view.closure_call_layout.learned_instance_fields_byte as i32], r11w
-        ; mov r10d, [rcx + view.closure_call_layout.own_props_byte as i32]
-        ; test r10d, r10d
-        ; jz =>guard_miss
-        ; lea r9, [r8 + r10]
-        ; cmp BYTE [r9], OBJECT_BODY_TYPE_TAG as i8
-        ; jne =>guard_miss
-        ; test BYTE [r9 + view.object_flags_byte as i32], otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK as i8
-        ; jnz =>guard_miss
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10d, [rcx + view.closure_call_layout.prototype_shape_byte as i32]
-        ; test r10d, r10d
-        ; jz =>guard_miss
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; cmp r10d, [r9 + view.object_shape_byte as i32]
-        ; jne =>guard_miss
-    );
-    // The bag's shape names the prototype slot, so the slot is live.
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10d, [rcx + view.closure_call_layout.prototype_slot_byte as i32]
-    );
-    // The bag's slot base: in-object until it spills, then its slab's
-    // words (`r8` holds the cage base).
-    dynasm!(ops
-        ; .arch x64
-        ; mov r11d, [r9 + view.object_slab_handle_byte as i32]
-        ; test r11d, r11d
-        ; jnz >bag_spilled
-        ; lea r9, [r9 + view.object_inline_values_byte as i32]
-        ; jmp >bag_base
-        ; bag_spilled:
-        ; lea r9, [r8 + r11]
-        ; add r9, view.object_slab_words_byte as i32
-        ; bag_base:
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; mov rsi, [r9 + r10 * 8]
+        // The function's `prototype` slot: the hole until the default
+        // object exists, which the cell test below rejects.
+        ; mov rsi, [rcx + view.closure_call_layout.prototype_byte as i32]
         ; test rsi, rsi
         ; jz =>guard_miss
     );

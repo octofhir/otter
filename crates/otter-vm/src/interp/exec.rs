@@ -136,6 +136,7 @@ impl Interpreter {
         self.function_user_props.retain(|id, _| outside(id));
         self.function_prototype_overrides
             .retain(|id, _| outside(id));
+        self.function_prototype_slots.retain(|id, _| outside(id));
         self.function_non_extensible.retain(outside);
         self.function_deleted_metadata.retain(|(id, _)| outside(id));
         self.optimizing_tier_policy.evict_function_range(start, end);

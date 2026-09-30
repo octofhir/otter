@@ -306,12 +306,9 @@ pub struct JitClosureCallLayout {
     /// Byte offset of the own-property bag handle, from the decompressed
     /// rare-record pointer.
     pub own_props_byte: u32,
-    /// Byte offset of the prototype-slot proof's bag shape, from the rare
-    /// record.
-    pub prototype_shape_byte: u32,
-    /// Byte offset of the prototype-slot proof's slot index, from the rare
-    /// record.
-    pub prototype_slot_byte: u32,
+    /// Byte offset of the function's `prototype` slot value (the hole until
+    /// the default object is allocated), from the rare record.
+    pub prototype_byte: u32,
     /// Byte offset of the `u16` learned instance size, from the rare record.
     pub learned_instance_fields_byte: u32,
     /// Byte offset of the last-receiver observation, from the closure.
@@ -462,7 +459,7 @@ pub(crate) struct JitConstructorFieldTransitionPlan {
     pub(crate) slot: u16,
 }
 
-const _: [(); 56] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 52] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -2528,7 +2525,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 56);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 52);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -2541,15 +2538,11 @@ mod layout_tests {
             std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
             std::mem::offset_of!(JitClosureCallLayout, rare_byte),
             std::mem::offset_of!(JitClosureCallLayout, own_props_byte),
-            std::mem::offset_of!(JitClosureCallLayout, prototype_shape_byte),
-            std::mem::offset_of!(JitClosureCallLayout, prototype_slot_byte),
+            std::mem::offset_of!(JitClosureCallLayout, prototype_byte),
             std::mem::offset_of!(JitClosureCallLayout, learned_instance_fields_byte),
             std::mem::offset_of!(JitClosureCallLayout, last_instance_byte),
         ];
-        assert_eq!(
-            fields,
-            [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52]
-        );
+        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]);
     }
 
     #[test]

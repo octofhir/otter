@@ -192,10 +192,6 @@ impl SyncJsCallRoots {
         self.current.get()
     }
 
-    pub(crate) fn construct_target(&self) -> Value {
-        self.new_target.get()
-    }
-
     pub(crate) fn receiver_value(&self) -> Value {
         self.receiver.get()
     }
@@ -498,13 +494,9 @@ impl Interpreter {
                 .map(|closure| closure.cached_function_id)
         }) {
             let owner = new_target.as_closure(&self.gc_heap);
-            let Some(bag) = self.callable_bag_read(owner, function_id) else {
-                return Ok(None);
-            };
-            match crate::object::lookup_own(bag, &self.gc_heap, "prototype") {
-                crate::object::PropertyLookup::Data { value, .. } => value,
-                crate::object::PropertyLookup::Accessor { .. }
-                | crate::object::PropertyLookup::Absent => return Ok(None),
+            match self.function_prototype_slot(context, owner, function_id) {
+                Some((value, _)) if !value.is_hole() => value,
+                _ => return Ok(None),
             }
         } else if let Some(class) = new_target.as_class_constructor() {
             Value::object(class.prototype(&self.gc_heap))
@@ -523,7 +515,6 @@ impl Interpreter {
         } else {
             self.constructor_prototype_value("Object")?
         });
-        self.prepare_closure_prototype_slot(&roots);
         Ok(Some(self.allocate_bytecode_constructor_receiver(
             context,
             function_id,

@@ -562,6 +562,42 @@ impl JsClosure {
         });
     }
 
+    /// The function's `prototype` slot: its value (the hole until the default
+    /// object is allocated) and whether it is writable. `None` without a
+    /// rare record: unallocated and writable.
+    #[must_use]
+    pub(crate) fn prototype_slot(self, heap: &GcHeap) -> Option<(Value, bool)> {
+        self.with_rare(heap, |rare| (rare.prototype, rare.prototype_writable))
+    }
+
+    /// Store the function's `prototype` value into the rare record the caller
+    /// already allocated. The value may be younger than the record, so the
+    /// edge is barriered.
+    pub(crate) fn set_prototype_value(self, heap: &mut GcHeap, value: Value) {
+        use crate::pelt::PeltField as _;
+        let rare = self
+            .rare(heap)
+            .expect("a prototype value is stored into an allocated rare record");
+        heap.with_payload(rare, |rare| rare.prototype = value);
+        let mut child = value;
+        let mut visit = |slot: *mut RawGc| {
+            // SAFETY: `pelt_trace` hands out pointers into the local copy of
+            // the value; the slot is read to record its edge only.
+            let raw = unsafe { *slot };
+            heap.record_write_edge(rare, raw);
+        };
+        child.pelt_trace(&mut visit);
+    }
+
+    /// Clear the `prototype` property's writable attribute in the rare record
+    /// the caller already allocated.
+    pub(crate) fn freeze_prototype(self, heap: &mut GcHeap) {
+        let rare = self
+            .rare(heap)
+            .expect("a prototype attribute is stored into an allocated rare record");
+        heap.with_payload(rare, |rare| rare.prototype_writable = false);
+    }
+
     /// The learned instance size recorded for this constructor closure.
     pub(crate) fn learned_instance_fields(self, heap: &GcHeap) -> u16 {
         self.with_rare(heap, |rare| rare.learned_instance_fields.get())

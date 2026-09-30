@@ -114,12 +114,9 @@ fn emit_receiver_candidate(
     dynasm!(ops ; .arch aarch64 ; b.ne =>guard_miss);
     // A nonzero sample proves the existing ledger owns this weak observation.
     // No generated operation creates a ledger entry or keeps it across GC.
-    // The closure owns an internal ordinary property table, not an arbitrary
-    // JS receiver. An empty sidecar retained by dictionary migration is legal;
-    // matching shape and unmodified slot attributes remain authoritative.
-    // The learned size, the bag and the prototype slot proof live in the
-    // closure's rare record (`x17`); a closure without one was never
-    // prepared as a constructor.
+    // The learned size and the `prototype` slot live in the closure's rare
+    // record (`x17`); a closure without one was never prepared as a
+    // constructor.
     dynasm!(ops ; .arch aarch64
         ; ldr w17, [x2, view.closure_call_layout.rare_byte]
         ; cbz w17, =>guard_miss ; add x17, x12, x17
@@ -136,29 +133,9 @@ fn emit_receiver_candidate(
         ; cmp w11, w14 ; csel w14, w11, w14, hi
         ; cmp w14, u32::from(plan.inline_capacity) ; b.hi =>guard_miss
         ; strh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
-        ; ldr w11, [x17, view.closure_call_layout.own_props_byte]
-        ; cbz w11, =>guard_miss ; add x13, x12, x11
-        ; ldrb w14, [x13] ; cmp w14, OBJECT_BODY_TYPE_TAG ; b.ne =>guard_miss
-    );
-    crate::template::arm64::ic_probe::emit_ordinary_lookup_state_guard(ops, view, 13, guard_miss);
-    let bag_inline = ops.new_dynamic_label();
-    let bag_base = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64
-        ; ldr w14, [x17, view.closure_call_layout.prototype_shape_byte] ; cbz w14, =>guard_miss
-        ; ldr w15, [x13, view.object_shape_byte] ; cmp w14, w15 ; b.ne =>guard_miss
-        // The bag's shape names the prototype slot, so the slot is live.
-        ; ldr w14, [x17, view.closure_call_layout.prototype_slot_byte]
-        // The bag's slot base: in-object until it spills, then its slab's
-        // words (`x12` holds the cage base).
-        ; ldr w15, [x13, view.object_slab_handle_byte]
-        ; cbz w15, =>bag_inline
-        ; add x13, x12, x15
-        ; add x13, x13, view.object_slab_words_byte
-        ; b =>bag_base
-        ; =>bag_inline
-        ; add x13, x13, view.object_inline_values_byte
-        ; =>bag_base
-        ; ldr x4, [x13, w14, UXTW #3]
+        // The function's `prototype` slot: the hole until the default
+        // object exists, which the cell test below rejects.
+        ; ldr x4, [x17, view.closure_call_layout.prototype_byte]
     );
     emit_cell_test(ops, 4, 11, CellTest::IsNotCell, guard_miss);
     dynasm!(ops ; .arch aarch64

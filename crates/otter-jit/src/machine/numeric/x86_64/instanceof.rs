@@ -35,7 +35,7 @@ pub(super) fn emit(
     let walk = ops.new_dynamic_label();
     let step = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; mov r11, Rq(target) ; mov r10, Rq(value));
-    if view.cage_base == 0 || view.closure_call_layout.prototype_shape_byte == 0 {
+    if view.cage_base == 0 || view.closure_call_layout.prototype_byte == 0 {
         dynasm!(ops ; .arch x64 ; jmp =>miss);
     } else {
         let layout = view.closure_call_layout;
@@ -63,17 +63,19 @@ pub(super) fn emit(
             ; and eax, !i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
             ; cmp eax, i32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
             ; jne =>miss
-            // `prototype` lives in the bag once observed. The bag and its
-            // slot proof live in the rare record (`r11` from here).
+            // `prototype` lives in the rare record's slot (`r11` from here);
+            // without a record, or while the slot holds the hole, the
+            // committed operation allocates the default object.
             ; mov r11d, [r11 + layout.rare_byte as i32]
             ; test r11d, r11d
             ; jz =>miss
             ; add r11, r9
+            // No symbol-keyed own property in the bag, so no own
+            // `@@hasInstance`.
             ; mov r8d, [r11 + layout.own_props_byte as i32]
             ; test r8d, r8d
-            ; jz =>miss
+            ; jz >symbols_absent
             ; add r8, r9
-            // No symbol-keyed own property, so no own `@@hasInstance`.
             ; mov eax, [r8 + view.object_exotic_handle_byte as i32]
             ; test eax, eax
             ; jz >symbols_absent
@@ -81,25 +83,7 @@ pub(super) fn emit(
             ; cmp DWORD [rax + otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE as i32], 0
             ; jne =>miss
             ; symbols_absent:
-            ; mov eax, [r11 + layout.prototype_shape_byte as i32]
-            ; test eax, eax
-            ; jz =>miss
-            ; cmp eax, [r8 + view.object_shape_byte as i32]
-            ; jne =>miss
-            // The bag's shape names the prototype slot, so the slot is live.
-            ; mov eax, [r11 + layout.prototype_slot_byte as i32]
-            // The bag's slot base: in-object until it spills, then its
-            // slab's words (`r9` holds the cage base).
-            ; mov ecx, [r8 + view.object_slab_handle_byte as i32]
-            ; test ecx, ecx
-            ; jnz >bag_spilled
-            ; lea rcx, [r8 + view.object_inline_values_byte as i32]
-            ; jmp >bag_base
-            ; bag_spilled:
-            ; add rcx, r9
-            ; add rcx, view.object_slab_words_byte as i32
-            ; bag_base:
-            ; mov rdx, [rcx + rax * 8]
+            ; mov rdx, [r11 + layout.prototype_byte as i32]
         );
         // The prototype must be an ordinary object; anything else throws.
         load64(ops, 0, NOT_CELL_MASK);

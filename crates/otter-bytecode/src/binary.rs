@@ -39,7 +39,8 @@
 
 use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant, Function,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
+    ExceptionHandler, Function,
     MappedArgumentBinding, ModuleInit, ModuleResolution, ScopeDescriptor, ScopeFlags, ScopeKind,
     SlotDescriptor, SlotKind, SourceKind, SpanEntry, TemplateSite,
     encoding::{op_from_byte, op_to_byte},
@@ -415,6 +416,13 @@ impl Writer {
         self.u32(site.class_function_id);
     }
 
+    fn exception_handler(&mut self, handler: &ExceptionHandler) {
+        self.u32(handler.start);
+        self.u32(handler.end);
+        self.u32(handler.target);
+        self.u16(handler.exception);
+    }
+
     fn slot_descriptor(&mut self, slot: &SlotDescriptor) {
         self.string(&slot.name);
         let (tag, payload) = slot_kind_tag(slot.kind);
@@ -522,6 +530,7 @@ impl Writer {
             None => self.bool(false),
         }
         self.function_code(&function.code);
+        self.seq(&function.handlers, Self::exception_handler);
         self.seq(&function.spans, Self::span_entry);
         self.u32_seq(&function.number_hint_sites);
         self.seq(&function.class_hint_sites, Self::class_hint_site);
@@ -723,6 +732,15 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn exception_handler(&mut self) -> Option<ExceptionHandler> {
+        Some(ExceptionHandler {
+            start: self.u32()?,
+            end: self.u32()?,
+            target: self.u32()?,
+            exception: self.u16()?,
+        })
+    }
+
     fn slot_descriptor(&mut self) -> Option<SlotDescriptor> {
         let name = self.string()?;
         let tag = self.u8()?;
@@ -831,6 +849,7 @@ impl<'a> Reader<'a> {
             None
         };
         let code = self.function_code()?;
+        let handlers = self.seq(Self::exception_handler)?;
         let spans = self.seq(Self::span_entry)?;
         let number_hint_sites = self.u32_seq()?;
         let class_hint_sites = self.seq(Self::class_hint_site)?;
@@ -861,6 +880,7 @@ impl<'a> Reader<'a> {
             source_text_range,
             source_text_span,
             code,
+            handlers,
             spans,
             number_hint_sites,
             class_hint_sites,
@@ -1073,6 +1093,12 @@ mod tests {
                 source_text_range: Some((0, 18)),
                 source_text_span: Some((0, 18)),
                 code: code.finish(),
+                handlers: vec![ExceptionHandler {
+                    start: 0,
+                    end: 1,
+                    target: 1,
+                    exception: 0,
+                }],
                 spans: vec![SpanEntry {
                     pc: 0,
                     span: (0, 4),

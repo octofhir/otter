@@ -1,21 +1,20 @@
-//! System V x86-64 structured-exception transition emission.
+//! System V x86-64 exception-raising transition emission.
 //!
 //! # Contents
-//! - Uniform calls to the VM-owned exception semantic helper.
-//! - Dynamic same-frame continuation publication.
-//! - Normal return and committed-throw routing.
+//! - Calls to the VM-owned helper that raises a compiled exception opcode's
+//!   exception and routes it through the frame's handler table.
 //!
 //! # Invariants
-//! - The target-neutral template operation is committed exactly once by the
-//!   shared runtime stub; generated code never replays it after reentry.
-//! - A dynamic resume PC is stored in the published `Frame` before the
-//!   ordinary runtime-transition side exit.
+//! - The helper never asks generated code to replay the source opcode: the
+//!   frame either resumes at its handler's canonical PC, stored in the
+//!   published `Frame` before the ordinary runtime-transition side exit, or
+//!   propagates the raised value.
 //! - Calls obey the System V integer ABI and consume the shared native-result
 //!   pair in `rax`/`rdx`.
 //!
 //! # See also
 //! - `crate::template::arm64::exceptions` — peer target implementation.
-//! - `otter_vm::Interpreter::jit_runtime_exception_op` — semantic owner.
+//! - `otter_vm::RuntimeCall::exception_op` — semantic owner.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::native_abi as abi;
@@ -33,20 +32,16 @@ pub(super) fn emit_exception_op(
     transitions: &TransitionTable,
     opcode: u8,
     arg0: u64,
-    arg1: u64,
-    arg2: u64,
     side_exit: DynamicLabel,
-    returned: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
 ) {
     let resume = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; mov rdi, r15);
     emit_load_u64(ops, 6, u64::from(opcode));
     emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 1, arg1);
-    emit_load_u64(ops, 8, arg2);
+    emit_load_u64(ops, 1, 0);
+    emit_load_u64(ops, 8, 0);
     emit_load_runtime_stub(
         ops,
         relocations,
@@ -56,10 +51,6 @@ pub(super) fn emit_exception_op(
     dynasm!(ops
         ; .arch x64
         ; call r11
-        ; cmp edx, abi::NativeResultStatus::Continue as i32
-        ; je =>done
-        ; cmp edx, abi::NativeResultStatus::Success as i32
-        ; je =>returned
         ; cmp edx, abi::NativeResultStatus::SideExit as i32
         ; je =>resume
         ; cmp edx, abi::NativeResultStatus::Throw as i32
@@ -68,6 +59,5 @@ pub(super) fn emit_exception_op(
         ; =>resume
         ; mov [r14 + NATIVE_FRAME_PC_OFFSET as i32], eax
         ; jmp =>side_exit
-        ; =>done
     );
 }

@@ -151,34 +151,14 @@ impl Interpreter {
         input: Value,
         operation: UnaryCoercionOp,
     ) -> Result<Value, VmError> {
-        self.with_handle_scope(|interp, scope| {
-            let input = interp.scoped_value(scope, input);
-            let (numeric, hint) = match operation {
-                UnaryCoercionOp::ToNumeric => (true, abstract_ops::ToPrimitiveHint::Number),
-                UnaryCoercionOp::ToPrimitive { hint } => (false, hint.abstract_hint()),
-            };
-            let current = interp.escape_scoped(input);
-            let primitive = if abstract_ops::is_primitive(&current) {
-                current
-            } else {
-                interp.evaluate_to_primitive(stack, context, &current, hint)?
-            };
-            let primitive = interp.scoped_value(scope, primitive);
-            let primitive_value = interp.escape_scoped(primitive);
-            let result = if !numeric || primitive_value.is_number() || primitive_value.is_big_int()
-            {
-                primitive_value
-            } else if primitive_value.is_symbol() {
-                return Err(interp
-                    .err_type(("Cannot convert a Symbol value to a number".to_string()).into()));
-            } else {
-                Value::number(crate::number::NumberValue::from_f64(
-                    crate::number::parse::to_number_value(&primitive_value, &interp.gc_heap),
-                ))
-            };
-            let result = interp.scoped_value(scope, result);
-            Ok(interp.escape_scoped(result))
-        })
+        match operation {
+            UnaryCoercionOp::ToNumeric => {
+                crate::coerce::to_numeric_or_throw(self, stack, context, &input)
+            }
+            UnaryCoercionOp::ToPrimitive { hint } => {
+                self.evaluate_to_primitive(stack, context, &input, hint.abstract_hint())
+            }
+        }
     }
 
     /// Define one object-literal data property from decoded registers.
@@ -245,19 +225,6 @@ impl Interpreter {
         let result = self.run_load_builtin_error_active(&resolved, frame, dst, kind_index);
         frame.set_pc(saved_pc);
         result
-    }
-
-    /// Execute generic ECMAScript unary negation against the canonical frame.
-    pub fn jit_runtime_neg(
-        &mut self,
-        frame: &mut ActiveFrameMut<'_>,
-        dst: u16,
-        src: u16,
-    ) -> Result<(), VmError> {
-        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let value = frame.read(src)?;
-        let result = self.neg_value(value)?;
-        frame.write(dst, result)
     }
 
     /// Apply a descriptor object through `OrdinaryDefineOwnProperty`.
@@ -446,7 +413,14 @@ mod tests {
                 .jit_runtime_add(&mut stack, &context, &mut frame, 3, 0, 1)
                 .expect("native add runtime op");
             interp
-                .jit_runtime_neg(&mut frame, 4, 1)
+                .jit_runtime_numeric_op(
+                    &mut stack,
+                    &context,
+                    &mut frame,
+                    4,
+                    1,
+                    NumericRuntimeOp::Neg,
+                )
                 .expect("native negate runtime op");
             interp
                 .jit_runtime_coerce_unary(

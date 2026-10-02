@@ -75,6 +75,7 @@ fn test_function(
         contains_direct_eval: false,
         code: code.into(),
         spans,
+        handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     }
@@ -4899,6 +4900,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
             pc: 0,
             span: (0, 0),
         }],
+        handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     };
@@ -4919,7 +4921,12 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         ))
         .expect("valid bytecode fixture");
     let err = interp
-        .unwind_throw(&context, &mut stack, Value::boolean(true))
+        .unwind_throw(
+            &context,
+            &mut stack,
+            Value::boolean(true),
+            crate::activation_stack::ThrowSite::Instruction,
+        )
         .unwrap_err();
     match err {
         VmError::Uncaught => assert_eq!(
@@ -4969,42 +4976,54 @@ fn unwind_throw_lands_in_catch_handler() {
             pc: 0,
             span: (0, 0),
         }],
+        handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     };
     let mut interp = Interpreter::new();
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
-    let mut frame = interp.test_frame_for_function(&main).unwrap();
-    interp
-        .frame_ensure_cold(&mut frame)
-        .handlers
-        .push(TryHandler {
-            catch_pc: Some(42),
-            finally_pc: None,
-            exc_register: 1,
-        });
+    let frame = interp.test_frame_for_function(&main).unwrap();
     stack.push(frame);
-    let context = interp
-        .link_module(module_with(
-            vec![Instruction {
+    let mut module = module_with(
+        vec![
+            Instruction {
                 pc: 0,
+                op: Op::Throw,
+                operands: vec![Operand::Register(0)],
+            },
+            Instruction {
+                pc: 1,
                 op: Op::ReturnUndefined,
                 operands: vec![],
-            }],
-            2,
-        ))
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(1)],
+            },
+        ],
+        2,
+    );
+    module.functions[0].handlers = vec![otter_bytecode::ExceptionHandler {
+        start: 0,
+        end: 1,
+        target: 2,
+        exception: 1,
+    }];
+    let context = interp
+        .link_module(module)
         .expect("valid bytecode fixture");
     interp
-        .unwind_throw(&context, &mut stack, Value::boolean(true))
+        .unwind_throw(
+            &context,
+            &mut stack,
+            Value::boolean(true),
+            crate::activation_stack::ThrowSite::Instruction,
+        )
         .unwrap();
-    assert_eq!(stack[0].pc, 42);
+    assert_eq!(stack[0].pc, 2);
     assert_eq!(stack[0].registers[1], Value::boolean(true));
-    assert!(
-        interp
-            .frame_cold(&stack[0])
-            .is_none_or(|c| c.handlers.is_empty())
-    );
 }
 
 #[test]
@@ -5524,6 +5543,7 @@ fn arrow_closure_overrides_call_site_this() {
             pc: 0,
             span: (0, 0),
         }],
+        handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     };
@@ -5570,6 +5590,7 @@ fn arrow_closure_overrides_call_site_this() {
             pc: 0,
             span: (0, 0),
         }],
+        handlers: Vec::new(),
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     };

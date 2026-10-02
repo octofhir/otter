@@ -749,6 +749,26 @@ struct InnerRefCollector {
     nested_direct_eval: bool,
 }
 
+/// Whether `expr` names `name` anywhere, read or written, nested functions
+/// included.
+#[must_use]
+pub fn expression_mentions_name(expr: &oxc_ast::ast::Expression<'_>, name: &str) -> bool {
+    struct Finder<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for Finder<'_> {
+        fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+            if it.name.as_str() == self.name {
+                self.found = true;
+            }
+        }
+    }
+    let mut finder = Finder { name, found: false };
+    finder.visit_expression(expr);
+    finder.found
+}
+
 /// Collects every identifier reference in a function body at any
 /// depth (direct body refs and nested-closure refs alike). Backs
 /// [`body_references_name`]'s "is the self-name observable" question.

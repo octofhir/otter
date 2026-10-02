@@ -219,9 +219,7 @@ pub(crate) extern "C" fn jit_exception_op_stub(
         Err(error) => Err(error),
     };
     match outcome {
-        Ok(JitExceptionOutcome::Continue) => NativeResultPair::continue_execution(),
         Ok(JitExceptionOutcome::Resume(pc)) => NativeResultPair::side_exit(runtime_side_exit(pc)),
-        Ok(JitExceptionOutcome::Return(value)) => NativeResultPair::success(value),
         Ok(JitExceptionOutcome::Throw(exception)) => NativeResultPair::throw_value(exception),
         Err(error) => match ctx
             .runtime_call()

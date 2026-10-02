@@ -1171,15 +1171,6 @@ impl NumericFunction {
             note_structural(decline, "invalid or empty function layout");
             return None;
         }
-        if code
-            .control_flow()
-            .exception_regions()
-            .iter()
-            .any(|region| region.catch_pc.is_none() || region.finally_pc.is_some())
-        {
-            note_structural(decline, "finally or catch-less exception region");
-            return None;
-        }
 
         let Some(instruction_semantics) = classify_snapshot(view) else {
             note_structural(decline, "instruction semantics");
@@ -1503,7 +1494,7 @@ impl NumericFunction {
                 logical_pc: u32::try_from(raw.start).ok()?,
                 osr_entry_allowed: code
                     .control_flow()
-                    .enclosing_exception_region(u32::try_from(raw.start).ok()?)
+                    .handler_at(u32::try_from(raw.start).ok()?)
                     .is_none(),
                 predecessors: raw.predecessors.clone(),
                 successors: raw.successors.clone(),
@@ -2101,11 +2092,7 @@ fn build_raw_blocks(
         let protected_throw = instruction_semantics
             .get(pc as usize)?
             .has_implicit_exception_side_exit(op)
-            && code
-                .control_flow()
-                .enclosing_exception_region(pc)
-                .and_then(|region| region.catch_pc)
-                .is_some();
+            && code.control_flow().handler_at(pc).is_some();
         let speculated_load = op == Op::LoadProperty
             && super::property_speculation::speculated_load(view, pc).is_some();
         // Only a site lowering to the binding CFG ends its block; a
@@ -2164,9 +2151,9 @@ fn build_raw_blocks(
             || instruction_semantics
                 .get(terminal_pc as usize)?
                 .has_implicit_exception_side_exit(op))
-        .then(|| code.control_flow().enclosing_exception_region(terminal_pc))
+        .then(|| code.control_flow().handler_at(terminal_pc))
         .flatten()
-        .and_then(|region| Some((*by_pc.get(&region.catch_pc?)?, region.exception_register)));
+        .and_then(|handler| Some((*by_pc.get(&handler.target)?, handler.exception)));
         let (exceptional_edge, exception_register) = if let Some((handler, register)) = exceptional
         {
             let edge = successors.len();
@@ -2190,8 +2177,8 @@ fn build_raw_blocks(
 
 /// Remove bytecode blocks that can only be entered after leaving generated
 /// code through exact deoptimization. In particular, a catch body with no
-/// committed pure-exception predecessor resumes in the interpreter after the
-/// materialized handler stack is reconstructed; manufacturing a Machine edge
+/// committed pure-exception predecessor resumes in the interpreter at its
+/// handler after exact deoptimization; manufacturing a Machine edge
 /// would require an exception value that the generated operation never owns.
 fn retain_reachable_raw_blocks(blocks: Vec<RawBlock>) -> Option<Vec<RawBlock>> {
     if blocks.is_empty() {
@@ -2321,15 +2308,12 @@ fn build_instruction_exception_handlers(
             continue;
         }
         let pc = u32::try_from(pc).ok()?;
-        let Some(region) = code.control_flow().enclosing_exception_region(pc) else {
-            continue;
-        };
-        let Some(catch_pc) = region.catch_pc else {
+        let Some(entry) = code.control_flow().handler_at(pc) else {
             continue;
         };
         *handler = Some(InstructionExceptionHandler {
-            block: *blocks_by_pc.get(&catch_pc)?,
-            exception_register: region.exception_register,
+            block: *blocks_by_pc.get(&entry.target)?,
+            exception_register: entry.exception,
         });
     }
     Some(handlers)
@@ -3074,7 +3058,7 @@ fn lower_instruction(
         byte_pc: instruction.byte_pc,
     };
     let node = match op {
-        Op::Nop | Op::EnterTry | Op::LeaveTry => return Some(()),
+        Op::Nop => return Some(()),
         Op::StoreLocal => {
             let value = read_state(registers, register(instruction, code, 0)?)?;
             write(registers, local_index(instruction, code, 1)?, value)?;
@@ -4758,9 +4742,7 @@ fn push_frame_state(
 }
 
 fn has_local_exception_handler(code: &otter_vm::CodeBlock, logical_pc: u32) -> bool {
-    code.control_flow()
-        .enclosing_exception_region(logical_pc)
-        .is_some_and(|region| region.catch_pc.is_some())
+    code.control_flow().handler_at(logical_pc).is_some()
 }
 
 /// Whether an indexed site may speculate: outside a local handler, and no
@@ -5067,7 +5049,7 @@ fn write(registers: &mut [RegisterState], register: u16, value: RegisterState) -
 
 #[cfg(test)]
 mod tests {
-    use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
+    use otter_bytecode::{Op, Operand};
     use otter_vm::{
         JitCompileSnapshot, JitDirectCallThisMode, JitDirectCallee, JitElementAccess,
         jit::{
@@ -5621,14 +5603,7 @@ mod tests {
             )
         };
         let instructions = vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(10),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(7),
-                ],
-            ),
+            (Op::Nop, Vec::new()),
             (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(7)]),
             (
                 Op::Call,
@@ -5647,11 +5622,11 @@ mod tests {
             (Op::LoadInt32, vec![Operand::Register(8), Operand::Imm32(2)]),
             element,
             after_element,
-            (Op::LeaveTry, Vec::new()),
+            (Op::Nop, Vec::new()),
             (Op::ReturnValue, vec![Operand::Register(4)]),
             (Op::ReturnValue, vec![Operand::Register(5)]),
         ];
-        let mut view = JitCompileSnapshot::without_feedback(
+        let mut view = JitCompileSnapshot::without_feedback_with_handlers(
             91,
             2,
             9,
@@ -5662,6 +5637,12 @@ mod tests {
                     JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
                 })
                 .collect(),
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 9,
+                target: 11,
+                exception: 7,
+            }],
         );
         view.seed_arith_feedback_for_test(8, ArithFeedback::from_bits(ARITH_INT32));
         let call_byte_pc = view.instructions[2].byte_pc;
@@ -5700,21 +5681,12 @@ mod tests {
     }
 
     fn direct_call_catch_view() -> JitCompileSnapshot {
-        let mut view = JitCompileSnapshot::without_feedback(
+        let mut view = JitCompileSnapshot::without_feedback_with_handlers(
             128,
             1,
             3,
             vec![
-                JitTestInstruction::new(
-                    Op::EnterTry,
-                    0,
-                    0,
-                    vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(NO_HANDLER_OFFSET),
-                        Operand::Register(2),
-                    ],
-                ),
+                JitTestInstruction::new(Op::Nop, 0, 0, Vec::new()),
                 JitTestInstruction::new(
                     Op::Call,
                     1,
@@ -5725,10 +5697,16 @@ mod tests {
                         Operand::ConstIndex(0),
                     ],
                 ),
-                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::Nop, 2, 16, Vec::new()),
                 JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(1)]),
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(2)]),
             ],
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 2,
+                target: 4,
+                exception: 2,
+            }],
         );
         view.direct_callees.insert(8, vec![direct_callee(129)]);
         view
@@ -5775,14 +5753,7 @@ mod tests {
 
     fn property_catch_liveness_view() -> JitCompileSnapshot {
         let instructions = vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(10),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(7),
-                ],
-            ),
+            (Op::Nop, Vec::new()),
             (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(7)]),
             (
                 Op::Call,
@@ -5808,11 +5779,11 @@ mod tests {
                 ],
             ),
             (Op::Nop, Vec::new()),
-            (Op::LeaveTry, Vec::new()),
+            (Op::Nop, Vec::new()),
             (Op::ReturnValue, vec![Operand::Register(3)]),
             (Op::ReturnValue, vec![Operand::Register(5)]),
         ];
-        let mut view = JitCompileSnapshot::without_feedback(
+        let mut view = JitCompileSnapshot::without_feedback_with_handlers(
             102,
             2,
             8,
@@ -5823,6 +5794,12 @@ mod tests {
                     JitTestInstruction::new(op, pc as u32, pc as u32 * 8, operands)
                 })
                 .collect(),
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 9,
+                target: 11,
+                exception: 7,
+            }],
         );
         let call_byte_pc = view.instructions[2].byte_pc;
         view.direct_callees.insert(
@@ -7483,26 +7460,23 @@ mod tests {
 
     #[test]
     fn committed_bind_this_publishes_its_status_value_to_the_catch() {
-        let view = JitCompileSnapshot::without_feedback(
+        let view = JitCompileSnapshot::without_feedback_with_handlers(
             123,
             1,
             2,
             vec![
-                JitTestInstruction::new(
-                    Op::EnterTry,
-                    0,
-                    0,
-                    vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(NO_HANDLER_OFFSET),
-                        Operand::Register(1),
-                    ],
-                ),
+                JitTestInstruction::new(Op::Nop, 0, 0, Vec::new()),
                 JitTestInstruction::new(Op::BindThisValue, 1, 8, vec![Operand::Register(0)]),
-                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::Nop, 2, 16, Vec::new()),
                 JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(0)]),
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(1)]),
             ],
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 2,
+                target: 4,
+                exception: 1,
+            }],
         );
         let hir = NumericFunction::build(&view).expect("committed BindThis catch HIR");
         let bind = hir
@@ -7566,21 +7540,12 @@ mod tests {
 
     #[test]
     fn committed_instanceof_publishes_a_pure_exception_ssa_landing() {
-        let view = JitCompileSnapshot::without_feedback(
+        let view = JitCompileSnapshot::without_feedback_with_handlers(
             125,
             2,
             4,
             vec![
-                JitTestInstruction::new(
-                    Op::EnterTry,
-                    0,
-                    0,
-                    vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(NO_HANDLER_OFFSET),
-                        Operand::Register(3),
-                    ],
-                ),
+                JitTestInstruction::new(Op::Nop, 0, 0, Vec::new()),
                 JitTestInstruction::new(
                     Op::Instanceof,
                     1,
@@ -7591,10 +7556,16 @@ mod tests {
                         Operand::Register(1),
                     ],
                 ),
-                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::Nop, 2, 16, Vec::new()),
                 JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(2)]),
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
             ],
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 2,
+                target: 4,
+                exception: 3,
+            }],
         );
         let hir = NumericFunction::build(&view).expect("committed Instanceof catch HIR");
         let instanceof = hir
@@ -7712,21 +7683,12 @@ mod tests {
 
     #[test]
     fn guarded_warm_int32_operation_inside_catch_region_is_machine_eligible() {
-        let mut view = JitCompileSnapshot::without_feedback(
+        let mut view = JitCompileSnapshot::without_feedback_with_handlers(
             126,
             2,
             4,
             vec![
-                JitTestInstruction::new(
-                    Op::EnterTry,
-                    0,
-                    0,
-                    vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(NO_HANDLER_OFFSET),
-                        Operand::Register(3),
-                    ],
-                ),
+                JitTestInstruction::new(Op::Nop, 0, 0, Vec::new()),
                 JitTestInstruction::new(
                     Op::Add,
                     1,
@@ -7737,10 +7699,16 @@ mod tests {
                         Operand::Register(1),
                     ],
                 ),
-                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::Nop, 2, 16, Vec::new()),
                 JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(2)]),
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(3)]),
             ],
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 2,
+                target: 4,
+                exception: 3,
+            }],
         );
         view.seed_arith_feedback_for_test(1, ArithFeedback::from_bits(ARITH_INT32));
         let hir = NumericFunction::build(&view)

@@ -1,7 +1,7 @@
 //! Cold side records for interpreter call frames.
 //!
 //! Each [`crate::Frame`] carries an `Option<ColdFrameIdx>` slot. When
-//! an opcode needs cold protocol state (try handlers, async parking,
+//! an opcode needs cold protocol state (async parking,
 //! pending ToPrimitive / bind / iterator ladder, etc.) it acquires a
 //! slot from the per-interpreter [`ColdFramePool`] and writes through
 //! it. Frames that never run a cold-state opcode (most short helpers,
@@ -29,57 +29,10 @@ use std::num::NonZeroU32;
 
 use otter_gc::raw::SlotVisitor;
 
-use crate::Value;
 use crate::frame_state::{
     AsyncFrameState, PendingBindFunction, PendingGetIterator, PendingIteratorNext,
-    PendingToPrimitive, TryHandler,
+    PendingToPrimitive,
 };
-use smallvec::SmallVec;
-
-/// A non-throw abrupt completion (`return` / `break` / `continue`)
-/// that must run intervening `finally` blocks before reaching its
-/// target. Parked on the frame while a `finally` block executes; the
-/// `EndFinally` opcode resumes the completion afterwards.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-try-statement-runtime-semantics-evaluation>
-#[derive(Debug, Clone, Copy)]
-pub enum AbruptKind {
-    /// `return value;` — pop the frame yielding `value` once all
-    /// enclosing `finally` blocks have run.
-    Return(Value),
-    /// `break` / `continue` — jump to `target` pc (intra-frame loop
-    /// label) once the crossed `finally` blocks have run.
-    Jump(u32),
-}
-
-/// Frame-local result of advancing an [`AbruptKind`] without changing the
-/// owning ActivationStack shape.
-pub(crate) enum AbruptFrameOutcome {
-    /// Execution resumes in the same frame at its updated PC.
-    Resume,
-    /// No finally remains; the frame boundary must return this value.
-    Return(Value),
-}
-
-/// A completion parked while its `finally` block runs (§14.15.3
-/// Try-statement evaluation: B's completion replaces F when B is
-/// abrupt). One entry per in-flight `finally`, innermost on top; the
-/// paired `u32` in [`ColdFrame::parked_finally`] is the handler-stack
-/// depth recorded at entry — an unwind that pops the handler stack
-/// below that depth abandons the finally block, so the entry is
-/// discarded and the new abrupt completion wins.
-#[derive(Debug, Clone)]
-pub enum ParkedFinally {
-    /// Normal completion — `Op::EndFinally` falls through.
-    Normal,
-    /// In-flight exception that routed into the `finally`; re-thrown
-    /// by `Op::EndFinally`.
-    Throw(Value),
-    /// Parked `return` / `break` / `continue` with its unwind floor;
-    /// `Op::EndFinally` resumes the walk toward the target.
-    Abrupt(AbruptKind, u32),
-}
 
 /// Niche-encoded handle into a [`ColdFramePool`]. Stored as
 /// `Option<ColdFrameIdx>` (4 bytes) on the hot frame; `None` means no
@@ -138,33 +91,6 @@ pub struct ColdFrame {
     pub pending_get_iterator: Option<PendingGetIterator>,
     /// In-flight ECMA-262 §7.4.5 `IteratorNext` over a user iterator.
     pub pending_iterator_next: Option<PendingIteratorNext>,
-    /// Completions parked while `finally` blocks run, innermost on
-    /// top. Each entry pairs the parked completion with the
-    /// handler-stack depth at finally entry; unwinds that pop below
-    /// that depth discard the entry (§14.15.3 — the finally's own
-    /// abrupt completion replaces the parked one). Pushed by the
-    /// unwind walks and by `Op::LeaveTry` on a finally handler
-    /// (normal entry); popped by `Op::EndFinally`.
-    pub parked_finally: SmallVec<[(ParkedFinally, u32); 2]>,
-    /// Active try-handler stack. Pushed by `Op::EnterTry`, popped by
-    /// `Op::LeaveTry` or by exception unwind landing on a matching
-    /// catch / finally. Innermost handler on top.
-    pub handlers: SmallVec<[TryHandler; 4]>,
-    /// Iterators whose `[[return]]` must run on an abrupt completion
-    /// that exits their region (§7.4.9 IteratorClose). Each entry pairs
-    /// the iterator with the `handlers` stack depth recorded when its
-    /// region opened (`Op::IteratorCloseStart`). On throw-unwind a
-    /// closer is run only when the catching handler sits *below* that
-    /// depth (the throw genuinely leaves the region); a `try`/`catch`
-    /// nested *inside* the region leaves the iterator open. Also drained
-    /// innermost-first when a parked generator is resumed with
-    /// `.return()`.
-    pub active_iterator_closers: SmallVec<[(Value, u32); 2]>,
-    /// The `DerivedThis` context slot a [`otter_bytecode::Op::ReturnDerived`]
-    /// completion named: the context value and the slot coordinate relative
-    /// to it. The frame reads the slot when it actually pops, after crossed
-    /// `finally` blocks, which may still call `super()`.
-    pub derived_this_slot: Option<(Value, otter_bytecode::ContextCoord)>,
 }
 
 impl ColdFrame {
@@ -185,21 +111,6 @@ impl ColdFrame {
         if let Some(pending) = &self.pending_iterator_next {
             crate::code_liveness::visit_value(&pending.iterator, visitor);
         }
-        for (parked, _) in &self.parked_finally {
-            match parked {
-                ParkedFinally::Throw(value)
-                | ParkedFinally::Abrupt(AbruptKind::Return(value), _) => {
-                    crate::code_liveness::visit_value(value, visitor);
-                }
-                ParkedFinally::Normal | ParkedFinally::Abrupt(AbruptKind::Jump(_), _) => {}
-            }
-        }
-        for (value, _) in &self.active_iterator_closers {
-            crate::code_liveness::visit_value(value, visitor);
-        }
-        if let Some((context, _)) = &self.derived_this_slot {
-            crate::code_liveness::visit_value(context, visitor);
-        }
     }
 
     /// Whether this slot is logically empty (no cold state worth
@@ -212,54 +123,6 @@ impl ColdFrame {
             && self.pending_bind_function.is_none()
             && self.pending_get_iterator.is_none()
             && self.pending_iterator_next.is_none()
-            && self.parked_finally.is_empty()
-            && self.handlers.is_empty()
-            && self.active_iterator_closers.is_empty()
-            && self.derived_this_slot.is_none()
-    }
-
-    /// Whether exact deoptimization may replace only this record's static
-    /// catch-handler stack.
-    ///
-    /// Suspension owners, in-flight protocol ladders, parked `finally`
-    /// completions, iterator-close regions, and non-catch handlers carry
-    /// dynamic control state that cannot be derived from a resume PC. The
-    /// remaining fields are activation state independent of the handler stack
-    /// and must survive reconstruction unchanged.
-    ///
-    /// This destructuring is deliberately exhaustive: adding a cold-frame
-    /// field requires an explicit audit of whether static deopt reconstruction
-    /// preserves or rejects it.
-    #[must_use]
-    pub(crate) fn supports_static_catch_rebuild(&self) -> bool {
-        let Self {
-            acquired,
-            osr_origin: _,
-            async_state,
-            generator_owner,
-            pending_to_primitive,
-            pending_bind_function,
-            pending_get_iterator,
-            pending_iterator_next,
-            parked_finally,
-            handlers,
-            active_iterator_closers,
-            derived_this_slot,
-        } = self;
-        let _preserved = acquired;
-
-        async_state.is_none()
-            && generator_owner.is_none()
-            && pending_to_primitive.is_none()
-            && pending_bind_function.is_none()
-            && pending_get_iterator.is_none()
-            && pending_iterator_next.is_none()
-            && parked_finally.is_empty()
-            && active_iterator_closers.is_empty()
-            && derived_this_slot.is_none()
-            && handlers
-                .iter()
-                .all(|handler| handler.catch_pc.is_some() && handler.finally_pc.is_none())
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -291,20 +154,6 @@ impl ColdFrame {
             p.iterator.trace_value_slots(visitor);
         }
         // `pending_get_iterator` carries only pc + dst, no values.
-        for (parked, _) in &self.parked_finally {
-            match parked {
-                ParkedFinally::Throw(v) | ParkedFinally::Abrupt(AbruptKind::Return(v), _) => {
-                    v.trace_value_slots(visitor);
-                }
-                ParkedFinally::Normal | ParkedFinally::Abrupt(AbruptKind::Jump(_), _) => {}
-            }
-        }
-        for (v, _) in &self.active_iterator_closers {
-            v.trace_value_slots(visitor);
-        }
-        if let Some((context, _)) = &self.derived_this_slot {
-            context.trace_value_slots(visitor);
-        }
     }
 }
 

@@ -89,6 +89,7 @@ mod tests {
                     Operand::Register(2),
                 ],
             )],
+            &[],
         )
     }
 

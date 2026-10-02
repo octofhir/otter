@@ -43,7 +43,9 @@
 //! - [`crate::encoding::layout_wordcode_function`]
 //! - [`crate::binary`]
 
-use crate::encoding::{FunctionLayout, VerifyError, layout_wordcode_function};
+use crate::encoding::{
+    FunctionLayout, VerifyError, layout_wordcode_function, verify_exception_handlers,
+};
 use std::collections::HashSet;
 
 use crate::opcode_schema::{ImmediateDomain, RegisterAccess, operand_spec_at, register_access_at};
@@ -398,6 +400,17 @@ pub enum BytecodeVerifyError {
         /// Operand position.
         operand_index: usize,
     },
+    /// An exception handler's register falls outside the frame window.
+    HandlerRegister {
+        /// Owning function table index.
+        function_index: usize,
+        /// Index into the handler table.
+        handler_index: usize,
+        /// Register receiving the thrown value.
+        register: u16,
+        /// Exact register-window size.
+        register_count: u32,
+    },
     /// A schema-declared register operand falls outside the frame window.
     RegisterOperand {
         /// Owning function table index.
@@ -675,6 +688,15 @@ impl std::fmt::Display for BytecodeVerifyError {
             } => write!(
                 f,
                 "function {function_index} instruction {instruction_pc} operand {operand_index} cannot be decoded"
+            ),
+            Self::HandlerRegister {
+                function_index,
+                handler_index,
+                register,
+                register_count,
+            } => write!(
+                f,
+                "function {function_index} exception handler {handler_index} register {register} is outside 0..{register_count}"
             ),
             Self::RegisterOperand {
                 function_index,
@@ -1093,6 +1115,22 @@ fn verify_function(
         function_index,
         error: VerifyError::FunctionTooLarge,
     })?;
+    verify_exception_handlers(&function.code, &function.handlers).map_err(|error| {
+        BytecodeVerifyError::Wordcode {
+            function_index,
+            error,
+        }
+    })?;
+    for (handler_index, handler) in function.handlers.iter().enumerate() {
+        if u32::from(handler.exception) >= register_count {
+            return Err(BytecodeVerifyError::HandlerRegister {
+                function_index,
+                handler_index,
+                register: handler.exception,
+                register_count,
+            });
+        }
+    }
 
     verify_source_span(function_index, "function", function.span)?;
     if let Some(span) = function.source_text_span {

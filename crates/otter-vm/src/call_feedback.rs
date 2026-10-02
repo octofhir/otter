@@ -171,6 +171,7 @@ mod tests {
                     otter_bytecode::Operand::ConstIndex(0),
                 ],
             )],
+            &[],
         )
     }
 

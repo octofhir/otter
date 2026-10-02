@@ -32,9 +32,9 @@ use crate::*;
 /// Each emitted tail call is followed by an `Op::ReturnValue` reading
 /// the call's dst: in the optimised path the dispatcher discards the
 /// current frame and never reaches it, but if the runtime must fall
-/// back to an ordinary call (constructor / async / a live `finally`
-/// handler) that `ReturnValue` performs the normal return — including
-/// any `finally` — so the lowering is always correct.
+/// back to an ordinary call (constructor / async) that `ReturnValue`
+/// performs the normal return. Callers lower only a `return` that no
+/// enclosing construct observes this way.
 pub(crate) fn compile_tail_return(
     cx: &mut Compiler,
     expr: &oxc_ast::ast::Expression<'_>,
@@ -46,7 +46,7 @@ pub(crate) fn compile_tail_return(
         Expression::SequenceExpression(seq) => {
             let n = seq.expressions.len();
             for e in &seq.expressions[..n.saturating_sub(1)] {
-                let _ = compile_expr(cx, e, span)?;
+                compile_effect(cx, e, span)?;
             }
             match seq.expressions.last() {
                 Some(last) => compile_tail_return(cx, last, span),
@@ -121,47 +121,6 @@ pub(crate) fn compile_tail_return(
 /// Compile one statement. Returns `Some(reg)` when the statement is
 /// an `ExpressionStatement` whose value should propagate as the
 /// program's completion value; `None` otherwise.
-/// Emit the jump for a `break`/`continue` targeting `cx.loops[target_idx]`.
-/// When one or more handlers sit between the jump site and the target, emit
-/// [`Op::JumpViaFinally`]. It runs crossed `finally` blocks and also removes
-/// crossed catch-only handlers before jumping down to the target's exact
-/// `handler_floor`; otherwise emit a plain [`Op::Jump`]. Returns the instruction
-/// pc so the caller can register it for back-patching.
-fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -> u32 {
-    // §14.15.3 — exiting a finally BODY abandons the completion that
-    // finally parked; discard one entry per crossed body before the
-    // jump so an enclosing EndFinally resumes the right completion.
-    let crossed_bodies = cx
-        .finally_body_depth
-        .saturating_sub(cx.loops[target_idx].finally_body_floor);
-    if crossed_bodies > 0 {
-        cx.emit(
-            Op::PopParkedFinally,
-            [Operand::Imm32(crossed_bodies as i32)],
-            span,
-        );
-    }
-    let crossed_handlers = cx
-        .active_handlers
-        .saturating_sub(cx.loops[target_idx].handler_floor);
-    let crossed_finally = cx
-        .active_finally
-        .saturating_sub(cx.loops[target_idx].finally_floor);
-    debug_assert!(crossed_finally <= crossed_handlers);
-    if crossed_handlers > 0 {
-        let floor = cx.loops[target_idx].handler_floor as i32;
-        let pc = cx.next_pc();
-        cx.emit(
-            Op::JumpViaFinally,
-            vec![Operand::Imm32(0), Operand::Imm32(floor)],
-            span,
-        );
-        pc
-    } else {
-        cx.emit_branch_placeholder(Op::Jump, None, span)
-    }
-}
-
 /// Compile one `if` branch statement. §B.3.2 — a sloppy-mode
 /// single-statement function declaration (`if (x) function f() {}`)
 /// behaves like a block containing only the declaration: the
@@ -277,6 +236,10 @@ fn compile_statement_body(
 
         Statement::ExpressionStatement(es) => {
             let span = (es.span.start, es.span.end);
+            if !cx.completion_tracking() {
+                compile_effect(cx, &es.expression, span)?;
+                return Ok(None);
+            }
             let reg = compile_expr(cx, &es.expression, span)?;
             // §8.4 — thread the statement value into the program
             // completion register immediately, so abrupt exits
@@ -406,9 +369,11 @@ fn compile_statement_body(
                             continue;
                         }
                         // §14.3.1.2 — `BindingIdentifier = AnonymousFunction`
-                        // infers the binding's name.
+                        // infers the binding's name. A register binding takes
+                        // the value directly, unless a handler of this frame
+                        // could observe a partial write (`a || f()` throwing).
                         let init_reg = match cx.lookup_binding(&name).map(|info| info.storage) {
-                            Some(BindingStorage::Register { reg }) => {
+                            Some(BindingStorage::Register { reg }) if !cx.in_protected_range() => {
                                 crate::expr::compile_expr_into_with_inferred_name(
                                     cx, init, &name, reg, span,
                                 )?
@@ -658,7 +623,7 @@ fn compile_statement_body(
             // their values.
             emit_per_iteration_copy(cx, per_iteration_ctx, span);
             if let Some(update) = &s.update {
-                compile_expr(cx, update, span)?;
+                compile_effect(cx, update, span)?;
             }
             let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
             cx.patch_branch(back_jmp, test_top);
@@ -703,19 +668,9 @@ fn compile_statement_body(
                         span,
                     })?,
             };
-            // §7.4.9 — `break` exits every frame from the innermost up
-            // to and including the target, so close each crossed
-            // `for…of` iterator innermost-first before jumping.
-            let close_regs: Vec<u16> = cx.loops[target_idx..]
-                .iter()
-                .rev()
-                .filter_map(|f| f.iterator_close_reg)
-                .collect();
-            for reg in close_regs {
-                cx.emit(Op::IteratorClose, [Operand::Register(reg)], span);
-            }
-            let pc = emit_loop_exit_jump(cx, target_idx, span);
-            cx.loops[target_idx].break_patches.push(pc);
+            // §14.15.3 / §7.4.9 — the break leaves through every finally
+            // block and open iterator up to and including the target.
+            cx.emit_abrupt(crate::control::Command::Break(target_idx), None, span);
             Ok(None)
         }
 
@@ -814,56 +769,32 @@ fn compile_statement_body(
         Statement::ReturnStatement(r) => {
             let span = (r.span.start, r.span.end);
             match &r.argument {
+                // §15.10.3 — a strict-mode `return <call>` with nothing to
+                // run after it is a proper tail call.
+                Some(arg)
+                    if cx.is_strict && cx.return_leaves_directly() && !cx.is_async_generator =>
+                {
+                    compile_tail_return(cx, arg, span)?;
+                }
                 Some(arg) => {
-                    let close_regs: Vec<u16> = cx
-                        .loops
-                        .iter()
-                        .rev()
-                        .filter_map(|f| f.iterator_close_reg)
-                        .collect();
-                    // §15.10.3 — a strict-mode `return <call>` with no
-                    // pending `for…of` iterator close (which would have to
-                    // run *after* the value, defeating the tail position)
-                    // lowers through the proper-tail-call path.
-                    if cx.is_strict && close_regs.is_empty() && !cx.is_async_generator {
-                        compile_tail_return(cx, arg, span)?;
-                    } else {
-                        // Evaluate the return value first, then close every
-                        // enclosing `for…of` iterator (§7.4.9) innermost-
-                        // first before the abrupt return propagates.
-                        let mut reg = compile_expr(cx, arg, span)?;
-                        // §14.10.1 step 3 — `return <expr>` in an async
-                        // generator awaits the value before the return
-                        // completion propagates, so an explicit
-                        // `return undefined` settles one tick after an
-                        // implicit return.
-                        if cx.is_async_generator {
-                            let awaited = cx.alloc_scratch();
-                            cx.emit(
-                                Op::Await,
-                                [Operand::Register(awaited), Operand::Register(reg)],
-                                span,
-                            );
-                            reg = awaited;
-                        }
-                        for creg in close_regs {
-                            cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
-                        }
-                        cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
+                    let mut reg = compile_expr(cx, arg, span)?;
+                    // §14.10.1 step 3 — `return <expr>` in an async
+                    // generator awaits the value before the return
+                    // completion propagates, so an explicit
+                    // `return undefined` settles one tick after an
+                    // implicit return.
+                    if cx.is_async_generator {
+                        let awaited = cx.alloc_scratch();
+                        cx.emit(
+                            Op::Await,
+                            [Operand::Register(awaited), Operand::Register(reg)],
+                            span,
+                        );
+                        reg = awaited;
                     }
+                    cx.emit_abrupt(crate::control::Command::Return, Some(reg), span);
                 }
-                None => {
-                    let close_regs: Vec<u16> = cx
-                        .loops
-                        .iter()
-                        .rev()
-                        .filter_map(|f| f.iterator_close_reg)
-                        .collect();
-                    for creg in close_regs {
-                        cx.emit(Op::IteratorClose, [Operand::Register(creg)], span);
-                    }
-                    cx.emit(Op::ReturnUndefined, [], span);
-                }
+                None => cx.emit_abrupt(crate::control::Command::Return, None, span),
             }
             Ok(None)
         }
@@ -1214,19 +1145,9 @@ fn compile_statement_body(
                     idx
                 }
             };
-            // §7.4.9 — `continue` exits the frames inside the target
-            // (the target loop itself re-iterates and is not closed),
-            // so close each crossed `for…of` iterator innermost-first.
-            let close_regs: Vec<u16> = cx.loops[target_idx + 1..]
-                .iter()
-                .rev()
-                .filter_map(|f| f.iterator_close_reg)
-                .collect();
-            for reg in close_regs {
-                cx.emit(Op::IteratorClose, [Operand::Register(reg)], span);
-            }
-            let pc = emit_loop_exit_jump(cx, target_idx, span);
-            cx.loops[target_idx].continue_patches.push(pc);
+            // §7.4.9 — `continue` leaves the constructs inside the target;
+            // the target loop itself re-iterates and keeps its iterator.
+            cx.emit_abrupt(crate::control::Command::Continue(target_idx), None, span);
             Ok(None)
         }
 
@@ -1346,9 +1267,16 @@ pub(crate) fn compile_for_init_decl(
                     .expect("for-head lexical pre-declared")
                     .storage;
                 cx.annotate_binding(&name, hint);
-                let init_reg = match &declarator.init {
-                    Some(init) => compile_expr(cx, init, span)?,
-                    None => {
+                let init_reg = match (&declarator.init, storage) {
+                    // §14.3.1.2 — NamedEvaluation; a register binding takes
+                    // the value directly.
+                    (Some(init), BindingStorage::Register { reg }) => {
+                        crate::expr::compile_expr_into_with_inferred_name(cx, init, &name, reg, span)?
+                    }
+                    (Some(init), BindingStorage::Slot { .. }) => {
+                        crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?
+                    }
+                    (None, _) => {
                         let dst = cx.alloc_scratch();
                         cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
                         dst

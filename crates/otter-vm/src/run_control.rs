@@ -9,8 +9,8 @@
 //! - [`VmError`] — structured interpreter/runtime failure categories.
 //! - [`StackFrameSnapshot`] and [`RunError`] — error plus stack context returned
 //!   from VM entry points.
-//! - [`DEFAULT_MAX_STACK_DEPTH`] and [`NO_HANDLER_OFFSET`] — execution-control
-//!   constants shared with embedders and bytecode helpers.
+//! - [`DEFAULT_MAX_STACK_DEPTH`] — execution-control constants shared with
+//!   embedders.
 //!
 //! # Invariants
 //! - Interrupts are cooperative: callers may trip [`InterruptFlag`] from any
@@ -338,12 +338,6 @@ pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
 
 /// Default synchronous re-entry limit for host-driven JS callbacks.
 pub const DEFAULT_MAX_SYNC_REENTRY_DEPTH: u32 = 256;
-
-/// Re-export of the bytecode-defined sentinel for "this try block
-/// has no catch / finally clause". Kept on the VM surface so
-/// embedders that want to hand-build EnterTry operands have one
-/// import path for the runtime semantics.
-pub use otter_bytecode::NO_HANDLER_OFFSET;
 
 /// One stack-frame snapshot captured at the moment an error is
 /// raised. Foundation slice 16 ships this — task 24 (exceptions)

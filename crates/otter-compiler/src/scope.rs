@@ -175,23 +175,13 @@ pub(crate) struct LoopFrame {
     /// `false` for a `switch` body, where `continue` must skip the
     /// frame and target the enclosing loop instead.
     pub(crate) is_real_loop: bool,
-    /// For a `for…of` frame, the register holding the iterator that
-    /// must be closed (§7.4.9 IteratorClose) when an abrupt
-    /// completion (`break` / labelled `continue` / `return`) exits the
-    /// loop. `None` for every other loop / switch frame.
-    pub(crate) iterator_close_reg: Option<u16>,
-    /// Runtime try-handler-stack depth in effect when this frame was
-    /// entered. A `break`/`continue` targeting this frame must run
-    /// every `finally` pushed since (handlers above this floor).
-    pub(crate) handler_floor: u32,
-    /// `finally`-handler count in effect at entry; a target whose
-    /// `active_finally` exceeds this needs the finally-routing
-    /// `break`/`continue` opcode.
-    pub(crate) finally_floor: u32,
-    /// [`crate::function_context::FunctionContext::finally_body_depth`]
-    /// at entry; an exit jump discards one parked completion per
-    /// finally BODY it abandons.
-    pub(crate) finally_body_floor: u32,
+    /// [`crate::function_context::FunctionContext::control`] depth a
+    /// `break` to this frame leaves through: every scope above it is
+    /// crossed, including the frame's own iterator.
+    pub(crate) break_depth: usize,
+    /// Control depth a `continue` to this frame leaves through: the frame's
+    /// own iterator stays open.
+    pub(crate) continue_depth: usize,
 }
 
 impl LoopFrame {
@@ -201,10 +191,8 @@ impl LoopFrame {
             break_patches: Vec::new(),
             label: None,
             is_real_loop: true,
-            iterator_close_reg: None,
-            handler_floor: 0,
-            finally_floor: 0,
-            finally_body_floor: 0,
+            break_depth: 0,
+            continue_depth: 0,
         }
     }
 
@@ -214,10 +202,8 @@ impl LoopFrame {
             break_patches: Vec::new(),
             label: None,
             is_real_loop: false,
-            iterator_close_reg: None,
-            handler_floor: 0,
-            finally_floor: 0,
-            finally_body_floor: 0,
+            break_depth: 0,
+            continue_depth: 0,
         }
     }
 }

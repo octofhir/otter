@@ -36,7 +36,7 @@
 
 use serde::Serialize;
 
-use crate::{NO_HANDLER_OFFSET, Op, Operand};
+use crate::{Op, Operand};
 
 /// Authority/precision of one schema field family.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -316,8 +316,6 @@ pub enum ControlFlow {
     Throw,
     /// Suspend and later resume a frame.
     Suspend,
-    /// Mutate or resume structured exception control flow.
-    ExceptionRegion,
 }
 
 /// Base coordinate used by an encoded relative successor.
@@ -366,42 +364,16 @@ impl SuccessorShape {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum ExceptionSuccessorSpec {
-    /// Optional encoded handler target; the sentinel means no edge.
-    OptionalRelativeTarget {
-        /// Operand position containing the signed byte delta.
-        operand_index: usize,
-        /// Coordinate from which the byte delta is applied.
-        base: RelativeTargetBase,
-        /// Immediate value representing an absent handler.
-        absent_value: i32,
-    },
-    /// Unwind to the current frame handler or continue in the caller.
-    DynamicFrameHandlerOrCaller,
+    /// Land in the innermost entry of the function's handler table that
+    /// covers the instruction, or continue in the caller.
+    HandlerTableOrCaller,
     /// The current activation has already completed: route a catchable failure
     /// through the caller's handler or let it escape the dispatch stack.
     ///
     /// The return family owns this terminal intra-function edge because
     /// derived-constructor validation and async completion settlement happen
-    /// after the returning frame is removed. `TailCall` deliberately retains
-    /// [`Self::DynamicFrameHandlerOrCaller`]: an activation that cannot be
-    /// discarded falls back to an ordinary call while its handlers remain
-    /// active; a discarded activation is proven to own no handlers.
+    /// after the returning frame is removed.
     CallerHandlerOrUncaught,
-    /// Resume a parked throw/return/break/continue completion.
-    ResumeParkedAbruptCompletion,
-    /// Resume a suspended frame with a `return` completion: discard catch-only
-    /// handlers, run every pending `finally`, then complete the frame.
-    ///
-    /// Ordinary `yield` owns this dynamic edge because
-    /// `Generator.prototype.return` resumes after the suspension without
-    /// executing another bytecode opcode first. Delegating `yield*` instead
-    /// receives the resume kind as ordinary data.
-    RunFinallyHandlersToFrameReturn,
-    /// Run pending finally handlers down to an encoded handler-stack floor.
-    RunFinallyHandlersToFloor {
-        /// Operand position containing the non-negative floor.
-        floor_operand_index: usize,
-    },
 }
 
 /// Precision of an opcode's exception/unwind successors.
@@ -1251,147 +1223,141 @@ opcode_schema! {
     (Op::LoadThis, 0x37),
     (Op::LoadNewTarget, 0x38),
     (Op::Throw, 0x39),
-    (Op::EnterTry, 0x3A),
-    (Op::LeaveTry, 0x3B),
-    (Op::EndFinally, 0x3C),
-    (Op::NewError, 0x3D),
-    (Op::GetIterator, 0x3E),
-    (Op::IteratorNext, 0x3F),
-    (Op::ArrayPush, 0x40),
-    (Op::CallSpread, 0x41),
-    (Op::New, 0x42),
-    (Op::NewSpread, 0x43),
-    (Op::SuperConstructSpread, 0x44),
-    (Op::MakeClass, 0x45),
-    (Op::MathLoad, 0x46),
-    (Op::CollectRest, 0x47),
-    (Op::ReturnValue, 0x48),
-    (Op::ReturnUndefined, 0x49),
-    (Op::NewObject, 0x4A),
-    (Op::LoadProperty, 0x4B),
-    (Op::StoreProperty, 0x4C),
-    (Op::DeleteProperty, 0x4D),
-    (Op::GetPrototype, 0x4E),
-    (Op::SetPrototype, 0x4F),
-    (Op::NewArray, 0x50),
-    (Op::LoadElement, 0x51),
-    (Op::StoreElement, 0x52),
-    (Op::ArrayLength, 0x53),
-    (Op::HasProperty, 0x54),
-    (Op::Instanceof, 0x55),
-    (Op::Eval, 0x56),
-    (Op::NewFunction, 0x57),
-    (Op::LoadGlobalThis, 0x58),
-    (Op::LoadGlobalOrThrow, 0x59),
-    (Op::CollectArguments, 0x5A),
-    (Op::LoadGlobalOrUndefined, 0x5B),
-    (Op::DefineGlobalVar, 0x5C),
-    (Op::ImportMetaResolve, 0x5D),
-    (Op::ImportNamespaceDynamic, 0x5E),
-    (Op::ImportNamespace, 0x5F),
-    (Op::PromiseFulfilledOf, 0x60),
-    (Op::TemporalLoad, 0x61),
-    (Op::NewCollection, 0x62),
-    (Op::NewWeakRef, 0x63),
-    (Op::NewFinalizationRegistry, 0x64),
-    (Op::SymbolLoad, 0x65),
-    (Op::TypeOf, 0x66),
-    (Op::DeleteElement, 0x67),
-    (Op::Await, 0x68),
-    (Op::SameValue, 0x69),
-    (Op::IsArray, 0x6A),
-    (Op::LooseEqual, 0x6B),
-    (Op::LooseNotEqual, 0x6C),
-    (Op::NewBuiltinError, 0x6D),
-    (Op::LoadBuiltinError, 0x6E),
-    (Op::BigIntCall, 0x6F),
-    (Op::ArrayConstruct, 0x70),
-    (Op::ArrayFrom, 0x71),
-    (Op::ArrayOf, 0x72),
-    (Op::ArrayBufferCall, 0x73),
-    (Op::DataViewCall, 0x74),
-    (Op::Yield, 0x75),
-    (Op::SharedArrayBufferCall, 0x76),
-    (Op::ToPrimitive, 0x77),
-    (Op::ForInKeys, 0x78),
-    (Op::CopyDataProperties, 0x79),
-    (Op::DefineOwnProperty, 0x7A),
-    (Op::IteratorClose, 0x7B),
-    (Op::IteratorCloseStart, 0x7C),
-    (Op::IteratorCloseEnd, 0x7D),
-    (Op::GeneratorStart, 0x7E),
-    (Op::GetAsyncIterator, 0x7F),
-    (Op::BindThisValue, 0x80),
-    (Op::LoadSuperProperty, 0x81),
-    (Op::LoadSuperElement, 0x82),
-    (Op::SetSuperProperty, 0x83),
-    (Op::SetSuperElement, 0x84),
-    (Op::JumpViaFinally, 0x85),
-    (Op::CreateContext, 0x86),
-    (Op::ImportNamespaceDeferred, 0x87),
-    (Op::EvaluateModule, 0x88),
-    (Op::MarkModuleEvaluated, 0x89),
-    (Op::StarReexport, 0x8A),
-    (Op::ModuleNamespaceObject, 0x8B),
-    (Op::LoadImportBinding, 0x8C),
-    (Op::StoreContextSlotChecked, 0x8D),
-    (Op::DeclareGlobalVar, 0x8E),
-    (Op::LoadLookupGlobal, 0x8F),
-    (Op::StoreLookupGlobal, 0x90),
-    (Op::TypeofLookupGlobal, 0x91),
-    (Op::DefineGlobalFunction, 0x92),
-    (Op::DeclareGlobalLex, 0x93),
-    (Op::StoreGlobalBinding, 0x94),
-    (Op::InitGlobalLex, 0x95),
-    (Op::ValidateGlobalDecl, 0x96),
-    (Op::ToObject, 0x97),
-    (Op::ToNumeric, 0x98),
-    (Op::PrivateGet, 0x99),
-    (Op::PrivateSet, 0x9A),
-    (Op::YieldDelegate, 0x9B),
-    (Op::DefineDataProperty, 0x9C),
-    (Op::SetFunctionName, 0x9D),
-    (Op::ClassCheck, 0x9E),
-    (Op::ToPropertyKey, 0x9F),
-    (Op::Increment, 0xA0),
-    (Op::PrivateBrandCheck, 0xA1),
-    (Op::LoadLookupSlot, 0xA2),
-    (Op::GetTemplateObject, 0xA3),
-    (Op::DeleteLookupGlobal, 0xA4),
-    (Op::NewPrivateName, 0xA5),
-    (Op::TailCall, 0xA6),
-    (Op::IsEvalIntrinsic, 0xA7),
-    (Op::PopParkedFinally, 0xA8),
-    (Op::GlobalBindingExists, 0xA9),
-    (Op::StoreGlobalChecked, 0xAA),
-    (Op::AddImm, 0xAB),
-    (Op::SubImm, 0xAC),
-    (Op::BitwiseAndImm, 0xAD),
-    (Op::LessThanImm, 0xAE),
-    (Op::EqualImm, 0xAF),
-    (Op::NotEqualImm, 0xB0),
-    (Op::SuperConstruct, 0xB1),
-    (Op::StoreLookupSlot, 0xB2),
-    (Op::DeleteLookupSlot, 0xB3),
-    (Op::AsyncIteratorReturn, 0xB4),
-    (Op::CheckIteratorResult, 0xB5),
-    (Op::ResolveLookupRef, 0xB6),
-    (Op::LoadContextSlotChecked, 0xB7),
-    (Op::StoreRef, 0xB8),
-    (Op::DeclareEvalVar, 0xB9),
-    (Op::StorePropertyStrict, 0xBA),
-    (Op::StoreElementStrict, 0xBB),
-    (Op::CallForwardArguments, 0xBC),
-    (Op::NewObjectLiteral, 0xBD),
-    (Op::LoadArgumentsLength, 0xBE),
-    (Op::LoadArgumentsElement, 0xBF),
-    (Op::LoadClosureContext, 0xC0),
-    (Op::LoadSelf, 0xC1),
-    (Op::CopyContext, 0xC2),
-    (Op::BindThisContextSlot, 0xC3),
-    (Op::ReturnDerived, 0xC4),
-    (Op::StoreVarScope, 0xC5),
-    (Op::TestTypeOf, 0xC6),
+    (Op::NewError, 0x3A),
+    (Op::GetIterator, 0x3B),
+    (Op::IteratorNext, 0x3C),
+    (Op::ArrayPush, 0x3D),
+    (Op::CallSpread, 0x3E),
+    (Op::New, 0x3F),
+    (Op::NewSpread, 0x40),
+    (Op::SuperConstructSpread, 0x41),
+    (Op::MakeClass, 0x42),
+    (Op::MathLoad, 0x43),
+    (Op::CollectRest, 0x44),
+    (Op::ReturnValue, 0x45),
+    (Op::ReturnUndefined, 0x46),
+    (Op::NewObject, 0x47),
+    (Op::LoadProperty, 0x48),
+    (Op::StoreProperty, 0x49),
+    (Op::DeleteProperty, 0x4A),
+    (Op::GetPrototype, 0x4B),
+    (Op::SetPrototype, 0x4C),
+    (Op::NewArray, 0x4D),
+    (Op::LoadElement, 0x4E),
+    (Op::StoreElement, 0x4F),
+    (Op::ArrayLength, 0x50),
+    (Op::HasProperty, 0x51),
+    (Op::Instanceof, 0x52),
+    (Op::Eval, 0x53),
+    (Op::NewFunction, 0x54),
+    (Op::LoadGlobalThis, 0x55),
+    (Op::LoadGlobalOrThrow, 0x56),
+    (Op::CollectArguments, 0x57),
+    (Op::LoadGlobalOrUndefined, 0x58),
+    (Op::DefineGlobalVar, 0x59),
+    (Op::ImportMetaResolve, 0x5A),
+    (Op::ImportNamespaceDynamic, 0x5B),
+    (Op::ImportNamespace, 0x5C),
+    (Op::PromiseFulfilledOf, 0x5D),
+    (Op::TemporalLoad, 0x5E),
+    (Op::NewCollection, 0x5F),
+    (Op::NewWeakRef, 0x60),
+    (Op::NewFinalizationRegistry, 0x61),
+    (Op::SymbolLoad, 0x62),
+    (Op::TypeOf, 0x63),
+    (Op::DeleteElement, 0x64),
+    (Op::Await, 0x65),
+    (Op::SameValue, 0x66),
+    (Op::IsArray, 0x67),
+    (Op::LooseEqual, 0x68),
+    (Op::LooseNotEqual, 0x69),
+    (Op::NewBuiltinError, 0x6A),
+    (Op::LoadBuiltinError, 0x6B),
+    (Op::BigIntCall, 0x6C),
+    (Op::ArrayConstruct, 0x6D),
+    (Op::ArrayFrom, 0x6E),
+    (Op::ArrayOf, 0x6F),
+    (Op::ArrayBufferCall, 0x70),
+    (Op::DataViewCall, 0x71),
+    (Op::Yield, 0x72),
+    (Op::SharedArrayBufferCall, 0x73),
+    (Op::ToPrimitive, 0x74),
+    (Op::ForInKeys, 0x75),
+    (Op::CopyDataProperties, 0x76),
+    (Op::DefineOwnProperty, 0x77),
+    (Op::IteratorClose, 0x78),
+    (Op::IteratorCloseThrow, 0x79),
+    (Op::GeneratorStart, 0x7A),
+    (Op::GetAsyncIterator, 0x7B),
+    (Op::BindThisValue, 0x7C),
+    (Op::LoadSuperProperty, 0x7D),
+    (Op::LoadSuperElement, 0x7E),
+    (Op::SetSuperProperty, 0x7F),
+    (Op::SetSuperElement, 0x80),
+    (Op::CreateContext, 0x81),
+    (Op::ImportNamespaceDeferred, 0x82),
+    (Op::EvaluateModule, 0x83),
+    (Op::MarkModuleEvaluated, 0x84),
+    (Op::StarReexport, 0x85),
+    (Op::ModuleNamespaceObject, 0x86),
+    (Op::LoadImportBinding, 0x87),
+    (Op::StoreContextSlotChecked, 0x88),
+    (Op::DeclareGlobalVar, 0x89),
+    (Op::LoadLookupGlobal, 0x8A),
+    (Op::StoreLookupGlobal, 0x8B),
+    (Op::TypeofLookupGlobal, 0x8C),
+    (Op::DefineGlobalFunction, 0x8D),
+    (Op::DeclareGlobalLex, 0x8E),
+    (Op::StoreGlobalBinding, 0x8F),
+    (Op::InitGlobalLex, 0x90),
+    (Op::ValidateGlobalDecl, 0x91),
+    (Op::ToObject, 0x92),
+    (Op::ToNumeric, 0x93),
+    (Op::PrivateGet, 0x94),
+    (Op::PrivateSet, 0x95),
+    (Op::YieldDelegate, 0x96),
+    (Op::DefineDataProperty, 0x97),
+    (Op::SetFunctionName, 0x98),
+    (Op::ClassCheck, 0x99),
+    (Op::ToPropertyKey, 0x9A),
+    (Op::Increment, 0x9B),
+    (Op::PrivateBrandCheck, 0x9C),
+    (Op::LoadLookupSlot, 0x9D),
+    (Op::GetTemplateObject, 0x9E),
+    (Op::DeleteLookupGlobal, 0x9F),
+    (Op::NewPrivateName, 0xA0),
+    (Op::TailCall, 0xA1),
+    (Op::IsEvalIntrinsic, 0xA2),
+    (Op::GlobalBindingExists, 0xA3),
+    (Op::StoreGlobalChecked, 0xA4),
+    (Op::AddImm, 0xA5),
+    (Op::SubImm, 0xA6),
+    (Op::BitwiseAndImm, 0xA7),
+    (Op::LessThanImm, 0xA8),
+    (Op::EqualImm, 0xA9),
+    (Op::NotEqualImm, 0xAA),
+    (Op::SuperConstruct, 0xAB),
+    (Op::StoreLookupSlot, 0xAC),
+    (Op::DeleteLookupSlot, 0xAD),
+    (Op::AsyncIteratorReturn, 0xAE),
+    (Op::CheckIteratorResult, 0xAF),
+    (Op::ResolveLookupRef, 0xB0),
+    (Op::LoadContextSlotChecked, 0xB1),
+    (Op::StoreRef, 0xB2),
+    (Op::DeclareEvalVar, 0xB3),
+    (Op::StorePropertyStrict, 0xB4),
+    (Op::StoreElementStrict, 0xB5),
+    (Op::CallForwardArguments, 0xB6),
+    (Op::NewObjectLiteral, 0xB7),
+    (Op::LoadArgumentsLength, 0xB8),
+    (Op::LoadArgumentsElement, 0xB9),
+    (Op::LoadClosureContext, 0xBA),
+    (Op::LoadSelf, 0xBB),
+    (Op::CopyContext, 0xBC),
+    (Op::BindThisContextSlot, 0xBD),
+    (Op::ReturnDerived, 0xBE),
+    (Op::StoreVarScope, 0xBF),
+    (Op::TestTypeOf, 0xC0),
 }
 
 /// Return the authoritative schema row for `op`.
@@ -1552,14 +1518,12 @@ const COUNTED_VALUES_PREFIX: &[OperandSpec] = &[W, CONST];
 const OBJECT_LITERAL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
 const METHOD_CALL_PREFIX: &[OperandSpec] = &[W, R, CONST, CONST];
 const NAMESPACE_CALL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
-const ENTER_TRY: &[OperandSpec] = &[IMM, IMM, W];
 const WRITE_READ_CONST: &[OperandSpec] = &[W, R, CONST];
 const WRITE_CONST_CONST: &[OperandSpec] = &[W, CONST, CONST];
 const READ_CONST_READ_WRITE: &[OperandSpec] = &[R, CONST, R, W];
 const READ_READ: &[OperandSpec] = &[R, R];
 const READ_READ_READ: &[OperandSpec] = &[R, R, R];
 const WRITE_WRITE_READ: &[OperandSpec] = &[W, W, R];
-const JUMP_VIA_FINALLY: &[OperandSpec] = &[IMM, IMM];
 const READ_CONST: &[OperandSpec] = &[R, CONST];
 const CONST_READ: &[OperandSpec] = &[CONST, R];
 const WRITE_READ_WRITE: &[OperandSpec] = &[W, R, W];
@@ -1651,8 +1615,6 @@ const fn operand_shape(op: Op) -> OperandShape {
         },
         Op::CallForwardArguments => OperandShape::Fixed(CALL_FORWARD_ARGUMENTS),
         Op::Throw => OperandShape::Fixed(&[R]),
-        Op::EnterTry => OperandShape::Fixed(ENTER_TRY),
-        Op::EndFinally => OperandShape::Fixed(EMPTY),
         Op::NewObject => OperandShape::Fixed(WRITE),
         Op::LoadProperty | Op::DeleteProperty => OperandShape::Fixed(WRITE_READ_CONST),
         Op::StoreProperty => OperandShape::Fixed(READ_CONST_READ_WRITE),
@@ -1668,10 +1630,9 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::StoreElement => OperandShape::Fixed(READ_READ_READ),
         Op::StoreElementStrict => OperandShape::Fixed(READ_READ_READ),
         Op::IteratorNext => OperandShape::Fixed(WRITE_WRITE_READ),
-        Op::IteratorClose
-        | Op::IteratorCloseStart
-        | Op::IteratorCloseEnd
-        | Op::CheckIteratorResult => OperandShape::Fixed(&[R]),
+        Op::IteratorClose | Op::IteratorCloseThrow | Op::CheckIteratorResult => {
+            OperandShape::Fixed(&[R])
+        }
         Op::AsyncIteratorReturn => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::ForInKeys => OperandShape::Fixed(WRITE_READ),
         Op::CreateContext => OperandShape::Fixed(CREATE_CONTEXT),
@@ -1691,8 +1652,6 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::StoreRef => OperandShape::Fixed(STORE_REF),
         Op::DeclareEvalVar => OperandShape::Fixed(DECLARE_EVAL_VAR),
         Op::StoreVarScope => OperandShape::Fixed(STORE_VAR_SCOPE),
-        Op::JumpViaFinally => OperandShape::Fixed(JUMP_VIA_FINALLY),
-        Op::PopParkedFinally => OperandShape::Fixed(&[IMM]),
         Op::QueueMicrotask => OperandShape::Variadic {
             prefix: &[R, CONST],
             count_operand_index: 1,
@@ -1729,13 +1688,12 @@ const fn operand_shape(op: Op) -> OperandShape {
         | Op::NewPrivateName
         | Op::EvaluateModule => OperandShape::Fixed(WRITE_CONST),
         Op::MakeClosure => OperandShape::Fixed(MAKE_CLOSURE),
-        Op::LeaveTry | Op::GeneratorStart => OperandShape::Fixed(EMPTY),
+        Op::GeneratorStart => OperandShape::Fixed(EMPTY),
         Op::NewError
         | Op::ImportMetaResolve
         | Op::PromiseFulfilledOf
         | Op::NewWeakRef
-        | Op::NewFinalizationRegistry
-        | Op::Yield => OperandShape::Fixed(WRITE_READ),
+        | Op::NewFinalizationRegistry => OperandShape::Fixed(WRITE_READ),
         Op::CallSpread => OperandShape::Fixed(WRITE_READ_READ_READ),
         Op::NewSpread | Op::SuperConstructSpread | Op::ImportNamespaceDynamic => {
             OperandShape::Fixed(WRITE_READ_READ)
@@ -1752,7 +1710,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::DefineOwnProperty | Op::PrivateSet | Op::DefineDataProperty => {
             OperandShape::Fixed(&[R, R, R])
         }
-        Op::YieldDelegate => OperandShape::Fixed(WRITE_WRITE_READ),
+        Op::Yield | Op::YieldDelegate => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::SetFunctionName => OperandShape::Fixed(&[R, R, CONST]),
         Op::StoreGlobalChecked => OperandShape::Fixed(&[R, CONST, R]),
         Op::BindThisValue => OperandShape::Fixed(&[R]),
@@ -1827,11 +1785,7 @@ const fn successor_shape(op: Op) -> SuccessorShape {
             SuccessorShape::new(RETURN_SUCCESSORS)
         }
         Op::TailCall => SuccessorShape::new(TAIL_CALL_SUCCESSORS),
-        Op::EnterTry | Op::LeaveTry | Op::EndFinally | Op::PopParkedFinally => {
-            SuccessorShape::new(FALLTHROUGH_SUCCESSORS)
-        }
         Op::Throw => SuccessorShape::new(NO_NORMAL_SUCCESSORS),
-        Op::JumpViaFinally => SuccessorShape::new(JUMP_SUCCESSORS),
         Op::Await | Op::Yield | Op::YieldDelegate | Op::GeneratorStart => {
             SuccessorShape::new(FALLTHROUGH_SUCCESSORS)
         }
@@ -1843,51 +1797,23 @@ const fn successor_shape(op: Op) -> SuccessorShape {
             | ControlFlow::Branch
             | ControlFlow::Return
             | ControlFlow::Throw
-            | ControlFlow::Suspend
-            | ControlFlow::ExceptionRegion => unreachable!(),
+            | ControlFlow::Suspend => unreachable!(),
         },
     }
 }
 
-const ENTER_TRY_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] = &[
-    ExceptionSuccessorSpec::OptionalRelativeTarget {
-        operand_index: 0,
-        base: RelativeTargetBase::AfterOpcode,
-        absent_value: NO_HANDLER_OFFSET,
-    },
-    ExceptionSuccessorSpec::OptionalRelativeTarget {
-        operand_index: 1,
-        base: RelativeTargetBase::AfterOpcode,
-        absent_value: NO_HANDLER_OFFSET,
-    },
-];
 const THROW_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
-    &[ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller];
+    &[ExceptionSuccessorSpec::HandlerTableOrCaller];
 const RETURN_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
     &[ExceptionSuccessorSpec::CallerHandlerOrUncaught];
-const YIELD_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] = &[
-    ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller,
-    ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn,
-];
-const END_FINALLY_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
-    &[ExceptionSuccessorSpec::ResumeParkedAbruptCompletion];
-const JUMP_VIA_FINALLY_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] =
-    &[ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
-        floor_operand_index: 1,
-    }];
 const NO_EXCEPTION_SUCCESSORS: &[ExceptionSuccessorSpec] = &[];
 
 const fn exception_successor_shape(op: Op) -> ExceptionSuccessorShape {
     match op {
-        Op::EnterTry => ExceptionSuccessorShape::new(ENTER_TRY_EXCEPTION_SUCCESSORS),
         Op::Throw => ExceptionSuccessorShape::new(THROW_EXCEPTION_SUCCESSORS),
         Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived => {
             ExceptionSuccessorShape::new(RETURN_EXCEPTION_SUCCESSORS)
         }
-        Op::Yield => ExceptionSuccessorShape::new(YIELD_EXCEPTION_SUCCESSORS),
-        Op::EndFinally => ExceptionSuccessorShape::new(END_FINALLY_EXCEPTION_SUCCESSORS),
-        Op::JumpViaFinally => ExceptionSuccessorShape::new(JUMP_VIA_FINALLY_EXCEPTION_SUCCESSORS),
-        Op::PopParkedFinally => ExceptionSuccessorShape::new(NO_EXCEPTION_SUCCESSORS),
         _ if !effects(op).may_throw => ExceptionSuccessorShape::new(NO_EXCEPTION_SUCCESSORS),
         _ => ExceptionSuccessorShape::new(THROW_EXCEPTION_SUCCESSORS),
     }
@@ -1895,15 +1821,12 @@ const fn exception_successor_shape(op: Op) -> ExceptionSuccessorShape {
 
 const fn control_flow(op: Op) -> ControlFlow {
     match op {
-        Op::Jump | Op::JumpViaFinally => ControlFlow::Jump,
+        Op::Jump => ControlFlow::Jump,
         Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => ControlFlow::Branch,
         Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived | Op::TailCall => {
             ControlFlow::Return
         }
         Op::Throw => ControlFlow::Throw,
-        Op::EnterTry | Op::LeaveTry | Op::EndFinally | Op::PopParkedFinally => {
-            ControlFlow::ExceptionRegion
-        }
         Op::Await | Op::Yield | Op::YieldDelegate | Op::GeneratorStart => ControlFlow::Suspend,
         Op::Call
         | Op::CallWithThis
@@ -2118,8 +2041,7 @@ const fn effects(op: Op) -> OpcodeEffects {
         | Op::Jump
         | Op::JumpIfTrue
         | Op::JumpIfFalse
-        | Op::JumpIfNullish
-        | Op::LeaveTry => OpcodeEffects::LEAF,
+        | Op::JumpIfNullish => OpcodeEffects::LEAF,
         // Allocation-free, non-reentrant leaves that own a typed exception
         // exit: `LoadThis` can hit the derived-`this` TDZ, and a return
         // completion can fail only after leaving this frame.
@@ -2389,20 +2311,20 @@ mod tests {
         let k = (K, N, None);
         let coord = (I, N, Some(ImmediateDomain::ContextCoord));
 
-        assert_row(Op::LoadClosureContext, 0xC0, &[w], None);
-        assert_row(Op::LoadSelf, 0xC1, &[w], None);
+        assert_row(Op::LoadClosureContext, 0xBA, &[w], None);
+        assert_row(Op::LoadSelf, 0xBB, &[w], None);
         assert_row(
             Op::CreateContext,
-            0x86,
+            0x81,
             &[w, r, (I, N, Some(ImmediateDomain::ScopeIndex))],
             None,
         );
-        assert_row(Op::CopyContext, 0xC2, &[w, r], None);
+        assert_row(Op::CopyContext, 0xBC, &[w, r], None);
         assert_row(Op::LoadContextSlot, 0x32, &[w, r, coord], None);
         assert_row(Op::StoreContextSlot, 0x33, &[r, r, coord], None);
         assert_row(
             Op::LoadContextSlotChecked,
-            0xB7,
+            0xB1,
             &[w, r, coord],
             Some(BindingSemantics::Read(BindingRead::ContextSlot {
                 destination: 0,
@@ -2412,7 +2334,7 @@ mod tests {
         );
         assert_row(
             Op::StoreContextSlotChecked,
-            0x8D,
+            0x88,
             &[r, r, coord],
             Some(BindingSemantics::Write(BindingWrite::ContextSlot {
                 value: 0,
@@ -2422,7 +2344,7 @@ mod tests {
         );
         assert_row(
             Op::BindThisContextSlot,
-            0xC3,
+            0xBD,
             &[r, r, coord],
             Some(BindingSemantics::Write(BindingWrite::BindThis {
                 value: 0,
@@ -2430,10 +2352,10 @@ mod tests {
                 coord: 2,
             })),
         );
-        assert_row(Op::ReturnDerived, 0xC4, &[r, r, coord], None);
+        assert_row(Op::ReturnDerived, 0xBE, &[r, r, coord], None);
         assert_row(Op::MakeClosure, 0x31, &[w, k, r], None);
-        assert_row(Op::Eval, 0x56, &[w, r, r, (I, N, None)], None);
-        assert_row(Op::CallForwardArguments, 0xBC, &[w, r, r, r, r], None);
+        assert_row(Op::Eval, 0x53, &[w, r, r, (I, N, None)], None);
+        assert_row(Op::CallForwardArguments, 0xB6, &[w, r, r, r, r], None);
     }
 
     #[test]
@@ -2448,7 +2370,7 @@ mod tests {
 
         assert_row(
             Op::LoadLookupSlot,
-            0xA2,
+            0x9D,
             &[w, r, k, coord],
             Some(BindingSemantics::Read(BindingRead::LookupSlot {
                 destination: 0,
@@ -2459,7 +2381,7 @@ mod tests {
         );
         assert_row(
             Op::StoreLookupSlot,
-            0xB2,
+            0xAC,
             &[r, r, k, coord, (I, N, Some(ImmediateDomain::StoreFallback))],
             Some(BindingSemantics::Write(BindingWrite::LookupSlot {
                 value: 0,
@@ -2471,7 +2393,7 @@ mod tests {
         );
         assert_row(
             Op::DeleteLookupSlot,
-            0xB3,
+            0xAD,
             &[w, r, k, depth],
             Some(BindingSemantics::Delete(BindingDelete::LookupSlot {
                 destination: 0,
@@ -2481,8 +2403,8 @@ mod tests {
             })),
         );
         for (op, byte, missing) in [
-            (Op::LoadLookupGlobal, 0x8F, BindingMissing::Throw),
-            (Op::TypeofLookupGlobal, 0x91, BindingMissing::Undefined),
+            (Op::LoadLookupGlobal, 0x8A, BindingMissing::Throw),
+            (Op::TypeofLookupGlobal, 0x8C, BindingMissing::Undefined),
         ] {
             assert_row(
                 op,
@@ -2499,7 +2421,7 @@ mod tests {
         }
         assert_row(
             Op::StoreLookupGlobal,
-            0x90,
+            0x8B,
             &[r, r, k, (I, N, Some(ImmediateDomain::LookupGlobalMode))],
             Some(BindingSemantics::Write(BindingWrite::LookupGlobal {
                 value: 0,
@@ -2510,7 +2432,7 @@ mod tests {
         );
         assert_row(
             Op::DeleteLookupGlobal,
-            0xA4,
+            0x9F,
             &[w, r, k, depth],
             Some(BindingSemantics::Delete(BindingDelete::LookupGlobal {
                 destination: 0,
@@ -2521,7 +2443,7 @@ mod tests {
         );
         assert_row(
             Op::ResolveLookupRef,
-            0xB6,
+            0xB0,
             &[w, r, k, (I, N, Some(ImmediateDomain::LookupRefTarget))],
             Some(BindingSemantics::Read(BindingRead::ResolveRef {
                 destination: 0,
@@ -2532,7 +2454,7 @@ mod tests {
         );
         assert_row(
             Op::StoreRef,
-            0xB8,
+            0xB2,
             &[r, r, k, (I, N, Some(ImmediateDomain::StoreRefMode))],
             Some(BindingSemantics::Write(BindingWrite::StoreRef {
                 value: 0,
@@ -2543,7 +2465,7 @@ mod tests {
         );
         assert_row(
             Op::DeclareEvalVar,
-            0xB9,
+            0xB3,
             &[r, k, depth],
             Some(BindingSemantics::Write(BindingWrite::DeclareEvalVar {
                 context: 0,
@@ -2553,7 +2475,7 @@ mod tests {
         );
         assert_row(
             Op::StoreVarScope,
-            0xC5,
+            0xBF,
             &[r, r, k, depth],
             Some(BindingSemantics::Write(BindingWrite::VarScope {
                 value: 0,
@@ -2617,7 +2539,7 @@ mod tests {
         for op in [Op::LoadContextSlotChecked, Op::StoreContextSlotChecked] {
             assert_eq!(
                 opcode_schema(op).exception_successor_shape.exact(),
-                &[ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller]
+                &[ExceptionSuccessorSpec::HandlerTableOrCaller]
             );
         }
         let return_derived = opcode_schema(Op::ReturnDerived);
@@ -2843,18 +2765,6 @@ mod tests {
                     .operand_shape
                     .fixed()
                     .expect("exact relative successors require an exact operand shape");
-                assert_eq!(operands[*operand_index].kind, OperandKind::Imm32);
-            }
-            for successor in schema.exception_successor_shape.exact() {
-                let ExceptionSuccessorSpec::OptionalRelativeTarget { operand_index, .. } =
-                    successor
-                else {
-                    continue;
-                };
-                let operands = schema
-                    .operand_shape
-                    .fixed()
-                    .expect("encoded exception targets require an exact fixed shape");
                 assert_eq!(operands[*operand_index].kind, OperandKind::Imm32);
             }
         }

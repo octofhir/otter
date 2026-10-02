@@ -558,6 +558,7 @@ pub(crate) fn try_compile(
         Box::default(),
         load_ic_cells,
         store_ic_cells,
+        Box::default(),
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -5413,7 +5414,7 @@ mod tests {
     use otter_bytecode::opcode_schema::{
         BindingRead, BindingSemantics, OPCODE_SCHEMA, OperandKind, RegisterAccess,
     };
-    use otter_bytecode::{NO_HANDLER_OFFSET, Op, Operand};
+    use otter_bytecode::{Op, Operand};
     use otter_vm::{
         JitArtifactFileName, JitArtifactIdentity, JitCacheIrOp, JitCacheIrProgram,
         JitCompileSnapshot, JitDebugTarget, JitDebugTier, JitDirectCallThisMode, JitDirectCallee,
@@ -8483,31 +8484,28 @@ mod tests {
     }
 
     fn binding_catch_hir() -> NumericFunction {
-        let view = JitCompileSnapshot::without_feedback(
+        let view = JitCompileSnapshot::without_feedback_with_handlers(
             197,
             0,
             3,
             vec![
-                JitTestInstruction::new(
-                    Op::EnterTry,
-                    0,
-                    0,
-                    vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(NO_HANDLER_OFFSET),
-                        Operand::Register(2),
-                    ],
-                ),
+                JitTestInstruction::new(Op::Nop, 0, 0, Vec::new()),
                 JitTestInstruction::new(
                     Op::LoadGlobalOrThrow,
                     1,
                     8,
                     vec![Operand::Register(1), Operand::ConstIndex(0)],
                 ),
-                JitTestInstruction::new(Op::LeaveTry, 2, 16, Vec::new()),
+                JitTestInstruction::new(Op::Nop, 2, 16, Vec::new()),
                 JitTestInstruction::new(Op::ReturnValue, 3, 24, vec![Operand::Register(1)]),
                 JitTestInstruction::new(Op::ReturnValue, 4, 32, vec![Operand::Register(2)]),
             ],
+            &[otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 2,
+                target: 4,
+                exception: 2,
+            }],
         );
         NumericFunction::build(&view).expect("caught binding HIR")
     }

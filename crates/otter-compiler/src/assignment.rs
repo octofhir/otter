@@ -31,9 +31,26 @@ enum PreparedAssignmentTarget {
     SuperElement { base_reg: u16, idx_reg: u16 },
 }
 
+/// Whether the value of an assignment expression is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignUse {
+    /// The expression's value flows on.
+    Value,
+    /// Only the store happens.
+    Discarded,
+}
+
 pub(crate) fn compile_assignment(
     cx: &mut Compiler,
     a: &oxc_ast::ast::AssignmentExpression<'_>,
+) -> Result<u16, CompileError> {
+    compile_assignment_with(cx, a, AssignUse::Value)
+}
+
+pub(crate) fn compile_assignment_with(
+    cx: &mut Compiler,
+    a: &oxc_ast::ast::AssignmentExpression<'_>,
+    use_: AssignUse,
 ) -> Result<u16, CompileError> {
     let span = (a.span.start, a.span.end);
     let compound_op = compound_assign_op(a.operator);
@@ -78,14 +95,13 @@ pub(crate) fn compile_assignment(
                     let current =
                         compile_super_member_load(cx, member.property.name.as_str(), span)?;
                     let rhs = compile_expr(cx, &a.right, span)?;
-                    let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                     let dst = cx.alloc_scratch();
                     cx.emit(
                         op,
                         vec![
                             Operand::Register(dst),
-                            Operand::Register(cur_p),
-                            Operand::Register(rhs_p),
+                            Operand::Register(current),
+                            Operand::Register(rhs),
                         ],
                         span,
                     );
@@ -119,14 +135,13 @@ pub(crate) fn compile_assignment(
                     span,
                 );
                 let rhs = compile_expr(cx, &a.right, span)?;
-                let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
                     vec![
                         Operand::Register(dst),
-                        Operand::Register(cur_p),
-                        Operand::Register(rhs_p),
+                        Operand::Register(current),
+                        Operand::Register(rhs),
                     ],
                     span,
                 );
@@ -171,14 +186,13 @@ pub(crate) fn compile_assignment(
                     span,
                 );
                 let rhs = compile_expr(cx, &a.right, span)?;
-                let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
                     vec![
                         Operand::Register(dst),
-                        Operand::Register(cur_p),
-                        Operand::Register(rhs_p),
+                        Operand::Register(current),
+                        Operand::Register(rhs),
                     ],
                     span,
                 );
@@ -228,14 +242,13 @@ pub(crate) fn compile_assignment(
                         span,
                     );
                     let rhs = compile_expr(cx, &a.right, span)?;
-                    let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                     let dst = cx.alloc_scratch();
                     cx.emit(
                         op,
                         vec![
                             Operand::Register(dst),
-                            Operand::Register(cur_p),
-                            Operand::Register(rhs_p),
+                            Operand::Register(current),
+                            Operand::Register(rhs),
                         ],
                         span,
                     );
@@ -269,14 +282,13 @@ pub(crate) fn compile_assignment(
                     span,
                 );
                 let rhs = compile_expr(cx, &a.right, span)?;
-                let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
                     vec![
                         Operand::Register(dst),
-                        Operand::Register(cur_p),
-                        Operand::Register(rhs_p),
+                        Operand::Register(current),
+                        Operand::Register(rhs),
                     ],
                     span,
                 );
@@ -344,6 +356,53 @@ pub(crate) fn compile_assignment(
     }
     // §13.15.2 steps 1.a–1.b — the target reference resolves first.
     let reference = cx.resolve_ref(&name);
+    // A mutable own binding held in a register, which nothing but this
+    // expression can name: no closure captures it and no eval reaches it,
+    // so when the right-hand side does not mention it either, the result is
+    // computed straight into the binding. A compound operator writes it once,
+    // last; a plain right-hand side may write the destination before it
+    // completes (`a || f()`), which only a handler of this frame could
+    // observe.
+    if cx.active_with_envs.is_empty()
+        && (compound_op.is_some() || (direct_identifier && !cx.in_protected_range()))
+        && let Some(reg) = cx.plain_register_binding(&reference)
+        && !crate::capture::expression_mentions_name(&a.right, &name)
+    {
+        match compound_op {
+            None => {
+                crate::expr::compile_expr_into_with_inferred_name(
+                    cx, &a.right, &name, reg, span,
+                )?;
+            }
+            Some(op) => {
+                let rhs = compile_expr(cx, &a.right, span)?;
+                cx.emit(
+                    op,
+                    vec![
+                        Operand::Register(reg),
+                        Operand::Register(reg),
+                        Operand::Register(rhs),
+                    ],
+                    span,
+                );
+            }
+        }
+        cx.emit_module_export_mirror(&name, reg, span);
+        // A read result is a fresh register: a sibling operand the caller
+        // evaluates later may reassign the binding.
+        return Ok(match use_ {
+            AssignUse::Discarded => reg,
+            AssignUse::Value => {
+                let value = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadLocal,
+                    [Operand::Register(value), Operand::Imm32(i32::from(reg))],
+                    span,
+                );
+                value
+            }
+        });
+    }
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
     // An eval extension may intercept the name: pin the reference's base
@@ -400,14 +459,13 @@ pub(crate) fn compile_assignment(
                 cx.patch_branch_to_here(done);
             }
             let rhs = compile_expr(cx, &a.right, span)?;
-            let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
             let dst = cx.alloc_scratch();
             cx.emit(
                 op,
                 vec![
                     Operand::Register(dst),
-                    Operand::Register(cur_p),
-                    Operand::Register(rhs_p),
+                    Operand::Register(current),
+                    Operand::Register(rhs),
                 ],
                 span,
             );
@@ -1101,30 +1159,35 @@ pub(crate) fn assign_array_pattern(
         [Operand::Register(iter_reg), Operand::Register(value_reg)],
         span,
     );
-    cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
-    let mut last_done_reg = None;
-    for element in &arr.elements {
-        let prepared = match element {
-            Some(element) => prepare_maybe_default_target(cx, element, span)?,
-            None => None,
+    crate::destructuring::with_open_iterator(cx, iter_reg, span, |cx| {
+        let mut last_done_reg = None;
+        for element in &arr.elements {
+            let prepared = match element {
+                Some(element) => prepare_maybe_default_target(cx, element, span)?,
+                None => None,
+            };
+            let val_reg = cx.alloc_scratch();
+            let done_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::IteratorNext,
+                [
+                    Operand::Register(val_reg),
+                    Operand::Register(done_reg),
+                    Operand::Register(iter_reg),
+                ],
+                span,
+            );
+            last_done_reg = Some(done_reg);
+            let Some(element) = element else { continue };
+            let elem_span = span;
+            assign_maybe_default_with_prepared(cx, element, prepared, val_reg, elem_span)?;
+        }
+        let Some(rest) = arr.rest.as_ref() else {
+            return Ok(last_done_reg.map_or(
+                crate::destructuring::IteratorTail::Open,
+                crate::destructuring::IteratorTail::Done,
+            ));
         };
-        let val_reg = cx.alloc_scratch();
-        let done_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::IteratorNext,
-            [
-                Operand::Register(val_reg),
-                Operand::Register(done_reg),
-                Operand::Register(iter_reg),
-            ],
-            span,
-        );
-        last_done_reg = Some(done_reg);
-        let Some(element) = element else { continue };
-        let elem_span = span;
-        assign_maybe_default_with_prepared(cx, element, prepared, val_reg, elem_span)?;
-    }
-    if let Some(rest) = arr.rest.as_ref() {
         let prepared_rest = prepare_assignment_target(cx, &rest.target, span)?;
         let collected = cx.alloc_scratch();
         cx.emit(
@@ -1157,17 +1220,8 @@ pub(crate) fn assign_array_pattern(
             Some(target) => assign_prepared_target(cx, target, collected, span)?,
             None => assign_to_target(cx, &rest.target, collected, span)?,
         }
-        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    } else if let Some(done_reg) = last_done_reg {
-        let skip_close = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
-        cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
-        cx.patch_branch_to_here(skip_close);
-        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    } else {
-        cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
-        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    }
-    Ok(())
+        Ok(crate::destructuring::IteratorTail::Drained)
+    })
 }
 
 /// Apply `value_reg` to an `ObjectAssignmentTarget`.

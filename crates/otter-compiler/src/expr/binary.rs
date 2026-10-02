@@ -18,40 +18,6 @@
 use crate::*;
 use oxc_ast::ast::{BinaryExpression, Expression, LogicalExpression, PrivateInExpression};
 
-/// `true` when `expr` provably evaluates to a primitive, so the
-/// `ToPrimitive` step a binary-op lowering would emit ahead of it is
-/// redundant. Conservative — only AST shapes whose result is *always* a
-/// primitive (number / string / boolean / bigint / undefined / null) qualify.
-/// A primitive's `ToPrimitive` has no observable side effect (no `valueOf` /
-/// `toString` / `[Symbol.toPrimitive]` call), so eliding the op is
-/// behavior-preserving; it only removes redundant coercion instructions.
-pub(crate) fn expr_is_primitive(expr: &Expression<'_>) -> bool {
-    // `(expr)` is transparent — recurse through the parens.
-    if let Expression::ParenthesizedExpression(p) = expr {
-        return expr_is_primitive(&p.expression);
-    }
-    matches!(
-        expr,
-        // Literals that are primitives (object literals/regexp excluded).
-        Expression::NumericLiteral(_)
-            | Expression::StringLiteral(_)
-            | Expression::BooleanLiteral(_)
-            | Expression::NullLiteral(_)
-            | Expression::BigIntLiteral(_)
-            // A template literal always coerces its parts to a String.
-            | Expression::TemplateLiteral(_)
-            // Every binary operator yields a primitive: arith/bitwise/shift →
-            // number|bigint, `+` → string|number, compare/equality/`in`/
-            // `instanceof` → boolean.
-            | Expression::BinaryExpression(_)
-            // typeof→string, void→undefined, `!`→boolean, `-`/`+`/`~`→number|
-            // bigint, delete→boolean.
-            | Expression::UnaryExpression(_)
-            // `++`/`--` → number|bigint.
-            | Expression::UpdateExpression(_)
-    )
-}
-
 /// The immediate-right opcode for a binary operator whose right operand is an
 /// integer literal, or `None` when no immediate form exists.
 const fn immediate_variant(op: Op) -> Option<Op> {

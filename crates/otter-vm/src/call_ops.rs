@@ -1089,11 +1089,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
-        let tail_safe = !self.frame_has_suspension_owner(frame)
-            && !frame.is_construct()
-            && self
-                .frame_cold(frame)
-                .is_none_or(|cold| cold.handlers.is_empty());
+        let tail_safe = !self.frame_has_suspension_owner(frame) && !frame.is_construct();
         let return_destination = frame.return_destination;
         self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))?;
         if tail_safe && let Some(request) = stack.staged_request_mut() {
@@ -1109,8 +1105,9 @@ impl Interpreter {
     /// Stage `callee(...args)` with an explicit receiver; the completion is
     /// delivered to the caller's `dst` when its activation resumes.
     ///
-    /// `caller_pc` must already be advanced so the resumed dispatch continues
-    /// after the originating instruction.
+    /// An instruction that has advanced the caller's PC continues after
+    /// itself when the call completes; one that has not runs again and
+    /// finds its parked state (see `dispatch_loop_inner`).
     pub(crate) fn invoke(
         &mut self,
         stack: &mut ActivationStack,

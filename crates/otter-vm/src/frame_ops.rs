@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Current `this` binding and rest-array materialization.
-//! - Cold exception-handler and finally state.
+//! - Abandoning protocol ladders whose staged call threw.
 //!
 //! # Invariants
 //! Kernels receive decoded inputs and keep register access scoped. Rest values
@@ -13,12 +13,11 @@
 //! # See also
 //! - [`crate::active_frame`] for register and actual-window access.
 //! - [`crate::context_ops`] for captured bindings.
-//! - [`crate::cold_frame`] for exception state.
 
 use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
-use crate::{ActiveFrameMut, Frame, Interpreter, TryHandler, Value, VmError};
+use crate::{ActiveFrameMut, Interpreter, Value, VmError};
 
 impl Interpreter {
     /// Load the current `this` binding into `dst` for either frame storage.
@@ -37,6 +36,22 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
+    /// A call a protocol ladder staged completed with a throw: the ladder's
+    /// instruction fails, so its parked state is dropped. An abandoned
+    /// `IteratorNext` leaves its iterator done (§7.4.8 IteratorStep).
+    pub(crate) fn abandon_pending_ladders(&mut self, frame: &mut crate::Frame) {
+        let Some(cold) = self.frame_cold_mut(frame) else {
+            return;
+        };
+        let pending_next = cold.pending_iterator_next.take();
+        cold.pending_to_primitive = None;
+        cold.pending_get_iterator = None;
+        cold.pending_bind_function = None;
+        if let Some(pending) = pending_next {
+            self.iterator_mark_done(pending.iterator);
+        }
+    }
+
     /// Allocate a rest array from the published actual-argument suffix.
     /// The runtime turn roots the complete physical chain across allocation.
     pub(crate) fn collect_rest(
@@ -53,66 +68,6 @@ impl Interpreter {
             .collect::<Result<_, _>>()?;
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
         ActiveFrameMut::from_frame(&mut stack[top_idx]).write(dst, Value::array(array))
-    }
-
-    /// Install a verified exception region in the frame's cold record.
-    pub(crate) fn frame_enter_try_region(
-        &mut self,
-        frame: &mut Frame,
-        region: crate::executable::code_block_cfg::CodeBlockExceptionRegion,
-    ) -> Result<(), VmError> {
-        debug_assert_eq!(region.enter_pc, frame.pc);
-        self.frame_enter_try_handler(
-            frame,
-            TryHandler {
-                catch_pc: region.catch_pc,
-                finally_pc: region.finally_pc,
-                exc_register: region.exception_register,
-            },
-        )
-    }
-
-    /// Install a decoded handler in the frame's cold record.
-    pub(crate) fn frame_enter_try_handler(
-        &mut self,
-        frame: &mut Frame,
-        handler: TryHandler,
-    ) -> Result<(), VmError> {
-        self.frame_ensure_cold(frame).handlers.push(handler);
-        Ok(())
-    }
-
-    /// Drop abandoned finally completions from cold state.
-    pub(crate) fn frame_pop_parked_finally(
-        &mut self,
-        frame: &mut Frame,
-        count: usize,
-    ) -> Result<(), VmError> {
-        if let Some(cold) = self.frame_cold_mut(frame) {
-            for _ in 0..count {
-                cold.parked_finally.pop();
-            }
-        }
-        Ok(())
-    }
-
-    /// Leave the innermost handler in the frame's cold record.
-    pub(crate) fn frame_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
-        let popped = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
-        let Some(handler) = popped else {
-            return Err(VmError::InvalidOperand);
-        };
-        // §14.15.3 — leaving a try (or catch) body whose handler owns
-        // a `finally` falls through into the finally block; park a
-        // Normal completion so `Op::EndFinally` knows this entry was
-        // not an unwind.
-        if handler.finally_pc.is_some() {
-            let cold = self.frame_ensure_cold(frame);
-            let depth = cold.handlers.len() as u32;
-            cold.parked_finally
-                .push((crate::cold_frame::ParkedFinally::Normal, depth));
-        }
-        Ok(())
     }
 }
 

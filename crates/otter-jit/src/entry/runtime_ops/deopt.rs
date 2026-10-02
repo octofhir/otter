@@ -115,35 +115,6 @@ extern "C" fn prepare_deopt_writeback(
         if native_frame.header.function_id != state.outermost().function_id {
             return compiled_fatal(ctx, VmError::InvalidOperand);
         }
-        let rebuild_result = (|| {
-            let activation = match ctx.checked_activation() {
-                Some(activation) => activation,
-                None => {
-                    // Pure emitter fixtures intentionally execute arithmetic
-                    // and deopt code without a VM runtime context. They cannot
-                    // own a materialized catch stack. Production compiled
-                    // entries always publish the activation used below.
-                    #[cfg(test)]
-                    return Ok(());
-                    #[cfg(not(test))]
-                    return Err(VmError::InvalidOperand);
-                }
-            };
-            let frame_index = ctx.frame_index()?;
-            // SAFETY: the live runtime activation owns these pointers for the
-            // complete compiled-entry transaction. Handler reconstruction
-            // mutates only the published frame's cold handler stack.
-            let vm = unsafe { &mut *activation.vm_ptr() };
-            let stack = unsafe { &mut *activation.stack_ptr() };
-            // SAFETY: the published frame and activation context are live.
-            let owner = unsafe { activation.owner_context((*ctx.native_frame).header.function_id) }
-                .ok_or(VmError::InvalidOperand)?;
-            let context = &owner;
-            vm.jit_rebuild_frame_catch_handlers(context, stack, frame_index, exit.resume_pcs[0])
-        })();
-        if let Err(error) = rebuild_result {
-            return compiled_fatal(ctx, error);
-        }
         // SAFETY: runtime-capable JIT contexts publish this native frame for
         // the full compiled entry dynamic extent.
         let Some(native_frame) = (unsafe { ctx.native_frame.as_mut() }) else {

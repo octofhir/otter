@@ -3,19 +3,16 @@
 //!
 //! # Contents
 //! - panic-free validation for logical DTOs and authoritative wordcode
-//! - bounded handler/abrupt-completion control-flow analysis
+//! - [`verify_exception_handlers`] — the handler table against its code
 //! - cold byte-stream encoding, decoding, and branch fixups
 //! - source-map and serialized-layout helpers
 //!
 //! # Invariants
 //! - Authoritative wordcode is validated before executable consumers inspect it.
-//! - Runtime handler stacks agree with the lexical `EnterTry`/`LeaveTry`
-//!   regions at every reachable instruction and every control-flow join.
-//! - Parked-finally state distinguishes normal from abrupt completion. Joins
-//!   union those finite kinds, while abrupt destinations remain explicit
-//!   bounded summary edges.
-//! - Abrupt edges use the same handler floors and finally ordering as the
-//!   interpreter; validation stores at most linear state plus discovered edges.
+//! - No path from the entry or from a handler target runs off the end of the
+//!   code.
+//! - Handler ranges nest or are disjoint, an inner range precedes the ranges
+//!   enclosing it, and no handler covers its own target.
 //!
 //! Encodes the compiler's [`Instruction`] DTO stream into a self-describing
 //! byte buffer retained for cold metadata, diagnostics, and serialization.
@@ -45,12 +42,11 @@
 //!     Imm32:       i32 little-endian
 //! ```
 
-use std::collections::{HashMap, VecDeque};
 
 use crate::{
-    FunctionCode, Instruction, NO_HANDLER_OFFSET, Op, Operand, SpanEntry,
+    ExceptionHandler, FunctionCode, Instruction, Op, Operand, SpanEntry,
     opcode_schema::{
-        ExceptionSuccessorSpec, OperandKind, OperandShapeError, RelativeTargetBase, SuccessorSpec,
+        OperandKind, OperandShapeError, RelativeTargetBase, SuccessorSpec,
         decode_operand_word, opcode_schema, operand_kind_at, verify_operand_shape,
     },
     wordcode::{INLINE_OPERAND_WORDS, Instruction as WordInstruction},
@@ -60,7 +56,7 @@ use crate::{
 ///
 /// # Errors
 /// Returns [`VerifyError`] for malformed/noncanonical operand storage,
-/// operand-shape, branch-target, handler-target, or finally-floor violations.
+/// operand-shape or branch-target violations, or a reachable function end.
 pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> {
     let len = i64::try_from(code.len()).map_err(|_| VerifyError::FunctionTooLarge)?;
     let (instructions, overflow_operand_words) = code.raw_parts();
@@ -88,46 +84,91 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
                 verify_wordcode_target(operands, instruction_index, *operand_index, None, len)?;
             }
         }
-        for successor in schema.exception_successor_shape.exact() {
-            match successor {
-                ExceptionSuccessorSpec::OptionalRelativeTarget {
-                    operand_index,
-                    absent_value,
-                    ..
-                } => verify_wordcode_target(
-                    operands,
-                    instruction_index,
-                    *operand_index,
-                    Some(*absent_value),
-                    len,
-                )?,
-                ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
-                    floor_operand_index,
-                } => {
-                    let floor = checked_wordcode_imm32_operand(
-                        operands,
-                        instruction_index,
-                        *floor_operand_index,
-                    )?;
-                    if floor < 0 {
-                        return Err(VerifyError::InvalidControlFlowOperand {
-                            instruction_index,
-                            operand_index: *floor_operand_index,
-                            value: floor,
-                        });
-                    }
-                }
-                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller
-                | ExceptionSuccessorSpec::CallerHandlerOrUncaught
-                | ExceptionSuccessorSpec::ResumeParkedAbruptCompletion
-                | ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn => {}
-            }
-        }
         decoded_operands.ends.push(decoded_operands.operands.len());
     }
     verify_wordcode_overflow_consumed(next_overflow_offset, overflow_operand_words.len())?;
-    verify_wordcode_control_flow(instructions, &decoded_operands)?;
+    verify_reachable_end(instructions, &decoded_operands, [0])?;
     Ok(())
+}
+
+/// Verify a function's exception handler table against its verified code.
+///
+/// # Errors
+/// Returns [`VerifyError`] for a range outside the code, a target outside the
+/// code or inside its own range, ranges that overlap without nesting or list
+/// an enclosing range first, or a path from a target that runs off the end.
+pub fn verify_exception_handlers(
+    code: &FunctionCode,
+    handlers: &[ExceptionHandler],
+) -> Result<(), VerifyError> {
+    let len = u32::try_from(code.len()).map_err(|_| VerifyError::FunctionTooLarge)?;
+    for (handler_index, handler) in handlers.iter().enumerate() {
+        if handler.start >= handler.end || handler.end > len {
+            return Err(VerifyError::InvalidHandlerRange {
+                handler_index,
+                start: handler.start,
+                end: handler.end,
+            });
+        }
+        if handler.target >= len || handler.covers(handler.target) {
+            return Err(VerifyError::InvalidHandlerTarget {
+                handler_index,
+                target: handler.target,
+            });
+        }
+    }
+    // Sweep ranges by start, outer before inner: every range must sit inside
+    // the innermost range still open at its start, and come before it in
+    // the table.
+    let mut order: Vec<usize> = (0..handlers.len()).collect();
+    order.sort_by_key(|&index| {
+        let handler = handlers[index];
+        (
+            handler.start,
+            std::cmp::Reverse(handler.end),
+            std::cmp::Reverse(index),
+        )
+    });
+    let mut open: Vec<usize> = Vec::new();
+    for handler_index in order {
+        let handler = handlers[handler_index];
+        while open
+            .last()
+            .is_some_and(|&outer| handlers[outer].end <= handler.start)
+        {
+            open.pop();
+        }
+        if let Some(&outer) = open.last()
+            && (handler.end > handlers[outer].end || outer < handler_index)
+        {
+            return Err(VerifyError::HandlerNesting {
+                handler_index: handler_index.max(outer),
+                earlier_index: handler_index.min(outer),
+            });
+        }
+        open.push(handler_index);
+    }
+    if handlers.is_empty() {
+        return Ok(());
+    }
+    let (instructions, overflow_operand_words) = code.raw_parts();
+    let mut next_overflow_offset = 0;
+    let mut decoded_operands = DecodedOperands::with_capacity(instructions.len());
+    for (instruction_index, instr) in instructions.iter().enumerate() {
+        decode_wordcode_operands(
+            instr,
+            overflow_operand_words,
+            &mut next_overflow_offset,
+            instruction_index,
+            &mut decoded_operands.operands,
+        )?;
+        decoded_operands.ends.push(decoded_operands.operands.len());
+    }
+    verify_reachable_end(
+        instructions,
+        &decoded_operands,
+        handlers.iter().map(|handler| handler.target as usize),
+    )
 }
 
 /// Every instruction's decoded operands in one buffer, delimited by the end
@@ -373,746 +414,48 @@ fn verify_wordcode_overflow_consumed(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-struct HandlerRegion {
-    enter_instruction_index: usize,
-    parent: Option<usize>,
-    depth: usize,
-    catch_target: Option<usize>,
-    finally_target: Option<usize>,
-}
-
-struct HandlerLayout {
-    regions: Vec<HandlerRegion>,
-    enter_regions: Vec<Option<usize>>,
-    leave_regions: Vec<Option<usize>>,
-    lexical_tops: Vec<Option<usize>>,
-}
-
-impl HandlerLayout {
-    fn build(
-        instructions: &[WordInstruction],
-        operands: &DecodedOperands,
-    ) -> Result<Self, VerifyError> {
-        let instruction_count =
-            i64::try_from(instructions.len()).map_err(|_| VerifyError::FunctionTooLarge)?;
-        let mut regions = Vec::new();
-        let mut enter_regions = vec![None; instructions.len()];
-        let mut leave_regions = vec![None; instructions.len()];
-        let mut lexical_tops = vec![None; instructions.len().saturating_add(1)];
-        let mut open_regions = Vec::new();
-
-        for (instruction_index, instruction) in instructions.iter().enumerate() {
-            lexical_tops[instruction_index] = open_regions.last().copied();
-            match instruction.op {
-                Op::EnterTry => {
-                    let catch_target = resolve_wordcode_target(
-                        operands.of(instruction_index),
-                        instruction_index,
-                        0,
-                        Some(NO_HANDLER_OFFSET),
-                        instruction_count,
-                    )?;
-                    let finally_target = resolve_wordcode_target(
-                        operands.of(instruction_index),
-                        instruction_index,
-                        1,
-                        Some(NO_HANDLER_OFFSET),
-                        instruction_count,
-                    )?;
-                    if catch_target.is_none() && finally_target.is_none() {
-                        return Err(VerifyError::HandlerWithoutTarget { instruction_index });
-                    }
-                    for (operand_index, target) in [(0, catch_target), (1, finally_target)] {
-                        if target == Some(instructions.len()) {
-                            return Err(VerifyError::InvalidHandlerTarget {
-                                instruction_index,
-                                operand_index,
-                                target: instructions.len(),
-                            });
-                        }
-                    }
-                    let region_index = regions.len();
-                    regions.push(HandlerRegion {
-                        enter_instruction_index: instruction_index,
-                        parent: open_regions.last().copied(),
-                        depth: open_regions.len().saturating_add(1),
-                        catch_target,
-                        finally_target,
-                    });
-                    enter_regions[instruction_index] = Some(region_index);
-                    open_regions.push(region_index);
-                }
-                Op::LeaveTry => {
-                    let Some(region_index) = open_regions.pop() else {
-                        return Err(VerifyError::HandlerStackUnderflow { instruction_index });
-                    };
-                    leave_regions[instruction_index] = Some(region_index);
-                }
-                _ => {}
-            }
-        }
-        lexical_tops[instructions.len()] = open_regions.last().copied();
-        if let Some(region_index) = open_regions.last().copied() {
-            return Err(VerifyError::UnclosedHandler {
-                enter_instruction_index: regions[region_index].enter_instruction_index,
-            });
-        }
-
-        let layout = Self {
-            regions,
-            enter_regions,
-            leave_regions,
-            lexical_tops,
-        };
-        for region in &layout.regions {
-            for target in [region.catch_target, region.finally_target]
-                .into_iter()
-                .flatten()
-            {
-                let actual = layout.lexical_tops[target];
-                if actual != region.parent {
-                    return Err(VerifyError::InvalidHandlerLandingState {
-                        instruction_index: region.enter_instruction_index,
-                        target,
-                        expected_depth: layout.handler_depth(region.parent),
-                        actual_depth: layout.handler_depth(actual),
-                    });
-                }
-            }
-        }
-        Ok(layout)
-    }
-
-    fn handler_depth(&self, top: Option<usize>) -> usize {
-        top.map_or(0, |region_index| self.regions[region_index].depth)
-    }
-
-    fn enter_instruction_index(&self, top: Option<usize>) -> Option<usize> {
-        top.map(|region_index| self.regions[region_index].enter_instruction_index)
-    }
-}
-
-type ParkedStackId = usize;
-const EMPTY_PARKED_STACK: ParkedStackId = 0;
-/// Hard ceiling for implicit handler/parked-state steps discovered while
-/// expanding abrupt summaries and joining completion states. Normal CFG work
-/// remains linear in the instruction stream; this prevents deeply nested
-/// hostile regions from manufacturing quadratic verification work.
-const MAX_WORDCODE_ABRUPT_TRANSITIONS: usize = 1 << 20;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ParkedCompletionKinds(u8);
-
-impl ParkedCompletionKinds {
-    const NORMAL: Self = Self(1 << 0);
-    const ABRUPT: Self = Self(1 << 1);
-
-    fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    fn contains_normal(self) -> bool {
-        self.0 & Self::NORMAL.0 != 0
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ParkedStackNode {
-    parent: ParkedStackId,
-    handler: usize,
-    completions: ParkedCompletionKinds,
-    depth: usize,
-}
-
-struct ParkedStacks {
-    nodes: Vec<ParkedStackNode>,
-    interned: HashMap<(ParkedStackId, usize, ParkedCompletionKinds), ParkedStackId>,
-}
-
-impl ParkedStacks {
-    fn new() -> Self {
-        Self {
-            nodes: vec![ParkedStackNode {
-                parent: EMPTY_PARKED_STACK,
-                handler: usize::MAX,
-                completions: ParkedCompletionKinds(0),
-                depth: 0,
-            }],
-            interned: HashMap::new(),
-        }
-    }
-
-    fn depth(&self, stack: ParkedStackId) -> usize {
-        self.nodes[stack].depth
-    }
-
-    fn push(
-        &mut self,
-        stack: ParkedStackId,
-        handler: usize,
-        completions: ParkedCompletionKinds,
-    ) -> ParkedStackId {
-        if let Some(existing) = self.interned.get(&(stack, handler, completions)).copied() {
-            return existing;
-        }
-        let id = self.nodes.len();
-        self.nodes.push(ParkedStackNode {
-            parent: stack,
-            handler,
-            completions,
-            depth: self.nodes[stack].depth.saturating_add(1),
-        });
-        self.interned.insert((stack, handler, completions), id);
-        id
-    }
-
-    fn pop(&self, stack: ParkedStackId) -> Option<(ParkedStackId, ParkedCompletionKinds)> {
-        (stack != EMPTY_PARKED_STACK).then(|| {
-            let node = self.nodes[stack];
-            (node.parent, node.completions)
-        })
-    }
-
-    fn pop_count(&self, mut stack: ParkedStackId, count: usize) -> Option<ParkedStackId> {
-        if count > self.depth(stack) {
-            return None;
-        }
-        for _ in 0..count {
-            stack = self.nodes[stack].parent;
-        }
-        Some(stack)
-    }
-
-    fn prune_to_handler_depth(
-        &self,
-        mut stack: ParkedStackId,
-        handler_depth: usize,
-        layout: &HandlerLayout,
-    ) -> (ParkedStackId, usize) {
-        let mut pruned = 0;
-        while stack != EMPTY_PARKED_STACK {
-            let node = self.nodes[stack];
-            let parked_at_depth = layout.regions[node.handler].depth.saturating_sub(1);
-            if parked_at_depth <= handler_depth {
-                break;
-            }
-            stack = node.parent;
-            pruned += 1;
-        }
-        (stack, pruned)
-    }
-
-    /// Merge completion kinds for two stacks with the same handler spine.
-    /// Frames are returned top-to-bottom so the caller can charge the complete
-    /// traversal before interning the widened state.
-    fn merged_frames(
-        &self,
-        mut first: ParkedStackId,
-        mut second: ParkedStackId,
-    ) -> Option<Vec<(usize, ParkedCompletionKinds)>> {
-        let mut merged = Vec::new();
-        while first != EMPTY_PARKED_STACK && second != EMPTY_PARKED_STACK {
-            let first_node = self.nodes[first];
-            let second_node = self.nodes[second];
-            if first_node.handler != second_node.handler {
-                return None;
-            }
-            merged.push((
-                first_node.handler,
-                first_node.completions.union(second_node.completions),
-            ));
-            first = first_node.parent;
-            second = second_node.parent;
-        }
-        if first != EMPTY_PARKED_STACK || second != EMPTY_PARKED_STACK {
-            return None;
-        }
-        Some(merged)
-    }
-
-    fn intern_merged_frames(
-        &mut self,
-        frames_top_to_bottom: &[(usize, ParkedCompletionKinds)],
-    ) -> ParkedStackId {
-        let mut stack = EMPTY_PARKED_STACK;
-        for &(handler, completions) in frames_top_to_bottom.iter().rev() {
-            stack = self.push(stack, handler, completions);
-        }
-        stack
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WordcodeFlowState {
-    handlers: Option<usize>,
-    parked: ParkedStackId,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct IncomingWordcodeFlowState {
-    state: WordcodeFlowState,
-    predecessor: Option<usize>,
-}
-
-struct WordcodeControlFlowVerifier<'a> {
-    instructions: &'a [WordInstruction],
-    operands: &'a DecodedOperands,
-    layout: HandlerLayout,
-    parked_stacks: ParkedStacks,
-    incoming: Vec<Option<IncomingWordcodeFlowState>>,
-    worklist: VecDeque<usize>,
-    instruction_count: i64,
-    abrupt_transitions: usize,
-}
-
-impl<'a> WordcodeControlFlowVerifier<'a> {
-    fn new(
-        instructions: &'a [WordInstruction],
-        operands: &'a DecodedOperands,
-    ) -> Result<Self, VerifyError> {
-        let layout = HandlerLayout::build(instructions, operands)?;
-        let mut incoming = vec![None; instructions.len().saturating_add(1)];
-        incoming[0] = Some(IncomingWordcodeFlowState {
-            state: WordcodeFlowState {
-                handlers: None,
-                parked: EMPTY_PARKED_STACK,
-            },
-            predecessor: None,
-        });
-        let mut worklist = VecDeque::new();
-        if !instructions.is_empty() {
-            worklist.push_back(0);
-        }
-        Ok(Self {
-            instructions,
-            operands,
-            layout,
-            parked_stacks: ParkedStacks::new(),
-            incoming,
-            worklist,
-            instruction_count: i64::try_from(instructions.len())
-                .map_err(|_| VerifyError::FunctionTooLarge)?,
-            abrupt_transitions: 0,
-        })
-    }
-
-    fn verify(mut self) -> Result<(), VerifyError> {
-        while let Some(instruction_index) = self.worklist.pop_front() {
-            let Some(incoming) = self.incoming[instruction_index] else {
-                continue;
-            };
-            self.verify_lexical_handler_state(instruction_index, incoming.state)?;
-            self.visit_instruction(instruction_index, incoming.state)?;
-        }
-        if let Some(incoming) = self.incoming[self.instructions.len()] {
-            self.verify_lexical_handler_state(self.instructions.len(), incoming.state)?;
-            return Err(VerifyError::ReachableFunctionEnd {
-                predecessor: incoming.predecessor,
-                handler_depth: self.layout.handler_depth(incoming.state.handlers),
-                parked_finally_depth: self.parked_stacks.depth(incoming.state.parked),
-            });
-        }
-        Ok(())
-    }
-
-    fn verify_lexical_handler_state(
-        &self,
-        instruction_index: usize,
-        state: WordcodeFlowState,
-    ) -> Result<(), VerifyError> {
-        let expected = self.layout.lexical_tops[instruction_index];
-        if state.handlers == expected {
-            return Ok(());
-        }
-        Err(VerifyError::InvalidHandlerStackState {
-            instruction_index,
-            expected_depth: self.layout.handler_depth(expected),
-            actual_depth: self.layout.handler_depth(state.handlers),
-            expected_enter_instruction_index: self.layout.enter_instruction_index(expected),
-            actual_enter_instruction_index: self.layout.enter_instruction_index(state.handlers),
-        })
-    }
-
-    fn visit_instruction(
-        &mut self,
-        instruction_index: usize,
-        state: WordcodeFlowState,
-    ) -> Result<(), VerifyError> {
-        let instruction = &self.instructions[instruction_index];
-        match instruction.op {
-            Op::EnterTry => {
-                let region = self.layout.enter_regions[instruction_index]
-                    .ok_or(VerifyError::HandlerStackUnderflow { instruction_index })?;
-                let mut outgoing = state;
-                outgoing.handlers = Some(region);
-                self.propagate_normal_successors(instruction_index, outgoing)
-            }
-            Op::LeaveTry => {
-                let region = self.layout.leave_regions[instruction_index]
-                    .ok_or(VerifyError::HandlerStackUnderflow { instruction_index })?;
-                if state.handlers != Some(region) {
-                    return Err(VerifyError::InvalidHandlerStackState {
-                        instruction_index,
-                        expected_depth: self.layout.regions[region].depth,
-                        actual_depth: self.layout.handler_depth(state.handlers),
-                        expected_enter_instruction_index: Some(
-                            self.layout.regions[region].enter_instruction_index,
-                        ),
-                        actual_enter_instruction_index: self
-                            .layout
-                            .enter_instruction_index(state.handlers),
-                    });
-                }
-                let handler = self.layout.regions[region];
-                let mut outgoing = state;
-                outgoing.handlers = handler.parent;
-                if handler.finally_target.is_some() {
-                    outgoing.parked = self.parked_stacks.push(
-                        outgoing.parked,
-                        region,
-                        ParkedCompletionKinds::NORMAL,
-                    );
-                }
-                self.propagate_normal_successors(instruction_index, outgoing)
-            }
-            Op::EndFinally => {
-                let available = self.parked_stacks.depth(state.parked);
-                let Some((parked, completions)) = self.parked_stacks.pop(state.parked) else {
-                    return Err(VerifyError::AbruptCompletionUnderflow {
-                        instruction_index,
-                        op: instruction.op,
-                        requested: 1,
-                        available,
-                    });
-                };
-                if completions.contains_normal() {
-                    self.propagate_normal_successors(
-                        instruction_index,
-                        WordcodeFlowState { parked, ..state },
-                    )?;
-                }
-                Ok(())
-            }
-            Op::PopParkedFinally => {
-                let count = checked_wordcode_imm32_operand(
-                    self.operands.of(instruction_index),
-                    instruction_index,
-                    0,
-                )?;
-                let count =
-                    usize::try_from(count).map_err(|_| VerifyError::InvalidControlFlowOperand {
-                        instruction_index,
-                        operand_index: 0,
-                        value: count,
-                    })?;
-                let available = self.parked_stacks.depth(state.parked);
-                if count > available {
-                    return Err(VerifyError::AbruptCompletionUnderflow {
-                        instruction_index,
-                        op: instruction.op,
-                        requested: count,
-                        available,
-                    });
-                }
-                self.charge_abrupt_transitions(instruction_index, count)?;
-                let parked = self.parked_stacks.pop_count(state.parked, count).ok_or(
-                    VerifyError::AbruptCompletionUnderflow {
-                        instruction_index,
-                        op: instruction.op,
-                        requested: count,
-                        available,
-                    },
-                )?;
-                self.propagate_normal_successors(
-                    instruction_index,
-                    WordcodeFlowState { parked, ..state },
-                )
-            }
-            Op::JumpViaFinally => {
-                let target = self.relative_target(instruction_index, 0)?;
-                let floor = checked_wordcode_imm32_operand(
-                    self.operands.of(instruction_index),
-                    instruction_index,
-                    1,
-                )?;
-                let floor =
-                    usize::try_from(floor).map_err(|_| VerifyError::InvalidControlFlowOperand {
-                        instruction_index,
-                        operand_index: 1,
-                        value: floor,
-                    })?;
-                self.route_abrupt(instruction_index, state, floor, Some(target))
-            }
-            Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived => {
-                self.route_abrupt(instruction_index, state, 0, None)
-            }
-            Op::Throw => self.route_throw(instruction_index, state),
-            _ => {
-                let exception_successors = opcode_schema(instruction.op)
-                    .exception_successor_shape
-                    .exact();
-                if exception_successors
-                    .contains(&ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller)
-                {
-                    self.route_throw(instruction_index, state)?;
-                }
-                if exception_successors
-                    .contains(&ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn)
-                {
-                    self.route_abrupt(instruction_index, state, 0, None)?;
-                }
-                self.propagate_normal_successors(instruction_index, state)
-            }
-        }
-    }
-
-    fn relative_target(
-        &self,
-        instruction_index: usize,
-        operand_index: usize,
-    ) -> Result<usize, VerifyError> {
-        resolve_wordcode_target(
-            self.operands.of(instruction_index),
-            instruction_index,
-            operand_index,
-            None,
-            self.instruction_count,
-        )?
-        .ok_or(VerifyError::InvalidControlFlowOperand {
-            instruction_index,
-            operand_index,
-            value: NO_HANDLER_OFFSET,
-        })
-    }
-
-    fn propagate_normal_successors(
-        &mut self,
-        instruction_index: usize,
-        state: WordcodeFlowState,
-    ) -> Result<(), VerifyError> {
-        for successor in opcode_schema(self.instructions[instruction_index].op)
-            .successor_shape
-            .exact()
-        {
-            match successor {
-                SuccessorSpec::Fallthrough => {
-                    let target = instruction_index
-                        .checked_add(1)
-                        .ok_or(VerifyError::FunctionTooLarge)?;
-                    self.propagate(instruction_index, target, state)?;
-                }
-                SuccessorSpec::RelativeTarget { operand_index, .. } => {
-                    let target = self.relative_target(instruction_index, *operand_index)?;
-                    self.propagate(instruction_index, target, state)?;
-                }
-                SuccessorSpec::FrameReturn => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn route_throw(
-        &mut self,
-        instruction_index: usize,
-        state: WordcodeFlowState,
-    ) -> Result<(), VerifyError> {
-        let mut handlers = state.handlers;
-        let mut parked = state.parked;
-        while let Some(region_index) = handlers {
-            self.charge_abrupt_transition(instruction_index)?;
-            let region = self.layout.regions[region_index];
-            handlers = region.parent;
-            let (next_parked, pruned) = self.parked_stacks.prune_to_handler_depth(
-                parked,
-                self.layout.handler_depth(handlers),
-                &self.layout,
-            );
-            self.charge_abrupt_transitions(instruction_index, pruned)?;
-            parked = next_parked;
-            if let Some(target) = region.catch_target {
-                return self.propagate(
-                    instruction_index,
-                    target,
-                    WordcodeFlowState { handlers, parked },
-                );
-            }
-            if let Some(target) = region.finally_target {
-                let finalizer_parked =
-                    self.parked_stacks
-                        .push(parked, region_index, ParkedCompletionKinds::ABRUPT);
-                self.propagate(
-                    instruction_index,
-                    target,
-                    WordcodeFlowState {
-                        handlers,
-                        parked: finalizer_parked,
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn route_abrupt(
-        &mut self,
-        instruction_index: usize,
-        state: WordcodeFlowState,
-        floor: usize,
-        direct_target: Option<usize>,
-    ) -> Result<(), VerifyError> {
-        let handler_depth = self.layout.handler_depth(state.handlers);
-        if floor > handler_depth {
-            return Err(VerifyError::InvalidFinallyFloor {
-                instruction_index,
-                floor,
-                handler_depth,
-            });
-        }
-        let mut handlers = state.handlers;
-        let mut parked = state.parked;
-        while self.layout.handler_depth(handlers) > floor {
-            self.charge_abrupt_transition(instruction_index)?;
-            let region_index = handlers.ok_or(VerifyError::InvalidFinallyFloor {
-                instruction_index,
-                floor,
-                handler_depth,
-            })?;
-            let region = self.layout.regions[region_index];
-            handlers = region.parent;
-            let (next_parked, pruned) = self.parked_stacks.prune_to_handler_depth(
-                parked,
-                self.layout.handler_depth(handlers),
-                &self.layout,
-            );
-            self.charge_abrupt_transitions(instruction_index, pruned)?;
-            parked = next_parked;
-            if let Some(target) = region.finally_target {
-                let finalizer_parked =
-                    self.parked_stacks
-                        .push(parked, region_index, ParkedCompletionKinds::ABRUPT);
-                self.propagate(
-                    instruction_index,
-                    target,
-                    WordcodeFlowState {
-                        handlers,
-                        parked: finalizer_parked,
-                    },
-                )?;
-            }
-        }
-        if let Some(target) = direct_target {
-            self.propagate(
-                instruction_index,
-                target,
-                WordcodeFlowState { handlers, parked },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn charge_abrupt_transition(&mut self, instruction_index: usize) -> Result<(), VerifyError> {
-        self.charge_abrupt_transitions(instruction_index, 1)
-    }
-
-    fn charge_abrupt_transitions(
-        &mut self,
-        instruction_index: usize,
-        count: usize,
-    ) -> Result<(), VerifyError> {
-        self.abrupt_transitions = self.abrupt_transitions.checked_add(count).ok_or(
-            VerifyError::ControlFlowAnalysisLimitExceeded {
-                instruction_index,
-                limit: MAX_WORDCODE_ABRUPT_TRANSITIONS,
-            },
-        )?;
-        if self.abrupt_transitions > MAX_WORDCODE_ABRUPT_TRANSITIONS {
-            return Err(VerifyError::ControlFlowAnalysisLimitExceeded {
-                instruction_index,
-                limit: MAX_WORDCODE_ABRUPT_TRANSITIONS,
-            });
-        }
-        Ok(())
-    }
-
-    fn merge_parked_states(
-        &mut self,
-        instruction_index: usize,
-        first: ParkedStackId,
-        second: ParkedStackId,
-    ) -> Result<Option<ParkedStackId>, VerifyError> {
-        let Some(frames) = self.parked_stacks.merged_frames(first, second) else {
-            return Ok(None);
-        };
-        self.charge_abrupt_transitions(instruction_index, frames.len())?;
-        Ok(Some(self.parked_stacks.intern_merged_frames(&frames)))
-    }
-
-    fn propagate(
-        &mut self,
-        predecessor: usize,
-        instruction_index: usize,
-        state: WordcodeFlowState,
-    ) -> Result<(), VerifyError> {
-        if instruction_index >= self.incoming.len() {
-            return Err(VerifyError::InvalidControlFlowTarget {
-                instruction_index: predecessor,
-                target: i64::try_from(instruction_index).unwrap_or(i64::MAX),
-            });
-        }
-        if let Some(first) = self.incoming[instruction_index] {
-            if first.state.handlers != state.handlers {
-                return Err(VerifyError::IncompatibleHandlerStackStates {
-                    instruction_index,
-                    first_predecessor: first.predecessor,
-                    conflicting_predecessor: predecessor,
-                    first_depth: self.layout.handler_depth(first.state.handlers),
-                    conflicting_depth: self.layout.handler_depth(state.handlers),
-                });
-            }
-            if first.state.parked != state.parked {
-                let Some(parked) =
-                    self.merge_parked_states(instruction_index, first.state.parked, state.parked)?
-                else {
-                    return Err(VerifyError::IncompatibleAbruptCompletionStates {
-                        instruction_index,
-                        first_predecessor: first.predecessor,
-                        conflicting_predecessor: predecessor,
-                        first_depth: self.parked_stacks.depth(first.state.parked),
-                        conflicting_depth: self.parked_stacks.depth(state.parked),
-                    });
-                };
-                if parked != first.state.parked {
-                    self.incoming[instruction_index] = Some(IncomingWordcodeFlowState {
-                        state: WordcodeFlowState {
-                            parked,
-                            ..first.state
-                        },
-                        predecessor: first.predecessor,
-                    });
-                    if instruction_index < self.instructions.len() {
-                        self.worklist.push_back(instruction_index);
-                    }
-                }
-            }
-            return Ok(());
-        }
-        self.incoming[instruction_index] = Some(IncomingWordcodeFlowState {
-            state,
-            predecessor: Some(predecessor),
-        });
-        if instruction_index < self.instructions.len() {
-            self.worklist.push_back(instruction_index);
-        }
-        Ok(())
-    }
-}
-
-fn verify_wordcode_control_flow(
+/// Walk normal successors from `roots`; no reachable path may run off the
+/// end of the code.
+fn verify_reachable_end(
     instructions: &[WordInstruction],
     operands: &DecodedOperands,
+    roots: impl IntoIterator<Item = usize>,
 ) -> Result<(), VerifyError> {
-    WordcodeControlFlowVerifier::new(instructions, operands)?.verify()
+    let len = instructions.len();
+    let count = i64::try_from(len).map_err(|_| VerifyError::FunctionTooLarge)?;
+    let mut seen = vec![false; len];
+    let mut worklist = Vec::new();
+    for root in roots {
+        if root >= len {
+            return Err(VerifyError::ReachableFunctionEnd { predecessor: None });
+        }
+        if !seen[root] {
+            seen[root] = true;
+            worklist.push(root);
+        }
+    }
+    while let Some(index) = worklist.pop() {
+        for successor in opcode_schema(instructions[index].op).successor_shape.exact() {
+            let target = match successor {
+                SuccessorSpec::Fallthrough => index + 1,
+                SuccessorSpec::RelativeTarget { operand_index, .. } => {
+                    resolve_wordcode_target(operands.of(index), index, *operand_index, None, count)?
+                        .ok_or(VerifyError::FunctionTooLarge)?
+                }
+                SuccessorSpec::FrameReturn => continue,
+            };
+            if target >= len {
+                return Err(VerifyError::ReachableFunctionEnd {
+                    predecessor: Some(index),
+                });
+            }
+            if !seen[target] {
+                seen[target] = true;
+                worklist.push(target);
+            }
+        }
+    }
+    Ok(())
 }
 
 const OPERAND_KIND_REGISTER: u8 = 0;
@@ -1337,116 +680,35 @@ pub enum VerifyError {
         /// Invalid signed immediate.
         value: i32,
     },
-    /// A source-order `LeaveTry` has no lexically enclosing `EnterTry`.
-    HandlerStackUnderflow {
-        /// Dense source-order instruction index of the unmatched leave.
-        instruction_index: usize,
+    /// A handler range is empty or extends past the code.
+    InvalidHandlerRange {
+        /// Index into the handler table.
+        handler_index: usize,
+        /// First covered instruction.
+        start: u32,
+        /// One past the last covered instruction.
+        end: u32,
     },
-    /// An `EnterTry` reaches the end of the function without a matching leave.
-    UnclosedHandler {
-        /// Dense source-order instruction index of the unmatched enter.
-        enter_instruction_index: usize,
-    },
-    /// An `EnterTry` would install a handler that can handle no completion.
-    HandlerWithoutTarget {
-        /// Dense source-order instruction index of the invalid enter.
-        instruction_index: usize,
-    },
-    /// A catch/finally landing points at the non-executable end boundary.
+    /// A handler target lies outside the code or inside its own range.
     InvalidHandlerTarget {
-        /// Dense source-order instruction index of the owning enter.
-        instruction_index: usize,
-        /// Catch/finally operand position.
-        operand_index: usize,
-        /// Resolved end-boundary instruction index.
-        target: usize,
+        /// Index into the handler table.
+        handler_index: usize,
+        /// Target instruction.
+        target: u32,
     },
-    /// A handler landing is lexically inside a different handler stack.
-    InvalidHandlerLandingState {
-        /// Dense source-order instruction index of the owning enter.
-        instruction_index: usize,
-        /// Resolved catch/finally landing instruction.
-        target: usize,
-        /// Handler depth after the owning handler is popped.
-        expected_depth: usize,
-        /// Lexical handler depth at the landing instruction.
-        actual_depth: usize,
-    },
-    /// One reachable instruction does not have its lexical handler stack.
-    InvalidHandlerStackState {
-        /// Dense source-order instruction index.
-        instruction_index: usize,
-        /// Handler depth implied by lexical region nesting.
-        expected_depth: usize,
-        /// Handler depth carried by the incoming runtime path.
-        actual_depth: usize,
-        /// Expected innermost `EnterTry`, when any.
-        expected_enter_instruction_index: Option<usize>,
-        /// Actual innermost `EnterTry`, when any.
-        actual_enter_instruction_index: Option<usize>,
-    },
-    /// Two predecessors reach one instruction with different handler stacks.
-    IncompatibleHandlerStackStates {
-        /// Dense source-order join instruction index (or function end).
-        instruction_index: usize,
-        /// Predecessor that installed the first state; `None` is function entry.
-        first_predecessor: Option<usize>,
-        /// Predecessor carrying the conflicting state.
-        conflicting_predecessor: usize,
-        /// First handler depth.
-        first_depth: usize,
-        /// Conflicting handler depth.
-        conflicting_depth: usize,
-    },
-    /// A `JumpViaFinally` floor exceeds the live handler-stack depth.
-    InvalidFinallyFloor {
-        /// Dense source-order jump instruction index.
-        instruction_index: usize,
-        /// Requested non-negative handler floor.
-        floor: usize,
-        /// Handler depth on this runtime path.
-        handler_depth: usize,
-    },
-    /// `EndFinally`/`PopParkedFinally` consumes unavailable completions.
-    AbruptCompletionUnderflow {
-        /// Dense source-order instruction index.
-        instruction_index: usize,
-        /// Abrupt-completion opcode being validated.
-        op: Op,
-        /// Number of parked completions requested.
-        requested: usize,
-        /// Number of parked completions available on this path.
-        available: usize,
-    },
-    /// Two predecessors disagree about the structural parked-finally stack.
-    IncompatibleAbruptCompletionStates {
-        /// Dense source-order join instruction index (or function end).
-        instruction_index: usize,
-        /// Predecessor that installed the first state; `None` is function entry.
-        first_predecessor: Option<usize>,
-        /// Predecessor carrying the conflicting state.
-        conflicting_predecessor: usize,
-        /// First parked-finally depth.
-        first_depth: usize,
-        /// Conflicting parked-finally depth.
-        conflicting_depth: usize,
+    /// Two handler ranges overlap without nesting, or an enclosing range
+    /// precedes a range inside it.
+    HandlerNesting {
+        /// Later entry of the conflicting pair.
+        handler_index: usize,
+        /// Earlier entry of the conflicting pair.
+        earlier_index: usize,
     },
     /// Normal control flow reaches the non-executable function-end boundary.
     ReachableFunctionEnd {
-        /// Instruction whose successor reaches the end; `None` for an empty body.
+        /// Instruction whose successor reaches the end; `None` for an empty
+        /// body or a handler target at the end.
         predecessor: Option<usize>,
-        /// Live handler depth carried to the end boundary.
-        handler_depth: usize,
-        /// Live parked-finally depth carried to the end boundary.
-        parked_finally_depth: usize,
-    },
-    /// Adversarial exceptional or parked-state flow exceeded the fixed
-    /// analysis-work budget.
-    ControlFlowAnalysisLimitExceeded {
-        /// Instruction whose unwind walk exhausted the budget.
-        instruction_index: usize,
-        /// Maximum handler transitions inspected per function.
-        limit: usize,
     },
 }
 
@@ -1490,98 +752,31 @@ impl std::fmt::Display for VerifyError {
                 f,
                 "invalid control-flow operand {operand_index} value {value} at instruction {instruction_index}"
             ),
-            Self::HandlerStackUnderflow { instruction_index } => write!(
-                f,
-                "LeaveTry at instruction {instruction_index} has no enclosing EnterTry"
-            ),
-            Self::UnclosedHandler {
-                enter_instruction_index,
+            Self::InvalidHandlerRange {
+                handler_index,
+                start,
+                end,
             } => write!(
                 f,
-                "EnterTry at instruction {enter_instruction_index} has no matching LeaveTry"
-            ),
-            Self::HandlerWithoutTarget { instruction_index } => write!(
-                f,
-                "EnterTry at instruction {instruction_index} has neither a catch nor a finally target"
+                "exception handler {handler_index} covers invalid range {start}..{end}"
             ),
             Self::InvalidHandlerTarget {
-                instruction_index,
-                operand_index,
+                handler_index,
                 target,
             } => write!(
                 f,
-                "EnterTry operand {operand_index} at instruction {instruction_index} targets non-executable function end {target}"
+                "exception handler {handler_index} targets invalid instruction {target}"
             ),
-            Self::InvalidHandlerLandingState {
-                instruction_index,
-                target,
-                expected_depth,
-                actual_depth,
+            Self::HandlerNesting {
+                handler_index,
+                earlier_index,
             } => write!(
                 f,
-                "EnterTry at instruction {instruction_index} lands at instruction {target} with lexical handler depth {actual_depth}, expected {expected_depth}"
+                "exception handlers {earlier_index} and {handler_index} overlap without nesting inner-first"
             ),
-            Self::InvalidHandlerStackState {
-                instruction_index,
-                expected_depth,
-                actual_depth,
-                expected_enter_instruction_index,
-                actual_enter_instruction_index,
-            } => write!(
+            Self::ReachableFunctionEnd { predecessor } => write!(
                 f,
-                "instruction {instruction_index} has handler depth {actual_depth} (top {actual_enter_instruction_index:?}), expected depth {expected_depth} (top {expected_enter_instruction_index:?})"
-            ),
-            Self::IncompatibleHandlerStackStates {
-                instruction_index,
-                first_predecessor,
-                conflicting_predecessor,
-                first_depth,
-                conflicting_depth,
-            } => write!(
-                f,
-                "instruction {instruction_index} joins handler depth {first_depth} from {first_predecessor:?} with depth {conflicting_depth} from instruction {conflicting_predecessor}"
-            ),
-            Self::InvalidFinallyFloor {
-                instruction_index,
-                floor,
-                handler_depth,
-            } => write!(
-                f,
-                "JumpViaFinally at instruction {instruction_index} requests handler floor {floor} above live depth {handler_depth}"
-            ),
-            Self::AbruptCompletionUnderflow {
-                instruction_index,
-                op,
-                requested,
-                available,
-            } => write!(
-                f,
-                "{op:?} at instruction {instruction_index} consumes {requested} parked finally completions, but only {available} are available"
-            ),
-            Self::IncompatibleAbruptCompletionStates {
-                instruction_index,
-                first_predecessor,
-                conflicting_predecessor,
-                first_depth,
-                conflicting_depth,
-            } => write!(
-                f,
-                "instruction {instruction_index} joins parked-finally depth {first_depth} from {first_predecessor:?} with depth {conflicting_depth} from instruction {conflicting_predecessor}"
-            ),
-            Self::ReachableFunctionEnd {
-                predecessor,
-                handler_depth,
-                parked_finally_depth,
-            } => write!(
-                f,
-                "normal control flow from {predecessor:?} reaches function end with handler depth {handler_depth} and parked-finally depth {parked_finally_depth}"
-            ),
-            Self::ControlFlowAnalysisLimitExceeded {
-                instruction_index,
-                limit,
-            } => write!(
-                f,
-                "control-flow analysis at instruction {instruction_index} exceeds {limit} handler/parked-state transitions"
+                "normal control flow from {predecessor:?} reaches function end"
             ),
         }
     }
@@ -1593,8 +788,7 @@ impl std::error::Error for VerifyError {}
 /// coordinate system.
 ///
 /// # Errors
-/// Returns [`VerifyError`] for operand-shape, branch-target, handler-target, or
-/// finally-floor violations.
+/// Returns [`VerifyError`] for operand-shape or branch-target violations.
 pub fn verify_logical_function(instructions: &[Instruction]) -> Result<(), VerifyError> {
     let len = instructions.len() as i64;
     for (instruction_index, instr) in instructions.iter().enumerate() {
@@ -1608,40 +802,6 @@ pub fn verify_logical_function(instructions: &[Instruction]) -> Result<(), Verif
         for successor in schema.successor_shape.exact() {
             if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
                 verify_logical_target(instructions, instruction_index, *operand_index, None, len)?;
-            }
-        }
-        for successor in schema.exception_successor_shape.exact() {
-            match successor {
-                ExceptionSuccessorSpec::OptionalRelativeTarget {
-                    operand_index,
-                    absent_value,
-                    ..
-                } => verify_logical_target(
-                    instructions,
-                    instruction_index,
-                    *operand_index,
-                    Some(*absent_value),
-                    len,
-                )?,
-                ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
-                    floor_operand_index,
-                } => {
-                    let Operand::Imm32(floor) = instr.operands.as_slice()[*floor_operand_index]
-                    else {
-                        unreachable!("operand shape verified before control-flow metadata")
-                    };
-                    if floor < 0 {
-                        return Err(VerifyError::InvalidControlFlowOperand {
-                            instruction_index,
-                            operand_index: *floor_operand_index,
-                            value: floor,
-                        });
-                    }
-                }
-                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller
-                | ExceptionSuccessorSpec::CallerHandlerOrUncaught
-                | ExceptionSuccessorSpec::ResumeParkedAbruptCompletion
-                | ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn => {}
             }
         }
     }
@@ -1859,7 +1019,7 @@ pub struct EncodedFunction {
 /// per-instruction byte-offset map.
 ///
 /// The compiler emits branch operands (`Op::Jump`, `Op::JumpIfTrue`,
-/// `Op::JumpIfFalse`, `Op::JumpIfNullish`, `Op::EnterTry`) as
+/// `Op::JumpIfFalse`, `Op::JumpIfNullish`) as
 /// *instruction-index* deltas relative to the instruction following the
 /// jump. The wire format wants *byte-offset* deltas relative to
 /// `(jump_pc + 1)` (the byte right after the opcode), so encoding is a
@@ -1869,9 +1029,6 @@ pub struct EncodedFunction {
 ///    byte position and the source instruction-index delta.
 /// 2. Re-resolve each captured slot to a byte-offset delta computed
 ///    against `instr_to_byte_pc`.
-///
-/// The `NO_HANDLER_OFFSET` sentinel (`i32::MIN`) is preserved as-is —
-/// the runtime treats it as "absent handler" for [`Op::EnterTry`].
 #[must_use]
 pub fn encode_function(instructions: &[Instruction]) -> EncodedFunction {
     try_encode_function(instructions)
@@ -1972,9 +1129,6 @@ fn resolve_jump_fixup(
         .try_into()
         .expect("imm32 payload occupies exactly 4 bytes");
     let raw = i32::from_le_bytes(raw_bytes);
-    if raw == NO_HANDLER_OFFSET {
-        return;
-    }
     let target_instr_idx = (fixup.jump_idx as i64) + 1 + (raw as i64);
     assert!(
         target_instr_idx >= 0,
@@ -2000,10 +1154,7 @@ fn resolve_jump_fixup(
 /// delta. Non-branch opcodes return an empty slice.
 fn branch_imm32_operand_slots(op: Op) -> &'static [usize] {
     match op {
-        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish | Op::JumpViaFinally => {
-            &[0]
-        }
-        Op::EnterTry => &[0, 1],
+        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
         _ => &[],
     }
 }
@@ -2072,41 +1223,6 @@ fn verify_control_flow_targets(
                 continue;
             };
             verify_relative_target(instr, *operand_index, *base, None, &boundaries, code_len)?;
-        }
-        for successor in schema.exception_successor_shape.exact() {
-            match successor {
-                ExceptionSuccessorSpec::OptionalRelativeTarget {
-                    operand_index,
-                    base,
-                    absent_value,
-                } => verify_relative_target(
-                    instr,
-                    *operand_index,
-                    *base,
-                    Some(*absent_value),
-                    &boundaries,
-                    code_len,
-                )?,
-                ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
-                    floor_operand_index,
-                } => {
-                    let Operand::Imm32(floor) = instr.operands.as_slice()[*floor_operand_index]
-                    else {
-                        unreachable!("schema operand verification precedes successor verification")
-                    };
-                    if floor < 0 {
-                        return Err(DecodeError::InvalidControlFlowOperand {
-                            offset: instr.pc as usize,
-                            operand_index: *floor_operand_index,
-                            value: floor,
-                        });
-                    }
-                }
-                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller
-                | ExceptionSuccessorSpec::CallerHandlerOrUncaught
-                | ExceptionSuccessorSpec::ResumeParkedAbruptCompletion
-                | ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn => {}
-            }
         }
     }
     Ok(())
@@ -2464,486 +1580,75 @@ mod tests {
     }
 
     #[test]
-    fn wordcode_verifier_rejects_unbalanced_handler_structure() {
-        let underflow = build_wordcode(vec![(Op::LeaveTry, vec![]), (Op::ReturnUndefined, vec![])]);
-        assert!(matches!(
-            verify_wordcode_function(&underflow),
-            Err(VerifyError::HandlerStackUnderflow {
-                instruction_index: 0
-            })
-        ));
-
-        let unclosed = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(0),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert!(matches!(
-            verify_wordcode_function(&unclosed),
-            Err(VerifyError::UnclosedHandler {
-                enter_instruction_index: 0
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_verifier_rejects_incompatible_handler_join() {
-        // The taken path reaches instruction 4 with no handler. The other
-        // path jumps over the matching LeaveTry while the handler is live.
+    fn handler_table_rejects_bad_ranges_targets_and_nesting() {
         let code = build_wordcode(vec![
-            (
-                Op::JumpIfTrue,
-                vec![Operand::Imm32(3), Operand::Register(0)],
-            ),
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(3),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::Jump, vec![Operand::Imm32(1)]),
-            (Op::LeaveTry, vec![]),
-            (Op::ReturnUndefined, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-
-        assert!(matches!(
-            verify_wordcode_function(&code),
-            Err(VerifyError::IncompatibleHandlerStackStates {
-                instruction_index: 4,
-                first_depth: 0,
-                conflicting_depth: 1,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_verifier_rejects_invalid_handler_target_and_empty_handler() {
-        let target_at_end = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(2),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::LeaveTry, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert!(matches!(
-            verify_wordcode_function(&target_at_end),
-            Err(VerifyError::InvalidHandlerTarget {
-                instruction_index: 0,
-                operand_index: 0,
-                target: 3,
-            })
-        ));
-
-        let empty_handler = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::LeaveTry, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert!(matches!(
-            verify_wordcode_function(&empty_handler),
-            Err(VerifyError::HandlerWithoutTarget {
-                instruction_index: 0
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_verifier_rejects_bad_finally_floor() {
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(2),
-                    Operand::Register(0),
-                ],
-            ),
-            (
-                Op::JumpViaFinally,
-                vec![Operand::Imm32(2), Operand::Imm32(2)],
-            ),
-            (Op::LeaveTry, vec![]),
-            (Op::EndFinally, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-
-        assert!(matches!(
-            verify_wordcode_function(&code),
-            Err(VerifyError::InvalidFinallyFloor {
-                instruction_index: 1,
-                floor: 2,
-                handler_depth: 1,
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_verifier_rejects_reachable_function_end_and_stale_finally_state() {
-        let fallthrough = build_wordcode(vec![(Op::Nop, vec![])]);
-        assert!(matches!(
-            verify_wordcode_function(&fallthrough),
-            Err(VerifyError::ReachableFunctionEnd {
-                predecessor: Some(0),
-                handler_depth: 0,
-                parked_finally_depth: 0,
-            })
-        ));
-
-        let stale_parked = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(1),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::LeaveTry, vec![]),
-            (Op::Jump, vec![Operand::Imm32(2)]),
-            (Op::EndFinally, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert!(matches!(
-            verify_wordcode_function(&stale_parked),
-            Err(VerifyError::ReachableFunctionEnd {
-                predecessor: Some(2),
-                handler_depth: 0,
-                parked_finally_depth: 1,
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_abrupt_analysis_budget_is_typed() {
-        let code = build_wordcode(vec![(Op::ReturnUndefined, vec![])]);
-        let (instructions, _) = code.raw_parts();
-        let mut operands = DecodedOperands::with_capacity(1);
-        operands.ends.push(0);
-        let mut verifier = WordcodeControlFlowVerifier::new(instructions, &operands).unwrap();
-        verifier.abrupt_transitions = MAX_WORDCODE_ABRUPT_TRANSITIONS;
-
-        assert!(matches!(
-            verifier.charge_abrupt_transition(0),
-            Err(VerifyError::ControlFlowAnalysisLimitExceeded {
-                instruction_index: 0,
-                limit: MAX_WORDCODE_ABRUPT_TRANSITIONS,
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_verifier_rejects_abrupt_completion_underflow_and_join() {
-        for (op, operands, requested) in [
-            (Op::EndFinally, vec![], 1),
-            (Op::PopParkedFinally, vec![Operand::Imm32(1)], 1),
-        ] {
-            let code = build_wordcode(vec![(op, operands), (Op::ReturnUndefined, vec![])]);
-            assert!(matches!(
-                verify_wordcode_function(&code),
-                Err(VerifyError::AbruptCompletionUnderflow {
-                    instruction_index: 0,
-                    requested: actual,
-                    available: 0,
-                    ..
-                }) if actual == requested
-            ));
-        }
-
-        // EndFinally consumes the parked record and then loops back to itself,
-        // joining the original parked state with an empty one.
-        let incompatible = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(1),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::LeaveTry, vec![]),
-            (Op::EndFinally, vec![]),
-            (
-                Op::JumpIfTrue,
-                vec![Operand::Imm32(-2), Operand::Register(0)],
-            ),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert!(matches!(
-            verify_wordcode_function(&incompatible),
-            Err(VerifyError::IncompatibleAbruptCompletionStates {
-                instruction_index: 2,
-                first_depth: 1,
-                conflicting_depth: 0,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_yield_return_skips_catch_and_reaches_outer_finally() {
-        // GeneratorResumeAbrupt(return) at Yield does not execute the inner
-        // catch. It removes that catch-only handler and enters the outer
-        // finally. Both ordinary continuation and generator `.throw()` loop
-        // forever here, so only the external `.return()` edge can expose the
-        // malformed fallthrough at the finalizer target.
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(7),
-                    Operand::Register(0),
-                ],
-            ),
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(3),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::Yield, vec![Operand::Register(0), Operand::Register(1)]),
-            (Op::Jump, vec![Operand::Imm32(-1)]),
-            (Op::LeaveTry, vec![]),
-            (Op::Jump, vec![Operand::Imm32(-1)]),
-            (Op::LeaveTry, vec![]),
-            (Op::ReturnUndefined, vec![]),
             (Op::Nop, vec![]),
+            (Op::Nop, vec![]),
+            (Op::ReturnUndefined, vec![]),
+            (Op::ReturnUndefined, vec![]),
         ]);
+        let handler = |start, end, target| ExceptionHandler {
+            start,
+            end,
+            target,
+            exception: 0,
+        };
+        assert!(verify_exception_handlers(&code, &[handler(0, 2, 3)]).is_ok());
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler(2, 2, 3)]),
+            Err(VerifyError::InvalidHandlerRange { .. })
+        ));
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler(0, 5, 3)]),
+            Err(VerifyError::InvalidHandlerRange { .. })
+        ));
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler(0, 2, 1)]),
+            Err(VerifyError::InvalidHandlerTarget { .. })
+        ));
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler(0, 2, 4)]),
+            Err(VerifyError::InvalidHandlerTarget { .. })
+        ));
+        // Inner before outer is accepted; outer before inner or a partial
+        // overlap is not.
+        assert!(verify_exception_handlers(&code, &[handler(1, 2, 3), handler(0, 2, 3)]).is_ok());
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler(0, 2, 3), handler(1, 2, 3)]),
+            Err(VerifyError::HandlerNesting { .. })
+        ));
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler(0, 2, 3), handler(1, 3, 3)]),
+            Err(VerifyError::HandlerNesting { .. })
+        ));
+    }
 
+    #[test]
+    fn handler_target_must_not_run_off_the_end() {
+        let code = build_wordcode(vec![(Op::ReturnUndefined, vec![]), (Op::Nop, vec![])]);
+        let handler = ExceptionHandler {
+            start: 0,
+            end: 1,
+            target: 1,
+            exception: 0,
+        };
+        assert!(matches!(
+            verify_exception_handlers(&code, &[handler]),
+            Err(VerifyError::ReachableFunctionEnd {
+                predecessor: Some(1)
+            })
+        ));
+    }
+
+    #[test]
+    fn wordcode_verifier_rejects_reachable_function_end() {
+        let code = build_wordcode(vec![(Op::Nop, vec![])]);
         assert!(matches!(
             verify_wordcode_function(&code),
             Err(VerifyError::ReachableFunctionEnd {
-                predecessor: Some(8),
-                handler_depth: 0,
-                parked_finally_depth: 1,
+                predecessor: Some(0)
             })
         ));
-    }
-
-    #[test]
-    fn wordcode_load_this_tdz_reaches_catch_and_malformed_tail() {
-        // The ordinary path leaves the handler and returns. A derived-`this`
-        // hole instead throws from LoadThis, so the otherwise dead catch target
-        // exposes the unterminated tail.
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(3),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::LoadThis, vec![Operand::Register(0)]),
-            (Op::LeaveTry, vec![]),
-            (Op::ReturnUndefined, vec![]),
-            (Op::Nop, vec![]),
-        ]);
-
-        assert!(matches!(
-            verify_wordcode_function(&code),
-            Err(VerifyError::ReachableFunctionEnd {
-                predecessor: Some(4),
-                handler_depth: 0,
-                parked_finally_depth: 0,
-            })
-        ));
-    }
-
-    #[test]
-    fn wordcode_return_caller_exception_does_not_reach_local_catch() {
-        // Derived-constructor validation (and async completion settlement)
-        // happens after the returning activation is gone. Even though Return
-        // may throw into its caller, the current frame's catch target remains
-        // dead; making it reachable would expose this deliberately malformed
-        // EOF and reject valid return control flow.
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(2),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::ReturnUndefined, vec![]),
-            (Op::LeaveTry, vec![]),
-            (Op::Nop, vec![]),
-        ]);
-
-        assert_eq!(verify_wordcode_function(&code), Ok(()));
-    }
-
-    #[test]
-    fn abrupt_only_finally_does_not_manufacture_fallthrough() {
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(2),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::ReturnUndefined, vec![]),
-            (Op::LeaveTry, vec![]),
-            (Op::Nop, vec![]),
-            (Op::EndFinally, vec![]),
-            // The return parked at instruction 1 resumes at EndFinally, so this
-            // deliberately unterminated dead tail is not a normal successor.
-            (Op::Nop, vec![]),
-        ]);
-
-        assert_eq!(verify_wordcode_function(&code), Ok(()));
-    }
-
-    #[test]
-    fn finally_join_unions_normal_and_abrupt_completion_kinds() {
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(3),
-                    Operand::Register(0),
-                ],
-            ),
-            (
-                Op::JumpIfTrue,
-                vec![Operand::Imm32(1), Operand::Register(0)],
-            ),
-            (Op::ReturnUndefined, vec![]),
-            (Op::LeaveTry, vec![]),
-            (Op::Nop, vec![]),
-            (Op::EndFinally, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-
-        assert_eq!(verify_wordcode_function(&code), Ok(()));
-    }
-
-    #[test]
-    fn abrupt_only_nested_finally_chain_does_not_fall_through() {
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(5),
-                    Operand::Register(0),
-                ],
-            ),
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(2),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::ReturnUndefined, vec![]),
-            (Op::LeaveTry, vec![]),
-            (Op::EndFinally, vec![]),
-            (Op::LeaveTry, vec![]),
-            (Op::EndFinally, vec![]),
-            (Op::Nop, vec![]),
-        ]);
-
-        assert_eq!(verify_wordcode_function(&code), Ok(()));
-    }
-
-    #[test]
-    fn wordcode_verifier_accepts_nested_try_catch_finally_loop_and_abrupt_paths() {
-        // Compiler-shaped outer finally + inner catch. LoadProperty supplies
-        // the dynamic throw edge; the backedge stays inside the inner region;
-        // JumpViaFinally summarizes the break path through the outer finally.
-        let code = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(10),
-                    Operand::Register(0),
-                ],
-            ),
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(5),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            (
-                Op::LoadProperty,
-                vec![
-                    Operand::Register(0),
-                    Operand::Register(1),
-                    Operand::ConstIndex(0),
-                ],
-            ),
-            (
-                Op::JumpIfTrue,
-                vec![Operand::Imm32(1), Operand::Register(0)],
-            ),
-            (Op::Jump, vec![Operand::Imm32(-3)]),
-            (Op::LeaveTry, vec![]),
-            (Op::Jump, vec![Operand::Imm32(1)]),
-            (Op::Nop, vec![]),
-            (
-                Op::JumpIfFalse,
-                vec![Operand::Imm32(1), Operand::Register(0)],
-            ),
-            (
-                Op::JumpViaFinally,
-                vec![Operand::Imm32(3), Operand::Imm32(0)],
-            ),
-            (Op::LeaveTry, vec![]),
-            (Op::Nop, vec![]),
-            (Op::EndFinally, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert_eq!(verify_wordcode_function(&code), Ok(()));
-
-        let return_through_finally = build_wordcode(vec![
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(2),
-                    Operand::Register(0),
-                ],
-            ),
-            (Op::ReturnUndefined, vec![]),
-            (Op::LeaveTry, vec![]),
-            (Op::EndFinally, vec![]),
-            (Op::ReturnUndefined, vec![]),
-        ]);
-        assert_eq!(verify_wordcode_function(&return_through_finally), Ok(()));
     }
 
     #[test]
@@ -3174,86 +1879,6 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_enter_try_rejects_handler_inside_instruction() {
-        let mut writer = BytecodeWriter::new();
-        // EnterTry occupies bytes 0..15 and Nop begins at 15. Base PC+1 plus
-        // delta 15 resolves to byte 16, inside the Nop encoding.
-        writer.write(&make_instr(
-            Op::EnterTry,
-            &[
-                Operand::Imm32(15),
-                Operand::Imm32(NO_HANDLER_OFFSET),
-                Operand::Register(0),
-            ],
-        ));
-        writer.write(&make_instr(Op::Nop, &[]));
-        let bytes = writer.into_bytes();
-        assert!(matches!(
-            decode_function(&bytes),
-            Err(DecodeError::InvalidControlFlowTarget {
-                offset: 0,
-                target: 16
-            })
-        ));
-    }
-
-    #[test]
-    fn authoritative_enter_try_accepts_absent_handler_sentinels() {
-        let instructions = [
-            make_instr(
-                Op::EnterTry,
-                &[
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            make_instr(Op::EndFinally, &[]),
-            make_instr(Op::ReturnUndefined, &[]),
-        ];
-        let encoded = encode_function(&instructions);
-        assert!(decode_function(&encoded.code).is_ok());
-    }
-
-    #[test]
-    fn jump_via_finally_uses_the_shared_branch_fixup() {
-        let instructions = [
-            make_instr(Op::JumpViaFinally, &[Operand::Imm32(1), Operand::Imm32(0)]),
-            make_instr(Op::Nop, &[]),
-            make_instr(Op::ReturnUndefined, &[]),
-        ];
-        let encoded = encode_function(&instructions);
-        let (jump, _) = decode_instruction(&encoded.code, 0).expect("decode jump-via-finally");
-        let Operand::Imm32(delta) = jump.operands.as_slice()[0] else {
-            panic!("target must remain Imm32")
-        };
-        assert_eq!(
-            (i64::from(jump.pc) + 1 + i64::from(delta)) as u32,
-            encoded.instr_to_byte_pc[2]
-        );
-        assert!(decode_function(&encoded.code).is_ok());
-    }
-
-    #[test]
-    fn jump_via_finally_rejects_negative_handler_floor() {
-        let mut writer = BytecodeWriter::new();
-        // A single instruction is 12 bytes, so delta 11 targets end-of-stream.
-        writer.write(&make_instr(
-            Op::JumpViaFinally,
-            &[Operand::Imm32(11), Operand::Imm32(-1)],
-        ));
-        let bytes = writer.into_bytes();
-        assert!(matches!(
-            decode_function(&bytes),
-            Err(DecodeError::InvalidControlFlowOperand {
-                offset: 0,
-                operand_index: 1,
-                value: -1
-            })
-        ));
-    }
-
-    #[test]
     fn op_byte_table_round_trips() {
         for (op, byte) in OP_BYTE_TABLE {
             assert_eq!(op_to_byte(*op), Some(*byte));
@@ -3388,61 +2013,6 @@ mod tests {
         );
         let resolved_target = (jump_byte_pc as i64) + 1 + (byte_delta as i64);
         assert_eq!(resolved_target as u32, target_byte_pc);
-    }
-
-    #[test]
-    fn enter_try_no_handler_sentinel_preserved() {
-        let instructions = vec![
-            make_instr(
-                Op::EnterTry,
-                &[
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(0),
-                ],
-            ),
-            make_instr(Op::LeaveTry, &[]),
-            make_instr(Op::Return, &[Operand::Register(0)]),
-        ];
-        let encoded = encode_function(&instructions);
-        let (decoded, _) = decode_instruction(&encoded.code, 0).unwrap();
-        let operands = decoded.operands.as_slice();
-        assert_eq!(operands[0], Operand::Imm32(NO_HANDLER_OFFSET));
-        assert_eq!(operands[1], Operand::Imm32(NO_HANDLER_OFFSET));
-        assert_eq!(operands[2], Operand::Register(0));
-    }
-
-    #[test]
-    fn enter_try_handler_offsets_rewritten_to_byte_pcs() {
-        // instr 0 = EnterTry catch=+1 finally=NO_HANDLER (size = 1+1+5+5+3 = 15)
-        // instr 1 = LoadInt32 (size 10)
-        // instr 2 = LeaveTry (size 1+1 = 2)        ← catch target
-        // instr 3 = Return (size 5)
-        let instructions = vec![
-            make_instr(
-                Op::EnterTry,
-                &[
-                    Operand::Imm32(1), // catch_offset (instr-index delta = +1 → target = idx 2)
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Register(7),
-                ],
-            ),
-            make_instr(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(0)]),
-            make_instr(Op::LeaveTry, &[]),
-            make_instr(Op::Return, &[Operand::Register(0)]),
-        ];
-        let encoded = encode_function(&instructions);
-        let try_byte_pc = encoded.instr_to_byte_pc[0];
-        let leave_byte_pc = encoded.instr_to_byte_pc[2];
-        let (decoded, _) = decode_instruction(&encoded.code, try_byte_pc as usize).unwrap();
-        let operands = decoded.operands.as_slice();
-        let Operand::Imm32(catch_byte_delta) = operands[0] else {
-            panic!("catch operand must remain Imm32");
-        };
-        assert_eq!(operands[1], Operand::Imm32(NO_HANDLER_OFFSET));
-        assert_eq!(operands[2], Operand::Register(7));
-        let resolved = (try_byte_pc as i64) + 1 + (catch_byte_delta as i64);
-        assert_eq!(resolved as u32, leave_byte_pc);
     }
 
     #[test]

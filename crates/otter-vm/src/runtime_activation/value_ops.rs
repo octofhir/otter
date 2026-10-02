@@ -326,16 +326,6 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_add(stack, context, &mut frame, dst, lhs, rhs)
     }
 
-    /// Complete generic unary negation.
-    pub fn neg(&mut self, dst: u16, src: u16) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let frame = self.frame.as_ptr();
-        // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_neg(&mut frame, dst, src)
-    }
-
     /// Complete one decoded numeric-family operation.
     pub fn numeric(
         &mut self,

@@ -49,7 +49,6 @@
 // intentionally redundant and outside the source-level emitter's control.
 #![allow(clippy::useless_conversion)]
 
-mod activation;
 pub(crate) mod arith;
 mod binding;
 mod calls;
@@ -161,7 +160,6 @@ fn compile_with_reach(
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
-    let code_block_id = view.code_block.id;
     // Identity-only property source cells are address-stable before their
     // pointers are baked, consumed strictly in emission order, and owned by
     // the finalized code object. Semantic proof data lives only in the
@@ -243,13 +241,13 @@ fn compile_with_reach(
         })
         .collect::<BTreeSet<_>>();
 
-    let shape = activation::EntryShape::of(
+    let shape = crate::arm64::frame::EntryShape::of(
         view,
         code_object_id,
         abi::NativeFrameKind::Baseline,
         !plan.safepoint_records.is_empty(),
     )?;
-    let activation_exits = activation::ActivationExits {
+    let activation_exits = crate::arm64::frame::ActivationExits {
         construct: ops.new_dynamic_label(),
         side_exit: ops.new_dynamic_label(),
     };
@@ -257,9 +255,9 @@ fn compile_with_reach(
     // builds this function's record and window and falls through.
     let entry = ops.offset();
     let body = ops.new_dynamic_label();
-    activation::emit_tier_prologue(&mut ops);
+    crate::arm64::frame::emit_tier_prologue(&mut ops, crate::arm64::frame::SpillArea::NONE);
     dynasm!(ops ; .arch aarch64 ; b =>body);
-    let call_entry = (!plan.osr_only).then(|| activation::emit_call_entry(&mut ops, view, shape));
+    let call_entry = (!plan.osr_only).then(|| crate::arm64::frame::emit_call_entry(&mut ops, view, shape, crate::arm64::frame::SpillArea::NONE));
     dynasm!(ops ; .arch aarch64 ; =>body);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
@@ -354,1289 +352,42 @@ fn compile_with_reach(
         if operation_requires_pc_stamp(instr.op, canonical_boolean_branch) {
             emit_stamp_pc(&mut ops, instr.pc);
         }
-        match instr.op {
-            TemplateOp::LoadImmediate { dst, bits } => {
-                emit_load_u64(&mut ops, 9, bits);
-                emit_store_reg(&mut ops, 9, dst)?;
-            }
-            TemplateOp::Move { dst, src } => {
-                emit_load_reg(&mut ops, 9, src)?;
-                emit_store_reg(&mut ops, 9, dst)?;
-            }
-            TemplateOp::Jump { target, back_edge } => {
-                let tgt = labels[&target];
-                if back_edge {
-                    emit_backedge_poll(
-                        &mut ops,
-                        &mut relocations,
-                        poll_entry,
-                        target,
-                        backedge_relink_exit,
-                        threw,
-                        fatal,
-                    );
-                }
-                dynasm!(ops ; .arch aarch64 ; b =>tgt);
-            }
-            TemplateOp::Branch {
-                condition,
-                target,
-                when_truthy,
-                back_edge,
-            } => {
-                let tgt = labels[&target];
-                emit_load_reg(&mut ops, 9, condition)?;
-                if !canonical_boolean_branch {
-                    emit_truthiness_bool(&mut ops, &mut relocations, type_mismatch_exit);
-                }
-                dynasm!(ops ; .arch aarch64 ; cmp x9, VALUE_TRUE_IMM);
-                if back_edge {
-                    let taken = ops.new_dynamic_label();
-                    let fallthrough = ops.new_dynamic_label();
-                    if when_truthy {
-                        dynasm!(ops ; .arch aarch64 ; b.eq =>taken);
-                    } else {
-                        dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
-                    }
-                    dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                    emit_backedge_poll(
-                        &mut ops,
-                        &mut relocations,
-                        poll_entry,
-                        target,
-                        backedge_relink_exit,
-                        threw,
-                        fatal,
-                    );
-                    dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
-                } else if far_branches {
-                    let fallthrough = ops.new_dynamic_label();
-                    if when_truthy {
-                        dynasm!(ops ; .arch aarch64 ; b.ne =>fallthrough);
-                    } else {
-                        dynasm!(ops ; .arch aarch64 ; b.eq =>fallthrough);
-                    }
-                    dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
-                } else if when_truthy {
-                    dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
-                } else {
-                    dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
-                }
-            }
-            TemplateOp::BranchNullish {
-                condition,
-                target,
-                back_edge,
-            } => {
-                let tgt = labels[&target];
-                emit_load_reg(&mut ops, 9, condition)?;
-                let taken = ops.new_dynamic_label();
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp x9, VALUE_NULL_IMM
-                    ; b.eq =>taken
-                    ; cmp x9, VALUE_UNDEFINED_IMM
-                    ; b.eq =>taken
-                );
-                let fallthrough = ops.new_dynamic_label();
-                dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                if back_edge {
-                    emit_backedge_poll(
-                        &mut ops,
-                        &mut relocations,
-                        poll_entry,
-                        target,
-                        backedge_relink_exit,
-                        threw,
-                        fatal,
-                    );
-                }
-                dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
-            }
-            TemplateOp::Truthiness { dst, src, negate } => {
-                emit_load_reg(&mut ops, 9, src)?;
-                emit_truthiness_bool(&mut ops, &mut relocations, type_mismatch_exit);
-                if negate {
-                    // VALUE_TRUE and VALUE_FALSE differ exactly in bit 0.
-                    dynasm!(ops ; .arch aarch64 ; eor x9, x9, #1);
-                }
-                emit_store_reg(&mut ops, 9, dst)?;
-            }
-            TemplateOp::FusedNumericChain {
-                steps,
-                leaves,
-                jump_target,
-            } => {
-                emit_fused_numeric_chain(
-                    &mut ops,
-                    plan.chain_step_tail(steps),
-                    plan.chain_leaf_tail(leaves),
-                    labels[&jump_target],
-                )?;
-            }
-            TemplateOp::BinaryArith {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => {
-                emit_binary_arith(
-                    &mut ops,
-                    &mut relocations,
-                    dst,
-                    lhs,
-                    rhs,
-                    kind,
-                    arith::ArithSite::of(view, instr.pc),
-                    &mut numeric_slow_paths,
-                )?;
-            }
-            TemplateOp::Compare {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => {
-                emit_compare(
-                    &mut ops,
-                    &mut relocations,
-                    dst,
-                    lhs,
-                    rhs,
-                    kind,
-                    arith::ArithSite::of(view, instr.pc),
+        emit_operation(
+            OperationContext {
+                ops: &mut ops,
+                relocations: &mut relocations,
+                transitions,
+                view,
+                plan: &plan,
+                labels: &labels,
+                exits: OperationExits {
                     type_mismatch_exit,
-                    &mut numeric_slow_paths,
-                )?;
-            }
-            TemplateOp::TestTypeOf { dst, src, test } => {
-                arith::emit_test_typeof(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    dst,
-                    src,
-                    test,
-                    type_mismatch_exit,
-                )?;
-            }
-            TemplateOp::LooseCompare {
-                dst,
-                lhs,
-                rhs,
-                negate,
-            } => {
-                emit_loose_compare(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    dst,
-                    lhs,
-                    rhs,
-                    negate,
-                    type_mismatch_exit,
-                    threw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::IntBitwise {
-                dst,
-                lhs,
-                rhs,
-                kind,
-            } => {
-                emit_int_bitwise(&mut ops, dst, lhs, rhs, kind, &mut numeric_slow_paths)?;
-            }
-            TemplateOp::UnsignedShiftRight { dst, lhs, rhs } => {
-                emit_unsigned_shift_right(&mut ops, dst, lhs, rhs, &mut numeric_slow_paths)?;
-            }
-            TemplateOp::Increment { dst, src, delta } => {
-                emit_increment(
-                    &mut ops,
-                    &mut relocations,
-                    dst,
-                    src,
-                    delta,
-                    arith::ArithSite::of(view, instr.pc),
-                    &mut numeric_slow_paths,
-                )?;
-            }
-            TemplateOp::Negate { dst, src } => {
-                emit_negate(
-                    &mut ops,
-                    &mut relocations,
-                    dst,
-                    src,
-                    arith::ArithSite::of(view, instr.pc),
-                    &mut numeric_slow_paths,
-                )?;
-            }
-            TemplateOp::BitwiseNot { dst, src } => {
-                emit_bitwise_not(&mut ops, dst, src, &mut numeric_slow_paths)?;
-            }
-            TemplateOp::ToNumeric { dst, src } => {
-                emit_to_numeric(&mut ops, dst, src, &mut coercion_slow_paths)?;
-            }
-            TemplateOp::ToPrimitive { dst, src, hint } => {
-                emit_to_primitive(&mut ops, dst, src, hint, &mut coercion_slow_paths)?;
-            }
-            TemplateOp::AddGeneric {
-                dst,
-                lhs,
-                rhs,
-                concat_safepoint,
-            } => {
-                emit_add_generic(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    lhs,
-                    rhs,
-                    concat_safepoint,
-                    arith::ArithSite::of(view, instr.pc),
-                    threw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::LoadThis { dst } => {
-                dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_THIS_OFFSET]);
-                if view.derived_constructor {
-                    emit_load_u64(&mut ops, 12, VALUE_HOLE);
-                    // A derived-ctor `this`-before-`super` hole resolves in the
-                    // interpreter.
-                    dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>runtime_transition_exit);
-                }
-                emit_store_reg(&mut ops, 9, dst)?;
-            }
-            TemplateOp::LoadSelfClosure { dst } => {
-                dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_SELF_OFFSET]);
-                emit_store_reg(&mut ops, 9, dst)?;
-            }
-            TemplateOp::LoadClosureContext { dst } => {
-                context::emit_load_closure_context(&mut ops, view, dst)?;
-            }
-            TemplateOp::LoadContextSlot {
-                dst,
-                context,
-                depth,
-                slot,
-            } => {
-                context::emit_load_context_slot(&mut ops, view, dst, context, depth, slot)?;
-            }
-            TemplateOp::StoreContextSlot {
-                src,
-                context,
-                depth,
-                slot,
-            } => {
-                context::emit_store_context_slot(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    src,
-                    context,
-                    depth,
-                    slot,
-                )?;
-            }
-            TemplateOp::CreateContext {
-                dst,
-                parent,
-                scope,
-                safepoint,
-            } => {
-                context::emit_context_allocation(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    dst,
-                    context::ContextAllocation::Create { parent, scope },
-                    safepoint,
-                    allocation_miss_exit,
-                )?;
-            }
-            TemplateOp::CopyContext {
-                dst,
-                src,
-                safepoint,
-            } => {
-                context::emit_context_allocation(
-                    &mut ops,
-                    &mut relocations,
-                    view,
-                    dst,
-                    context::ContextAllocation::Copy { source: src },
-                    safepoint,
-                    allocation_miss_exit,
-                )?;
-            }
-            TemplateOp::ClassSuperConstructor { dst, class } => {
-                emit_load_reg(&mut ops, 1, class)?;
-                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                emit_load_runtime_stub(
-                    &mut ops,
-                    &mut relocations,
-                    16,
-                    transitions.variadic_entry(abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
-                    abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
-                );
-                dynasm!(ops ; .arch aarch64 ; blr x16);
-                emit_load_u64(&mut ops, 16, VALUE_HOLE);
-                dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>runtime_transition_exit);
-                emit_store_reg(&mut ops, 0, dst)?;
-            }
-            TemplateOp::MakeFunction { dst, constant } => {
-                let done = ops.new_dynamic_label();
-                if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
-                    let slow = ops.new_dynamic_label();
-                    emit_load_u64(&mut ops, 15, VALUE_UNDEFINED);
-                    crate::arm64::allocation::emit_closure(&mut ops, view, plan, 20, 21, slow);
-                    emit_store_reg(&mut ops, 16, dst)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
-                }
-                transitions::emit_make_function(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    constant,
-                    threw,
-                    fatal,
-                );
-                dynasm!(ops ; .arch aarch64 ; =>done);
-            }
-            TemplateOp::MakeClosure {
-                dst,
-                function,
-                context,
-            } => {
-                let done = ops.new_dynamic_label();
-                if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
-                    let slow = ops.new_dynamic_label();
-                    emit_load_reg(&mut ops, 15, context)?;
-                    crate::arm64::allocation::emit_closure(&mut ops, view, plan, 20, 21, slow);
-                    emit_store_reg(&mut ops, 16, dst)?;
-                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
-                }
-                transitions::emit_make_closure(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    code_block_id,
-                    dst,
-                    function,
-                    context,
-                    threw,
-                    fatal,
-                );
-                dynasm!(ops ; .arch aarch64 ; =>done);
-            }
-            TemplateOp::LoadRegExp { dst, constant } => {
-                transitions::emit_load_regexp(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    constant,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::BindingValue {
-                semantics,
-                result,
-                value0,
-                value1,
-                context_coord,
-            } => {
-                binding::emit_binding_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    semantics,
-                    result,
-                    value0,
-                    value1,
-                    context_coord,
-                    instr.byte_pc,
-                    code_map.as_mut(),
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::GlobalDeclarationValue {
-                semantics,
-                value0,
-                value1,
-            } => {
-                binding::emit_global_declaration_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    semantics,
-                    value0,
-                    value1,
-                    instr.byte_pc,
-                    code_map.as_mut(),
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::LoadBuiltinError { dst, constant } => {
-                transitions::emit_load_builtin_error(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    constant,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::NewObject { dst } => {
-                transitions::emit_new_object(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::CollectArguments { dst } => {
-                transitions::emit_collect_arguments(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::CallForwardArguments {
-                dst,
-                method,
-                receiver,
-                this_value,
-            } => {
-                forward_call::emit_forward_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    code_map.as_mut(),
-                    instr.pc,
-                    [dst, method, receiver, this_value],
-                    threw,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::NewArray { dst, elements } => {
-                transitions::emit_new_array(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    plan.register_tail(elements),
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::NewObjectLiteral { dst, elements } => {
-                transitions::emit_new_object_literal(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    plan.register_tail(elements),
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::DefineDataProperty { object, key, value } => {
-                transitions::emit_define_data_property(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    object,
-                    key,
-                    value,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::DefineOwnProperty {
-                target,
-                key,
-                descriptor,
-            } => {
-                transitions::emit_define_own_property(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    target,
-                    key,
-                    descriptor,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::LoadElement {
-                dst,
-                receiver,
-                index,
-            } => {
-                transitions::emit_load_element(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    dst,
-                    receiver,
-                    index,
-                    instr.byte_pc,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::StoreElement {
-                receiver,
-                index,
-                value,
-            } => {
-                transitions::emit_store_element(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    receiver,
-                    index,
-                    value,
-                    instr.byte_pc,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::LoadProperty {
-                dst,
-                object,
-                name,
-                site,
-                array_length,
-            } => {
-                let cell_ordinal =
-                    u32::try_from(next_load_ic).expect("template load IC ordinal fits u32");
-                let cell = &mut load_ic_cells[next_load_ic];
-                next_load_ic += 1;
-                cell.set_source(view.code_block.id, instr.pc);
-                let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
-                properties::emit_load_property(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    dst,
-                    object,
-                    instr.byte_pc,
-                    name,
-                    site,
-                    array_length,
-                    cell_addr,
-                    cell_ordinal,
-                    view.property_programs
-                        .get(&instr.byte_pc)
-                        .map(Vec::as_slice),
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::StoreProperty {
-                object,
-                name,
-                value,
-                site,
-            } => {
-                let cell_ordinal =
-                    u32::try_from(next_store_ic).expect("template store IC ordinal fits u32");
-                let cell = &mut store_ic_cells[next_store_ic];
-                next_store_ic += 1;
-                cell.set_source(view.code_block.id, instr.pc);
-                let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
-                properties::emit_store_property(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    object,
-                    name,
-                    value,
-                    site,
-                    cell_addr,
-                    cell_ordinal,
-                    view.property_programs
-                        .get(&instr.byte_pc)
-                        .map(Vec::as_slice),
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::Call {
-                dst,
-                callee,
-                argc,
-                packed_args,
-                byte_pc,
-            } => {
-                let argument_registers = plan.call_argument_registers(argc, packed_args);
-                calls::emit_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    direct_call_events.as_mut(),
-                    code_map.as_mut(),
-                    dst,
-                    callee,
-                    argc,
-                    &argument_registers,
-                    instr.pc,
-                    byte_pc,
                     identity_guard_exit,
-                    threw,
-                    committed_throw,
-                )?;
-            }
-            TemplateOp::CallWithThis {
-                dst,
-                callee,
-                this_value,
-                argc,
-                packed_args,
-                byte_pc,
-            } => {
-                let argument_registers = plan.call_argument_registers(argc, packed_args);
-                calls::emit_call_with_receiver(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    direct_call_events.as_mut(),
-                    code_map.as_mut(),
-                    dst,
-                    callee,
-                    Some(this_value),
-                    argc,
-                    &argument_registers,
-                    instr.pc,
-                    byte_pc,
-                    identity_guard_exit,
-                    threw,
-                    committed_throw,
-                )?;
-            }
-            TemplateOp::Construct {
-                dst,
-                callee,
-                argc,
-                packed_args,
-                super_construct,
-                byte_pc,
-            } => {
-                let argument_registers = plan.call_argument_registers(argc, packed_args);
-                calls::emit_construct(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    code_map.as_mut(),
-                    dst,
-                    callee,
-                    &argument_registers,
-                    super_construct,
-                    instr.pc,
-                    byte_pc,
-                    threw,
-                    committed_throw,
-                )?;
-            }
-            TemplateOp::MethodCall {
-                dst,
-                receiver,
-                arguments,
-                byte_pc,
-                arg0,
-                arg1,
-            } => {
-                let argument_registers = plan.register_tail(arguments);
-                calls::emit_method_call(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    direct_call_events.as_mut(),
-                    code_map.as_mut(),
-                    dst,
-                    receiver,
-                    argument_registers,
-                    instr.pc,
-                    byte_pc,
-                    arg0,
-                    arg1,
-                    identity_guard_exit,
-                    threw,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::EnterTry {
-                catch_pc,
-                finally_pc,
-                exception_register,
-            } => {
-                exceptions::emit_exception_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::EnterTry as u8,
-                    u64::from(catch_pc.unwrap_or(u32::MAX)),
-                    u64::from(finally_pc.unwrap_or(u32::MAX)),
-                    u64::from(exception_register),
-                    bail,
-                    returned,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::LeaveTry => {
-                exceptions::emit_exception_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::LeaveTry as u8,
-                    0,
-                    0,
-                    0,
-                    bail,
-                    returned,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::Throw { src } => {
-                scalar::emit_scalar_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    otter_vm::native_abi::ScalarValueOp::PrepareThrow,
-                    src,
-                    Some(src),
-                    None,
-                    committed_throw,
-                    fatal,
-                )?;
-                values::emit_load_reg(&mut ops, 0, src)?;
-                dynasm!(ops ; .arch aarch64 ; b =>committed_throw);
-            }
-            TemplateOp::TdzError { local_index } => {
-                exceptions::emit_exception_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::TdzError as u8,
-                    u64::from(local_index),
-                    0,
-                    0,
-                    bail,
-                    returned,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::EndFinally => {
-                exceptions::emit_exception_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::EndFinally as u8,
-                    0,
-                    0,
-                    0,
-                    bail,
-                    returned,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::PopParkedFinally { count } => {
-                exceptions::emit_exception_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::PopParkedFinally as u8,
-                    u64::from(count),
-                    0,
-                    0,
-                    bail,
-                    returned,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::JumpViaFinally { target, floor } => {
-                exceptions::emit_exception_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::JumpViaFinally as u8,
-                    u64::from(target),
-                    u64::from(floor),
-                    0,
-                    bail,
-                    returned,
-                    committed_throw,
-                    fatal,
-                );
-            }
-            TemplateOp::IteratorNext {
-                value_dst,
-                done_dst,
-                iterator,
-            } => {
-                iterators::emit_iterator_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::IteratorNext as u8,
-                    u64::from(value_dst),
-                    u64::from(done_dst),
-                    u64::from(iterator),
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::IteratorClose { iterator } => {
-                iterators::emit_iterator_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::IteratorClose as u8,
-                    u64::from(iterator),
-                    0,
-                    0,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::IteratorCloseStart { iterator } => {
-                iterators::emit_iterator_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::IteratorCloseStart as u8,
-                    u64::from(iterator),
-                    0,
-                    0,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::IteratorCloseEnd { iterator } => {
-                iterators::emit_iterator_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::IteratorCloseEnd as u8,
-                    u64::from(iterator),
-                    0,
-                    0,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::BindFunction {
-                dst,
-                callee,
-                bound_this,
-                argc,
-                packed_args,
-            } => {
-                let packed_meta = u64::from(dst)
-                    | (u64::from(callee) << 16)
-                    | (u64::from(bound_this) << 32)
-                    | (u64::from(argc) << 48);
-                functions::emit_bind_function(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    packed_meta,
-                    packed_args,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ObjectProtocolValue {
-                operation,
-                result,
-                value0,
-                value1,
-            } => {
-                protocol::emit_object_protocol_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    operation,
-                    result,
-                    value0,
-                    value1,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::DeleteOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                delete::emit_delete_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ScalarValue {
-                operation,
-                result,
-                value0,
-                value1,
-            } => {
-                scalar::emit_scalar_value(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    operation,
-                    result,
-                    value0,
-                    value1,
-                    committed_throw,
-                    fatal,
-                )?;
-            }
-            TemplateOp::LoadStringConstant { dst } => {
-                scalar::emit_string_constant(&mut ops, &mut relocations, view, instr.byte_pc, dst)?;
-            }
-            TemplateOp::SuperOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                super_access::emit_super_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::PrivateOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                private_access::emit_private_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ValueLoadOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                value_load::emit_value_load_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ConstructOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                construct::emit_construct_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::StructuralOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                structural::emit_structural_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ClassOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                class_ops::emit_class_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::ArrayConstruct {
-                dst,
-                length,
-                safepoint,
-            } => {
-                transitions::emit_array_construct_alloc_call(
-                    &mut ops,
-                    &mut relocations,
-                    dst,
-                    length,
-                    safepoint,
                     allocation_miss_exit,
-                )?;
-            }
-            TemplateOp::VariadicOp {
-                opcode,
-                prefix,
-                argc,
-                packed_args,
-            } => {
-                variadic::emit_variadic_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    prefix,
-                    argc,
-                    packed_args,
+                    unsupported_exit,
+                    runtime_transition_exit,
+                    backedge_relink_exit,
                     bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::StaticCallOp {
-                opcode,
-                packed_head,
-                method,
-                packed_args,
-            } => {
-                static_call::emit_static_call_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    packed_head,
-                    method,
-                    packed_args,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::SpreadCallOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                spread_call::emit_spread_call_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    view,
-                    code_map.as_mut(),
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    instr.pc,
-                    instr.byte_pc,
-                    threw,
+                    returned,
                     committed_throw,
-                )?;
-            }
-            TemplateOp::ClassValueOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                class_value::emit_class_value_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
                     threw,
+                    propagate_throw,
                     fatal,
-                );
-            }
-            TemplateOp::ModuleOp {
-                opcode,
-                arg0,
-                arg1,
-                arg2,
-            } => {
-                module_op::emit_module_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::NoOp => {}
-            TemplateOp::GetIterator { dst, src } => {
-                iterators::emit_iterator_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::GetIterator as u8,
-                    u64::from(dst),
-                    u64::from(src),
-                    0,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::GetAsyncIterator { dst, src } => {
-                iterators::emit_iterator_op(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    Op::GetAsyncIterator as u8,
-                    u64::from(dst),
-                    u64::from(src),
-                    0,
-                    bail,
-                    threw,
-                    fatal,
-                );
-            }
-            TemplateOp::Return { src } => {
-                let off = reg_offset(src)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; ldr x0, [x19, off]
-                    ; b =>returned
-                );
-            }
-            TemplateOp::ReturnUndefined => {
-                emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch aarch64 ; b =>returned);
-            }
-            TemplateOp::ReturnDerived {
-                value,
-                context,
-                depth,
-                slot,
-            } => {
-                // Only `undefined` over a bound receiver completes here; the
-                // receiver is the construct result. Every other shape re-runs
-                // `ReturnDerived` in the interpreter before any effect. Template
-                // never compiles a return that crosses a `finally`, so reading
-                // the `DerivedThis` slot now equals reading it at frame pop.
-                emit_load_reg(&mut ops, 9, value)?;
-                emit_load_u64(&mut ops, 10, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>runtime_transition_exit);
-                context::emit_read_context_slot(&mut ops, view, 0, context, depth, slot)?;
-                emit_load_u64(&mut ops, 10, VALUE_HOLE);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; cmp x0, x10
-                    ; b.eq =>runtime_transition_exit
-                    ; b =>returned
-                );
-            }
-            TemplateOp::UnsupportedBail => {
-                dynasm!(ops ; .arch aarch64 ; b =>unsupported_exit);
-            }
-        }
+                },
+                poll_entry,
+                far_branches,
+                load_ic_cells: &mut load_ic_cells,
+                next_load_ic: &mut next_load_ic,
+                store_ic_cells: &mut store_ic_cells,
+                next_store_ic: &mut next_store_ic,
+                numeric_slow_paths: &mut numeric_slow_paths,
+                coercion_slow_paths: &mut coercion_slow_paths,
+                direct_call_events: &mut direct_call_events,
+                code_map: &mut code_map,
+            },
+            instr,
+            canonical_boolean_branch,
+        )?;
         if let Some(code_map) = code_map.as_mut() {
             code_map.record(CodeRegion::instruction(
                 instruction_start,
@@ -1728,7 +479,7 @@ fn compile_with_reach(
         ; =>returned
         ; movz x1, abi::NativeResultStatus::Success as u32
     );
-    activation::emit_epilogue(&mut ops, activation_exits);
+    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::arm64::frame::SpillArea::NONE);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "returnEpilogue",
@@ -1849,24 +600,25 @@ fn compile_with_reach(
         ; =>propagate_throw
         ; movz x1, abi::NativeResultStatus::Throw as u32
     );
-    activation::emit_epilogue(&mut ops, activation_exits);
+    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::arm64::frame::SpillArea::NONE);
     dynasm!(ops
         ; .arch aarch64
         ; =>fatal
     );
     emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; movz x1, abi::NativeResultStatus::Fatal as u32);
-    activation::emit_epilogue(&mut ops, activation_exits);
-    activation::emit_exits(
+    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::arm64::frame::SpillArea::NONE);
+    crate::arm64::frame::emit_exits(
         &mut ops,
         &mut relocations,
         transitions,
         view,
         shape.derived,
         activation_exits,
+        crate::arm64::frame::SpillArea::NONE,
     );
     if let Some((_, cold)) = call_entry {
-        activation::emit_call_entry_cold(
+        crate::arm64::frame::emit_call_entry_cold(
             &mut ops,
             &mut relocations,
             transitions,
@@ -1899,7 +651,7 @@ fn compile_with_reach(
             continue;
         };
         let offset = ops.offset().0;
-        activation::emit_tier_prologue(&mut ops);
+        crate::arm64::frame::emit_tier_prologue(&mut ops, crate::arm64::frame::SpillArea::NONE);
         dynasm!(ops ; .arch aarch64 ; b =>target);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record_osr(header_pc, offset, ops.offset().0);
@@ -1954,6 +706,1282 @@ fn compile_with_reach(
     })
 }
 
+
+/// Exit labels one template operation branches to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperationExits {
+    pub(crate) type_mismatch_exit: DynamicLabel,
+    pub(crate) identity_guard_exit: DynamicLabel,
+    pub(crate) allocation_miss_exit: DynamicLabel,
+    pub(crate) unsupported_exit: DynamicLabel,
+    pub(crate) runtime_transition_exit: DynamicLabel,
+    pub(crate) backedge_relink_exit: DynamicLabel,
+    /// Runtime-transition helpers' shared side exit.
+    pub(crate) bail: DynamicLabel,
+    pub(crate) returned: DynamicLabel,
+    pub(crate) committed_throw: DynamicLabel,
+    pub(crate) threw: DynamicLabel,
+    pub(crate) propagate_throw: DynamicLabel,
+    pub(crate) fatal: DynamicLabel,
+}
+
+/// Everything one template operation's emission reads or appends to.
+pub(crate) struct OperationContext<'c> {
+    pub(crate) ops: &'c mut Assembler,
+    pub(crate) relocations: &'c mut RelocationCapture,
+    pub(crate) transitions: &'c crate::entry::TransitionTable,
+    pub(crate) view: &'c JitCompileSnapshot,
+    pub(crate) plan: &'c TemplatePlan,
+    /// Branch targets by logical PC; control operations only.
+    pub(crate) labels: &'c BTreeMap<u32, DynamicLabel>,
+    pub(crate) exits: OperationExits,
+    pub(crate) poll_entry: u64,
+    pub(crate) far_branches: bool,
+    pub(crate) load_ic_cells: &'c mut [crate::entry::PropertySourceCell],
+    pub(crate) next_load_ic: &'c mut usize,
+    pub(crate) store_ic_cells: &'c mut [crate::entry::PropertySourceCell],
+    pub(crate) next_store_ic: &'c mut usize,
+    pub(crate) numeric_slow_paths: &'c mut Vec<arith::NumericSlowPath>,
+    pub(crate) coercion_slow_paths: &'c mut Vec<arith::CoercionSlowPath>,
+    pub(crate) direct_call_events: &'c mut Option<super::DirectCallEvents>,
+    pub(crate) code_map: &'c mut Option<CodeMapCapture>,
+}
+
+/// Emit one planned template operation over the register window.
+///
+/// The caller has bound the operation's label and stamped its PC when the
+/// operation requires one.
+pub(crate) fn emit_operation(
+    context: OperationContext<'_>,
+    instr: &super::plan::TemplateInstr,
+    canonical_boolean_branch: bool,
+) -> Result<(), Unsupported> {
+    let OperationContext {
+        ops,
+        relocations,
+        transitions,
+        view,
+        plan,
+        labels,
+        exits,
+        poll_entry,
+        far_branches,
+        load_ic_cells,
+        next_load_ic,
+        store_ic_cells,
+        next_store_ic,
+        numeric_slow_paths,
+        coercion_slow_paths,
+        direct_call_events,
+        code_map,
+    } = context;
+    let OperationExits {
+        type_mismatch_exit,
+        identity_guard_exit,
+        allocation_miss_exit,
+        unsupported_exit,
+        runtime_transition_exit,
+        backedge_relink_exit,
+        bail,
+        returned,
+        committed_throw,
+        threw,
+        propagate_throw,
+        fatal,
+    } = exits;
+    let _ = (propagate_throw, far_branches);
+    let code_block_id = view.code_block.id;
+
+    match instr.op {
+        TemplateOp::LoadImmediate { dst, bits } => {
+            emit_load_u64(ops, 9, bits);
+            emit_store_reg(ops, 9, dst)?;
+        }
+        TemplateOp::Move { dst, src } => {
+            emit_load_reg(ops, 9, src)?;
+            emit_store_reg(ops, 9, dst)?;
+        }
+        TemplateOp::Jump { target, back_edge } => {
+            let tgt = labels[&target];
+            if back_edge {
+                emit_backedge_poll(
+                    ops,
+                    relocations,
+                    poll_entry,
+                    target,
+                    backedge_relink_exit,
+                    threw,
+                    fatal,
+                );
+            }
+            dynasm!(ops ; .arch aarch64 ; b =>tgt);
+        }
+        TemplateOp::Branch {
+            condition,
+            target,
+            when_truthy,
+            back_edge,
+        } => {
+            let tgt = labels[&target];
+            emit_load_reg(ops, 9, condition)?;
+            if !canonical_boolean_branch {
+                emit_truthiness_bool(ops, relocations, type_mismatch_exit);
+            }
+            dynasm!(ops ; .arch aarch64 ; cmp x9, VALUE_TRUE_IMM);
+            if back_edge {
+                let taken = ops.new_dynamic_label();
+                let fallthrough = ops.new_dynamic_label();
+                if when_truthy {
+                    dynasm!(ops ; .arch aarch64 ; b.eq =>taken);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
+                emit_backedge_poll(
+                    ops,
+                    relocations,
+                    poll_entry,
+                    target,
+                    backedge_relink_exit,
+                    threw,
+                    fatal,
+                );
+                dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
+            } else if far_branches {
+                let fallthrough = ops.new_dynamic_label();
+                if when_truthy {
+                    dynasm!(ops ; .arch aarch64 ; b.ne =>fallthrough);
+                } else {
+                    dynasm!(ops ; .arch aarch64 ; b.eq =>fallthrough);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
+            } else if when_truthy {
+                dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
+            } else {
+                dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
+            }
+        }
+        TemplateOp::BranchNullish {
+            condition,
+            target,
+            back_edge,
+        } => {
+            let tgt = labels[&target];
+            emit_load_reg(ops, 9, condition)?;
+            let taken = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x9, VALUE_NULL_IMM
+                ; b.eq =>taken
+                ; cmp x9, VALUE_UNDEFINED_IMM
+                ; b.eq =>taken
+            );
+            let fallthrough = ops.new_dynamic_label();
+            dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
+            if back_edge {
+                emit_backedge_poll(
+                    ops,
+                    relocations,
+                    poll_entry,
+                    target,
+                    backedge_relink_exit,
+                    threw,
+                    fatal,
+                );
+            }
+            dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
+        }
+        TemplateOp::Truthiness { dst, src, negate } => {
+            emit_load_reg(ops, 9, src)?;
+            emit_truthiness_bool(ops, relocations, type_mismatch_exit);
+            if negate {
+                // VALUE_TRUE and VALUE_FALSE differ exactly in bit 0.
+                dynasm!(ops ; .arch aarch64 ; eor x9, x9, #1);
+            }
+            emit_store_reg(ops, 9, dst)?;
+        }
+        TemplateOp::FusedNumericChain {
+            steps,
+            leaves,
+            jump_target,
+        } => {
+            emit_fused_numeric_chain(
+                ops,
+                plan.chain_step_tail(steps),
+                plan.chain_leaf_tail(leaves),
+                labels[&jump_target],
+            )?;
+        }
+        TemplateOp::BinaryArith {
+            dst,
+            lhs,
+            rhs,
+            kind,
+        } => {
+            emit_binary_arith(
+                ops,
+                relocations,
+                dst,
+                lhs,
+                rhs,
+                kind,
+                arith::ArithSite::of(view, instr.pc),
+                numeric_slow_paths,
+            )?;
+        }
+        TemplateOp::Compare {
+            dst,
+            lhs,
+            rhs,
+            kind,
+        } => {
+            emit_compare(
+                ops,
+                relocations,
+                dst,
+                lhs,
+                rhs,
+                kind,
+                arith::ArithSite::of(view, instr.pc),
+                type_mismatch_exit,
+                numeric_slow_paths,
+            )?;
+        }
+        TemplateOp::TestTypeOf { dst, src, test } => {
+            arith::emit_test_typeof(
+                ops,
+                relocations,
+                view,
+                dst,
+                src,
+                test,
+                type_mismatch_exit,
+            )?;
+        }
+        TemplateOp::LooseCompare {
+            dst,
+            lhs,
+            rhs,
+            negate,
+        } => {
+            emit_loose_compare(
+                ops,
+                relocations,
+                transitions,
+                view,
+                dst,
+                lhs,
+                rhs,
+                negate,
+                type_mismatch_exit,
+                threw,
+                fatal,
+            )?;
+        }
+        TemplateOp::IntBitwise {
+            dst,
+            lhs,
+            rhs,
+            kind,
+        } => {
+            emit_int_bitwise(ops, dst, lhs, rhs, kind, numeric_slow_paths)?;
+        }
+        TemplateOp::UnsignedShiftRight { dst, lhs, rhs } => {
+            emit_unsigned_shift_right(ops, dst, lhs, rhs, numeric_slow_paths)?;
+        }
+        TemplateOp::Increment { dst, src, delta } => {
+            emit_increment(
+                ops,
+                relocations,
+                dst,
+                src,
+                delta,
+                arith::ArithSite::of(view, instr.pc),
+                numeric_slow_paths,
+            )?;
+        }
+        TemplateOp::Negate { dst, src } => {
+            emit_negate(
+                ops,
+                relocations,
+                dst,
+                src,
+                arith::ArithSite::of(view, instr.pc),
+                numeric_slow_paths,
+            )?;
+        }
+        TemplateOp::BitwiseNot { dst, src } => {
+            emit_bitwise_not(ops, dst, src, numeric_slow_paths)?;
+        }
+        TemplateOp::ToNumeric { dst, src } => {
+            emit_to_numeric(ops, dst, src, coercion_slow_paths)?;
+        }
+        TemplateOp::ToPrimitive { dst, src, hint } => {
+            emit_to_primitive(ops, dst, src, hint, coercion_slow_paths)?;
+        }
+        TemplateOp::AddGeneric {
+            dst,
+            lhs,
+            rhs,
+            concat_safepoint,
+        } => {
+            emit_add_generic(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                lhs,
+                rhs,
+                concat_safepoint,
+                arith::ArithSite::of(view, instr.pc),
+                threw,
+                fatal,
+            )?;
+        }
+        TemplateOp::LoadThis { dst } => {
+            dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_THIS_OFFSET]);
+            if view.derived_constructor {
+                emit_load_u64(ops, 12, VALUE_HOLE);
+                // A derived-ctor `this`-before-`super` hole resolves in the
+                // interpreter.
+                dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>runtime_transition_exit);
+            }
+            emit_store_reg(ops, 9, dst)?;
+        }
+        TemplateOp::LoadSelfClosure { dst } => {
+            dynasm!(ops ; .arch aarch64 ; ldr x9, [x21, NATIVE_FRAME_SELF_OFFSET]);
+            emit_store_reg(ops, 9, dst)?;
+        }
+        TemplateOp::LoadClosureContext { dst } => {
+            context::emit_load_closure_context(ops, view, dst)?;
+        }
+        TemplateOp::LoadContextSlot {
+            dst,
+            context,
+            depth,
+            slot,
+        } => {
+            context::emit_load_context_slot(ops, view, dst, context, depth, slot)?;
+        }
+        TemplateOp::StoreContextSlot {
+            src,
+            context,
+            depth,
+            slot,
+        } => {
+            context::emit_store_context_slot(
+                ops,
+                relocations,
+                view,
+                src,
+                context,
+                depth,
+                slot,
+            )?;
+        }
+        TemplateOp::CreateContext {
+            dst,
+            parent,
+            scope,
+            safepoint,
+        } => {
+            context::emit_context_allocation(
+                ops,
+                relocations,
+                view,
+                dst,
+                context::ContextAllocation::Create { parent, scope },
+                safepoint,
+                allocation_miss_exit,
+            )?;
+        }
+        TemplateOp::CopyContext {
+            dst,
+            src,
+            safepoint,
+        } => {
+            context::emit_context_allocation(
+                ops,
+                relocations,
+                view,
+                dst,
+                context::ContextAllocation::Copy { source: src },
+                safepoint,
+                allocation_miss_exit,
+            )?;
+        }
+        TemplateOp::ClassSuperConstructor { dst, class } => {
+            emit_load_reg(ops, 1, class)?;
+            dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+            emit_load_runtime_stub(
+                ops,
+                relocations,
+                16,
+                transitions.variadic_entry(abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR),
+                abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
+            );
+            dynasm!(ops ; .arch aarch64 ; blr x16);
+            emit_load_u64(ops, 16, VALUE_HOLE);
+            dynasm!(ops ; .arch aarch64 ; cmp x0, x16 ; b.eq =>runtime_transition_exit);
+            emit_store_reg(ops, 0, dst)?;
+        }
+        TemplateOp::MakeFunction { dst, constant } => {
+            let done = ops.new_dynamic_label();
+            if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
+                let slow = ops.new_dynamic_label();
+                emit_load_u64(ops, 15, VALUE_UNDEFINED);
+                crate::arm64::allocation::emit_closure(ops, view, plan, 20, 21, slow);
+                emit_store_reg(ops, 16, dst)?;
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
+            }
+            transitions::emit_make_function(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                constant,
+                threw,
+                fatal,
+            );
+            dynasm!(ops ; .arch aarch64 ; =>done);
+        }
+        TemplateOp::MakeClosure {
+            dst,
+            function,
+            context,
+        } => {
+            let done = ops.new_dynamic_label();
+            if let Some(&plan) = view.closure_allocations.get(&instr.byte_pc) {
+                let slow = ops.new_dynamic_label();
+                emit_load_reg(ops, 15, context)?;
+                crate::arm64::allocation::emit_closure(ops, view, plan, 20, 21, slow);
+                emit_store_reg(ops, 16, dst)?;
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
+            }
+            transitions::emit_make_closure(
+                ops,
+                relocations,
+                transitions,
+                code_block_id,
+                dst,
+                function,
+                context,
+                threw,
+                fatal,
+            );
+            dynasm!(ops ; .arch aarch64 ; =>done);
+        }
+        TemplateOp::LoadRegExp { dst, constant } => {
+            transitions::emit_load_regexp(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                constant,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::BindingValue {
+            semantics,
+            result,
+            value0,
+            value1,
+            context_coord,
+        } => {
+            binding::emit_binding_value(
+                ops,
+                relocations,
+                transitions,
+                view,
+                semantics,
+                result,
+                value0,
+                value1,
+                context_coord,
+                instr.byte_pc,
+                code_map.as_mut(),
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::GlobalDeclarationValue {
+            semantics,
+            value0,
+            value1,
+        } => {
+            binding::emit_global_declaration_value(
+                ops,
+                relocations,
+                transitions,
+                semantics,
+                value0,
+                value1,
+                instr.byte_pc,
+                code_map.as_mut(),
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::LoadBuiltinError { dst, constant } => {
+            transitions::emit_load_builtin_error(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                constant,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::NewObject { dst } => {
+            transitions::emit_new_object(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::CollectArguments { dst } => {
+            transitions::emit_collect_arguments(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::CallForwardArguments {
+            dst,
+            method,
+            receiver,
+            this_value,
+        } => {
+            forward_call::emit_forward_call(
+                ops,
+                relocations,
+                transitions,
+                view,
+                code_map.as_mut(),
+                instr.pc,
+                [dst, method, receiver, this_value],
+                threw,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::NewArray { dst, elements } => {
+            transitions::emit_new_array(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                plan.register_tail(elements),
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::NewObjectLiteral { dst, elements } => {
+            transitions::emit_new_object_literal(
+                ops,
+                relocations,
+                transitions,
+                dst,
+                plan.register_tail(elements),
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::DefineDataProperty { object, key, value } => {
+            transitions::emit_define_data_property(
+                ops,
+                relocations,
+                transitions,
+                object,
+                key,
+                value,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::DefineOwnProperty {
+            target,
+            key,
+            descriptor,
+        } => {
+            transitions::emit_define_own_property(
+                ops,
+                relocations,
+                transitions,
+                target,
+                key,
+                descriptor,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::LoadElement {
+            dst,
+            receiver,
+            index,
+        } => {
+            transitions::emit_load_element(
+                ops,
+                relocations,
+                transitions,
+                view,
+                dst,
+                receiver,
+                index,
+                instr.byte_pc,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::StoreElement {
+            receiver,
+            index,
+            value,
+        } => {
+            transitions::emit_store_element(
+                ops,
+                relocations,
+                transitions,
+                view,
+                receiver,
+                index,
+                value,
+                instr.byte_pc,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::LoadProperty {
+            dst,
+            object,
+            name,
+            site,
+            array_length,
+        } => {
+            let cell_ordinal =
+                u32::try_from(*next_load_ic).expect("template load IC ordinal fits u32");
+            let cell = &mut load_ic_cells[*next_load_ic];
+            *next_load_ic += 1;
+            cell.set_source(view.code_block.id, instr.pc);
+            let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
+            properties::emit_load_property(
+                ops,
+                relocations,
+                transitions,
+                view,
+                dst,
+                object,
+                instr.byte_pc,
+                name,
+                site,
+                array_length,
+                cell_addr,
+                cell_ordinal,
+                view.property_programs
+                    .get(&instr.byte_pc)
+                    .map(Vec::as_slice),
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::StoreProperty {
+            object,
+            name,
+            value,
+            site,
+        } => {
+            let cell_ordinal =
+                u32::try_from(*next_store_ic).expect("template store IC ordinal fits u32");
+            let cell = &mut store_ic_cells[*next_store_ic];
+            *next_store_ic += 1;
+            cell.set_source(view.code_block.id, instr.pc);
+            let cell_addr = cell as *mut crate::entry::PropertySourceCell as usize;
+            properties::emit_store_property(
+                ops,
+                relocations,
+                transitions,
+                view,
+                object,
+                name,
+                value,
+                site,
+                cell_addr,
+                cell_ordinal,
+                view.property_programs
+                    .get(&instr.byte_pc)
+                    .map(Vec::as_slice),
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::Call {
+            dst,
+            callee,
+            argc,
+            packed_args,
+            byte_pc,
+        } => {
+            let argument_registers = plan.call_argument_registers(argc, packed_args);
+            calls::emit_call(
+                ops,
+                relocations,
+                transitions,
+                view,
+                direct_call_events.as_mut(),
+                code_map.as_mut(),
+                dst,
+                callee,
+                argc,
+                &argument_registers,
+                instr.pc,
+                byte_pc,
+                identity_guard_exit,
+                threw,
+                committed_throw,
+            )?;
+        }
+        TemplateOp::CallWithThis {
+            dst,
+            callee,
+            this_value,
+            argc,
+            packed_args,
+            byte_pc,
+        } => {
+            let argument_registers = plan.call_argument_registers(argc, packed_args);
+            calls::emit_call_with_receiver(
+                ops,
+                relocations,
+                transitions,
+                view,
+                direct_call_events.as_mut(),
+                code_map.as_mut(),
+                dst,
+                callee,
+                Some(this_value),
+                argc,
+                &argument_registers,
+                instr.pc,
+                byte_pc,
+                identity_guard_exit,
+                threw,
+                committed_throw,
+            )?;
+        }
+        TemplateOp::Construct {
+            dst,
+            callee,
+            argc,
+            packed_args,
+            super_construct,
+            byte_pc,
+        } => {
+            let argument_registers = plan.call_argument_registers(argc, packed_args);
+            calls::emit_construct(
+                ops,
+                relocations,
+                transitions,
+                view,
+                code_map.as_mut(),
+                dst,
+                callee,
+                &argument_registers,
+                super_construct,
+                instr.pc,
+                byte_pc,
+                threw,
+                committed_throw,
+            )?;
+        }
+        TemplateOp::MethodCall {
+            dst,
+            receiver,
+            arguments,
+            byte_pc,
+            arg0,
+            arg1,
+        } => {
+            let argument_registers = plan.register_tail(arguments);
+            calls::emit_method_call(
+                ops,
+                relocations,
+                transitions,
+                view,
+                direct_call_events.as_mut(),
+                code_map.as_mut(),
+                dst,
+                receiver,
+                argument_registers,
+                instr.pc,
+                byte_pc,
+                arg0,
+                arg1,
+                identity_guard_exit,
+                threw,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::Throw { src } => {
+            scalar::emit_scalar_value(
+                ops,
+                relocations,
+                transitions,
+                view,
+                otter_vm::native_abi::ScalarValueOp::PrepareThrow,
+                src,
+                Some(src),
+                None,
+                committed_throw,
+                fatal,
+            )?;
+            values::emit_load_reg(ops, 0, src)?;
+            dynasm!(ops ; .arch aarch64 ; b =>committed_throw);
+        }
+        TemplateOp::TdzError { local_index } => {
+            exceptions::emit_exception_op(
+                ops,
+                relocations,
+                transitions,
+                Op::TdzError as u8,
+                u64::from(local_index),
+                bail,
+                propagate_throw,
+                fatal,
+            );
+        }
+        TemplateOp::IteratorNext {
+            value_dst,
+            done_dst,
+            iterator,
+        } => {
+            iterators::emit_iterator_op(
+                ops,
+                relocations,
+                transitions,
+                Op::IteratorNext as u8,
+                u64::from(value_dst),
+                u64::from(done_dst),
+                u64::from(iterator),
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::IteratorClose { iterator } => {
+            iterators::emit_iterator_op(
+                ops,
+                relocations,
+                transitions,
+                Op::IteratorClose as u8,
+                u64::from(iterator),
+                0,
+                0,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::IteratorCloseThrow { iterator } => {
+            iterators::emit_iterator_op(
+                ops,
+                relocations,
+                transitions,
+                Op::IteratorCloseThrow as u8,
+                u64::from(iterator),
+                0,
+                0,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::BindFunction {
+            dst,
+            callee,
+            bound_this,
+            argc,
+            packed_args,
+        } => {
+            let packed_meta = u64::from(dst)
+                | (u64::from(callee) << 16)
+                | (u64::from(bound_this) << 32)
+                | (u64::from(argc) << 48);
+            functions::emit_bind_function(
+                ops,
+                relocations,
+                transitions,
+                packed_meta,
+                packed_args,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ObjectProtocolValue {
+            operation,
+            result,
+            value0,
+            value1,
+        } => {
+            protocol::emit_object_protocol_value(
+                ops,
+                relocations,
+                transitions,
+                operation,
+                result,
+                value0,
+                value1,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::DeleteOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            delete::emit_delete_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ScalarValue {
+            operation,
+            result,
+            value0,
+            value1,
+        } => {
+            scalar::emit_scalar_value(
+                ops,
+                relocations,
+                transitions,
+                view,
+                operation,
+                result,
+                value0,
+                value1,
+                committed_throw,
+                fatal,
+            )?;
+        }
+        TemplateOp::LoadStringConstant { dst } => {
+            scalar::emit_string_constant(ops, relocations, view, instr.byte_pc, dst)?;
+        }
+        TemplateOp::SuperOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            super_access::emit_super_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::PrivateOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            private_access::emit_private_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ValueLoadOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            value_load::emit_value_load_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ConstructOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            construct::emit_construct_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::StructuralOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            structural::emit_structural_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ClassOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            class_ops::emit_class_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ArrayConstruct {
+            dst,
+            length,
+            safepoint,
+        } => {
+            transitions::emit_array_construct_alloc_call(
+                ops,
+                relocations,
+                dst,
+                length,
+                safepoint,
+                allocation_miss_exit,
+            )?;
+        }
+        TemplateOp::VariadicOp {
+            opcode,
+            prefix,
+            argc,
+            packed_args,
+        } => {
+            variadic::emit_variadic_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                prefix,
+                argc,
+                packed_args,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::StaticCallOp {
+            opcode,
+            packed_head,
+            method,
+            packed_args,
+        } => {
+            static_call::emit_static_call_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                packed_head,
+                method,
+                packed_args,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::SpreadCallOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            spread_call::emit_spread_call_op(
+                ops,
+                relocations,
+                transitions,
+                view,
+                code_map.as_mut(),
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                instr.pc,
+                instr.byte_pc,
+                threw,
+                committed_throw,
+            )?;
+        }
+        TemplateOp::ClassValueOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            class_value::emit_class_value_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::ModuleOp {
+            opcode,
+            arg0,
+            arg1,
+            arg2,
+        } => {
+            module_op::emit_module_op(
+                ops,
+                relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::NoOp => {}
+        TemplateOp::GetIterator { dst, src } => {
+            iterators::emit_iterator_op(
+                ops,
+                relocations,
+                transitions,
+                Op::GetIterator as u8,
+                u64::from(dst),
+                u64::from(src),
+                0,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::GetAsyncIterator { dst, src } => {
+            iterators::emit_iterator_op(
+                ops,
+                relocations,
+                transitions,
+                Op::GetAsyncIterator as u8,
+                u64::from(dst),
+                u64::from(src),
+                0,
+                bail,
+                threw,
+                fatal,
+            );
+        }
+        TemplateOp::Return { src } => {
+            let off = reg_offset(src)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x0, [x19, off]
+                ; b =>returned
+            );
+        }
+        TemplateOp::ReturnUndefined => {
+            emit_load_u64(ops, 0, VALUE_UNDEFINED);
+            dynasm!(ops ; .arch aarch64 ; b =>returned);
+        }
+        TemplateOp::ReturnDerived {
+            value,
+            context,
+            depth,
+            slot,
+        } => {
+            // Only `undefined` over a bound receiver completes here; the
+            // receiver is the construct result. Every other shape re-runs
+            // `ReturnDerived` in the interpreter before any effect. Template
+            // never compiles a return that crosses a `finally`, so reading
+            // the `DerivedThis` slot now equals reading it at frame pop.
+            emit_load_reg(ops, 9, value)?;
+            emit_load_u64(ops, 10, VALUE_UNDEFINED);
+            dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>runtime_transition_exit);
+            context::emit_read_context_slot(ops, view, 0, context, depth, slot)?;
+            emit_load_u64(ops, 10, VALUE_HOLE);
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x0, x10
+                ; b.eq =>runtime_transition_exit
+                ; b =>returned
+            );
+        }
+        TemplateOp::UnsupportedBail => {
+            dynasm!(ops ; .arch aarch64 ; b =>unsupported_exit);
+        }
+    }
+    Ok(())
+}
+
 /// Whether an operation can leave native code and therefore needs an exact
 /// resume PC published before it starts.
 fn operation_requires_pc_stamp(op: TemplateOp, canonical_boolean_branch: bool) -> bool {
@@ -2001,13 +2029,7 @@ fn branch_condition_is_canonical_boolean(
     if plan.instructions.iter().any(|instruction| {
         matches!(
             instruction.op,
-            TemplateOp::EnterTry { .. }
-                | TemplateOp::LeaveTry
-                | TemplateOp::Throw { .. }
-                | TemplateOp::TdzError { .. }
-                | TemplateOp::EndFinally
-                | TemplateOp::PopParkedFinally { .. }
-                | TemplateOp::JumpViaFinally { .. }
+            TemplateOp::Throw { .. } | TemplateOp::TdzError { .. }
         )
     }) {
         return false;

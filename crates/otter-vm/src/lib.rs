@@ -145,7 +145,6 @@ mod jit_class_value_ops;
 mod jit_construct_ops;
 pub mod jit_debug;
 mod jit_delete_ops;
-mod jit_deopt_handlers;
 mod jit_exception_ops;
 /// Compatibility path for JIT consumers while feedback ownership migrates to
 /// the tier-neutral [`feedback`] API.
@@ -254,14 +253,14 @@ pub use cpu_profile::CpuProfile;
 pub use execution_context::{CallFeedbackStats, ExecutionContext};
 pub use frame_state::{
     AsyncFrameState, PendingBindFunction, PendingBindStage, PendingGetIterator,
-    PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,
+    PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage,
 };
 pub use jit_exception_ops::JitExceptionOutcome;
 pub use jit_runtime_ops::{UnaryCoercionOp, UnaryPrimitiveHint};
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
-    NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
+    RunError, StackFrameSnapshot, VmError,
 };
 pub use runtime_activation::{
     BackedgePollOutcome, BinaryOperator, ClassRuntimeOp, CommittedValueError,
@@ -275,9 +274,7 @@ use smallvec::SmallVec;
 
 use arithmetic_dispatch::{bigint_and_op, bigint_or_op, bigint_sub_op, bigint_xor_op};
 pub(crate) use error_ops::{native_to_vm_error, native_to_vm_error_with_stack, symbol_to_vm_error};
-pub use executable::code_block_cfg::{
-    ActiveCatchRegionError, ActiveCatchRegions, CodeBlockControlFlowView, CodeBlockExceptionRegion,
-};
+pub use executable::code_block_cfg::CodeBlockControlFlowView;
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
 use operand_decode::{apply_branch, const_operand, register_operand};
 

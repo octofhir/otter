@@ -2,10 +2,10 @@
 //!
 //! # Contents
 //! - [`compile_expr`] — main expression dispatch.
+//! - [`compile_effect`] — lowering of an expression whose value is unused.
 //! - [`compile_expr_into_with_inferred_name`] — destination-aware declaration
 //!   initializer lowering.
 //! - [`compile_expr_as_property_key`] — property-key coercion for patterns.
-//! - [`coerce_compound_operands`] — compound assignment operand coercion.
 //! - [`emit_to_primitive`] — ToPrimitive bytecode emission helper.
 //! - [`identifier`] — identifier expression lowering.
 //! - [`literal`] — literal expression lowering.
@@ -37,6 +37,35 @@ pub(crate) mod object_array;
 mod unary;
 
 use crate::*;
+
+/// Evaluate `expr` for its effects alone: nothing reads its value.
+pub(crate) fn compile_effect(
+    cx: &mut Compiler,
+    expr: &Expression<'_>,
+    enclosing_span: (u32, u32),
+) -> Result<(), CompileError> {
+    match unwrap_ts_expr(expr) {
+        Expression::UpdateExpression(u) => {
+            unary::compile_update(cx, u, enclosing_span, unary::UpdateUse::Discarded)?;
+        }
+        Expression::AssignmentExpression(a) => {
+            crate::assignment::compile_assignment_with(cx, a, crate::assignment::AssignUse::Discarded)?;
+        }
+        Expression::SequenceExpression(s) => {
+            let span = (s.span.start, s.span.end);
+            for expr in &s.expressions {
+                compile_effect(cx, expr, span)?;
+            }
+        }
+        Expression::ParenthesizedExpression(p) => {
+            compile_effect(cx, &p.expression, (p.span.start, p.span.end))?;
+        }
+        expr => {
+            compile_expr(cx, expr, enclosing_span)?;
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn compile_expr(
     cx: &mut Compiler,
@@ -132,12 +161,15 @@ pub(crate) fn compile_expr(
         // <https://tc39.es/ecma262/#sec-comma-operator>
         Expression::SequenceExpression(s) => {
             let span = (s.span.start, s.span.end);
-            let mut last = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, [Operand::Register(last)], span);
-            for expr in s.expressions.iter() {
-                last = compile_expr(cx, expr, span)?;
+            let Some((last, leading)) = s.expressions.split_last() else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                return Ok(dst);
+            };
+            for expr in leading {
+                compile_effect(cx, expr, span)?;
             }
-            Ok(last)
+            compile_expr(cx, last, span)
         }
 
         Expression::TemplateLiteral(t) => compile_template_literal(cx, t),
@@ -270,7 +302,9 @@ pub(crate) fn compile_expr(
         // (a subsequent slice covers them when test262 surfaces a
         // matching gap).
         // <https://tc39.es/ecma262/#sec-update-expressions>
-        Expression::UpdateExpression(u) => unary::compile_update(cx, u, enclosing_span),
+        Expression::UpdateExpression(u) => {
+            unary::compile_update(cx, u, enclosing_span, unary::UpdateUse::Value)
+        }
 
         other => Err(CompileError::Unsupported {
             node: format!("Expression ({})", expr_kind_name(other)),
@@ -416,7 +450,7 @@ pub(crate) fn compile_expr_into_with_inferred_name(
                 return Ok(destination);
             };
             for expression in preceding {
-                let _ = compile_expr(cx, expression, span)?;
+                compile_effect(cx, expression, span)?;
             }
             let result = compile_expr(cx, last, span)?;
             move_result_into(cx, result, destination, span);
@@ -493,54 +527,6 @@ pub(crate) fn compile_expr_as_property_key(
             node: format!("PropertyKey ({key:?}) in pattern"),
             span,
         }),
-    }
-}
-
-/// Pre-coerce the loaded current value and RHS register of a compound
-/// assignment through `Op::ToPrimitive`, mirroring the
-/// [`Expression::BinaryExpression`] lowering for the equivalent
-/// operator.
-///
-/// Compound assignment is specified as `x op= y` ⇒ `x = x op y`,
-/// so the operand-coercion rules are identical to the plain
-/// `BinaryExpression` rules (§13.15.4 step 1, §13.15.3
-/// ApplyStringOrNumericBinaryOperator, §7.2.13 / §7.2.14 for the
-/// relational and equality coercion ladders). Without this pass the
-/// runtime sees a raw object operand (e.g. `new Boolean(true)`
-/// receiver of `x ^= true`) and bails out of the type-checked numeric
-/// opcode with `TypeMismatch`.
-///
-/// The `Op::ToPrimitive` runtime helper short-circuits on already
-/// primitive operands, so the extra instruction is cheap on the
-/// common path.
-pub(crate) fn coerce_compound_operands(
-    cx: &mut Compiler,
-    op: Op,
-    current: u16,
-    rhs: u16,
-    span: (u32, u32),
-) -> (u16, u16) {
-    let hint = match op {
-        Op::Add => Some("default"),
-        Op::Sub
-        | Op::Mul
-        | Op::Div
-        | Op::Rem
-        | Op::Pow
-        | Op::BitwiseAnd
-        | Op::BitwiseOr
-        | Op::BitwiseXor
-        | Op::Shl
-        | Op::Shr
-        | Op::Ushr => Some("number"),
-        _ => None,
-    };
-    match hint {
-        Some(h) => (
-            emit_to_primitive(cx, current, h, span),
-            emit_to_primitive(cx, rhs, h, span),
-        ),
-        None => (current, rhs),
     }
 }
 

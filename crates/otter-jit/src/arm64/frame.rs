@@ -1,6 +1,9 @@
-//! Template activations: the one native frame a call builds and retires.
+//! The one native frame a generated call builds and retires, shared by the
+//! baseline and graph tiers.
 //!
 //! # Contents
+//! - [`SpillArea`] — tier-owned slots reserved below the register window
+//!   and the safepoint that roots their tagged part.
 //! - [`emit_call_entry`] — the JavaScript call ABI entry: frame record and
 //!   register window built in the callee prologue, entry accounting,
 //!   receiver binding and publication.
@@ -15,15 +18,20 @@
 //! - `[x29 + 40]` holds the frame to publish on return: the caller of a
 //!   called record, or the published interpreter frame itself under a tier
 //!   entry. Bit 0 marks a record that owes constructor completion.
-//! - A call entry reserves the window and the record below `x29` and
-//!   publishes the record after every field and register is initialized.
-//!   Nothing allocates or reenters before publication.
+//! - A call entry reserves the spill area, the window and the record below
+//!   `x29` (spill area lowest, at `sp`) and publishes the record after every
+//!   field and register is initialized. Nothing allocates or reenters
+//!   before publication.
+//! - With a spill area, the record names the area's safepoint and its base
+//!   for the body's whole extent; a tier entry saves the interpreter
+//!   record's previous words in the area's top 16 bytes and every exit of a
+//!   tier frame restores them. Tagged slots are zeroed before publication.
 //! - A side exit of a called record continues in the interpreter on the same
 //!   record and window and returns its completion; a tier-entered frame
 //!   returns the exit to its interpreter.
 //!
 //! # See also
-//! - [`crate::arm64::activation`] — pieces shared with the optimizing tier.
+//! - [`crate::arm64::activation`] — receiver and object tests used here.
 //! - [`crate::call_linkage`] — the call contract.
 
 use dynasmrt::{
@@ -31,9 +39,9 @@ use dynasmrt::{
 };
 use otter_vm::{JitCompileSnapshot, native_abi as abi};
 
-use super::transitions::TransitionTable;
-use super::values::{emit_load_runtime_stub, emit_load_u64};
-pub(super) use crate::arm64::activation::EntryShape;
+use crate::entry::TransitionTable;
+use crate::template::arm64::values::{emit_load_runtime_stub, emit_load_u64};
+pub(crate) use crate::arm64::activation::EntryShape;
 use crate::{
     arm64::activation::{emit_lexical_this, emit_object_receiver_test, emit_object_test},
     artifact::relocation::RelocationCapture,
@@ -49,19 +57,67 @@ use crate::{
 const RETURN_FRAME: u32 = 40;
 /// Bytes of the record reserved below the saved registers.
 const RECORD_BYTES: u32 = std::mem::size_of::<abi::Frame>() as u32;
+/// `call_site` and `machine_roots` of the record, as two words: the
+/// depth/call-site word at 80 and the roots word at 88.
+const DEPTH_CALL_SITE: u32 = abi::NATIVE_FRAME_DEPTH_OFFSET;
+const MACHINE_ROOTS: u32 = abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET;
+
+/// Tier-owned slots reserved below the register window.
+///
+/// The area starts at `sp`. Its first `tagged_slots` words are tagged
+/// values the record's `safepoint` roots for the collector; untagged words
+/// follow. A tier entry keeps the interpreter record's previous root words
+/// in the area's last 16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpillArea {
+    /// Bytes of the area, a multiple of 16; zero for none.
+    pub(crate) bytes: u32,
+    /// Leading tagged slots, zeroed before the body runs.
+    pub(crate) tagged_slots: u32,
+    /// Safepoint naming every tagged slot.
+    pub(crate) safepoint: abi::SafepointId,
+}
+
+impl SpillArea {
+    /// No tier-owned slots: the record roots only its window.
+    pub(crate) const NONE: Self = Self {
+        bytes: 0,
+        tagged_slots: 0,
+        safepoint: abi::NO_SAFEPOINT,
+    };
+}
+
+/// Zero the area's tagged slots at `sp`.
+fn emit_zero_tagged_slots(ops: &mut Assembler, spill: SpillArea) {
+    let mut index = 0;
+    while index < spill.tagged_slots {
+        let offset = index * 8;
+        if index + 1 < spill.tagged_slots && offset <= 504 {
+            dynasm!(ops ; .arch aarch64 ; stp xzr, xzr, [sp, offset as i32]);
+            index += 2;
+        } else if offset <= 32760 {
+            dynasm!(ops ; .arch aarch64 ; str xzr, [sp, offset]);
+            index += 1;
+        } else {
+            emit_load_u64(ops, 16, u64::from(offset));
+            dynasm!(ops ; .arch aarch64 ; str xzr, [sp, x16]);
+            index += 1;
+        }
+    }
+}
 
 /// Labels shared by the exits of one Template body.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ActivationExits {
+pub(crate) struct ActivationExits {
     /// Constructor completion of `x0`/`x1`, then the return.
-    pub(super) construct: DynamicLabel,
+    pub(crate) construct: DynamicLabel,
     /// Side exit with the encoded exit in `x0`.
-    pub(super) side_exit: DynamicLabel,
+    pub(crate) side_exit: DynamicLabel,
 }
 
 /// Cold continuations of the call entry, each a `(cold, back)` pair.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CallEntryCold {
+pub(crate) struct CallEntryCold {
     overflow: DynamicLabel,
     break_even: (DynamicLabel, DynamicLabel),
     promote: (DynamicLabel, DynamicLabel),
@@ -82,7 +138,7 @@ fn emit_save(ops: &mut Assembler) {
 
 /// The entry over the published interpreter frame: its window and record
 /// become the body's, and the return publishes that frame again.
-pub(super) fn emit_tier_prologue(ops: &mut Assembler) {
+pub(crate) fn emit_tier_prologue(ops: &mut Assembler, spill: SpillArea) {
     emit_save(ops);
     dynasm!(ops
         ; .arch aarch64
@@ -91,25 +147,68 @@ pub(super) fn emit_tier_prologue(ops: &mut Assembler) {
         ; ldr x19, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET]
         ; str x21, [x29, RETURN_FRAME]
     );
+    if spill.bytes == 0 {
+        return;
+    }
+    // The interpreter already checked the stack for its own frame; the
+    // area is bounded by the same headroom the call entry checks.
+    if spill.bytes <= 4095 {
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill.bytes);
+    } else {
+        emit_load_u64(ops, 16, u64::from(spill.bytes));
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, x16);
+    }
+    emit_zero_tagged_slots(ops, spill);
+    emit_load_u64(ops, 17, u64::from(spill.safepoint));
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x16, [x21, DEPTH_CALL_SITE]
+        ; stur x16, [x29, -16]
+        ; ldr x16, [x21, MACHINE_ROOTS]
+        ; stur x16, [x29, -8]
+        ; str w17, [x21, DEPTH_CALL_SITE + 4]
+        ; mov x16, sp
+        ; str x16, [x21, MACHINE_ROOTS]
+    );
+}
+
+/// Restore an interpreter record's root words before a tier frame leaves.
+/// `x9` holds the return frame; clobbers x16.
+fn emit_restore_tier_roots(ops: &mut Assembler, spill: SpillArea) {
+    if spill.bytes == 0 {
+        return;
+    }
+    let called = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; cmp x9, x21
+        ; b.ne =>called
+        ; ldur x16, [x29, -16]
+        ; str x16, [x21, DEPTH_CALL_SITE]
+        ; ldur x16, [x29, -8]
+        ; str x16, [x21, MACHINE_ROOTS]
+        ; =>called
+    );
 }
 
 /// Bytes the call entry reserves below the saved registers: the register
 /// window, then the record.
-fn reservation(shape: EntryShape) -> u32 {
-    (u32::from(shape.register_count) * 8 + RECORD_BYTES).next_multiple_of(16)
+fn reservation(shape: EntryShape, spill: SpillArea) -> u32 {
+    (u32::from(shape.register_count) * 8 + RECORD_BYTES).next_multiple_of(16) + spill.bytes
 }
 
 /// Emit the call-ABI entry. It falls through into the body; its cold
 /// continuations are emitted by [`emit_call_entry_cold`].
-pub(super) fn emit_call_entry(
+pub(crate) fn emit_call_entry(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     shape: EntryShape,
+    spill: SpillArea,
 ) -> (AssemblyOffset, CallEntryCold) {
     let start = ops.offset();
     let overflow = ops.new_dynamic_label();
     let break_even = (ops.new_dynamic_label(), ops.new_dynamic_label());
-    let bytes = reservation(shape);
+    let bytes = reservation(shape, spill);
     let window = u32::from(shape.register_count) * 8;
     emit_save(ops);
     dynasm!(ops ; .arch aarch64 ; mov x20, x0);
@@ -137,7 +236,14 @@ pub(super) fn emit_call_entry(
             ; =>probed
         );
     }
-    dynasm!(ops ; .arch aarch64 ; mov sp, x9 ; mov x19, x9);
+    dynasm!(ops ; .arch aarch64 ; mov sp, x9);
+    if spill.bytes == 0 {
+        dynasm!(ops ; .arch aarch64 ; mov x19, x9);
+    } else {
+        emit_load_u64(ops, 19, u64::from(spill.bytes));
+        dynasm!(ops ; .arch aarch64 ; add x19, x9, x19);
+        emit_zero_tagged_slots(ops, spill);
+    }
     emit_load_u64(ops, 21, u64::from(window));
     dynasm!(ops
         ; .arch aarch64
@@ -190,8 +296,24 @@ pub(super) fn emit_call_entry(
         ; stp x1, x4, [x21, (NATIVE_FRAME_SELF_OFFSET) as i32]
         ; add x15, x29, 48
         ; stp x15, x10, [x21, (abi::NATIVE_FRAME_ACTUALS_OFFSET) as i32]
-        ; orr x16, x11, 0xffff_ffff_0000_0000
-        ; stp x16, xzr, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
+    );
+    if spill.bytes == 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; orr x16, x11, 0xffff_ffff_0000_0000
+            ; stp x16, xzr, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
+        );
+    } else {
+        emit_load_u64(ops, 16, u64::from(spill.safepoint) << 32);
+        dynasm!(ops
+            ; .arch aarch64
+            ; orr x16, x16, x11
+            ; mov x17, sp
+            ; stp x16, x17, [x21, (abi::NATIVE_FRAME_DEPTH_OFFSET) as i32]
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
         ; movn w16, 0
         ; str x16, [x21, abi::NATIVE_FRAME_CONTINUATION_OFFSET]
     );
@@ -269,7 +391,7 @@ fn emit_fill_window(ops: &mut Assembler, shape: EntryShape) {
 }
 
 /// Emit the cold continuations of the call entry.
-pub(super) fn emit_call_entry_cold(
+pub(crate) fn emit_call_entry_cold(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
@@ -358,24 +480,26 @@ fn emit_restore(ops: &mut Assembler) {
 
 /// Return `x0`/`x1`: constructor completion when the record owes it, then
 /// publish the return frame and release this native frame.
-pub(super) fn emit_epilogue(ops: &mut Assembler, exits: ActivationExits) {
+pub(crate) fn emit_epilogue(ops: &mut Assembler, exits: ActivationExits, spill: SpillArea) {
     dynasm!(ops
         ; .arch aarch64
         ; ldr x9, [x29, RETURN_FRAME]
         ; tbnz x9, 0, =>exits.construct
-        ; str x9, [x20, NATIVE_FRAME_OFFSET]
     );
+    emit_restore_tier_roots(ops, spill);
+    dynasm!(ops ; .arch aarch64 ; str x9, [x20, NATIVE_FRAME_OFFSET]);
     emit_restore(ops);
 }
 
 /// Emit the shared constructor completion and side-exit continuation.
-pub(super) fn emit_exits(
+pub(crate) fn emit_exits(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &TransitionTable,
     view: &JitCompileSnapshot,
     derived: bool,
     exits: ActivationExits,
+    spill: SpillArea,
 ) {
     // §10.2.2 steps 10–12; an abrupt completion passes through.
     let done = ops.new_dynamic_label();
@@ -412,14 +536,23 @@ pub(super) fn emit_exits(
         ; and x9, x9, -2i64 as u64
         ; cmp x9, x21
         ; b.eq =>tier
-        ; mov x1, x0
-        ; mov x0, x20
     );
+    if spill.bytes != 0 {
+        // The interpreter continues on this record: it roots its window only.
+        dynasm!(ops
+            ; .arch aarch64
+            ; movn w16, 0
+            ; str w16, [x21, DEPTH_CALL_SITE + 4]
+            ; str xzr, [x21, MACHINE_ROOTS]
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; mov x1, x0 ; mov x0, x20);
     emit_stub(ops, relocations, transitions, abi::STUB_JIT_DEOPT_CALL);
-    emit_epilogue(ops, exits);
+    emit_epilogue(ops, exits, spill);
+    dynasm!(ops ; .arch aarch64 ; =>tier);
+    emit_restore_tier_roots(ops, spill);
     dynasm!(ops
         ; .arch aarch64
-        ; =>tier
         ; movz x1, abi::NativeResultStatus::SideExit as u32
         ; str x9, [x20, NATIVE_FRAME_OFFSET]
     );

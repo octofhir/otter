@@ -48,10 +48,7 @@ pub(super) fn speculated_load(view: &JitCompileSnapshot, logical_pc: u32) -> Opt
     if instruction.op(code) != Op::LoadProperty
         || instruction.load_array_length
         || view.cage_base == 0
-        || code
-            .control_flow()
-            .enclosing_exception_region(logical_pc)
-            .is_some_and(|region| region.catch_pc.is_some())
+        || code.control_flow().handler_at(logical_pc).is_some()
         || (view.property_lookup_cache.is_some()
             && view
                 .property_megamorphic_accesses

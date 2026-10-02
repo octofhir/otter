@@ -85,6 +85,9 @@ pub struct OptimizedCode {
     _load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Per-`StoreProperty`-site inline caches, same ownership contract.
     _store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
+    /// Operand registers of generic baseline operations whose addresses the
+    /// code bakes; same ownership contract.
+    _register_operands: Box<[u16]>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
@@ -100,6 +103,7 @@ impl OptimizedCode {
         dependencies: Box<[CodeDependency]>,
         load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
+        register_operands: Box<[u16]>,
         metadata: OptimizedMetadata,
     ) -> Self {
         let code_metadata = CodeObjectMetadata {
@@ -121,6 +125,7 @@ impl OptimizedCode {
             dependencies,
             _load_ic_cells: load_ic_cells,
             _store_ic_cells: store_ic_cells,
+            _register_operands: register_operands,
             metadata,
             code_metadata,
         }

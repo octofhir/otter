@@ -27,8 +27,9 @@ use otter_bytecode::binary::{ModuleDecodeError, decode_module, encode_module};
 use otter_bytecode::wordcode::FunctionCodeBuilder;
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BindingStoreFallback, BytecodeModule,
-    ClassHintSite, Constant, ContextCoord, Function, LookupGlobalMode, LookupRefTarget,
-    MappedArgumentBinding, ModuleInit, ModuleResolution, NO_HANDLER_OFFSET, Op, Operand,
+    ClassHintSite, Constant, ContextCoord, ExceptionHandler, Function, LookupGlobalMode,
+    LookupRefTarget,
+    MappedArgumentBinding, ModuleInit, ModuleResolution, Op, Operand,
     ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanEntry,
     StoreRefMode, TemplateSite,
 };
@@ -84,39 +85,21 @@ fn seed_minimal() -> BytecodeModule {
     }
 }
 
-/// Nested `try` regions with both catch and finally targets, so the handler
-/// layout, the finally floors, and the abrupt-completion lattice all run.
+/// Nested handler ranges, so table structure and handler reachability run.
 fn seed_handlers() -> BytecodeModule {
     let mut code = FunctionCodeBuilder::new();
-    let outer = code.push(
-        Op::EnterTry,
-        &[
-            Operand::Imm32(NO_HANDLER_OFFSET),
-            Operand::Imm32(0),
-            Operand::Register(0),
-        ],
-    );
-    let inner = code.push(
-        Op::EnterTry,
-        &[
-            Operand::Imm32(NO_HANDLER_OFFSET),
-            Operand::Imm32(0),
-            Operand::Register(1),
-        ],
-    );
     code.push(Op::LoadUndefined, &[Operand::Register(0)]);
-    code.push(Op::LeaveTry, &[]);
+    let skip_inner = code.push(Op::Jump, &[Operand::Imm32(0)]);
     let inner_handler = code.next_pc();
     code.push(Op::LoadUndefined, &[Operand::Register(1)]);
-    code.push(Op::EndFinally, &[]);
-    code.push(Op::LeaveTry, &[]);
+    let after_inner = code.next_pc();
+    let skip_outer = code.push(Op::Jump, &[Operand::Imm32(0)]);
     let outer_handler = code.next_pc();
     code.push(Op::LoadUndefined, &[Operand::Register(0)]);
-    code.push(Op::EndFinally, &[]);
+    let end = code.next_pc();
     code.push(Op::ReturnUndefined, &[]);
-    // Offsets are relative to the instruction that carries them.
-    set_offset(&mut code, outer, 1, outer_handler);
-    set_offset(&mut code, inner, 1, inner_handler);
+    set_offset(&mut code, skip_inner, 0, after_inner);
+    set_offset(&mut code, skip_outer, 0, end);
 
     BytecodeModule {
         module: "file:///handlers.js".to_string(),
@@ -127,6 +110,20 @@ fn seed_handlers() -> BytecodeModule {
             name: "<main>".to_string(),
             locals: 2,
             code: code.finish(),
+            handlers: vec![
+                ExceptionHandler {
+                    start: 0,
+                    end: inner_handler,
+                    target: inner_handler,
+                    exception: 1,
+                },
+                ExceptionHandler {
+                    start: 0,
+                    end: outer_handler,
+                    target: outer_handler,
+                    exception: 0,
+                },
+            ],
             module_url: "file:///handlers.js".to_string(),
             ..Default::default()
         }],
@@ -406,9 +403,8 @@ fn seed_iterators() -> BytecodeModule {
     let exit = code.push(Op::JumpIfTrue, &[Operand::Imm32(0), Operand::Register(3)]);
     let back = code.push(Op::Jump, &[Operand::Imm32(0)]);
     let after = code.next_pc();
-    code.push(Op::IteratorCloseStart, &[Operand::Register(1)]);
     code.push(Op::IteratorClose, &[Operand::Register(1)]);
-    code.push(Op::IteratorCloseEnd, &[Operand::Register(1)]);
+    code.push(Op::IteratorCloseThrow, &[Operand::Register(1)]);
     code.push(
         Op::GetAsyncIterator,
         &[Operand::Register(4), Operand::Register(0)],
@@ -452,7 +448,14 @@ fn seed_suspensions() -> BytecodeModule {
     let mut generator = FunctionCodeBuilder::new();
     generator.push(Op::GeneratorStart, &[]);
     generator.push(Op::LoadUndefined, &[Operand::Register(0)]);
-    generator.push(Op::Yield, &[Operand::Register(1), Operand::Register(0)]);
+    generator.push(
+        Op::Yield,
+        &[
+            Operand::Register(1),
+            Operand::Register(2),
+            Operand::Register(0),
+        ],
+    );
     generator.push(
         Op::YieldDelegate,
         &[
@@ -472,7 +475,14 @@ fn seed_suspensions() -> BytecodeModule {
     async_generator.push(Op::GeneratorStart, &[]);
     async_generator.push(Op::LoadUndefined, &[Operand::Register(0)]);
     async_generator.push(Op::Await, &[Operand::Register(1), Operand::Register(0)]);
-    async_generator.push(Op::Yield, &[Operand::Register(2), Operand::Register(1)]);
+    async_generator.push(
+        Op::Yield,
+        &[
+            Operand::Register(2),
+            Operand::Register(0),
+            Operand::Register(1),
+        ],
+    );
     async_generator.push(Op::ReturnUndefined, &[]);
 
     let mut main = FunctionCodeBuilder::new();
@@ -1372,8 +1382,30 @@ fn structural_mutations_are_typed_rejections() {
         module
     };
 
+    let handler_target_out_of_range = {
+        let mut module = seed_handlers();
+        module.functions[0].handlers[0].target = 4_000;
+        module
+    };
+    let handler_register_outside_window = {
+        let mut module = seed_handlers();
+        module.functions[0].handlers[1].exception = 300;
+        module
+    };
+    let outer_handler_listed_first = {
+        let mut module = seed_handlers();
+        module.functions[0].handlers.swap(0, 1);
+        module
+    };
+
     for (name, module) in [
         ("sparse function ids", sparse),
+        ("handler target out of range", handler_target_out_of_range),
+        (
+            "handler register outside the window",
+            handler_register_outside_window,
+        ),
+        ("outer handler listed first", outer_handler_listed_first),
         ("dangling constant index", dangling_constant),
         ("short register window", short_register_window),
         (
@@ -1445,31 +1477,23 @@ fn verification_cost_stays_linear_in_handler_nesting() {
     // multiple of the instruction count, so the depth cannot be used to
     // amplify verification work.
     fn nested_module(depth: usize) -> BytecodeModule {
-        // Textual nesting, the shape a compiler emits: each region's finally
-        // block sits inside its parent, so its landing lexical depth matches
-        // the region it belongs to.
+        // Textual nesting, the shape a compiler emits: every range covers
+        // the body, and each handler sits after the ranges it encloses.
         let mut code = FunctionCodeBuilder::new();
-        let mut enters = Vec::with_capacity(depth);
-        for _ in 0..depth {
-            enters.push(code.push(
-                Op::EnterTry,
-                &[
-                    Operand::Imm32(NO_HANDLER_OFFSET),
-                    Operand::Imm32(0),
-                    Operand::Register(0),
-                ],
-            ));
-        }
         code.push(Op::LoadUndefined, &[Operand::Register(0)]);
-        for enter in enters.into_iter().rev() {
-            code.push(Op::LeaveTry, &[]);
+        let mut handlers = Vec::with_capacity(depth);
+        for _ in 0..depth {
             let skip = code.push(Op::Jump, &[Operand::Imm32(0)]);
             let landing = code.next_pc();
             code.push(Op::LoadUndefined, &[Operand::Register(0)]);
-            code.push(Op::EndFinally, &[]);
             let after = code.next_pc();
-            set_offset(&mut code, enter, 1, landing);
             set_offset(&mut code, skip, 0, after);
+            handlers.push(ExceptionHandler {
+                start: 0,
+                end: landing,
+                target: landing,
+                exception: 0,
+            });
         }
         code.push(Op::ReturnUndefined, &[]);
         BytecodeModule {
@@ -1481,6 +1505,7 @@ fn verification_cost_stays_linear_in_handler_nesting() {
                 name: "<main>".to_string(),
                 locals: 1,
                 code: code.finish(),
+                handlers,
                 module_url: "file:///nested.js".to_string(),
                 ..Default::default()
             }],

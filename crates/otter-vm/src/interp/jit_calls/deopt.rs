@@ -8,9 +8,10 @@
 //! The physical outer frame and its windows stay published throughout deopt.
 //! Its tier changes in place, preserving actuals, SELF, constructor bindings
 //! and arguments identity. Only inlined descendants require new native extents;
-//! their owned inputs transfer through the common trampoline. Static catch
-//! handlers are installed before dispatch observes a restored PC. A committed
-//! source operation is never replayed, and dispatch stays above its caller floor.
+//! their owned inputs transfer through the common trampoline. A restored frame
+//! waiting on a restored callee stands at its call instruction and moves past
+//! it when the callee returns. A committed source operation is never replayed,
+//! and dispatch stays above its caller floor.
 //!
 //! # See also
 //! - [`crate::active_frame`] for checked frame access.
@@ -23,7 +24,7 @@ use crate::{
 };
 
 impl Interpreter {
-    /// Restore interpreter ownership and catch state without executing JS.
+    /// Restore interpreter ownership without executing JS.
     /// The native deopt entry resumes this frame after this method returns.
     pub(crate) fn prepare_deoptimized_frame(
         &mut self,
@@ -37,11 +38,6 @@ impl Interpreter {
         let function = context
             .exec_function(native.header.function_id)
             .ok_or(VmError::InvalidOperand)?;
-        let handler_plan = Self::jit_prepare_static_catch_handlers(
-            context,
-            native.header.function_id,
-            native.header.pc,
-        )?;
         let register_count = active.register_count();
         if register_count != usize::from(function.register_count) {
             return Err(VmError::InvalidOperand);
@@ -50,7 +46,7 @@ impl Interpreter {
         if !native.enter_interpreter() {
             return Err(VmError::InvalidOperand);
         }
-        self.jit_install_static_catch_handlers(native, handler_plan)
+        Ok(())
     }
 
     /// Prepare restored inline descendants for assembly-owned continuation.
@@ -137,31 +133,29 @@ impl Interpreter {
                     count: 0,
                 });
         }
-        let handler_plans = frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| {
-                Self::jit_prepare_static_catch_handlers(
-                    context,
-                    frame.function_id,
-                    resume_pcs[index],
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         // The outer recipe writes back into its existing physical activation.
         // Descendants are owned entry inputs until assembly creates their extents.
+        // Every frame but the innermost waits on its restored callee: its
+        // recipe resumes after the call instruction, and it stands at that
+        // instruction until the callee returns.
+        let waiting = |index: usize| index + 1 < frames.len();
+        let standing_pc = |index: usize| -> Result<u32, VmError> {
+            if waiting(index) {
+                resume_pcs[index].checked_sub(1).ok_or(VmError::InvalidOperand)
+            } else {
+                Ok(resume_pcs[index])
+            }
+        };
         native.registers.copy_from_slice(&outermost.slots);
-        native.header.pc = resume_pcs[0];
+        native.header.pc = standing_pc(0)?;
+        if waiting(0) {
+            native.header.flags = native.header.flags.with(NativeFrameFlags::ADVANCE_ON_RESUME);
+        }
         if !native.enter_interpreter() {
             return Err(VmError::InvalidOperand);
         }
-        let mut plans = handler_plans.into_iter();
-        self.jit_install_static_catch_handlers(
-            native,
-            plans.next().ok_or(VmError::InvalidOperand)?,
-        )?;
         let mut descendants = Vec::with_capacity(frames.len().saturating_sub(1));
-        for (index, plan) in plans.enumerate() {
+        for index in 0..frames.len().saturating_sub(1) {
             // Plans exclude the physical outer activation.
             let deopt = &frames[index + 1];
             let entry = deopt.entry.ok_or(VmError::InvalidOperand)?;
@@ -177,7 +171,10 @@ impl Interpreter {
                 entry.closure,
                 entry.this,
             );
-            call.pc = resume_pcs[index + 1];
+            call.pc = standing_pc(index + 1)?;
+            if waiting(index + 1) {
+                call.header.flags = call.header.flags.with(NativeFrameFlags::ADVANCE_ON_RESUME);
+            }
             call.initial_registers.extend_from_slice(&deopt.slots);
             call.arguments.extend(
                 deopt
@@ -194,7 +191,6 @@ impl Interpreter {
                     call.set_construct();
                 }
             }
-            self.jit_install_prepared_catch_handlers(&mut call, plan)?;
             self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
                 index: (index + 1) as u32,
                 total: frames.len() as u32,
@@ -221,6 +217,8 @@ mod tests {
     use crate::BytecodeModule;
     use otter_bytecode::{Function, Instruction, Op, Operand, SourceKind};
 
+    /// `catch (e) { return e }` around `throw r0`, after a call site at pc 0
+    /// a waiting caller stands on.
     fn catch_function(id: u32) -> Function {
         Function {
             id,
@@ -229,12 +227,8 @@ mod tests {
             code: vec![
                 Instruction {
                     pc: 0,
-                    op: Op::EnterTry,
-                    operands: vec![
-                        Operand::Imm32(3),
-                        Operand::Imm32(otter_bytecode::NO_HANDLER_OFFSET),
-                        Operand::Register(1),
-                    ],
+                    op: Op::Nop,
+                    operands: Vec::new(),
                 },
                 Instruction {
                     pc: 1,
@@ -243,26 +237,22 @@ mod tests {
                 },
                 Instruction {
                     pc: 2,
-                    op: Op::LeaveTry,
+                    op: Op::ReturnUndefined,
                     operands: Vec::new(),
                 },
                 Instruction {
                     pc: 3,
-                    op: Op::Jump,
-                    operands: vec![Operand::Imm32(1)],
-                },
-                Instruction {
-                    pc: 4,
                     op: Op::Return,
                     operands: vec![Operand::Register(1)],
                 },
-                Instruction {
-                    pc: 5,
-                    op: Op::ReturnUndefined,
-                    operands: Vec::new(),
-                },
             ]
             .into(),
+            handlers: vec![otter_bytecode::ExceptionHandler {
+                start: 1,
+                end: 2,
+                target: 3,
+                exception: 1,
+            }],
             ..Function::default()
         }
     }
@@ -282,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn every_spliced_frame_rebuilds_its_own_catch_stack() {
+    fn every_spliced_frame_routes_throws_through_its_handler_table() {
         let context = context(vec![catch_function(0), catch_function(1)]);
         let mut interpreter = Interpreter::new();
         let mut stack = crate::test_support::FrameChainFixture::new();
@@ -389,11 +379,20 @@ mod tests {
                             ]
                             .into()
                         } else {
-                            vec![Instruction {
-                                pc: 0,
-                                op: Op::ReturnValue,
-                                operands: vec![Operand::Register(0)],
-                            }]
+                            // The waiting caller stands on its call site at
+                            // pc 0 and returns the callee's result.
+                            vec![
+                                Instruction {
+                                    pc: 0,
+                                    op: Op::Nop,
+                                    operands: Vec::new(),
+                                },
+                                Instruction {
+                                    pc: 1,
+                                    op: Op::ReturnValue,
+                                    operands: vec![Operand::Register(0)],
+                                },
+                            ]
                             .into()
                         },
                         ..Function::default()
@@ -419,7 +418,11 @@ mod tests {
                 let frames = [
                     crate::deopt::DeoptFrame {
                         function_id: 0,
-                        byte_pc: 0,
+                        byte_pc: context
+                            .exec_function(0)
+                            .unwrap()
+                            .instruction_byte_pc(1)
+                            .unwrap(),
                         entry: None,
                         slots: Box::new([Value::undefined()]),
                     },
@@ -465,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_stack_frame_rebuilds_catch_before_dispatch() {
+    fn generated_stack_frame_resumes_into_its_handler_table() {
         let context = context(vec![catch_function(0)]);
         let mut interpreter = Interpreter::new();
         let mut stack = crate::test_support::FrameChainFixture::new();

@@ -378,7 +378,8 @@ pub(crate) fn compile_function_impl(
 
     let mut child = parent.pop();
     // No mapped formals, eval or suspension can observe hidden identity in
-    // this admitted family. Alias/escape proof uses lowered register flow.
+    // this admitted family, and without exception handlers every edge is a
+    // normal successor. Alias/escape proof uses lowered register flow.
     if needs_arguments
         && param_count == 0
         && !has_rest
@@ -386,6 +387,7 @@ pub(crate) fn compile_function_impl(
         && !is_async
         && !is_generator
         && !is_async_generator
+        && child.handlers.is_empty()
         && let Some(plan) = crate::arguments_elision::analyze(
             &child.code,
             &module.borrow().constants,
@@ -723,6 +725,7 @@ pub(crate) fn finish_function(
     slot.scopes = finished.scopes;
     slot.number_hint_sites = finished.number_hint_sites;
     slot.code = finished.code;
+    slot.handlers = finished.handlers;
     slot.spans = finished.spans;
     fill(slot);
     drop(module_mut);

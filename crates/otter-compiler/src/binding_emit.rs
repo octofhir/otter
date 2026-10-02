@@ -159,6 +159,26 @@ impl Compiler {
         }
     }
 
+    /// The frame register of a mutable own binding that an update can rewrite
+    /// in place: no eval extension can intercept the name, its initialization
+    /// dominates this point, and a store into it needs no check.
+    pub(crate) fn plain_register_binding(&self, reference: &NameRef) -> Option<u16> {
+        let NameRef::Binding(resolved) = reference else {
+            return None;
+        };
+        if resolved.lookup.is_some()
+            || resolved.access != Access::Own
+            || !resolved.info.initialized
+            || self.store_fallback(&resolved.info) != BindingStoreFallback::Mutable
+        {
+            return None;
+        }
+        match resolved.info.storage {
+            crate::scope::BindingStorage::Register { reg } => Some(reg),
+            crate::scope::BindingStorage::Slot { .. } => None,
+        }
+    }
+
     /// Store fallback of a resolved binding under the current strictness.
     fn store_fallback(&self, info: &BindingInfo) -> BindingStoreFallback {
         if info.fn_self_name {

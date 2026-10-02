@@ -93,7 +93,14 @@ impl Interpreter {
         if self.pending_uncaught_frames.is_none() {
             self.pending_uncaught_frames = Some(self.snapshot_active_frames(context, usize::MAX));
         }
-        let unwind = self.unwind_throw_above(context, stack, floor, thrown);
+        // A compiled frame publishes the PC of the instruction that raised.
+        let unwind = self.unwind_throw_above(
+            context,
+            stack,
+            floor,
+            thrown,
+            crate::activation_stack::ThrowSite::Instruction,
+        );
         if unwind.is_ok() {
             self.pending_uncaught_frames = None;
         }
@@ -253,7 +260,7 @@ impl Interpreter {
                 if !optimized {
                     self.note_jit_entry_success(fid);
                 }
-                self.return_running_finally_above(stack, floor, result.payload_value())
+                self.pop_frame_above(stack, floor, result.payload_value(), None)
             }
             NativeResultStatus::SideExit => {
                 let exit = result.side_exit_payload().ok_or(VmError::InvalidOperand)?;

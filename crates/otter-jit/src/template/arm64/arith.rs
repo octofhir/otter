@@ -45,7 +45,7 @@ use otter_vm::native_abi as abi;
 /// success branches to `resume`, while throws use the function's shared status
 /// epilogue. A live canonical activation is part of the runtime-op contract;
 /// function ownership is read from its frame header rather than emitted again.
-pub(super) struct CoercionSlowPath {
+pub(crate) struct CoercionSlowPath {
     entry: DynamicLabel,
     resume: DynamicLabel,
     dst: u16,
@@ -57,7 +57,7 @@ pub(super) struct CoercionSlowPath {
 /// One cold completion for a numeric-family fast-path miss. `rhs_or_delta`
 /// is a register index for binary operations and the signed immediate bits for
 /// `Increment`; unary operations ignore it.
-pub(super) struct NumericSlowPath {
+pub(crate) struct NumericSlowPath {
     entry: DynamicLabel,
     resume: DynamicLabel,
     dst: u16,
@@ -1088,7 +1088,7 @@ pub(super) fn emit_to_primitive(
 /// stream. The VM helper writes `dst` only after the full operation succeeds;
 /// a live runtime therefore returns handled-or-threw and never replays an
 /// observable conversion through interpreter resume.
-pub(super) fn emit_numeric_slow_paths(
+pub(crate) fn emit_numeric_slow_paths(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
@@ -1125,7 +1125,7 @@ pub(super) fn emit_numeric_slow_paths(
 /// Emit all deferred coercion continuations after the hot operation stream.
 /// The stub commits `dst` only after the VM coercion succeeds, so branching
 /// back to `resume` cannot expose a partially completed operation.
-pub(super) fn emit_coercion_slow_paths(
+pub(crate) fn emit_coercion_slow_paths(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,

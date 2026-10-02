@@ -487,7 +487,7 @@ impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
             let base = match location.kind {
                 TaggedLocationKind::FrameSlot => {
                     debug_assert!(location.index < frame.header.register_count);
-                    frame.register_base as *mut u64
+                    frame.register_base() as *mut u64
                 }
                 TaggedLocationKind::SpillSlot => {
                     debug_assert!(location.index < self.ctx.spill_slot_count);
@@ -2697,7 +2697,7 @@ fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
 mod tests {
     use super::*;
     use crate::native_abi::{
-        NO_FRAME_STATE, NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultStatus,
+        Frame, NO_FRAME_STATE, NativeFrameFlags, NativeFrameKind, NativeResultStatus,
         TaggedLocation, TaggedLocationKind, VmFrameHeader, VmThread,
     };
     use otter_gc::ExtraRootSource;
@@ -2758,10 +2758,11 @@ mod tests {
         let registry = Box::leak(Box::new(CodeRegistryView {
             context: std::ptr::from_ref(active) as u64,
             resolve_safepoint: resolve_test_safepoint as *const () as u64,
-            hot_function: 0,
+            function_entries: 0,
+            function_entry_count: 0,
         }));
         let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation::for_test(vm)));
-        let native_frame = NativeFrame::new(
+        let native_frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 0,
@@ -2947,7 +2948,6 @@ mod tests {
         let mut slots = [Value::map(map).to_abi_bits(), n(7).to_abi_bits()];
         let safepoint = SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: crate::native_abi::NO_CALL_PC,
             id: 12,
             frame_state: NO_FRAME_STATE,
@@ -3011,7 +3011,6 @@ mod tests {
         let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &[], 1);
         let no_safepoint = SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: crate::native_abi::NO_CALL_PC,
             id: NO_SAFEPOINT,
             frame_state: NO_FRAME_STATE,
@@ -3059,7 +3058,6 @@ mod tests {
 
         let unsupported = SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: crate::native_abi::NO_CALL_PC,
             id: 3,
             frame_state: NO_FRAME_STATE,
@@ -3271,7 +3269,6 @@ mod tests {
         let mut spill = [obj.to_abi_bits()];
         let record = SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: crate::native_abi::NO_CALL_PC,
             id: 1,
             frame_state: NO_FRAME_STATE,
@@ -3305,7 +3302,6 @@ mod tests {
         );
         let reg_record = SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: crate::native_abi::NO_CALL_PC,
             id: 1,
             frame_state: NO_FRAME_STATE,
@@ -3585,6 +3581,8 @@ mod tests {
                         | crate::native_abi::RuntimeStubSignature::CommittedValue2
                         | crate::native_abi::RuntimeStubSignature::RouteThrow1
                         | crate::native_abi::RuntimeStubSignature::AcknowledgeCaughtThrow0
+                        | crate::native_abi::RuntimeStubSignature::ExecutionEntry0
+                        | crate::native_abi::RuntimeStubSignature::JsCall
                 ));
             }
         }

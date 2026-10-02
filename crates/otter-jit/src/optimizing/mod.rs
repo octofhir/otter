@@ -36,15 +36,12 @@
 use std::collections::BTreeSet;
 
 use otter_vm::{
-    JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
+    JitCompileSnapshot, JitFunctionCode,
     deopt::DeoptTable,
     native_abi::{CodeDependency, CodeObjectMetadata, SafepointRecord},
 };
 
-use crate::{
-    CompiledCode, Unsupported,
-    entry::{TransitionTable, enter_compiled},
-};
+use crate::{CompiledCode, Unsupported, entry::TransitionTable};
 
 /// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +54,6 @@ pub struct OptimizedMetadata {
     pub param_count: u16,
     /// Number of writable interpreter registers reconstructed on bail.
     pub register_count: u16,
-    /// Stack-owned generated calls may publish only initialized parameters
-    /// until this body reaches a cold exit.
-    pub parameter_prefix_entry: bool,
     /// Total number of physical GPR and FP registers used by regalloc2.
     pub machine_register_count: u8,
     /// Spill slots selected by regalloc2 before root-save area reservation.
@@ -71,10 +65,11 @@ pub struct OptimizedMetadata {
 
 /// Finalized optimizing code and its exact-PC deoptimization metadata.
 pub struct OptimizedCode {
+    /// The body; its entry continues a published interpreter frame.
     code: CompiledCode,
-    /// Exact persistent native-stack reservation for generated entry, or
-    /// `None` when this backend has not proven stack-owned cold deoptimization.
-    generated_stack_frame_bytes: Option<u32>,
+    /// Offset of the JavaScript call ABI entry, which builds this
+    /// function's own frame.
+    call_entry: usize,
     /// Deopt metadata whose address is baked into the shared exit handler; the
     /// allocation must live exactly as long as the code.
     deopt: Box<otter_vm::deopt::DeoptRuntime>,
@@ -98,7 +93,7 @@ impl OptimizedCode {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         code: CompiledCode,
-        generated_stack_frame_bytes: Option<u32>,
+        call_entry: usize,
         deopt: Box<otter_vm::deopt::DeoptRuntime>,
         safepoint_records: Box<[SafepointRecord]>,
         osr_headers: BTreeSet<u32>,
@@ -119,7 +114,7 @@ impl OptimizedCode {
         };
         Self {
             code,
-            generated_stack_frame_bytes,
+            call_entry,
             deopt,
             safepoint_records,
             osr_headers,
@@ -159,10 +154,7 @@ impl std::fmt::Debug for OptimizedCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OptimizedCode")
             .field("code_len", &self.code.len())
-            .field(
-                "generated_stack_frame_bytes",
-                &self.generated_stack_frame_bytes,
-            )
+            .field("call_entry", &self.call_entry)
             .field("deopt_points", &self.deopt.table.len())
             .field("safepoints", &self.safepoint_records.len())
             .field("osr_headers", &self.osr_headers.len())
@@ -197,12 +189,9 @@ impl JitFunctionCode for OptimizedCode {
         otter_vm::native_abi::NativeFrameKind::Optimizing
     }
 
-    fn generated_stack_frame_bytes(&self) -> Option<u32> {
-        self.generated_stack_frame_bytes
-    }
-
-    fn generated_entry_uses_parameter_prefix(&self) -> bool {
-        self.metadata.parameter_prefix_entry
+    fn call_entry_addr(&self) -> Option<usize> {
+        // SAFETY: the assembler recorded this entry in the live mapping.
+        Some(unsafe { self.code.ptr_at(self.call_entry) as usize })
     }
 
     fn dependencies(&self) -> &[CodeDependency] {
@@ -231,55 +220,10 @@ impl JitFunctionCode for OptimizedCode {
             .map(|index| &self.safepoint_records[index])
     }
 
-    fn run_entry(&self, _activation: otter_vm::VmRuntimeActivation) -> JitExecOutcome {
-        JitExecOutcome::Fatal(otter_vm::VmError::InvalidOperand)
-    }
-
-    fn run_optimized_entry(&self, activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
-        // SAFETY: this object owns the live executable mapping, whose entry was
-        // emitted with the shared `JitCtx` ABI. `activation` carries the VM's
-        // frozen-borrow contract for the dynamic call.
-        let entry = unsafe { self.code.entry_ptr() };
-        Some(unsafe {
-            enter_compiled(
-                activation,
-                entry,
-                self.metadata.code_object_id,
-                self.metadata.function_id,
-                self.metadata.register_count,
-                otter_vm::native_abi::NativeFrameKind::Optimizing,
-                !self.safepoint_records.is_empty(),
-                None,
-            )
-        })
-    }
-
-    fn enters_optimized_osr_header(&self, logical_pc: u32) -> bool {
-        self.osr_headers.contains(&logical_pc)
-    }
-
-    fn run_optimized_osr_entry(
-        &self,
-        activation: VmRuntimeActivation,
-        logical_pc: u32,
-    ) -> Option<JitExecOutcome> {
-        if !self.osr_headers.contains(&logical_pc) {
-            return None;
-        }
-        // SAFETY: the entry dispatch at this live mapping's entry reads the
-        // OSR frame bit and PC and enters the header's OSR block.
-        let entry = unsafe { self.code.entry_ptr() };
-        Some(unsafe {
-            enter_compiled(
-                activation,
-                entry,
-                self.metadata.code_object_id,
-                self.metadata.function_id,
-                self.metadata.register_count,
-                otter_vm::native_abi::NativeFrameKind::Optimizing,
-                !self.safepoint_records.is_empty(),
-                Some(logical_pc),
-            )
+    fn osr_entry_addr(&self, logical_pc: u32) -> Option<usize> {
+        self.osr_headers.contains(&logical_pc).then(|| {
+            // SAFETY: the live mapping dispatches OSR from the frame bit and PC.
+            unsafe { self.code.entry_ptr() as usize }
         })
     }
 }

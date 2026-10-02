@@ -6,7 +6,8 @@
 //!   declaration/initialization family.
 //!
 //! # Invariants
-//! - Published function/PC and `OpcodeSchema` are the sole semantic authority;
+//! - The physical or inline source function/PC and `OpcodeSchema` are the sole
+//!   semantic authority;
 //!   the native ABI carries only two boxed SSA values, in
 //!   `BindingSemantics::value_operands` order: the stored value first, then
 //!   the context or reference register (or the pre-RHS existence Boolean).
@@ -16,6 +17,7 @@
 //!   Entered JavaScript semantics return only success or a catchable error.
 //! - Both boxed inputs and the result are rooted for the complete allocating or
 //!   reentrant operation; allocating kernels re-read contexts from those roots.
+//! - Source and immutable operands are resolved before exclusive VM access.
 //! - No operation advances the PC or writes a destination register.
 //!
 //! # See also
@@ -58,19 +60,36 @@ impl RuntimeCall<'_> {
         mut value0: Value,
         mut value1: Value,
     ) -> Result<Value, CommittedValueError> {
-        let operation = self
-            .published_opcode()
-            .map_err(CommittedValueError::Fatal)
-            .and_then(|op| {
-                opcode_schema(op)
-                    .binding
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
-            })?;
-        let function_id = self.function_id();
+        let (function_id, instruction_pc) =
+            self.semantic_source().map_err(CommittedValueError::Fatal)?;
+        let owner = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let context = &*owner;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let instruction = function
+            .instr_at_index(instruction_pc as usize)
+            .filter(|instruction| instruction.instruction_pc == instruction_pc)
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let operation = opcode_schema(function.op(instruction))
+            .binding
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let const_index = |operand: u8| {
+            function
+                .const_index(instruction, usize::from(operand))
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
+        };
+        let imm32 = |operand: u8| {
+            function
+                .imm32(instruction, usize::from(operand))
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
+        };
+        // Source and immutable operands are resolved before exclusive VM access.
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let context = self.context.clone();
-        let context = &context;
         let stack = unsafe { &mut *self.stack.as_ptr() };
 
         let mut result = Value::undefined();
@@ -88,9 +107,7 @@ impl RuntimeCall<'_> {
                 Ok(Value::object(vm.global_this))
             }
             BindingSemantics::Read(BindingRead::Global { name, missing, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
                 match missing {
                     BindingMissing::Throw => {
                         vm.load_global_or_throw_value(stack, context, function_id, name_idx)
@@ -101,24 +118,16 @@ impl RuntimeCall<'_> {
                 }
             }
             BindingSemantics::Read(BindingRead::Exists { name, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
                 vm.global_binding_exists_value(stack, context, function_id, name_idx)
             }
             BindingSemantics::Read(BindingRead::ContextSlot { coord, .. }) => {
-                let coord = self
-                    .published_imm32(coord)
-                    .map_err(CommittedValueError::Fatal)?;
+                let coord = imm32(coord)?;
                 vm.load_context_slot_value(context, value0, coord, true)
             }
             BindingSemantics::Read(BindingRead::LookupSlot { name, coord, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let coord = self
-                    .published_imm32(coord)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let coord = imm32(coord)?;
                 vm.load_lookup_slot_value(context, function_id, value0, name_idx, coord)
             }
             BindingSemantics::Read(BindingRead::LookupGlobal {
@@ -127,12 +136,8 @@ impl RuntimeCall<'_> {
                 missing,
                 ..
             }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let depth = self
-                    .published_imm32(depth)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let depth = imm32(depth)?;
                 vm.load_lookup_global_value(
                     context,
                     stack,
@@ -144,29 +149,18 @@ impl RuntimeCall<'_> {
                 )
             }
             BindingSemantics::Read(BindingRead::ResolveRef { name, target, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let target = self
-                    .published_imm32(target)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let target = imm32(target)?;
                 vm.resolve_lookup_ref_value(context, function_id, value0, name_idx, target)
             }
             BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let strict = flag(
-                    self.published_imm32(strict)
-                        .map_err(CommittedValueError::Fatal)?,
-                )?;
+                let name_idx = const_index(name)?;
+                let strict = flag(imm32(strict)?)?;
                 vm.store_global_binding_value(context, stack, function_id, value0, name_idx, strict)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::GlobalChecked { name, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
                 let existed = value1
                     .as_boolean()
                     .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
@@ -181,16 +175,12 @@ impl RuntimeCall<'_> {
                 .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::ContextSlot { coord, .. }) => {
-                let coord = self
-                    .published_imm32(coord)
-                    .map_err(CommittedValueError::Fatal)?;
+                let coord = imm32(coord)?;
                 vm.store_context_slot_value(context, value1, coord, value0, true)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::BindThis { coord, .. }) => {
-                let coord = self
-                    .published_imm32(coord)
-                    .map_err(CommittedValueError::Fatal)?;
+                let coord = imm32(coord)?;
                 vm.bind_this_context_slot_value(value1, coord, value0)
                     .map(|()| Value::undefined())
             }
@@ -200,15 +190,9 @@ impl RuntimeCall<'_> {
                 fallback,
                 ..
             }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let coord = self
-                    .published_imm32(coord)
-                    .map_err(CommittedValueError::Fatal)?;
-                let fallback = self
-                    .published_imm32(fallback)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let coord = imm32(coord)?;
+                let fallback = imm32(fallback)?;
                 vm.store_lookup_slot_value(
                     context,
                     function_id,
@@ -221,12 +205,8 @@ impl RuntimeCall<'_> {
                 .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::LookupGlobal { name, mode, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let mode = self
-                    .published_imm32(mode)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let mode = imm32(mode)?;
                 vm.store_lookup_global_value(
                     context,
                     stack,
@@ -239,55 +219,35 @@ impl RuntimeCall<'_> {
                 .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::StoreRef { name, mode, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let mode = self
-                    .published_imm32(mode)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let mode = imm32(mode)?;
                 vm.store_ref_value(context, stack, function_id, value1, name_idx, mode, value0)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::DeclareEvalVar {
                 name, var_depth, ..
             }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let var_depth = self
-                    .published_imm32(var_depth)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let var_depth = imm32(var_depth)?;
                 vm.declare_eval_var_value(context, function_id, value0, name_idx, var_depth)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::VarScope {
                 name, var_depth, ..
             }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let var_depth = self
-                    .published_imm32(var_depth)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let var_depth = imm32(var_depth)?;
                 vm.store_var_scope_value(context, function_id, value1, name_idx, var_depth, value0)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Delete(BindingDelete::LookupSlot { name, depth, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let depth = self
-                    .published_imm32(depth)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let depth = imm32(depth)?;
                 vm.delete_lookup_slot_value(context, function_id, value0, name_idx, depth)
             }
             BindingSemantics::Delete(BindingDelete::LookupGlobal { name, depth, .. }) => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let depth = self
-                    .published_imm32(depth)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let depth = imm32(depth)?;
                 vm.delete_lookup_global_value(context, function_id, value0, name_idx, depth)
             }
         }
@@ -301,19 +261,36 @@ impl RuntimeCall<'_> {
         mut value0: Value,
         mut value1: Value,
     ) -> Result<Value, CommittedValueError> {
-        let operation = self
-            .published_opcode()
-            .map_err(CommittedValueError::Fatal)
-            .and_then(|op| {
-                opcode_schema(op)
-                    .global_declaration
-                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
-            })?;
-        let function_id = self.function_id();
+        let (function_id, instruction_pc) =
+            self.semantic_source().map_err(CommittedValueError::Fatal)?;
+        let owner = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let context = &*owner;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let instruction = function
+            .instr_at_index(instruction_pc as usize)
+            .filter(|instruction| instruction.instruction_pc == instruction_pc)
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let operation = opcode_schema(function.op(instruction))
+            .global_declaration
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let const_index = |operand: u8| {
+            function
+                .const_index(instruction, usize::from(operand))
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
+        };
+        let imm32 = |operand: u8| {
+            function
+                .imm32(instruction, usize::from(operand))
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))
+        };
+        // Source and immutable operands are resolved before exclusive VM access.
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let context = self.context.clone();
-        let context = &context;
 
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);
@@ -326,62 +303,39 @@ impl RuntimeCall<'_> {
 
         let semantic = match operation {
             GlobalDeclarationSemantics::DeclareVar { name, configurable } => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let configurable = flag(
-                    self.published_imm32(configurable)
-                        .map_err(CommittedValueError::Fatal)?,
-                )?;
+                let name_idx = const_index(name)?;
+                let configurable = flag(imm32(configurable)?)?;
                 vm.declare_global_var_value(context, function_id, name_idx, configurable)
             }
             GlobalDeclarationSemantics::DeclareLexical { name, is_const } => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let is_const = flag(
-                    self.published_imm32(is_const)
-                        .map_err(CommittedValueError::Fatal)?,
-                )?;
+                let name_idx = const_index(name)?;
+                let is_const = flag(imm32(is_const)?)?;
                 vm.declare_global_lex_value(context, function_id, name_idx, is_const)
             }
             GlobalDeclarationSemantics::Validate {
                 name,
                 declaration_kind,
             } => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let kind = self
-                    .published_imm32(declaration_kind)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
+                let kind = imm32(declaration_kind)?;
                 if !(0..=2).contains(&kind) {
                     return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
                 }
                 vm.validate_global_decl_value(context, function_id, name_idx, kind)
             }
             GlobalDeclarationSemantics::DefineVar { name, .. } => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
                 vm.define_global_var_value(context, function_id, name_idx, value0)
             }
             GlobalDeclarationSemantics::DefineFunction {
                 name, deletable, ..
             } => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
-                let deletable = flag(
-                    self.published_imm32(deletable)
-                        .map_err(CommittedValueError::Fatal)?,
-                )?;
+                let name_idx = const_index(name)?;
+                let deletable = flag(imm32(deletable)?)?;
                 vm.define_global_function_value(context, function_id, name_idx, value0, deletable)
             }
             GlobalDeclarationSemantics::InitializeLexical { name, .. } => {
-                let name_idx = self
-                    .published_const_index(name)
-                    .map_err(CommittedValueError::Fatal)?;
+                let name_idx = const_index(name)?;
                 vm.init_global_lex_value(context, function_id, name_idx, value0)
             }
         };

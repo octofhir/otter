@@ -2159,7 +2159,6 @@ impl Interpreter {
         y_anchor: usize,
         comparefn_anchor: usize,
         fast_path: Option<SortComparatorFastPath>,
-        lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<std::cmp::Ordering, VmError> {
         use std::cmp::Ordering;
         let x = self.iteration_anchor(x_anchor);
@@ -2182,25 +2181,14 @@ impl Interpreter {
             {
                 return Ok(order);
             }
-            let r = match lean_inner {
-                Some(state) => self.run_bytecode_callable_committed_lean_args(
-                    stack,
-                    state,
-                    context,
-                    Value::undefined(),
-                    &[x, y],
-                ),
-                None => {
-                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
-                    self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &comparefn,
-                        Value::undefined(),
-                        args,
-                    )
-                }
-            }?;
+            let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
+            let r = self.run_callable_sync_rooted(
+                stack,
+                context,
+                &comparefn,
+                Value::undefined(),
+                args,
+            )?;
             let f = if let Some(f) = r.as_f64() {
                 f
             } else {
@@ -2245,7 +2233,6 @@ impl Interpreter {
         items: Vec<usize>,
         comparefn_anchor: usize,
         fast_path: Option<SortComparatorFastPath>,
-        lean_inner: Option<&mut crate::call_ops::LeanCallbackState>,
     ) -> Result<Vec<usize>, VmError> {
         use std::cmp::Ordering;
         let n = items.len();
@@ -2255,7 +2242,6 @@ impl Interpreter {
         let mut src = items;
         let mut dst = vec![0; n];
         let mut width = 1usize;
-        let mut lean_inner = lean_inner;
         while width < n {
             let mut start = 0usize;
             while start < n {
@@ -2279,7 +2265,6 @@ impl Interpreter {
                             src[right],
                             comparefn_anchor,
                             fast_path,
-                            lean_inner.as_deref_mut(),
                         )?,
                     };
                     // Stable: keep the left element on a tie.
@@ -2388,22 +2373,9 @@ impl Interpreter {
                 }
             }
             let item_count = items.len();
-            // Lean comparator invocation: when the comparator is a plain
-            // bytecode closure, drive every SortCompare call through the
-            // committed bytecode tail on this same ActivationStack. Always
-            // release the guard/state before propagating an abrupt result.
             let comparefn = self.iteration_anchor(comparefn_anchor);
             let fast_path = self.sort_comparator_fast_path(context, comparefn);
-            let mut lean = self.acquire_lean_callback_stack(context, comparefn);
-            let sorted = self.sort_merge(
-                stack,
-                context,
-                items,
-                comparefn_anchor,
-                fast_path,
-                lean.as_mut(),
-            );
-            self.release_lean_callback_stack(lean);
+            let sorted = self.sort_merge(stack, context, items, comparefn_anchor, fast_path);
             let sorted = sorted?;
             // §23.1.3.30 steps 8-9 — write the sorted prefix back with
             // `Set(O, j, v, true)` (so an own / inherited accessor setter
@@ -4022,16 +3994,7 @@ impl Interpreter {
             }
             let comparefn = self.iteration_anchor(comparefn_anchor);
             let fast_path = self.sort_comparator_fast_path(context, comparefn);
-            let mut lean = self.acquire_lean_callback_stack(context, comparefn);
-            let sorted = self.sort_merge(
-                stack,
-                context,
-                items,
-                comparefn_anchor,
-                fast_path,
-                lean.as_mut(),
-            );
-            self.release_lean_callback_stack(lean);
+            let sorted = self.sort_merge(stack, context, items, comparefn_anchor, fast_path);
             let sorted = sorted?;
             // Building this host Vec cannot trigger a VM collection. The
             // array allocator traces the owned values while it allocates.
@@ -4529,15 +4492,6 @@ pub(crate) fn array_callback_native_dispatch(
         interp.push_iteration_anchor(string_data.map_or_else(Value::undefined, Value::string));
         interp.push_iteration_anchor(acc);
         interp.push_iteration_anchor(Value::undefined());
-        // Lean per-element callback invocation. When the callback is a plain
-        // bytecode function/closure (not native/bound/proxy/generator/async/…), we
-        // enter the sync-reentry guard once for the whole loop, then append each
-        // callback frame above a floor on the current runtime turn — skipping
-        // `run_callable_sync`'s per-call bound/proxy/native dispatch checks.
-        // Ineligible callbacks keep the general rooted call path on the same
-        // activation stack. `function_id` is shape-stable, so resolving it once on the
-        // pre-loop callback handle is valid for the whole walk.
-        let mut lean_inner = interp.acquire_lean_callback_stack(&context, callback);
         // Run the walk inside a closure so the matching
         // `pop_iteration_anchors_to` always runs — on normal completion and
         // on every `?` error — without threading a manual cleanup through
@@ -4688,42 +4642,12 @@ pub(crate) fn array_callback_native_dispatch(
                 let cb_result = if let Some(result) = fast_result {
                     Ok(result)
                 } else {
-                    match lean_inner {
-                        Some(ref mut state) => {
-                            if reduce_kind {
-                                interp.run_bytecode_callable_committed_lean_args(
-                                    stack,
-                                    state,
-                                    &context,
-                                    cb_this,
-                                    &[acc_now, v, Value::number_f64(idx as f64), receiver],
-                                )
-                            } else {
-                                interp.run_bytecode_callable_committed_lean_args(
-                                    stack,
-                                    state,
-                                    &context,
-                                    cb_this,
-                                    &[v, Value::number_f64(idx as f64), receiver],
-                                )
-                            }
-                        }
-                        None => {
-                            let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
-                                smallvec::smallvec![
-                                    acc_now,
-                                    v,
-                                    Value::number_f64(idx as f64),
-                                    receiver,
-                                ]
-                            } else {
-                                smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,]
-                            };
-                            interp.run_callable_sync_rooted(
-                                stack, &context, &callback, cb_this, cb_args,
-                            )
-                        }
-                    }
+                    let cb_args: SmallVec<[Value; 8]> = if reduce_kind {
+                        smallvec::smallvec![acc_now, v, Value::number_f64(idx as f64), receiver]
+                    } else {
+                        smallvec::smallvec![v, Value::number_f64(idx as f64), receiver]
+                    };
+                    interp.run_callable_sync_rooted(stack, &context, &callback, cb_this, cb_args)
                 };
                 let result = cb_result.map_err(|err| {
                     crate::native_function::vm_to_native_error(
@@ -4800,9 +4724,6 @@ pub(crate) fn array_callback_native_dispatch(
             }
             Ok(())
         })();
-        // Release the lean-path stack + reentry guard on every completion path
-        // (mirrors the anchor pop below), regardless of `walk` success/error.
-        interp.release_lean_callback_stack(lean_inner.take());
         // Read the (possibly relocated) output target and accumulator back
         // before releasing the anchors so the final result returns a live
         // handle. `map`/`filter`/`flatMap` keep their target identity; other

@@ -37,14 +37,14 @@ pub struct CodeRegistryView {
     pub context: u64,
     /// Address of a [`SafepointResolverFn`].
     pub resolve_safepoint: u64,
-    /// One pending generated tier-up request: function identity plus one, or
-    /// zero. Nested callees never overwrite it. Cold policy suppresses further
-    /// requests from a generation after caching its compilation outcome, so a
-    /// rejected inner callee cannot starve its hot callers or siblings.
-    pub hot_function: u64,
+    /// Address of the isolate-owned array of stable function-cell addresses.
+    /// Reload after any VM transition: linking may grow the directory.
+    pub function_entries: u64,
+    /// Number of indexed function identities in `function_entries`.
+    pub function_entry_count: u64,
 }
 
-const _: [(); 16] = [(); std::mem::offset_of!(CodeRegistryView, hot_function)];
+const _: [(); 16] = [(); std::mem::offset_of!(CodeRegistryView, function_entries)];
 
 impl CodeRegistryView {
     /// Resolve one code-object-local safepoint record.
@@ -175,14 +175,9 @@ pub struct SafepointRecord {
     pub frame_state: FrameStateId,
     /// Tagged values visible to the moving collector.
     pub tagged_locations: Vec<TaggedLocation>,
-    /// Cold inline descendants, with values indexed into the precise spill map.
+    /// Logical inline descendants, with values indexed into the precise spill map.
     /// The owning code generation and this record's id select the recipe.
     pub inline_frames: Box<[crate::deopt::DeoptFrame<Option<u16>>]>,
-    /// A generated call to JavaScript: these descendants are never published
-    /// as NativeFrames. Stack walks describe them from this recipe for the
-    /// duration of the call, and cold runtime entries do not reconstruct them.
-    /// Otherwise (a committed runtime call) the runtime publishes them.
-    pub inline_frames_virtual: bool,
     /// Canonical PC, in the code object's own function, of the generated
     /// JavaScript call this safepoint belongs to, or [`NO_CALL_PC`]. Stack
     /// walks read a calling frame's position here instead of a per-call PC
@@ -203,7 +198,6 @@ impl SafepointRecord {
     ) -> Self {
         Self {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: NO_CALL_PC,
             id,
             frame_state,
@@ -240,7 +234,6 @@ impl SafepointRecord {
             .collect();
         Some(Self {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: NO_CALL_PC,
             id: frame_map.id,
             frame_state,
@@ -265,7 +258,7 @@ impl SafepointRecord {
 }
 
 const _: [(); 4] = [(); std::mem::size_of::<TaggedLocation>()];
-const _: [(); 24] = [(); std::mem::size_of::<CodeRegistryView>()];
+const _: [(); 32] = [(); std::mem::size_of::<CodeRegistryView>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeRegistryView>()];
 const _: [(); 12] = [(); std::mem::size_of::<FrameMap>()];
 const _: [(); 12] = [(); std::mem::size_of::<SpillMap>()];

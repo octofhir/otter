@@ -35,11 +35,11 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    ActiveFrameMut, BoundFunction, ClassConstructor, ExecutionContext, Frame, Interpreter,
-    JsObject, JsString, PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome,
-    VmIntrinsicFunction, VmPropertyKey, abstract_ops, array, function_metadata, object,
-    object_statics, operand_decode::register_operand, read_register, rooting::RootScopeExt, symbol,
-    to_length, write_register,
+    ActiveFrameMut, ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString,
+    PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome, VmIntrinsicFunction,
+    VmPropertyKey, abstract_ops, array, function_metadata, object, object_statics,
+    operand_decode::register_operand, read_register, rooting::RootScopeExt, symbol, to_length,
+    write_register,
 };
 
 pub(crate) enum BindMetadataGet {
@@ -73,7 +73,7 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
-        let mut active = ActiveFrameMut::materialized(frame);
+        let mut active = ActiveFrameMut::from_frame(frame);
         self.run_make_function_active_reg(context, &mut active, dst, idx)
     }
 
@@ -126,11 +126,9 @@ impl Interpreter {
         function_index: u32,
         context_reg: u16,
     ) -> Result<(), VmError> {
-        let new_target = self.frame_cold(frame).and_then(|cold| cold.new_target);
-        let mut active = ActiveFrameMut::materialized_with_new_target(
-            frame,
-            new_target.unwrap_or_else(Value::undefined),
-        );
+        let target = frame.new_target();
+        let new_target = (!target.is_undefined()).then_some(target);
+        let mut active = ActiveFrameMut::from_frame(frame);
         self.run_make_closure_active_regs(
             context,
             &mut active,
@@ -596,40 +594,13 @@ impl Interpreter {
             bound_args.len(),
             &self.gc_heap,
         );
-        // §10.4.1.3 BoundFunctionCreate step 1 — the bound function's
-        // [[Prototype]] is the target's [[GetPrototypeOf]] result,
-        // resolved by the caller. Only a non-default result needs the
-        // body override.
-        let default_proto = self.function_prototype_object().ok().map(Value::object);
-        let proto_override = (Some(target_proto) != default_proto).then_some(target_proto);
-        let target_root = target;
-        let bound_this_root = bound_this;
-        let bound_args_root = bound_args.clone();
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            target_root.trace_value_slots(visitor);
-            bound_this_root.trace_value_slots(visitor);
-            for arg in &bound_args_root {
-                arg.trace_value_slots(visitor);
-            }
-            if let Some(p) = &proto_override {
-                p.trace_value_slots(visitor);
-            }
-        };
-        let bound = BoundFunction::new_with_metadata_and_roots(
-            &mut self.gc_heap,
+        let bound = self.alloc_bound_function(
             target,
             bound_this,
-            bound_args,
+            &bound_args,
             metadata,
-            &mut external_visit,
+            Some(target_proto),
         )?;
-        if let Some(proto) = proto_override {
-            bound.set_prototype_override(&mut self.gc_heap, proto);
-        }
         let top_idx = stack.len() - 1;
         if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
             cold.pending_bind_function = None;
@@ -885,27 +856,17 @@ impl Interpreter {
                     roots.args_len(),
                     &self.gc_heap,
                 );
-                // Reconstitute the owned inline-4 representation only at the
-                // bound-function storage boundary. No VM allocation can occur
-                // between taking it from the registered state and handing it
-                // to the constructor, which roots its exact owned parameters.
-                let bound_args: SmallVec<[Value; 4]> = roots.take_args().into_iter().collect();
+                let bound_args = roots.take_args();
                 let target = roots.target();
                 let receiver = roots.receiver_value();
-                let mut external_visit = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-                let bound = BoundFunction::new_with_metadata_and_roots(
-                    &mut self.gc_heap,
+                let target_proto = roots.scratch(0);
+                let bound = self.alloc_bound_function(
                     target,
                     receiver,
-                    bound_args,
+                    &bound_args,
                     metadata,
-                    &mut external_visit,
+                    Some(target_proto),
                 )?;
-                let default_proto = self.function_prototype_object().ok().map(Value::object);
-                let target_proto = roots.scratch(0);
-                if Some(target_proto) != default_proto {
-                    bound.set_prototype_override(&mut self.gc_heap, target_proto);
-                }
                 Ok(Value::bound_function(bound))
             }
             VmIntrinsicFunction::FunctionPrototypeToString => {
@@ -2478,7 +2439,7 @@ impl Interpreter {
     fn legacy_arguments_value(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         callee: Value,
     ) -> Result<Value, VmError> {
         let mut args: Option<Vec<Value>> = None;
@@ -2486,25 +2447,13 @@ impl Interpreter {
             if frame.self_value != callee {
                 continue;
             }
-            if let Some(cold) = self.frame_cold(frame)
-                && !cold.incoming_args.is_empty()
-            {
-                args = Some(cold.incoming_args.to_vec());
-                break;
-            }
-            let param_count = context
-                .exec_function(frame.function_id)
-                .map(|f| f.param_count as usize)
-                .unwrap_or(0);
-            let mut collected = Vec::with_capacity(param_count);
-            for reg in 0..param_count {
-                collected.push(
-                    crate::read_register(frame, reg as u16)
-                        .copied()
-                        .unwrap_or_else(|_| Value::undefined()),
-                );
-            }
-            args = Some(collected);
+            let view = crate::ActiveFrameRef::from_frame(frame);
+            let count = view.incoming_argument_count();
+            args = Some(
+                (0..count)
+                    .map(|index| view.incoming_argument(index))
+                    .collect::<Result<_, _>>()?,
+            );
             break;
         }
         let Some(mut args) = args else {

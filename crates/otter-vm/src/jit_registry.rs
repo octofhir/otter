@@ -47,9 +47,9 @@ use crate::jit::{
     JitCodeGenerationSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitFunctionCode,
 };
 use crate::native_abi::{
-    CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CODE_ENTRY_PARAMETER_PREFIX,
-    CodeDependency, CodeDependencyKind, CodeEntryCell, CodeLifetimeState, CodeRegistryView,
-    FunctionEntryCell, NativeFrameKind, SafepointId, SafepointRecord,
+    CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CodeDependency, CodeDependencyKind,
+    CodeEntryCell, CodeLifetimeState, CodeRegistryView, FunctionEntryCell, NativeFrameKind,
+    SafepointId, SafepointRecord,
 };
 use std::sync::Arc;
 
@@ -76,7 +76,6 @@ pub(crate) struct GeneratedCallFeedback {
     pub(crate) entries: u64,
     pub(crate) returns: u64,
     pub(crate) deopts: u64,
-    pub(crate) throws: u64,
 }
 
 /// Current direct-call health for one exact generated code object.
@@ -92,7 +91,6 @@ struct GeneratedFeedbackSeen {
     entries: u64,
     returns: u64,
     deopts: u64,
-    throws: u64,
 }
 
 /// Isolate-owned installed-code registry behind a stable published view.
@@ -113,6 +111,8 @@ pub struct JitCodeRegistry {
     /// bake these addresses once; tier publication switches only the contained
     /// generation-cell pointer.
     function_entry_cells: rustc_hash::FxHashMap<u32, Box<FunctionEntryCell>>,
+    /// Indexed linkage addresses published through the stable registry view.
+    function_entries: Vec<u64>,
     /// Last cumulative generated-call counters merged into VM tier policy.
     generated_feedback_seen: rustc_hash::FxHashMap<u64, GeneratedFeedbackSeen>,
     /// Latest isolate-local epoch by dependency family and stable identity.
@@ -127,17 +127,61 @@ impl JitCodeRegistry {
             view: CodeRegistryView {
                 context: 0,
                 resolve_safepoint: resolve_jit_registry_safepoint as *const () as u64,
-                hot_function: 0,
+                function_entries: 0,
+                function_entry_count: 0,
             },
             account: otter_resource::ResourceAccount::default(),
             codes: rustc_hash::FxHashMap::default(),
             entry_cells: rustc_hash::FxHashMap::default(),
             function_entry_cells: rustc_hash::FxHashMap::default(),
+            function_entries: Vec::new(),
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
         registry
+    }
+
+    /// Publish permanent linkage for a bytecode function at module linking.
+    pub(crate) fn link_function(&mut self, function: &crate::executable::CodeBlock, realm_id: u32) {
+        self.ensure_function_entry(
+            function.id,
+            function.param_count,
+            function.register_count,
+            function.call_flags(),
+            realm_id,
+        );
+    }
+
+    fn ensure_function_entry(
+        &mut self,
+        function_id: u32,
+        param_count: u16,
+        register_count: u16,
+        call_flags: u32,
+        realm_id: u32,
+    ) {
+        let cell = self
+            .function_entry_cells
+            .entry(function_id)
+            .or_insert_with(|| {
+                FunctionEntryCell::new(function_id, param_count, register_count, call_flags, realm_id)
+            });
+        assert_eq!(
+            cell.param_count, param_count,
+            "linked function parameter layout is immutable"
+        );
+        assert_eq!(
+            cell.register_count, register_count,
+            "linked function register layout is immutable"
+        );
+        let index = function_id as usize;
+        if self.function_entries.len() <= index {
+            self.function_entries.resize(index + 1, 0);
+        }
+        self.function_entries[index] = std::ptr::from_ref(cell.as_ref()) as u64;
+        self.view.function_entries = self.function_entries.as_ptr() as u64;
+        self.view.function_entry_count = self.function_entries.len() as u64;
     }
 
     /// Install the ledger charged for installed code objects' retained bytes.
@@ -205,28 +249,24 @@ impl JitCodeRegistry {
         if code.native_frame_kind() == NativeFrameKind::Optimizing {
             flags |= CODE_ENTRY_OPTIMIZING_TIER;
         }
-        if code.generated_entry_uses_parameter_prefix() {
-            // Only the optimizing tier publishes a prefix; its safepoints
-            // name call-site root homes, never window slots.
-            if code.native_frame_kind() != NativeFrameKind::Optimizing
-                || param_count > register_count
-            {
-                return false;
-            }
-            flags |= CODE_ENTRY_PARAMETER_PREFIX;
+        if param_count > register_count {
+            return false;
         }
+        // A body without a call entry is reached only through classification,
+        // which runs a suspendable function's interpreter destination.
+        let call_entry = code.call_entry_addr().unwrap_or(
+            crate::native_abi::call_generic_entry as *const () as usize,
+        );
         let entry_cell = Box::new(CodeEntryCell::new(
-            entry_addr,
+            call_entry,
             code_object_id,
             metadata.code_block_id,
-            param_count,
             register_count,
             flags,
-            code.generated_stack_frame_bytes().unwrap_or(0),
             crate::tier_policy::TierCostModel::calibrated().minimum_profitable_executions(
                 crate::tier_policy::TierCostInput {
                     tier: crate::tier_policy::CostedTier::Optimizing,
-                    trigger: crate::tier_policy::TierTrigger::DirectCallTarget,
+                    trigger: crate::tier_policy::TierTrigger::FunctionEntry,
                     executions: 0,
                     exits: 0,
                     bytecode_instructions: u64::try_from(instruction_count).unwrap_or(u64::MAX),
@@ -290,16 +330,8 @@ impl JitCodeRegistry {
         debug_assert!(replaced.is_none(), "code-object ids are never reused");
         if let Some((entry_cell, param_count, register_count)) = entry_cell {
             let function_id = entry_cell.native_frame_header.function_id;
-            let function_entry =
-                self.function_entry_cells
-                    .entry(function_id)
-                    .or_insert_with(|| {
-                        Box::new(FunctionEntryCell::new(
-                            function_id,
-                            param_count,
-                            register_count,
-                        ))
-                    });
+            self.ensure_function_entry(function_id, param_count, register_count, 0, 0);
+            let function_entry = &self.function_entry_cells[&function_id];
             if function_entry.param_count != param_count
                 || function_entry.register_count != register_count
             {
@@ -335,12 +367,6 @@ impl JitCodeRegistry {
         })
     }
 
-    /// Take the function identity generated linkage reported as hot, if any.
-    pub(crate) fn take_hot_function(&mut self) -> Option<u32> {
-        let raw = std::mem::take(&mut self.view.hot_function);
-        raw.checked_sub(1).and_then(|id| u32::try_from(id).ok())
-    }
-
     /// Generated native entries into `function_id`'s current published
     /// generation, or zero without one. Generated linkage counts these without
     /// a runtime call, so tier policy folds them into the function's hotness.
@@ -360,27 +386,16 @@ impl JitCodeRegistry {
         cell.generated_entries.get()
     }
 
-    /// Whether this function has ever owned an entry-capable native generation.
-    ///
-    /// Function-entry cells are permanent registry identities: invalidation
-    /// clears their current generation but does not erase the fact that the
-    /// cost policy already admitted a generated-call target. A bounded eager
-    /// rebuild may use this history to replace an invalidated target without
-    /// charging the first-generation admission threshold again.
-    #[must_use]
-    pub(crate) fn has_entry_generation_history(&self, function_id: u32) -> bool {
-        self.function_entry_cells.contains_key(&function_id)
-    }
-
-    /// Resolve the bytecode function identity owned by one permanent entry cell.
-    #[must_use]
-    pub(crate) fn function_id_for_entry_addr(&self, function_entry_addr: u64) -> Option<u32> {
-        self.function_entry_cells
-            .iter()
-            .find_map(|(&function_id, cell)| {
-                (std::ptr::from_ref(cell.as_ref()) as u64 == function_entry_addr)
-                    .then_some(function_id)
-            })
+    /// A promotion request that did not promote waits one more interval of
+    /// entries before this generation asks again.
+    pub(crate) fn defer_generated_tiering(&self, function_id: u32) {
+        if let Some((_, generation)) = self.published_function_entry(function_id) {
+            let next = generation
+                .generated_entries
+                .get()
+                .saturating_add(u64::from(generation.generated_tiering_interval.max(1)));
+            generation.generated_tiering_break_even.set(next);
+        }
     }
 
     /// A cached compile outcome makes repeated requests from this generation
@@ -403,14 +418,18 @@ impl JitCodeRegistry {
         function: &crate::executable::CodeBlock,
     ) -> Option<JitDirectCallPlan> {
         let (function_entry, generation) = self.published_function_entry(function.id)?;
-        let registered = self.codes.get(&generation.code_object_id)?;
-        if registered.state != CodeLifetimeState::Installed
-            || !self.dependencies_are_current(&registered.dependencies)
-            || generation
-                .entry_addr
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-            || generation.generated_stack_frame_bytes == 0
+        if generation.code_object_id != 0 {
+            let registered = self.codes.get(&generation.code_object_id)?;
+            if registered.state != CodeLifetimeState::Installed
+                || !self.dependencies_are_current(&registered.dependencies)
+            {
+                return None;
+            }
+        }
+        if generation
+            .entry_addr
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
         {
             return None;
         }
@@ -418,7 +437,7 @@ impl JitCodeRegistry {
             function_id: function.id,
             code_object_id: generation.code_object_id,
             entry_cell: std::ptr::from_ref(function_entry) as u64,
-            tier: registered.code.native_frame_kind(),
+            tier: generation.native_frame_header.kind,
             // An unobservable binding needs no OrdinaryCallBindThis.
             this_mode: if function.is_strict || function.is_arrow || !function.observes_this {
                 JitDirectCallThisMode::StrictOrLexical
@@ -426,10 +445,10 @@ impl JitCodeRegistry {
                 JitDirectCallThisMode::SloppyGlobal
             },
             is_derived_constructor: function.is_derived_constructor,
-            generated_stack_frame_bytes: Some(generation.generated_stack_frame_bytes),
+            call_flags: function.call_flags(),
             param_count: function.param_count,
             register_count: function.register_count,
-            needs_incoming_arguments: function.needs_arguments,
+            callee_cell: 0,
         })
     }
 
@@ -452,19 +471,6 @@ impl JitCodeRegistry {
         let generation = unsafe { &*(address as *const CodeEntryCell) };
         debug_assert_eq!(generation.native_frame_header.function_id, function_id);
         Some((function, generation))
-    }
-
-    /// Re-read one permanent function cell through the registry's cold
-    /// resolver. This path does not compile or allocate; it repairs publication
-    /// from already-installed generations and returns the selected generation
-    /// cell, or zero when generated calls must side-exit.
-    #[must_use]
-    pub(crate) fn resolve_function_entry(&mut self, function_entry_addr: u64) -> u64 {
-        let Some(function_id) = self.function_id_for_entry_addr(function_entry_addr) else {
-            return 0;
-        };
-        self.refresh_function_entry(function_id);
-        self.function_entry_cells[&function_id].current_generation()
     }
 
     /// Stable machine-visible cell for the exact installed code generation.
@@ -632,7 +638,7 @@ impl JitCodeRegistry {
                 .get(&function_id)
                 .expect("every generation retains its permanent function cell");
             let registered = self.codes.get(&code_object_id);
-            let (entries, returns, deopts, throws) = cell.generated_feedback();
+            let (entries, returns, deopts) = cell.generated_feedback();
             generations.push(JitCodeGenerationSnapshot {
                 code_object_id,
                 function_id,
@@ -650,7 +656,6 @@ impl JitCodeRegistry {
                 generated_entries: entries,
                 generated_returns: returns,
                 generated_deopts: deopts,
-                generated_throws: throws,
                 dependencies: registered.map(|registered| {
                     let mut dependencies = registered.dependencies.to_vec();
                     dependencies.sort_unstable_by_key(|dependency| {
@@ -673,42 +678,45 @@ impl JitCodeRegistry {
     /// remains available after invalidation and executable retirement.
     pub(crate) fn take_generated_feedback(&mut self) -> Vec<GeneratedCallFeedback> {
         let mut feedback = Vec::new();
-        for (&code_object_id, cell) in &self.entry_cells {
-            let (entries, returns, deopts, throws) = cell.generated_feedback();
+        for cell in self.entry_cells.values().map(Box::as_ref).chain(
+            self.function_entry_cells
+                .values()
+                .map(|function| function.interpreter_destination()),
+        ) {
+            let code_object_id = cell.code_object_id;
+            let (entries, returns, deopts) = cell.generated_feedback();
             let seen = self
                 .generated_feedback_seen
-                .entry(code_object_id)
+                .entry(std::ptr::from_ref(cell) as u64)
                 .or_default();
             let delta = GeneratedCallFeedback {
                 function_id: cell.native_frame_header.function_id,
                 code_object_id,
-                tier: if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
-                    NativeFrameKind::Baseline
-                } else {
-                    NativeFrameKind::Optimizing
-                },
+                tier: cell.native_frame_header.kind,
                 entries: entries.saturating_sub(seen.entries),
                 returns: returns.saturating_sub(seen.returns),
                 deopts: deopts.saturating_sub(seen.deopts),
-                throws: throws.saturating_sub(seen.throws),
             };
             *seen = GeneratedFeedbackSeen {
                 entries,
                 returns,
                 deopts,
-                throws,
             };
-            if delta.entries != 0 || delta.returns != 0 || delta.deopts != 0 || delta.throws != 0 {
+            if delta.entries != 0 || delta.returns != 0 || delta.deopts != 0 {
                 feedback.push(delta);
             }
         }
-        feedback.sort_unstable_by_key(|entry| entry.code_object_id);
+        feedback.sort_unstable_by_key(|entry| (entry.code_object_id, entry.function_id));
         feedback
     }
 
     /// Current generated-call health for one exact generation.
+    /// The generation's state as it takes one side exit, counted in its
+    /// feedback.
     pub(crate) fn generated_deopt_state(&self, code_object_id: u64) -> Option<GeneratedDeoptState> {
         let cell = self.entry_cells.get(&code_object_id)?;
+        cell.generated_deopts
+            .set(cell.generated_deopts.get().saturating_add(1));
         let tier = if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
             NativeFrameKind::Baseline
         } else {
@@ -722,6 +730,17 @@ impl JitCodeRegistry {
     }
 
     /// Function identity retained for one exact generated-code generation.
+    /// Notify the exact retained generation after validating its completion.
+    pub(crate) fn note_completion(
+        &self,
+        code_object_id: u64,
+        status: crate::native_abi::NativeResultStatus,
+    ) {
+        if let Some(registered) = self.codes.get(&code_object_id) {
+            registered.code.note_completion(status);
+        }
+    }
+
     pub(crate) fn generation_function_id(&self, code_object_id: u64) -> Option<u32> {
         self.entry_cells
             .get(&code_object_id)
@@ -760,9 +779,7 @@ impl JitCodeRegistry {
                     return None;
                 }
                 let cell = self.entry_cells.get(&code_object_id)?;
-                if cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) == 0
-                    || cell.generated_stack_frame_bytes == 0
-                {
+                if cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) == 0 {
                     return None;
                 }
                 let tier_priority =
@@ -778,7 +795,7 @@ impl JitCodeRegistry {
             return;
         };
         if target == 0 {
-            function_entry.clear();
+            function_entry.restore_interpreter();
         } else {
             function_entry.publish(target);
         }
@@ -898,10 +915,6 @@ mod tests {
                 .ok()
                 .map(|index| &self.records[index])
         }
-
-        fn run_entry(&self, _activation: crate::VmRuntimeActivation) -> crate::jit::JitExecOutcome {
-            unreachable!("fake code is never entered")
-        }
     }
 
     #[derive(Debug)]
@@ -909,8 +922,6 @@ mod tests {
         id: u64,
         function_id: u32,
         tier: NativeFrameKind,
-        native_frame_bytes: u32,
-        parameter_prefix_entry: bool,
     }
 
     impl JitFunctionCode for GeneratedFakeCode {
@@ -931,13 +942,6 @@ mod tests {
             self.tier
         }
 
-        fn generated_stack_frame_bytes(&self) -> Option<u32> {
-            Some(self.native_frame_bytes)
-        }
-
-        fn generated_entry_uses_parameter_prefix(&self) -> bool {
-            self.parameter_prefix_entry
-        }
 
         fn code_len(&self) -> usize {
             4
@@ -945,10 +949,6 @@ mod tests {
 
         fn entry_addr(&self) -> Option<usize> {
             Some(0x10_0000 + self.id as usize * 16)
-        }
-
-        fn run_entry(&self, _activation: crate::VmRuntimeActivation) -> crate::jit::JitExecOutcome {
-            unreachable!("fake code is never entered")
         }
     }
 
@@ -1058,8 +1058,6 @@ mod tests {
                 id,
                 function_id: 7,
                 tier,
-                native_frame_bytes: 64,
-                parameter_prefix_entry: false,
             });
             assert!(registry.register_generation(id, code, 0, 4, 1));
             assert_eq!(
@@ -1086,34 +1084,104 @@ mod tests {
     }
 
     #[test]
+    fn linked_interpreter_entries_survive_directory_growth_and_invalidation() {
+        let mut registry = JitCodeRegistry::new_boxed();
+        registry.ensure_function_entry(0, 2, 9, 5, 0);
+        let stable = registry.function_entries[0];
+        let destination = registry.function_entry_cells[&0].current_generation();
+        let (_, entry) = registry.published_function_entry(0).unwrap();
+        assert_eq!(entry.native_frame_header.kind, NativeFrameKind::Interpreter);
+        assert_eq!(entry.native_frame_header.register_count, 9);
+        assert_eq!(entry.code_object_id, 0);
+        assert_eq!(entry.flags, 0);
+        assert_eq!(
+            entry.entry_addr.load(std::sync::atomic::Ordering::Acquire),
+            crate::native_abi::call_generic_entry as *const () as u64
+        );
+        for function_id in 1..4096 {
+            registry.ensure_function_entry(function_id, 0, 1, 0, 0);
+        }
+        assert_eq!(registry.view.function_entry_count, 4096);
+        assert_eq!(
+            registry.view.function_entries,
+            registry.function_entries.as_ptr() as u64
+        );
+        assert_eq!(registry.function_entries[0], stable);
+        assert_eq!(
+            registry.function_entry_cells[&0].current_generation(),
+            destination
+        );
+        registry.invalidate_all();
+        assert_eq!(
+            registry.function_entry_cells[&0].current_generation(),
+            destination
+        );
+        // SAFETY: every address is owned by a permanent registry box.
+        let directory = unsafe {
+            std::slice::from_raw_parts(registry.view.function_entries as *const u64, 4096)
+        };
+        assert!(directory.iter().all(|address| *address != 0));
+    }
+
+    #[test]
+    fn interpreter_feedback_is_distinct_per_function_and_drains_once() {
+        let mut registry = JitCodeRegistry::new_boxed();
+        for (id, entries, deopts) in [(7, 3, 1), (8, 5, 2)] {
+            registry.ensure_function_entry(id, 1, 4, 0, 0);
+            let cell = registry.function_entry_cells[&id].interpreter_destination();
+            cell.generated_entries.set(entries);
+            cell.generated_deopts.set(deopts);
+        }
+        let feedback = registry.take_generated_feedback();
+        let observed: Vec<_> = feedback
+            .iter()
+            .map(|delta| {
+                assert_eq!(delta.code_object_id, 0);
+                assert_eq!(delta.tier, NativeFrameKind::Interpreter);
+                (
+                    delta.function_id,
+                    delta.entries,
+                    delta.returns,
+                    delta.deopts,
+                )
+            })
+            .collect();
+        assert_eq!(observed, [(7, 3, 2, 1), (8, 5, 3, 2)]);
+        assert!(registry.take_generated_feedback().is_empty());
+        registry.function_entry_cells[&7]
+            .interpreter_destination()
+            .generated_entries
+            .set(4);
+        let next = registry.take_generated_feedback();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].function_id, 7);
+        assert_eq!(
+            (next[0].entries, next[0].returns, next[0].deopts),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
     fn stable_function_entry_switches_tiers_without_invalidating_callers() {
         let mut registry = JitCodeRegistry::new_boxed();
         let baseline: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
             id: 101,
             function_id: 7,
             tier: NativeFrameKind::Baseline,
-            native_frame_bytes: 64,
-            parameter_prefix_entry: false,
         });
         let optimizing: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
             id: 102,
             function_id: 7,
             tier: NativeFrameKind::Optimizing,
-            native_frame_bytes: 96,
-            parameter_prefix_entry: true,
         });
         let caller: Arc<dyn JitFunctionCode> = Arc::new(GeneratedFakeCode {
             id: 201,
             function_id: 8,
             tier: NativeFrameKind::Baseline,
-            native_frame_bytes: 64,
-            parameter_prefix_entry: false,
         });
 
         assert!(registry.published_function_entry(7).is_none());
-        assert!(!registry.has_entry_generation_history(7));
         assert!(registry.register_generation(101, baseline, 2, 9, 1));
-        assert!(registry.has_entry_generation_history(7));
         assert_eq!(
             registry
                 .published_function_entry(7)
@@ -1124,8 +1192,6 @@ mod tests {
         );
         assert!(registry.register_generation(201, caller, 2, 12, 1));
         let stable_addr = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
-        assert_eq!(registry.function_id_for_entry_addr(stable_addr), Some(7));
-        assert_eq!(registry.function_id_for_entry_addr(stable_addr + 1), None);
         assert_eq!(
             registry.function_entry_cells[&7].current_generation(),
             registry.entry_cell_addr(101).unwrap()
@@ -1154,7 +1220,7 @@ mod tests {
         let optimizing_cell =
             unsafe { &*(registry.entry_cell_addr(102).unwrap() as *const CodeEntryCell) };
         assert_eq!(registry.function_entry_cells[&7].register_count, 9);
-        assert_eq!(optimizing_cell.native_frame_header.register_count, 2);
+        assert_eq!(optimizing_cell.native_frame_header.register_count, 9);
 
         assert_eq!(registry.invalidate_code_object(102), vec![7]);
         assert_eq!(
@@ -1180,8 +1246,6 @@ mod tests {
             id: 103,
             function_id: 7,
             tier: NativeFrameKind::Optimizing,
-            native_frame_bytes: 96,
-            parameter_prefix_entry: true,
         });
         assert!(registry.register_generation(103, optimizing_refresh, 2, 9, 1));
         assert_eq!(registry.invalidate_code_object(101), vec![7]);
@@ -1200,9 +1264,19 @@ mod tests {
         );
         assert_eq!(registry.invalidate_function(7), vec![7]);
         registry.retire_unreferenced();
-        assert!(registry.published_function_entry(7).is_none());
-        assert!(registry.has_entry_generation_history(7));
-        assert_eq!(registry.function_id_for_entry_addr(stable_addr), Some(7));
+        let (function, destination) = registry.published_function_entry(7).unwrap();
+        assert_eq!(std::ptr::from_ref(function) as u64, stable_addr);
+        assert_eq!(destination.code_object_id, 0);
+        assert_eq!(
+            destination.native_frame_header.kind,
+            NativeFrameKind::Interpreter
+        );
+        assert_ne!(
+            destination
+                .entry_addr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
         assert!(
             registry.entry_cell_addr(103).is_some(),
             "retired cells remain owned tombstones"

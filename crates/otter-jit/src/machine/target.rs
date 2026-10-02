@@ -543,6 +543,7 @@ impl TargetSpec {
         allocation: &AllocatedSequence,
         root_slots: u16,
         raw_slots: u16,
+        window_slots: u16,
     ) -> Result<MachineFrameLayout, FrameLayoutError> {
         if allocation.architecture() != self.architecture {
             return Err(FrameLayoutError::TargetMismatch);
@@ -583,6 +584,7 @@ impl TargetSpec {
             allocation,
             root_slots,
             raw_slots,
+            window_slots,
             fixed_bytes,
             self.frame.stack_alignment,
             self.frame.entry_stack_bias,

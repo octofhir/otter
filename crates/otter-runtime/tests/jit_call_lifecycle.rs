@@ -55,17 +55,15 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 struct RunResult {
     completion: String,
-    compile_attempts: u64,
     reentrant_transitions: u64,
     generated_calls: u64,
     caller_invalidations: u64,
-    cold_entry_resolver_misses: u64,
     code_generations: u64,
 }
 
 struct SplitRunResult {
     completion: String,
-    compile_attempts: u64,
+    code_generations: u64,
     runtime_stub_delta: u64,
     generated_call_delta: u64,
 }
@@ -83,11 +81,9 @@ fn run(source: &str, name: &str, selection: JitSelection) -> RunResult {
     let stats = runtime.execution_stats();
     RunResult {
         completion,
-        compile_attempts: stats.jit_compile_attempts,
         reentrant_transitions: stats.jit_reentrant_stub_transitions,
         generated_calls: stats.jit_generated_calls,
         caller_invalidations: stats.jit_caller_invalidations,
-        cold_entry_resolver_misses: stats.jit_cold_entry_resolver_misses,
         code_generations: stats.jit_code_generations,
     }
 }
@@ -116,7 +112,7 @@ fn run_after_warmup(
     let after = runtime.execution_stats();
     SplitRunResult {
         completion,
-        compile_attempts: before.jit_compile_attempts,
+        code_generations: before.jit_code_generations,
         runtime_stub_delta: after
             .jit_runtime_stub_transitions
             .saturating_sub(before.jit_runtime_stub_transitions),
@@ -138,8 +134,8 @@ fn assert_inline_method_probe(
     assert_eq!(compiled.completion, oracle.completion);
     assert_eq!(compiled.completion, expected);
     assert!(
-        compiled.compile_attempts > 0,
-        "{name} must compile the warmed method caller"
+        compiled.code_generations > 0,
+        "{name} must install the warmed entry or OSR body"
     );
     if expect_inline_hit {
         assert_eq!(
@@ -154,7 +150,7 @@ fn assert_inline_method_probe(
 }
 
 fn assert_whole_function_direct_calls(result: &RunResult) {
-    assert_whole_function_compiled(result);
+    assert_compiled_execution(result);
     assert!(
         result.generated_calls > 0,
         "fixture must cross a native compiled-call boundary"
@@ -163,20 +159,16 @@ fn assert_whole_function_direct_calls(result: &RunResult) {
         result.caller_invalidations, 0,
         "stable function entries must preserve generated callers"
     );
-    assert_eq!(
-        result.cold_entry_resolver_misses, 0,
-        "ordinary tier publication must remain on the generated hot path"
-    );
     assert!(
         result.code_generations > 0,
         "compiled entries must publish generation counters"
     );
 }
 
-fn assert_whole_function_compiled(result: &RunResult) {
+fn assert_compiled_execution(result: &RunResult) {
     assert!(
-        result.compile_attempts > 0,
-        "fixture must compile whole-function entries"
+        result.code_generations > 0,
+        "fixture must install a compiled entry or OSR body"
     );
 }
 
@@ -188,6 +180,7 @@ function makeCaptured(offset) {
 }
 
 function callPlain(fn, value) {
+  if (arguments.length !== 2) throw "caller arity";
   return fn(value);
 }
 
@@ -244,6 +237,7 @@ function subtract(value) {
   return this.base - value;
 }
 function callMethod(receiver, value) {
+  if (arguments.length !== 2) throw "caller arity";
   return receiver.apply(value);
 }
 
@@ -258,8 +252,7 @@ const receivers = [
   subtractSecond
 ];
 
-// Install entry-capable generations before the polymorphic caller snapshots
-// its target chain.
+// Prime the method feedback before the polymorphic caller snapshots its targets.
 for (let i = 0; i < 320; i++) {
   add(i);
   multiply(i);
@@ -614,7 +607,7 @@ fn own_upvalue_fallback_roots_receiver_and_new_cells() {
         compiled.completion,
         "[72768,[10,1001,12,1003,14,1005,16,1007]]"
     );
-    assert_whole_function_compiled(&compiled);
+    assert_compiled_execution(&compiled);
 }
 
 const FRAMELESS_MAKE_FUNCTION: &str = r#"
@@ -625,11 +618,12 @@ function mint() {
 }
 
 function mintThroughCompiledCaller() {
+  if (arguments.length !== 0) throw "caller arity";
   return mint();
 }
 
-// Compile both endpoints, then keep allocating distinct capture-free closure
-// bodies through a compiled-to-compiled call. The volume is intentional: it
+// Keep a distinct caller activation while allocating capture-free closure
+// bodies through generated linkage. The volume is intentional: it
 // exercises relocation while MakeFunction's destination stays in the native
 // owner's published register window.
 let warmChecksum = 0;
@@ -675,13 +669,21 @@ function throwYoungResult(ordinal) {
 }
 
 function callReturnYoungResult(ordinal) {
+  if (arguments.length !== 1) throw "caller arity";
   return returnYoungResult(ordinal);
 }
 
 function callThrowYoungResult(ordinal) {
+  if (arguments.length !== 1) throw "caller arity";
   return throwYoungResult(ordinal);
 }
 
+for (let ordinal = 0; ordinal < 5000; ordinal++) {
+  callReturnYoungResult(ordinal);
+  try { callThrowYoungResult(ordinal); } catch (thrown) {
+    if (thrown.ordinal !== ordinal) throw "warm throw identity";
+  }
+}
 let returnedChecksum = 0;
 let thrownChecksum = 0;
 let lastReturned = null;
@@ -719,7 +721,7 @@ fn generated_result_payloads_survive_feedback_reconciliation() {
         compiled.completion,
         r#"[73536,73536,"return-383","throw-383"]"#
     );
-    assert_whole_function_compiled(&compiled);
+    assert_compiled_execution(&compiled);
     assert!(
         compiled.generated_calls > 0,
         "reconciliation must publish generated-call feedback"

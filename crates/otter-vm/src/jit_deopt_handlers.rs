@@ -3,8 +3,8 @@
 //! # Contents
 //! - [`StaticCatchHandlerPlan`] — validated outer-to-inner catch-only state for
 //!   one function/resume PC.
-//! - [`Interpreter::jit_rebuild_materialized_catch_handlers`] — the public JIT
-//!   boundary for an existing interpreter-owned activation.
+//! - [`Interpreter::jit_rebuild_frame_catch_handlers`] — the public JIT
+//!   boundary for an existing published activation.
 //! - Internal prepare/install helpers shared by generated stack-call and
 //!   spliced-frame materialization.
 //!
@@ -42,7 +42,10 @@ impl Interpreter {
         function_id: u32,
         resume_pc: u32,
     ) -> Result<StaticCatchHandlerPlan, VmError> {
-        let function = context
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let function = owner
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         if function.id != function_id || function.instr_at_index(resume_pc as usize).is_none() {
@@ -101,13 +104,28 @@ impl Interpreter {
         Ok(())
     }
 
+    pub(crate) fn jit_install_prepared_catch_handlers(
+        &mut self,
+        call: &mut crate::PreparedCall,
+        plan: StaticCatchHandlerPlan,
+    ) -> Result<(), VmError> {
+        if call.function_id != plan.function_id {
+            return Err(VmError::InvalidOperand);
+        }
+        if !plan.handlers.is_empty() {
+            let index = *call.cold.get_or_insert_with(|| self.cold_frames.acquire());
+            self.cold_frames.get_mut(index).handlers = plan.handlers;
+        }
+        Ok(())
+    }
+
     /// Rebuild the exact catch-only handler stack for one existing
     /// interpreter-owned activation about to resume after Machine deopt.
     ///
     /// The caller still owns register and PC writeback. This boundary only
     /// validates static control flow and replaces `cold.handlers`, preserving
     /// every supported sibling field verbatim.
-    pub fn jit_rebuild_materialized_catch_handlers(
+    pub fn jit_rebuild_frame_catch_handlers(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
@@ -191,36 +209,45 @@ mod tests {
     }
 
     #[test]
-    fn materialized_rebuild_replaces_only_handlers() {
+    fn frame_rebuild_replaces_only_handlers() {
         let function = catch_function(0);
         let context = context(vec![function.clone()]);
         let mut interpreter = Interpreter::new();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let mut frame = interpreter
             .test_frame_for_function(&function)
             .expect("frame");
         {
+            frame.set_new_target(Value::function(19));
+            frame.set_derived_constructor();
             let cold = interpreter.frame_ensure_cold(&mut frame);
-            cold.new_target = Some(Value::function(19));
-            cold.rest_args.push(Value::number_i32(23));
-            cold.incoming_args.push(Value::number_i32(29));
-            cold.is_derived_constructor = true;
             cold.handlers.push(TryHandler {
                 catch_pc: Some(99),
                 finally_pc: None,
                 exc_register: 0,
             });
         }
+        frame.set_actual_arguments(&[Value::number_i32(23), Value::number_i32(29)]);
         stack.push(frame);
 
         interpreter
-            .jit_rebuild_materialized_catch_handlers(&context, &mut stack, 0, 1)
+            .jit_rebuild_frame_catch_handlers(&context, &mut stack, 0, 1)
             .expect("catch reconstruction");
         let cold = interpreter.frame_cold(&stack[0]).expect("preserved cold");
-        assert_eq!(cold.new_target, Some(Value::function(19)));
-        assert_eq!(cold.rest_args.as_slice(), &[Value::number_i32(23)]);
-        assert_eq!(cold.incoming_args.as_slice(), &[Value::number_i32(29)]);
-        assert!(cold.is_derived_constructor);
+        assert_eq!(stack[0].new_target(), Value::function(19));
+        assert_eq!(
+            crate::ActiveFrameRef::from_frame(&stack[0])
+                .incoming_argument(0)
+                .unwrap(),
+            Value::number_i32(23)
+        );
+        assert_eq!(
+            crate::ActiveFrameRef::from_frame(&stack[0])
+                .incoming_argument(1)
+                .unwrap(),
+            Value::number_i32(29)
+        );
+        assert!(stack[0].is_derived_constructor());
         assert_eq!(cold.handlers.len(), 1);
         assert_eq!(cold.handlers[0].catch_pc, Some(4));
         assert_eq!(cold.handlers[0].finally_pc, None);
@@ -228,20 +255,25 @@ mod tests {
         assert_eq!(stack[0].pc, 0, "handler-only helper must not own PC");
 
         interpreter
-            .jit_rebuild_materialized_catch_handlers(&context, &mut stack, 0, 4)
+            .jit_rebuild_frame_catch_handlers(&context, &mut stack, 0, 4)
             .expect("catch body has no active handler");
         let cold = interpreter.frame_cold(&stack[0]).expect("preserved cold");
         assert!(cold.handlers.is_empty());
-        assert_eq!(cold.new_target, Some(Value::function(19)));
-        assert_eq!(cold.rest_args.as_slice(), &[Value::number_i32(23)]);
+        assert_eq!(stack[0].new_target(), Value::function(19));
+        assert_eq!(
+            crate::ActiveFrameRef::from_frame(&stack[0])
+                .incoming_argument(0)
+                .unwrap(),
+            Value::number_i32(23)
+        );
     }
 
     #[test]
-    fn materialized_rebuild_rejects_parked_control_state_without_mutation() {
+    fn frame_rebuild_rejects_parked_control_state_without_mutation() {
         let function = catch_function(0);
         let context = context(vec![function.clone()]);
         let mut interpreter = Interpreter::new();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let mut frame = interpreter
             .test_frame_for_function(&function)
             .expect("frame");
@@ -257,7 +289,7 @@ mod tests {
         stack.push(frame);
 
         assert!(matches!(
-            interpreter.jit_rebuild_materialized_catch_handlers(&context, &mut stack, 0, 1),
+            interpreter.jit_rebuild_frame_catch_handlers(&context, &mut stack, 0, 1),
             Err(VmError::InvalidOperand)
         ));
         let cold = interpreter.frame_cold(&stack[0]).expect("cold retained");

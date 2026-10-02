@@ -1,21 +1,21 @@
-//! Cold policy and diagnostics for compiler-generated direct calls.
+//! Cold policy and diagnostics for side exits of entered generations.
 //!
 //! # Contents
-//! - [`Interpreter::note_generated_call_deopt`] — validates one exact generated
-//!   code generation, emits its structured cold-deopt event, and feeds the
-//!   shared cost policy.
+//! - [`Interpreter::note_entered_generation_deopt`] — validates one exact
+//!   generated code generation, emits its structured deopt event, and feeds
+//!   the shared cost policy.
 //!
 //! # Invariants
-//! - This module runs only after generated code reports a callee bailout.
-//!   Successful generated calls never transition through the VM.
-//! - Callee identity and tier come from the exact
-//!   retained [`crate::native_abi::CodeEntryCell`] generation.
-//! - The published stack-owned frame must agree with that generation before
-//!   diagnostics or policy state changes.
-//! - An inline caller is checked against its owning generation's exact safepoint
-//!   and the physical parent immediately preceding the bailed callee.
+//! - This module runs only after a generation entered through the call
+//!   trampoline reports a side exit. Successful calls never transition
+//!   through the VM.
+//! - Callee identity and tier come from the exact retained
+//!   [`crate::native_abi::CodeEntryCell`] generation, and the published frame
+//!   must agree with it before diagnostics or policy state changes.
+//! - The exit is charged to the generation that took it; the caller that
+//!   entered it is not consulted.
 //! - Exit cost is applied once per still-linked generation; later deopts from
-//!   already-active callers cannot invalidate an already-unlinked cell.
+//!   already-active frames cannot invalidate an already-unlinked cell.
 //! - Event construction remains lazy and allocation-free while JIT event
 //!   capture is disabled.
 //!
@@ -25,93 +25,22 @@
 
 use crate::{
     ExecutionContext, Interpreter, VmError,
-    jit::JitDirectCallKind,
     jit_debug::{JitDebugEvent, JitDebugTier},
-    native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind},
+    native_abi::{Frame, NativeFrameKind},
 };
 
 impl Interpreter {
-    /// A source caller may be an inline descendant of the active generation.
-    /// Its parents are virtual: the callee's physical caller names the call
-    /// site whose recipe ends in that source function at that call.
-    fn generated_caller_matches(
-        &self,
-        context: &ExecutionContext,
-        function_id: u32,
-        call_pc: u32,
-        code_object_id: u64,
-        callee: &NativeFrame,
-    ) -> bool {
-        let Some(owner) = self
-            .jit_code_registry
-            .generation_function_id(code_object_id)
-        else {
-            return false;
-        };
-        if owner == function_id {
-            return true;
-        }
-        // SAFETY: generated linkage keeps the callee and its caller published
-        // until after this non-reentrant check.
-        let Some(root) = (unsafe { callee.caller_frame().as_ref() }) else {
-            return false;
-        };
-        if root.header.function_id != owner
-            || u64::from(root.code_object_id) != code_object_id
-            || root.call_site == crate::native_abi::NO_SAFEPOINT
-        {
-            return false;
-        }
-        let Some(record) = self
-            .jit_code_registry
-            .safepoint_record(code_object_id, root.call_site)
-        else {
-            return false;
-        };
-        if !record.inline_frames_virtual || record.id != root.call_site {
-            return false;
-        }
-        let Some(source) = record.inline_frames.last() else {
-            return false;
-        };
-        let Some(function) = context.exec_function(function_id) else {
-            return false;
-        };
-        source.function_id == function_id
-            && function.instruction_byte_pc(call_pc as usize) == Some(source.byte_pc)
-    }
-
-    /// Record one exact generated-call deopt and apply baseline bail policy.
-    pub(super) fn note_generated_call_deopt(
+    /// Record one exact entered-generation deopt and apply its bail policy.
+    pub(crate) fn note_entered_generation_deopt(
         &mut self,
         context: &ExecutionContext,
-        caller_function_id: u32,
-        caller_call_pc: u32,
-        caller_code_object_id: u64,
-        callee_code_object_id: u64,
-        call_kind: JitDirectCallKind,
-        callee: &NativeFrame,
+        callee: &Frame,
         exit: crate::native_abi::SideExit,
     ) -> Result<(), VmError> {
-        if caller_code_object_id == 0
-            || callee_code_object_id == 0
-            || !callee
-                .header
-                .flags
-                .contains(NativeFrameFlags::STACK_REGISTERS)
-        {
+        let callee_code_object_id = u64::from(callee.code_object_id);
+        if callee_code_object_id == 0 {
             return Err(VmError::InvalidOperand);
         }
-        if !self.generated_caller_matches(
-            context,
-            caller_function_id,
-            caller_call_pc,
-            caller_code_object_id,
-            callee,
-        ) {
-            return Err(VmError::InvalidOperand);
-        }
-
         let Some(state) = self
             .jit_code_registry
             .generated_deopt_state(callee_code_object_id)
@@ -125,15 +54,13 @@ impl Interpreter {
         let tier = match state.tier {
             NativeFrameKind::Baseline => JitDebugTier::Template,
             NativeFrameKind::Optimizing => JitDebugTier::Optimizing,
-            NativeFrameKind::Interpreter => return Err(VmError::InvalidOperand),
+            NativeFrameKind::Interpreter | NativeFrameKind::Host => {
+                return Err(VmError::InvalidOperand);
+            }
         };
         let callee_function_id = callee.header.function_id;
         let callee_resume_pc = callee.header.pc;
-        self.record_jit_debug_event(|| JitDebugEvent::GeneratedCallDeopt {
-            call_kind,
-            caller_function_id,
-            caller_call_pc,
-            caller_code_object_id,
+        self.record_jit_debug_event(|| JitDebugEvent::EnteredGenerationDeopt {
             callee_function_id,
             callee_code_object_id,
             callee_tier: tier,
@@ -165,7 +92,7 @@ impl Interpreter {
                     // initialized for `register_count` tagged slots until the
                     // deoptimizer consumes it.
                     crate::Value::from_bits(unsafe {
-                        std::ptr::read((callee.register_base as *const u64).add(index))
+                        std::ptr::read((callee.register_base() as *const u64).add(index))
                     })
                 })
                 .collect::<smallvec::SmallVec<[crate::Value; 8]>>();

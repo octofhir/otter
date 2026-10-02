@@ -1,0 +1,397 @@
+//! Template JavaScript calls on x86-64.
+//!
+//! # Contents
+//! - [`emit_call`] — one call or construct: the actual span, the call ABI
+//!   registers and the call into a proven target's current generation or the
+//!   generic entry, then completion routing.
+//! - [`emit_method_call`] — method resolution through the shared caches,
+//!   then the call.
+//! - [`emit_spread_call_op`] / [`emit_forward_call`] — calls whose span, or
+//!   whole request, a runtime staging entry writes.
+//!
+//! # Invariants
+//! - `r15` holds the context, `r14` the published frame and `r13` its
+//!   register window; the stack stays 16-byte aligned at every call.
+//! - The callee owns its activation, receiver binding, constructor
+//!   completion and deoptimization. A completion commits once: success
+//!   stores the destination, a throw reaches `throw_value` with the exception
+//!   in `rax`, a parked error reaches `threw`.
+//!
+//! # See also
+//! - [`crate::x86_64::js_call`] — the shared call ABI emitters.
+
+use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
+use otter_vm::{JitCompileSnapshot, native_abi as abi};
+
+use super::{emit_load_reg, emit_load_runtime_stub, emit_store_reg};
+use crate::{
+    artifact::relocation::RelocationCapture,
+    entry::{NATIVE_FRAME_NEW_TARGET_OFFSET, TransitionTable, Unsupported, VALUE_UNDEFINED},
+    x86_64::js_call::{
+        CallTarget, emit_call as emit_js_call, emit_enter_staged, emit_pop_arguments,
+        emit_push_arguments, emit_staged_call,
+    },
+};
+
+/// `new.target` of a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallNewTarget {
+    /// `[[Call]]`.
+    None,
+    /// `new C(...)`: the constructor itself.
+    Callee,
+    /// `super(...)`: the frame's `new.target`, or the parent outside a
+    /// construct.
+    Super,
+}
+
+/// Deliver a completion in `rax`/`rdx`: success to `dst`, a throw to
+/// `throw_value`, a parked error to `threw`.
+fn emit_completion(
+    ops: &mut Assembler,
+    dst: u16,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) {
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; test rdx, rdx
+        ; jz =>done
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>threw
+        ; =>done
+    );
+    emit_store_reg(ops, 0, dst);
+}
+
+/// `rcx = new.target` for a callee in `rsi`.
+fn emit_new_target(ops: &mut Assembler, new_target: CallNewTarget) {
+    match new_target {
+        CallNewTarget::None => {}
+        CallNewTarget::Callee => dynasm!(ops ; .arch x64 ; mov rcx, rsi),
+        CallNewTarget::Super => {
+            let ready = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch x64
+                ; mov rcx, [r14 + NATIVE_FRAME_NEW_TARGET_OFFSET as i32]
+                ; cmp rcx, VALUE_UNDEFINED as i32
+                ; jne =>ready
+                ; mov rcx, rsi
+                ; =>ready
+            );
+        }
+    }
+}
+
+/// Branch to `miss` unless the callable in `r9` is the bytecode function
+/// `function_id` without runtime call setup. Clobbers r8, r10 and r11.
+fn emit_identity_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    function_id: u32,
+    miss: DynamicLabel,
+) {
+    let guarded = ops.new_dynamic_label();
+    let layout = view.closure_call_layout;
+    dynasm!(ops
+        ; .arch x64
+        ; mov r10, QWORD otter_vm::value::tag::box_function_id(function_id) as i64
+        ; cmp r9, r10
+        ; je =>guarded
+        ; test r9, r9
+        ; jz =>miss
+        ; mov r11, QWORD otter_vm::value::tag::NOT_CELL_MASK as i64
+        ; test r9, r11
+        ; jnz =>miss
+        ; cmp BYTE [r9], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
+        ; jne =>miss
+    );
+    if layout.runtime_setup_flags != 0 {
+        dynasm!(ops
+            ; .arch x64
+            ; test DWORD [r9 + layout.flags_byte as i32], layout.runtime_setup_flags as i32
+            ; jnz =>miss
+        );
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; cmp DWORD [r9 + layout.function_id_byte as i32], function_id as i32
+        ; jne =>miss
+        ; =>guarded
+    );
+}
+
+/// Call `callee` (a register, or `r9` when `None`) with `arguments` and
+/// deliver the completion to `dst`. A proven target `known` is entered
+/// through its current generation after its identity guard; every other
+/// callee through the generic entry.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    callee: Option<u16>,
+    receiver: Option<u16>,
+    new_target: CallNewTarget,
+    arguments: &[u16],
+    known: Option<otter_vm::jit::JitDirectCallPlan>,
+    call_pc: u32,
+    dst: u16,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let done = ops.new_dynamic_label();
+    let count = u32::try_from(arguments.len())
+        .map_err(|_| Unsupported::OperandShape("x86-64 call actual count"))?;
+    // `[[Construct]]` enters a proven target directly only when it has the
+    // internal method; classification throws otherwise.
+    let known = known.filter(|plan| {
+        new_target == CallNewTarget::None
+            || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
+    });
+    if let Some(callee) = callee {
+        emit_load_reg(ops, 9, callee);
+    }
+    let targets = known
+        .map(|plan| {
+            (
+                Some(plan),
+                CallTarget::Known {
+                    entry_cell: plan.entry_cell,
+                    function_id: plan.function_id,
+                },
+            )
+        })
+        .into_iter()
+        .chain([(None, CallTarget::Generic)]);
+    for (plan, target) in targets {
+        let next = ops.new_dynamic_label();
+        let pushed = match plan {
+            Some(plan) => {
+                crate::x86_64::js_call::emit_cached_identity(
+                    ops,
+                    relocations,
+                    plan,
+                    call_pc,
+                    next,
+                    |ops, bail| emit_identity_guard(ops, view, plan.function_id, bail),
+                );
+                arguments.len().max(usize::from(plan.param_count))
+            }
+            None => arguments.len(),
+        };
+        let bytes = emit_push_arguments(ops, pushed, 0, |ops, index, register, _| {
+            match arguments.get(index) {
+                Some(&source) => emit_load_reg(ops, register, source),
+                None => dynasm!(ops ; .arch x64 ; mov Rd(register), VALUE_UNDEFINED as i32),
+            }
+            Ok(())
+        })?;
+        dynasm!(ops ; .arch x64 ; mov rsi, r9);
+        if let Some(receiver) = receiver {
+            emit_load_reg(ops, 2, receiver);
+        }
+        emit_new_target(ops, new_target);
+        emit_js_call(
+            ops,
+            relocations,
+            table,
+            15,
+            receiver.is_some(),
+            new_target != CallNewTarget::None,
+            count,
+            target,
+        );
+        emit_pop_arguments(ops, bytes);
+        emit_completion(ops, dst, throw_value, threw);
+        dynasm!(ops ; .arch x64 ; jmp =>done ; =>next);
+    }
+    dynasm!(ops ; .arch x64 ; =>done);
+    Ok(())
+}
+
+/// Resolve the method of `receiver` through the shared caches, then call it
+/// with `receiver` as `this`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_method_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    receiver: u16,
+    arguments: &[u16],
+    dst: u16,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let resolved = ops.new_dynamic_label();
+    emit_load_reg(ops, 0, receiver);
+    dynasm!(ops
+        ; .arch x64
+        ; sub rsp, 16
+        ; mov [rsp], rax
+        ; mov rdi, r15
+        ; mov rsi, rsp
+        ; mov edx, 1
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        table.entry(abi::STUB_JIT_RESOLVE_METHOD),
+        abi::STUB_JIT_RESOLVE_METHOD,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; add rsp, 16
+        ; test rdx, rdx
+        ; jz =>resolved
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>threw
+        ; =>resolved
+        ; mov r9, rax
+    );
+    emit_call(
+        ops,
+        relocations,
+        table,
+        view,
+        None,
+        Some(receiver),
+        CallNewTarget::None,
+        arguments,
+        None,
+        0,
+        dst,
+        throw_value,
+        threw,
+    )
+}
+
+/// `CallSpread`, `NewSpread` and `SuperConstructSpread`: stage the dense
+/// spread array's elements as the request's span, then call.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_spread_call_op(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    opcode: u8,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
+    let (dst, callee, receiver, array, new_target) =
+        if opcode == otter_bytecode::Op::CallSpread as u8 {
+            (
+                lane(arg0, 0),
+                lane(arg0, 1),
+                Some(lane(arg0, 2)),
+                lane(arg0, 3),
+                CallNewTarget::None,
+            )
+        } else if opcode == otter_bytecode::Op::NewSpread as u8 {
+            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Callee)
+        } else if opcode == otter_bytecode::Op::SuperConstructSpread as u8 {
+            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Super)
+        } else {
+            return Err(Unsupported::OperandShape("x86-64 spread call opcode"));
+        };
+    let staged = ops.new_dynamic_label();
+    emit_load_reg(ops, 6, array);
+    dynasm!(ops ; .arch x64 ; mov rdi, r15);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        table.entry(abi::STUB_JIT_STAGE_SPREAD),
+        abi::STUB_JIT_STAGE_SPREAD,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; test rdx, rdx
+        ; jz =>staged
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>threw
+        ; =>staged
+    );
+    emit_load_reg(ops, 6, callee);
+    if let Some(receiver) = receiver {
+        emit_load_reg(ops, 2, receiver);
+    }
+    emit_new_target(ops, new_target);
+    emit_staged_call(
+        ops,
+        relocations,
+        table,
+        15,
+        receiver.is_some(),
+        new_target != CallNewTarget::None,
+    );
+    emit_completion(ops, dst, throw_value, threw);
+    Ok(())
+}
+
+/// `CallForwardArguments`: stage the complete request from the resolved
+/// `apply`, callee, receiver and current argument bindings, then call.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_forward_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    [dst, method, callee, receiver]: [u16; 4],
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let mut words = vec![method, callee, receiver];
+    words.extend(
+        view.code_block
+            .forwarded_argument_bindings()
+            .filter_map(|(_, storage)| match storage {
+                otter_bytecode::ArgumentBindingStorage::Register { reg } => Some(reg),
+                otter_bytecode::ArgumentBindingStorage::Context { .. } => None,
+            }),
+    );
+    words.extend(view.code_block.forwarded_formals_context());
+    let bytes = crate::call_linkage::pushed_argument_bytes(words.len())?;
+    dynasm!(ops ; .arch x64 ; sub rsp, bytes as i32);
+    for (index, &word) in words.iter().enumerate() {
+        emit_load_reg(ops, 0, word);
+        dynasm!(ops ; .arch x64 ; mov [rsp + (index * 8) as i32], rax);
+    }
+    let staged = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov rsi, rsp
+        ; mov edx, words.len() as i32
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        table.entry(abi::STUB_JIT_STAGE_FORWARD),
+        abi::STUB_JIT_STAGE_FORWARD,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; add rsp, bytes as i32
+        ; test rdx, rdx
+        ; jz =>staged
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>threw
+        ; =>staged
+    );
+    emit_enter_staged(ops, relocations, table, 15);
+    emit_completion(ops, dst, throw_value, threw);
+    Ok(())
+}

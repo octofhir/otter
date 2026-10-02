@@ -8,7 +8,7 @@
 //! - An arrow referencing the enclosing activation's `arguments`.
 //! - Live mapped parameters and mutated/materialized argument lists, including
 //!   allocating length coercion and index getters.
-//! - Target growth after tier-up invalidates and replans forwarding feedback.
+//! - Generated callers follow interpreter destinations and changed targets.
 //! - Native polymorphic hits, dynamic actual windows, bounded fallback, moving
 //!   roots and exact exceptions after warmup.
 //! - Saturated native dispatch with fresh/inherited captures and semantic misses.
@@ -95,7 +95,7 @@ fn run(selection: JitSelection) -> Run {
             } if forwarding(function_name) => {
                 forward_bails.push(format!("{function_name}@{op_debug:?}"));
             }
-            JitDebugEvent::GeneratedCallDeopt {
+            JitDebugEvent::EnteredGenerationDeopt {
                 callee_function_id,
                 callee_resume_pc,
                 ..
@@ -237,7 +237,7 @@ fn forwarded_arguments_read_live_mappings_and_materialized_objects() {
 }
 
 #[test]
-fn generated_forwarding_replans_when_the_resolved_target_changes() {
+fn generated_interpreter_destinations_follow_a_changed_forward_target() {
     let source = r#"
 function first(value) { return value + 1; }
 function second(value) { return value + 2; }
@@ -263,43 +263,30 @@ sum;
             .expect("forwarded target switch");
         assert_eq!(result.completion_string(), "25010000", "{selection:?}");
         let report = result.jit_debug_report().expect("events");
-        let forward_id = report
+        let interpreter_edges = report
             .events()
             .iter()
-            .find_map(|event| match event {
-                JitDebugEvent::CompilePrepared {
-                    function_id,
-                    function_name,
-                    ..
-                } if function_name == "forward" => Some(*function_id),
-                _ => None,
+            .filter(|event| {
+                matches!(
+                    event,
+                    JitDebugEvent::DirectCallLowered {
+                        outcome: otter_runtime::JitDirectCallLoweringOutcome::Generated {
+                            code_object_id: 0,
+                            target_tier: otter_runtime::JitDebugTier::Interpreter,
+                            ..
+                        },
+                        ..
+                    }
+                )
             })
-            .expect("forward must enter generated code before the target changes");
-        let mut monomorphic = false;
-        let mut grew_after_compile = false;
-        for event in report.events() {
-            if let JitDebugEvent::InlineCandidate {
-                caller_function_id,
-                callee_function_id,
-                bake_rejection,
-                ..
-            } = event
-                && *caller_function_id == forward_id
-            {
-                if callee_function_id.is_some() {
-                    monomorphic = true;
-                }
-                if matches!(
-                    bake_rejection,
-                    Some(otter_runtime::JitInlineRejectionReason::Polymorphic)
-                ) {
-                    grew_after_compile |= monomorphic;
-                }
-            }
-        }
+            .count();
         assert!(
-            grew_after_compile,
-            "{selection:?}: compiled forwarding must publish its new target and replan the monomorphic snapshot"
+            interpreter_edges > 0,
+            "{selection:?}: generated callers must enter the permanent interpreter destination"
+        );
+        assert!(
+            runtime.execution_stats().jit_generated_calls > 0,
+            "{selection:?}: the linked destination must actually execute"
         );
     }
 }

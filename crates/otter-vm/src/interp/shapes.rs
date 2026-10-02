@@ -309,7 +309,11 @@ impl Interpreter {
             let receiver = interp.scoped_value(scope, Value::object(*obj));
             let cursor = interp.scoped_value(scope, Value::object(*obj));
             for _ in 0..object::PROTO_CHAIN_HARD_CAP {
-                let mut current = interp.escape_scoped(cursor).as_object().unwrap();
+                // A function or other non-ordinary object in the chain keeps
+                // its own property storage; the dictionary walk ends there.
+                let Some(mut current) = interp.escape_scoped(cursor).as_object() else {
+                    break;
+                };
                 if let Some(ordered) =
                     object::dictionary_ordered_slot_attrs(current, &interp.gc_heap)
                 {

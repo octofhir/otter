@@ -9,9 +9,14 @@
 //! # Invariants
 //! - The identity guard completes before an intrinsic or native call has an
 //!   observable effect.
+//! - Static kind and external identity come from the VM's one C callable header.
 //! - Tagged leaf calls receive `(heap, value0, value1[, value2])` in the
 //!   System V integer argument registers and return the shared pair.
 //! - No path allocates, collects, throws, or publishes a safepoint.
+//!
+//! # See also
+//! - [`otter_vm::jit::JitNativeCallLayout`] for shared callable offsets.
+//! - [`super`] for leaf declarations and Machine admission.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::{
@@ -44,7 +49,7 @@ pub(crate) fn emit_guard(
         ; jz =>miss
         ; cmp BYTE [r10], view.collection_layout.native_function_type_tag as i8
         ; jne =>miss
-        ; cmp DWORD [r10 + view.native_ref_byte as i32], builtin_native_ref as i32
+        ; cmp DWORD [r10 + view.native_call_layout.identity_byte as i32], builtin_native_ref as i32
         ; jne =>miss
     );
 }

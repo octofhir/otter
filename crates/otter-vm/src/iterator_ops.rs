@@ -3247,7 +3247,6 @@ impl Interpreter {
         handle: &crate::generator::JsGenerator,
         kind: GeneratorResumeKind,
     ) -> Result<Value, VmError> {
-        let _window_rollback = self.register_window_rollback();
         let (frame_opt, resume_dst) = (
             handle.has_frame(&self.gc_heap),
             handle.resume_dst(&self.gc_heap),
@@ -3283,8 +3282,11 @@ impl Interpreter {
             }
         };
         let mut frame = Box::new(self.resume_parked_frame(*frame)?);
+        let input_roots = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(frame.as_ref()));
         if let Some(c) = cold {
-            self.frame_attach_cold(&mut frame, c);
+            self.prepared_attach_cold(&mut frame, c);
         }
         // §27.5.3.7 — a frame parked on `Op::YieldDelegate` receives
         // every resume kind as data (kind code + argument) so the
@@ -3300,17 +3302,14 @@ impl Interpreter {
                 GeneratorResumeKind::Throw(v) => (1, *v),
                 GeneratorResumeKind::Return(v) => (2, *v),
             };
-            if let Some(slot) = frame.registers.get_mut(kind_dst as usize) {
-                *slot = Value::number_i32(code);
-            }
-            if let Some(slot) = frame.registers.get_mut(resume_dst as usize) {
-                *slot = arg;
-            }
+            frame.seed_register(kind_dst, Value::number_i32(code))?;
+            frame.seed_register(resume_dst, arg)?;
             let is_async = handle.is_async(&self.gc_heap);
             if is_async {
                 handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
             }
             let floor = stack.floor();
+            drop(input_roots);
             stack.push(*frame);
             return self.finish_generator_dispatch(stack, floor, context, handle, is_async);
         }
@@ -3322,16 +3321,13 @@ impl Interpreter {
             GeneratorResumeKind::Next(arg) => {
                 // §27.5.3.3 — the value passed to the first `next()`
                 // (frame parked at GeneratorStart) is discarded.
-                if frame.pc != 0
-                    && resume_dst != crate::generator::JsGenerator::RESUME_DST_NONE
-                    && let Some(slot) = frame.registers.get_mut(resume_dst as usize)
-                {
-                    *slot = *arg;
+                if frame.pc != 0 && resume_dst != crate::generator::JsGenerator::RESUME_DST_NONE {
+                    frame.seed_register(resume_dst, *arg)?;
                 }
             }
             GeneratorResumeKind::Return(arg) => {
                 let closers = self
-                    .frame_cold(&frame)
+                    .prepared_cold(&frame)
                     .map(|cold| cold.active_iterator_closers.clone())
                     .unwrap_or_default();
                 for (iterator, _) in closers.iter().rev() {
@@ -3360,7 +3356,7 @@ impl Interpreter {
                 // the completion). With no active finally, complete
                 // immediately.
                 let has_finally = self
-                    .frame_cold(&frame)
+                    .prepared_cold(&frame)
                     .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
                 if !has_finally {
                     handle.mark_done(&mut self.gc_heap);
@@ -3383,70 +3379,14 @@ impl Interpreter {
                 throw_value = Some(*reason);
             }
         }
+        frame.resume = match (throw_value, return_value) {
+            (Some(reason), _) => crate::prepared_call::ResumeInput::Throw(reason),
+            (_, Some(value)) => crate::prepared_call::ResumeInput::Return(value),
+            _ => crate::prepared_call::ResumeInput::Normal,
+        };
         let floor = stack.floor();
+        drop(input_roots);
         stack.push(*frame);
-        if let Some(arg) = return_value {
-            // Drive the parked frame's `finally` blocks via the abrupt
-            // `return` path; `EndFinally` resumes the completion.
-            match self.return_running_finally_above(stack, floor, arg) {
-                Ok(Some(v)) => {
-                    handle.mark_done(&mut self.gc_heap);
-                    self.release_frames_above(stack, floor);
-                    return self.make_runtime_rooted_iter_result(v, true, &[], &[]);
-                }
-                Ok(None) => { /* finally parked; dispatch below runs it */ }
-                Err(err) => {
-                    handle.mark_done(&mut self.gc_heap);
-                    self.release_frames_above(stack, floor);
-                    return Err(err);
-                }
-            }
-        }
-        if let Some(reason) = throw_value {
-            // Preserve the original throw value so the caller can
-            // re-raise it on the outer stack when the gen body
-            // does not catch it (the unwind_throw machinery
-            // converts the value to a string when it surfaces as
-            // VmError::Uncaught, losing the payload).
-            self.pending_generator_throw = Some(reason);
-            match self.unwind_throw_above(context, stack, floor, reason) {
-                Ok(_) => {}
-                Err(err) => {
-                    handle.mark_done(&mut self.gc_heap);
-                    self.release_frames_above(stack, floor);
-                    self.pending_generator_throw = None;
-                    // An async generator answers through its queued
-                    // request: the uncaught throw is that request's
-                    // rejection, not an escaping dispatch error.
-                    if handle.is_async(&self.gc_heap) {
-                        let reason = if matches!(err, VmError::Uncaught) {
-                            self.take_pending_uncaught_throw().unwrap_or(reason)
-                        } else {
-                            reason
-                        };
-                        self.async_generator_complete_step(context, handle, Err(reason), true)?;
-                        self.async_generator_drain_done(stack, context, handle)?;
-                        return Ok(Value::undefined());
-                    }
-                    return Err(err);
-                }
-            }
-            if stack.is_at_floor(floor) {
-                handle.mark_done(&mut self.gc_heap);
-                self.pending_generator_throw = None;
-                // An async generator answers through its queued request; the
-                // uncaught body throw becomes that request's rejection
-                // instead of escaping the dispatch tick.
-                if handle.is_async(&self.gc_heap) {
-                    self.async_generator_complete_step(context, handle, Err(reason), true)?;
-                    self.async_generator_drain_done(stack, context, handle)?;
-                    return Ok(Value::undefined());
-                }
-                return Err(self.err_uncaught(("generator-throw".to_string()).into()));
-            }
-            // A handler caught the throw — clear the side channel.
-            self.pending_generator_throw = None;
-        }
         let is_async = handle.is_async(&self.gc_heap);
         if is_async {
             handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
@@ -3519,9 +3459,7 @@ impl Interpreter {
                         self.async_generator_drain_done(stack, context, handle)?;
                         return Ok(Value::undefined());
                     }
-                    let rejection = if let Some(thrown) = self.pending_generator_throw.take() {
-                        Some(thrown)
-                    } else if let Some(thrown) = self.pending_uncaught_throw.take() {
+                    let rejection = if let Some(thrown) = self.pending_uncaught_throw.take() {
                         Some(thrown)
                     } else {
                         self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)

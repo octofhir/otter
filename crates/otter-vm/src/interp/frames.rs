@@ -1,44 +1,25 @@
-//! Register-window and frame-stack management.
+//! Cold activation state, completion and native frame publication.
 //!
 //! # Contents
-//! Register allocation/reclaim on the contiguous register stack, ActivationStack
-//! draw/return, cold-frame attach/detach, frame pop/unwind
-//! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), the native frame
-//! chain (entry cells, Rust publication, depth, tracing), optimized frames'
-//! call-site root homes, and the raw pointers compiled code uses to address
-//! the reg window.
+//! - Cold-record ownership and suspension inputs.
+//! - Return, throw and finally handling bounded by an activation floor.
+//! - Publication, tracing and safepoint access for the native caller chain.
 //!
 //! # Invariants
-//! The reg stack is a GC root region: windows must be zeroed on alloc
-//! and truncated on reclaim so stale slots never masquerade as values.
-//! Stack-owned native frames remain published for the complete dynamic extent
-//! of every allocating or reentrant compiled call; an optimized frame's
-//! `call_site` names the safepoint of the call it is making.
-//! Frames are published and unpublished innermost first; each links to its
-//! caller, so the chain from the innermost frame is the complete live set.
+//! The trampoline owns active frames and initialized tagged windows. Logical
+//! completion keeps the physical frame published until assembly releases its
+//! extent. Cold records transfer once on suspension and release once on
+//! completion. A collecting compiled call publishes its safepoint before entry.
+//!
+//! # See also
+//! - [`crate::activation_stack`] for the non-owning activation view.
+//! - [`crate::native_abi::call_trampoline`] for active storage.
+//! - [`crate::frame_state::ParkedFrameState`] for suspended storage.
+
 #![allow(unused_imports)]
 use crate::*;
 
 impl Interpreter {
-    #[cfg(test)]
-    pub(crate) fn test_frame_for_function(
-        &mut self,
-        function: &otter_bytecode::Function,
-    ) -> Result<Frame, VmError> {
-        let total = function
-            .param_count
-            .saturating_add(function.locals)
-            .saturating_add(function.scratch) as usize;
-        let window = self.alloc_reg_window(total)?;
-        Ok(Frame::for_function(
-            function,
-            None,
-            Value::function(function.id),
-            Value::undefined(),
-            window,
-        ))
-    }
-
     /// Borrow the cold record attached to `frame`, if any.
     #[inline]
     #[must_use]
@@ -103,83 +84,141 @@ impl Interpreter {
             .is_some_and(|cold| cold.async_state.is_some() || cold.generator_owner.is_some())
     }
 
-    /// Reserve a zero-filled `count`-slot window at the top of the flat register
-    /// stack, bumping its live cursor. Returns the authoritative C-layout
-    /// descriptor stored in [`Frame`]; frame pop releases the
-    /// arena back to its recorded base.
-    ///
-    /// The stack is pre-reserved and never reallocates (live `Window` frames
-    /// hold raw pointers into it), so an overflow throws a catchable stack
-    /// overflow instead of growing.
-    pub(crate) fn alloc_reg_window(&mut self, count: usize) -> Result<RegisterWindow, VmError> {
-        self.register_stack.allocate(count)
-    }
-
-    pub(crate) fn register_window_rollback(
+    /// Start the suspension owner of a freshly entered async or generator
+    /// activation, on its already published frame: an async function's
+    /// result promise, or a generator object that `GeneratorStart` parks the
+    /// activation into. Resumed and VM-prepared activations already carry
+    /// their owner and are left unchanged.
+    pub(crate) fn begin_suspendable_activation(
         &mut self,
-    ) -> crate::register_stack::RegisterStackCheckpoint {
-        self.register_stack.rollback_checkpoint()
+        stack: &mut ActivationStack,
+        context: &crate::ExecutionContext,
+    ) -> Result<(), VmError> {
+        let Some(frame) = stack.last() else {
+            return Ok(());
+        };
+        if frame.header.pc != 0
+            || frame.header.kind != crate::native_abi::NativeFrameKind::Interpreter
+            || self.frame_has_suspension_owner(frame)
+        {
+            return Ok(());
+        }
+        let function_id = frame.header.function_id;
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let function = owner
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        if function.is_generator {
+            let generator = crate::generator::JsGenerator::new_for_running_activation(
+                &mut self.gc_heap,
+                function.is_async_generator,
+            )?;
+            let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+            self.frame_ensure_cold(frame).generator_owner = Some(generator);
+        } else if function.is_async {
+            let result_promise =
+                crate::promise_dispatch::PromiseBuilder::with_context(owner.clone())
+                    .pending_stack_rooted(self, stack, &[], &[])?;
+            let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+            self.frame_set_async_state(frame, crate::frame_state::AsyncFrameState { result_promise });
+        }
+        Ok(())
     }
 
-    /// Convert a cold-detached active frame into owned suspension state and
-    /// atomically unpublish its register window from the arena. The detached
-    /// cold record travels beside the returned snapshot in generator/promise
-    /// ownership; accepting an attached pool index here would lose GC roots and
-    /// is rejected even in release builds.
+    /// Read `fn.prototype` for a generator whose prologue just parked, through
+    /// the invoked closure instance, and return the generator.
+    pub(crate) fn resolve_started_generator(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::ExecutionContext,
+        generator: crate::generator::JsGenerator,
+        callee: Value,
+        function_id: u32,
+    ) -> Result<Value, VmError> {
+        let generator_anchor = self.push_iteration_anchor(Value::generator(generator)) - 1;
+        let callee_anchor = self.push_iteration_anchor(callee) - 1;
+        let result = (|| -> Result<Value, VmError> {
+            let owner = context
+                .for_function(function_id)
+                .map_err(|_| VmError::InvalidOperand)?;
+            let closure = self.iteration_anchor(callee_anchor).as_closure(&self.gc_heap);
+            let proto =
+                self.function_property_get(stack, &owner, closure, function_id, "prototype")?;
+            let generator = self
+                .iteration_anchor(generator_anchor)
+                .as_generator()
+                .ok_or(VmError::InvalidOperand)?;
+            generator.set_prototype_override(
+                &mut self.gc_heap,
+                proto.as_object().is_some().then_some(proto),
+            );
+            Ok(self.iteration_anchor(generator_anchor))
+        })();
+        self.pop_iteration_anchors_to(generator_anchor);
+        result
+    }
+
+    /// Copy a cold-detached activation while its native extent remains published.
     pub(crate) fn park_active_frame(
         &mut self,
-        frame: Frame,
+        frame: &Frame,
     ) -> crate::frame_state::ParkedFrameState {
         assert!(
             frame.cold.is_none(),
-            "cold ownership must be detached before parking a frame"
+            "detach cold ownership before suspension"
         );
-        let (parked, window) = crate::frame_state::ParkedFrameState::copy_from_active(frame);
-        self.free_reg_window(window.stack_base());
-        parked
+        crate::frame_state::ParkedFrameState::copy_from_active(frame)
     }
 
-    /// Reserve a fresh initialized window and restore one parked frame into it.
+    /// Restore owned suspension inputs without allocating an active frame.
     pub(crate) fn resume_parked_frame(
         &mut self,
         parked: crate::frame_state::ParkedFrameState,
-    ) -> Result<Frame, VmError> {
-        let window = self.alloc_reg_window(parked.register_count())?;
-        Ok(parked.into_active(window))
+    ) -> Result<crate::PreparedCall, VmError> {
+        Ok(parked.into_prepared())
     }
 
-    /// Truncate the flat register stack back to `base`, releasing every window
-    /// at or above it. Called when a `Window` frame leaves the stack (return,
-    /// unwind, or generator/async park).
-    #[inline]
-    pub(crate) fn free_reg_window(&mut self, base: u32) {
-        // Release this window: truncate the cursor to `base`. Only ever LOWER
-        // `reg_top` — never raise it. A window can be freed more than once (a
-        // frame returns normally, lowering `reg_top`, then re-entry cleanup drains
-        // the finished re-entry stack and reclaims the same frame); a second
-        // free then arrives with `base > reg_top`. Setting `reg_top = base`
-        // unconditionally would raise the cursor back over slots that were
-        // already released and never re-cleared, so `trace_reg_stack` would then
-        // scan those stale register cells as live roots — feeding moved-from /
-        // garbage pointers to the scavenger (crashes, wrong dispatch, type
-        // mismatches under GC stress). `min` makes a redundant free a no-op.
-        self.register_stack.release(base);
+    pub(crate) fn prepared_cold(
+        &self,
+        call: &crate::PreparedCall,
+    ) -> Option<&cold_frame::ColdFrame> {
+        call.cold.map(|index| self.cold_frames.get(index))
+    }
+
+    pub(crate) fn prepared_set_async_state(
+        &mut self,
+        call: &mut crate::PreparedCall,
+        state: crate::frame_state::AsyncFrameState,
+    ) {
+        let index = *call.cold.get_or_insert_with(|| self.cold_frames.acquire());
+        self.cold_frames.get_mut(index).async_state = Some(state);
+    }
+
+    pub(crate) fn prepared_attach_cold(
+        &mut self,
+        call: &mut crate::PreparedCall,
+        cold: Box<cold_frame::ColdFrame>,
+    ) {
+        assert!(call.cold.is_none());
+        call.cold = Some(self.cold_frames.attach(*cold));
     }
 
     /// Innermost published native frame, or null when none is published.
     #[inline]
     #[must_use]
-    pub fn jit_innermost_native_frame(&self) -> *mut crate::native_abi::NativeFrame {
+    pub fn jit_innermost_native_frame(&self) -> *mut crate::native_abi::Frame {
         let bits = match self.jit_frame_cell {
             // SAFETY: the live compiled entry keeps its frame cell valid until
             // `jit_leave_native_frames` restores the enclosing cell.
             Some(cell) => unsafe { *cell.as_ptr() },
             None => self.jit_detached_frame,
         };
-        bits as *mut crate::native_abi::NativeFrame
+        bits as *mut crate::native_abi::Frame
     }
 
-    fn set_jit_innermost_native_frame(&mut self, frame: *mut crate::native_abi::NativeFrame) {
+    fn set_jit_innermost_native_frame(&mut self, frame: *mut crate::native_abi::Frame) {
         match self.jit_frame_cell {
             // SAFETY: see `jit_innermost_native_frame`.
             Some(cell) => unsafe { *cell.as_ptr() = frame as u64 },
@@ -198,7 +237,7 @@ impl Interpreter {
     /// Published native frames from the innermost outward.
     pub(crate) fn jit_native_frames(
         &self,
-    ) -> impl Iterator<Item = *mut crate::native_abi::NativeFrame> + '_ {
+    ) -> impl Iterator<Item = *mut crate::native_abi::Frame> + '_ {
         let mut frame = self.jit_innermost_native_frame();
         std::iter::from_fn(move || {
             if frame.is_null() {
@@ -220,32 +259,20 @@ impl Interpreter {
     /// the matching [`Self::jit_pop_native_frame`].
     pub unsafe fn jit_push_native_frame(
         &mut self,
-        frame: &mut crate::native_abi::NativeFrame,
+        frame: &mut crate::native_abi::Frame,
     ) -> Result<(), VmError> {
         // SAFETY: forwarded from this function's publication contract. The
         // checked view centralizes null/alignment/window validation before the
         // frame becomes visible to GC.
-        unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+        unsafe { crate::ActiveFrameMut::from_ptr(frame) }.map_err(|_| VmError::InvalidOperand)?;
         self.link_native_frame(frame)
     }
 
-    fn link_native_frame(
-        &mut self,
-        frame: &mut crate::native_abi::NativeFrame,
-    ) -> Result<(), VmError> {
+    fn link_native_frame(&mut self, frame: &mut crate::native_abi::Frame) -> Result<(), VmError> {
         let caller = self.jit_innermost_native_frame();
         // SAFETY: the innermost published record is live.
         let caller_depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
-        let depth = if frame
-            .header
-            .flags
-            .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
-        {
-            caller_depth.saturating_add(1)
-        } else {
-            caller_depth
-        };
+        let depth = caller_depth.saturating_add(1);
         if depth > self.max_stack_depth {
             return Err(VmError::StackOverflow {
                 limit: self.max_stack_depth,
@@ -281,10 +308,9 @@ impl Interpreter {
         cell: std::ptr::NonNull<u64>,
     ) -> Result<Option<std::ptr::NonNull<u64>>, VmError> {
         // SAFETY: forwarded from the entry contract.
-        let frame = unsafe { &mut *(*cell.as_ptr() as *mut crate::native_abi::NativeFrame) };
+        let frame = unsafe { &mut *(*cell.as_ptr() as *mut crate::native_abi::Frame) };
         // SAFETY: as in `jit_push_native_frame`.
-        unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+        unsafe { crate::ActiveFrameMut::from_ptr(frame) }.map_err(|_| VmError::InvalidOperand)?;
         let caller = self.jit_innermost_native_frame();
         // SAFETY: the innermost published record is live.
         frame.depth = unsafe { caller.as_ref() }.map_or(0, |caller| caller.depth);
@@ -307,35 +333,15 @@ impl Interpreter {
             .saturating_sub(u32::try_from(interpreter_frames).unwrap_or(u32::MAX))
     }
 
-    /// Logical depth owned by compiler-generated frames that remain native.
-    ///
-    /// The innermost frame's depth counts every stack-register frame in the
-    /// chain. Cold deoptimization may temporarily mirror one published frame
-    /// in the materialized stack, which the transfer count removes here.
-    #[inline]
-    pub(crate) fn jit_generated_call_depth(&self) -> u32 {
-        // SAFETY: the innermost published record is live.
-        unsafe { self.jit_innermost_native_frame().as_ref() }
-            .map_or(0, |frame| frame.depth)
-            .saturating_sub(self.jit_materialized_generated_calls.len() as u32)
-    }
-
-    /// Trace every published native frame. Register-arena windows are traced
-    /// once by [`Self::trace_reg_stack`]; generated-code stack windows are
-    /// absent from that arena and are traced through their frame here.
+    /// Trace tagged windows, actuals, frame fields and optimized root homes
+    /// through the one published activation chain.
     pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         for native in self.jit_native_frames() {
             // SAFETY: published frames and their windows stay live until
             // unpublished.
-            let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(native) }
+            let frame = unsafe { crate::ActiveFrameRef::from_ptr(native) }
                 .expect("published native frame must remain valid");
-            if frame
-                .header()
-                .flags
-                .contains(native_abi::NativeFrameFlags::STACK_REGISTERS)
-            {
-                frame.trace_stack_register_slots(visitor);
-            }
+            frame.trace_stack_register_slots(visitor);
             frame.trace_non_register_slots(visitor);
             // SAFETY: as above; only scalar fields are read here.
             let record = unsafe { &*native };
@@ -391,25 +397,6 @@ impl Interpreter {
         self.gc_heap.marking_flag_addr()
     }
 
-    /// Capacity of the flat JIT register stack in slots — the overflow bound
-    /// compiled code checks before reserving a callee window.
-    #[must_use]
-    pub fn jit_reg_stack_cap() -> usize {
-        register_stack::REGISTER_STACK_CAPACITY
-    }
-
-    /// GC-trace the live JIT register stack (`reg_stack[0..reg_top]`): every
-    /// callee window of an in-flight frameless JIT call. A no-op when no such
-    /// call is in flight.
-    pub(crate) fn trace_reg_stack(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        self.register_stack.trace(&self.gc_heap, visitor);
-    }
-
-    #[inline]
-    pub(crate) fn reclaim_registers(&mut self, frame: &mut Frame) {
-        self.free_reg_window(frame.registers.stack_base());
-    }
-
     /// Acquire (or lazily create) this frame's cold side record and
     /// then return a mutable borrow.
     #[inline]
@@ -447,18 +434,6 @@ impl Interpreter {
         Some(Box::new(self.cold_frames.detach(idx)))
     }
 
-    /// Re-attach an owned cold record into the pool and bind it to
-    /// `frame`. Matches [`Self::frame_detach_cold`] on the resume path.
-    #[inline]
-    pub(crate) fn frame_attach_cold(
-        &mut self,
-        frame: &mut Frame,
-        cold: Box<cold_frame::ColdFrame>,
-    ) {
-        let idx = self.cold_frames.attach(*cold);
-        frame.cold = Some(idx);
-    }
-
     /// Borrow the per-interpreter cold-frame pool.
     #[inline]
     #[must_use]
@@ -475,23 +450,26 @@ impl Interpreter {
 }
 
 impl Interpreter {
-    /// Release every activation owned by the nested region above `floor`.
-    ///
-    /// This is the single abnormal-exit cleanup path for shared-stack VM
-    /// re-entry.  Cold side records and register windows are reclaimed in LIFO
-    /// order; caller-owned frames below the floor are never inspected.
+    /// Release an unentered request after an entry failure. Assembly owns
+    /// physical extents and has already returned to the caller's floor.
     pub(crate) fn release_frames_above(
         &mut self,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
     ) {
-        debug_assert!(floor.depth() <= stack.len());
-        while !stack.is_at_floor(floor) {
-            let mut frame = stack
-                .pop()
-                .expect("activation depth above floor was just observed");
-            self.frame_release_cold(&mut frame);
-            self.reclaim_registers(&mut frame);
+        debug_assert!(stack.len() <= floor.depth());
+        if let Some(call) = stack.take_pending() {
+            self.release_prepared_inputs(call);
+        }
+    }
+
+    pub(crate) fn release_prepared_inputs(&mut self, call: crate::PreparedCall) {
+        let mut current = Some(call);
+        while let Some(mut call) = current {
+            if let Some(index) = call.cold.take() {
+                self.cold_frames.release(index);
+            }
+            current = call.child.take().map(|child| *child);
         }
     }
 
@@ -535,18 +513,16 @@ impl Interpreter {
         if stack.is_at_floor(floor) {
             return Err(VmError::InvalidOperand);
         }
-        let mut popped = stack.pop().ok_or_else(|| VmError::InvalidOperand)?;
+        let popped = stack.pop().ok_or_else(|| VmError::InvalidOperand)?;
         // An ordinary synchronous frame owns no cold record, so the whole
         // construct/derived/async completion vocabulary resolves from one
         // pool probe rather than from a probe per question.
-        let mut construct_target = None;
-        let mut is_derived_ctor = false;
+        let construct_target = popped.is_construct().then_some(popped.this_value);
+        let is_derived_ctor = popped.is_derived_constructor();
         let mut derived_this_slot = None;
         let mut async_state = None;
         if let Some(idx) = popped.cold.take() {
             let cold = self.cold_frames.get_mut(idx);
-            construct_target = cold.construct_target;
-            is_derived_ctor = cold.is_derived_constructor;
             derived_this_slot = cold.derived_this_slot.take();
             async_state = cold.async_state.take();
             // Release the cold slot now so the pool can reuse it; every
@@ -562,7 +538,6 @@ impl Interpreter {
         };
         // The frame is terminal — return its spilled register window to the
         // pool. Nothing below reads `popped.registers`.
-        self.reclaim_registers(&mut popped);
         let resolved = if is_derived_ctor {
             // §10.2.2 derived-constructor return semantics. An object
             // return overrides the bound `this`; `undefined` yields
@@ -586,33 +561,29 @@ impl Interpreter {
         } else {
             match construct_target {
                 Some(_) if value.is_object_type() => value,
-                Some(target) => Value::object(target),
+                Some(target) => target,
                 None => value,
             }
         };
         if let Some(state) = async_state {
-            crate::promise_dispatch::resolve_promise_from_interpreter(
+            // The activation's completion is its result promise, rooted across
+            // settlement.
+            let anchor = self.push_iteration_anchor(Value::promise(state.result_promise)) - 1;
+            let settled = crate::promise_dispatch::resolve_promise_from_interpreter(
                 self,
                 state.result_promise,
                 resolved,
                 None,
-            )?;
+            );
+            let promise = self.iteration_anchor(anchor);
+            self.pop_iteration_anchors_to(anchor);
+            settled?;
             if stack.is_at_floor(floor) {
-                return Ok(Some(Value::undefined()));
+                return Ok(Some(promise));
             }
             return Ok(None);
         }
-        let Some(return_reg) = popped.return_register else {
-            return Ok(Some(resolved));
-        };
-        if stack.is_at_floor(floor) {
-            return Err(VmError::InvalidOperand);
-        }
-        let caller = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-        write_register(caller, return_reg, resolved)?;
-        // Caller's pc was set to the next instruction at call time;
-        // nothing to advance here.
-        Ok(None)
+        Ok(Some(resolved))
     }
 
     /// §14.15.3 — run the `finally` blocks between an abrupt `return` /
@@ -734,75 +705,45 @@ impl Interpreter {
 mod tests {
     use super::*;
 
-    fn function(registers: u16) -> otter_bytecode::Function {
-        otter_bytecode::Function {
-            locals: registers,
-            ..otter_bytecode::Function::default()
-        }
-    }
-
     #[test]
-    fn park_releases_window_and_resume_restores_fresh_window() {
+    fn parked_values_are_owned_and_resume_as_entry_inputs() {
         let mut interp = Interpreter::new();
-        let function = function(3);
+        let function = otter_bytecode::Function {
+            locals: 3,
+            ..Default::default()
+        };
         let mut frame = interp.test_frame_for_function(&function).unwrap();
         frame.registers.copy_from_slice(&[
             Value::number_i32(7),
             Value::number_i32(11),
             Value::number_i32(13),
         ]);
-        assert_eq!(interp.register_stack.checkpoint(), 3);
-
-        let parked = interp.park_active_frame(frame);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
+        let parked = interp.park_active_frame(&frame);
+        frame.registers.fill(Value::UNDEFINED);
         assert_eq!(parked.debug_register(1), Some(Value::number_i32(11)));
-
-        let mut resumed = interp.resume_parked_frame(parked).unwrap();
-        assert_eq!(interp.register_stack.checkpoint(), 3);
-        assert_eq!(resumed.registers[2], Value::number_i32(13));
-        interp.reclaim_registers(&mut resumed);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
+        let resumed = interp.resume_parked_frame(parked).unwrap();
+        assert_eq!(resumed.initial_registers[2], Value::number_i32(13));
+        assert_eq!(resumed.packet().initial_register_count, 3);
     }
 
     #[test]
-    fn nested_windows_reclaim_lifo_and_duplicate_cleanup_never_raises_top() {
+    fn completion_preserves_the_published_caller() {
         let mut interp = Interpreter::new();
-        let outer_function = function(2);
-        let inner_function = function(5);
-        let mut outer = interp.test_frame_for_function(&outer_function).unwrap();
-        let mut inner = interp.test_frame_for_function(&inner_function).unwrap();
-        assert_eq!(interp.register_stack.checkpoint(), 7);
-
-        interp.reclaim_registers(&mut inner);
-        assert_eq!(interp.register_stack.checkpoint(), 2);
-        interp.reclaim_registers(&mut outer);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
-        interp.reclaim_registers(&mut inner);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
-    }
-
-    #[test]
-    fn region_completion_preserves_caller_frames_and_registers() {
-        let mut interp = Interpreter::new();
-        let parent_function = function(2);
-        let child_function = function(3);
-        let parent = interp.test_frame_for_function(&parent_function).unwrap();
-        let mut stack = ActivationStack::new();
+        let function = otter_bytecode::Function {
+            locals: 2,
+            ..Default::default()
+        };
+        let parent = interp.test_frame_for_function(&function).unwrap();
+        let child = interp.test_frame_for_function(&function).unwrap();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         stack.push(parent);
         let floor = stack.floor();
-        stack.push(interp.test_frame_for_function(&child_function).unwrap());
-        assert_eq!(interp.register_stack.checkpoint(), 5);
-
+        stack.push(child);
         let result = interp
             .pop_frame_above(&mut stack, floor, Value::number_i32(42))
             .unwrap();
-
         assert_eq!(result, Some(Value::number_i32(42)));
         assert_eq!(stack.len(), floor.depth());
-        assert_eq!(interp.register_stack.checkpoint(), 2);
-
-        let mut parent = stack.pop().unwrap();
-        interp.reclaim_registers(&mut parent);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
+        assert_eq!(stack[0].registers.len(), 2);
     }
 }

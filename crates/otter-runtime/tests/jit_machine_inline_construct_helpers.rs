@@ -114,9 +114,9 @@ for(var i=0;i<70000;i++)outer(p);
         )
         .unwrap();
     let bundles = warm.jit_artifacts().unwrap().bundles();
-    let helper_id = bundles
+    let cell_id = bundles
         .iter()
-        .find(|b| b.manifest().function_name() == "helper")
+        .find(|b| b.manifest().function_name() == "Cell")
         .unwrap()
         .manifest()
         .function_id();
@@ -156,9 +156,9 @@ p.before-before,p.after-after,coercions]);
     assert_eq!(exit.completion_string(), "[true,8,true,true,1,1,1]");
     let events = exit.jit_debug_report().unwrap().events();
     let generated = events.iter().any(|e| {
-        matches!(e,otter_vm::JitDebugEvent::GeneratedCallDeopt {
-        caller_function_id,caller_code_object_id,..}
-        if *caller_function_id==helper_id && outer_ids.contains(caller_code_object_id))
+        matches!(e, otter_vm::JitDebugEvent::EnteredGenerationDeopt {
+            callee_function_id, ..
+        } if *callee_function_id == cell_id)
     });
     let inline = events.iter().any(|e| {
         matches!(

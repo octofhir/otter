@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - Callable identity for a frameless inline body.
+//! - [`emit_cached_identity`] — the same proof behind a call site's cache of
+//!   the last callee it proved.
 //! - Plain-call this binding for the Machine inline activation recipe.
 //! - Explicit-receiver this binding for a spliced reduced `f.call`.
 //!
@@ -23,6 +25,44 @@ use otter_vm::{
     JitCompileSnapshot, JitDirectCallThisMode, closure::JS_CLOSURE_BODY_TYPE_TAG,
     value::tag as value_tag,
 };
+
+/// Prove the callee in `x9` is `plan`'s function or branch to `bail`.
+///
+/// The site's identity cell holds the last callee proved here, so a repeated
+/// callee costs one compare; any other value takes the full proof, which
+/// caches it on success. Clobbers `x10`–`x12`.
+pub(crate) fn emit_cached_identity(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitDirectCallPlan,
+    call_pc: u32,
+    bail: DynamicLabel,
+) {
+    if plan.callee_cell == 0 {
+        emit_inline_identity(ops, view, plan.function_id, bail);
+        return;
+    }
+    let cell = crate::artifact::relocation::RelocationTarget::CalleeIdentityCell {
+        function_id: plan.function_id,
+        call_pc,
+    };
+    let proven = ops.new_dynamic_label();
+    let start = ops.offset().0;
+    emit_load_u64(ops, 10, plan.callee_cell);
+    relocations.record_mov_wide(start, ops.offset().0, 10, cell.clone());
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x10, [x10]
+        ; cmp x9, x10
+        ; b.eq =>proven
+    );
+    emit_inline_identity(ops, view, plan.function_id, bail);
+    let start = ops.offset().0;
+    emit_load_u64(ops, 10, plan.callee_cell);
+    relocations.record_mov_wide(start, ops.offset().0, 10, cell);
+    dynasm!(ops ; .arch aarch64 ; str x9, [x10] ; =>proven);
+}
 
 pub(crate) fn emit_inline_identity(
     ops: &mut Assembler,
@@ -95,7 +135,7 @@ pub(crate) fn emit_inline_this(
     if this_mode == JitDirectCallThisMode::StrictOrLexical {
         emit_load_u64(ops, 12, VALUE_UNDEFINED);
     } else {
-        super::direct_call::emit_load_sloppy_global_this(ops, relocations, view, context_register);
+        emit_load_sloppy_global_this(ops, relocations, view, context_register);
     }
     dynasm!(ops ; .arch aarch64 ; =>done);
 }
@@ -129,7 +169,7 @@ pub(crate) fn emit_inline_explicit_this(
         dynasm!(ops ; .arch aarch64 ; cmp x12, x14 ; b.eq =>global_this);
         emit_load_u64(ops, 14, value_tag::VALUE_NULL);
         dynasm!(ops ; .arch aarch64 ; cmp x12, x14 ; b.eq =>global_this);
-        super::direct_call::emit_object_type_branch(
+        super::emit_object_type_branch(
             ops,
             relocations,
             view,
@@ -139,7 +179,41 @@ pub(crate) fn emit_inline_explicit_this(
             bail,
         );
         dynasm!(ops ; .arch aarch64 ; =>global_this);
-        super::direct_call::emit_load_sloppy_global_this(ops, relocations, view, context_register);
+        emit_load_sloppy_global_this(ops, relocations, view, context_register);
     }
     dynasm!(ops ; .arch aarch64 ; =>done);
+}
+
+/// Load the active realm's GC-rooted global object as full `Value` bits into
+/// `x12`.
+///
+/// No allocation or safepoint occurs between reading the compressed root slot
+/// and consuming it.
+fn emit_load_sloppy_global_this(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    context_register: u8,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x14, [X(context_register), crate::entry::GLOBAL_THIS_OFFSET_PTR_OFFSET]
+        ; ldr w12, [x14]
+    );
+    let start = ops.offset().0;
+    let cage_base = view.cage_base as u64;
+    dynasm!(ops ; .arch aarch64 ; movz x14, (cage_base & 0xffff) as u32);
+    for shift in [16u32, 32, 48] {
+        let part = ((cage_base >> shift) & 0xffff) as u32;
+        if part != 0 {
+            dynasm!(ops ; .arch aarch64 ; movk x14, part, lsl shift);
+        }
+    }
+    relocations.record_mov_wide(
+        start,
+        ops.offset().0,
+        14,
+        crate::artifact::relocation::RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch aarch64 ; orr x12, x14, x12);
 }

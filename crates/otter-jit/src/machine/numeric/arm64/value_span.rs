@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - Shared argument emission for calls and literal allocation.
+//! - [`emit_value_span_words`] — packets with non-root words, such as a
+//!   published formals context.
 //!
 //! # Invariants
 //! - Roots are already saved and published when this helper runs.
@@ -19,8 +21,27 @@ pub(super) fn emit_value_span_arguments(
     site: &MachineSafepointSite,
     arguments: impl ExactSizeIterator<Item = super::super::super::MachineValue>,
 ) -> Result<(), Unsupported> {
-    let count = u16::try_from(arguments.len())
-        .map_err(|_| Unsupported::OperandShape("scalar value-span length"))?;
+    let arguments = arguments.collect::<Vec<_>>();
+    emit_value_span_words(ops, sequence, frame, arguments.len(), |ops, index, register| {
+        emit_load_safepoint_root(ops, frame, site, arguments[index], register, 0)
+    })
+}
+
+/// Fill a `count`-word packet through `load(ops, index, register)`, which
+/// loads word `index` into `register`, and leave its address in `x1` and its
+/// length in `w2`.
+pub(super) fn emit_value_span_words<Load>(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    sequence: &InstructionSequence,
+    frame: MachineFrameLayout,
+    count: usize,
+    mut load: Load,
+) -> Result<(), Unsupported>
+where
+    Load: FnMut(&mut dynasmrt::aarch64::Assembler, usize, u8) -> Result<(), Unsupported>,
+{
+    let count =
+        u16::try_from(count).map_err(|_| Unsupported::OperandShape("scalar value-span length"))?;
     if count == 0 {
         dynasm!(ops ; .arch aarch64 ; mov x1, xzr ; mov w2, wzr);
         return Ok(());
@@ -33,9 +54,9 @@ pub(super) fn emit_value_span_arguments(
     if count > packet.raw_words || end > frame.raw_slots() {
         return Err(Unsupported::OperandShape("scalar value-span capacity"));
     }
-    for (index, value) in arguments.enumerate() {
-        emit_load_safepoint_root(ops, frame, site, value, 16, 0)?;
-        let offset = raw_offset(frame, packet.raw_start + index as u16)?;
+    for index in 0..count {
+        load(ops, usize::from(index), 16)?;
+        let offset = raw_offset(frame, packet.raw_start + index)?;
         emit_frame_str_x(ops, 16, offset);
     }
     let offset = raw_offset(frame, packet.raw_start)?;

@@ -31,11 +31,6 @@ use std::fmt;
 use otter_vm::native_abi::{RuntimeStubDescriptor, RuntimeStubSignature, runtime_stub_name};
 use serde::Serialize;
 
-use super::{
-    DirectCallArgumentModeArtifact, DirectCallArtifact, DirectCallKindArtifact,
-    DirectCallThisModeArtifact, DirectCallTierArtifact,
-};
-
 const NORMALIZED_MAGIC: &[u8; 8] = b"OTJNCODE";
 #[cfg(not(target_arch = "x86_64"))]
 const NORMALIZED_ARCH_AARCH64: u16 = 1;
@@ -51,14 +46,14 @@ const ITEM_DIRECT_BRANCH: u8 = 2;
 const TARGET_RUNTIME_STUB: u8 = 1;
 const TARGET_GC_CAGE_BASE: u8 = 2;
 const TARGET_PROPERTY_SOURCE_CELL: u8 = 3;
-const TARGET_TEMPLATE_OPERAND_SLICE: u8 = 4;
 const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
-const TARGET_DIRECT_CALL_ENTRY_CELL: u8 = 8;
+const TARGET_FUNCTION_ENTRY_CELL: u8 = 8;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
 const TARGET_DEOPT_RUNTIME_DATA: u8 = 11;
 const TARGET_STRING_CONSTANT_CELL: u8 = 12;
 const TARGET_PROPERTY_LOOKUP_CACHE_TABLE: u8 = 13;
 const TARGET_STORE_TRANSITION_CACHE_TABLE: u8 = 14;
+const TARGET_CALLEE_IDENTITY_CELL: u8 = 16;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a property source-identity cell serves a load or a store site.
@@ -67,20 +62,6 @@ const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 pub(crate) enum PropertySourceAccess {
     Load,
     Store,
-}
-
-/// Template-plan arena owning an address-stable operand slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum TemplateOperandArena {
-    Registers,
-}
-
-/// Semantic role of one template-plan operand slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum TemplateOperandRole {
-    ConstructArguments,
 }
 
 /// Address-stable heap component used by a collection fast path.
@@ -140,25 +121,22 @@ pub(crate) enum RelocationTarget {
         access: PropertySourceAccess,
         ordinal: u32,
     },
-    TemplateOperandSlice {
-        arena: TemplateOperandArena,
-        role: TemplateOperandRole,
-        start: u32,
-        len: u32,
-    },
     GuardedHeapReference {
         component: GuardedHeapComponent,
         byte_pc: u32,
         runtime_stub_id: u32,
     },
-    /// Stable registry cell guarded by one generated direct-call site.
-    ///
-    /// The process address is intentionally absent. Exact JSON retains the
-    /// target generation id; normalized code omits that id and retains the
-    /// portable target/layout contract.
-    DirectCallEntryCell {
-        byte_pc: u32,
-        direct_call: DirectCallArtifact,
+    /// Permanent `FunctionEntryCell` of a proven call target, through which
+    /// a generated call enters the target's current generation. The process
+    /// address is absent; the function id is the portable identity.
+    FunctionEntryCell {
+        function_id: u32,
+    },
+    /// Code-owned cache of the last callee one call site proved to be its
+    /// baked target, named by that target and the site's canonical PC.
+    CalleeIdentityCell {
+        function_id: u32,
+        call_pc: u32,
     },
 }
 
@@ -192,6 +170,8 @@ fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str 
         RuntimeStubSignature::CommittedValue2 => "committedValue2",
         RuntimeStubSignature::RouteThrow1 => "routeThrow1",
         RuntimeStubSignature::AcknowledgeCaughtThrow0 => "acknowledgeCaughtThrow0",
+        RuntimeStubSignature::ExecutionEntry0 => "executionEntry0",
+        RuntimeStubSignature::JsCall => "jsCall",
     }
 }
 
@@ -1044,6 +1024,8 @@ pub(super) enum DirectBranchKind {
     Cbnz { is_64_bit: bool, register: u8 },
     Tbz { bit: u8, register: u8 },
     Tbnz { bit: u8, register: u8 },
+    /// Code-relative address materialization (`adr`).
+    Adr { register: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1087,6 +1069,10 @@ impl DirectBranch {
             DirectBranchKind::Tbnz { bit, register } => {
                 output.push(6);
                 output.push(bit);
+                output.push(register);
+            }
+            DirectBranchKind::Adr { register } => {
+                output.push(7);
                 output.push(register);
             }
         }
@@ -1135,6 +1121,15 @@ pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<Di
             target: offset as i64 + displacement,
         });
     }
+    if instruction & 0x9f00_0000 == 0x1000_0000 {
+        let immediate = ((instruction >> 5) & 0x7ffff) << 2 | ((instruction >> 29) & 0x3);
+        return Some(DirectBranch {
+            kind: DirectBranchKind::Adr {
+                register: (instruction & 0x1f) as u8,
+            },
+            target: offset as i64 + sign_extend(immediate, 21),
+        });
+    }
     if instruction & 0x7e00_0000 == 0x3600_0000 {
         let displacement = sign_extend((instruction >> 5) & 0x3fff, 14) << 2;
         let is_nonzero = instruction & (1 << 24) != 0;
@@ -1154,10 +1149,8 @@ pub(super) fn decode_direct_branch(instruction: u32, offset: usize) -> Option<Di
 
 #[cfg(not(target_arch = "x86_64"))]
 fn unsupported_pc_relative(instruction: u32) -> Option<&'static str> {
-    match instruction & 0x9f00_0000 {
-        0x1000_0000 => return Some("ADR"),
-        0x9000_0000 => return Some("ADRP"),
-        _ => {}
+    if instruction & 0x9f00_0000 == 0x9000_0000 {
+        return Some("ADRP");
     }
     if instruction & 0x3b00_0000 == 0x1800_0000 {
         return Some("literal load/prefetch");
@@ -1216,22 +1209,6 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             });
             put_u32(output, *ordinal);
         }
-        RelocationTarget::TemplateOperandSlice {
-            arena,
-            role,
-            start,
-            len,
-        } => {
-            output.push(TARGET_TEMPLATE_OPERAND_SLICE);
-            output.push(match arena {
-                TemplateOperandArena::Registers => 0,
-            });
-            output.push(match role {
-                TemplateOperandRole::ConstructArguments => 3,
-            });
-            put_u32(output, *start);
-            put_u32(output, *len);
-        }
         RelocationTarget::GuardedHeapReference {
             component,
             byte_pc,
@@ -1245,43 +1222,17 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *byte_pc);
             put_u32(output, *runtime_stub_id);
         }
-        RelocationTarget::DirectCallEntryCell {
-            byte_pc,
-            direct_call,
+        RelocationTarget::FunctionEntryCell { function_id } => {
+            output.push(TARGET_FUNCTION_ENTRY_CELL);
+            put_u32(output, *function_id);
+        }
+        RelocationTarget::CalleeIdentityCell {
+            function_id,
+            call_pc,
         } => {
-            output.push(TARGET_DIRECT_CALL_ENTRY_CELL);
-            put_u32(output, direct_call.target_function_id);
-            put_u32(output, direct_call.target_index);
-            put_u32(output, direct_call.target_count);
-            put_u32(output, *byte_pc);
-            output.push(match direct_call.call_kind {
-                DirectCallKindArtifact::Plain => 0,
-                DirectCallKindArtifact::Method => 1,
-                DirectCallKindArtifact::Construct => 2,
-                DirectCallKindArtifact::DerivedConstruct => 3,
-                DirectCallKindArtifact::SuperConstruct => 4,
-                DirectCallKindArtifact::DerivedSuperConstruct => 5,
-            });
-            output.push(match direct_call.argument_mode {
-                DirectCallArgumentModeArtifact::Fixed => 0,
-                DirectCallArgumentModeArtifact::Spread => 1,
-                DirectCallArgumentModeArtifact::Forward => 2,
-            });
-            output.push(match direct_call.target_tier {
-                DirectCallTierArtifact::Template => 0,
-                DirectCallTierArtifact::Optimizing => 1,
-            });
-            output.push(match direct_call.this_mode {
-                DirectCallThisModeArtifact::StrictOrLexical => 0,
-                DirectCallThisModeArtifact::SloppyGlobal => 1,
-                DirectCallThisModeArtifact::MethodReceiver => 2,
-                DirectCallThisModeArtifact::ConstructReceiver => 3,
-                DirectCallThisModeArtifact::DerivedConstructor => 4,
-            });
-            put_u32(output, direct_call.callee_native_frame_bytes);
-            put_u32(output, direct_call.linkage_bytes.unwrap_or(u32::MAX));
-            put_u32(output, direct_call.reserved_stack_bytes.unwrap_or(u32::MAX));
-            put_u16(output, direct_call.callee_register_count);
+            output.push(TARGET_CALLEE_IDENTITY_CELL);
+            put_u32(output, *function_id);
+            put_u32(output, *call_pc);
         }
     }
     Ok(())
@@ -1337,28 +1288,8 @@ mod tests {
         RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL)
     }
 
-    fn direct_call_target(
-        target_code_object_id: u64,
-        target_tier: DirectCallTierArtifact,
-        this_mode: DirectCallThisModeArtifact,
-    ) -> RelocationTarget {
-        RelocationTarget::DirectCallEntryCell {
-            byte_pc: 13,
-            direct_call: DirectCallArtifact {
-                call_kind: DirectCallKindArtifact::Plain,
-                argument_mode: DirectCallArgumentModeArtifact::Fixed,
-                target_function_id: 12,
-                target_index: 0,
-                target_count: 1,
-                target_code_object_id,
-                target_tier,
-                this_mode,
-                callee_native_frame_bytes: 160,
-                linkage_bytes: Some(112),
-                reserved_stack_bytes: Some(272),
-                callee_register_count: 6,
-            },
-        }
+    fn function_entry_cell(function_id: u32) -> RelocationTarget {
+        RelocationTarget::FunctionEntryCell { function_id }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1490,42 +1421,13 @@ mod tests {
                 access: PropertySourceAccess::Store,
                 ordinal: 7,
             },
-            direct_call_target(
-                41,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::MethodReceiver,
-            ),
+            function_entry_cell(12),
         ];
         let normalized: BTreeSet<_> = targets
             .into_iter()
             .map(|target| render_x86_single(11, 0x1234, target).normalized_code)
             .collect();
         assert_eq!(normalized.len(), 4);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn x86_direct_call_generation_is_exact_but_not_portable_identity() {
-        let first = render_x86_single(
-            11,
-            0x1111,
-            direct_call_target(
-                29,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::SloppyGlobal,
-            ),
-        );
-        let second = render_x86_single(
-            11,
-            0x2222,
-            direct_call_target(
-                30,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::SloppyGlobal,
-            ),
-        );
-        assert_eq!(first.normalized_code, second.normalized_code);
-        assert_ne!(first.json, second.json);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1730,11 +1632,11 @@ mod tests {
             }
         );
         assert_eq!(
-            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_METHOD_VALUE),
+            RelocationTarget::runtime_stub(otter_vm::native_abi::STUB_JIT_CALL_GENERIC),
             RelocationTarget::RuntimeStub {
-                id: 83,
-                name: "jit_call_method_value",
-                signature: "reentrantValueSpan",
+                id: 91,
+                name: "jit_call_generic",
+                signature: "jsCall",
             }
         );
         assert_eq!(
@@ -1814,22 +1716,16 @@ mod tests {
                 access: PropertySourceAccess::Load,
                 ordinal: 2,
             },
-            RelocationTarget::TemplateOperandSlice {
-                arena: TemplateOperandArena::Registers,
-                role: TemplateOperandRole::ConstructArguments,
-                start: 3,
-                len: 4,
+            RelocationTarget::CalleeIdentityCell {
+                function_id: 3,
+                call_pc: 4,
             },
             RelocationTarget::GuardedHeapReference {
                 component: GuardedHeapComponent::Prototype,
                 byte_pc: 8,
                 runtime_stub_id: 9,
             },
-            direct_call_target(
-                29,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::SloppyGlobal,
-            ),
+            function_entry_cell(12),
         ];
         let normalized: BTreeSet<_> = targets
             .into_iter()
@@ -1861,78 +1757,15 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn direct_call_exact_generation_is_not_portable_normalized_identity() {
+    fn function_entry_cell_identity_is_the_function_id() {
         let code = instructions(&[movz(16, 0x1234, 0, true)]);
-        let first = render_single(
-            &code,
-            4,
-            direct_call_target(
-                29,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::SloppyGlobal,
-            ),
-        );
-        let second = render_single(
-            &code,
-            4,
-            direct_call_target(
-                30,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::SloppyGlobal,
-            ),
-        );
-        assert_eq!(first.normalized_code, second.normalized_code);
-        assert_ne!(first.json, second.json);
-
+        let first = render_single(&code, 4, function_entry_cell(12));
+        let other = render_single(&code, 4, function_entry_cell(13));
+        assert_ne!(first.normalized_code, other.normalized_code);
         let document: Value = serde_json::from_str(&first.json).unwrap();
         let target = &document["relocations"][0]["target"];
-        assert_eq!(target["kind"], "directCallEntryCell");
-        assert_eq!(target["bytePc"], 13);
-        assert_eq!(target["directCall"]["targetFunctionId"], 12);
-        assert_eq!(target["directCall"]["targetIndex"], 0);
-        assert_eq!(target["directCall"]["targetCount"], 1);
-        assert_eq!(target["directCall"]["targetCodeObjectId"], 29);
-        assert_eq!(target["directCall"]["targetTier"], "optimizing");
-        assert_eq!(target["directCall"]["thisMode"], "sloppyGlobal");
-        assert_eq!(target["directCall"]["calleeNativeFrameBytes"], 160);
-        assert_eq!(target["directCall"]["linkageBytes"], 112);
-        assert_eq!(target["directCall"]["reservedStackBytes"], 272);
-        assert_eq!(target["directCall"]["calleeRegisterCount"], 6);
-
-        let template = render_single(
-            &code,
-            4,
-            direct_call_target(
-                29,
-                DirectCallTierArtifact::Template,
-                DirectCallThisModeArtifact::SloppyGlobal,
-            ),
-        );
-        assert_ne!(first.normalized_code, template.normalized_code);
-
-        let strict_or_lexical = render_single(
-            &code,
-            4,
-            direct_call_target(
-                29,
-                DirectCallTierArtifact::Optimizing,
-                DirectCallThisModeArtifact::StrictOrLexical,
-            ),
-        );
-        assert_ne!(first.normalized_code, strict_or_lexical.normalized_code);
-
-        let mut chained = direct_call_target(
-            29,
-            DirectCallTierArtifact::Optimizing,
-            DirectCallThisModeArtifact::SloppyGlobal,
-        );
-        let RelocationTarget::DirectCallEntryCell { direct_call, .. } = &mut chained else {
-            unreachable!("direct-call fixture target")
-        };
-        direct_call.target_index = 1;
-        direct_call.target_count = 4;
-        let chained = render_single(&code, 4, chained);
-        assert_ne!(first.normalized_code, chained.normalized_code);
+        assert_eq!(target["kind"], "functionEntryCell");
+        assert_eq!(target["functionId"], 12);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2061,7 +1894,6 @@ mod tests {
     #[test]
     fn rejects_unsupported_pc_relative_instructions() {
         for (instruction, name) in [
-            (0x1000_0000, "ADR"),
             (0x9000_0000, "ADRP"),
             (0x5800_0000, "literal load/prefetch"),
             (0xd800_0000, "literal load/prefetch"),

@@ -572,7 +572,7 @@ fn parked_frame_keeps_alive() {
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::object(object);
 
-    let frame = interp.park_active_frame(frame);
+    let frame = interp.park_active_frame(&frame);
     let parked = crate::generator::alloc_parked_frame(interp.gc_heap_mut(), frame, None)
         .expect("parked frame");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
@@ -615,11 +615,11 @@ fn bound_function_root_survives_force_gc() {
     let mut interp = Interpreter::new();
     let target = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("target");
     let bound_this = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this");
-    let bound = crate::BoundFunction::new(
-        interp.gc_heap_mut(),
+    let bound = crate::test_support::alloc_bound_function(
+        &mut interp,
         crate::Value::object(target),
         crate::Value::object(bound_this),
-        smallvec::smallvec![crate::Value::boolean(true)],
+        &[crate::Value::boolean(true)],
     )
     .expect("bound");
     let mut global_this = *interp.global_this();

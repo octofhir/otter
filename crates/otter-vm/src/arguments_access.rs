@@ -23,12 +23,10 @@ use crate::{
 impl Interpreter {
     fn unmaterialized_argument_read(
         &self,
-        stack: &ActivationStack,
         frame: &ActiveFrameRef<'_>,
-        materialized: Option<usize>,
         key: Option<Value>,
     ) -> Result<Option<Value>, VmError> {
-        let Some(count) = self.elided_forward_argument_count(stack, frame, materialized) else {
+        let Some(count) = self.elided_forward_argument_count(frame) else {
             return Ok(None);
         };
         let Some(key) = key else {
@@ -42,15 +40,7 @@ impl Interpreter {
         if index >= count as usize {
             return Ok(None);
         }
-        let value = if frame.incoming_argument_count().is_some() {
-            frame.incoming_argument(index)?
-        } else {
-            *materialized
-                .and_then(|index| stack.get(index))
-                .and_then(|frame| self.frame_cold(frame))
-                .and_then(|cold| cold.incoming_args.get(index))
-                .ok_or(VmError::InvalidOperand)?
-        };
+        let value = frame.incoming_argument(index)?;
         Ok(Some(value))
     }
 
@@ -74,12 +64,9 @@ impl Interpreter {
         index: usize,
         key: Option<Value>,
     ) -> Result<Value, VmError> {
-        if let Some(value) = self.unmaterialized_argument_read(
-            stack,
-            &ActiveFrameRef::materialized(&stack[index]),
-            Some(index),
-            key,
-        )? {
+        if let Some(value) =
+            self.unmaterialized_argument_read(&ActiveFrameRef::from_frame(&stack[index]), key)?
+        {
             return Ok(value);
         }
         let mut rooted_key = key.unwrap_or_else(Value::undefined);
@@ -97,12 +84,9 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame: &mut ActiveFrameMut<'_>,
-        materialized: Option<usize>,
         key: Option<Value>,
     ) -> Result<Value, VmError> {
-        if let Some(value) =
-            self.unmaterialized_argument_read(stack, &frame.as_ref(), materialized, key)?
-        {
+        if let Some(value) = self.unmaterialized_argument_read(&frame.as_ref(), key)? {
             return Ok(value);
         }
         let mut rooted_key = key.unwrap_or_else(Value::undefined);
@@ -111,7 +95,7 @@ impl Interpreter {
         unsafe {
             roots.add_value(&mut rooted_key);
         }
-        let object = self.jit_materialize_arguments(context, stack, frame, materialized)?;
+        let object = self.jit_materialize_arguments(context, stack, frame)?;
         self.materialized_argument_read(context, stack, object, key.map(|_| rooted_key))
     }
 }

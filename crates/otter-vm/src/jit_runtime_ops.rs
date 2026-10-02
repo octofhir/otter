@@ -339,7 +339,7 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader};
+    use crate::native_abi::{Frame, NativeFrameFlags, NativeFrameKind, VmFrameHeader};
 
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
@@ -397,7 +397,7 @@ mod tests {
             kind: NativeFrameKind::Baseline,
             flags: NativeFrameFlags::empty(),
         };
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             header,
             registers.as_mut_ptr() as u64,
             crate::Value::undefined(),
@@ -406,8 +406,8 @@ mod tests {
         {
             // SAFETY: `native` and its initialized register array remain live
             // and unmoved for the active view's scoped lifetime.
-            let mut frame = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
-                .expect("valid native activation");
+            let mut frame =
+                unsafe { ActiveFrameMut::from_ptr(&mut native) }.expect("valid native activation");
             let mut interp = Interpreter::new();
             let mut stack = crate::ActivationStack::new();
             let context = empty_context();

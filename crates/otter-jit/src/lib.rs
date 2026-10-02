@@ -46,6 +46,7 @@
 #[cfg(target_arch = "aarch64")]
 mod arm64;
 mod artifact;
+mod call_linkage;
 mod code;
 mod entry;
 pub mod machine;

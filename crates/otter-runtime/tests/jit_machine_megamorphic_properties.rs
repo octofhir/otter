@@ -159,7 +159,6 @@ fn assert_probe(before: RuntimeExecutionStats, after: RuntimeExecutionStats, pro
     assert_completion(before, after, property_misses);
     assert_eq!(after.jit_compile_attempts, before.jit_compile_attempts);
     assert_eq!(after.jit_code_generations, before.jit_code_generations);
-    assert_eq!(after.jit_feedback_refreshes, before.jit_feedback_refreshes);
 }
 
 fn assert_completion(

@@ -58,10 +58,8 @@ pub(crate) enum CostedTier {
 /// Dynamic observation that would trigger compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TierTrigger {
+    /// Entries through the call trampoline, from any caller tier.
     FunctionEntry,
-    /// A compiled caller already observed this target and can replace a Rust
-    /// call transition with generated linkage once the target owns entry code.
-    DirectCallTarget,
     LoopBackedge {
         /// Static instruction span between the loop header and latch. This is
         /// the generated work one successful OSR iteration avoids.
@@ -136,10 +134,11 @@ pub(crate) struct TierCostModel {
     optimizing_code_per_instruction_bytes: u64,
     code_per_register_bytes: u64,
     template_entry_saved_per_instruction_ns: u64,
-    template_entry_transition_cost_ns: u64,
+    /// One interpreter activation turn a compiled destination avoids: every
+    /// caller enters through the call trampoline, which runs a compiled
+    /// generation directly and the interpreter through a Rust turn.
+    interpreter_entry_saved_ns: u64,
     optimizing_entry_saved_per_instruction_ns: u64,
-    optimizing_entry_transition_cost_ns: u64,
-    direct_call_target_saved_ns: u64,
     template_backedge_saved_per_instruction_ns: u64,
     optimizing_backedge_saved_per_instruction_ns: u64,
     exit_penalty_ns: u64,
@@ -165,10 +164,8 @@ impl TierCostModel {
             optimizing_code_per_instruction_bytes: 38,
             code_per_register_bytes: 16,
             template_entry_saved_per_instruction_ns: 12,
-            template_entry_transition_cost_ns: 96,
+            interpreter_entry_saved_ns: 1_450,
             optimizing_entry_saved_per_instruction_ns: 20,
-            optimizing_entry_transition_cost_ns: 128,
-            direct_call_target_saved_ns: 1_450,
             template_backedge_saved_per_instruction_ns: 103,
             optimizing_backedge_saved_per_instruction_ns: 108,
             exit_penalty_ns: 192,
@@ -181,7 +178,6 @@ impl TierCostModel {
     const fn continuation_multiplier(self, trigger: TierTrigger) -> u64 {
         match trigger {
             TierTrigger::FunctionEntry => self.entry_continuation_multiplier,
-            TierTrigger::DirectCallTarget => self.entry_continuation_multiplier,
             TierTrigger::LoopBackedge { .. } => self.loop_continuation_multiplier,
         }
     }
@@ -193,15 +189,15 @@ impl TierCostModel {
         bytecode_instructions: u64,
     ) -> u64 {
         match (tier, trigger) {
+            // Template and optimizing generations are entered alike, so only
+            // the template replaces an interpreter turn.
             (CostedTier::Template, TierTrigger::FunctionEntry) => self
                 .template_entry_saved_per_instruction_ns
                 .saturating_mul(bytecode_instructions)
-                .saturating_sub(self.template_entry_transition_cost_ns),
+                .saturating_add(self.interpreter_entry_saved_ns),
             (CostedTier::Optimizing, TierTrigger::FunctionEntry) => self
                 .optimizing_entry_saved_per_instruction_ns
-                .saturating_mul(bytecode_instructions)
-                .saturating_sub(self.optimizing_entry_transition_cost_ns),
-            (_, TierTrigger::DirectCallTarget) => self.direct_call_target_saved_ns,
+                .saturating_mul(bytecode_instructions),
             (CostedTier::Template, TierTrigger::LoopBackedge { span_instructions }) => self
                 .template_backedge_saved_per_instruction_ns
                 .saturating_mul(span_instructions),
@@ -457,11 +453,7 @@ impl Interpreter {
             .generated_entries_for_function(function_id);
         let executions = u64::from(self.jit_call_counts.get(&function_id).copied().unwrap_or(0))
             .saturating_add(generated_entries);
-        let trigger = if generated_entries == 0 {
-            TierTrigger::FunctionEntry
-        } else {
-            TierTrigger::DirectCallTarget
-        };
+        let trigger = TierTrigger::FunctionEntry;
         let feedback_epoch = self.code_space.feedback_epoch(function_id);
         self.optimizing_tier_policy.sample_and_decide(
             function_id,
@@ -569,7 +561,7 @@ mod tests {
         let mut policy = TierPolicy::default();
         let input = TierCostInput {
             tier: CostedTier::Optimizing,
-            trigger: TierTrigger::DirectCallTarget,
+            trigger: TierTrigger::FunctionEntry,
             executions: 0,
             exits: 0,
             bytecode_instructions: 17,

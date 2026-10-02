@@ -1,112 +1,39 @@
-//! Cold materialization for JIT side exits.
-//!
-//! Native execution normally keeps the canonical [`crate::native_abi::NativeFrame`] and its
-//! register window intact. This module is the narrow exception: a generated
-//! stack-owned call or nested inline exit copies/materializes an
-//! [`crate::ActivationStack`] frame only after the side exit has fired.
+//! Exact interpreter resumption after generated side exits.
 //!
 //! # Contents
-//! - [`Interpreter::jit_deopt_materialize_stack_call`] — standard generated
-//!   stack-call deopt, including exact-generation diagnostics and policy.
-//! - [`Interpreter::jit_deopt_materialize_inline_frames`] — nested inline deopt.
+//! - Physical deopt prepares the existing frame for an assembly continuation.
+//! - Inline deopt restores the outer frame and prepares missing descendants.
 //!
 //! # Invariants
-//! - These APIs are cold side-exit operations, never normal call entry or a
-//!   native-to-interpreter tier transition.
-//! - Register values are attached/copied exactly once after the side exit.
-//! - Contexts travel as ordinary register values; every rebuilt frame gets
-//!   its exact SELF, through which it reaches its incoming context.
-//! - Inline chains return a complete result for materialized and stack-owned
-//!   native entries alike; their published outer frame retains its GC lifetime.
-//! - Every rebuilt frame receives the exact static catch-only handler stack for
-//!   its resume PC before interpreter dispatch can observe it.
-//! - The outer inline continuation retains the live activation's actuals,
-//!   SELF, arguments object and constructor bindings. Descendants
-//!   use the same decoded frame schema, including their own or lexical new.target.
-//!   A lexical arrow binding never enables constructor result substitution.
-//! - Every temporary materialized frame and register window is removed before
-//!   returning to compiled code.
-//! - Nested dispatch stops at the caller's activation floor and reuses the
-//!   already-published runtime-turn root provider.
-//! - A stack-owned frame stays published while copying and dispatching, so its
-//!   machine-stack values remain precise roots until generated code unpublishes
-//!   the activation after this API returns.
-//! - Generated code owns synchronous-depth and native-stack-byte counters.
-//!   Stack-call deopt neither enters nor leaves synchronous re-entry. Its
-//!   logical-depth slot is transferred temporarily to the materialized frame
-//!   so interpreter stack checks count native outer frames exactly once.
-//! - New interpreter/baseline/optimizer transitions must use
-//!   [`crate::ActiveFrameMut`] over the existing [`NativeFrame`] instead.
+//! The physical outer frame and its windows stay published throughout deopt.
+//! Its tier changes in place, preserving actuals, SELF, constructor bindings
+//! and arguments identity. Only inlined descendants require new native extents;
+//! their owned inputs transfer through the common trampoline. Static catch
+//! handlers are installed before dispatch observes a restored PC. A committed
+//! source operation is never replayed, and dispatch stays above its caller floor.
 //!
 //! # See also
-//! - [`crate::active_frame`] — canonical tier-neutral activation access.
-//! - [`crate::deopt::DeoptFrame`] — owned inline-deopt reconstruction input.
-//! - [`crate::native_abi::NativeFrame`] — canonical activation reconstructed only after a
-//!   cold side exit.
+//! - [`crate::active_frame`] for checked frame access.
+//! - [`crate::deopt::DeoptFrame`] for inline reconstruction recipes.
+//! - [`crate::interp::call_dispatch`] for native resumption.
 
 use crate::{
-    ActivationStack, ActiveFrameRef, ExecutionContext, Frame, Interpreter, Value, VmError, jit,
-    native_abi::{NativeFrame, NativeFrameFlags, SideExit},
+    ActivationStack, ActiveFrameRef, ExecutionContext, Frame, Interpreter, Value, VmError,
+    native_abi::{NativeFrameFlags, SideExit},
 };
 
 impl Interpreter {
-    /// Materialize one generated stack-owned activation in interpreter storage
-    /// and run it from its exact published resume PC.
-    ///
-    /// `native` is the still-published stack frame. Generated code retains
-    /// ownership of its synchronous-depth and native-stack-byte reservations
-    /// across this call and releases them only after the interpreter
-    /// continuation returns.
-    pub fn jit_deopt_materialize_stack_call(
+    /// Restore interpreter ownership and catch state without executing JS.
+    /// The native deopt entry resumes this frame after this method returns.
+    pub(crate) fn prepare_deoptimized_frame(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        native: &mut NativeFrame,
-        caller_function_id: u32,
-        caller_call_pc: u32,
-        callee_code_object_id: u64,
-        caller_code_object_id: u64,
-        call_kind: jit::JitDirectCallKind,
-        exit: SideExit,
-    ) -> Result<Value, VmError> {
-        let context = context
-            .for_function(native.header.function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let context = &*context;
-        if !native
-            .header
-            .flags
-            .contains(NativeFrameFlags::STACK_REGISTERS)
-        {
-            return Err(VmError::InvalidOperand);
-        }
-        self.note_generated_call_deopt(
-            context,
-            caller_function_id,
-            caller_call_pc,
-            caller_code_object_id,
-            callee_code_object_id,
-            call_kind,
-            native,
-            exit,
-        )?;
-        self.jit_deopt_resume_stack_call(context, stack, native, call_kind)
-    }
-
-    /// Materialize and resume one already-validated generated stack frame.
-    /// Diagnostics/generation policy stay at the public boundary above; this
-    /// helper owns the representation transition and is independently tested.
-    fn jit_deopt_resume_stack_call(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        native: &mut NativeFrame,
-        call_kind: jit::JitDirectCallKind,
-    ) -> Result<Value, VmError> {
-        // SAFETY: generated code keeps the original NativeFrame and both
+        native: &mut Frame,
+    ) -> Result<(), VmError> {
+        // SAFETY: generated code keeps the original Frame and both
         // windows initialized, published, and stable across this cold call.
-        let active = unsafe { ActiveFrameRef::from_native_ptr(native) }
-            .map_err(|_| VmError::InvalidOperand)?;
+        let active =
+            unsafe { ActiveFrameRef::from_ptr(native) }.map_err(|_| VmError::InvalidOperand)?;
         let function = context
             .exec_function(native.header.function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -120,89 +47,35 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
 
-        // Copy all scalar and tagged inputs before building the materialized
-        // frame. Host Vec/register-arena growth cannot collect; once pushed,
-        // ordinary runtime-turn tracing owns the new interpreter storage.
-        // Contexts travel as ordinary register values and through SELF.
-        let self_value = active.self_value();
-        let this_value = active.this_value();
-
-        let _window_rollback = self.register_window_rollback();
-        let mut window = self.alloc_reg_window(register_count)?;
-        for index in 0..register_count {
-            let register = u16::try_from(index).map_err(|_| VmError::InvalidOperand)?;
-            window[index] = active.read(register)?;
+        if !native.enter_interpreter() {
+            return Err(VmError::InvalidOperand);
         }
-        let mut frame = Frame::for_code_block(function, None, self_value, this_value, window);
-        frame.pc = native.header.pc;
-        if let Some(object) = native.arguments_object() {
-            self.frame_ensure_cold(&mut frame).arguments_object = Some(Value::object(object));
-        }
-        // The generated caller's actual-argument window dies with its stack
-        // frame; the interpreter continuation reads the same list from the
-        // cold record, exactly as an interpreter-entered call would.
-        if let Some(count) = active.incoming_argument_count() {
-            let incoming = (0..count)
-                .map(|index| active.incoming_argument(index))
-                .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()?;
-            self.frame_ensure_cold(&mut frame).incoming_args = incoming;
-        }
-        if matches!(
-            call_kind,
-            jit::JitDirectCallKind::Construct | jit::JitDirectCallKind::SuperConstruct
-        ) {
-            let receiver = this_value.as_object().ok_or(VmError::InvalidOperand)?;
-            let cold = self.frame_ensure_cold(&mut frame);
-            cold.construct_target = Some(receiver);
-            cold.new_target = Some(active.new_target_value());
-        } else if matches!(
-            call_kind,
-            jit::JitDirectCallKind::DerivedConstruct
-                | jit::JitDirectCallKind::DerivedSuperConstruct
-        ) {
-            let cold = self.frame_ensure_cold(&mut frame);
-            cold.is_derived_constructor = true;
-            cold.new_target = Some(active.new_target_value());
-        }
-        if let Err(error) = self.jit_install_static_catch_handlers(&mut frame, handler_plan) {
-            self.frame_release_cold(&mut frame);
-            return Err(error);
-        }
-        self.with_materialized_native_frame(
-            std::ptr::from_mut(native) as usize,
-            stack.len(),
-            |interp| {
-                let floor = stack.floor();
-                stack.push(frame);
-                let result = interp.dispatch_loop_above_rooted(context, stack, floor);
-                interp.release_frames_above(stack, floor);
-                result
-            },
-        )?
+        self.jit_install_static_catch_handlers(native, handler_plan)
     }
 
-    /// Materialize a nested inline deopt chain and run it to completion.
+    /// Prepare restored inline descendants for assembly-owned continuation.
     ///
     /// `frames` is ordered outermost first. The outermost completion returns to
     /// compiled code; every younger frame returns through its recorded parent
     /// destination. This owned reconstruction is reserved for inlined
     /// optimized exits that cannot resume one canonical native activation.
-    /// `materialized_index` identifies the existing owner for an arena-backed
-    /// entry; generated stack entries carry their actuals in the native window.
-    pub fn jit_deopt_materialize_inline_frames(
+    pub fn prepare_inline_deopt_frames(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        native: &mut NativeFrame,
-        materialized_index: Option<usize>,
+        native: &mut Frame,
         frames: &[crate::deopt::DeoptFrame<Value>],
         exit: SideExit,
-    ) -> Result<Value, VmError> {
-        // The chain runs to completion here rather than reporting a bail, so
-        // this is the only place the exit can charge the optimizing tier's
+    ) -> Result<(), VmError> {
+        // Assembly will complete this restored chain without another bail, so
+        // this preparation is the only place that charges the optimizing tier's
         // bounded reoptimization budget. An installed generation that keeps
         // exiting is discarded on the same rule as every other entry path.
         let outermost = frames.first().ok_or(VmError::InvalidOperand)?;
+        let owner = context
+            .for_function(outermost.function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
         if native.header.function_id != outermost.function_id {
             return Err(VmError::InvalidOperand);
         }
@@ -210,7 +83,10 @@ impl Interpreter {
             .iter()
             .enumerate()
             .map(|(index, frame)| {
-                let function = context
+                let owner = context
+                    .for_function(frame.function_id)
+                    .map_err(|_| VmError::InvalidOperand)?;
+                let function = owner
                     .exec_function(frame.function_id)
                     .ok_or(VmError::InvalidOperand)?;
                 if frame.entry.is_some() != (index != 0)
@@ -237,35 +113,6 @@ impl Interpreter {
             .collect::<Result<Vec<_>, _>>()?;
         // SAFETY: the entry remains published until this continuation returns;
         // copying its windows below performs only host allocation, never GC.
-        let active = unsafe { ActiveFrameRef::from_native_ptr(native) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        let source = materialized_index
-            .map(|index| {
-                let frame = stack.get(index).ok_or(VmError::InvalidOperand)?;
-                if frame.header.function_id != native.header.function_id
-                    || frame.registers.as_ptr() as u64 != native.register_base
-                {
-                    return Err(VmError::InvalidOperand);
-                }
-                Ok(frame)
-            })
-            .transpose()?;
-        let source_cold = source.and_then(|frame| self.frame_cold(frame)).map(|cold| {
-            (
-                cold.incoming_args.clone(),
-                cold.rest_args.clone(),
-                cold.arguments_object,
-                cold.construct_target,
-            )
-        });
-        let incoming = active
-            .incoming_argument_count()
-            .map(|count| {
-                (0..count)
-                    .map(|index| active.incoming_argument(index))
-                    .collect::<Result<smallvec::SmallVec<[Value; 4]>, _>>()
-            })
-            .transpose()?;
         // The speculation that exited lives in the innermost spliced body, so
         // its site is the one an arithmetic exit widens.
         let (site_fid, site_pc) = match (frames.last(), resume_pcs.last()) {
@@ -301,113 +148,70 @@ impl Interpreter {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let _window_rollback = self.register_window_rollback();
-        let floor = stack.floor();
-        let mut materialized: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
-
-        for (index, deopt) in frames.iter().enumerate() {
-            let entry = deopt.entry.unwrap_or(crate::deopt::DeoptFrameEntry {
-                return_register: 0,
-                this: native.this_value(),
-                closure: native.self_value(),
-                new_target: native.new_target(),
-            });
-            let function = context
+        // The outer recipe writes back into its existing physical activation.
+        // Descendants are owned entry inputs until assembly creates their extents.
+        native.registers.copy_from_slice(&outermost.slots);
+        native.header.pc = resume_pcs[0];
+        if !native.enter_interpreter() {
+            return Err(VmError::InvalidOperand);
+        }
+        let mut plans = handler_plans.into_iter();
+        self.jit_install_static_catch_handlers(
+            native,
+            plans.next().ok_or(VmError::InvalidOperand)?,
+        )?;
+        let mut descendants = Vec::with_capacity(frames.len().saturating_sub(1));
+        for (index, plan) in plans.enumerate() {
+            // Plans exclude the physical outer activation.
+            let deopt = &frames[index + 1];
+            let entry = deopt.entry.ok_or(VmError::InvalidOperand)?;
+            let owner = context
+                .for_function(deopt.function_id)
+                .map_err(|_| VmError::InvalidOperand)?;
+            let function = owner
                 .exec_function(deopt.function_id)
                 .ok_or(VmError::InvalidOperand)?;
-            // Contexts are ordinary tagged slots of the recipe; each frame's
-            // incoming context is its exact SELF closure's.
-            let mut window = self.alloc_reg_window(deopt.slots.len())?;
-            window.copy_from_slice(&deopt.slots);
-            let return_register = (index != 0).then_some(entry.return_register);
-            let mut frame =
-                Frame::for_code_block(function, return_register, entry.closure, entry.this, window);
-            frame.pc = resume_pcs[index];
-            materialized.push(frame);
-            self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
-                index: u32::try_from(index).unwrap_or(u32::MAX),
-                total: u32::try_from(frames.len()).unwrap_or(u32::MAX),
-                function_id: deopt.function_id,
-                resume_pc: resume_pcs[index],
-            });
-        }
-
-        // All fallible frame/window construction is complete. Attach call
-        // state before any handler installation or dispatch can collect.
-        let outer = &mut materialized[0];
-        let new_target = active.new_target_value();
-        let arguments_object = native.arguments_object();
-        if source_cold.is_some()
-            || incoming.is_some()
-            || !new_target.is_undefined()
-            || arguments_object.is_some()
-        {
-            let cold = self.frame_ensure_cold(outer);
-            if let Some((args, rest, object, receiver)) = source_cold {
-                cold.incoming_args = args;
-                cold.rest_args = rest;
-                cold.arguments_object = object;
-                cold.construct_target = receiver;
-            }
-            if let Some(args) = incoming {
-                cold.incoming_args = args;
-            }
-            if let Some(object) = arguments_object {
-                cold.arguments_object = Some(Value::object(object));
-            }
-            cold.new_target = (!new_target.is_undefined()).then_some(new_target);
-            cold.is_derived_constructor = native.is_derived_constructor();
-            if !new_target.is_undefined()
-                && !cold.is_derived_constructor
-                && !context
-                    .exec_function(outermost.function_id)
-                    .expect("validated function")
-                    .is_arrow
-            {
-                cold.construct_target = native.this_value().as_object();
-            }
-        }
-
-        for (deopt, frame) in frames.iter().zip(materialized.iter_mut()).skip(1) {
-            let entry = deopt.entry.expect("validated descendant entry");
+            let mut call = crate::PreparedCall::for_code_block(
+                function,
+                Some(entry.return_register),
+                entry.closure,
+                entry.this,
+            );
+            call.pc = resume_pcs[index + 1];
+            call.initial_registers.extend_from_slice(&deopt.slots);
+            call.arguments.extend(
+                deopt
+                    .slots
+                    .iter()
+                    .copied()
+                    .take(usize::from(function.param_count)),
+            );
+            call.set_new_target(entry.new_target);
             if !entry.new_target.is_undefined() {
-                let function = context
-                    .exec_function(deopt.function_id)
-                    .expect("validated function");
-                let derived = function.is_derived_constructor;
-                let cold = self.frame_ensure_cold(frame);
-                cold.new_target = Some(entry.new_target);
-                cold.is_derived_constructor = derived;
-                if !derived && !function.is_arrow {
-                    cold.construct_target = entry.this.as_object();
+                if function.is_derived_constructor {
+                    call.set_derived_constructor();
+                } else if !function.is_arrow {
+                    call.set_construct();
                 }
             }
+            self.jit_install_prepared_catch_handlers(&mut call, plan)?;
+            self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
+                index: (index + 1) as u32,
+                total: frames.len() as u32,
+                function_id: deopt.function_id,
+                resume_pc: resume_pcs[index + 1],
+            });
+            descendants.push(call);
         }
-
-        for (index, plan) in handler_plans.into_iter().enumerate() {
-            if let Err(error) =
-                self.jit_install_static_catch_handlers(&mut materialized[index], plan)
-            {
-                for frame in &mut materialized {
-                    self.frame_release_cold(frame);
-                }
-                return Err(error);
-            }
+        let mut child = None;
+        for mut call in descendants.into_iter().rev() {
+            call.child = child;
+            child = Some(Box::new(call));
         }
-
-        if let Err(error) = self.enter_sync_reentry() {
-            for frame in &mut materialized {
-                self.frame_release_cold(frame);
-            }
-            return Err(error);
+        if let Some(child) = child {
+            stack.push(*child);
         }
-        for frame in materialized {
-            stack.push(frame);
-        }
-        let result = self.dispatch_loop_above_rooted(context, stack, floor);
-        self.leave_sync_reentry();
-        self.release_frames_above(stack, floor);
-        result
+        Ok(())
     }
 }
 
@@ -479,77 +283,79 @@ mod tests {
 
     #[test]
     fn every_spliced_frame_rebuilds_its_own_catch_stack() {
-        for stack_owned in [false, true] {
-            let context = context(vec![catch_function(0), catch_function(1)]);
-            let mut interpreter = Interpreter::new();
-            let mut stack = ActivationStack::new();
-            let thrown = Value::number_i32(73);
-            let mut native = NativeFrame::new(
-                crate::native_abi::VmFrameHeader {
-                    function_id: 0,
-                    pc: 1,
-                    register_count: 0,
-                    kind: crate::native_abi::NativeFrameKind::Optimizing,
-                    flags: NativeFrameFlags::empty(),
-                },
-                0,
-                Value::function(0),
-                Value::undefined(),
-            );
-            let mut native_registers = [Value::undefined(); 2];
-            if stack_owned {
-                native.register_base = native_registers.as_mut_ptr() as u64;
-                native.header.register_count = 2;
-                native.set_stack_registers();
-            }
-            let frames = [
-                crate::deopt::DeoptFrame {
-                    function_id: 0,
-                    byte_pc: context
-                        .exec_function(0)
-                        .unwrap()
-                        .instruction_byte_pc(1)
-                        .unwrap(),
-                    entry: None,
-                    slots: Box::new([Value::undefined(), Value::undefined()]),
-                },
-                crate::deopt::DeoptFrame {
-                    function_id: 1,
-                    byte_pc: context
-                        .exec_function(1)
-                        .unwrap()
-                        .instruction_byte_pc(1)
-                        .unwrap(),
-                    entry: Some(crate::deopt::DeoptFrameEntry {
-                        return_register: 0,
-                        this: Value::undefined(),
-                        closure: Value::function(1),
-                        new_target: Value::undefined(),
-                    }),
-                    slots: Box::new([thrown, Value::undefined()]),
-                },
-            ];
+        let context = context(vec![catch_function(0), catch_function(1)]);
+        let mut interpreter = Interpreter::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let thrown = Value::number_i32(73);
+        let mut native = Frame::new(
+            crate::native_abi::VmFrameHeader {
+                function_id: 0,
+                pc: 1,
+                register_count: 2,
+                kind: crate::native_abi::NativeFrameKind::Optimizing,
+                flags: NativeFrameFlags::empty(),
+            },
+            0,
+            Value::function(0),
+            Value::undefined(),
+        );
+        let mut native_registers = [Value::undefined(); 2];
+        native.registers = crate::RegisterWindow::attached(native_registers.as_mut_ptr(), 2);
+        // SAFETY: the frame and initialized window remain stationary through resumption.
+        unsafe { interpreter.jit_push_native_frame(&mut native).unwrap() };
+        let frames = [
+            crate::deopt::DeoptFrame {
+                function_id: 0,
+                byte_pc: context
+                    .exec_function(0)
+                    .unwrap()
+                    .instruction_byte_pc(1)
+                    .unwrap(),
+                entry: None,
+                slots: Box::new([Value::undefined(), Value::undefined()]),
+            },
+            crate::deopt::DeoptFrame {
+                function_id: 1,
+                byte_pc: context
+                    .exec_function(1)
+                    .unwrap()
+                    .instruction_byte_pc(1)
+                    .unwrap(),
+                entry: Some(crate::deopt::DeoptFrameEntry {
+                    return_register: 0,
+                    this: Value::undefined(),
+                    closure: Value::function(1),
+                    new_target: Value::undefined(),
+                }),
+                slots: Box::new([thrown, Value::undefined()]),
+            },
+        ];
 
-            let result = interpreter
-                .with_runtime_turn(&mut stack, |turn| {
-                    let (interpreter, stack) = turn.into_parts();
-                    interpreter.jit_deopt_materialize_inline_frames(
-                        &context,
-                        stack,
-                        &mut native,
-                        None,
-                        &frames,
-                        SideExit::new(
-                            1,
-                            crate::native_abi::ExitReason::UnsupportedOperation,
-                            crate::native_abi::ExitAction::Recompile,
-                        ),
-                    )
-                })
-                .expect("both nested catches resume");
-            assert_eq!(result, thrown);
-            assert!(stack.is_empty());
-        }
+        let result = interpreter
+            .with_runtime_turn(&mut stack, |turn| {
+                let (interpreter, stack) = turn.into_parts();
+                interpreter.prepare_inline_deopt_frames(
+                    &context,
+                    stack,
+                    &mut native,
+                    &frames,
+                    SideExit::new(
+                        1,
+                        crate::native_abi::ExitReason::UnsupportedOperation,
+                        crate::native_abi::ExitAction::Recompile,
+                    ),
+                )?;
+                crate::test_support::resume_prepared_frame(
+                    interpreter,
+                    stack,
+                    &context,
+                    &mut native,
+                )
+            })
+            .expect("both nested catches resume");
+        interpreter.jit_pop_native_frame();
+        assert_eq!(result, thrown);
+        assert!(stack.is_empty());
     }
 
     #[test]
@@ -595,15 +401,17 @@ mod tests {
                     .collect(),
             );
             let mut vm = Interpreter::new();
-            let mut stack = ActivationStack::new();
+            let mut stack = crate::test_support::FrameChainFixture::new();
             let mut registers = [Value::undefined()];
-            let mut native = NativeFrame::new(
+            let mut native = Frame::new(
                 crate::native_abi::VmFrameHeader::interpreter(0, 1),
                 registers.as_mut_ptr() as u64,
                 Value::function(0),
                 Value::undefined(),
             );
-            native.set_stack_registers();
+
+            // SAFETY: the frame and initialized window remain stationary through resumption.
+            unsafe { vm.jit_push_native_frame(&mut native).unwrap() };
             vm.with_runtime_turn(&mut stack, |turn| {
                 let (vm, stack) = turn.into_parts();
                 let receiver =
@@ -627,20 +435,21 @@ mod tests {
                         slots: Box::new([Value::undefined()]),
                     },
                 ];
-                let result = vm
-                    .jit_deopt_materialize_inline_frames(
-                        &context,
-                        stack,
-                        &mut native,
-                        None,
-                        &frames,
-                        SideExit::new(
-                            0,
-                            crate::native_abi::ExitReason::UnsupportedOperation,
-                            crate::native_abi::ExitAction::Recompile,
-                        ),
-                    )
-                    .unwrap();
+                vm.prepare_inline_deopt_frames(
+                    &context,
+                    stack,
+                    &mut native,
+                    &frames,
+                    SideExit::new(
+                        0,
+                        crate::native_abi::ExitReason::UnsupportedOperation,
+                        crate::native_abi::ExitAction::Recompile,
+                    ),
+                )
+                .unwrap();
+                let result =
+                    crate::test_support::resume_prepared_frame(vm, stack, &context, &mut native)
+                        .unwrap();
                 assert_eq!(
                     result,
                     if returns_target {
@@ -650,6 +459,7 @@ mod tests {
                     }
                 );
             });
+            vm.jit_pop_native_frame();
             assert!(stack.is_empty());
         }
     }
@@ -658,10 +468,10 @@ mod tests {
     fn generated_stack_frame_rebuilds_catch_before_dispatch() {
         let context = context(vec![catch_function(0)]);
         let mut interpreter = Interpreter::new();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let thrown = Value::number_i32(91);
         let mut registers = [thrown, Value::undefined()];
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             crate::native_abi::VmFrameHeader {
                 function_id: 0,
                 pc: 1,
@@ -673,7 +483,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        native.set_stack_registers();
+
         // SAFETY: this fixture keeps `native` and its register window live and
         // stationary through the complete rooted deopt transaction below.
         unsafe {
@@ -685,11 +495,12 @@ mod tests {
         let result = interpreter
             .with_runtime_turn(&mut stack, |turn| {
                 let (interpreter, stack) = turn.into_parts();
-                interpreter.jit_deopt_resume_stack_call(
-                    &context,
+                interpreter.prepare_deoptimized_frame(&context, &mut native)?;
+                crate::test_support::resume_prepared_frame(
+                    interpreter,
                     stack,
+                    &context,
                     &mut native,
-                    jit::JitDirectCallKind::Plain,
                 )
             })
             .expect("stack-call catch resumes");

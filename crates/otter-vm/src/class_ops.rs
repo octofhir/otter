@@ -45,10 +45,7 @@ impl Interpreter {
         value: crate::Value,
     ) -> Result<crate::Value, VmError> {
         let frame = &mut stack[top_idx];
-        if !self
-            .frame_cold(frame)
-            .is_some_and(|cold| cold.is_derived_constructor)
-        {
+        if !frame.is_derived_constructor() {
             return Err(self.err_this_uninit(
                 ("super called outside a derived constructor".to_string()).into(),
             ));
@@ -57,10 +54,6 @@ impl Interpreter {
             return Err(self.err_this_uninit(crate::context_ops::SUPER_CALLED_TWICE.into()));
         }
         frame.this_value = value;
-        if let Some(obj) = value.as_object() {
-            let cold = self.frame_ensure_cold(frame);
-            cold.construct_target = Some(obj);
-        }
         Ok(value)
     }
 

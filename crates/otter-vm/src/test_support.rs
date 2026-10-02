@@ -5,13 +5,14 @@
 //! - Old-space object, array, WeakRef, and FinalizationRegistry constructors
 //!   for raw mark/sweep regression fixtures that operate directly on a
 //!   `GcHeap`.
+//! - Bound-callable fixtures using the production handle-scope allocator.
 //! - Read-only inspectors for invariant tests that need to assert internal
 //!   rooted payloads without exposing those payloads through production APIs.
 //!
 //! # Invariants
 //!
-//! - Helpers in this module exist only for unit tests that exercise raw
-//!   mark/sweep phases without an interpreter frame/root stack.
+//! - Raw mark/sweep fixtures use old-space helpers; fixtures with an
+//!   interpreter use its production rooting and allocation contracts.
 //! - Production paths must use stack, runtime, or native root contracts instead
 //!   of these old-space fixture helpers.
 //! - This module is hidden from public API docs and is not a contributor-facing
@@ -20,6 +21,13 @@
 //! # See also
 //!
 //! - [`crate::weak_refs`]
+
+#[cfg(test)]
+mod native_frames;
+#[cfg(test)]
+pub(crate) use native_frames::{
+    FrameChainFixture, FrameFixture, complete_staged_call, resume_prepared_frame,
+};
 
 use crate::execution_context::ExecutionContext;
 use crate::native_function::{NativeCallTarget, NativeFunction};
@@ -135,4 +143,23 @@ pub fn native_function_captures(native: NativeFunction, heap: &otter_gc::GcHeap)
         }
         NativeCallTarget::Static(_) | NativeCallTarget::VmIntrinsic(_) => Vec::new(),
     }
+}
+
+/// Allocate a bound callable with neutral name/length metadata for GC fixtures.
+pub fn alloc_bound_function(
+    interp: &mut crate::Interpreter,
+    target: Value,
+    receiver: Value,
+    args: &[Value],
+) -> Result<crate::BoundFunction, VmError> {
+    interp.alloc_bound_function(
+        target,
+        receiver,
+        args,
+        crate::function_metadata::BoundFunctionCreateMetadata {
+            name: "bound ".to_owned(),
+            length: crate::number::NumberValue::from_i32(0),
+        },
+        None,
+    )
 }

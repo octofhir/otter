@@ -84,7 +84,7 @@ fn an_overflowing_int32_site_exits_once_per_budget_and_then_stays_float() {
                 JitDebugEvent::CompilePrepared { .. }
                     | JitDebugEvent::CompileFinished { .. }
                     | JitDebugEvent::Bail { .. }
-                    | JitDebugEvent::GeneratedCallDeopt { .. }
+                    | JitDebugEvent::EnteredGenerationDeopt { .. }
             )
         })
         .take(30)
@@ -104,7 +104,7 @@ fn an_overflowing_int32_site_exits_once_per_budget_and_then_stays_float() {
         .filter(|event| {
             matches!(
                 event,
-                JitDebugEvent::GeneratedCallDeopt {
+                JitDebugEvent::EnteredGenerationDeopt {
                     exit_reason: otter_vm::native_abi::ExitReason::Int32Overflow,
                     ..
                 }

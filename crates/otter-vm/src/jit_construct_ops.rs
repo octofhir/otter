@@ -39,7 +39,15 @@ impl Interpreter {
         let saved_pc = stack[frame_index].pc;
         match opcode {
             value if value == Op::CollectRest as u8 => {
-                self.materialized_collect_rest(stack, frame_index, arg0 as u16)?;
+                self.collect_rest(
+                    stack,
+                    frame_index,
+                    context
+                        .exec_function(stack[frame_index].function_id)
+                        .ok_or(VmError::InvalidOperand)?
+                        .param_count,
+                    arg0 as u16,
+                )?;
             }
             value if value == Op::ArrayPush as u8 => {
                 self.run_array_push_regs(stack, frame_index, arg0 as u16, arg1 as u16)?;

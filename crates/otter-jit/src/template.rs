@@ -273,7 +273,7 @@ mod tests {
         let mut error = None;
         let interrupt_probe: u8 = interrupt;
         let mut backedge_fuel_probe: u64 = fuel;
-        let mut native_frame = otter_vm::native_abi::NativeFrame::new(
+        let mut native_frame = otter_vm::native_abi::Frame::new(
             otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
             regs.as_mut_ptr() as u64,
             otter_vm::Value::undefined(),
@@ -293,6 +293,10 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
+            completion_destination: u32::MAX,
+            completion_generation: 0,
+            pending_call: otter_vm::native_abi::CallRequest::EMPTY,
+            completion: otter_vm::native_abi::NativeResultPair::success(otter_vm::Value::UNDEFINED),
         };
         unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         // SAFETY: the fixture owns every published context record, and the

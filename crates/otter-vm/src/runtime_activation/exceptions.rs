@@ -16,9 +16,9 @@
 //!
 //! # See also
 //! - [`crate::CodeBlockControlFlowView::active_catch_regions`]
-//! - [`crate::Interpreter::jit_rebuild_materialized_catch_handlers`]
+//! - [`crate::Interpreter::jit_rebuild_frame_catch_handlers`]
 
-use super::{RuntimeCall, RuntimeFrameIdentity};
+use super::RuntimeCall;
 use crate::{JitExceptionOutcome, Value, VmError};
 use otter_bytecode::Op;
 
@@ -31,7 +31,10 @@ impl RuntimeCall<'_> {
         arg1: u64,
         arg2: u64,
     ) -> Result<JitExceptionOutcome, VmError> {
-        if let RuntimeFrameIdentity::Materialized(index) = self.identity {
+        if unsafe { self.frame.as_ref().header.kind }
+            != crate::native_abi::NativeFrameKind::Optimizing
+        {
+            let index = self.frame_index()?;
             // SAFETY: the bound call owns exclusive mutator access; no native
             // frame view is retained across canonical unwind or allocation.
             return unsafe { &mut *self.vm.as_ptr() }.jit_runtime_exception_op(
@@ -101,7 +104,10 @@ impl RuntimeCall<'_> {
     /// Route an already-committed pure throw. A catch result selects a new PC;
     /// `None` propagates the original exception without pending-throw storage.
     pub fn route_throw(&mut self, exception: Value) -> Result<Option<u32>, VmError> {
-        if let RuntimeFrameIdentity::Materialized(index) = self.identity {
+        if unsafe { self.frame.as_ref().header.kind }
+            != crate::native_abi::NativeFrameKind::Optimizing
+        {
+            let index = self.frame_index()?;
             // SAFETY: no frame/register borrow survives canonical unwind.
             return unsafe { &mut *self.vm.as_ptr() }.jit_route_throw(
                 &self.context,

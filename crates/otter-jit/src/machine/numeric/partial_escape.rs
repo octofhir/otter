@@ -546,7 +546,10 @@ fn node_inputs(function: &NumericFunction, node: NumericNode) -> Vec<NumericValu
                 NumericDirectCallArguments::Fixed { start, count } => {
                     inputs.extend(span_values(function, start, count));
                 }
-                NumericDirectCallArguments::Spread(value) => inputs.push(value),
+                NumericDirectCallArguments::Spread { receiver, array } => {
+                    inputs.extend(receiver);
+                    inputs.push(array);
+                }
             }
         }
         N::NativeLeaf {
@@ -778,11 +781,14 @@ fn rewrite_node(node: &mut NumericNode, replacements: &[NumericValue]) {
         }
         N::DirectCall {
             source,
-            arguments: NumericDirectCallArguments::Spread(spread),
+            arguments: NumericDirectCallArguments::Spread { receiver, array },
             ..
         } => {
             replacement(source);
-            replacement(spread);
+            if let Some(receiver) = receiver {
+                replacement(receiver);
+            }
+            replacement(array);
         }
         N::DirectCall { source, .. } => replacement(source),
         N::TaggedStrictEqual(left, right)

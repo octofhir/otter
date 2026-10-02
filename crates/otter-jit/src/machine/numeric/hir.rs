@@ -503,7 +503,11 @@ pub(super) enum NumericNode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum NumericDirectCallArguments {
     Fixed { start: u32, count: u32 },
-    Spread(NumericValue),
+    /// A dense spread array; `CallSpread` also carries its explicit receiver.
+    Spread {
+        receiver: Option<NumericValue>,
+        array: NumericValue,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,7 +638,7 @@ fn function_prototype_call(
 ) -> Option<otter_vm::JitFunctionPrototypeCallSite> {
     if exceptional_edge.is_some()
         || view.cage_base == 0
-        || view.native_ref_byte == 0
+        || view.native_call_layout.identity_byte == 0
         || view
             .optimized_exit_reasons
             .get(&logical_pc)
@@ -4011,7 +4015,7 @@ fn lower_instruction(
                 _ => return None,
             };
             let kind = match (op, callee.plan.is_derived_constructor) {
-                (Op::CallSpread, _) => NumericDirectCallKind::Plain,
+                (Op::CallSpread, _) => NumericDirectCallKind::CallWithThis,
                 (Op::NewSpread, false) => NumericDirectCallKind::Construct,
                 (Op::NewSpread, true) => NumericDirectCallKind::DerivedConstruct,
                 (Op::SuperConstructSpread, false) => NumericDirectCallKind::SuperConstruct,
@@ -4019,10 +4023,17 @@ fn lower_instruction(
                 _ => return None,
             };
             let source = read_value(registers, register(instruction, code, 1)?)?;
-            let arguments = NumericDirectCallArguments::Spread(read_value(
-                registers,
-                register(instruction, code, 2)?,
-            )?);
+            let arguments = if op == Op::CallSpread {
+                NumericDirectCallArguments::Spread {
+                    receiver: Some(read_value(registers, register(instruction, code, 2)?)?),
+                    array: read_value(registers, register(instruction, code, 3)?)?,
+                }
+            } else {
+                NumericDirectCallArguments::Spread {
+                    receiver: None,
+                    array: read_value(registers, register(instruction, code, 2)?)?,
+                }
+            };
             let target = intern_direct_call_target(
                 direct_call_targets,
                 monomorphic_direct_call_target(kind, callee),
@@ -4124,7 +4135,11 @@ fn lower_instruction(
                 );
             }
             let target = match direct_methods.get(&instruction.byte_pc) {
-                Some(methods) => method_direct_call_target(methods)?,
+                // A population past the guarded chain resolves the method
+                // and enters it through the generic entry.
+                Some(methods) => {
+                    method_direct_call_target(methods).unwrap_or_else(generic_method_call_target)
+                }
                 None if instruction.call_attempted => generic_method_call_target(),
                 None => {
                     return lower_cold_call_exit(
@@ -5128,10 +5143,10 @@ mod tests {
                 tier: NativeFrameKind::Baseline,
                 this_mode: JitDirectCallThisMode::StrictOrLexical,
                 is_derived_constructor: false,
-                generated_stack_frame_bytes: Some(0),
+                call_flags: otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE,
                 param_count: 1,
                 register_count: 2,
-                needs_incoming_arguments: false,
+                callee_cell: 0,
             },
             receiver_allocation: None,
         }
@@ -5210,7 +5225,7 @@ mod tests {
             for count in 0..=3 {
                 let arguments = vec![1; count];
                 let mut view = call_view_with_arguments(false, &arguments);
-                view.native_ref_byte = 8;
+                view.native_call_layout = otter_vm::jit::JitNativeCallLayout::current();
                 view.seed_call_attempted_for_test(0);
                 view.static_native_calls.insert(
                     0,
@@ -5657,10 +5672,10 @@ mod tests {
                     tier: NativeFrameKind::Baseline,
                     this_mode: JitDirectCallThisMode::StrictOrLexical,
                     is_derived_constructor: false,
-                    generated_stack_frame_bytes: Some(0),
+                    call_flags: otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE,
                     param_count: 0,
                     register_count: 1,
-                    needs_incoming_arguments: false,
+                    callee_cell: 0,
                 },
                 receiver_allocation: None,
             }],
@@ -5817,10 +5832,10 @@ mod tests {
                     tier: NativeFrameKind::Baseline,
                     this_mode: JitDirectCallThisMode::StrictOrLexical,
                     is_derived_constructor: false,
-                    generated_stack_frame_bytes: Some(0),
+                    call_flags: otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE,
                     param_count: 0,
                     register_count: 1,
-                    needs_incoming_arguments: false,
+                    callee_cell: 0,
                 },
                 receiver_allocation: None,
             }],
@@ -6007,23 +6022,27 @@ mod tests {
     }
 
     #[test]
-    fn partial_gapped_or_oversized_method_chains_reject_machine_hir() {
+    fn partial_gapped_or_oversized_method_chains_lower_generic_method_calls() {
         let mut wrong_function = direct_method(0, 1, 140);
         wrong_function.guard.method_fid += 1;
-        let invalid = [
+        let oversized = crate::machine::MAX_MACHINE_DIRECT_METHOD_TARGETS as u32 + 1;
+        let incomplete = [
             Vec::new(),
             vec![direct_method(0, 2, 140)],
             vec![direct_method(0, 2, 140), direct_method(2, 2, 141)],
             vec![direct_method(0, 2, 140), direct_method(1, 3, 141)],
             vec![wrong_function],
-            (0..5)
-                .map(|index| direct_method(index, 5, 140 + index))
+            (0..oversized)
+                .map(|index| direct_method(index, oversized, 140 + index))
                 .collect(),
         ];
-        for methods in invalid {
+        for methods in incomplete {
             let mut view = call_view(true);
             view.direct_methods.insert(0, methods);
-            assert!(NumericFunction::build(&view).is_err());
+            let hir = NumericFunction::build(&view).expect("generic method call HIR");
+            let target = &hir.direct_call_targets[0];
+            assert_eq!(target.kind, NumericDirectCallKind::Method);
+            assert!(target.candidates.is_empty());
         }
     }
 
@@ -6642,10 +6661,10 @@ mod tests {
                     tier: NativeFrameKind::Baseline,
                     this_mode: JitDirectCallThisMode::StrictOrLexical,
                     is_derived_constructor: false,
-                    generated_stack_frame_bytes: Some(0),
+                    call_flags: otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE,
                     param_count: 1,
                     register_count: 6,
-                    needs_incoming_arguments: false,
+                    callee_cell: 0,
                 },
                 receiver_allocation: None,
             }],

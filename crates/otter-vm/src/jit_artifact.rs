@@ -344,6 +344,7 @@ impl JitArtifactBundle {
             .iter()
             .any(|file| file.name == JitArtifactFileName::OptimizedIr);
         if match metadata.tier {
+            JitDebugTier::Interpreter => true,
             JitDebugTier::Template => !has_template || has_optimized,
             JitDebugTier::Optimizing => has_template || !has_optimized,
         } {

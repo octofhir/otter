@@ -13,7 +13,7 @@
 //!
 //! # Invariants
 //! - A function cell is allocated once and never reused for another function.
-//! - `FunctionEntryCell::generation_cell == 0` selects the cold resolver.
+//! - Every linked function selects a live interpreter or compiled destination.
 //! - Publication switches the function cell before the old generation unlinks.
 //! - `entry_addr == 0` means unlinked and permanently rejects new entries.
 //! - Generated callers run on the isolate's single mutator and load the current
@@ -40,7 +40,7 @@ use super::{NativeFrameFlags, NativeFrameKind, VmFrameHeader};
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct FunctionEntryCell {
-    /// Address of the current [`CodeEntryCell`], or zero for the cold resolver.
+    /// Address of the current interpreter or compiled [`CodeEntryCell`].
     pub generation_cell: AtomicU64,
     /// Immutable bytecode function identity.
     pub function_id: u32,
@@ -48,18 +48,63 @@ pub struct FunctionEntryCell {
     pub param_count: u16,
     /// Tagged register-window length shared by every generation.
     pub register_count: u16,
+    /// Immutable OrdinaryCallBindThis and construction semantics; see the
+    /// `FUNCTION_CALL_*` bits.
+    pub call_flags: u32,
+    /// Realm that linked this function. The call trampoline binds a sloppy
+    /// `undefined`/`null` receiver to the active global only while the active
+    /// realm matches; any other realm's global is bound by activation
+    /// preparation.
+    pub realm_id: u32,
+    /// Permanent destination used before compilation and after invalidation.
+    interpreter: CodeEntryCell,
 }
 
+/// The receiver is passed unconverted (strict, arrow, or `this`-free body).
+pub const FUNCTION_CALL_NO_RECEIVER_CONVERSION: u32 = 1 << 0;
+/// The body is a derived class constructor.
+pub const FUNCTION_CALL_DERIVED_CONSTRUCTOR: u32 = 1 << 1;
+/// The body has a `[[Construct]]` internal method.
+pub const FUNCTION_CALL_CONSTRUCTIBLE: u32 = 1 << 2;
+/// Async, generator or async-generator body: the interpreter entry performs
+/// its promise or generator prologue, so dispatch always selects that entry.
+pub const FUNCTION_CALL_SUSPENDABLE: u32 = 1 << 3;
+/// Arrow function: `this` and `new.target` come from the closure, never from
+/// the call.
+pub const FUNCTION_CALL_LEXICAL_THIS: u32 = 1 << 4;
+
+/// Byte offset of the immutable call flags in [`FunctionEntryCell`].
+pub const FUNCTION_ENTRY_CALL_FLAGS_OFFSET: usize = std::mem::offset_of!(FunctionEntryCell, call_flags);
+/// Byte offset of the formal parameter count in [`FunctionEntryCell`].
+pub const FUNCTION_ENTRY_PARAM_COUNT_OFFSET: usize =
+    std::mem::offset_of!(FunctionEntryCell, param_count);
+/// Byte offset of the linking realm in [`FunctionEntryCell`].
+pub const FUNCTION_ENTRY_REALM_OFFSET: usize = std::mem::offset_of!(FunctionEntryCell, realm_id);
+/// Byte offset of the permanent interpreter destination in [`FunctionEntryCell`].
+pub const FUNCTION_ENTRY_INTERPRETER_OFFSET: usize =
+    std::mem::offset_of!(FunctionEntryCell, interpreter);
+
 impl FunctionEntryCell {
-    /// Construct one unresolved stable function entry.
+    /// Allocate the permanent cell and publish its interpreter destination.
     #[must_use]
-    pub const fn new(function_id: u32, param_count: u16, register_count: u16) -> Self {
-        Self {
+    pub fn new(
+        function_id: u32,
+        param_count: u16,
+        register_count: u16,
+        call_flags: u32,
+        realm_id: u32,
+    ) -> Box<Self> {
+        let cell = Box::new(Self {
             generation_cell: AtomicU64::new(0),
             function_id,
             param_count,
             register_count,
-        }
+            call_flags,
+            realm_id,
+            interpreter: CodeEntryCell::interpreter(function_id, register_count),
+        });
+        cell.restore_interpreter();
+        cell
     }
 
     /// Publish one current generation cell.
@@ -69,9 +114,14 @@ impl FunctionEntryCell {
             .store(generation_cell, Ordering::Release);
     }
 
-    /// Select the cold resolver until another generation is published.
-    pub fn clear(&self) {
-        self.generation_cell.store(0, Ordering::Release);
+    /// Publish the owned interpreter destination after compiled invalidation.
+    pub fn restore_interpreter(&self) {
+        self.publish(std::ptr::from_ref(&self.interpreter) as u64);
+    }
+
+    /// Registry-owned interpreter destination, including its generated feedback.
+    pub(crate) fn interpreter_destination(&self) -> &CodeEntryCell {
+        &self.interpreter
     }
 
     /// Current generation-cell address.
@@ -83,29 +133,24 @@ impl FunctionEntryCell {
 
 /// The compiled generation owns precise safepoint metadata.
 pub const CODE_ENTRY_HAS_SAFEPOINTS: u32 = 1 << 0;
-/// Generated callers initially publish only the initialized parameter prefix.
-pub const CODE_ENTRY_PARAMETER_PREFIX: u32 = 1 << 1;
 /// The compiled generation belongs to the optimizing tier.
-pub const CODE_ENTRY_OPTIMIZING_TIER: u32 = 1 << 2;
+pub const CODE_ENTRY_OPTIMIZING_TIER: u32 = 1 << 1;
 
 /// Stable per-generation entry cell consumed by native call linkage.
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct CodeEntryCell {
-    /// Current native entry address; zero after unlinking.
+    /// Entry of this generation in the JavaScript call ABI; zero after
+    /// unlinking. A compiled generation's entry builds, publishes and
+    /// retires its own frame. The interpreter destination's entry classifies
+    /// the call through the trampoline, which builds the interpreter frame.
     pub entry_addr: AtomicU64,
     /// Immutable isolate-local code-object identity.
     pub code_object_id: u64,
     /// Static properties of this compiled generation.
     pub flags: u32,
-    /// Persistent native-stack bytes reserved by the target after entry, or
-    /// zero when this generation cannot accept stack-owned generated calls.
-    pub generated_stack_frame_bytes: u32,
     /// Explicit leases that may outlive a native-activation retirement epoch.
     pub active_count: AtomicU32,
-    /// Keeps the copied frame header naturally aligned for target pair loads.
-    /// This is layout padding, not feedback or compatibility state.
-    _native_frame_alignment: u32,
     /// Ready-to-copy frame header for stack-owned generated calls.
     ///
     /// Function identity, register shape, tier, and safepoint capability are
@@ -116,16 +161,19 @@ pub struct CodeEntryCell {
     /// It completes the header's second word, so linkage copies register
     /// shape, tier, flags and generation with one load/store pair.
     pub native_frame_code_object_id: u32,
-    /// Per-function execution count at which generated baseline calls wake the
-    /// cold optimizing cost policy. This is derived from the function's size
-    /// and calibrated coefficients when the generation is installed.
-    pub generated_tiering_break_even: u64,
+    /// Entry count at which the next generated entry asks the cold optimizing
+    /// policy for promotion. It starts at the function's break-even, derived
+    /// from its size and calibrated coefficients; a decision that does not
+    /// promote moves it one interval further, like an interrupt budget.
+    pub generated_tiering_break_even: Cell<u64>,
     /// Whether this baseline generation may request optimizing compilation.
     /// Cold policy clears it after a cached compile outcome; a replacement
     /// generation starts fresh. Optimizing generations never request promotion.
     pub generated_tiering_enabled: Cell<u32>,
+    /// Entries between two promotion requests: the initial break-even.
+    pub generated_tiering_interval: u32,
     /// Generated native entries observed for tiering/introspection. Normal
-    /// returns are derived as `entries - deopts - throws` during cold
+    /// completions are derived as `entries - deopts` during cold
     /// reconciliation, so the hot path owns no redundant return counter.
     ///
     /// The isolate has one mutator and reconciles feedback only after native
@@ -134,21 +182,33 @@ pub struct CodeEntryCell {
     pub generated_entries: Cell<u64>,
     /// Generated entries that bailed and resumed through cold deoptimization.
     pub generated_deopts: Cell<u64>,
-    /// Generated entries that propagated a throw status.
-    pub generated_throws: Cell<u64>,
 }
 
 impl CodeEntryCell {
+    fn interpreter(function_id: u32, register_count: u16) -> Self {
+        Self {
+            entry_addr: AtomicU64::new(super::call_trampoline::call_generic_entry as *const () as u64),
+            code_object_id: 0,
+            flags: 0,
+            active_count: AtomicU32::new(0),
+            native_frame_header: VmFrameHeader::interpreter(function_id, register_count),
+            native_frame_code_object_id: 0,
+            generated_tiering_break_even: Cell::new(0),
+            generated_tiering_enabled: Cell::new(0),
+            generated_tiering_interval: 0,
+            generated_entries: Cell::new(0),
+            generated_deopts: Cell::new(0),
+        }
+    }
+
     /// Construct one linked code generation.
     #[must_use]
     pub fn new(
         entry_addr: usize,
         code_object_id: u64,
         function_id: u32,
-        param_count: u16,
         register_count: u16,
         flags: u32,
-        generated_stack_frame_bytes: u32,
         generated_tiering_break_even: u64,
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
@@ -158,36 +218,30 @@ impl CodeEntryCell {
         } else {
             NativeFrameKind::Baseline
         };
-        let mut frame_flag_bits = NativeFrameFlags::STACK_REGISTERS;
+        let mut frame_flag_bits = 0;
         if flags & CODE_ENTRY_HAS_SAFEPOINTS != 0 {
             frame_flag_bits |= NativeFrameFlags::HAS_SAFEPOINTS;
         }
         let frame_flags = NativeFrameFlags::from_bits(frame_flag_bits);
-        let initialized_register_count = if flags & CODE_ENTRY_PARAMETER_PREFIX != 0 {
-            param_count
-        } else {
-            register_count
-        };
         Self {
             entry_addr: AtomicU64::new(entry_addr as u64),
             code_object_id,
             flags,
-            generated_stack_frame_bytes,
             active_count: AtomicU32::new(0),
-            _native_frame_alignment: 0,
             native_frame_header: VmFrameHeader {
                 function_id,
                 pc: 0,
-                register_count: initialized_register_count,
+                register_count,
                 kind,
                 flags: frame_flags,
             },
             native_frame_code_object_id: u32::try_from(code_object_id)
                 .expect("code object ids fit the frame record's generation field"),
-            generated_tiering_break_even,
+            generated_tiering_break_even: Cell::new(generated_tiering_break_even),
+            generated_tiering_interval: u32::try_from(generated_tiering_break_even)
+                .unwrap_or(u32::MAX),
             generated_entries: Cell::new(0),
             generated_deopts: Cell::new(0),
-            generated_throws: Cell::new(0),
             generated_tiering_enabled: Cell::new(u32::from(
                 flags & CODE_ENTRY_OPTIMIZING_TIER == 0,
             )),
@@ -247,12 +301,10 @@ impl CodeEntryCell {
 
     /// Cumulative generated-call feedback for this exact code generation.
     #[must_use]
-    pub fn generated_feedback(&self) -> (u64, u64, u64, u64) {
+    pub fn generated_feedback(&self) -> (u64, u64, u64) {
         let entries = self.generated_entries.get();
         let deopts = self.generated_deopts.get();
-        let throws = self.generated_throws.get();
-        let returns = entries.saturating_sub(deopts.saturating_add(throws));
-        (entries, returns, deopts, throws)
+        (entries, entries.saturating_sub(deopts), deopts)
     }
 }
 
@@ -284,33 +336,36 @@ impl Drop for CodeEntryLease<'_> {
     }
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<FunctionEntryCell>()];
+const _: [(); 96] = [(); std::mem::size_of::<FunctionEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<FunctionEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(FunctionEntryCell, generation_cell)];
 const _: [(); 8] = [(); std::mem::offset_of!(FunctionEntryCell, function_id)];
+const _: [(); 12] = [(); FUNCTION_ENTRY_PARAM_COUNT_OFFSET];
+const _: [(); 14] = [(); std::mem::offset_of!(FunctionEntryCell, register_count)];
+const _: [(); 16] = [(); FUNCTION_ENTRY_CALL_FLAGS_OFFSET];
+const _: [(); 20] = [(); FUNCTION_ENTRY_REALM_OFFSET];
+const _: [(); 24] = [(); FUNCTION_ENTRY_INTERPRETER_OFFSET];
 
-const _: [(); 88] = [(); std::mem::size_of::<CodeEntryCell>()];
-const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_break_even)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
+const _: [(); 72] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_break_even)];
+const _: [(); 48] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled)];
+const _: [(); 52] = [(); std::mem::offset_of!(CodeEntryCell, generated_tiering_interval)];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
 const _: [(); 16] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
-const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, generated_stack_frame_bytes)];
-const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
-const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, _native_frame_alignment)];
-const _: [(); 32] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
-const _: [(); 44] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_code_object_id)];
-const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
-const _: [(); 72] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
-const _: [(); 80] = [(); std::mem::offset_of!(CodeEntryCell, generated_throws)];
+const _: [(); 20] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_header)];
+const _: [(); 36] = [(); std::mem::offset_of!(CodeEntryCell, native_frame_code_object_id)];
+const _: [(); 56] = [(); std::mem::offset_of!(CodeEntryCell, generated_entries)];
+const _: [(); 64] = [(); std::mem::offset_of!(CodeEntryCell, generated_deopts)];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cell() -> CodeEntryCell {
-        CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_HAS_SAFEPOINTS, 64, 321)
+        CodeEntryCell::new(0x1234, 7, 9, 12, CODE_ENTRY_HAS_SAFEPOINTS, 321)
     }
 
     #[test]
@@ -349,16 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn parameter_prefix_generation_publishes_only_formals() {
-        let cell = CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_PARAMETER_PREFIX, 64, 321);
-        assert_eq!(cell.native_frame_header.register_count, 2);
-    }
-
-    #[test]
     fn generation_cell_keeps_one_function_identity_in_a_compact_layout() {
         let cell = cell();
-        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 88);
+        assert_eq!(std::mem::size_of::<CodeEntryCell>(), 72);
         assert_eq!(cell.native_frame_header.function_id, 9);
-        assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 32);
+        assert_eq!(std::mem::offset_of!(CodeEntryCell, native_frame_header), 24);
     }
 }

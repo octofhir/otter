@@ -8,8 +8,7 @@
 //!
 //! So the values live in a GC body with the payload in trailing storage
 //! in the same cell — V8's `FixedArray`, reached from the owner by
-//! handle. An array's dense elements and a native function's captures
-//! are the two current owners.
+//! handle. Owners include arrays, native captures and bound-call prefixes.
 //!
 //! # Contents
 //!
@@ -65,6 +64,11 @@ pub struct ValueSlabBody {
     /// every mutation writes both.
     len: u32,
 }
+
+/// Byte offset of the initialized length in a [`ValueSlabBody`]'s payload.
+pub const VALUE_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(ValueSlabBody, len);
+/// Byte offset of the first value in a [`ValueSlabBody`]'s payload.
+pub const VALUE_SLAB_VALUES_OFFSET: usize = std::mem::size_of::<ValueSlabBody>();
 
 impl ValueSlabBody {
     /// Trailing bytes a slab of `capacity` values needs.

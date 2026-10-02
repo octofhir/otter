@@ -8,8 +8,8 @@
 //!
 //! # Contents
 //! - [`NativeFunction`] — cheap-to-clone GC handle.
-//! - [`NativeFunctionBody`] — name, closure payload, and traced
-//!   captured values.
+//! - [`NativeFunctionBody`] — C call header, name and traced captures.
+//! - [`NativeEntryKind`] — the immutable machine-visible payload kind.
 //! - [`NativeFastFn`] / [`NativeCall`] — static and dynamic native
 //!   dispatch targets.
 //! - [`NativeFn`] — the dynamic closure signature.
@@ -24,8 +24,9 @@
 //!   Host async work must copy owned, non-GC data out before any
 //!   `.await`; `NativeCtx`, `Value`, and GC handles are
 //!   isolate-local.
-//! - Static builtins carry a plain function pointer and no captured
-//!   payload.
+//! - Every body starts with the one C call header. Static entries retain a
+//!   typed function pointer; dynamic entries retain a host-table index. All
+//!   policy mutation updates this header, and captures stay in a traced slab.
 //! - Public dynamic native constructors require `Send + Sync`
 //!   closures and pass traced JS captures as an explicit slice at
 //!   call time. That keeps embedders from hiding isolate-local
@@ -38,6 +39,11 @@
 //! # See also
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 //! - [Native bindings](../../../docs/book/src/extensions/native-bindings.md)
+
+mod call_header;
+
+use call_header::NativeCallHeader;
+pub use call_header::NativeEntryKind;
 
 use std::sync::Arc;
 
@@ -138,6 +144,7 @@ pub type NativeCapturesFn =
 /// host-native [`NativeCtx`] boundary. The dispatch loop handles
 /// them directly before the ordinary native-call path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum VmIntrinsicFunction {
     /// `Function.prototype.call`.
     FunctionPrototypeCall,
@@ -196,24 +203,6 @@ enum NativeCallStorage {
     LocalDynamic(Arc<LocalNativeFn>),
 }
 
-/// What [`NativeFunctionBody`] stores for `[[Call]]`.
-///
-/// A dynamic closure's `Arc` never sits in the body: the body names it
-/// by index into the isolate's [`otter_gc::host_refs::HostRefTable`],
-/// which owns the payload, and the sweep releases the slot when the
-/// body dies (see the `ReleaseHostRefs` impl below). That leaves the body free
-/// of anything `Drop` — an opaque page image carries it whole. Static function
-/// pointers remain valid because restore is strictly in-process; `native_ref`
-/// rebuilds the parallel guard table at the same dense index.
-#[derive(Clone, Copy)]
-enum NativeCallSlot {
-    Static(NativeFastFn),
-    StaticWithCaptures(NativeCapturesFn),
-    VmIntrinsic(VmIntrinsicFunction),
-    Dynamic(u32),
-    LocalDynamic(u32),
-}
-
 impl From<NativeCall> for NativeCallStorage {
     fn from(value: NativeCall) -> Self {
         match value {
@@ -242,27 +231,10 @@ impl std::fmt::Debug for NativeCall {
 #[pelt(tag = NATIVE_FUNCTION_BODY_TYPE_TAG)]
 #[repr(C)]
 pub struct NativeFunctionBody {
-    /// Machine-readable static function identity for JIT builtin guards.
-    ///
-    /// [`otter_gc::NO_EXTERNAL_REF`] means the callable is a dynamic
-    /// closure. Static builtins store the index of their entry point in the
-    /// isolate's [`otter_gc::ExternalRefTable`], and VM intrinsics the index of
-    /// their identity address, so generated code can validate prototype
-    /// method slots without decoding the Rust enum. Opaque
-    /// snapshot restore is same-process, so the call slot's static entry point
-    /// remains valid without serializing or translating it.
+    /// Authoritative machine-readable call target and callable policy.
+    /// Its payload has no GC values; captures live immediately after it.
     #[pelt(skip)]
-    native_ref: u32,
-    /// Display name (used in stack traces and `Function.prototype.
-    /// toString` once that lands). A heap-owned string, not a
-    /// `&'static str`, so ownership and tracing remain explicit.
-    name: JsString,
-    /// ECMAScript `.length` metadata.
-    #[pelt(skip)]
-    length: u8,
-    /// Static function pointer or dynamic closure index.
-    #[pelt(skip)]
-    call: NativeCallSlot,
+    call_header: NativeCallHeader,
     /// JS values owned by the native payload and therefore traced
     /// strongly while this function is reachable, in a
     /// [`crate::value_slab::ValueSlabBody`] of their own — null when
@@ -271,20 +243,15 @@ pub struct NativeFunctionBody {
     /// shared Rust state behind the closure's `Arc` must hold no
     /// `Value` (a counter is fine), because nothing traces it.
     captures: crate::value_slab::ValueSlabHandle,
+    /// Display name retained and traced by this body.
+    name: JsString,
     /// Own property state for the built-in `name` property.
     name_property: NativeOwnProperty,
     /// Own property state for the built-in `length` property.
     length_property: NativeOwnProperty,
-    /// Attribute policy for built-in metadata descriptors.
-    #[pelt(skip)]
-    metadata: NativeFunctionMetadata,
     /// Ordinary own properties installed on native callables, such
     /// as `%Proxy%.revocable`.
     own_properties: JsObject,
-    /// Native callable `[[Extensible]]` slot. `%ThrowTypeError%`
-    /// starts non-extensible per §10.2.4 / §20.2.4.1.
-    #[pelt(skip)]
-    extensible: bool,
     /// Override for `[[Prototype]]`. Defaults to `None` so
     /// `Object.getPrototypeOf` falls back to `%Function.prototype%`.
     /// Spec-mandated overrides (e.g. each concrete TypedArray ctor
@@ -297,10 +264,26 @@ pub struct NativeFunctionBody {
     realm_global: Option<JsObject>,
 }
 
-pub(crate) const NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET: usize =
-    std::mem::offset_of!(NativeFunctionBody, native_ref);
+/// One body layout for VM invocation, generated guards and callee dispatch.
+pub(crate) fn jit_call_layout() -> crate::jit::JitNativeCallLayout {
+    let header = (otter_gc::header::HEADER_SIZE
+        + std::mem::offset_of!(NativeFunctionBody, call_header)) as u32;
+    crate::jit::JitNativeCallLayout {
+        identity_byte: header + call_header::NATIVE_REF_OFFSET as u32,
+        kind_byte: header + call_header::KIND_OFFSET as u32,
+        flags_byte: header + call_header::FLAGS_OFFSET as u32,
+        payload_byte: header + call_header::PAYLOAD_OFFSET as u32,
+        captures_byte: (otter_gc::header::HEADER_SIZE
+            + std::mem::offset_of!(NativeFunctionBody, captures)) as u32,
+        constructable_flag: NativeCallHeader::CONSTRUCTABLE,
+        extensible_flag: NativeCallHeader::EXTENSIBLE,
+    }
+}
 
-const _: () = assert!(NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET == 0);
+const _: () = {
+    assert!(std::mem::offset_of!(NativeFunctionBody, call_header) == 0);
+    assert!(std::mem::offset_of!(NativeFunctionBody, captures) == 16);
+};
 
 impl NativeFunctionBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
@@ -314,28 +297,24 @@ impl NativeFunctionBody {
         }
     }
 
-    /// Describe this body's non-GC payload for
-    /// [`crate::native_census`]. Lives here because the storage enum
-    /// and the raw entry address are module-private; the census
-    /// itself is pure aggregation over what this returns.
+    /// Describe the body's call header and traced capture extent for the
+    /// native census, without exposing payload ownership to the aggregator.
     pub(crate) fn census_facts(&self) -> crate::native_census::NativeBodyFacts {
         use crate::native_census::{NativeBodyFacts, NativeStorageKind};
-        let (kind, static_addr) = match &self.call {
-            NativeCallSlot::Static(f) => {
-                (NativeStorageKind::Static, Some(*f as *const () as usize))
+        let kind = match self.call_header.kind {
+            NativeEntryKind::Static | NativeEntryKind::StaticWithCaptures => {
+                NativeStorageKind::Static
             }
-            NativeCallSlot::StaticWithCaptures(f) => {
-                (NativeStorageKind::Static, Some(*f as *const () as usize))
-            }
-            NativeCallSlot::VmIntrinsic(_) => (NativeStorageKind::VmIntrinsic, None),
-            NativeCallSlot::Dynamic(_) => (NativeStorageKind::Dynamic, None),
-            NativeCallSlot::LocalDynamic(_) => (NativeStorageKind::LocalDynamic, None),
+            NativeEntryKind::VmIntrinsic => NativeStorageKind::VmIntrinsic,
+            NativeEntryKind::Dynamic => NativeStorageKind::Dynamic,
+            NativeEntryKind::LocalDynamic => NativeStorageKind::LocalDynamic,
         };
+        let static_addr = self.call_header.static_address();
         NativeBodyFacts {
             name: self.name,
             kind,
             static_addr,
-            native_ref: self.native_ref,
+            native_ref: self.call_header.native_ref,
             // SAFETY: `self` is a live payload borrow, which keeps the
             // slab it names reachable.
             capture_count: unsafe { crate::value_slab::live_slice(self.captures).len() },
@@ -396,13 +375,8 @@ pub(crate) fn install_dynamic_native(
 
 impl otter_gc::trace::ReleaseHostRefs for NativeFunctionBody {
     fn release_host_refs(&mut self, table: &mut otter_gc::host_refs::HostRefTable) {
-        match self.call {
-            NativeCallSlot::Dynamic(index) | NativeCallSlot::LocalDynamic(index) => {
-                table.release(index);
-            }
-            NativeCallSlot::Static(_)
-            | NativeCallSlot::StaticWithCaptures(_)
-            | NativeCallSlot::VmIntrinsic(_) => {}
+        if let Some(index) = self.call_header.host_ref() {
+            table.release(index);
         }
     }
 }
@@ -458,31 +432,10 @@ impl NativeFunction {
             JsString::from_str_with_roots(name, heap, &mut visit)?
         };
         let name_root = Value::string(name_string);
-        // Interning before the body is built keeps this the one place a
-        // static native's entry address enters the isolate: every
-        // constructor and every install funnel reaches the heap through
-        // here, so registration is automatic and ordered by install
-        // sequence rather than by anything a call site remembers to do.
-        let native_ref = heap.intern_external_ref(match &call {
-            NativeCallStorage::Static(f) => *f as *const () as usize,
-            NativeCallStorage::StaticWithCaptures(f) => *f as *const () as usize,
-            NativeCallStorage::VmIntrinsic(intrinsic) => intrinsic.identity_address(),
-            NativeCallStorage::Dynamic(_) | NativeCallStorage::LocalDynamic(_) => 0,
-        });
-        // A dynamic closure's Arc moves into the isolate's host-ref
-        // table here, through the same single funnel: the body stores
-        // the index, and the sweep releases the slot when the body dies.
-        let call = match call {
-            NativeCallStorage::Static(f) => NativeCallSlot::Static(f),
-            NativeCallStorage::StaticWithCaptures(f) => NativeCallSlot::StaticWithCaptures(f),
-            NativeCallStorage::VmIntrinsic(intrinsic) => NativeCallSlot::VmIntrinsic(intrinsic),
-            NativeCallStorage::Dynamic(arc) => {
-                NativeCallSlot::Dynamic(heap.intern_host_ref(Box::new(arc)))
-            }
-            NativeCallStorage::LocalDynamic(arc) => {
-                NativeCallSlot::LocalDynamic(heap.intern_host_ref(Box::new(arc)))
-            }
-        };
+        // Call payload ownership and external identity are published together.
+        // Dynamic entries move their Arc to the host table; the body owns its
+        // index and releases it when collected.
+        let call_header = NativeCallHeader::allocate(heap, call, metadata, length);
         let own_properties = {
             let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 external_visit(visitor);
@@ -530,16 +483,12 @@ impl NativeFunction {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 NativeFunctionBody {
-                    native_ref,
+                    call_header,
                     name: name_string,
-                    length,
-                    call,
                     captures: captures_slab,
                     name_property: default_name_property(),
                     length_property: default_length_property(),
-                    metadata,
                     own_properties,
-                    extensible: metadata.extensible,
                     prototype_override: None,
                     realm_global: None,
                 },
@@ -600,10 +549,8 @@ impl NativeFunction {
     /// dynamic/closure callable) returns `false`.
     #[must_use]
     pub(crate) fn is_static_native(&self, heap: &otter_gc::GcHeap, target: NativeFastFn) -> bool {
-        heap.read_payload(self.inner, |body| match &body.call {
-            NativeCallSlot::Static(f) => std::ptr::fn_addr_eq(*f, target),
-            _ => false,
-        })
+        self.static_fn(heap)
+            .is_some_and(|call| std::ptr::fn_addr_eq(call, target))
     }
 
     /// Build a native function with a static name and an `Fn`
@@ -899,40 +846,40 @@ impl NativeFunction {
     /// Read ECMAScript `.length` metadata.
     #[must_use]
     pub fn length(&self, heap: &otter_gc::GcHeap) -> u8 {
-        heap.read_payload(self.inner, |body| body.length)
+        heap.read_payload(self.inner, |body| body.call_header.length)
     }
 
     /// Whether this native function has `[[Construct]]`.
     #[must_use]
     pub(crate) fn is_constructable(&self, heap: &otter_gc::GcHeap) -> bool {
-        heap.read_payload(self.inner, |body| body.metadata.constructable)
+        heap.read_payload(self.inner, |body| body.call_header.constructable())
     }
 
     /// Native callable `[[IsExtensible]]`.
     #[must_use]
     pub(crate) fn is_extensible(&self, heap: &otter_gc::GcHeap) -> bool {
-        heap.read_payload(self.inner, |body| body.extensible)
+        heap.read_payload(self.inner, |body| body.call_header.extensible())
     }
 
     /// Native callable `[[PreventExtensions]]`.
     pub(crate) fn prevent_extensions(&self, heap: &mut otter_gc::GcHeap) {
         let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
         crate::object::prevent_extensions(own_properties, heap);
-        heap.with_payload(self.inner, |body| body.extensible = false);
+        heap.with_payload(self.inner, |body| body.call_header.prevent_extensions());
     }
 
     /// `Object.isSealed` for native callable values.
     #[must_use]
     pub(crate) fn is_sealed(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| {
-            !body.extensible
+            !body.call_header.extensible()
                 && native_own_property_is_sealed(
                     &body.name_property,
-                    body.metadata.name_configurable,
+                    body.call_header.name_configurable(),
                 )
                 && native_own_property_is_sealed(
                     &body.length_property,
-                    body.metadata.length_configurable,
+                    body.call_header.length_configurable(),
                 )
                 && crate::object::is_sealed(body.own_properties, heap)
         })
@@ -942,14 +889,14 @@ impl NativeFunction {
     #[must_use]
     pub(crate) fn is_frozen(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| {
-            !body.extensible
+            !body.call_header.extensible()
                 && native_own_property_is_frozen(
                     &body.name_property,
-                    body.metadata.name_configurable,
+                    body.call_header.name_configurable(),
                 )
                 && native_own_property_is_frozen(
                     &body.length_property,
-                    body.metadata.length_configurable,
+                    body.call_header.length_configurable(),
                 )
                 && crate::object::is_frozen(body.own_properties, heap)
         })
@@ -1006,8 +953,9 @@ impl NativeFunction {
                 let body_snapshot: NativeFunctionBodySnapshot =
                     heap.read_payload(body_inner, |body| NativeFunctionBodySnapshot {
                         name: body.name,
-                        length: body.length,
-                        metadata: body.metadata,
+                        length: body.call_header.length,
+                        name_configurable: body.call_header.name_configurable(),
+                        length_configurable: body.call_header.length_configurable(),
                     });
                 native_builtin_descriptor(&body_snapshot, heap, key, external_visit).map(Some)
             }
@@ -1214,8 +1162,8 @@ impl NativeFunction {
             };
             let configurable = match slot {
                 NativeOwnProperty::Builtin => match key {
-                    "name" => body.metadata.name_configurable,
-                    "length" => body.metadata.length_configurable,
+                    "name" => body.call_header.name_configurable(),
+                    "length" => body.call_header.length_configurable(),
                     _ => true,
                 },
                 NativeOwnProperty::Deleted => return true,
@@ -1247,31 +1195,8 @@ impl NativeFunction {
     /// where a stack clone would silently go stale.
     #[must_use]
     pub(crate) fn call_target(&self, heap: &otter_gc::GcHeap) -> NativeCallTarget {
-        heap.read_payload(self.inner, |body| match body.call {
-            NativeCallSlot::Static(call) => NativeCallTarget::Static(call),
-            NativeCallSlot::StaticWithCaptures(call) => NativeCallTarget::StaticWithCaptures {
-                call,
-                captures: body.captures,
-            },
-            NativeCallSlot::VmIntrinsic(intrinsic) => NativeCallTarget::VmIntrinsic(intrinsic),
-            NativeCallSlot::Dynamic(index) => NativeCallTarget::Dynamic {
-                call: heap
-                    .host_refs()
-                    .get(index)
-                    .and_then(|any| any.downcast_ref::<Arc<NativeFn>>())
-                    .cloned()
-                    .expect("dynamic native's host-ref index resolves to its closure"),
-                captures: body.captures,
-            },
-            NativeCallSlot::LocalDynamic(index) => NativeCallTarget::LocalDynamic {
-                call: heap
-                    .host_refs()
-                    .get(index)
-                    .and_then(|any| any.downcast_ref::<Arc<LocalNativeFn>>())
-                    .cloned()
-                    .expect("local dynamic native's host-ref index resolves to its closure"),
-                captures: body.captures,
-            },
+        heap.read_payload(self.inner, |body| {
+            body.call_header.target(heap, body.captures)
         })
     }
 
@@ -1280,7 +1205,7 @@ impl NativeFunction {
     #[must_use]
     pub fn is_static_call(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| {
-            matches!(body.call, NativeCallSlot::Static(_))
+            body.call_header.kind == NativeEntryKind::Static
         })
     }
 
@@ -1288,17 +1213,12 @@ impl NativeFunction {
     #[must_use]
     /// Static entry of a static-backed callable, read once.
     pub(crate) fn static_fn(&self, heap: &otter_gc::GcHeap) -> Option<NativeFastFn> {
-        heap.read_payload(self.inner, |body| match body.call {
-            NativeCallSlot::Static(call) => Some(call),
-            _ => None,
-        })
+        heap.read_payload(self.inner, |body| body.call_header.static_fn())
     }
 
     pub(crate) fn is_static_fn(&self, heap: &otter_gc::GcHeap, expected: NativeFastFn) -> bool {
-        heap.read_payload(self.inner, |body| match body.call {
-            NativeCallSlot::Static(call) => std::ptr::fn_addr_eq(call, expected),
-            _ => false,
-        })
+        self.static_fn(heap)
+            .is_some_and(|call| std::ptr::fn_addr_eq(call, expected))
     }
 
     /// External-reference index identifying this callable's static entry or
@@ -1306,7 +1226,8 @@ impl NativeFunction {
     #[must_use]
     pub(crate) fn native_ref(&self, heap: &otter_gc::GcHeap) -> Option<u32> {
         heap.read_payload(self.inner, |body| {
-            (body.native_ref != otter_gc::NO_EXTERNAL_REF).then_some(body.native_ref)
+            (body.call_header.native_ref != otter_gc::NO_EXTERNAL_REF)
+                .then_some(body.call_header.native_ref)
         })
     }
 
@@ -1317,10 +1238,9 @@ impl NativeFunction {
     /// an extra frame.
     #[must_use]
     pub fn is_vm_intrinsic(&self, heap: &otter_gc::GcHeap, intrinsic: VmIntrinsicFunction) -> bool {
-        heap.read_payload(
-            self.inner,
-            |body| matches!(body.call, NativeCallSlot::VmIntrinsic(i) if i == intrinsic),
-        )
+        heap.read_payload(self.inner, |body| {
+            body.call_header.intrinsic() == Some(intrinsic)
+        })
     }
 
     /// Trace this handle as a root slot.
@@ -1535,7 +1455,8 @@ where
 struct NativeFunctionBodySnapshot {
     name: JsString,
     length: u8,
-    metadata: NativeFunctionMetadata,
+    name_configurable: bool,
+    length_configurable: bool,
 }
 
 fn native_builtin_descriptor(
@@ -1552,8 +1473,8 @@ fn native_builtin_descriptor(
         _ => Value::undefined(),
     };
     let configurable = match key {
-        "name" => body.metadata.name_configurable,
-        "length" => body.metadata.length_configurable,
+        "name" => body.name_configurable,
+        "length" => body.length_configurable,
         _ => true,
     };
     Ok(PropertyDescriptor::data(value, false, false, configurable))
@@ -1880,6 +1801,141 @@ pub fn vm_to_native_error(
 mod tests {
     use super::*;
     use crate::NativeCallInfo;
+
+    #[test]
+    fn c_header_selects_every_native_payload_and_preserves_callable_policy() {
+        fn plain(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args[0])
+        }
+        fn captured(
+            _: &mut NativeCtx<'_>,
+            _: &[Value],
+            captures: &[Value],
+        ) -> Result<Value, NativeError> {
+            Ok(captures[0])
+        }
+        let mut interp = crate::Interpreter::new();
+        let layout = jit_call_layout();
+        let cases = [
+            (NativeEntryKind::Static, NativeCallStorage::Static(plain)),
+            (
+                NativeEntryKind::StaticWithCaptures,
+                NativeCallStorage::StaticWithCaptures(captured),
+            ),
+            (
+                NativeEntryKind::VmIntrinsic,
+                NativeCallStorage::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeApply),
+            ),
+            (
+                NativeEntryKind::Dynamic,
+                NativeCallStorage::Dynamic(Arc::new(|_, _, captures| Ok(captures[0]))),
+            ),
+            (
+                NativeEntryKind::LocalDynamic,
+                NativeCallStorage::LocalDynamic(Arc::new(|_, _, captures| Ok(captures[0]))),
+            ),
+        ];
+        for (kind, storage) in cases {
+            let mut roots = no_roots;
+            let native = NativeFunction::allocate_with_roots(
+                interp.gc_heap_mut(),
+                "header-probe",
+                3,
+                storage,
+                smallvec::smallvec![Value::number_i32(23)],
+                NativeFunctionMetadata::CONSTRUCTOR,
+                &mut roots,
+            )
+            .expect("native callable");
+            interp.gc_heap().read_payload(native.inner, |body| {
+                // SAFETY: this live payload borrow retains its cell. The VM
+                // publishes these exact aligned offsets to both JIT encoders.
+                let cell = unsafe {
+                    std::ptr::from_ref(body)
+                        .cast::<u8>()
+                        .sub(otter_gc::header::HEADER_SIZE)
+                };
+                let raw_kind = unsafe { *cell.add(layout.kind_byte as usize) };
+                let flags = unsafe { *cell.add(layout.flags_byte as usize) };
+                let payload =
+                    unsafe { cell.add(layout.payload_byte as usize).cast::<u64>().read() };
+                let identity =
+                    unsafe { cell.add(layout.identity_byte as usize).cast::<u32>().read() };
+                let captures =
+                    unsafe { cell.add(layout.captures_byte as usize).cast::<u32>().read() };
+                assert_eq!(raw_kind, kind as u8);
+                assert_ne!(captures, 0);
+                assert_eq!(identity, body.call_header.native_ref);
+                assert_ne!(flags & layout.constructable_flag, 0);
+                assert_ne!(flags & layout.extensible_flag, 0);
+                match kind {
+                    NativeEntryKind::Static => assert_eq!(payload, plain as *const () as u64),
+                    NativeEntryKind::StaticWithCaptures => {
+                        assert_eq!(payload, captured as *const () as u64)
+                    }
+                    NativeEntryKind::VmIntrinsic => {
+                        assert_eq!(payload, VmIntrinsicFunction::FunctionPrototypeApply as u64)
+                    }
+                    NativeEntryKind::Dynamic | NativeEntryKind::LocalDynamic => {
+                        assert_eq!(payload >> 32, 0);
+                        assert!(interp.gc_heap().host_refs().get(payload as u32).is_some());
+                    }
+                }
+            });
+            assert_eq!(native.length(interp.gc_heap()), 3);
+            assert!(native.is_constructable(interp.gc_heap()));
+            let call = native.call_target(interp.gc_heap());
+            if kind == NativeEntryKind::VmIntrinsic {
+                assert!(matches!(
+                    call,
+                    NativeCallTarget::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeApply)
+                ));
+            } else {
+                NativeCtx::with_host_context(
+                    &mut interp,
+                    NativeCallInfo::call(Value::UNDEFINED),
+                    None,
+                    |ctx| {
+                        let result = call.invoke(ctx, &[Value::number_i32(7)]).unwrap();
+                        assert_eq!(
+                            result,
+                            Value::number_i32(if kind == NativeEntryKind::Static {
+                                7
+                            } else {
+                                23
+                            })
+                        );
+                    },
+                );
+            }
+            native.prevent_extensions(interp.gc_heap_mut());
+            assert!(!native.is_extensible(interp.gc_heap()));
+            assert!(native.is_constructable(interp.gc_heap()));
+            assert_eq!(native.length(interp.gc_heap()), 3);
+        }
+    }
+
+    #[test]
+    fn restricted_native_header_preserves_metadata_descriptor_rules() {
+        fn entry(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::UNDEFINED)
+        }
+        let mut interp = crate::Interpreter::new();
+        let mut roots = no_roots;
+        let native =
+            NativeFunction::throw_type_error_with_roots(interp.gc_heap_mut(), entry, &mut roots)
+                .expect("restricted native");
+        assert!(!native.is_constructable(interp.gc_heap()));
+        assert!(!native.is_extensible(interp.gc_heap()));
+        for property in ["name", "length"] {
+            let descriptor = native
+                .own_property_descriptor(interp.gc_heap_mut(), property)
+                .unwrap()
+                .unwrap();
+            assert!(!descriptor.configurable());
+            assert!(!native.delete_own_property(interp.gc_heap_mut(), property));
+        }
+    }
 
     /// A dynamic native's closure lives in the host-ref table; the
     /// slot must be released when the body dies — young (scavenge) or

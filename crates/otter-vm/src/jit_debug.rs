@@ -106,10 +106,12 @@ impl JitDebugRequest {
     }
 }
 
-/// Native compilation tier associated with a debug event.
+/// Execution destination or compilation tier associated with a debug event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JitDebugTier {
+    /// Linked bytecode destination before compilation or after invalidation.
+    Interpreter,
     /// Template baseline compilation or execution.
     Template,
     /// Feedback-driven optimizing compilation or execution.
@@ -658,16 +660,8 @@ pub enum JitDebugEvent {
         /// Human-readable operand rendering, when the PC resolves.
         operands_debug: Option<String>,
     },
-    /// One already-started compiler-generated callee entered cold deopt.
-    GeneratedCallDeopt {
-        /// Source opcode represented by the generated call site.
-        call_kind: crate::jit::JitDirectCallKind,
-        /// Function containing the generated call site.
-        caller_function_id: u32,
-        /// Exact caller code generation containing the generated edge.
-        caller_code_object_id: u64,
-        /// Exact logical PC of the caller's generated `Call` instruction.
-        caller_call_pc: u32,
+    /// One generation entered through the call trampoline took a side exit.
+    EnteredGenerationDeopt {
         /// Global bytecode function id of the deoptimizing callee.
         callee_function_id: u32,
         /// Exact isolate-local generated callee code generation.

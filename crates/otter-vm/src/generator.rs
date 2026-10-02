@@ -251,6 +251,31 @@ impl JsGenerator {
         Self::new_with_prototype(heap, frame, None, None)
     }
 
+    /// Allocate the generator of a generator-function activation that is
+    /// running its prologue. `GeneratorStart` parks that live activation into
+    /// it, and only then does the generator own a frame.
+    pub fn new_for_running_activation(
+        heap: &mut otter_gc::GcHeap,
+        is_async: bool,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_old(GeneratorBody {
+                frame: None,
+                cold: None,
+                resume_dst: 0,
+                done: false,
+                yielded: None,
+                resume_kind_dst: 0,
+                delegating: false,
+                is_async,
+                prototype_override: None,
+                expando: None,
+                async_requests: VecDeque::new(),
+                async_state: AsyncGeneratorState::SuspendedStart,
+            })?,
+        })
+    }
+
     /// Allocate a fresh generator over `frame` and its detached cold ownership
     /// record, with the call-time generator prototype.
     pub fn new_with_prototype(

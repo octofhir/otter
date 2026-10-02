@@ -92,7 +92,7 @@ impl Interpreter {
         let owned_message = self.coerce_error_message(stack, context, &message)?;
         let obj =
             self.make_error_instance_with_stack_roots(stack, kind, owned_message, &message)?;
-        self.capture_error_stack_frames(context, stack, obj);
+        self.capture_error_stack_frames(context, obj);
         Ok(Value::object(obj))
     }
 
@@ -100,17 +100,12 @@ impl Interpreter {
     /// bounded by `Error.stackTraceLimit`) onto a freshly built error
     /// instance for `Error.prototype.stack`. No-op when the limit is 0
     /// or the stack is empty.
-    fn capture_error_stack_frames(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        obj: object::JsObject,
-    ) {
+    fn capture_error_stack_frames(&mut self, context: &ExecutionContext, obj: object::JsObject) {
         let limit = self.current_stack_trace_limit();
         if limit == 0 {
             return;
         }
-        let frames = self.snapshot_active_frames(context, stack, limit);
+        let frames = self.snapshot_active_frames(context, limit);
         if !frames.is_empty() {
             object::set_error_stack_frames(obj, self.gc_heap_mut(), frames);
         }
@@ -192,7 +187,7 @@ impl Interpreter {
         dst: u16,
         kind_idx: u32,
     ) -> Result<(), VmError> {
-        let mut frame = ActiveFrameMut::materialized(frame);
+        let mut frame = ActiveFrameMut::from_frame(frame);
         self.run_load_builtin_error_active(context, &mut frame, dst, kind_idx)
     }
 
@@ -535,7 +530,7 @@ impl Interpreter {
         // as user `new Error(...)` instances, so `e.stack` shows frames for
         // a VM TypeError exactly like V8/JSC.
         if let Some(context) = context {
-            self.capture_error_stack_frames(context, stack, obj);
+            self.capture_error_stack_frames(context, obj);
         }
         Some(Value::object(obj))
     }

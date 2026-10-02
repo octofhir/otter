@@ -19,6 +19,7 @@
 //! activation, completes a full collection, retires generated code, and only
 //! then tombstones a payload proven free of ids and retained contexts.
 #![allow(unused_imports)]
+use super::call_dispatch::DispatchOutcome;
 use crate::*;
 
 impl Interpreter {
@@ -298,6 +299,13 @@ impl Interpreter {
         function_count: u32,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         context.resolve_atoms(&self.names);
+        for function_id in context.function_base()..context.function_base() + function_count {
+            let function = context
+                .exec_function(function_id)
+                .expect("verified linked function");
+            self.jit_code_registry
+                .link_function(function, self.active_realm_id);
+        }
         if self.active_realm_id != 0 {
             let base = context.function_base();
             let end = base.checked_add(function_count).ok_or(
@@ -333,6 +341,17 @@ impl Interpreter {
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
             self.code_space = std::sync::Arc::clone(context.space());
             self.code_space.resolve_atoms(&self.names);
+            for function_id in context.function_base()..context.function_end() {
+                let function = context
+                    .exec_function(function_id)
+                    .expect("verified adopted function");
+                let realm_id = self
+                    .function_realm_ids
+                    .get(&function_id)
+                    .copied()
+                    .unwrap_or(0);
+                self.jit_code_registry.link_function(function, realm_id);
+            }
         }
         // Remember the realm's dispatch context as the universal microtask
         // fallback. It shares the code space adopted above, so it resolves
@@ -513,7 +532,6 @@ impl Interpreter {
         context: &ExecutionContext,
         task: Microtask,
     ) -> Result<(), RunError> {
-        let _window_rollback = self.register_window_rollback();
         // Reaction-mode rejection forwarding (§27.2.1.3.2) reads the
         // abrupt completion's [[Value]] from `pending_uncaught_throw`
         // after `dispatch_loop` returns. Clear any stale payload
@@ -587,10 +605,9 @@ impl Interpreter {
     }
 
     /// Body of [`Self::invoke_microtask`] running under the
-    /// locals-root registration (see there). `current` / `this` /
-    /// `args` are traced live through the caller's registration, so
-    /// the collector rewrites them in place across every allocation
-    /// this path performs.
+    /// locals-root registration (see there). The job's callable enters the
+    /// classifying trampoline like any other call; an async handler completes
+    /// with its result promise, which the downstream capability adopts.
     fn invoke_microtask_rooted(
         &mut self,
         context: &ExecutionContext,
@@ -603,310 +620,17 @@ impl Interpreter {
         if !stack.is_runtime_rooted_by(self) {
             return Err(RunError::bare(VmError::InvalidOperand));
         }
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(RunError {
-                    error: VmError::StackOverflow {
-                        limit: self.max_stack_depth,
-                    },
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-            if let Some(bound) = current.as_bound_function() {
-                hops += 1;
-                let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                let mut combined: SmallVec<[Value; 8]> =
-                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                combined.extend(bound_args);
-                combined.extend(effective_args.drain(..));
-                *effective_this = bound_this;
-                *effective_args = combined;
-                *current = target;
-            } else if let Some(cc) = current.as_class_constructor() {
-                hops += 1;
-                *current = cc.ctor(&self.gc_heap);
-            } else {
-                break;
-            }
-        }
-        // Native callables run inline at the drain site: no frame
-        // push, no return register. Errors propagate as RunError.
-        if let Some(native) = current.as_native_function() {
-            let native = &native;
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                return match self.run_vm_intrinsic_sync_rooted(
-                    stack,
-                    context,
-                    intrinsic,
-                    *effective_this,
-                    std::mem::take(effective_args),
-                ) {
-                    Ok(value) => self.settle_microtask_capability(
-                        context,
-                        stack,
-                        result_capability.take(),
-                        Ok(value),
-                    ),
-                    Err(vm_err) => {
-                        if result_capability.is_some() && !vm_err.is_termination() {
-                            let reason =
-                                crate::promise_dispatch::rejection_value_for(self, &vm_err);
-                            self.settle_microtask_capability(
-                                context,
-                                stack,
-                                result_capability.take(),
-                                Err(reason),
-                            )
-                        } else {
-                            Err(RunError {
-                                error: vm_err,
-                                frames: Vec::new(),
-                                detail: self.take_error_detail(),
-                            })
-                        }
-                    }
-                };
-            }
-            let call_info = NativeCallInfo::call(*effective_this);
-            if let Err(error) = self.record_runtime_native_call() {
-                return Err(RunError {
-                    error,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-            let raw = {
-                let slice_roots = [effective_args.as_slice()];
-                let roots = crate::runtime_cx::NativeCallRoots::new(&call_info, &[], &slice_roots);
-                let _call_roots = self
-                    .gc_heap
-                    .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-                let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(self, stack);
-                let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
-                let result = call.invoke(&mut ctx, effective_args.as_slice());
-                let (interp, stack) = ctx.cx.into_parts();
-                result.map_err(|err| native_to_vm_error_with_stack(interp, stack, err))
-            };
-            return match raw {
-                Ok(value) => {
-                    self.settle_microtask_capability(
-                        context,
-                        stack,
-                        result_capability.take(),
-                        Ok(value),
-                    )?;
-                    Ok(())
-                }
-                Err(vm_err) => {
-                    if result_capability.is_some() && !vm_err.is_termination() {
-                        // Reaction-mode: route the error into the
-                        // downstream promise as a rejection rather
-                        // than aborting the drain. If a sub-dispatch
-                        // (e.g. `run_callable_sync` from within the
-                        // native body) caught a user `throw`, the
-                        // original `Value` was stashed on
-                        // `pending_uncaught_throw` — prefer it over a
-                        // stringified `vm_err_to_value` rendering so
-                        // identity is preserved per §27.2.1.3.2 step
-                        // 1.f.iii.
-                        let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
-                            crate::promise_dispatch::rejection_value_for(self, &vm_err)
-                        });
-                        self.settle_microtask_capability(
-                            context,
-                            stack,
-                            result_capability.take(),
-                            Err(reason),
-                        )
-                    } else {
-                        Err(RunError {
-                            error: vm_err,
-                            frames: Vec::new(),
-                            detail: self.take_error_detail(),
-                        })
-                    }
-                }
-            };
-        }
-        // A callable Proxy reaches [[Call]] only through the `apply`
-        // trap (§10.5.12); it has neither a bytecode target nor a
-        // native call slot, so the frame-pushing path below cannot
-        // reach it. Run it on the synchronous call path, which owns
-        // the trap dispatch, and settle the reaction capability from
-        // its completion exactly as the native arm does.
-        if current.as_proxy().is_some() {
-            let callee = *current;
-            let this_value = *effective_this;
-            let args = std::mem::take(effective_args);
-            return match self.run_callable_sync_rooted(stack, context, &callee, this_value, args) {
-                Ok(value) => {
-                    self.settle_microtask_capability(
-                        context,
-                        stack,
-                        result_capability.take(),
-                        Ok(value),
-                    )?;
-                    Ok(())
-                }
-                Err(vm_err) => {
-                    if result_capability.is_some() && !vm_err.is_termination() {
-                        let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
-                            crate::promise_dispatch::rejection_value_for(self, &vm_err)
-                        });
-                        self.settle_microtask_capability(
-                            context,
-                            stack,
-                            result_capability.take(),
-                            Err(reason),
-                        )
-                    } else {
-                        Err(RunError {
-                            error: vm_err,
-                            frames: Vec::new(),
-                            detail: self.take_error_detail(),
-                        })
-                    }
-                }
-            };
-        }
-        let (function_id, this_for_callee, _new_target_for_callee, _callee_closure) =
-            match Self::bytecode_call_target_parts(*current, *effective_this, &self.gc_heap) {
-                Ok(parts) => parts,
-                Err(error) => {
-                    return Err(RunError {
-                        error,
-                        frames: Vec::new(),
-                        detail: self.take_error_detail(),
-                    });
-                }
-            };
-        let owner = match context.for_function(function_id) {
-            Ok(owner) => owner,
-            Err(_) => {
-                return Err(RunError {
-                    error: VmError::InvalidOperand,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-        };
-        let context = &*owner;
-        let function = match context.exec_function(function_id) {
-            Some(f) => f,
-            None => {
-                return Err(RunError {
-                    error: VmError::InvalidOperand,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-        };
-        let this_for_callee = match self.this_for_bytecode_call_runtime_rooted(
-            function,
-            this_for_callee,
-            &[effective_args.as_slice()],
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(RunError {
-                    error,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-        };
-        let window = self
-            .alloc_reg_window(function.register_count as usize)
-            .map_err(|error| RunError {
-                error,
-                frames: Vec::new(),
-                detail: self.take_error_detail(),
-            })?;
-        let mut new_frame = Frame::for_code_block(
-            function,
-            None, // top-level — no return register
-            *current,
-            this_for_callee,
-            window,
-        );
-        self.bind_bytecode_call_arguments(function, &mut new_frame, std::mem::take(effective_args))
-            .map_err(|error| RunError {
-                error,
-                frames: Vec::new(),
-                detail: self.take_error_detail(),
-            })?;
-        let entry_floor = stack.floor();
-        stack.push(new_frame);
-        // An `async` handler invoked as a reaction is a top-level call with no
-        // caller frame, so — exactly like the async entry frame in `run_inner`
-        // and the direct-call path — it needs an async result promise wired up
-        // front. Without it `Op::Await` finds no `async_state` and aborts with
-        // `InvalidOperand`. The downstream reaction promise then adopts this
-        // result promise, so it settles when the handler ultimately completes.
-        let async_result_anchor = if function.is_async && !function.is_generator {
-            let result = match promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_stack_rooted(self, stack, &[], &[])
-            {
-                Ok(result) => result,
-                Err(oom) => {
-                    return Err(RunError {
-                        error: VmError::from(oom),
-                        frames: Vec::new(),
-                        detail: self.take_error_detail(),
-                    });
-                }
-            };
-            // The dispatch below can park/pop the async frame and perform an
-            // arbitrary number of moving collections. Keep the promise value
-            // in an interpreter-owned root slot rather than retaining the raw
-            // `JsPromise` handle in this Rust local.
-            let result_anchor = self.push_iteration_anchor(Value::promise(result)) - 1;
-            let rooted_result = self
-                .iteration_anchor(result_anchor)
-                .as_promise()
-                .expect("async result anchor must contain a promise");
-            let frame = stack.last_mut().expect("reaction frame was just pushed");
-            self.frame_set_async_state(
-                frame,
-                AsyncFrameState {
-                    result_promise: rooted_result,
-                },
-            );
-            Some(result_anchor)
-        } else {
-            None
-        };
-        let result = match self.dispatch_loop_above_rooted(context, stack, entry_floor) {
+        let callee = *current;
+        let this_value = *effective_this;
+        let args = std::mem::take(effective_args);
+        match self.run_callable_sync_rooted(stack, context, &callee, this_value, args) {
             Ok(value) => {
-                // Reaction job: settle the downstream promise with
-                // the handler's return value (spec §27.2.5.4). For an async
-                // handler the return value is its result promise, which the
-                // downstream adopts (resolving once the handler completes).
-                let settle_value = match async_result_anchor {
-                    Some(anchor) => self.iteration_anchor(anchor),
-                    None => value,
-                };
-                self.settle_microtask_capability(
-                    context,
-                    stack,
-                    result_capability.take(),
-                    Ok(settle_value),
-                )
+                self.settle_microtask_capability(context, stack, result_capability.take(), Ok(value))
             }
             Err(error) => {
                 if result_capability.is_some() && !error.is_termination() {
-                    // Reaction-mode unwind: route the abrupt
-                    // completion's [[Value]] into the downstream
-                    // promise as a rejection per ECMA-262
-                    // §27.2.1.3.2 PromiseReactionJob step 1.f.iii.
-                    // Spec requires the *original* thrown value, not
-                    // a stringified `VmError::Uncaught` rendering;
-                    // [`Self::unwind_throw_with_uncaught`] preserves
-                    // it on `pending_uncaught_throw` for exactly this
-                    // hop.
+                    // §27.2.1.3.2 step 1.f.iii: the rejection carries the
+                    // original thrown value when one was preserved.
                     let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
                         crate::promise_dispatch::rejection_value_for(self, &error)
                     });
@@ -917,7 +641,7 @@ impl Interpreter {
                         Err(reason),
                     )
                 } else {
-                    let frames = snapshot_frames(context, stack);
+                    let frames = self.snapshot_active_frames(context, usize::MAX);
                     Err(RunError {
                         error,
                         frames,
@@ -925,11 +649,7 @@ impl Interpreter {
                     })
                 }
             }
-        };
-        if let Some(anchor) = async_result_anchor {
-            self.pop_iteration_anchors_to(anchor);
         }
-        result
     }
 
     /// Resolve / reject the downstream promise that a reaction
@@ -969,7 +689,6 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
-        let _window_rollback = self.register_window_rollback();
         let main = context.exec_main();
         let mut stack: ActivationStack = ActivationStack::new();
         // The script `<main>` closes over no context.
@@ -987,10 +706,7 @@ impl Interpreter {
         } else {
             Value::object(self.global_this)
         };
-        let window = self
-            .alloc_reg_window(main.register_count as usize)
-            .map_err(|error| (error, Vec::new()))?;
-        let entry = Frame::for_code_block(main, None, self_value, entry_this, window);
+        let entry = crate::PreparedCall::for_code_block(main, None, self_value, entry_this);
         let entry_is_async = main.is_async;
         stack.push(entry);
         // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the
@@ -1002,8 +718,8 @@ impl Interpreter {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, &stack, &[], &[])
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
-            let frame = stack.last_mut().expect("entry frame was just pushed");
-            self.frame_set_async_state(
+            let frame = stack.pending_mut().expect("entry inputs were just queued");
+            self.prepared_set_async_state(
                 frame,
                 AsyncFrameState {
                     result_promise: result,
@@ -1057,7 +773,7 @@ impl Interpreter {
                 let frames = self
                     .pending_uncaught_frames
                     .take()
-                    .unwrap_or_else(|| snapshot_frames(context, &stack));
+                    .unwrap_or_else(|| self.snapshot_active_frames(context, usize::MAX));
                 Err((err, frames))
             }
         }
@@ -1086,20 +802,12 @@ impl Interpreter {
         if floor.depth() > stack.len() {
             return Err(VmError::InvalidOperand);
         }
-        // A nested dispatch allocates its frames' register windows above the
-        // caller's flat-stack cursor; on exit clamp the cursor down to release
-        // any window a non-locally-exited sub-frame left behind. Only ever
-        // LOWER it: when this loop entered on a re-entry frame (its window was
-        // allocated below the saved cursor by the caller and then reclaimed as
-        // that frame returned here), the cursor is already below `saved` and
-        // raising it back would re-leak that window on every `run_callable_sync`.
-        let register_checkpoint = self.register_stack.checkpoint();
-        let result = self.with_runtime_turn(stack, |turn| {
+        // The turn roots queued inputs before assembly creates their native
+        // extent, then retains the physical caller chain until completion.
+        self.with_runtime_turn(stack, |turn| {
             let (interp, stack) = turn.into_parts();
-            interp.dispatch_loop_rooted(context, stack, floor)
-        });
-        self.register_stack.restore(register_checkpoint);
-        result
+            interp.execute_prepared_call(context, stack)
+        })
     }
 
     /// Drive a nested region of the stack already owned by a runtime turn.
@@ -1115,10 +823,7 @@ impl Interpreter {
         if floor.depth() > stack.len() || !stack.is_runtime_rooted_by(self) {
             return Err(VmError::InvalidOperand);
         }
-        let register_checkpoint = self.register_stack.checkpoint();
-        let result = self.dispatch_loop_rooted(context, stack, floor);
-        self.register_stack.restore(register_checkpoint);
-        result
+        self.execute_prepared_call(context, stack)
     }
 
     /// Drive the dispatch loop, converting convertible `VmError`
@@ -1134,18 +839,22 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    fn dispatch_loop_rooted(
+    pub(super) fn dispatch_current_activation(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
-    ) -> Result<Value, VmError> {
+        mut resume_error: Option<VmError>,
+    ) -> Result<DispatchOutcome, VmError> {
         debug_assert!(stack.is_runtime_rooted_by(self));
         self.ensure_method_feedback_context(context);
-        self.begin_work_budget_turn();
-        let result = (|| -> Result<Value, VmError> {
+        (|| -> Result<DispatchOutcome, VmError> {
             loop {
-                match self.dispatch_loop_inner(context, stack, floor) {
+                let step = match resume_error.take() {
+                    Some(error) => Err(error),
+                    None => self.dispatch_loop_inner(context, stack, floor),
+                };
+                match step {
                     Ok(value) => break Ok(value),
                     Err(err) => {
                         if matches!(err, VmError::Uncaught)
@@ -1154,7 +863,7 @@ impl Interpreter {
                         {
                             if self.pending_uncaught_frames.is_none() {
                                 self.pending_uncaught_frames =
-                                    Some(snapshot_frames(context, stack));
+                                    Some(self.snapshot_active_frames(context, usize::MAX));
                             }
                             let unwind = self.unwind_throw_above(context, stack, floor, thrown);
                             if unwind.is_ok() {
@@ -1170,7 +879,13 @@ impl Interpreter {
                             }
                             unwind?;
                             if stack.is_at_floor(floor) {
-                                break Ok(Value::undefined());
+                                // An async activation that absorbed the throw
+                                // completes with its rejected result promise.
+                                let result = self
+                                    .completed_activation_result
+                                    .take()
+                                    .unwrap_or_else(Value::undefined);
+                                break Ok(DispatchOutcome::Returned(result));
                             }
                             continue;
                         }
@@ -1187,7 +902,7 @@ impl Interpreter {
                             };
                             if self.pending_uncaught_frames.is_none() {
                                 self.pending_uncaught_frames =
-                                    Some(snapshot_frames(context, stack));
+                                    Some(self.snapshot_active_frames(context, usize::MAX));
                             }
                             let unwind = self.unwind_throw_with_uncaught_above(
                                 context, stack, floor, thrown, uncaught,
@@ -1197,7 +912,11 @@ impl Interpreter {
                             }
                             unwind?;
                             if stack.is_at_floor(floor) {
-                                break Ok(Value::undefined());
+                                let result = self
+                                    .completed_activation_result
+                                    .take()
+                                    .unwrap_or_else(Value::undefined);
+                                break Ok(DispatchOutcome::Returned(result));
                             }
                             continue;
                         }
@@ -1205,20 +924,15 @@ impl Interpreter {
                     }
                 }
             }
-        })();
-        self.finish_work_budget_turn();
-        result
+        })()
     }
 }
 
 /// Live root over [`Interpreter::invoke_microtask`]'s
 /// callee/this/argument locals: the values leave the traced microtask
-/// queue before any callee-side roots exist, and every allocation on
-/// the invocation path (`this` boxing, bound-arg
-/// concatenation) can drive a moving scavenge that would otherwise
-/// launder them. Raw pointers because the locals are mutated
-/// (bound-function unwrapping) while registered; the registration is
-/// popped before the locals drop.
+/// queue before the staged request owns them. Raw pointers because the
+/// locals are moved out while registered; the registration is popped
+/// before the locals drop.
 struct MicrotaskLocalsRoot {
     current: *const Value,
     this_value: *const Value,

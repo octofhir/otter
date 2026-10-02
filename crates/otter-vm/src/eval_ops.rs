@@ -38,7 +38,7 @@ use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
-    AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, Value, VmError,
+    AsyncFrameState, EvalCompileOptions, ExecutionContext, Interpreter, Value, VmError,
     abstract_ops, operand_decode::register_operand, promise_dispatch, read_register,
     write_register,
 };
@@ -177,16 +177,12 @@ impl Interpreter {
         // frame's value (direct eval is contained in function code).
         // Class field initializers observe `undefined` (§15.7.10).
         let caller_new_target = if new_target_suppressed {
-            None
+            Value::undefined()
         } else {
-            self.frame_cold(&stack[top_idx])
-                .and_then(|cold| cold.new_target)
+            stack[top_idx].new_target()
         };
-        let window = self.alloc_reg_window(main.register_count as usize)?;
-        let mut entry = Frame::for_code_block(main, None, self_value, entry_this, window);
-        if caller_new_target.is_some() {
-            self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
-        }
+        let mut entry = crate::PreparedCall::for_code_block(main, None, self_value, entry_this);
+        entry.set_new_target(caller_new_target);
         // Direct eval is synchronous re-entry in the caller's logical
         // activation chain. Keep the caller frames published for GC, stack
         // traces, and exception diagnostics, while the floor prevents the
@@ -301,8 +297,7 @@ impl Interpreter {
         } else {
             Value::object(self.global_this)
         };
-        let window = self.alloc_reg_window(main.register_count as usize)?;
-        let entry = Frame::for_code_block(main, None, self_value, entry_this, window);
+        let entry = crate::PreparedCall::for_code_block(main, None, self_value, entry_this);
         let entry_is_async = main.is_async;
         let floor = stack.floor();
         stack.push(entry);
@@ -310,8 +305,8 @@ impl Interpreter {
             let entry_promise = if entry_is_async {
                 let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
                     .pending_stack_rooted(interp, stack, &[], &[])?;
-                let frame = stack.last_mut().expect("entry frame was just pushed");
-                interp.frame_set_async_state(
+                let frame = stack.pending_mut().expect("entry inputs were just queued");
+                interp.prepared_set_async_state(
                     frame,
                     AsyncFrameState {
                         result_promise: result,
@@ -443,14 +438,12 @@ impl Interpreter {
         // completion).
         let main = context.exec_main();
         let self_value = self.main_self_closure(main.id, Value::undefined())?;
-        let window = self.alloc_reg_window(main.register_count as usize)?;
         let floor = stack.floor();
-        stack.push(Frame::for_code_block(
+        stack.push(crate::PreparedCall::for_code_block(
             main,
             None,
             self_value,
             Value::undefined(),
-            window,
         ));
         let result = self.dispatch_loop_above_rooted(&context, stack, floor);
         self.release_frames_above(stack, floor);
@@ -508,14 +501,12 @@ impl Interpreter {
         // program's completion).
         let main = context.exec_main();
         let self_value = self.main_self_closure(main.id, Value::undefined())?;
-        let window = self.alloc_reg_window(main.register_count as usize)?;
         let floor = stack.floor();
-        stack.push(Frame::for_code_block(
+        stack.push(crate::PreparedCall::for_code_block(
             main,
             None,
             self_value,
             Value::undefined(),
-            window,
         ));
         let result = self.dispatch_loop_above_rooted(&context, stack, floor);
         self.release_frames_above(stack, floor);
@@ -696,7 +687,7 @@ mod tests {
             .expect("caller register window");
         caller.pc = 19;
         caller.registers[0] = Value::number_i32(7);
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         stack.push(caller);
 
         interp.with_runtime_turn(&mut stack, |turn| {
@@ -729,18 +720,15 @@ mod tests {
             assert!(matches!(error, VmError::InvalidOperand));
             assert_caller_only(interp, stack);
 
-            let mut caller = stack.pop().expect("caller retained");
-            interp.reclaim_registers(&mut caller);
-            assert_eq!(interp.register_stack.checkpoint(), 0);
+            let _caller = stack.pop().expect("caller retained");
         });
     }
 
-    fn assert_caller_only(interp: &Interpreter, stack: &ActivationStack) {
+    fn assert_caller_only(_interp: &Interpreter, stack: &ActivationStack) {
         assert_eq!(stack.len(), 1);
         let caller = stack.last().expect("caller retained");
         assert_eq!(caller.function_id, 777);
         assert_eq!(caller.pc, 19);
         assert_eq!(caller.registers[0], Value::number_i32(7));
-        assert_eq!(interp.register_stack.checkpoint(), 2);
     }
 }

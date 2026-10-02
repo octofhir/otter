@@ -4,9 +4,10 @@
 //! - `emit` proves the cache/window and returns a tagged length or actual value.
 //!
 //! # Invariants
-//! - r11 contains the published NativeFrame; scratch is r8, r9, r10 and r11.
+//! - r11 contains the published Frame; scratch is r8, r9, r10 and r11.
 //! - The result is r8; all guards precede its publication.
 //! - A materialized object, non-Int32 key or out-of-range index uses the cold path.
+//! - Every frame names its actual span explicitly.
 //! - No moving pointer or argument-window address survives the probe.
 //!
 //! # See also
@@ -23,8 +24,6 @@ pub(crate) fn emit(ops: &mut Assembler, key: Option<u8>, miss: DynamicLabel) {
         ; .arch x64
         ; cmp DWORD [r11 + abi::NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET as i32], 0
         ; jne =>miss
-        ; test BYTE [r11 + crate::entry::NATIVE_FRAME_FLAGS_OFFSET as i32], abi::NativeFrameFlags::INCOMING_ARGUMENTS as i8
-        ; jz =>miss
         ; mov r8d, [r11 + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
     );
     if key.is_some() {
@@ -38,9 +37,7 @@ pub(crate) fn emit(ops: &mut Assembler, key: Option<u8>, miss: DynamicLabel) {
             ; cmp r9d, r8d
             ; jae =>miss
             ; mov r9d, r9d
-            ; movzx r10d, WORD [r11 + crate::entry::NATIVE_FRAME_REGISTER_COUNT_OFFSET as i32]
-            ; mov r11, [r11 + crate::entry::NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
-            ; lea r11, [r11 + r10 * 8]
+            ; mov r11, [r11 + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32]
             ; mov r8, [r11 + r9 * 8]
         );
     } else {

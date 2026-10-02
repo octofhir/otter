@@ -1007,8 +1007,6 @@ pub struct RuntimeExecutionStats {
     pub jit_generated_call_deopts: u64,
     /// Generated callers invalidated because a callee generation changed.
     pub jit_caller_invalidations: u64,
-    /// Stable function-entry probes that entered the cold resolver.
-    pub jit_cold_entry_resolver_misses: u64,
     /// Call-family transitions from generated code into Rust completion paths.
     pub jit_to_rust_call_transitions: u64,
     /// Generated template-tier callee entries.
@@ -1017,16 +1015,12 @@ pub struct RuntimeExecutionStats {
     pub jit_generated_template_returns: u64,
     /// Generated template-tier callees that cold-deoptimized.
     pub jit_generated_template_deopts: u64,
-    /// Generated template-tier callees that propagated a throw.
-    pub jit_generated_template_throws: u64,
     /// Generated optimizing-tier callee entries.
     pub jit_generated_optimizing_entries: u64,
     /// Generated optimizing-tier callees that returned normally.
     pub jit_generated_optimizing_returns: u64,
     /// Generated optimizing-tier callees that cold-deoptimized.
     pub jit_generated_optimizing_deopts: u64,
-    /// Generated optimizing-tier callees that propagated a throw.
-    pub jit_generated_optimizing_throws: u64,
     /// Optimizing-tier function and OSR entries.
     pub jit_optimized_entries: u64,
     /// Optimizing-tier entries materialized at a hot loop header.
@@ -1037,9 +1031,6 @@ pub struct RuntimeExecutionStats {
     pub jit_compile_attempts: u64,
     /// Successfully installed native code generations across tiers.
     pub jit_code_generations: u64,
-    /// Successful hot baseline generations rebuilt against mature call
-    /// feedback and live callee entry generations.
-    pub jit_feedback_refreshes: u64,
     /// Loop-OSR threshold attempts.
     pub jit_osr_attempts: u64,
     /// JIT property/method/element/global/context runtime stub calls.
@@ -4825,22 +4816,18 @@ impl Runtime {
             jit_generated_calls: jit.generated_calls,
             jit_generated_call_deopts: jit.generated_call_deopts,
             jit_caller_invalidations: jit.caller_invalidations,
-            jit_cold_entry_resolver_misses: jit.cold_entry_resolver_misses,
             jit_to_rust_call_transitions: jit.jit_to_rust_call_transitions,
             jit_generated_template_entries: jit.generated_template_entries,
             jit_generated_template_returns: jit.generated_template_returns,
             jit_generated_template_deopts: jit.generated_template_deopts,
-            jit_generated_template_throws: jit.generated_template_throws,
             jit_generated_optimizing_entries: jit.generated_optimizing_entries,
             jit_generated_optimizing_returns: jit.generated_optimizing_returns,
             jit_generated_optimizing_deopts: jit.generated_optimizing_deopts,
-            jit_generated_optimizing_throws: jit.generated_optimizing_throws,
             jit_optimized_entries: jit.optimized_entries,
             jit_optimized_osr_entries: jit.optimized_osr_entries,
             jit_optimized_deopts: jit.optimized_deopts,
             jit_compile_attempts: jit.compile_attempts,
             jit_code_generations: jit.code_generations,
-            jit_feedback_refreshes: jit.feedback_refreshes,
             jit_osr_attempts: jit.osr_attempts,
             jit_runtime_property_stubs: jit.runtime_property_stubs,
             jit_runtime_stub_transitions: jit.runtime_stub_transitions,

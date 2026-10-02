@@ -1,14 +1,12 @@
 //! Borrowed argument windows for bytecode call sites.
 //!
-//! Call opcodes carry their argument registers in the instruction operand
-//! stream. This module lets the VM bind ordinary bytecode callees directly
-//! from the caller's register window instead of first materialising an owned
-//! `SmallVec<Value>`.
+//! Call opcodes name argument registers in the operand stream. A checked
+//! window reads those values into owned inputs before native dispatch, keeping
+//! prepared arguments stable after the Rust bytecode entry returns.
 //!
 //! # Contents
 //! - [`BytecodeArgumentWindow`] for register-backed call arguments.
-//! - Binding helpers for parameter, rest, and `arguments` frame slots.
-//! - Owned materialisation for fallback call paths.
+//! - Owned actual-argument inputs for the common call trampoline.
 //!
 //! # Invariants
 //! - Windows never outlive the caller frame they borrow.
@@ -20,7 +18,7 @@
 //!
 //! # See also
 //! - [`crate::call_ops`]
-//! - [`crate::frame_state::Frame`]
+//! - [`crate::native_abi::Frame`]
 
 use smallvec::SmallVec;
 
@@ -169,89 +167,5 @@ impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
             args.push(*self.get(index)?);
         }
         Ok(args)
-    }
-
-    /// Bind the window into the callee `frame`'s register window and
-    /// return any rest / incoming-args side records the caller must
-    /// install into the frame's cold slot. Splitting it this way
-    /// avoids passing a `&mut Interpreter` through every argument-
-    /// window call site.
-    pub(crate) fn bind_into(
-        &self,
-        function: &CodeBlock,
-        frame: &mut Frame,
-    ) -> Result<BoundExtras, VmError> {
-        let bind_count = (function.param_count as usize).min(self.len);
-        if !function.needs_arguments && !function.has_rest {
-            // Ordinary callee: parameters are the only destination, so arguments
-            // past the last parameter are dropped without visiting them and no
-            // side-record vector is built.
-            //
-            // Verified execution records expose the argument registers as one
-            // word slice, so the whole bind resolves both the source and the
-            // destination ranges once instead of re-checking each index against
-            // the window length and the callee's register count.
-            if let Some(words) = self.arg_words {
-                let source = &self.caller.registers;
-                let destination = frame
-                    .registers
-                    .get_mut(..bind_count)
-                    .ok_or(VmError::InvalidOperand)?;
-                for (slot, &word) in destination.iter_mut().zip(&words[..bind_count]) {
-                    *slot = *source.get(word as usize).ok_or(VmError::InvalidOperand)?;
-                }
-                return Ok(BoundExtras {
-                    rest_args: SmallVec::new(),
-                    incoming_args: SmallVec::new(),
-                });
-            }
-            for index in 0..bind_count {
-                let value = *self.get(index)?;
-                let slot = frame
-                    .registers
-                    .get_mut(index)
-                    .ok_or(VmError::InvalidOperand)?;
-                *slot = value;
-            }
-            return Ok(BoundExtras {
-                rest_args: SmallVec::new(),
-                incoming_args: SmallVec::new(),
-            });
-        }
-        let mut rest_args: SmallVec<[Value; 4]> = SmallVec::new();
-        let mut incoming_args: SmallVec<[Value; 4]> = SmallVec::new();
-        for index in 0..self.len {
-            let value = *self.get(index)?;
-            if function.needs_arguments {
-                incoming_args.push(value);
-            }
-            if index < bind_count {
-                let slot = frame
-                    .registers
-                    .get_mut(index)
-                    .ok_or(VmError::InvalidOperand)?;
-                *slot = value;
-            } else if function.has_rest {
-                rest_args.push(value);
-            }
-        }
-        Ok(BoundExtras {
-            rest_args,
-            incoming_args,
-        })
-    }
-}
-
-/// Side records produced by [`BytecodeArgumentWindow::bind_into`] and
-/// installed into the callee frame's cold slot by the caller.
-pub(crate) struct BoundExtras {
-    pub rest_args: SmallVec<[Value; 4]>,
-    pub incoming_args: SmallVec<[Value; 4]>,
-}
-
-impl BoundExtras {
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rest_args.is_empty() && self.incoming_args.is_empty()
     }
 }

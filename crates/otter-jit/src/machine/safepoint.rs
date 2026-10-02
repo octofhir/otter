@@ -225,7 +225,6 @@ pub fn lower_safepoints(
         let frame_state = instruction.frame_state.unwrap_or(NO_FRAME_STATE);
         records.push(SafepointRecord {
             inline_frames: Box::default(),
-            inline_frames_virtual: false,
             call_pc: otter_vm::native_abi::NO_CALL_PC,
             id: id.0,
             frame_state,

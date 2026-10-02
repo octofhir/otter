@@ -33,7 +33,7 @@
 //! - The input is the same target-neutral [`super::TemplatePlan`] consumed by
 //!   the AArch64 backend; operand decoding and branch validation are not
 //!   repeated here.
-//! - `r15` retains `JitCtx`, `r14` the active `NativeFrame`, and `r13` its
+//! - `r15` retains `JitCtx`, `r14` the active `Frame`, and `r13` its
 //!   register window. Runtime calls obey the System V integer ABI and return
 //!   two-word native results in `rax`/`rdx`.
 //! - Allocating string calls publish the plan-owned safepoint before reentry;
@@ -53,10 +53,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "x86_64/activation.rs"]
+mod activation;
+#[path = "x86_64/calls.rs"]
+mod calls;
 #[path = "x86_64/context.rs"]
 mod context;
-#[path = "x86_64/direct_call.rs"]
-mod direct_call;
 #[path = "x86_64/exceptions.rs"]
 mod exceptions;
 #[path = "x86_64/intrinsic_prototype.rs"]
@@ -72,16 +74,13 @@ use crate::{
     CompiledCode, Unsupported,
     artifact::{
         ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
-        relocation::{
-            PropertySourceAccess, RelocationCapture, RelocationTarget, TemplateOperandArena,
-            TemplateOperandRole,
-        },
+        relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
     },
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET,
         NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL,
         VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET,
@@ -93,8 +92,6 @@ const DOUBLE_OFFSET: u64 = (DOUBLE_OFFSET_HI16 as u64) << 48;
 const CANONICAL_NAN: u64 = (CANONICAL_NAN_HI16 as u64) << 48;
 const NOT_CELL_MASK: u64 = otter_vm::value::tag::NOT_CELL_MASK;
 
-/// Persistent machine-stack reservation held by [`emit_prologue`].
-pub(super) const NATIVE_FRAME_BYTES: u32 = 40;
 
 pub(super) fn compile(
     view: &JitCompileSnapshot,
@@ -135,8 +132,24 @@ pub(super) fn compile(
         .iter()
         .map(|instruction| (instruction.pc, ops.new_dynamic_label()))
         .collect();
+    let shape = activation::EntryShape::of(
+        view,
+        code_object_id,
+        abi::NativeFrameKind::Baseline,
+        !plan.safepoint_records.is_empty(),
+    )?;
+    let activation_exits = activation::ActivationExits {
+        construct: ops.new_dynamic_label(),
+        side_exit: ops.new_dynamic_label(),
+    };
+    // The tier entry continues a published interpreter frame; the call entry
+    // builds this function's record and window and falls through.
     let entry = ops.offset();
-    emit_prologue(&mut ops);
+    let body = ops.new_dynamic_label();
+    activation::emit_tier_prologue(&mut ops);
+    dynasm!(ops ; .arch x64 ; jmp =>body);
+    let call_entry = (!plan.osr_only).then(|| activation::emit_call_entry(&mut ops, view, shape));
+    dynasm!(ops ; .arch x64 ; =>body);
     let mut labelled = BTreeSet::new();
 
     for (operation_index, instruction) in plan.instructions.iter().enumerate() {
@@ -434,21 +447,14 @@ pub(super) fn compile(
                 method,
                 receiver,
                 this_value,
-            } => emit_forward_call(
+            } => calls::emit_forward_call(
                 &mut ops,
                 &mut relocations,
                 transitions,
                 view,
-                code_map.as_mut(),
-                instruction.pc,
-                dst,
-                method,
-                receiver,
-                this_value,
-                identity_guard,
-                threw,
+                [dst, method, receiver, this_value],
                 committed_throw,
-                fatal,
+                threw,
             )?,
             TemplateOp::NewArray { dst, elements } => {
                 let words = plan
@@ -558,67 +564,17 @@ pub(super) fn compile(
                 arg0,
                 arg1,
                 arg2,
-            } => {
-                let direct_done = ops.new_dynamic_label();
-                let emitted_direct = if opcode == otter_bytecode::Op::CallSpread as u8 {
-                    let lane = |index: usize| ((arg0 >> (index * 16)) & 0xffff) as u16;
-                    direct_call::emit_spread_plain(
-                        &mut ops,
-                        &mut relocations,
-                        transitions,
-                        view,
-                        code_map.as_mut(),
-                        direct_call_events.as_mut(),
-                        lane(0),
-                        lane(1),
-                        lane(2),
-                        lane(3),
-                        instruction.pc,
-                        instruction.byte_pc,
-                        committed_throw,
-                        fatal,
-                        direct_done,
-                    )?
-                } else if opcode == otter_bytecode::Op::NewSpread as u8
-                    || opcode == otter_bytecode::Op::SuperConstructSpread as u8
-                {
-                    direct_call::emit_spread_construct(
-                        &mut ops,
-                        &mut relocations,
-                        transitions,
-                        view,
-                        code_map.as_mut(),
-                        direct_call_events.as_mut(),
-                        arg0 as u16,
-                        arg1 as u16,
-                        arg2 as u16,
-                        instruction.pc,
-                        instruction.byte_pc,
-                        opcode == otter_bytecode::Op::SuperConstructSpread as u8,
-                        committed_throw,
-                        fatal,
-                        direct_done,
-                    )?
-                } else {
-                    false
-                };
-                emit_opcode_transition(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    abi::STUB_JIT_SPREAD_CALL_OP,
-                    opcode,
-                    arg0,
-                    arg1,
-                    arg2,
-                    runtime_transition,
-                    threw,
-                    fatal,
-                );
-                if emitted_direct {
-                    dynasm!(ops ; .arch x64 ; =>direct_done);
-                }
-            }
+            } => calls::emit_spread_call_op(
+                &mut ops,
+                &mut relocations,
+                transitions,
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+                committed_throw,
+                threw,
+            )?,
             TemplateOp::DeleteOp {
                 opcode,
                 arg0,
@@ -1115,36 +1071,37 @@ pub(super) fn compile(
                         );
                     }
                 }
-                let direct_done = ops.new_dynamic_label();
-                let emitted_direct = direct_call::emit_plain(
+                let known = view
+                    .direct_callees
+                    .get(&byte_pc)
+                    .filter(|targets| targets.len() == 1)
+                    .map(|targets| targets[0].plan);
+                let start = ops.offset().0;
+                calls::emit_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
                     view,
-                    code_map.as_mut(),
-                    direct_call_events.as_mut(),
-                    dst,
-                    callee,
-                    &arguments,
-                    instruction.pc,
-                    byte_pc,
-                    committed_throw,
-                    fatal,
-                    direct_done,
-                )?;
-                emit_generic_call_transition(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    dst,
-                    callee,
+                    Some(callee),
                     None,
+                    calls::CallNewTarget::None,
                     &arguments,
+                    known,
+                    instruction.pc,
+                    dst,
                     committed_throw,
-                    fatal,
+                    threw,
                 )?;
-                if emitted_direct {
-                    dynasm!(ops ; .arch x64 ; =>direct_done);
+                if let Some(code_map) = code_map.as_mut() {
+                    code_map.record(CodeRegion::call_structural(
+                        "callTrampoline",
+                        start,
+                        ops.offset().0,
+                        view.code_block.id,
+                        instruction.pc,
+                        byte_pc,
+                        known.map(|plan| plan.function_id),
+                    ));
                 }
             }
             TemplateOp::CallWithThis {
@@ -1156,16 +1113,20 @@ pub(super) fn compile(
                 byte_pc: _,
             } => {
                 let arguments = plan.call_argument_registers(argc, packed_args);
-                emit_generic_call_transition(
+                calls::emit_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
-                    dst,
-                    callee,
+                    view,
+                    Some(callee),
                     Some(this_value),
+                    calls::CallNewTarget::None,
                     &arguments,
+                    None,
+                    instruction.pc,
+                    dst,
                     committed_throw,
-                    fatal,
+                    threw,
                 )?;
             }
             TemplateOp::Construct {
@@ -1177,83 +1138,61 @@ pub(super) fn compile(
                 byte_pc,
             } => {
                 let arguments = plan.call_argument_registers(argc, packed_args);
-                let direct_done = ops.new_dynamic_label();
-                let emitted_direct = direct_call::emit_construct(
+                let known = view
+                    .direct_callees
+                    .get(&byte_pc)
+                    .filter(|targets| targets.len() == 1)
+                    .map(|targets| targets[0].plan);
+                let start = ops.offset().0;
+                calls::emit_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
                     view,
-                    code_map.as_mut(),
-                    direct_call_events.as_mut(),
-                    dst,
-                    callee,
+                    Some(callee),
+                    None,
+                    if super_construct {
+                        calls::CallNewTarget::Super
+                    } else {
+                        calls::CallNewTarget::Callee
+                    },
                     &arguments,
+                    known,
                     instruction.pc,
-                    byte_pc,
-                    super_construct,
-                    committed_throw,
-                    fatal,
-                    direct_done,
-                )?;
-                emit_construct_transition(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    &plan,
                     dst,
-                    callee,
-                    argc,
-                    packed_args,
-                    super_construct,
-                    runtime_transition,
+                    committed_throw,
                     threw,
-                    fatal,
                 )?;
-                if emitted_direct {
-                    dynasm!(ops ; .arch x64 ; =>direct_done);
+                if let Some(code_map) = code_map.as_mut() {
+                    code_map.record(CodeRegion::call_structural(
+                        "callTrampoline",
+                        start,
+                        ops.offset().0,
+                        view.code_block.id,
+                        instruction.pc,
+                        byte_pc,
+                        known.map(|plan| plan.function_id),
+                    ));
                 }
             }
             TemplateOp::MethodCall {
                 dst,
                 receiver,
                 arguments,
-                byte_pc,
                 ..
             } => {
                 let argument_registers = plan.register_tail(arguments);
-                let direct_done = ops.new_dynamic_label();
-                let emitted_direct = direct_call::emit_method(
+                calls::emit_method_call(
                     &mut ops,
                     &mut relocations,
                     transitions,
                     view,
-                    code_map.as_mut(),
-                    direct_call_events.as_mut(),
-                    dst,
                     receiver,
                     argument_registers,
-                    instruction.pc,
-                    byte_pc,
-                    committed_throw,
-                    fatal,
-                    direct_done,
-                )?;
-                let mut words = Vec::with_capacity(arguments.len + 1);
-                words.push(PacketWord::Register(receiver));
-                words.extend(argument_registers.iter().copied().map(PacketWord::Register));
-                emit_value_packet_transition(
-                    &mut ops,
-                    &mut relocations,
-                    transitions,
-                    abi::STUB_JIT_CALL_METHOD_VALUE,
-                    &words,
                     dst,
                     committed_throw,
-                    fatal,
+                    threw,
                 )?;
-                if emitted_direct {
-                    dynasm!(ops ; .arch x64 ; =>direct_done);
-                }
             }
             TemplateOp::EnterTry {
                 catch_pc,
@@ -1535,7 +1474,7 @@ pub(super) fn compile(
         ; .arch x64
         ; call r11
         ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>pair_exit
+        ; je =>activation_exits.side_exit
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>pair_exit
         ; cmp edx, abi::NativeResultStatus::Fatal as i32
@@ -1543,39 +1482,45 @@ pub(super) fn compile(
         ; jmp =>fatal
         ; =>pair_exit
     );
-    emit_epilogue(&mut ops);
+    activation::emit_epilogue(&mut ops, activation_exits);
     emit_side_exit(
         &mut ops,
+        activation_exits.side_exit,
         type_mismatch,
         abi::ExitReason::TypeMismatch,
         abi::ExitAction::Recompile,
     );
     emit_side_exit(
         &mut ops,
+        activation_exits.side_exit,
         identity_guard,
         abi::ExitReason::IdentityGuard,
         abi::ExitAction::Recompile,
     );
     emit_side_exit(
         &mut ops,
+        activation_exits.side_exit,
         allocation_miss,
         abi::ExitReason::AllocationMiss,
         abi::ExitAction::Resume,
     );
     emit_side_exit(
         &mut ops,
+        activation_exits.side_exit,
         unsupported,
         abi::ExitReason::UnsupportedOperation,
         abi::ExitAction::Recompile,
     );
     emit_side_exit(
         &mut ops,
+        activation_exits.side_exit,
         runtime_transition,
         abi::ExitReason::RuntimeTransition,
         abi::ExitAction::Resume,
     );
     emit_side_exit(
         &mut ops,
+        activation_exits.side_exit,
         backedge_relink,
         abi::ExitReason::Interrupt,
         abi::ExitAction::Resume,
@@ -1595,7 +1540,7 @@ pub(super) fn compile(
         ; .arch x64
         ; call r11
         ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>pair_exit
+        ; je =>activation_exits.side_exit
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>pair_exit
         ; cmp edx, abi::NativeResultStatus::Fatal as i32
@@ -1605,7 +1550,24 @@ pub(super) fn compile(
     );
     emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
     dynasm!(ops ; .arch x64 ; mov edx, abi::NativeResultStatus::Fatal as i32);
-    emit_epilogue(&mut ops);
+    activation::emit_epilogue(&mut ops, activation_exits);
+    activation::emit_exits(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        view,
+        shape.derived,
+        activation_exits,
+    );
+    if let Some((_, cold)) = call_entry {
+        activation::emit_call_entry_cold(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            activation_exits,
+            cold,
+        );
+    }
 
     let mut osr_entries = BTreeMap::new();
     for &header_pc in view.code_block.loop_headers() {
@@ -1613,7 +1575,7 @@ pub(super) fn compile(
             continue;
         };
         let offset = ops.offset().0;
-        emit_prologue(&mut ops);
+        activation::emit_tier_prologue(&mut ops);
         dynasm!(ops ; .arch x64 ; jmp =>target);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record_osr(header_pc, offset, ops.offset().0);
@@ -1623,7 +1585,6 @@ pub(super) fn compile(
 
     let buffer = crate::entry::finalize_assembler(ops)?;
     let TemplatePlan {
-        register_count,
         register_operands,
         mut safepoint_records,
         osr_only,
@@ -1657,13 +1618,13 @@ pub(super) fn compile(
         compiled_code,
         code_object_id,
         view.code_block.id,
-        register_count,
         Box::new([]),
         register_operands,
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
         osr_entries,
+        call_entry.map(|(offset, _)| offset.0),
         osr_only,
     );
     Ok(NativeCompileOutput {
@@ -1701,32 +1662,7 @@ fn requires_pc_stamp(op: TemplateOp) -> bool {
     )
 }
 
-fn emit_prologue(ops: &mut Assembler) {
-    dynasm!(ops
-        ; .arch x64
-        ; push rbp
-        ; mov rbp, rsp
-        ; push r12
-        ; push r13
-        ; push r14
-        ; push r15
-        ; mov r15, rdi
-        ; mov r14, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov r13, [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
-    );
-}
 
-fn emit_epilogue(ops: &mut Assembler) {
-    dynasm!(ops
-        ; .arch x64
-        ; pop r15
-        ; pop r14
-        ; pop r13
-        ; pop r12
-        ; pop rbp
-        ; ret
-    );
-}
 
 fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
     dynasm!(ops ; .arch x64 ; mov DWORD [r14 + NATIVE_FRAME_PC_OFFSET as i32], pc as i32);
@@ -1734,6 +1670,7 @@ fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
 
 fn emit_side_exit(
     ops: &mut Assembler,
+    side_exit: DynamicLabel,
     label: DynamicLabel,
     reason: abi::ExitReason,
     action: abi::ExitAction,
@@ -1744,9 +1681,8 @@ fn emit_side_exit(
     dynasm!(ops
         ; .arch x64
         ; or rax, r11
-        ; mov edx, abi::NativeResultStatus::SideExit as i32
+        ; jmp =>side_exit
     );
-    emit_epilogue(ops);
 }
 
 /// Inline cooperative poll at a back edge. A side-exit status resumes the
@@ -3394,238 +3330,13 @@ fn emit_collect_arguments(
     emit_status_word_result(ops, threw, fatal);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_forward_call(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    view: &JitCompileSnapshot,
-    mut code_map: Option<&mut CodeMapCapture>,
-    logical_pc: u32,
-    dst: u16,
-    method: u16,
-    callee: u16,
-    receiver: u16,
-    identity_guard: DynamicLabel,
-    finish_error: DynamicLabel,
-    throw_value: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let byte_pc = view
-        .instructions
-        .get(logical_pc as usize)
-        .ok_or(Unsupported::OperandShape("x86-64 forward instruction PC"))?
-        .byte_pc;
-    let canonical = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    let native_start = ops.offset().0;
-    crate::x86_64::emit_runtime_forward(
-        ops,
-        relocations,
-        view,
-        transitions,
-        [dst, method, callee, receiver],
-        logical_pc,
-        byte_pc,
-        code_map.as_deref_mut(),
-        canonical,
-        finish_error,
-        throw_value,
-        fatal,
-        done,
-        |ops, source, target, _| {
-            emit_load_reg(ops, target, source);
-            Ok(())
-        },
-        |ops, destination, source, _| {
-            emit_store_reg(ops, source, destination);
-            Ok(())
-        },
-        |ops| {
-            dynasm!(ops
-                ; .arch x64
-                ; mov r14, [r15 + NATIVE_FRAME_OFFSET as i32]
-                ; mov r13, [r14 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
-            );
-            Ok(())
-        },
-        |ops, register, _| {
-            emit_load_reg(ops, 11, register);
-            Ok(())
-        },
-    )?;
-    if let Some(map) = code_map {
-        let targets: Vec<_> = view
-            .direct_callees
-            .get(&byte_pc)
-            .into_iter()
-            .flatten()
-            .collect();
-        for (index, target) in targets.iter().enumerate() {
-            if let Ok(artifact) =
-                direct_call::forward_artifact(target, index as u32, targets.len() as u32)
-            {
-                map.record(CodeRegion::call_structural(
-                    "runtimeForwardCallCandidate",
-                    native_start,
-                    ops.offset().0,
-                    view.code_block.id,
-                    logical_pc,
-                    byte_pc,
-                    artifact,
-                ));
-            }
-        }
-    }
-    dynasm!(ops ; .arch x64 ; =>canonical);
-    emit_load_reg(ops, 6, method);
-    dynasm!(ops ; .arch x64 ; mov rdi, r15);
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.entry(abi::STUB_JIT_FORWARD_SOURCE_READY),
-        abi::STUB_JIT_FORWARD_SOURCE_READY,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rax, rax
-        ; jz =>identity_guard
-    );
-
-    let mut words = vec![
-        PacketWord::Register(method),
-        PacketWord::Register(callee),
-        PacketWord::Register(receiver),
-    ];
-    words.extend(
-        view.code_block
-            .forwarded_argument_bindings()
-            .filter_map(|(_, storage)| match storage {
-                otter_bytecode::ArgumentBindingStorage::Register { reg } => {
-                    Some(PacketWord::Register(reg))
-                }
-                otter_bytecode::ArgumentBindingStorage::Context { .. } => None,
-            }),
-    );
-    words.extend(
-        view.code_block
-            .forwarded_formals_context()
-            .map(PacketWord::Register),
-    );
-    if words.len() > 510 {
-        dynasm!(ops ; .arch x64 ; jmp =>identity_guard);
-        return Ok(());
-    }
-    emit_value_packet_transition(
-        ops,
-        relocations,
-        transitions,
-        abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
-        &words,
-        dst,
-        throw_value,
-        fatal,
-    )?;
-    dynasm!(ops ; .arch x64 ; =>done);
-    Ok(())
-}
 
 #[derive(Debug, Clone, Copy)]
 enum PacketWord {
     Register(u16),
-    Undefined,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_construct_transition(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    plan: &super::TemplatePlan,
-    dst: u16,
-    callee: u16,
-    argc: u16,
-    packed_args: u64,
-    super_construct: bool,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let (packed_args, packed_tail) = plan.resolve_packed_args(argc, packed_args);
-    dynasm!(ops
-        ; .arch x64
-        ; mov rdi, r15
-        ; mov esi, i32::from(dst)
-        ; mov edx, i32::from(callee)
-    );
-    emit_load_u64(ops, 1, u64::from(argc) | (u64::from(super_construct) << 63));
-    if let Some(tail) = packed_tail {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            8,
-            packed_args,
-            RelocationTarget::TemplateOperandSlice {
-                arena: TemplateOperandArena::Registers,
-                role: TemplateOperandRole::ConstructArguments,
-                start: u32::try_from(tail.start)
-                    .map_err(|_| Unsupported::OperandShape("x86-64 construct argument start"))?,
-                len: u32::try_from(tail.len)
-                    .map_err(|_| Unsupported::OperandShape("x86-64 construct argument count"))?,
-            },
-        );
-    } else {
-        emit_load_u64(ops, 8, packed_args);
-    }
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        transitions.variadic_entry(abi::STUB_JIT_CONSTRUCT),
-        abi::STUB_JIT_CONSTRUCT,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; test rax, rax
-        ; je >completed
-        ; cmp eax, abi::NativeResultStatus::SideExit as i32
-        ; je =>bail
-        ; cmp eax, abi::NativeResultStatus::Throw as i32
-        ; je =>threw
-        ; jmp =>fatal
-        ; completed:
-    );
-    Ok(())
-}
 
-#[allow(clippy::too_many_arguments)]
-fn emit_generic_call_transition(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    transitions: &crate::entry::TransitionTable,
-    dst: u16,
-    callee: u16,
-    receiver: Option<u16>,
-    arguments: &[u16],
-    throw_value: DynamicLabel,
-    fatal: DynamicLabel,
-) -> Result<(), Unsupported> {
-    let mut words = Vec::with_capacity(arguments.len() + 2);
-    words.push(PacketWord::Register(callee));
-    words.push(receiver.map_or(PacketWord::Undefined, PacketWord::Register));
-    words.extend(arguments.iter().copied().map(PacketWord::Register));
-    emit_value_packet_transition(
-        ops,
-        relocations,
-        transitions,
-        abi::STUB_JIT_CALL_WITH_THIS_VALUE,
-        &words,
-        dst,
-        throw_value,
-        fatal,
-    )
-}
 
 fn emit_value_packet_transition(
     ops: &mut Assembler,
@@ -3651,7 +3362,6 @@ fn emit_value_packet_transition(
     for (index, word) in words.iter().enumerate() {
         match *word {
             PacketWord::Register(register) => emit_load_reg(ops, 0, register),
-            PacketWord::Undefined => emit_load_u64(ops, 0, VALUE_UNDEFINED),
         }
         let offset = i32::try_from(index * 8)
             .map_err(|_| Unsupported::OperandShape("x86-64 value-packet offset"))?;

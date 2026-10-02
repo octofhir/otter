@@ -201,15 +201,8 @@ impl Interpreter {
     /// it charges a bounded backedge batch and then reuses the same budget
     /// checkpoint. This keeps timeout/budget semantics independent of whether a
     /// hot loop has OSR'd into native code.
-    pub(crate) fn jit_backedge_poll(
-        &mut self,
-        context: &crate::execution_context::ExecutionContext,
-    ) -> Result<WorkBudgetCheckpoint, VmError> {
+    pub(crate) fn jit_backedge_poll(&mut self) -> Result<WorkBudgetCheckpoint, VmError> {
         self.record_jit_runtime_stub_class(native_abi::STUB_JIT_BACKEDGE_POLL.class);
-        // A compiled loop is the one place a long-running program may spend
-        // all its time without an interpreter entry; promote the callee its
-        // generated calls reported hot here.
-        self.promote_hot_generated_callee(context);
         // The interrupt flag is polled inline at every back-edge, so reaching
         // this re-entry with the flag set means a cancellation is pending.
         if self.interrupt.is_set() {
@@ -228,20 +221,6 @@ impl Interpreter {
             self.rotate_work_budget_slice();
         }
         Ok(checkpoint)
-    }
-
-    /// Make the next compiled back-edge re-enter [`Self::jit_backedge_poll`].
-    ///
-    /// Back-edges already consumed from the current window are charged now;
-    /// the one remaining unit is charged by that poll, so budget accounting
-    /// stays exact.
-    pub(crate) fn request_next_backedge_poll(&mut self) {
-        let consumed = self
-            .jit_backedge_fuel_window
-            .saturating_sub(self.jit_backedge_fuel);
-        self.work_budget_stats.record_work(consumed);
-        self.jit_backedge_fuel = 1;
-        self.jit_backedge_fuel_window = 1;
     }
 
     /// Address of the inline back-edge fuel counter, handed to compiled code so

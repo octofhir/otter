@@ -21,14 +21,15 @@ use otter_bytecode::ArgumentBindingStorage;
 use smallvec::SmallVec;
 
 impl Interpreter {
-    pub(crate) fn jit_runtime_forward_values(
+    /// Resolve the callee, receiver and actual list of one admitted forwarding
+    /// site. The caller stages them before any further allocation.
+    pub(crate) fn jit_runtime_forward_request(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         source: &ActiveFrameRef<'_>,
-        materialized: Option<usize>,
         values: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<(Value, Value, SmallVec<[Value; 8]>), VmError> {
         let function_id = source.function_id();
         let call_pc = source.pc();
         let function = context
@@ -50,32 +51,16 @@ impl Interpreter {
                 if !self.is_callable_runtime(&self.iteration_anchor(base + 1)) {
                     return Err(VmError::NotCallable);
                 }
-                let existing = source
-                    .native_arguments_object()
-                    .map(Value::object)
-                    .or_else(|| {
-                        materialized
-                            .and_then(|index| stack.get(index))
-                            .and_then(|frame| self.frame_cold(frame))
-                            .and_then(|cold| cold.arguments_object)
-                    });
+                let existing = source.native_arguments_object().map(Value::object);
                 let arguments = if let Some(object) = existing {
                     self.create_list_from_array_like(stack, context, object)?
                 } else {
                     let count = self
-                        .elided_forward_argument_count(stack, source, materialized)
+                        .elided_forward_argument_count(source)
                         .ok_or(VmError::InvalidOperand)? as usize;
                     let mut arguments = SmallVec::<[Value; 8]>::with_capacity(count);
                     for index in 0..count {
-                        let value = if source.incoming_argument_count().is_some() {
-                            source.incoming_argument(index)?
-                        } else {
-                            *materialized
-                                .and_then(|index| stack.get(index))
-                                .and_then(|frame| self.frame_cold(frame))
-                                .and_then(|cold| cold.incoming_args.get(index))
-                                .ok_or(VmError::InvalidOperand)?
-                        };
+                        let value = source.incoming_argument(index)?;
                         arguments.push(value);
                     }
                     let register_words = function
@@ -117,7 +102,32 @@ impl Interpreter {
                     arguments,
                 )
             } else {
-                let index = materialized.ok_or(VmError::InvalidOperand)?;
+                let index = stack
+                    .iter()
+                    .position(|frame| {
+                        frame.function_id == source.function_id()
+                            && frame.registers.as_ptr() == source.register_base_ptr()
+                    })
+                    .ok_or(VmError::InvalidOperand)?;
+                // Publish current SSA aliases before observable arguments creation.
+                // Every write ends before allocation; the canonical window roots
+                // the live context and register bindings through moving collection.
+                let mut word = base + 3;
+                for (_, storage) in function.forwarded_argument_bindings() {
+                    if let ArgumentBindingStorage::Register { reg } = storage {
+                        *stack[index]
+                            .registers
+                            .get_mut(usize::from(reg))
+                            .ok_or(VmError::InvalidOperand)? = self.iteration_anchor(word);
+                        word += 1;
+                    }
+                }
+                if let Some(register) = function.forwarded_formals_context() {
+                    *stack[index]
+                        .registers
+                        .get_mut(usize::from(register))
+                        .ok_or(VmError::InvalidOperand)? = self.iteration_anchor(word);
+                }
                 let object = self.materialize_frame_arguments_object(context, stack, index)?;
                 (
                     self.iteration_anchor(base),
@@ -136,7 +146,7 @@ impl Interpreter {
                 callee,
                 Value::undefined(),
             );
-            self.run_rooted_call_values(stack, context, callee, receiver, arguments)
+            Ok((callee, receiver, arguments))
         })();
         self.pop_iteration_anchors_to(base);
         result

@@ -8,7 +8,10 @@
 //! # Invariants
 //! - Every spill, root, and untraced runtime-scratch slot is one eight-byte word.
 //! - Allocator spills precede the reusable tagged-root save area, which in
-//!   turn precedes untraced runtime-scratch words.
+//!   turn precedes untraced runtime-scratch words, the optional interpreter
+//!   register window and the activation's [`otter_vm::Frame`] record. The
+//!   record is the frame the call-entry prologue publishes; the window exists
+//!   only for bodies whose runtime semantics read registers by index.
 //! - Untraced scratch words never enter safepoint or deoptimization root metadata.
 //! - The total native reservation includes target-owned fixed bytes and is
 //!   aligned to the target ABI requirement.
@@ -22,6 +25,8 @@
 use super::AllocatedSequence;
 
 const SPILL_SLOT_BYTES: u32 = 8;
+/// Bytes of the activation record held inside every Machine frame.
+pub(crate) const FRAME_RECORD_BYTES: u32 = std::mem::size_of::<otter_vm::Frame>() as u32;
 
 /// Failure to construct or query one machine frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,9 @@ pub struct MachineFrameLayout {
     root_area_offset: u32,
     raw_slots: u16,
     raw_area_offset: u32,
+    window_slots: u16,
+    window_offset: u32,
+    record_offset: u32,
     spill_area_bytes: u32,
     frame_bytes: u32,
 }
@@ -82,6 +90,7 @@ impl MachineFrameLayout {
             allocation,
             root_slots,
             raw_slots,
+            0,
             fixed_bytes,
             stack_alignment,
             0,
@@ -95,6 +104,7 @@ impl MachineFrameLayout {
         allocation: &AllocatedSequence,
         root_slots: u16,
         raw_slots: u16,
+        window_slots: u16,
         fixed_bytes: u32,
         stack_alignment: u32,
         entry_stack_bias: u32,
@@ -119,9 +129,15 @@ impl MachineFrameLayout {
         let raw_bytes = u32::from(raw_slots)
             .checked_mul(SPILL_SLOT_BYTES)
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;
-        let raw_spill_bytes = allocator_spill_bytes
-            .checked_add(root_bytes)
-            .and_then(|bytes| bytes.checked_add(raw_bytes))
+        let window_offset = raw_area_offset
+            .checked_add(raw_bytes)
+            .ok_or(FrameLayoutError::FrameSizeOverflow)?;
+        let record_offset = u32::from(window_slots)
+            .checked_mul(SPILL_SLOT_BYTES)
+            .and_then(|bytes| window_offset.checked_add(bytes))
+            .ok_or(FrameLayoutError::FrameSizeOverflow)?;
+        let raw_spill_bytes = record_offset
+            .checked_add(FRAME_RECORD_BYTES)
             .ok_or(FrameLayoutError::FrameSizeOverflow)?;
         let unaligned_total = fixed_bytes
             .checked_add(raw_spill_bytes)
@@ -144,6 +160,9 @@ impl MachineFrameLayout {
             root_area_offset,
             raw_slots,
             raw_area_offset,
+            window_slots,
+            window_offset,
+            record_offset,
             spill_area_bytes,
             frame_bytes,
         })
@@ -177,6 +196,25 @@ impl MachineFrameLayout {
     #[must_use]
     pub const fn raw_slots(self) -> u16 {
         self.raw_slots
+    }
+
+    /// Byte offset of the activation record from the post-prologue SP.
+    #[must_use]
+    pub const fn record_offset(self) -> u32 {
+        self.record_offset
+    }
+
+    /// Interpreter register slots reserved in the frame; zero for a body
+    /// whose register window is materialized only by deoptimization.
+    #[must_use]
+    pub const fn window_slots(self) -> u16 {
+        self.window_slots
+    }
+
+    /// Byte offset of the reserved register window from the post-prologue SP.
+    #[must_use]
+    pub const fn window_offset(self) -> u32 {
+        self.window_offset
     }
 
     /// Byte offset of one spill slot from the post-prologue stack pointer.

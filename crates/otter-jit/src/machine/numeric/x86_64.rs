@@ -24,8 +24,10 @@
 
 use std::collections::BTreeSet;
 
-#[path = "x86_64/direct_call.rs"]
-mod direct_call;
+#[path = "x86_64/activation.rs"]
+mod activation;
+#[path = "x86_64/call.rs"]
+mod call;
 #[path = "x86_64/instanceof.rs"]
 mod instanceof;
 #[path = "x86_64/loose_equality.rs"]
@@ -34,8 +36,9 @@ mod loose_equality;
 mod megamorphic_property;
 #[path = "x86_64/number_probe.rs"]
 mod number_probe;
+#[path = "x86_64/receiver_allocation.rs"]
+mod receiver_allocation;
 
-pub(crate) use direct_call::{emit_generated_receiver_allocation, emit_increment_runtime_counter};
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
@@ -59,24 +62,15 @@ use super::super::{
 };
 use crate::{
     CompiledCode, Unsupported,
-    artifact::{
-        DirectCallArgumentModeArtifact, DirectCallArtifact, DirectCallKindArtifact,
-        DirectCallThisModeArtifact, DirectCallTierArtifact,
-        relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
-    },
+    artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-        ALLOC_WINDOW_LAB_OFFSET, CANONICAL_NAN_HI16, CODE_ENTRY_CODE_OBJECT_ID_OFFSET,
-        CODE_ENTRY_GENERATED_DEOPTS_OFFSET, CODE_ENTRY_GENERATED_STACK_FRAME_BYTES_OFFSET,
-        CODE_ENTRY_GENERATED_THROWS_OFFSET, CODE_ENTRY_NATIVE_FRAME_HEADER_OFFSET,
-        DOUBLE_OFFSET_HI16, FUNCTION_ENTRY_GENERATION_CELL_OFFSET, GENERATED_DEPTH_LIMIT_OFFSET,
-        GENERATED_FEEDBACK_CLEAN_OFFSET, GLOBAL_THIS_OFFSET_PTR_OFFSET, LAB_LIMIT_OFFSET,
-        LAB_TOP_OFFSET, NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_CALLER_OFFSET,
-        NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_DEPTH_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
+        ALLOC_WINDOW_LAB_OFFSET, CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16,
+        GLOBAL_THIS_OFFSET_PTR_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET,
+        NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_FLAGS_OFFSET,
         NATIVE_FRAME_MACHINE_ROOTS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
         NATIVE_FRAME_THIS_OFFSET, NATIVE_STACK_LIMIT_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
         PropertySourceCell, RECEIVER_ALLOC_ATTEMPTS_OFFSET, RECEIVER_ALLOC_GENERATED_OFFSET,
         RECEIVER_ALLOC_GUARD_MISSES_OFFSET, RECEIVER_ALLOC_SPACE_MISSES_OFFSET,
@@ -95,8 +89,11 @@ const DEOPT_BANK_BYTES: i32 = 16 * 8;
 const DEOPT_DUMP_BYTES: i32 = DEOPT_BANK_BYTES * 2;
 
 pub(super) struct Emission {
+    /// The finalized body; its entry is the tier entry over a published
+    /// interpreter frame.
     pub(super) code: CompiledCode,
-    pub(super) generated_stack_frame_bytes: u32,
+    /// Offset of the JavaScript call ABI entry.
+    pub(super) call_entry: usize,
     pub(super) relocations: RelocationCapture,
     pub(super) osr_headers: BTreeSet<u32>,
     pub(super) osr_regions: Vec<(u32, usize, usize)>,
@@ -131,6 +128,7 @@ impl SavedFrame {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit(
     view: &JitCompileSnapshot,
+    code_object_id: u64,
     sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
     frame: MachineFrameLayout,
@@ -139,12 +137,6 @@ pub(super) fn emit(
     transitions: &TransitionTable,
     poll_entry: u64,
     deopt_writeback_entry: u64,
-    _deopt_stack_call_entry: u64,
-    _resolve_direct_entry: u64,
-    _try_prepare_construct_entry: u64,
-    _prepare_construct_entry: u64,
-    _derived_construct_result_entry: u64,
-    _copy_spread_arguments_entry: u64,
     string_concat_entry: u64,
     _array_construct_entry: u64,
     number_rem_entry: u64,
@@ -152,12 +144,8 @@ pub(super) fn emit(
     number_to_int32_entry: u64,
     strict_eq_entry: u64,
     to_boolean_entry: u64,
-    _call_method_value_entry: u64,
-    _call_with_this_value_entry: u64,
-    _construct_value_entry: u64,
     load_ic_cells: &mut [PropertySourceCell],
     store_ic_cells: &mut [PropertySourceCell],
-    vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
     validate_locations(sequence, allocation)?;
@@ -196,7 +184,25 @@ pub(super) fn emit(
         .iter()
         .any(|i| i.opcode == MachineOpcode::BackedgePoll);
 
-    prologue(&mut ops, frame, saved);
+    let shape = crate::x86_64::activation::EntryShape::of(
+        view,
+        code_object_id,
+        otter_vm::native_abi::NativeFrameKind::Optimizing,
+        !safepoints.records().is_empty(),
+    )?;
+    let exits = activation::ExitLabels {
+        plain: ops.new_dynamic_label(),
+        construct: shape.completes_construct().then(|| ops.new_dynamic_label()),
+    };
+    // The tier entry continues a published interpreter frame; the call entry
+    // builds this function's record and falls through into the body.
+    let body = ops.new_dynamic_label();
+    let tier_entry = activation::emit_tier_entry(&mut ops, frame, saved, body);
+    let (call_entry, call_entry_cold) =
+        activation::emit_call_entry(&mut ops, view, frame, saved, shape);
+    structural_regions.push(("machineTierEntry", None, tier_entry.0, call_entry.0));
+    structural_regions.push(("machineCallEntry", None, call_entry.0, ops.offset().0));
+    dynasm!(ops ; .arch x64 ; =>body);
     if has_poll {
         dynasm!(ops ; .arch x64 ; mov ebp, crate::GENERATED_POLL_BATCH as i32);
     }
@@ -269,12 +275,15 @@ pub(super) fn emit(
             }
             MachineOpcode::LoopPreheader => {}
             MachineOpcode::EntryValue(parameter) => {
+                // The record's actual pointer names the padded span of a
+                // call, or the window of a tier-entered interpreter frame.
                 let dst = ireg(loc[0])?;
                 let offset = i32::from(parameter) * 8;
+                let actuals = frame.record_offset() as i32
+                    + otter_vm::native_abi::NATIVE_FRAME_ACTUALS_OFFSET as i32;
                 dynasm!(ops
                     ; .arch x64
-                    ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
-                    ; mov r11, [r11 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
+                    ; mov r11, [rsp + actuals]
                     ; mov Rq(dst), [r11 + offset]
                 );
             }
@@ -345,8 +354,7 @@ pub(super) fn emit(
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                let flags = otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS
-                    | otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
+                let flags = otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
                 load_integer(&mut ops, frame, loc[0], 6)?;
                 dynasm!(ops
                     ; .arch x64
@@ -544,7 +552,7 @@ pub(super) fn emit(
             MachineOpcode::AllocateObject { plan, byte_pc } => {
                 let start = ops.offset().0;
                 load_integer(&mut ops, frame, loc[0], 2)?;
-                direct_call::emit_receiver_candidate_probe(&mut ops, &mut relocations, view, plan);
+                receiver_allocation::emit_receiver_candidate_probe(&mut ops, &mut relocations, view, plan);
                 store_integer(&mut ops, frame, loc[1], 0)?;
                 store_integer(&mut ops, frame, loc[2], 1)?;
                 structural_regions.push((
@@ -569,7 +577,7 @@ pub(super) fn emit(
                 load_integer(&mut ops, frame, loc[0], 2)?;
                 load_integer(&mut ops, frame, loc[1], 0)?;
                 load_integer(&mut ops, frame, loc[2], 1)?;
-                direct_call::emit_receiver_publication_effect(&mut ops, view);
+                receiver_allocation::emit_receiver_publication_effect(&mut ops, view);
                 dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
                 load64(&mut ops, 0, VALUE_UNDEFINED);
                 dynasm!(ops ; .arch x64 ; =>done);
@@ -2116,7 +2124,7 @@ pub(super) fn emit(
             MachineOpcode::Return => {
                 let src = ireg(loc[0])?;
                 dynasm!(ops ; .arch x64 ; mov rax, Rq(src) ; xor edx, edx);
-                epilogue(&mut ops, frame, saved);
+                activation::emit_return(&mut ops, frame, saved, exits);
             }
             MachineOpcode::Jump => {
                 let successor = sequence.blocks()[block_index]
@@ -2168,7 +2176,7 @@ pub(super) fn emit(
             MachineOpcode::Throw => {
                 load_integer(&mut ops, frame, loc[0], 0)?;
                 dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::Throw as i32);
-                epilogue(&mut ops, frame, saved);
+                activation::emit_plain_return(&mut ops, frame, saved);
             }
             MachineOpcode::NativeLeafIdentity {
                 builtin_native_ref,
@@ -2413,50 +2421,61 @@ pub(super) fn emit(
                     kind,
                     argument_mode,
                     candidates,
-                    caller_function_id,
-                    logical_pc,
                     byte_pc,
+                    ..
                 } = &descriptor.target
                 {
                     let site = safepoints
                         .site(id)
                         .filter(|site| instruction.safepoint == Some(site.id))
                         .ok_or(Unsupported::OperandShape("x86-64 direct call safepoint"))?;
-                    let exit = deopt(instruction.deopt_id(), &deopts)?;
-                    let direct_throw = ops.new_dynamic_label();
+                    let direct_threw = ops.new_dynamic_label();
                     let direct_done = ops.new_dynamic_label();
+                    if *kind == super::super::DirectCallKind::Forward {
+                        publish_forwarded_formals_context(
+                            &mut ops,
+                            view,
+                            frame,
+                            loc,
+                            descriptor.arguments.len(),
+                        )?;
+                    }
+                    save_roots(&mut ops, frame, site)?;
+                    stamp_call_site(&mut ops, site);
                     let start = ops.offset().0;
-                    let mut direct_regions = direct_call::DirectCallRegions::default();
-                    direct_call::emit(
+                    call::emit(
                         &mut ops,
                         &mut relocations,
-                        view,
-                        transitions,
-                        sequence,
-                        frame,
-                        instruction,
-                        descriptor,
-                        loc,
-                        site,
+                        &call::CallSite {
+                            view,
+                            transitions,
+                            sequence,
+                            instruction,
+                            frame,
+                            site,
+                            locations: loc,
+                            result_index: descriptor.arguments.len(),
+                            call_pc: safepoints.records()[site.id.0 as usize].call_pc,
+                            deopt: deopt(instruction.deopt_id(), &deopts)?,
+                            threw: direct_threw,
+                            fatal,
+                            done: direct_done,
+                        },
                         *kind,
                         *argument_mode,
                         candidates,
-                        *caller_function_id,
-                        *logical_pc,
-                        *byte_pc,
-                        false,
-                        exit,
-                        finish_error,
-                        fatal,
-                        direct_throw,
-                        direct_done,
-                        &mut direct_regions,
                     )?;
-                    dynasm!(ops ; .arch x64 ; =>direct_throw);
+                    structural_regions.push((
+                        "machineCallTrampoline",
+                        Some(*byte_pc),
+                        start,
+                        ops.offset().0,
+                    ));
+                    dynasm!(ops ; .arch x64 ; =>direct_threw);
                     match descriptor.exceptional {
                         super::super::ExceptionalEdge::Propagate => {
                             dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::Throw as i32);
-                            epilogue(&mut ops, frame, saved);
+                            activation::emit_plain_return(&mut ops, frame, saved);
                         }
                         super::super::ExceptionalEdge::LandingPad(target) => {
                             let result_index = descriptor.arguments.len();
@@ -2479,83 +2498,6 @@ pub(super) fn emit(
                         }
                     }
                     dynasm!(ops ; .arch x64 ; =>direct_done);
-                    structural_regions.push((
-                        if *kind == super::super::DirectCallKind::Forward {
-                            "machineForwardCall"
-                        } else {
-                            "machineDirectCall"
-                        },
-                        Some(*byte_pc),
-                        start,
-                        ops.offset().0,
-                    ));
-                    if *kind == super::super::DirectCallKind::Construct && candidates.is_empty() {
-                        structural_regions.push((
-                            "machineGenericConstruct",
-                            Some(*byte_pc),
-                            start,
-                            ops.offset().0,
-                        ));
-                    }
-                    for (guard_start, guard_end) in direct_regions.method_guards {
-                        structural_regions.push((
-                            "machineDirectMethodGuard",
-                            Some(*byte_pc),
-                            guard_start,
-                            guard_end,
-                        ));
-                    }
-                    for (candidate_start, candidate_end) in direct_regions.method_candidates {
-                        structural_regions.push((
-                            "machineDirectMethodCandidate",
-                            Some(*byte_pc),
-                            candidate_start,
-                            candidate_end,
-                        ));
-                    }
-                    for (generic_start, generic_end) in direct_regions.generic_methods {
-                        structural_regions.push((
-                            "machineGenericMethodCall",
-                            Some(*byte_pc),
-                            generic_start,
-                            generic_end,
-                        ));
-                    }
-                    for (region, ranges) in [
-                        (
-                            "directConstructPrepareFast",
-                            direct_regions.construct_prepare_fast,
-                        ),
-                        (
-                            "directConstructPrepareObservable",
-                            direct_regions.construct_prepare_observable,
-                        ),
-                        (
-                            "directConstructReceiverAllocFast",
-                            direct_regions.construct_receiver_alloc_fast,
-                        ),
-                        (
-                            "directConstructReceiverAllocCold",
-                            direct_regions.construct_receiver_alloc_cold,
-                        ),
-                        (
-                            "directConstructResultFast",
-                            direct_regions.construct_result_fast,
-                        ),
-                        (
-                            "directConstructResultThrow",
-                            direct_regions.construct_result_throw,
-                        ),
-                    ] {
-                        for (region_start, region_end) in ranges {
-                            structural_regions.push((
-                                region,
-                                Some(*byte_pc),
-                                region_start,
-                                region_end,
-                            ));
-                        }
-                    }
                     if !terminal {
                         edits(
                             &mut ops,
@@ -2814,29 +2756,90 @@ pub(super) fn emit(
         ; .arch x64
         ; =>throw_value
         ; mov edx, NativeResultStatus::Throw as i32
+        ; =>exits.plain
     );
-    epilogue(&mut ops, frame, saved);
-    emit_cold_exits(
+    activation::emit_plain_return(&mut ops, frame, saved);
+    activation::emit_bail(
         &mut ops,
         &mut relocations,
-        frame,
-        saved,
         transitions,
-        bail,
-        finish_error,
-        fatal,
-        vm_register_count,
-    );
-    emit_deopts(
-        &mut ops,
-        &mut relocations,
         frame,
         saved,
-        deopt_runtime,
-        deopt_writeback_entry,
-        &deopts,
-        shared_deopt,
-    )?;
+        shape,
+        exits,
+        bail,
+    );
+    // A parked error finishes at this frame's boundary.
+    let pair_side_exit = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; =>finish_error ; mov rdi, r15);
+    runtime(
+        &mut ops,
+        &mut relocations,
+        transitions.entry(STUB_JIT_FINISH_ERROR),
+        STUB_JIT_FINISH_ERROR,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; cmp edx, NativeResultStatus::SideExit as i32
+        ; je =>pair_side_exit
+        ; cmp edx, NativeResultStatus::Throw as i32
+        ; je =>exits.plain
+        ; cmp edx, NativeResultStatus::Fatal as i32
+        ; je =>exits.plain
+        ; =>fatal
+    );
+    load64(&mut ops, 0, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::Fatal as i32 ; jmp =>exits.plain);
+    activation::emit_pair_side_exit(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        frame,
+        saved,
+        exits,
+        pair_side_exit,
+    );
+    activation::emit_construct_completion(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        view,
+        frame,
+        shape,
+        exits,
+    );
+    activation::emit_call_entry_cold(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        frame,
+        saved,
+        exits,
+        call_entry_cold,
+    );
+    if !deopts.is_empty() {
+        for (index, &label) in deopts.iter().enumerate() {
+            let index = i32::try_from(index)
+                .ok()
+                .filter(|index| *index <= i32::from(u16::MAX))
+                .ok_or(Unsupported::OperandShape("x86-64 deopt count"))?;
+            dynasm!(ops ; .arch x64 ; =>label ; mov r11d, index ; jmp =>shared_deopt);
+        }
+        activation::emit_deopt(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            frame,
+            saved,
+            shape,
+            exits,
+            deopt_runtime,
+            deopt_writeback_entry,
+            shared_deopt,
+        );
+    }
+    // OSR exits leave a tier-entered frame only.
     for (bail, logical_pc) in osr_bails {
         dynasm!(ops
             ; .arch x64
@@ -2850,22 +2853,49 @@ pub(super) fn emit(
             SideExit::new(logical_pc, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits(),
         );
         dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::SideExit as i32);
-        epilogue(&mut ops, frame, saved);
+        activation::emit_plain_return(&mut ops, frame, saved);
     }
     let buffer = crate::entry::finalize_assembler(ops)?;
     Ok(Emission {
-        code: CompiledCode::new(buffer, AssemblyOffset(0)),
-        generated_stack_frame_bytes: frame.frame_bytes()
-            + if deopts.is_empty() {
-                0
-            } else {
-                DEOPT_DUMP_BYTES as u32
-            },
+        code: CompiledCode::new(buffer, tier_entry),
+        call_entry: call_entry.0,
         relocations,
         osr_headers,
         osr_regions,
         structural_regions,
     })
+}
+
+/// Store the forwarding function's parameter-scope context, the forward
+/// call's trailing argument, into its frame register. Native argument
+/// copies and arguments-object materialization read the context-held mapped
+/// formals through that register, which Machine code does not otherwise
+/// keep current. The register window is traced.
+fn publish_forwarded_formals_context(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    frame: MachineFrameLayout,
+    locations: &[AllocatedLocation],
+    argument_count: usize,
+) -> Result<(), Unsupported> {
+    let Some(frame_register) = view.code_block.forwarded_formals_context() else {
+        return Ok(());
+    };
+    let context = *argument_count
+        .checked_sub(1)
+        .and_then(|index| locations.get(index))
+        .ok_or(Unsupported::OperandShape("x86-64 forwarded formals context"))?;
+    // r11 is the only integer scratch; borrow rax around the store.
+    dynasm!(ops ; .arch x64 ; push rax);
+    load_integer_with_bias(ops, frame, context, 11, 8)?;
+    dynasm!(ops
+        ; .arch x64
+        ; mov rax, [r15 + NATIVE_FRAME_OFFSET as i32]
+        ; mov rax, [rax + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
+        ; mov [rax + i32::from(frame_register) * 8], r11
+        ; pop rax
+    );
+    Ok(())
 }
 
 fn validate_locations(
@@ -2923,54 +2953,7 @@ fn maybe_deopt(
     .transpose()
 }
 
-fn prologue(ops: &mut Assembler, frame: MachineFrameLayout, saved: SavedFrame) {
-    dynasm!(ops ; .arch x64 ; push rbp ; push r15);
-    if saved.rbx {
-        dynasm!(ops ; .arch x64 ; push rbx);
-    }
-    if let Some(highest) = saved.highest {
-        for register in 12..=highest {
-            dynasm!(ops ; .arch x64 ; push Rq(register));
-        }
-    }
-    let padding = frame.fixed_bytes() - saved.actual_bytes();
-    if padding != 0 {
-        dynasm!(ops ; .arch x64 ; sub rsp, padding as i32);
-    }
-    if frame.spill_area_bytes() != 0 {
-        dynasm!(ops ; .arch x64 ; sub rsp, frame.spill_area_bytes() as i32);
-    }
-    dynasm!(ops ; .arch x64 ; mov r15, rdi);
-    // Publish the root-home base once; call sites then name only their
-    // safepoint.
-    if let Ok(roots) = frame.root_offset(0) {
-        dynasm!(ops
-            ; .arch x64
-            ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-            ; lea r11, [rsp + roots as i32]
-            ; mov [r10 + NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], r11
-        );
-    }
-}
 
-fn epilogue(ops: &mut Assembler, frame: MachineFrameLayout, saved: SavedFrame) {
-    if frame.spill_area_bytes() != 0 {
-        dynasm!(ops ; .arch x64 ; add rsp, frame.spill_area_bytes() as i32);
-    }
-    let padding = frame.fixed_bytes() - saved.actual_bytes();
-    if padding != 0 {
-        dynasm!(ops ; .arch x64 ; add rsp, padding as i32);
-    }
-    if let Some(highest) = saved.highest {
-        for register in (12..=highest).rev() {
-            dynasm!(ops ; .arch x64 ; pop Rq(register));
-        }
-    }
-    if saved.rbx {
-        dynasm!(ops ; .arch x64 ; pop rbx);
-    }
-    dynasm!(ops ; .arch x64 ; pop r15 ; pop rbp ; ret);
-}
 
 fn edits(
     ops: &mut Assembler,
@@ -4369,134 +4352,7 @@ fn root_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported>
         .map_err(|_| Unsupported::OperandShape("x86-64 root-save offset"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_cold_exits(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    frame: MachineFrameLayout,
-    saved: SavedFrame,
-    transitions: &TransitionTable,
-    bail: DynamicLabel,
-    finish_error: DynamicLabel,
-    fatal: DynamicLabel,
-    register_count: u16,
-) {
-    dynasm!(ops
-        ; .arch x64
-        ; =>bail
-        ; mov r11, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov DWORD [r11 + NATIVE_FRAME_PC_OFFSET as i32], 0
-    );
-    materialize_vm_window(ops, register_count);
-    load64(
-        ops,
-        0,
-        SideExit::new(0, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits(),
-    );
-    dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::SideExit as i32);
-    epilogue(ops, frame, saved);
 
-    let pair_exit = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64 ; =>finish_error ; mov rdi, r15);
-    runtime(
-        ops,
-        relocations,
-        transitions.entry(STUB_JIT_FINISH_ERROR),
-        STUB_JIT_FINISH_ERROR,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; call r11
-        ; cmp edx, NativeResultStatus::SideExit as i32
-        ; je =>pair_exit
-        ; cmp edx, NativeResultStatus::Throw as i32
-        ; je =>pair_exit
-        ; cmp edx, NativeResultStatus::Fatal as i32
-        ; je =>pair_exit
-        ; =>fatal
-    );
-    load64(ops, 0, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch x64 ; mov edx, NativeResultStatus::Fatal as i32 ; =>pair_exit);
-    epilogue(ops, frame, saved);
-}
-
-fn materialize_vm_window(ops: &mut Assembler, register_count: u16) {
-    let done = ops.new_dynamic_label();
-    let loop_label = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch x64
-        ; mov r10, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; movzx r11d, WORD [r10 + NATIVE_FRAME_REGISTER_COUNT_OFFSET as i32]
-        ; cmp r11d, register_count as i32
-        ; je =>done
-        ; mov rax, [r10 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
-        ; lea rax, [rax + r11 * 8]
-        ; mov ecx, register_count as i32
-        ; sub ecx, r11d
-    );
-    load64(ops, 11, VALUE_UNDEFINED);
-    dynasm!(ops
-        ; .arch x64
-        ; =>loop_label
-        ; mov [rax], r11
-        ; add rax, 8
-        ; sub ecx, 1
-        ; jne =>loop_label
-        ; mov WORD [r10 + NATIVE_FRAME_REGISTER_COUNT_OFFSET as i32], register_count as i16
-        ; =>done
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_deopts(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    frame: MachineFrameLayout,
-    saved: SavedFrame,
-    runtime_data: &DeoptRuntime,
-    entry: u64,
-    labels: &[DynamicLabel],
-    shared: DynamicLabel,
-) -> Result<(), Unsupported> {
-    if labels.is_empty() {
-        return Ok(());
-    }
-    for (index, &label) in labels.iter().enumerate() {
-        let index = i32::try_from(index)
-            .ok()
-            .filter(|index| *index <= i32::from(u16::MAX))
-            .ok_or(Unsupported::OperandShape("x86-64 deopt count"))?;
-        dynasm!(ops ; .arch x64 ; =>label ; mov r11d, index ; jmp =>shared);
-    }
-    dynasm!(ops ; .arch x64 ; =>shared ; sub rsp, DEOPT_DUMP_BYTES);
-    for register in 0_u8..16 {
-        let offset = i32::from(register) * 8;
-        dynasm!(ops ; .arch x64 ; mov [rsp + offset], Rq(register));
-    }
-    for register in 0_u8..16 {
-        let offset = DEOPT_BANK_BYTES + i32::from(register) * 8;
-        dynasm!(ops ; .arch x64 ; movsd [rsp + offset], Rx(register));
-    }
-    dynasm!(ops ; .arch x64 ; mov rdi, r15 ; mov esi, r11d);
-    symbolic(
-        ops,
-        relocations,
-        2,
-        std::ptr::from_ref::<DeoptRuntime>(runtime_data) as u64,
-        RelocationTarget::DeoptRuntimeData,
-    );
-    dynasm!(ops
-        ; .arch x64
-        ; lea rcx, [rsp]
-        ; lea r8, [rsp + DEOPT_DUMP_BYTES]
-        ; mov r9, [r15 + NATIVE_FRAME_OFFSET as i32]
-        ; mov r9, [r9 + NATIVE_FRAME_REGISTER_BASE_OFFSET as i32]
-    );
-    runtime(ops, relocations, entry, STUB_JIT_DEOPT_WRITEBACK);
-    dynasm!(ops ; .arch x64 ; call r11 ; add rsp, DEOPT_DUMP_BYTES);
-    epilogue(ops, frame, saved);
-    Ok(())
-}
 
 /// Read interpreter frame register `frame_register` into `location` as
 /// `value_type`, jumping to `reject` when the tagged value lies outside it.
@@ -4928,7 +4784,7 @@ fn emit_inline_explicit_this(
         dynasm!(ops ; .arch x64 ; cmp rax, r10 ; je =>global_this);
         load64(ops, 10, Value::null().to_bits());
         dynasm!(ops ; .arch x64 ; cmp rax, r10 ; je =>global_this);
-        direct_call::emit_construct_object_branch(ops, view, 0, done, miss);
+        crate::x86_64::activation::emit_object_test(ops, view, 0, done, miss);
         dynasm!(ops
             ; .arch x64
             ; =>global_this

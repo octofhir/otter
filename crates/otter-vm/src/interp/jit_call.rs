@@ -1,8 +1,8 @@
 //! JIT entry, OSR, and generated-call frame plumbing.
 //!
 //! # Contents
-//! Tier-up dispatch (`maybe_dispatch_jit`, backedge/OSR accounting),
-//! compiled-frame entry (`run_compiled_frame`, `jit_runtime_call`),
+//! Tier-entry selection (`prepare_compiled_entry`, backedge/OSR accounting),
+//! compiled completions (`complete_compiled_entry`, `jit_runtime_call`),
 //! generated-call feedback through focused `jit_calls` modules, and cold
 //! inlined/stack-call side-exit materialization in `jit_calls/deopt`.
 //! Call and back-edge accounting also feeds the additive optimizing-tier
@@ -25,9 +25,9 @@
 //! exact continuation PC to the native entry boundary. They use the same fully
 //! wired runtime activation, published native frame, and call-scoped VM thread
 //! as baseline entries.
-//! Canonical tier transitions retain one [`NativeFrame`] and register window;
-//! materialized [`Frame`] construction is confined to cold deoptimization and
-//! interpreter-owned dispatch.
+//! Canonical tier transitions retain one [`Frame`] and register window;
+//! The native trampoline owns physical call frames; inline deopt prepares
+//! only descendants that had no physical activation.
 //! Template entry and loop OSR retain one canonical whole-function body per
 //! function id and select a header-specific trampoline from that shared object.
 //! A nested compiled return never allocates during post-entry bookkeeping: it
@@ -37,7 +37,7 @@
 use super::jit_compile::TemplateCompileOutcome;
 use crate::*;
 use crate::{
-    native_abi::{NativeFrame, NativeResultDomain, NativeResultPair, NativeResultStatus, SideExit},
+    native_abi::{Frame, NativeResultDomain, NativeResultPair, NativeResultStatus, SideExit},
     rooting::RootScopeExt,
 };
 
@@ -91,7 +91,7 @@ impl Interpreter {
         thrown: Value,
     ) -> Result<(), VmError> {
         if self.pending_uncaught_frames.is_none() {
-            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+            self.pending_uncaught_frames = Some(self.snapshot_active_frames(context, usize::MAX));
         }
         let unwind = self.unwind_throw_above(context, stack, floor, thrown);
         if unwind.is_ok() {
@@ -100,14 +100,6 @@ impl Interpreter {
         unwind
     }
 
-    /// After a call pushed a fresh bytecode callee frame as the new top of
-    /// `stack`, try to run it as compiled baseline code instead of interpreting.
-    ///
-    /// Only invoked when a JIT hook is installed and a frame was actually
-    /// pushed (the caller checks `stack` grew). Returns `Ok(None)` to interpret
-    /// normally; `Ok(Some(popped))` when the JIT ran and the callee returned,
-    /// where `popped` mirrors [`Self::return_running_finally`] (`Some(v)` means
-    /// the return unwound the dispatch entry and the loop should yield `v`).
     /// Count a generated receiver-allocation miss that left compiled code
     /// through an exact `AllocationMiss` exit instead of the cold allocation
     /// sibling, so every counted probe miss has exactly one completion.
@@ -184,30 +176,103 @@ impl Interpreter {
         });
     }
 
-    pub(crate) fn maybe_dispatch_jit(
+    /// Select a generation for assembly to enter after this Rust entry returns.
+    pub(crate) fn prepare_compiled_entry(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+    ) -> Result<Option<usize>, VmError> {
+        let top = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        let frame = &stack[top];
+        if frame.pc != 0 || self.frame_has_suspension_owner(frame) {
+            return Ok(None);
+        }
+        let fid = frame.function_id;
+        let owner = context
+            .for_function(fid)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
+        let code = self
+            .resolve_optimized_code_for_fid(context, fid)
+            .or_else(|| self.resolve_jit_code(stack, context, top));
+        let Some(code) = code else {
+            return Ok(None);
+        };
+        let Some(entry) = code.entry_addr().filter(|entry| *entry != 0) else {
+            return Ok(None);
+        };
+        if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
+            return Ok(None);
+        }
+        let kind = code.native_frame_kind();
+        let frame = &mut stack[top];
+        if !frame.enter_compiled(kind) {
+            return Err(VmError::InvalidOperand);
+        }
+        frame.code_object_id =
+            u32::try_from(code.metadata().id).map_err(|_| VmError::InvalidOperand)?;
+        if code.safepoint_count() != 0 {
+            frame.header.flags = native_abi::NativeFrameFlags::from_bits(
+                frame.header.flags.bits() | native_abi::NativeFrameFlags::HAS_SAFEPOINTS,
+            );
+        }
+        if kind == native_abi::NativeFrameKind::Optimizing {
+            self.jit_runtime_stats.optimized_entries =
+                self.jit_runtime_stats.optimized_entries.saturating_add(1);
+        }
+        Ok(Some(entry))
+    }
+
+    /// Consume a generated result on the same physical frame at the Rust entry.
+    pub(crate) fn complete_compiled_entry(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         floor: ActivationFloor,
-    ) -> Result<Option<Option<Value>>, VmError> {
-        let top_idx = stack.len() - 1;
-        let (outcome, optimized) =
-            if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
-                (outcome, true)
-            } else {
-                let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
-                    return Ok(None);
-                };
-                (
-                    self.run_compiled_frame(stack, context, top_idx, &code),
-                    false,
-                )
-            };
-        match outcome {
-            jit::JitExecOutcome::Bailed(exit) => {
-                let pc = exit.logical_pc();
-                stack[top_idx].pc = pc;
-                let fid = stack[top_idx].function_id;
+        result: NativeResultPair,
+    ) -> Result<Option<Value>, VmError> {
+        let top = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        let fid = stack[top].function_id;
+        let owner = context
+            .for_function(fid)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let context = &*owner;
+        let optimized = stack[top].header.kind == native_abi::NativeFrameKind::Optimizing;
+        let pc = stack[top].pc;
+        let osr_origin = self
+            .frame_cold_mut(&mut stack[top])
+            .and_then(|cold| cold.osr_origin.take());
+        let status = result
+            .validate(NativeResultDomain::Compiled)
+            .ok_or(VmError::InvalidOperand)?;
+        if !stack[top].enter_interpreter() {
+            return Err(VmError::InvalidOperand);
+        }
+        match status {
+            NativeResultStatus::Success => {
+                if !optimized {
+                    self.note_jit_entry_success(fid);
+                }
+                self.return_running_finally_above(stack, floor, result.payload_value())
+            }
+            NativeResultStatus::SideExit => {
+                let exit = result.side_exit_payload().ok_or(VmError::InvalidOperand)?;
+                if exit.logical_pc() != pc {
+                    return Err(VmError::InvalidOperand);
+                }
+                if optimized {
+                    let count = context
+                        .exec_function(fid)
+                        .ok_or(VmError::InvalidOperand)?
+                        .param_count;
+                    let parameters = stack[top]
+                        .registers
+                        .get(..usize::from(count))
+                        .ok_or(VmError::InvalidOperand)?
+                        .to_vec();
+                    self.widen_exited_parameters(fid, exit, &parameters);
+                    self.note_jit_optimized_bail(context, fid, exit);
+                }
                 self.record_jit_bail(
                     context,
                     fid,
@@ -216,39 +281,41 @@ impl Interpreter {
                     } else {
                         jit_debug::JitDebugTier::Template
                     },
-                    jit_debug::JitDebugTarget::Entry,
+                    osr_origin.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
+                        jit_debug::JitDebugTarget::Osr { pc }
+                    }),
                     exit,
                 );
-                // `run_optimized_frame` owns optimizing-bail accounting because
-                // callers such as the iterator fast path consume its outcome
-                // directly. Do not count the same exit again at this dispatch
-                // wrapper.
-                // A poll that handed the loop back to the interpreter is not
-                // a miss of this body.
-                if !optimized
-                    && !Self::is_poll_handoff(exit)
-                    && !self.reoptimize_arith_overflow_bail(context, fid, exit)
-                {
+                let repaired =
+                    !optimized && self.reoptimize_arith_overflow_bail(context, fid, exit);
+                if let Some(origin) = osr_origin {
+                    let installed = if optimized {
+                        matches!(self.jit_optimized_code.get(&fid), Some(Some(_)))
+                    } else {
+                        matches!(self.jit_code.get(&fid), Some(Some(_)))
+                    };
+                    if installed
+                        && !repaired
+                        && !Self::is_poll_handoff(exit)
+                        && Self::osr_bail_inside_target_loop(context, fid, origin, pc)
+                    {
+                        self.jit_osr_disabled.insert((fid, origin));
+                    }
+                } else if !optimized && !repaired && !Self::is_poll_handoff(exit) {
                     self.note_jit_entry_bail(context, fid);
                 }
                 Ok(None)
             }
-            jit::JitExecOutcome::Returned(value) => {
-                if !optimized {
-                    self.note_jit_entry_success(stack[top_idx].function_id);
-                }
-                let popped = self.return_running_finally_above(stack, floor, value)?;
-                Ok(Some(popped))
+            NativeResultStatus::Throw => {
+                self.unwind_compiled_throw_above(context, stack, floor, result.payload_value())?;
+                Ok(stack.is_at_floor(floor).then_some(Value::UNDEFINED))
             }
-            jit::JitExecOutcome::Throw(thrown) => {
-                self.unwind_compiled_throw_above(context, stack, floor, thrown)?;
-                if stack.is_at_floor(floor) {
-                    Ok(Some(Some(Value::undefined())))
-                } else {
-                    Ok(None)
-                }
+            NativeResultStatus::Fatal => {
+                let ctx = stack.execution_context();
+                let error = unsafe { (*ctx).error.as_mut() }.and_then(Option::take);
+                Err(error.unwrap_or(VmError::InvalidOperand))
             }
-            jit::JitExecOutcome::Fatal(err) => Err(err),
+            _ => Err(VmError::InvalidOperand),
         }
     }
 
@@ -267,8 +334,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
-        floor: ActivationFloor,
-    ) -> Result<Option<Option<Value>>, VmError> {
+    ) -> Result<Option<usize>, VmError> {
         // Interpreter-only (no JIT installed): pay nothing beyond this branch.
         if self.jit_hook.is_none() {
             return Ok(None);
@@ -347,12 +413,12 @@ impl Interpreter {
             return Ok(None);
         }
         // Threshold reached: drop this header's counter (it tiers up now or is
-        // marked disabled by `maybe_osr`, so it should not keep counting) and
+        // marked disabled by `prepare_osr`, so it should not keep counting) and
         // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
         self.jit_osr_counts.remove(&key);
         self.jit_osr_trigger = Some((key.0, key.1, u64::from(count)));
-        let outcome = self.maybe_osr(stack, context, top_idx, floor, optimizing);
+        let outcome = self.prepare_osr(stack, context, top_idx, optimizing);
         self.jit_osr_trigger = None;
         outcome
     }
@@ -416,68 +482,33 @@ impl Interpreter {
         .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
     }
 
-    /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
-    /// the threshold crossing (the top frame's `pc` is the loop header just
-    /// branched to). It prefers whole-body optimizing OSR, then preserves the
-    /// template OSR fallback for functions outside the optimizing subset.
-    ///
-    /// Returns `Ok(None)` to keep interpreting (ineligible, no OSR entry for
-    /// this header, or the compiled body bailed); `Ok(Some(popped))` when
-    /// compiled code ran the frame to `Return` and unwound the dispatch entry
-    /// (mirrors [`Self::maybe_dispatch_jit`]).
-    pub(crate) fn maybe_osr(
+    /// Select a loop entry and yield it to the common native trampoline.
+    pub(crate) fn prepare_osr(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
-        floor: ActivationFloor,
         prefer_optimizing: bool,
-    ) -> Result<Option<Option<Value>>, VmError> {
+    ) -> Result<Option<usize>, VmError> {
         let frame = &stack[top_idx];
-        // Only ordinary bytecode frames; async/generator bodies resume through
-        // their own machinery and must not be entered mid-loop.
         if self.frame_has_suspension_owner(frame) {
             return Ok(None);
         }
         let fid = frame.function_id;
-        // Whole function uncompilable → never retry, never re-arm.
-        if self.jit_osr_disabled.contains(&(fid, u32::MAX)) {
-            return Ok(None);
-        }
         let osr_pc = frame.pc;
-        // This specific loop header already proved un-tierable (bailed / no
-        // trampoline). The caller re-arms the counter, so a different hot loop
-        // in the same function still gets a tier-up shot.
-        if self.jit_osr_disabled.contains(&(fid, osr_pc)) {
+        if self.jit_osr_disabled.contains(&(fid, u32::MAX))
+            || self.jit_osr_disabled.contains(&(fid, osr_pc))
+        {
             return Ok(None);
         }
-        // See `run_compiled_frame`: the activation must name the chunk owning
-        // the OSR-entered frame, not the caller tick's chunk.
-        let resolved = context
-            .for_function(fid)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
-        let optimized_outcome = prefer_optimizing
+        let optimized = prefer_optimizing
             .then(|| self.resolve_optimized_osr_code(context, fid, osr_pc))
             .flatten()
             .filter(|code| self.jit_code_registry.is_current_for_entry(code.as_ref()))
-            .and_then(|code| code.run_optimized_osr_entry(activation, osr_pc));
-        let (outcome, optimized) = if let Some(outcome) = optimized_outcome {
-            self.jit_runtime_stats.optimized_entries =
-                self.jit_runtime_stats.optimized_entries.saturating_add(1);
-            self.jit_runtime_stats.optimized_osr_entries = self
-                .jit_runtime_stats
-                .optimized_osr_entries
-                .saturating_add(1);
-            if let jit::JitExecOutcome::Bailed(exit) = outcome {
-                self.note_jit_optimized_bail(context, fid, exit);
-            }
-            (outcome, true)
+            .and_then(|code| code.osr_entry_addr(osr_pc).map(|entry| (code, entry)));
+        let (code, entry) = if let Some(selected) = optimized {
+            selected
         } else {
-            // The whole-body optimizer declined this function/header. A
-            // Template body already contains the trampolines for every
-            // eligible loop header, so one function-owned object serves every
-            // OSR target instead of duplicating the whole executable mapping.
             let code = match self.resolve_template_osr_code(context, fid, osr_pc) {
                 TemplateCompileOutcome::Installed(code) => code,
                 TemplateCompileOutcome::Unsupported | TemplateCompileOutcome::Deferred => {
@@ -487,68 +518,38 @@ impl Interpreter {
             if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
                 return Ok(None);
             }
-            let Some(outcome) = code.osr_entry(activation, osr_pc) else {
+            let Some(entry) = code.osr_entry_addr(osr_pc) else {
                 self.jit_osr_disabled.insert((fid, osr_pc));
                 return Ok(None);
             };
-            (outcome, false)
+            (code, entry)
         };
-        match outcome {
-            jit::JitExecOutcome::Bailed(exit) => {
-                let pc = exit.logical_pc();
-                // Compiled body hit a guard or unsupported opcode. Resume the
-                // interpreter at the exact bail PC (committed side effects are
-                // preserved). Disable this loop header only when the miss was in
-                // the target loop itself. A compiled OSR slice may finish the hot
-                // loop, continue through cold epilogue/outer-loop code, and bail
-                // there; that should not permanently suppress the header on the
-                // next hot iteration.
-                self.record_jit_bail(
-                    context,
-                    fid,
-                    if optimized {
-                        jit_debug::JitDebugTier::Optimizing
-                    } else {
-                        jit_debug::JitDebugTier::Template
-                    },
-                    jit_debug::JitDebugTarget::Osr { pc: osr_pc },
-                    exit,
-                );
-                stack[top_idx].pc = pc;
-                // An optimizing exit already ran its arithmetic repair in
-                // `note_jit_optimized_bail`; a template exit repairs here.
-                if !optimized && self.reoptimize_arith_overflow_bail(context, fid, exit) {
-                    return Ok(None);
-                }
-                // A back-edge relink or a repair already unlinked the body;
-                // the header must stay eligible for its replacement.
-                let tier_still_installed = if optimized {
-                    matches!(self.jit_optimized_code.get(&fid), Some(Some(_)))
-                } else {
-                    matches!(self.jit_code.get(&fid), Some(Some(_)))
-                };
-                if tier_still_installed
-                    && !Self::is_poll_handoff(exit)
-                    && Self::osr_bail_inside_target_loop(context, fid, osr_pc, pc)
-                {
-                    self.jit_osr_disabled.insert((fid, osr_pc));
-                }
-                Ok(None)
-            }
-            jit::JitExecOutcome::Returned(value) => {
-                let popped = self.return_running_finally_above(stack, floor, value)?;
-                Ok(Some(popped))
-            }
-            jit::JitExecOutcome::Throw(thrown) => {
-                self.unwind_compiled_throw_above(context, stack, floor, thrown)?;
-                if stack.is_at_floor(floor) {
-                    Ok(Some(Some(Value::undefined())))
-                } else {
-                    Ok(None)
-                }
-            }
-            jit::JitExecOutcome::Fatal(err) => Err(err),
+        if entry == 0 {
+            return Err(VmError::InvalidOperand);
         }
+        let kind = code.native_frame_kind();
+        let frame = &mut stack[top_idx];
+        if !frame.enter_compiled(kind) {
+            return Err(VmError::InvalidOperand);
+        }
+        frame.code_object_id =
+            u32::try_from(code.metadata().id).map_err(|_| VmError::InvalidOperand)?;
+        let mut flags = frame.header.flags.bits() & !native_abi::NativeFrameFlags::HAS_SAFEPOINTS;
+        if code.safepoint_count() != 0 {
+            flags |= native_abi::NativeFrameFlags::HAS_SAFEPOINTS;
+        }
+        if kind == native_abi::NativeFrameKind::Optimizing {
+            flags |= native_abi::NativeFrameFlags::OSR_ENTRY;
+            self.jit_runtime_stats.optimized_entries =
+                self.jit_runtime_stats.optimized_entries.saturating_add(1);
+            self.jit_runtime_stats.optimized_osr_entries = self
+                .jit_runtime_stats
+                .optimized_osr_entries
+                .saturating_add(1);
+        }
+        frame.header.flags = native_abi::NativeFrameFlags::from_bits(flags);
+        self.frame_ensure_cold(frame).osr_origin = Some(osr_pc);
+        Ok(Some(entry))
     }
 
     /// Resolve one whole-function Template body for loop OSR.
@@ -984,119 +985,6 @@ impl Interpreter {
         self.discard_invalidated_jit_state(&affected);
     }
 
-    /// Cold repair for one stable generated-call function cell.
-    ///
-    /// Publication normally keeps the cell hot and this is never called.
-    /// A zero target first republishes an installed fallback generation. If
-    /// invalidation removed every generation, the resolver may compile a fresh
-    /// baseline while the caller's native frame remains the authoritative root
-    /// owner. Failure leaves the caller on its exact pre-effect side exit.
-    pub fn jit_resolve_direct_entry(
-        &mut self,
-        context: &ExecutionContext,
-        function_entry_addr: u64,
-    ) -> u64 {
-        self.jit_runtime_stats.cold_entry_resolver_misses = self
-            .jit_runtime_stats
-            .cold_entry_resolver_misses
-            .saturating_add(1);
-        let resolved = self
-            .jit_code_registry
-            .resolve_function_entry(function_entry_addr);
-        if resolved != 0 {
-            return resolved;
-        }
-        let Some(fid) = self
-            .jit_code_registry
-            .function_id_for_entry_addr(function_entry_addr)
-        else {
-            return 0;
-        };
-        if matches!(self.jit_code.get(&fid), Some(None)) {
-            return 0;
-        }
-        self.jit_runtime_stats.compile_attempts =
-            self.jit_runtime_stats.compile_attempts.saturating_add(1);
-        let outcome = self.compile_jit_function(context, fid, None);
-        self.retain_template_compile_outcome(fid, outcome);
-        self.jit_code_registry
-            .resolve_function_entry(function_entry_addr)
-    }
-
-    /// Tier-up entry point for a synchronously-entered call frame (the
-    /// [`Self::run_callable_sync`] path), where the callee frame was just
-    /// pushed as the sole frame above `floor`. Mirrors
-    /// [`Self::maybe_dispatch_jit`] but, on a successful compiled run, the
-    /// completion *is* the call result (there is no caller frame to unwind
-    /// into). The stack below `floor` may hold frames owned by live compiled
-    /// entries — an unhandled throw must never unwind past `floor`.
-    ///
-    /// Returns `Ok(Some(v))` when compiled code ran the frame to completion, or
-    /// `Ok(None)` to interpret it normally.
-    pub(crate) fn dispatch_jit_sync_entry(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        floor: ActivationFloor,
-    ) -> Result<Option<Value>, VmError> {
-        if self.jit_hook.is_none() {
-            return Ok(None);
-        }
-        let top_idx = stack.len() - 1;
-        let (outcome, optimized) =
-            if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
-                (outcome, true)
-            } else {
-                let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
-                    return Ok(None);
-                };
-                (
-                    self.run_compiled_frame(stack, context, top_idx, &code),
-                    false,
-                )
-            };
-        match outcome {
-            jit::JitExecOutcome::Bailed(exit) => {
-                let pc = exit.logical_pc();
-                stack[top_idx].pc = pc;
-                let fid = stack[top_idx].function_id;
-                self.record_jit_bail(
-                    context,
-                    fid,
-                    if optimized {
-                        jit_debug::JitDebugTier::Optimizing
-                    } else {
-                        jit_debug::JitDebugTier::Template
-                    },
-                    jit_debug::JitDebugTarget::SyncEntry,
-                    exit,
-                );
-                // The optimizing entry helper already recorded this exit; this
-                // synchronous wrapper only owns template-entry accounting.
-                // A poll that handed the loop back to the interpreter is not
-                // a miss of this body.
-                if !optimized
-                    && !Self::is_poll_handoff(exit)
-                    && !self.reoptimize_arith_overflow_bail(context, fid, exit)
-                {
-                    self.note_jit_entry_bail(context, fid);
-                }
-                Ok(None)
-            }
-            jit::JitExecOutcome::Returned(value) => {
-                if !optimized {
-                    self.note_jit_entry_success(stack[top_idx].function_id);
-                }
-                Ok(Some(value))
-            }
-            jit::JitExecOutcome::Throw(thrown) => {
-                self.unwind_compiled_throw_above(context, stack, floor, thrown)?;
-                Ok(None)
-            }
-            jit::JitExecOutcome::Fatal(err) => Err(err),
-        }
-    }
-
     /// Resolve installed compiled code for the bytecode frame at `top_idx`,
     /// compiling once the measured payoff becomes positive. Returns `None` when the frame is
     /// ineligible (not a fresh ordinary bytecode entry), still cold, or known to
@@ -1116,69 +1004,24 @@ impl Interpreter {
         self.resolve_jit_code_for_fid(context, frame.function_id)
     }
 
-    /// Resolve and enter installed optimized code over a fresh interpreter
-    /// frame through the same runtime activation used by baseline code.
-    pub(crate) fn run_optimized_frame(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        top_idx: usize,
-    ) -> Option<jit::JitExecOutcome> {
-        self.promote_hot_generated_callee(context);
-        let frame = stack.get(top_idx)?;
-        if frame.pc != 0 || self.frame_has_suspension_owner(frame) {
-            return None;
-        }
-        let fid = frame.function_id;
-        let code = self.resolve_optimized_code_for_fid(context, fid)?;
-        // Resolve the chunk owning the entered frame before any table read: a
-        // caller in another chunk (a later script, an eval body, a
-        // synchronous re-entry through an Array callback or comparator)
-        // passes its own ambient chunk, whose tables do not describe this
-        // function id at all — and runtime stubs decode published pcs and
-        // constant indices through the activation, so the activation must be
-        // the owner as well.
-        let resolved = context.for_function(fid).ok()?;
-        let function = resolved.exec_function(fid)?;
-        let param_count = usize::from(function.param_count);
-        if param_count > stack[top_idx].registers.len() {
-            return None;
-        }
-        self.jit_runtime_stats.optimized_entries =
-            self.jit_runtime_stats.optimized_entries.saturating_add(1);
-        let activation = VmRuntimeActivation::new(self, stack, &resolved, top_idx);
-        let outcome = code.run_optimized_entry(activation)?;
-        if let jit::JitExecOutcome::Bailed(exit) = outcome {
-            let parameters = stack[top_idx]
-                .registers
-                .get(..param_count)
-                .map(<[Value]>::to_vec)
-                .unwrap_or_default();
-            self.widen_exited_parameters(fid, exit, &parameters);
-            self.note_jit_optimized_bail(context, fid, exit);
-        }
-        Some(outcome)
-    }
-
-    /// Run promotion policy for the first pending generated callee request.
+    /// Run the promotion policy for a function whose generation the call
+    /// trampoline found past its break-even.
     ///
-    /// Generated direct calls never enter through the interpreter, so their
-    /// callee's entry counter would stay cold forever; the linkage instead
-    /// counts entries into the callee's generation and records the function in
-    /// the registry mailbox at its function-specific break-even point. This
-    /// drain runs the complete live decision for it: a
-    /// promoted body publishes through the function's permanent entry cell,
-    /// so every generated caller switches without recompiling.
-    pub(crate) fn promote_hot_generated_callee(&mut self, context: &ExecutionContext) {
-        let Some(fid) = self.jit_code_registry.take_hot_function() else {
-            return;
-        };
+    /// Generated callers enter bytecode callees without the interpreter, so
+    /// the trampoline counts entries into the selected generation and calls
+    /// this on the published frame. A promoted body publishes through the
+    /// function's permanent entry cell, so every caller switches without
+    /// recompiling; a cached outcome suppresses further requests from this
+    /// generation, and any other decision defers the next one by an interval.
+    pub(crate) fn promote_entered_function(&mut self, context: &ExecutionContext, fid: u32) {
         let Ok(owner) = context.for_function(fid) else {
             return;
         };
         let _ = self.resolve_optimized_code_for_fid(&owner, fid);
         if self.jit_optimized_code.contains_key(&fid) {
             self.jit_code_registry.suppress_generated_tiering(fid);
+        } else {
+            self.jit_code_registry.defer_generated_tiering(fid);
         }
     }
 
@@ -1240,19 +1083,14 @@ impl Interpreter {
         code
     }
 
-    /// Resolve (and compile once profitable) the installed non-OSR
-    /// baseline body for `fid`, independent of any stack frame. The lean
-    /// callback loop uses this to tier up its callee without synthesizing a
-    /// frame, then enters the cached body directly; [`Self::resolve_jit_code`]
-    /// wraps it for the frame-entry path after its freshness checks.
+    /// Select the installed entry-capable Template body for an interpreter
+    /// activation, compiling when the function-entry policy admits it.
     pub(crate) fn resolve_jit_code_for_fid(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        self.promote_hot_generated_callee(context);
         let count = self.note_jit_function_entry(fid);
-        self.maybe_refresh_successful_baseline(context, fid);
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
@@ -1435,10 +1273,6 @@ impl Interpreter {
                         .jit_runtime_stats
                         .generated_template_deopts
                         .saturating_add(entry.deopts);
-                    self.jit_runtime_stats.generated_template_throws = self
-                        .jit_runtime_stats
-                        .generated_template_throws
-                        .saturating_add(entry.throws);
                 }
                 native_abi::NativeFrameKind::Optimizing => {
                     self.jit_runtime_stats.generated_optimizing_entries = self
@@ -1453,13 +1287,10 @@ impl Interpreter {
                         .jit_runtime_stats
                         .generated_optimizing_deopts
                         .saturating_add(entry.deopts);
-                    self.jit_runtime_stats.generated_optimizing_throws = self
-                        .jit_runtime_stats
-                        .generated_optimizing_throws
-                        .saturating_add(entry.throws);
                 }
-                native_abi::NativeFrameKind::Interpreter => {
-                    debug_assert!(false, "entry cells never describe interpreter frames");
+                native_abi::NativeFrameKind::Interpreter | native_abi::NativeFrameKind::Host => {
+                    // The VM entry already charges its hotness and call budget.
+                    continue;
                 }
             }
             if entry.entries == 0 {
@@ -1481,21 +1312,9 @@ impl Interpreter {
                 baseline_candidates.push(fid);
             }
         }
-        // Compilation order determines code-object ids and artifact ordering.
-        // Keep it stable even though the aggregation map is intentionally fast.
-        // Callees are commonly assigned after their callers by source
-        // lowering. Refresh higher ids first so their new entry generations
-        // are available when a lower-id caller rebuilds in this cold batch.
-        baseline_candidates.sort_unstable_by(|left, right| right.cmp(left));
+        // Code object identities and captured artifacts follow this order.
+        baseline_candidates.sort_unstable();
         for fid in baseline_candidates {
-            // Generated calls never revisit the ordinary entry resolver while
-            // their caller stays native. Drive the same one-shot successful
-            // baseline refresh here, after entry-cell feedback has been
-            // reconciled and no native activation remains published.
-            if self.feedback_refresh_due(context, fid) {
-                self.maybe_refresh_successful_baseline(context, fid);
-                let _ = self.resolve_jit_code_for_fid(context, fid);
-            }
             let _ = self.resolve_optimized_code_for_fid(context, fid);
         }
     }
@@ -1515,243 +1334,6 @@ impl Interpreter {
         self.note_jit_function_entries(fid, 1)
     }
 
-    /// Whether `fid` has accumulated enough successful entry feedback for its
-    /// one-shot baseline rebuild.
-    #[inline]
-    fn feedback_refresh_due(&self, context: &ExecutionContext, fid: u32) -> bool {
-        let Some(pending_targets) = self.jit_pending_direct_targets.get(&fid) else {
-            return false;
-        };
-        let executions = u64::from(self.jit_call_counts.get(&fid).copied().unwrap_or(0));
-        !self.jit_feedback_refresh_attempted.contains(&fid)
-            && self
-                .jit_tier_cost_decision(
-                    context,
-                    fid,
-                    crate::tier_policy::CostedTier::Template,
-                    crate::tier_policy::TierTrigger::FunctionEntry,
-                    executions,
-                    0,
-                    0,
-                )
-                .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
-            && matches!(self.jit_code.get(&fid), Some(Some(code))
-                if self.jit_code_registry.is_current_for_entry(code.as_ref())
-                    && !code.osr_only())
-            && pending_targets.iter().all(|target_fid| {
-                context
-                    .exec_function(*target_fid)
-                    .and_then(|target| self.current_direct_callee_plan(target))
-                    .is_some()
-            })
-    }
-
-    /// Record that compiled code reached `callee` through the generic call
-    /// boundary from `caller_fid`.
-    ///
-    /// A site that had no feedback, or whose target was cold, when its body
-    /// was compiled keeps calling through Rust. Once the target's executions
-    /// repay a direct-call-target compile, it joins the caller's pending
-    /// targets and the next compiled back-edge polls, so a running baseline
-    /// loop relinks instead of paying the boundary until it exits.
-    pub(crate) fn note_generic_call_target(
-        &mut self,
-        context: &ExecutionContext,
-        caller_fid: u32,
-        callee: Value,
-    ) {
-        let callee = callee
-            .as_class_constructor()
-            .map(|class| class.ctor(&self.gc_heap))
-            .unwrap_or(callee);
-        let Some(target_fid) = callee.as_function().or_else(|| {
-            callee
-                .as_closure(&self.gc_heap)
-                .map(|closure| closure.function_id())
-        }) else {
-            return;
-        };
-        if self
-            .jit_relinked_direct_targets
-            .contains(&(caller_fid, target_fid))
-            || self
-                .jit_pending_direct_targets
-                .get(&caller_fid)
-                .is_some_and(|targets| targets.contains(&target_fid))
-        {
-            return;
-        }
-        let Ok(owner) = context.for_function(target_fid) else {
-            return;
-        };
-        let Some(target) = owner.exec_function(target_fid) else {
-            return;
-        };
-        if self.current_direct_callee_plan(target).is_none() {
-            let executions = u64::from(self.jit_call_counts.get(&target_fid).copied().unwrap_or(0));
-            if !self
-                .jit_tier_cost_decision(
-                    &owner,
-                    target_fid,
-                    crate::tier_policy::CostedTier::Template,
-                    crate::tier_policy::TierTrigger::DirectCallTarget,
-                    executions,
-                    0,
-                    0,
-                )
-                .is_some_and(crate::tier_policy::TierCostDecision::should_compile)
-            {
-                return;
-            }
-        }
-        self.jit_pending_direct_targets
-            .entry(caller_fid)
-            .or_default()
-            .insert(target_fid);
-        self.request_next_backedge_poll();
-    }
-
-    /// Discard a running baseline body at a loop back-edge once every call
-    /// target that lacked entry code when it was compiled owns one.
-    ///
-    /// Entry refresh only rebuilds at function entry, so a long loop entered
-    /// through OSR would otherwise pay the generic call boundary until it
-    /// ends. The body is unlinked here, while its activation still pins the
-    /// code; the caller resumes the interpreter at the loop header, whose next
-    /// OSR compiles direct linkage. Each `(caller, target)` pair relinks once.
-    pub(crate) fn take_backedge_relink(&mut self, context: &ExecutionContext, fid: u32) -> bool {
-        let Some(pending_targets) = self.jit_pending_direct_targets.get(&fid) else {
-            return false;
-        };
-        // The polling frame is a baseline activation of `fid`; its body may be
-        // an OSR generation the entry table does not own. Pairs that already
-        // relinked once never return here (see `note_generic_call_target`).
-        let pending_targets: Vec<u32> = pending_targets
-            .iter()
-            .copied()
-            .filter(|&target| !self.jit_relinked_direct_targets.contains(&(fid, target)))
-            .collect();
-        if pending_targets.is_empty() {
-            self.jit_pending_direct_targets.remove(&fid);
-            return false;
-        }
-        // A small callee may never repay an entry compile on its own; the
-        // generic sites this body reaches it through are what make it hot.
-        // Offer each target the same direct-call-target compile a caller
-        // compile would. The polling frame is baseline, so every live value
-        // is already rooted in its interpreter window while this compiles.
-        let mut pending_targets = pending_targets;
-        pending_targets.sort_unstable();
-        let mut linked = false;
-        for &target_fid in &pending_targets {
-            let planned = context.for_function(target_fid).ok().is_some_and(|owner| {
-                owner.exec_function(target_fid).is_some_and(|target| {
-                    self.ensure_direct_callee_plan(
-                        &owner,
-                        target,
-                        super::jit_compile::EAGER_DIRECT_TARGET_DEPTH,
-                        false,
-                        0,
-                    )
-                    .is_some()
-                })
-            });
-            linked |= planned;
-        }
-        if !linked {
-            return false;
-        }
-        self.jit_relinked_direct_targets
-            .extend(pending_targets.iter().map(|&target| (fid, target)));
-        self.jit_feedback_refresh_attempted.insert(fid);
-        self.jit_pending_direct_targets.remove(&fid);
-        self.jit_runtime_stats.feedback_refreshes =
-            self.jit_runtime_stats.feedback_refreshes.saturating_add(1);
-        self.invalidate_jit_baseline_generation(fid);
-        true
-    }
-
-    /// Rebuild one successful hot baseline generation against mature call
-    /// feedback. This policy is independent from bail/deopt recovery: it is
-    /// deliberately one-shot and never consumes the unhealthy-generation
-    /// budget.
-    fn maybe_refresh_successful_baseline(&mut self, context: &ExecutionContext, fid: u32) {
-        if !self.feedback_refresh_due(context, fid) {
-            return;
-        }
-        self.jit_feedback_refresh_attempted.insert(fid);
-        self.jit_pending_direct_targets.remove(&fid);
-        self.jit_runtime_stats.feedback_refreshes =
-            self.jit_runtime_stats.feedback_refreshes.saturating_add(1);
-        self.invalidate_jit_baseline_generation(fid);
-    }
-
-    /// Unlink `fid`'s canonical Template generation.
-    ///
-    /// Baseline feedback refresh replaces the one body shared by ordinary
-    /// entry and Template OSR. Machine entry/OSR objects have independent
-    /// feedback and remain installed.
-    fn invalidate_jit_baseline_generation(&mut self, fid: u32) {
-        let code = self.jit_code.remove(&fid).and_then(|slot| slot);
-        if let Some(code) = code {
-            let affected = self
-                .jit_code_registry
-                .invalidate_code_object(code.metadata().id);
-            self.jit_runtime_stats.caller_invalidations =
-                self.jit_runtime_stats.caller_invalidations.saturating_add(
-                    affected
-                        .iter()
-                        .filter(|&&affected_fid| affected_fid != fid)
-                        .count() as u64,
-                );
-        }
-        self.jit_template_osr_fids.remove(&fid);
-        self.jit_osr_disabled
-            .retain(|(disabled_fid, _)| *disabled_fid != fid);
-        self.jit_osr_counts
-            .retain(|(counted_fid, _), _| *counted_fid != fid);
-        if self
-            .jit_code_cache
-            .as_ref()
-            .is_some_and(|(cached_fid, _)| *cached_fid == fid)
-        {
-            self.jit_code_cache = None;
-        }
-        self.jit_entry_osr_only.remove(&fid);
-        self.jit_entry_bail_counts.remove(&fid);
-    }
-
-    /// Run compiled `code` over the rooted register window of frame `top_idx`.
-    ///
-    /// The window stays rooted on `stack` for the call, so closure allocation
-    /// and recursive calls inside the body are GC-safe.
-    pub(crate) fn run_compiled_frame(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        top_idx: usize,
-        code: &std::sync::Arc<dyn jit::JitFunctionCode>,
-    ) -> jit::JitExecOutcome {
-        // The activation context must be the chunk owning the entered frame:
-        // the caller's dispatch tick may be running a sibling script's chunk,
-        // and reentrant transitions resolve constants/atoms through the
-        // activation. Entering with the caller's chunk would decode the
-        // callee's constant-pool indices against foreign tables.
-        let fid = stack
-            .get(top_idx)
-            .map_or(u32::MAX, |frame| frame.function_id);
-        let resolved = match context.for_function(fid) {
-            Ok(resolved) => resolved,
-            Err(_) => return jit::JitExecOutcome::Fatal(VmError::InvalidOperand),
-        };
-        // SAFETY: the raw pointers are formed from this method's own live
-        // borrows (`self`, `stack`, `resolved`) and are valid for the duration
-        // of `run_entry`; the JIT does not retain them, and we do not touch
-        // those borrows again until `run_entry` returns.
-        let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
-        code.run_entry(activation)
-    }
-
     /// Complete one full fixed-arity construct in place for a compiled caller
     /// whose fixed-arity construction site fell outside the compiled subset.
     /// Reads the callee and
@@ -1769,7 +1351,7 @@ impl Interpreter {
     /// [`Self::run_construct_sync_rooted`] (the caller already holds an
     /// `ExtraRoots` registration): it may allocate, re-enter arbitrary JS, and
     /// invalidate the caller's body — the entry anchor keeps the mapping alive.
-    /// Register windows live in the pinned register-stack slab, so `caller_regs`
+    /// Register windows live in the native activation extent, so `caller_regs`
     /// stays valid across the nested dispatch; the callee and argument handles
     /// are read from the traced window and handed straight to the synchronous
     /// construct, which roots them at every allocation.
@@ -1894,6 +1476,16 @@ mod tests {
     const FAKE_TEMPLATE_MAPPING_BYTES: usize = 4096;
 
     fn template_entry_break_even(context: &ExecutionContext, fid: u32) -> u32 {
+        template_entry_break_even_after(context, fid, 0)
+    }
+
+    /// Entries a Template body needs to repay `cumulative_compile_ns` of
+    /// measured compile work on top of its own estimate.
+    fn template_entry_break_even_after(
+        context: &ExecutionContext,
+        fid: u32,
+        cumulative_compile_ns: u64,
+    ) -> u32 {
         let function = context.exec_function(fid).expect("test function");
         u32::try_from(
             crate::tier_policy::TierCostModel::calibrated().minimum_profitable_executions(
@@ -1906,7 +1498,7 @@ mod tests {
                     register_count: u64::from(function.register_count),
                     parameter_count: u64::from(function.param_count),
                     resident_code_bytes: 0,
-                    cumulative_compile_ns: 0,
+                    cumulative_compile_ns,
                 },
             ),
         )
@@ -1942,22 +1534,11 @@ mod tests {
             Some(0x10_0000 + self.code_object_id as usize * 16)
         }
 
-        fn run_entry(&self, _activation: jit::VmRuntimeActivation) -> jit::JitExecOutcome {
-            unreachable!("the ownership fixture never enters at function entry")
-        }
-
-        fn osr_entry(
-            &self,
-            _activation: jit::VmRuntimeActivation,
-            logical_pc: u32,
-        ) -> Option<jit::JitExecOutcome> {
-            self.osr_entries.binary_search(&logical_pc).ok().map(|_| {
-                jit::JitExecOutcome::Bailed(native_abi::SideExit::new(
-                    logical_pc,
-                    native_abi::ExitReason::UnsupportedOperation,
-                    native_abi::ExitAction::Recompile,
-                ))
-            })
+        fn osr_entry_addr(&self, logical_pc: u32) -> Option<usize> {
+            self.osr_entries
+                .binary_search(&logical_pc)
+                .ok()
+                .map(|_| 0x20_0000 + self.code_object_id as usize * 16 + logical_pc as usize)
         }
     }
 
@@ -2003,6 +1584,9 @@ mod tests {
             request: jit::JitCompileRequest,
         ) -> Result<jit::JitCompileStatus, jit::JitCompileError> {
             if self.requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                // The failed attempt costs measurable time, so the measured
+                // duration it charges is never below the clock's resolution.
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 Ok(jit::JitCompileStatus::Unavailable)
             } else {
                 Ok(compiled_template_status(request))
@@ -2121,12 +1705,11 @@ mod tests {
             native_abi::CodeLifetimeState::Installed
         );
 
-        let activation = jit::VmRuntimeActivation::for_test(&mut vm);
         for &osr_pc in &osr_entries {
-            assert!(matches!(
-                first.osr_entry(activation, osr_pc),
-                Some(jit::JitExecOutcome::Bailed(exit)) if exit.logical_pc() == osr_pc
-            ));
+            assert_eq!(
+                first.osr_entry_addr(osr_pc),
+                Some(0x20_0000 + 16 + osr_pc as usize)
+            );
         }
     }
 
@@ -2239,16 +1822,16 @@ mod tests {
             vm.resolve_jit_code_for_fid(&context, 0).is_none(),
             "actual failed-compile duration must prevent an immediate retry"
         );
-        let mut installed = false;
-        for _ in 0..100_000 {
-            if vm.resolve_jit_code_for_fid(&context, 0).is_some() {
-                installed = true;
-                break;
-            }
-        }
+        // The measured duration is wall-clock time, so the entry count that
+        // repays it is read back rather than assumed.
+        let failed_ns = vm
+            .optimizing_tier_policy
+            .cumulative_compile_ns(0, crate::tier_policy::CostedTier::Template);
+        vm.jit_call_counts
+            .insert(0, template_entry_break_even_after(&context, 0, failed_ns) - 1);
         assert!(
-            installed,
-            "new execution evidence eventually repays the failure"
+            vm.resolve_jit_code_for_fid(&context, 0).is_some(),
+            "new execution evidence repays the failure"
         );
         assert_eq!(hook.requests.load(Ordering::Relaxed), 2);
     }
@@ -2337,7 +1920,7 @@ mod tests {
         let context = empty_context();
         let result = NativeResultPair::success(Value::number_i32(41));
 
-        let mut parent = crate::native_abi::NativeFrame::new(
+        let mut parent = crate::native_abi::Frame::new(
             crate::native_abi::VmFrameHeader::interpreter(0, 0),
             0,
             Value::undefined(),

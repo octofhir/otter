@@ -1,4 +1,13 @@
-// Split out of `lib.rs` `mod tests`.
+//! Interpreter semantics and native activation regression fixtures.
+//!
+//! # Contents
+//! Bytecode dispatch, call windows, runtime roots and native entry execution.
+//!
+//! # Invariants
+//! Execution fixtures use the canonical activation contract and verified bytecode.
+//!
+//! # See also
+//! - [`super::call_dispatch`] for the native continuation boundary.
 #![allow(unused_imports)]
 use crate::rooting::RootScopeExt;
 use crate::*;
@@ -95,14 +104,28 @@ fn with_test_runtime_turn<R>(
     })
 }
 
+fn complete_staged(
+    interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: &ExecutionContext,
+    staged: Result<(), VmError>,
+) -> Result<(), VmError> {
+    staged?;
+    if stack.staged_request_mut().is_some() {
+        crate::test_support::complete_staged_call(interp, stack, context)
+    } else {
+        Ok(())
+    }
+}
+
 #[test]
 fn rooted_dispatch_rejects_a_different_activation_stack() {
     let module = module_with(Vec::new(), 1);
     let mut interp = Interpreter::new();
     let context = interp.link_module(module).expect("valid bytecode fixture");
     let mut other_interp = Interpreter::new();
-    let mut published = ActivationStack::new();
-    let mut unrelated = ActivationStack::new();
+    let mut published = crate::test_support::FrameChainFixture::new();
+    let mut unrelated = crate::test_support::FrameChainFixture::new();
 
     interp.with_runtime_turn(&mut published, |turn| {
         let (interp, published) = turn.into_parts();
@@ -838,7 +861,8 @@ fn bytecode_function_prototype_preserves_the_shared_caller_frame() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -889,7 +913,7 @@ fn handle_scoped_function_prototype_keeps_sibling_handle_live_without_a_frame() 
         .push(test_function(1, "target", 0, 1, Vec::new()));
     let mut interp = Interpreter::new();
     let context = interp.link_module(module).expect("valid bytecode fixture");
-    let mut stack = ActivationStack::new();
+    let mut stack = crate::test_support::FrameChainFixture::new();
     let target = Value::function(1);
     let arg = Value::string(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
 
@@ -942,7 +966,8 @@ fn bytecode_instanceof_function_prototype_uses_stack_roots() {
         .link_module(module.clone())
         .expect("valid bytecode fixture");
     let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1003,7 +1028,7 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
     interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| Ok(compiled.clone()))));
     let arg = Value::string(JsString::from_str("", interp.gc_heap_mut()).unwrap());
     let args = [arg];
-    let mut stack = ActivationStack::new();
+    let mut stack = crate::test_support::FrameChainFixture::new();
 
     let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
         interp
@@ -1057,7 +1082,8 @@ fn get_iterator_map_snapshot_uses_old_iterator_state_allocation_with_frame_roots
     )
     .unwrap();
 
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1095,7 +1121,8 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
     let mut interp = Interpreter::new();
     let iterator_obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
 
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1157,7 +1184,8 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1167,7 +1195,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.do_call_method_value(
+        { let staged = interp.do_call_method_value(
             stack,
             &context,
             &[
@@ -1177,7 +1205,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
                 Operand::ConstIndex(1),
                 Operand::Register(1),
             ],
-        )
+        ); complete_staged(interp, stack, &context, staged) }
     })
     .expect("array map");
 
@@ -1213,14 +1241,15 @@ fn call_method_on_nullish_receiver_reports_type_error() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::undefined();
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1230,7 +1259,7 @@ fn call_method_on_nullish_receiver_reports_type_error() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("nullish method call should reject before intrinsic fallback");
 
     assert!(matches!(err, VmError::TypeError));
@@ -1260,14 +1289,15 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::number_i32(1);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1277,7 +1307,7 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("missing primitive method should reject as non-callable");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1319,14 +1349,15 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = recv;
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1336,7 +1367,7 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable String.prototype.slice should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1412,7 +1443,7 @@ fn call_method_string_char_code_at_non_callable_shadows_builtin() {
 fn call_char_code_at(
     interp: &mut Interpreter,
     mut recv: Value,
-) -> Result<ActivationStack, VmError> {
+) -> Result<crate::test_support::FrameChainFixture, VmError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1436,7 +1467,8 @@ fn call_char_code_at(
         recv.as_string(interp.gc_heap()).is_some(),
         "rooted receiver survives module linking"
     );
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1448,7 +1480,7 @@ fn call_char_code_at(
     frame.registers[1] = Value::number_i32(1);
     stack.push(frame);
     with_test_runtime_turn(interp, &mut stack, |interp, stack| {
-        interp.do_call_method_value(
+        { let staged = interp.do_call_method_value(
             stack,
             &context,
             &[
@@ -1458,7 +1490,7 @@ fn call_char_code_at(
                 Operand::ConstIndex(1),
                 Operand::Register(1),
             ],
-        )
+        ); complete_staged(interp, stack, &context, staged) }
     })?;
     Ok(stack)
 }
@@ -1493,14 +1525,15 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::number_i32(7);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1510,7 +1543,7 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Number.prototype.toString should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1581,7 +1614,7 @@ fn call_number_to_string(
     interp: &mut Interpreter,
     recv: Value,
     arg: Option<Value>,
-) -> Result<ActivationStack, VmError> {
+) -> Result<crate::test_support::FrameChainFixture, VmError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1597,7 +1630,8 @@ fn call_number_to_string(
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1624,7 +1658,7 @@ fn call_number_to_string(
         ]
     };
     with_test_runtime_turn(interp, &mut stack, |interp, stack| {
-        interp.do_call_method_value(stack, &context, &operands)
+        { let staged = interp.do_call_method_value(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
     })?;
     Ok(stack)
 }
@@ -1659,14 +1693,15 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::boolean(true);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1676,7 +1711,7 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Boolean.prototype.valueOf should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1714,14 +1749,15 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::big_int(bigint);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1731,7 +1767,7 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable BigInt.prototype.toString should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1768,14 +1804,15 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::symbol(symbol);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1785,7 +1822,7 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Symbol.prototype.valueOf should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1826,14 +1863,15 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::weak_ref(weak_ref);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1843,7 +1881,7 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable WeakRef.prototype.deref should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1887,14 +1925,15 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::finalization_registry(registry);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1904,7 +1943,7 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable FinalizationRegistry.prototype.unregister should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1933,14 +1972,15 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::promise(promise);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -1950,7 +1990,7 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own promise method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -1987,14 +2027,15 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::promise(promise);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2004,7 +2045,7 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Promise.prototype.then should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2034,14 +2075,15 @@ fn call_method_array_own_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::array(array);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2051,7 +2093,7 @@ fn call_method_array_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own array method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2081,14 +2123,15 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::regexp(regexp);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2098,7 +2141,7 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own regexp method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2136,14 +2179,15 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::regexp(regexp);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2153,7 +2197,7 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable RegExp.prototype.exec should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2193,14 +2237,15 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::object(date);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2210,7 +2255,7 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Date.prototype.getTime should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2250,14 +2295,15 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::object(date);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2267,7 +2313,7 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Date.prototype.setTime should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2307,14 +2353,15 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::typed_array(typed_array);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2324,7 +2371,7 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own typed array method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2371,14 +2418,15 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::typed_array(typed_array);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2388,7 +2436,7 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Int8Array.prototype.map should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2435,14 +2483,15 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::typed_array(typed_array);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2452,7 +2501,7 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Int8Array.prototype.slice should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2493,7 +2542,8 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2504,7 +2554,7 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
         .expect("array iterator");
     stack[0].registers[0] = stack[0].registers[1];
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2514,7 +2564,7 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Iterator.prototype.toArray should shadow helper");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2551,14 +2601,15 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::map(map);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2568,7 +2619,7 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Map.prototype.forEach should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2605,14 +2656,15 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::set(set);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2622,7 +2674,7 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Set.prototype.forEach should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2659,14 +2711,15 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::map(map);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2676,7 +2729,7 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Map.prototype.get should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2713,14 +2766,15 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::set(set);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2730,7 +2784,7 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Set.prototype.add should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2767,14 +2821,15 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::weak_map(weak_map);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2784,7 +2839,7 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable WeakMap.prototype.get should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2821,14 +2876,15 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::weak_set(weak_set);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2838,7 +2894,7 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable WeakSet.prototype.add should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2877,14 +2933,15 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::array_buffer(buffer);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2894,7 +2951,7 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable ArrayBuffer.prototype.slice should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2935,14 +2992,15 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::data_view(view);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -2952,7 +3010,7 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable DataView.prototype.getUint8 should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -2989,14 +3047,15 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::set(set);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3006,7 +3065,7 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Set.prototype.union should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -3030,7 +3089,8 @@ fn call_method_function_own_non_callable_shadows_call() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3051,7 +3111,7 @@ fn call_method_function_own_non_callable_shadows_call() {
             .expect("function user property")
     );
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3061,7 +3121,7 @@ fn call_method_function_own_non_callable_shadows_call() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own function call should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -3085,7 +3145,8 @@ fn call_method_function_own_non_callable_shadows_object_method() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3106,7 +3167,7 @@ fn call_method_function_own_non_callable_shadows_object_method() {
             .expect("function user property")
     );
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3116,7 +3177,7 @@ fn call_method_function_own_non_callable_shadows_object_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own hasOwnProperty should shadow Object.prototype");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -3143,14 +3204,15 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::object(obj);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3160,7 +3222,7 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("null-prototype object should not inherit Object.prototype methods");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -3201,14 +3263,15 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = native;
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3218,7 +3281,7 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable Object.prototype.hasOwnProperty should shadow native intercept");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -3254,14 +3317,15 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     frame.registers[0] = Value::number_i32(1);
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3271,7 +3335,7 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err(
             "non-callable Object.prototype.hasOwnProperty should shadow primitive intercept",
         );
@@ -3335,7 +3399,8 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3344,7 +3409,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     frame.registers[2] = repl;
     stack.push(frame);
 
-    let err = interp
+    let err = { let staged = interp
         .do_call_method_value(
             &mut stack,
             &context,
@@ -3356,7 +3421,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
                 Operand::Register(1),
                 Operand::Register(2),
             ],
-        )
+        ); complete_staged(&mut interp, &mut stack, &context, staged) }
         .expect_err("non-callable own String wrapper replace should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
@@ -3416,7 +3481,7 @@ fn iterator_to_list_map_pairs_use_runtime_rooted_array_allocation() {
     let map_value = Value::map(map);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
-    let mut stack = ActivationStack::new();
+    let mut stack = crate::test_support::FrameChainFixture::new();
     let entries = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
         interp.iterator_to_list_sync(&context, stack, &map_value)
     })
@@ -3494,7 +3559,8 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3570,7 +3636,8 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
 fn vm_error_throwable_uses_stack_rooted_allocation() {
     let module = module_with(Vec::new(), 1);
     let mut interp = Interpreter::new();
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -3601,7 +3668,8 @@ fn vm_error_throwable_uses_stack_rooted_allocation() {
 fn oom_throwable_uses_range_error_prototype() {
     let module = module_with(Vec::new(), 1);
     let mut interp = Interpreter::new();
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -3835,18 +3903,19 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
     let mut interp = Interpreter::new();
     let context = interp.link_module(module).expect("valid bytecode fixture");
     let body_frame = interp.test_frame_for_function(&generator_body).unwrap();
-    let body_frame = interp.park_active_frame(body_frame);
+    let body_frame = interp.park_active_frame(&body_frame);
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), body_frame).expect("gen");
     generator.set_async(interp.gc_heap_mut(), true);
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp.test_frame_for_function(&main).unwrap();
     frame.registers[0] = Value::generator(generator);
     stack.push(frame);
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp
+        { let staged = interp
             .do_call_method_value(
                 stack,
                 &context,
@@ -3856,7 +3925,7 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
                     Operand::ConstIndex(0),
                     Operand::ConstIndex(0),
                 ],
-            )
+            ); complete_staged(interp, stack, &context, staged) }
             .expect("async generator next");
     });
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -3884,7 +3953,8 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
     };
     let mut interp = Interpreter::new();
     let context = interp.link_module(module).expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     stack.push(interp.test_frame_for_function(&main).unwrap());
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -4022,7 +4092,8 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     stack.push(frame);
     let context = interp.link_module(module).expect("valid bytecode fixture");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -4054,7 +4125,8 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
         .expect("valid bytecode fixture");
     let executor_value =
         native_value_static(interp.gc_heap_mut(), "executor", 2, executor).expect("executor");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -4087,7 +4159,8 @@ fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -4755,10 +4828,10 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         class_hint_sites: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let mut stack: ActivationStack = ActivationStack::new();
-    stack.push(interp.test_frame_for_function(&main).unwrap());
-    // Push a second frame on top — should be popped during
-    // unwinding and not absorb the throw.
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
+    // One activation per execution turn: the handler-less frame is
+    // completed and the throw escapes its floor.
     stack.push(interp.test_frame_for_function(&main).unwrap());
     let context = interp
         .link_module(module_with(
@@ -4825,7 +4898,8 @@ fn unwind_throw_lands_in_catch_handler() {
         class_hint_sites: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp.test_frame_for_function(&main).unwrap();
     interp
         .frame_ensure_cold(&mut frame)
@@ -4867,11 +4941,12 @@ fn is_callable_recognises_call_shapes() {
             .expect("closure");
     assert!(is_callable(&Value::closure(closure_handle)));
     let mut heap = crate::object::fixture_heap();
-    let bound = BoundFunction::new(
-        &mut heap,
+    let mut interp = Interpreter::new();
+    let bound = crate::test_support::alloc_bound_function(
+        &mut interp,
         Value::function(7),
         Value::undefined(),
-        SmallVec::new(),
+        &[],
     )
     .expect("bound");
     assert!(is_callable(&Value::bound_function(bound)));
@@ -4893,7 +4968,8 @@ fn native_call_context_receives_method_receiver() {
         native_value_static(interp.gc_heap_mut(), "returnThis", 0, return_this).expect("native");
     let receiver =
         Value::object(crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap());
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -4904,7 +4980,8 @@ fn native_call_context_receives_method_receiver() {
         .expect("valid bytecode fixture");
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.invoke(stack, &context, &callee, receiver, SmallVec::new(), 0)
+        interp.invoke(stack, &context, &callee, receiver, SmallVec::new(), 0)?;
+        crate::test_support::complete_staged_call(interp, stack, &context)
     })
     .unwrap();
 
@@ -4938,7 +5015,7 @@ fn native_construct_context_walks_the_live_caller_stack() {
         )
         .expect("native constructor"),
     );
-    let mut stack = ActivationStack::new();
+    let mut stack = crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .expect("caller frame");
@@ -4952,7 +5029,7 @@ fn native_construct_context_walks_the_live_caller_stack() {
     ];
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.do_construct(stack, &context, &operands)
+        { let staged = interp.do_construct(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
     })
     .expect("native construct");
 
@@ -4986,7 +5063,8 @@ fn direct_native_call_uses_contiguous_argument_window() {
     let module = module_with(vec![], 4);
     let mut interp = Interpreter::new();
     let callee = native_value_static(interp.gc_heap_mut(), "sum", 2, sum_smi_args).expect("native");
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -5006,7 +5084,7 @@ fn direct_native_call_uses_contiguous_argument_window() {
     ];
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.do_call(stack, &context, &operands)
+        { let staged = interp.do_call(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
     })
     .unwrap();
 
@@ -5033,7 +5111,8 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
         crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::object(handler)).unwrap(),
     );
 
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -5054,7 +5133,7 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.do_call(stack, &context, &operands)
+        { let staged = interp.do_call(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
     })
     .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5124,7 +5203,8 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
         .unwrap(),
     );
 
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -5141,7 +5221,7 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.do_construct(stack, &context, &operands)
+        { let staged = interp.do_construct(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
     })
     .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5233,7 +5313,7 @@ fn rooted_construct_receiver_uses_shared_turn_young_allocation() {
     };
     let mut interp = Interpreter::new();
     let context = interp.link_module(module).expect("valid bytecode fixture");
-    let mut stack = ActivationStack::new();
+    let mut stack = crate::test_support::FrameChainFixture::new();
     let target = Value::function(1);
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5299,7 +5379,7 @@ fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
         .unwrap(),
     );
     let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::number(NumberValue::Smi(13))];
-    let mut stack = ActivationStack::new();
+    let mut stack = crate::test_support::FrameChainFixture::new();
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
@@ -5438,7 +5518,8 @@ fn arrow_closure_overrides_call_site_this() {
     )
     .expect("closure alloc");
     let closure = Value::closure(closure_handle);
-    let mut stack: ActivationStack = ActivationStack::new();
+    let mut stack: crate::test_support::FrameChainFixture =
+        crate::test_support::FrameChainFixture::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -5447,46 +5528,13 @@ fn arrow_closure_overrides_call_site_this() {
     let context = interp
         .link_module(module.clone())
         .expect("valid bytecode fixture");
-    // Caller-supplied this is `Null` — the closure must override.
-    interp
-        .invoke(
-            &mut stack,
-            &context,
-            &closure,
-            Value::null(),
-            SmallVec::new(),
-            /* dst */ 0,
-        )
-        .unwrap();
-    // Drive the arrow's body to completion, then read r0 of <main>.
-    loop {
-        let top = stack.len() - 1;
-        let f = module
-            .functions
-            .get(stack[top].function_id as usize)
-            .unwrap();
-        let pc = stack[top].pc as usize;
-        let instr = &f.code[pc];
-        if matches!(instr.op, Op::ReturnValue) {
-            let value = stack[top].registers[0];
-            stack.pop();
-            let caller = stack.last_mut().unwrap();
-            let dst = caller.return_register.unwrap_or(0) as usize;
-            caller.registers[dst] = value;
-            break;
-        }
-        if matches!(instr.op, Op::LoadThis) {
-            let dst = match f.code.operand(instr, 0).expect("LoadThis dst") {
-                Operand::Register(r) => r,
-                _ => unreachable!(),
-            };
-            let value = stack[top].this_value;
-            stack[top].registers[dst as usize] = value;
-            stack[top].pc += 1;
-            continue;
-        }
-        unreachable!();
-    }
+    // Caller-supplied this is `Null` — the closure must override. The
+    // trampoline classifies the arrow and binds its lexical receiver.
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.invoke(stack, &context, &closure, Value::null(), SmallVec::new(), 0)?;
+        crate::test_support::complete_staged_call(interp, stack, &context)
+    })
+    .unwrap();
     assert_eq!(stack[0].registers[0], Value::string(bound));
 }
 
@@ -5576,4 +5624,38 @@ fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
         )],
     );
     assert_eq!(other.code_block.feedback_at(0).unwrap().arith_bits(), 0);
+}
+
+#[test]
+fn snapshot_restore_republishes_owned_interpreter_destinations() {
+    let mut vm = Interpreter::new();
+    let context = vm
+        .link_module(module_with(
+            vec![Instruction {
+                pc: 0,
+                op: Op::ReturnUndefined,
+                operands: vec![],
+            }],
+            3,
+        ))
+        .unwrap();
+    let donor = vm
+        .current_direct_callee_plan(context.exec_function(0).unwrap())
+        .unwrap();
+    let snapshot = vm.capture_isolate_snapshot().unwrap();
+    let restored = Interpreter::from_isolate_snapshot(&snapshot).unwrap();
+    let mut visited = 0;
+    restored.code_space.visit_live_functions(|function| {
+        let plan = restored.current_direct_callee_plan(function).unwrap();
+        assert_eq!(plan.function_id, function.id);
+        assert_eq!(plan.register_count, function.register_count);
+        assert_eq!(plan.tier, native_abi::NativeFrameKind::Interpreter);
+        assert_eq!(plan.code_object_id, 0);
+        assert_ne!(plan.entry_cell, donor.entry_cell);
+        // SAFETY: restoration owns fresh permanent function and entry cells.
+        let cell = unsafe { &*(plan.entry_cell as *const native_abi::FunctionEntryCell) };
+        assert_ne!(cell.current_generation(), 0);
+        visited += 1;
+    });
+    assert_eq!(visited, 1);
 }

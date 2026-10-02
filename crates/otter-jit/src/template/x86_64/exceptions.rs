@@ -8,7 +8,7 @@
 //! # Invariants
 //! - The target-neutral template operation is committed exactly once by the
 //!   shared runtime stub; generated code never replays it after reentry.
-//! - A dynamic resume PC is stored in the published `NativeFrame` before the
+//! - A dynamic resume PC is stored in the published `Frame` before the
 //!   ordinary runtime-transition side exit.
 //! - Calls obey the System V integer ABI and consume the shared native-result
 //!   pair in `rax`/`rdx`.

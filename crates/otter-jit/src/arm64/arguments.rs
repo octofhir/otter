@@ -6,6 +6,7 @@
 //! # Invariants
 //! - A cache hit means observable object semantics and branches to the cold path.
 //! - Only exact nonnegative Int32 indices inside the actual window are loaded.
+//! - Every frame names its actual span explicitly.
 //! - No raw window address survives this probe, a call or a backedge.
 //! - Scratch registers are x9, x10, x15, x16 and x17; the result is x16.
 //!
@@ -25,8 +26,6 @@ pub(crate) fn emit(ops: &mut Assembler, frame: u8, key: Option<u8>, miss: Dynami
         ; mov x15, X(frame)
         ; ldr w16, [x15, abi::NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET]
         ; cbnz w16, =>miss
-        ; ldrb w16, [x15, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
-        ; tbz w16, 3, =>miss
         ; ldr w16, [x15, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
     );
     if key.is_some() {
@@ -39,9 +38,7 @@ pub(crate) fn emit(ops: &mut Assembler, frame: u8, key: Option<u8>, miss: Dynami
             ; cmp w10, w16
             ; b.hs =>miss
             ; mov w10, w10
-            ; ldrh w9, [x15, crate::entry::NATIVE_FRAME_REGISTER_COUNT_OFFSET]
-            ; ldr x17, [x15, crate::entry::NATIVE_FRAME_REGISTER_BASE_OFFSET]
-            ; add x17, x17, x9, lsl #3
+            ; ldr x17, [x15, abi::NATIVE_FRAME_ACTUALS_OFFSET]
             ; ldr x16, [x17, x10, lsl #3]
         );
     } else {

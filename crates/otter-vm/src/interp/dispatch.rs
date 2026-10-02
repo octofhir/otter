@@ -6,6 +6,7 @@
 //! accounting. Deliberately a single function — splitting it would defeat the
 //! dispatch-locality the interpreter depends on.
 #![allow(unused_imports)]
+use super::call_dispatch::DispatchOutcome;
 use crate::*;
 
 impl Interpreter {
@@ -51,7 +52,7 @@ impl Interpreter {
         entry_context: &ExecutionContext,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
-    ) -> Result<Value, VmError> {
+    ) -> Result<DispatchOutcome, VmError> {
         // One stack can interleave frames from several code chunks
         // (closures escaped from `eval` / `new Function` / sibling
         // scripts), so each iteration dispatches against the chunk
@@ -60,11 +61,6 @@ impl Interpreter {
         // foreign chunk so repeated foreign-frame ticks don't re-lock
         // the code-space registry.
         let mut foreign_context: Option<ExecutionContext> = None;
-        // Call-target owners are separate from `foreign_context`: the current
-        // function may borrow the latter for the whole opcode, while this
-        // epoch-validated cache can retain sibling callees without cloning an
-        // owner on every call.
-        let mut function_owner_cache = crate::call_ops::FunctionOwnerCache::new(entry_context);
         // Hoisted once per turn: the budget config does not change mid-turn,
         // so the per-op checkpoint only needs to run when enforcement is on.
         // In the default Observe mode this collapses to a not-taken branch.
@@ -116,6 +112,9 @@ impl Interpreter {
         let mut cache_foreign = false;
         let mut cache_function: *const CodeBlock = std::ptr::null();
         loop {
+            if stack.has_pending_call() {
+                return Ok(DispatchOutcome::Call);
+            }
             if stack.is_at_floor(floor) {
                 // Defensive: unwind paths (throw / finally) can
                 // pop the last frame without writing back to a
@@ -126,8 +125,13 @@ impl Interpreter {
                 // flowed through `unwind_throw` and surfaced as
                 // `VmError::Uncaught`; this guard catches the
                 // residual "fell off the bottom" path and treats
-                // it as completion.
-                return Ok(Value::undefined());
+                // it as completion. An async activation that absorbed its
+                // throw completes with its rejected result promise.
+                let result = self
+                    .completed_activation_result
+                    .take()
+                    .unwrap_or_else(Value::undefined);
+                return Ok(DispatchOutcome::Returned(result));
             }
             let depth = stack.len();
             let top_idx = depth - 1;
@@ -192,9 +196,7 @@ impl Interpreter {
                     // pushed → a miss). Sampling the max here instead of on every
                     // instruction keeps `maxStackDepthObserved` exact while taking
                     // the comparison off the straight-line hot path.
-                    let depth32 = u32::try_from(depth)
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(self.jit_generated_call_depth());
+                    let depth32 = u32::try_from(depth).unwrap_or(u32::MAX);
                     if depth32 > self.work_budget_stats.max_stack_depth_observed {
                         self.work_budget_stats.max_stack_depth_observed = depth32;
                     }
@@ -229,8 +231,9 @@ impl Interpreter {
                 if enforce_budget {
                     self.enforce_work_budget_checkpoint()?;
                 }
-                if has_profiler && let Some(profiler) = self.cpu_profiler.as_mut() {
-                    profiler.maybe_sample(context, stack);
+                if has_profiler && let Some(mut profiler) = self.cpu_profiler.take() {
+                    profiler.maybe_sample(self, context);
+                    self.cpu_profiler = Some(profiler);
                 }
                 // The body is kept out of line so building the event costs the
                 // hot loop nothing.
@@ -258,7 +261,7 @@ impl Interpreter {
                         .cloned()
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     if let Some(popped) = self.return_running_finally_above(stack, floor, value)? {
-                        return Ok(popped);
+                        return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
                 }
@@ -266,7 +269,7 @@ impl Interpreter {
                     if let Some(popped) =
                         self.return_running_finally_above(stack, floor, Value::undefined())?
                     {
-                        return Ok(popped);
+                        return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
                 }
@@ -283,7 +286,7 @@ impl Interpreter {
                     let ctx = *read_register(frame, ctx_reg)?;
                     self.frame_ensure_cold(frame).derived_this_slot = Some((ctx, coord));
                     if let Some(popped) = self.return_running_finally_above(stack, floor, value)? {
-                        return Ok(popped);
+                        return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
                 }
@@ -298,7 +301,6 @@ impl Interpreter {
                             function_id,
                         );
                     }
-                    let depth_before = stack.len();
                     // `f.call(this, ...)` loaded as a value runs `f`: the site
                     // records that function, read before the call can collect.
                     let function_call_target = (jit_installed && op == Op::CallWithThis)
@@ -332,34 +334,20 @@ impl Interpreter {
                         None
                     };
                     if op == Op::CallWithThis {
-                        self.do_call_with_this_exec(
-                            stack,
-                            context,
-                            &mut function_owner_cache,
-                            function,
-                            instr,
-                        )?;
+                        self.do_call_with_this_exec(stack, function, instr)?;
                     } else {
-                        self.do_call_exec(
-                            stack,
-                            context,
-                            &mut function_owner_cache,
-                            function,
-                            instr,
-                        )?;
+                        self.do_call_exec(stack, function, instr)?;
                     }
                     // Record the resolved typed target before a tier-up hook
                     // consumes a newly pushed bytecode frame. Static natives
                     // complete synchronously and therefore leave stack depth
                     // unchanged.
-                    let bytecode_pushed = stack.len() > depth_before;
+                    let staged_target = self.staged_bytecode_target(stack);
                     if jit_installed
                         && let Some(target) = if function_call_target.is_some() {
                             function_call_target
-                        } else if bytecode_pushed {
-                            Some(crate::feedback::OrdinaryCallTarget::Bytecode(
-                                stack[stack.len() - 1].function_id,
-                            ))
+                        } else if let Some(function_id) = staged_target {
+                            Some(crate::feedback::OrdinaryCallTarget::Bytecode(function_id))
                         } else {
                             static_native_target.map(|declaration| {
                                 crate::feedback::OrdinaryCallTarget::StaticNative(
@@ -377,14 +365,6 @@ impl Interpreter {
                             self.evict_compiled_for_reopt(function_id);
                         }
                     }
-                    // Tier-up hook: only when a bytecode callee frame was just
-                    // pushed and a JIT is installed. Cheap (one bool) when off.
-                    if jit_installed
-                        && bytecode_pushed
-                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
-                    {
-                        return Ok(value);
-                    }
                     continue;
                 }
                 Op::TailCall => {
@@ -396,13 +376,7 @@ impl Interpreter {
                     if self.interrupt.is_set() {
                         return Err(VmError::Interrupted);
                     }
-                    self.do_tail_call_exec(
-                        stack,
-                        context,
-                        &mut function_owner_cache,
-                        function,
-                        instr,
-                    )?;
+                    self.do_tail_call_exec(stack, function, instr)?;
                     continue;
                 }
                 Op::CallForwardArguments => {
@@ -413,13 +387,9 @@ impl Interpreter {
                             function_id,
                         );
                     }
-                    let depth_before = stack.len();
                     self.do_call_forward_arguments_exec(stack, context, function, instr)?;
-                    let bytecode_pushed = stack.len() > depth_before;
-                    if jit_installed && bytecode_pushed {
-                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(
-                            stack[stack.len() - 1].function_id,
-                        );
+                    if jit_installed && let Some(function_id) = self.staged_bytecode_target(stack) {
+                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(function_id);
                         let transition = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
@@ -428,12 +398,6 @@ impl Interpreter {
                         if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
                         }
-                    }
-                    if jit_installed
-                        && bytecode_pushed
-                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
-                    {
-                        return Ok(value);
                     }
                     continue;
                 }
@@ -445,7 +409,6 @@ impl Interpreter {
                             function_id,
                         );
                     }
-                    let depth_before = stack.len();
                     let feedback_site = instr.property_ic_site();
                     // Capture the receiver/prototype layout before the call for
                     // method-inline feedback (the receiver register lives in the
@@ -463,20 +426,6 @@ impl Interpreter {
                             stack
                                 .get(top_idx)
                                 .and_then(|f| f.registers.get(r as usize).copied())
-                        });
-                    // The function `f.call(...)` runs is the receiver itself;
-                    // its id is read now, while the receiver handle is still
-                    // valid.
-                    let receiver_function_id = receiver_value
-                        .and_then(|value| value.as_closure(&self.gc_heap))
-                        .map(crate::closure::JsClosure::function_id)
-                        .filter(|_| {
-                            const_operand(function.operand(instr, 2))
-                                .ok()
-                                .and_then(|name| {
-                                    context.property_atom_for_function(function_id, name)
-                                })
-                                .is_some_and(|key| key.name() == "call")
                         });
                     let mut receiver = receiver_value.filter(|_| capture);
                     let name_idx = const_operand(function.operand(instr, 2)).ok();
@@ -509,22 +458,27 @@ impl Interpreter {
                         _ => None,
                     };
                     self.do_call_method_value_exec(stack, context, function, instr)?;
-                    // Tier-up hook, mirroring `Op::Call`: a bytecode method
-                    // callee pushed via `invoke` lands as a fresh pc==0 frame.
-                    if jit_installed && stack.len() > depth_before {
-                        let method_fid = stack[stack.len() - 1].function_id;
-                        if receiver_function_id == Some(method_fid) {
-                            let transition = self.record_ordinary_call_feedback(
-                                function,
-                                instr.instruction_pc,
-                                crate::feedback::OrdinaryCallTarget::FunctionPrototypeCall(
-                                    method_fid,
-                                ),
-                            );
-                            if transition.evict_for_reopt() {
-                                self.evict_compiled_for_reopt(function_id);
-                            }
+                    // Feedback comes from the staged request. `f.call(...)` stages `%Function.prototype.call%` with `f`
+                    // as its receiver; the site records the function it runs.
+                    let function_call_target = jit_installed
+                        .then(|| {
+                            stack
+                                .staged_request_mut()
+                                .map(|request| (request.callee, request.receiver))
+                        })
+                        .flatten()
+                        .and_then(|(callee, receiver)| {
+                            self.function_prototype_call_target(callee, receiver)
+                        });
+                    if let Some(target) = function_call_target {
+                        let transition =
+                            self.record_ordinary_call_feedback(function, instr.instruction_pc, target);
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
                         }
+                    } else if jit_installed
+                        && let Some(method_fid) = self.staged_bytecode_target(stack)
+                    {
                         if let (Some(feedback_site), Some(site)) = (feedback_site, method_site) {
                             let changed = self.note_method_target(feedback_site, method_fid, site);
                             self.commit_method_call_feedback_transition(
@@ -532,9 +486,6 @@ impl Interpreter {
                                 function_id,
                                 changed,
                             );
-                        }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
                         }
                     } else if jit_installed
                         && let (Some(feedback_site), Some(site), Some(stub_id)) =
@@ -547,28 +498,21 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallSpread => {
-                    let depth_before = stack.len();
                     let operands = function.operand_view(instr);
-                    self.do_call_spread(stack, context, operands)?;
-                    if jit_installed && stack.len() > depth_before {
+                    self.do_call_spread(stack, operands)?;
+                    if jit_installed && let Some(function_id) = self.staged_bytecode_target(stack) {
                         let transition = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
-                            crate::feedback::OrdinaryCallTarget::Bytecode(
-                                stack[stack.len() - 1].function_id,
-                            ),
+                            crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
                         );
                         if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
-                        }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
                         }
                     }
                     continue;
                 }
                 Op::New => {
-                    let depth_before = stack.len();
                     if jit_installed {
                         self.record_call_attempt_feedback(
                             function,
@@ -606,30 +550,26 @@ impl Interpreter {
                     } else {
                         None
                     };
-                    self.do_construct_exec(stack, context, function, instr)?;
+                    self.do_construct_exec(stack, function, instr)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode
                     // constructor frame pushed by `new` can enter JIT at pc=0.
-                    if jit_installed && stack.len() > depth_before {
-                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
-                            let transition = self.record_ordinary_call_feedback(
-                                function,
-                                instr.instruction_pc,
-                                crate::feedback::OrdinaryCallTarget::Bytecode(
-                                    stack[stack.len() - 1].function_id,
-                                ),
-                            );
-                            if transition.evict_for_reopt() {
-                                self.evict_compiled_for_reopt(function_id);
-                            }
-                        }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
+                    if jit_installed
+                        && let Some(function_id) = self.staged_bytecode_target(stack)
+                        && direct_construct_fid == Some(function_id)
+                    {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
                         }
                     }
+
                     continue;
                 }
                 Op::SuperConstruct => {
-                    let depth_before = stack.len();
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -660,28 +600,24 @@ impl Interpreter {
                     } else {
                         None
                     };
-                    self.do_super_construct_exec(stack, context, function, instr)?;
-                    if jit_installed && stack.len() > depth_before {
-                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
-                            let transition = self.record_ordinary_call_feedback(
-                                function,
-                                instr.instruction_pc,
-                                crate::feedback::OrdinaryCallTarget::Bytecode(
-                                    stack[stack.len() - 1].function_id,
-                                ),
-                            );
-                            if transition.evict_for_reopt() {
-                                self.evict_compiled_for_reopt(function_id);
-                            }
-                        }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
+                    self.do_super_construct_exec(stack, function, instr)?;
+                    if jit_installed
+                        && let Some(function_id) = self.staged_bytecode_target(stack)
+                        && direct_construct_fid == Some(function_id)
+                    {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
                         }
                     }
+
                     continue;
                 }
                 Op::NewSpread => {
-                    let depth_before = stack.len();
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -709,28 +645,24 @@ impl Interpreter {
                         None
                     };
                     let operands = function.operand_view(instr);
-                    self.do_construct_spread(stack, context, operands)?;
-                    if jit_installed && stack.len() > depth_before {
-                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
-                            let transition = self.record_ordinary_call_feedback(
-                                function,
-                                instr.instruction_pc,
-                                crate::feedback::OrdinaryCallTarget::Bytecode(
-                                    stack[stack.len() - 1].function_id,
-                                ),
-                            );
-                            if transition.evict_for_reopt() {
-                                self.evict_compiled_for_reopt(function_id);
-                            }
-                        }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
+                    self.do_construct_spread(stack, operands)?;
+                    if jit_installed
+                        && let Some(function_id) = self.staged_bytecode_target(stack)
+                        && direct_construct_fid == Some(function_id)
+                    {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
                         }
                     }
+
                     continue;
                 }
                 Op::SuperConstructSpread => {
-                    let depth_before = stack.len();
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -758,24 +690,21 @@ impl Interpreter {
                         None
                     };
                     let operands = function.operand_view(instr);
-                    self.do_super_construct_spread(stack, context, operands)?;
-                    if jit_installed && stack.len() > depth_before {
-                        if direct_construct_fid == Some(stack[stack.len() - 1].function_id) {
-                            let transition = self.record_ordinary_call_feedback(
-                                function,
-                                instr.instruction_pc,
-                                crate::feedback::OrdinaryCallTarget::Bytecode(
-                                    stack[stack.len() - 1].function_id,
-                                ),
-                            );
-                            if transition.evict_for_reopt() {
-                                self.evict_compiled_for_reopt(function_id);
-                            }
-                        }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
-                            return Ok(value);
+                    self.do_super_construct_spread(stack, operands)?;
+                    if jit_installed
+                        && let Some(function_id) = self.staged_bytecode_target(stack)
+                        && direct_construct_fid == Some(function_id)
+                    {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
                         }
                     }
+
                     continue;
                 }
                 Op::BindThisValue => {
@@ -797,7 +726,7 @@ impl Interpreter {
                     // through [`Self::clear_pending_uncaught_frames`].
                     if self.pending_uncaught_frames.is_none() {
                         self.pending_uncaught_frames =
-                            Some(self.snapshot_active_frames(context, stack, usize::MAX));
+                            Some(self.snapshot_active_frames(context, usize::MAX));
                     }
                     let unwind = self.unwind_throw_above(context, stack, floor, value);
                     if unwind.is_ok() {
@@ -820,7 +749,7 @@ impl Interpreter {
                         Some((crate::cold_frame::ParkedFinally::Throw(value), _)) => {
                             if self.pending_uncaught_frames.is_none() {
                                 self.pending_uncaught_frames =
-                                    Some(self.snapshot_active_frames(context, stack, usize::MAX));
+                                    Some(self.snapshot_active_frames(context, usize::MAX));
                             }
                             let unwind = self.unwind_throw_above(context, stack, floor, value);
                             if unwind.is_ok() {
@@ -840,7 +769,7 @@ impl Interpreter {
                             if let Some(popped) =
                                 self.unwind_abrupt_above(stack, floor, completion, handler_floor)?
                             {
-                                return Ok(popped);
+                                return Ok(DispatchOutcome::Returned(popped));
                             }
                         }
                         Some((crate::cold_frame::ParkedFinally::Normal, _)) | None => {
@@ -853,9 +782,19 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let awaited = *read_register(&stack[top_idx], src)?;
-                    self.do_await(stack, context, dst, awaited)?;
+                    // A suspended async activation completes with its result
+                    // promise, rooted across the await's allocations.
+                    let result = self
+                        .frame_cold(&stack[top_idx])
+                        .and_then(|cold| cold.async_state.as_ref())
+                        .map_or(Value::undefined(), |state| Value::promise(state.result_promise));
+                    let anchor = self.push_iteration_anchor(result) - 1;
+                    let awaited_result = self.do_await(stack, context, dst, awaited);
+                    let result = self.iteration_anchor(anchor);
+                    self.pop_iteration_anchors_to(anchor);
+                    awaited_result?;
                     if stack.is_at_floor(floor) {
-                        return Ok(Value::undefined());
+                        return Ok(DispatchOutcome::Returned(result));
                     }
                     continue;
                 }
@@ -880,8 +819,8 @@ impl Interpreter {
                         .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
-                    let mut popped = stack.pop().expect("frame present");
-                    let detached_cold = self.frame_detach_cold(&mut popped);
+                    let popped = stack.pop().expect("frame present");
+                    let detached_cold = self.frame_detach_cold(popped);
                     let popped = self.park_active_frame(popped);
                     owner.park_after_yield_delegate(
                         &mut self.gc_heap,
@@ -906,7 +845,7 @@ impl Interpreter {
                         self.async_generator_complete_step(context, &owner, Ok(yielded), false)?;
                         self.async_generator_resume_next(stack, context, &owner)?;
                     }
-                    return Ok(Value::undefined());
+                    return Ok(DispatchOutcome::Returned(Value::undefined()));
                 }
                 Op::Yield => {
                     let dst = instr.reg(0);
@@ -917,8 +856,8 @@ impl Interpreter {
                         .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
-                    let mut popped = stack.pop().expect("frame present");
-                    let detached_cold = self.frame_detach_cold(&mut popped);
+                    let popped = stack.pop().expect("frame present");
+                    let detached_cold = self.frame_detach_cold(popped);
                     let popped = self.park_active_frame(popped);
                     owner.park_after_yield(&mut self.gc_heap, popped, detached_cold, dst, yielded);
                     // §27.6 — async-generator yield settles the
@@ -933,19 +872,25 @@ impl Interpreter {
                         );
                         self.async_generator_yield_awaited(stack, context, &owner, yielded)?;
                     }
-                    return Ok(yielded);
+                    return Ok(DispatchOutcome::Returned(yielded));
                 }
                 Op::GeneratorStart => {
                     let owner = self
                         .frame_generator_owner(&stack[top_idx])
                         .ok_or(VmError::TypeMismatch)?;
+                    let callee = stack[top_idx].self_value;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     frame.advance_pc()?;
-                    let mut popped = stack.pop().expect("frame present");
-                    let detached_cold = self.frame_detach_cold(&mut popped);
+                    let popped = stack.pop().expect("frame present");
+                    let detached_cold = self.frame_detach_cold(popped);
                     let popped = self.park_active_frame(popped);
                     owner.park_frame(&mut self.gc_heap, popped, detached_cold);
-                    return Ok(Value::undefined());
+                    // §27.5.1 step 3: the prototype is read after
+                    // FunctionDeclarationInstantiation; the generator object is
+                    // this call's completion.
+                    let generator =
+                        self.resolve_started_generator(stack, context, owner, callee, function_id)?;
+                    return Ok(DispatchOutcome::Returned(generator));
                 }
                 // §7.1.4 ToNumber — the shared synchronous helper owns the
                 // full ToPrimitive(number) ladder before committing `dst`.
@@ -1318,7 +1263,7 @@ impl Interpreter {
                     let idx_reg = instr.reg(1);
                     let src_reg = instr.reg(2);
                     let (function_id, receiver, key, value) = {
-                        let frame = ActiveFrameRef::materialized(&stack[top_idx]);
+                        let frame = ActiveFrameRef::from_frame(&stack[top_idx]);
                         (
                             frame.function_id(),
                             frame.read(recv_reg)?,
@@ -1359,7 +1304,7 @@ impl Interpreter {
                     // view, then end the frame borrow before `[[Set]]` can
                     // allocate, collect, or synchronously re-enter JavaScript.
                     let (function_id, receiver, key, value) = {
-                        let frame = ActiveFrameRef::materialized(&stack[top_idx]);
+                        let frame = ActiveFrameRef::from_frame(&stack[top_idx]);
                         (
                             frame.function_id(),
                             frame.read(recv_reg)?,
@@ -1687,17 +1632,14 @@ impl Interpreter {
                 }
                 Op::LoadThis => {
                     let dst = instr.reg(0);
-                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
                     self.frame_load_this(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadNewTarget => {
                     let dst = instr.reg(0);
-                    let new_target = self
-                        .frame_cold(&stack[top_idx])
-                        .and_then(|cold| cold.new_target)
-                        .unwrap_or(Value::undefined());
+                    let new_target = stack[top_idx].new_target();
                     let result = self.scalar_value(
                         stack,
                         context,
@@ -1742,14 +1684,14 @@ impl Interpreter {
                 }
                 Op::LoadClosureContext => {
                     let dst = instr.reg(0);
-                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
                     self.frame_load_closure_context(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadSelf => {
                     let dst = instr.reg(0);
-                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
                     self.frame_load_self(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
@@ -1757,14 +1699,14 @@ impl Interpreter {
                 Op::CreateContext => {
                     let (dst, parent) = (instr.reg(0), instr.reg(1));
                     let scope = instr.imm(2) as u32;
-                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
                     self.frame_create_context(context, &mut frame, dst, parent, scope)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::CopyContext => {
                     let (dst, src) = (instr.reg(0), instr.reg(1));
-                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    let mut frame = ActiveFrameMut::from_frame(&mut stack[top_idx]);
                     self.frame_copy_context(&mut frame, dst, src)?;
                     frame.advance_pc()?;
                     continue;
@@ -1811,7 +1753,7 @@ impl Interpreter {
                 }
                 Op::CollectRest => {
                     let dst = instr.reg(0);
-                    self.materialized_collect_rest(&mut *stack, top_idx, dst)?;
+                    self.collect_rest(&mut *stack, top_idx, function.param_count, dst)?;
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -2388,13 +2330,13 @@ impl Interpreter {
                         .exception_region(instr.instruction_pc)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.materialized_enter_try_region(frame, region)?;
+                    self.frame_enter_try_region(frame, region)?;
                     frame.advance_pc()?;
                     continue;
                 }
                 Op::LeaveTry => {
                     let frame = &mut stack[top_idx];
-                    self.materialized_leave_try(frame)?;
+                    self.frame_leave_try(frame)?;
                     frame.advance_pc()?;
                     continue;
                 }
@@ -2418,7 +2360,7 @@ impl Interpreter {
                     // finally bodies abandons the completions those
                     // finallys parked (innermost on top).
                     let count = instr.imm(0).max(0) as usize;
-                    self.materialized_pop_parked_finally(&mut stack[top_idx], count)?;
+                    self.frame_pop_parked_finally(&mut stack[top_idx], count)?;
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -2437,7 +2379,7 @@ impl Interpreter {
                         crate::cold_frame::AbruptKind::Jump(next_pc as u32),
                         handler_floor,
                     )? {
-                        return Ok(popped);
+                        return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
                 }
@@ -2453,10 +2395,10 @@ impl Interpreter {
                     )?;
                     if jit_installed
                         && offset < 0
-                        && let Some(Some(value)) =
-                            self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
+                        && let Some(entry) =
+                            self.note_backedge_and_maybe_osr(stack, context, top_idx)?
                     {
-                        return Ok(value);
+                        return Ok(DispatchOutcome::Tier(entry));
                     }
                     continue;
                 }
@@ -2476,10 +2418,10 @@ impl Interpreter {
                         apply_branch(frame, offset, &self.interrupt)?;
                         if jit_installed
                             && offset < 0
-                            && let Some(Some(value)) =
-                                self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
+                            && let Some(entry) =
+                                self.note_backedge_and_maybe_osr(stack, context, top_idx)?
                         {
-                            return Ok(value);
+                            return Ok(DispatchOutcome::Tier(entry));
                         }
                     } else {
                         frame.advance_pc_fast();
@@ -2502,10 +2444,10 @@ impl Interpreter {
                         apply_branch(frame, offset, &self.interrupt)?;
                         if jit_installed
                             && offset < 0
-                            && let Some(Some(value)) =
-                                self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
+                            && let Some(entry) =
+                                self.note_backedge_and_maybe_osr(stack, context, top_idx)?
                         {
-                            return Ok(value);
+                            return Ok(DispatchOutcome::Tier(entry));
                         }
                     } else {
                         frame.advance_pc_fast();

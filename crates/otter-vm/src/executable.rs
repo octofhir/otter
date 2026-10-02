@@ -284,8 +284,8 @@ impl ExecutableModule {
 }
 
 impl CodeBlock {
-    /// Whether the function materializes `arguments`, so its callers publish
-    /// the actual-argument window after the complete register window.
+    /// Whether the function materializes `arguments`, so its activation
+    /// observes its actual arguments.
     #[must_use]
     pub fn needs_arguments(&self) -> bool {
         self.needs_arguments
@@ -313,6 +313,17 @@ impl CodeBlock {
             .saturating_add(std::mem::size_of_val::<[SpanEntry]>(&self.byte_spans) as u64)
             .saturating_add(std::mem::size_of_val::<[u64]>(&self.number_hints) as u64)
             .saturating_add(std::mem::size_of_val::<[(u32, u32)]>(&self.class_hints) as u64)
+    }
+
+    /// Whether execution observes this activation's actual-argument window.
+    /// A body spliced without that window cannot represent these operations.
+    #[must_use]
+    pub fn requires_argument_frame(&self) -> bool {
+        self.needs_arguments
+            || self
+                .code
+                .iter()
+                .any(|instruction| self.op(instruction) == Op::CallForwardArguments)
     }
 
     /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.
@@ -431,8 +442,7 @@ impl CodeBlock {
                     hash_avalanche_2: crate::collections::MAP_HASH_AVALANCHE_2,
                 },
             },
-            native_ref_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::native_function::NATIVE_FUNCTION_BODY_NATIVE_REF_OFFSET as u32,
+            native_call_layout: crate::jit::JitNativeCallLayout::current(),
             instructions: self
                 .code
                 .iter()
@@ -1088,6 +1098,38 @@ pub struct CodeBlock {
 }
 
 impl CodeBlock {
+    /// Immutable call flags of this function, the `FUNCTION_CALL_*` bits
+    /// its [`crate::native_abi::FunctionEntryCell`] publishes: receiver
+    /// conversion, derived constructor, `[[Construct]]`, suspendable body and
+    /// lexical `this`.
+    /// The call trampoline and every generated call entry bind by these bits.
+    #[must_use]
+    pub fn call_flags(&self) -> u32 {
+        use crate::native_abi::{
+            FUNCTION_CALL_CONSTRUCTIBLE, FUNCTION_CALL_DERIVED_CONSTRUCTOR,
+            FUNCTION_CALL_LEXICAL_THIS, FUNCTION_CALL_NO_RECEIVER_CONVERSION,
+            FUNCTION_CALL_SUSPENDABLE,
+        };
+        let suspendable = self.is_async || self.is_generator || self.is_async_generator;
+        let mut flags = 0;
+        if self.is_strict || self.is_arrow || !self.observes_this {
+            flags |= FUNCTION_CALL_NO_RECEIVER_CONVERSION;
+        }
+        if self.is_derived_constructor {
+            flags |= FUNCTION_CALL_DERIVED_CONSTRUCTOR;
+        }
+        if !self.is_arrow && !self.is_method && !suspendable {
+            flags |= FUNCTION_CALL_CONSTRUCTIBLE;
+        }
+        if suspendable {
+            flags |= FUNCTION_CALL_SUSPENDABLE;
+        }
+        if self.is_arrow {
+            flags |= FUNCTION_CALL_LEXICAL_THIS;
+        }
+        flags
+    }
+
     fn from_verified_bytecode(
         function: &Function,
         proof: &VerifiedFunction,

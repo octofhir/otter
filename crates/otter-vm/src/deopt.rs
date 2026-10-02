@@ -54,6 +54,7 @@
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
 use crate::Value;
+use crate::number::NumberValue;
 use crate::native_abi::{ExitAction, ExitReason, FrameStateId};
 
 /// Declared bounds used to verify one compiled function's deopt metadata.
@@ -208,8 +209,12 @@ impl DeoptRepr {
             DeoptRepr::Tagged => Value::from_bits(raw),
             DeoptRepr::Int32 => Value::number_i32(raw as u32 as i32),
             DeoptRepr::Boolean => Value::boolean(raw != 0),
-            DeoptRepr::Uint32 => Value::number_f64(f64::from(raw as u32)),
-            DeoptRepr::Float64 => Value::number_f64(f64::from_bits(raw)),
+            // Unboxed numbers return in the canonical Number encoding: an
+            // integral value in int32 range other than -0 is an int32, as
+            // every other producer boxes it, so operand feedback observed
+            // after the exit stays exact.
+            DeoptRepr::Uint32 => Value::number(NumberValue::from_f64(f64::from(raw as u32))),
+            DeoptRepr::Float64 => Value::number(NumberValue::from_f64(f64::from_bits(raw))),
         }
     }
 }
@@ -845,7 +850,14 @@ mod tests {
             Value::number_i32(i32::MIN),
             "Int32 uses only the low 32 bits"
         );
-        for integer in [0_u32, 1, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+        for integer in [0_u32, 1, i32::MAX as u32] {
+            assert_eq!(
+                DeoptRepr::Uint32.reconstitute(u64::from(integer)),
+                Value::number_i32(integer as i32),
+                "a Uint32 in int32 range is a canonical int32"
+            );
+        }
+        for integer in [i32::MAX as u32 + 1, u32::MAX] {
             assert_eq!(
                 DeoptRepr::Uint32.reconstitute(u64::from(integer)),
                 Value::number_f64(f64::from(integer))
@@ -857,10 +869,17 @@ mod tests {
             "Uint32 uses only the low 32 bits"
         );
 
-        for number in [0.0, -0.0, 3.5, f64::MIN, f64::MAX, f64::INFINITY] {
+        for number in [-0.0, 3.5, f64::MIN, f64::MAX, f64::INFINITY] {
             assert_eq!(
                 DeoptRepr::Float64.reconstitute(number.to_bits()),
                 Value::number_f64(number)
+            );
+        }
+        for integer in [i32::MIN, -1, 0, 1, i32::MAX] {
+            assert_eq!(
+                DeoptRepr::Float64.reconstitute(f64::from(integer).to_bits()),
+                Value::number_i32(integer),
+                "an integral Float64 in int32 range is a canonical int32"
             );
         }
         assert_ne!(

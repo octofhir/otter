@@ -1,32 +1,27 @@
-//! Spread/call-family transition emission.
+//! Spread call and construct emission through the call trampoline.
 //!
 //! # Contents
-//! - Monomorphic spread calls and constructions through shared generated
-//!   linkage.
-//! - Reentrant completion for spread sites without a generated target.
-//! - Uniform success, throw, and committed caller-handler resumption routing.
+//! - `CallSpread`, `NewSpread` and `SuperConstructSpread` stage the dense
+//!   spread array's elements as the request's actual span, then enter the
+//!   common call trampoline.
 //!
 //! # Invariants
-//! - Every success represents a fully committed opcode and falls through once.
-//! - A status-word `SideExit` carries the sole pre-effect activation miss. A
-//!   committed failure reaches the compiled frame's canonical final boundary;
-//!   neither path replays an observable call.
+//! - Staging reads the compiler-created array without allocating; the
+//!   trampoline copies the staged span before any other work.
+//! - Every completion commits once: success stores the destination, a throw
+//!   or a parked error reaches the frame's exception routing.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::jit_runtime_spread_call_op`
+//! - [`super::calls::emit_trampoline_call`] — the shared request and entry.
 
-use dynasmrt::{DynamicLabel, DynasmLabelApi, aarch64::Assembler, dynasm};
+use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
 
 use super::{
-    calls,
-    values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg},
+    calls::{self, CallActuals, CallCallee, CallNewTarget},
+    values::{emit_load_reg, emit_load_runtime_stub},
 };
 use crate::{
-    arm64::{
-        DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_target_is_supported,
-        emit_direct_call_with_access,
-    },
     artifact::{CodeMapCapture, relocation::RelocationCapture},
     entry::Unsupported,
 };
@@ -37,9 +32,6 @@ pub(super) fn emit_spread_call_op(
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
     view: &otter_vm::JitCompileSnapshot,
-    direct_call_events: Option<
-        &mut std::collections::BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>,
-    >,
     code_map: Option<&mut CodeMapCapture>,
     opcode: u8,
     arg0: u64,
@@ -47,144 +39,61 @@ pub(super) fn emit_spread_call_op(
     arg2: u64,
     logical_pc: u32,
     byte_pc: u32,
-    bail: DynamicLabel,
-    transition: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
-    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
-    let direct = if opcode == otter_bytecode::Op::CallSpread as u8 {
-        view.direct_callees
-            .get(&byte_pc)
-            .and_then(|targets| targets.first())
-            .map(|target| {
-                (
-                    target,
-                    DirectCallForm::CallWithThis {
-                        callable: lane(arg0, 1),
-                        receiver: lane(arg0, 2),
-                    },
-                    lane(arg0, 0),
-                    lane(arg0, 3),
-                    otter_vm::JitDirectCallKind::Plain,
-                )
-            })
-    } else if opcode == otter_bytecode::Op::NewSpread as u8
-        || opcode == otter_bytecode::Op::SuperConstructSpread as u8
-    {
-        view.direct_constructs.get(&byte_pc).map(|target| {
-            let super_construct = opcode == otter_bytecode::Op::SuperConstructSpread as u8;
-            let kind = match (super_construct, target.plan.is_derived_constructor) {
-                (false, false) => otter_vm::JitDirectCallKind::Construct,
-                (false, true) => otter_vm::JitDirectCallKind::DerivedConstruct,
-                (true, false) => otter_vm::JitDirectCallKind::SuperConstruct,
-                (true, true) => otter_vm::JitDirectCallKind::DerivedSuperConstruct,
-            };
-            let form = match kind {
-                otter_vm::JitDirectCallKind::Construct => DirectCallForm::Construct {
-                    callable: arg1 as u16,
-                    receiver: arg0 as u16,
-                },
-                otter_vm::JitDirectCallKind::DerivedConstruct => DirectCallForm::DerivedConstruct {
-                    callable: arg1 as u16,
-                },
-                otter_vm::JitDirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
-                    callable: arg1 as u16,
-                    receiver: arg0 as u16,
-                },
-                otter_vm::JitDirectCallKind::DerivedSuperConstruct => {
-                    DirectCallForm::DerivedSuperConstruct {
-                        callable: arg1 as u16,
-                    }
-                }
-                _ => unreachable!("spread construct kind"),
-            };
-            (target, form, arg0 as u16, arg2 as u16, kind)
-        })
-    } else {
-        None
-    };
-    if let Some((target, form, dst, arguments, kind)) =
-        direct.filter(|(target, ..)| direct_call_target_is_supported(target))
-    {
-        let done = ops.new_dynamic_label();
-        emit_direct_call_with_access(
-            ops,
-            relocations,
-            view,
-            DirectCallSite {
-                target,
-                target_index: 0,
-                target_count: 1,
-                caller_function_id: view.code_block.id,
-                logical_pc,
-                byte_pc,
-                dst,
-                form,
-                arguments: DirectCallArguments::Spread(arguments),
-            },
-            transitions.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
-            transitions.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
-            transitions.entry(abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
-            transitions.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
-            transitions.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
-            transitions.entry(abi::STUB_JIT_COPY_SPREAD_ARGUMENTS),
-            0,
-            code_map,
-            bail,
-            transition,
-            threw,
-            throw_value,
-            fatal,
-            done,
-            20,
-            |ops, source, target, _| emit_load_reg(ops, target, source),
-            |ops, destination, source, _| emit_store_reg(ops, source, destination),
-            |_| Ok(()),
-            |ops, source, _| emit_store_reg(ops, source, dst),
-            |_, _| Ok(()),
-            |_, _, _| {
-                Err(Unsupported::OperandShape(
-                    "forward bindings outside forwarding site",
-                ))
-            },
-        )?;
-        if let Some(events) = direct_call_events {
-            events.insert(
-                (byte_pc, 0),
-                calls::direct_call_lowering_event(
-                    kind,
-                    logical_pc,
-                    byte_pc,
-                    target,
-                    0,
-                    1,
-                    otter_vm::JitDirectCallLoweringOutcome::Generated {
-                        code_object_id: target.plan.code_object_id,
-                        target_tier: calls::direct_call_target_tier(target),
-                        this_mode: target.plan.this_mode,
-                    },
-                ),
-            );
-        }
-        dynasm!(ops ; .arch aarch64 ; =>done);
-        return Ok(());
-    }
-
+    let (dst, callee, receiver, array, new_target) =
+        if opcode == otter_bytecode::Op::CallSpread as u8 {
+            (
+                lane(arg0, 0),
+                lane(arg0, 1),
+                Some(lane(arg0, 2)),
+                lane(arg0, 3),
+                CallNewTarget::None,
+            )
+        } else if opcode == otter_bytecode::Op::NewSpread as u8 {
+            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Callee)
+        } else if opcode == otter_bytecode::Op::SuperConstructSpread as u8 {
+            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Super)
+        } else {
+            return Err(Unsupported::OperandShape("spread call opcode"));
+        };
+    emit_load_reg(ops, 1, array)?;
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-    emit_load_u64(ops, 1, u64::from(opcode));
-    emit_load_u64(ops, 2, arg0);
-    emit_load_u64(ops, 3, arg1);
-    emit_load_u64(ops, 4, arg2);
     emit_load_runtime_stub(
         ops,
         relocations,
         16,
-        transitions.variadic_entry(abi::STUB_JIT_SPREAD_CALL_OP),
-        abi::STUB_JIT_SPREAD_CALL_OP,
+        transitions.entry(abi::STUB_JIT_STAGE_SPREAD),
+        abi::STUB_JIT_STAGE_SPREAD,
     );
-    dynasm!(ops ; .arch aarch64 ; blr x16);
-    super::transitions::emit_status_word_result(ops, Some(bail), threw, fatal);
-    Ok(())
+    let staged = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cbz x1, =>staged
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>threw
+        ; =>staged
+    );
+    calls::emit_trampoline_call(
+        ops,
+        relocations,
+        transitions,
+        view,
+        code_map,
+        view.code_block.id,
+        logical_pc,
+        byte_pc,
+        CallCallee::Register(callee),
+        receiver,
+        new_target,
+        CallActuals::Staged,
+        None,
+        dst,
+        throw_value,
+        threw,
+    )
 }

@@ -1,68 +1,39 @@
-//! Representation-neutral access to a live JavaScript activation.
-//!
-//! [`NativeFrame`] plus its published register window is the canonical
-//! activation shared by interpreter, baseline, and optimizing tiers. Tier
-//! switches mutate only execution metadata and preserve that window. A
-//! materialized [`Frame`] remains the cold interpreter-owned representation.
-//! Runtime semantics should not otherwise know which representation they
-//! received.
+//! Checked access to the common JavaScript activation record.
 //!
 //! # Contents
-//! - [`ActiveFrameRef`] — shared access to common frame state.
-//! - [`ActiveFrameMut`] — register, binding, PC, and frame-state mutation.
-//! - [`ActiveFrameStorage`] — the active physical representation.
-//! - [`ActiveFrameError`] — validation failures at the native ABI boundary.
+//! - [`ActiveFrameRef`] and [`ActiveFrameMut`] provide scalar frame access.
+//! - Window validation and checked single-slot operations.
+//! - Collector traversal of frame fields and published tagged windows.
 //!
 //! # Invariants
-//! - Native views are created at one audited `unsafe` boundary. Their register
-//!   descriptors must refer to published, initialized storage for the whole
-//!   view lifetime.
-//! - A stack-owned frame may publish its actual arguments as a third tagged
-//!   window directly after the register window; it is traced with the
-//!   registers and read only through checked single-slot accessors.
-//! - Native windows stay raw inside the view. Safe operations create no slice
-//!   whose borrow can survive an allocating or reentrant VM call; reads return
-//!   copied handles and writes touch exactly one checked slot.
-//! - Interpreter entry on a native activation is zero-copy: register base,
-//!   SELF, and `this` remain authoritative in [`NativeFrame`].
-//! - An activation's incoming context is its SELF closure's context
-//!   ([`ActiveFrameRef::closure_context`]); frames store no binding storage.
-//! - A mutable native view has exclusive logical ownership of its frame record
-//!   and tagged windows. It deliberately does not manufacture long-lived Rust
-//!   references to register-stack storage: GC and reentrant runtime work may
-//!   revisit that storage through the owning interpreter between operations.
-//! - PC advancement is checked and register access is bounds checked for both
-//!   representations.
+//! - Every execution tier uses the same [`Frame`] and register descriptor.
+//! - Views retain raw window descriptors, never slices across allocation or
+//!   JavaScript reentry. Each read or write touches one checked slot.
+//! - A raw-pointer view requires stable, initialized frame storage for its
+//!   lifetime. Mutable access requires exclusive logical mutator ownership.
+//! - Every activation names its actual arguments explicitly: a generated
+//!   caller's outgoing span or the trampoline's copy. An optimizing frame has
+//!   no register window; its root homes are described separately.
+//! - GC rewrites the published slots in place; copied values must be rooted
+//!   separately when retained across an allocation.
 //!
 //! # See also
-//! - [`crate::frame_state::Frame`] — materialized interpreter state.
-//! - [`crate::native_abi::NativeFrame`] — stable machine-visible record.
-//! - [`crate::register_stack`] — published native register storage.
-
-use std::{fmt, mem, ptr::NonNull};
-
-use otter_gc::raw::{RawGc, SlotVisitor};
+//! - [`crate::native_abi::Frame`] for the machine-visible layout.
+//! - [`crate::frame_state`] for suspended execution state.
 
 use crate::{
     Frame, Value, VmError,
-    native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader},
+    native_abi::{NativeFrameKind, VmFrameHeader},
 };
-
-/// Physical representation backing an active frame view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveFrameStorage {
-    /// Full interpreter [`Frame`] published on a `ActivationStack`.
-    Materialized,
-    /// Machine-visible [`NativeFrame`] plus its published register window.
-    Native,
-}
+use otter_gc::raw::SlotVisitor;
+use std::{fmt, marker::PhantomData, mem, ptr::NonNull};
 
 /// Rejected native-frame pointer or window descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveFrameError {
     /// The native-frame pointer itself was null.
     NullNativeFrame,
-    /// The native-frame pointer did not satisfy [`NativeFrame`]'s alignment.
+    /// The native-frame pointer did not satisfy [`Frame`]'s alignment.
     MisalignedNativeFrame,
     /// A non-empty register window had no base address.
     MissingRegisterWindow,
@@ -72,9 +43,6 @@ pub enum ActiveFrameError {
     AddressOutOfRange,
     /// The described allocation range overflows the target address space.
     WindowOutOfRange,
-    /// The frame publishes an actual-argument window without owning its
-    /// register window on the generated-code stack.
-    UnownedIncomingArguments,
 }
 
 impl fmt::Display for ActiveFrameError {
@@ -86,9 +54,6 @@ impl fmt::Display for ActiveFrameError {
             Self::MisalignedRegisterWindow => "native register window is misaligned",
             Self::AddressOutOfRange => "native ABI address is outside the target pointer range",
             Self::WindowOutOfRange => "native ABI window is outside the target address range",
-            Self::UnownedIncomingArguments => {
-                "native incoming-argument window requires stack-owned registers"
-            }
         };
         f.write_str(message)
     }
@@ -143,653 +108,334 @@ impl<T: Copy> NativeWindow<T> {
     }
 }
 
-#[derive(Debug)]
-struct NativeFrameRef {
-    frame: NonNull<NativeFrame>,
-    registers: NativeWindow<Value>,
-    incoming: NativeWindow<Value>,
-}
-
-#[derive(Debug)]
-struct NativeFrameMut {
-    frame: NonNull<NativeFrame>,
-    registers: NativeWindow<Value>,
-    incoming: NativeWindow<Value>,
-}
-
-/// Validate the register window and the actual-argument window that a
-/// generated caller publishes directly after it.
+/// Validate the register window and the actual-argument span the frame names.
 fn checked_register_windows(
-    frame: &NativeFrame,
+    frame: &Frame,
 ) -> Result<(NativeWindow<Value>, NativeWindow<Value>), ActiveFrameError> {
     let register_count = usize::from(frame.header.register_count);
+    if register_count > frame.registers.len() {
+        return Err(ActiveFrameError::WindowOutOfRange);
+    }
     let registers = checked_window::<Value>(
-        frame.register_base,
+        frame.register_base(),
         register_count,
         ActiveFrameError::MissingRegisterWindow,
         ActiveFrameError::MisalignedRegisterWindow,
     )?;
-    let Some(argument_count) = frame.incoming_argument_count() else {
-        return Ok((registers, NativeWindow::empty()));
-    };
-    if !frame
-        .header
-        .flags
-        .contains(NativeFrameFlags::STACK_REGISTERS)
-    {
-        return Err(ActiveFrameError::UnownedIncomingArguments);
-    }
-    let register_bytes = (register_count as u64)
-        .checked_mul(mem::size_of::<Value>() as u64)
-        .ok_or(ActiveFrameError::WindowOutOfRange)?;
-    let incoming_base = frame
-        .register_base
-        .checked_add(register_bytes)
-        .ok_or(ActiveFrameError::WindowOutOfRange)?;
     let incoming = checked_window::<Value>(
-        incoming_base,
-        argument_count as usize,
+        frame.actuals as u64,
+        frame.incoming_argument_count() as usize,
         ActiveFrameError::MissingRegisterWindow,
         ActiveFrameError::MisalignedRegisterWindow,
     )?;
     Ok((registers, incoming))
 }
 
-#[derive(Debug)]
-enum ActiveFrameRefInner<'a> {
-    Materialized { frame: &'a Frame, new_target: Value },
-    Native(NativeFrameRef),
-}
-
-#[derive(Debug)]
-enum ActiveFrameMutInner<'a> {
-    Materialized {
-        frame: &'a mut Frame,
-        new_target: Value,
-    },
-    Native(NativeFrameMut),
-}
-
-/// Shared, representation-neutral access to one active JS frame.
+/// Shared slot-scoped access to one live activation.
 #[derive(Debug)]
 pub struct ActiveFrameRef<'a> {
-    inner: ActiveFrameRefInner<'a>,
+    frame: NonNull<Frame>,
+    registers: NativeWindow<Value>,
+    incoming: NativeWindow<Value>,
+    _lifetime: PhantomData<&'a Frame>,
 }
 
-/// Exclusive, representation-neutral access to one active JS frame.
+/// Exclusive logical mutator access to one live activation.
 #[derive(Debug)]
 pub struct ActiveFrameMut<'a> {
-    inner: ActiveFrameMutInner<'a>,
+    frame: NonNull<Frame>,
+    registers: NativeWindow<Value>,
+    incoming: NativeWindow<Value>,
+    _lifetime: PhantomData<&'a mut Frame>,
 }
 
 impl<'a> ActiveFrameRef<'a> {
-    /// Wrap a materialized interpreter frame.
+    /// Borrow an initialized frame and its published windows.
     #[must_use]
-    pub fn materialized(frame: &'a Frame) -> Self {
-        Self::materialized_with_new_target(frame, Value::undefined())
+    pub fn from_frame(frame: &'a Frame) -> Self {
+        // SAFETY: the frame owner keeps its initialized windows live.
+        unsafe { Self::from_ptr(frame) }.expect("initialized frame windows")
     }
 
-    /// Wrap a materialized interpreter frame and its immutable `new.target`
-    /// binding from the legacy cold sidecar.
-    #[must_use]
-    pub fn materialized_with_new_target(frame: &'a Frame, new_target: Value) -> Self {
-        debug_assert_eq!(
-            frame.registers.len(),
-            usize::from(frame.header.register_count)
-        );
-        Self {
-            inner: ActiveFrameRefInner::Materialized { frame, new_target },
-        }
-    }
-
-    /// Build a view over a machine-published native frame.
+    /// Open a view over a published frame without retaining Rust references.
     ///
     /// # Safety
-    ///
-    /// `frame` must remain valid for `'a`. Its non-empty
-    /// register descriptor must point to initialized storage that
-    /// remains live for `'a`; their backing allocations must not move. No
-    /// semantic writer may race this activation. The boxed value fields must
-    /// contain valid [`Value`] bit patterns. The returned view retains only raw
-    /// descriptors, so no Rust reference spans a safepoint.
-    pub unsafe fn from_native_ptr(frame: *const NativeFrame) -> Result<Self, ActiveFrameError> {
+    /// `frame` and its initialized windows must remain live and stable for
+    /// `'a`. No semantic writer may race this view. Collection may rewrite
+    /// slots only under the engine's exclusive mutator protocol.
+    pub unsafe fn from_ptr(frame: *const Frame) -> Result<Self, ActiveFrameError> {
         validate_frame_pointer(frame)?;
-        // SAFETY: null and alignment were validated above. The short reference
-        // is used only to copy scalar window descriptors.
-        let frame_ref = unsafe { &*frame };
-        let (registers, incoming) = checked_register_windows(frame_ref)?;
-        let frame = NonNull::new(frame.cast_mut()).expect("validated native frame pointer");
+        // SAFETY: pointer validity is the caller's contract; this reference
+        // ends after copying the scalar window descriptors.
+        let (registers, incoming) = checked_register_windows(unsafe { &*frame })?;
         Ok(Self {
-            inner: ActiveFrameRefInner::Native(NativeFrameRef {
-                frame,
-                registers,
-                incoming,
-            }),
+            frame: NonNull::new(frame.cast_mut()).expect("validated frame"),
+            registers,
+            incoming,
+            _lifetime: PhantomData,
         })
     }
 
-    /// Physical representation backing this view.
-    #[must_use]
-    pub const fn storage(&self) -> ActiveFrameStorage {
-        match self.inner {
-            ActiveFrameRefInner::Materialized { .. } => ActiveFrameStorage::Materialized,
-            ActiveFrameRefInner::Native(_) => ActiveFrameStorage::Native,
-        }
-    }
-
-    /// Common frame header.
+    /// Copy the tier-independent execution header.
     #[must_use]
     pub fn header(&self) -> VmFrameHeader {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.header,
-            // SAFETY: the native-view contract keeps the frame live. Copying
-            // the header ends the raw access before the caller can safepoint.
-            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().header },
-        }
+        // SAFETY: one scalar read from the live record.
+        unsafe { self.frame.as_ref().header }
     }
-
     /// Global function identity.
     #[must_use]
     pub fn function_id(&self) -> u32 {
         self.header().function_id
     }
-
     /// Canonical instruction-index resume PC.
     #[must_use]
     pub fn pc(&self) -> u32 {
         self.header().pc
     }
-
-    /// Number of tagged registers in the published window.
+    /// Number of initialized tagged registers.
     #[must_use]
     pub fn register_count(&self) -> usize {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.registers.len(),
-            ActiveFrameRefInner::Native(native) => native.registers.len,
-        }
+        self.registers.len
     }
-
-    /// Raw base of the initialized tagged register window.
-    ///
-    /// The pointer is a machine-code integration descriptor, not a Rust borrow.
-    /// Callers must not turn it into a slice that spans allocating, GC, or
-    /// reentrant VM work. Semantic code should prefer [`Self::read`].
+    /// Raw window base; callers must not retain a slice across a safepoint.
     #[must_use]
     pub fn register_base_ptr(&self) -> *const Value {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => {
-                frame.registers.as_mut_ptr().cast_const()
-            }
-            ActiveFrameRefInner::Native(native) => native.registers.base.as_ptr().cast_const(),
-        }
+        self.registers.base.as_ptr()
     }
-
-    /// Read one tagged register.
+    /// Read one checked register.
     pub fn read(&self, register: u16) -> Result<Value, VmError> {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame
-                .registers
-                .get(usize::from(register))
-                .copied()
-                .ok_or(VmError::InvalidOperand),
-            ActiveFrameRefInner::Native(native) => native
-                .registers
-                .read(usize::from(register))
-                .ok_or(VmError::InvalidOperand),
-        }
+        self.registers
+            .read(usize::from(register))
+            .ok_or(VmError::InvalidOperand)
     }
-
-    /// Number of actual arguments the generated caller published after the
-    /// register window, or `None` when this activation keeps them elsewhere.
+    /// Actual argument count in the contiguous published window.
     #[must_use]
-    pub fn incoming_argument_count(&self) -> Option<usize> {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { .. } => None,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref() }
-                .incoming_argument_count()
-                .map(|count| count as usize),
-        }
+    pub fn incoming_argument_count(&self) -> usize {
+        // SAFETY: one scalar read from the live record.
+        unsafe { self.frame.as_ref().incoming_argument_count() as usize }
     }
-
-    /// Native cache identity, when this view owns a native arguments slot.
+    /// The frame's cached arguments identity.
     pub(crate) fn native_arguments_object(&self) -> Option<crate::object::JsObject> {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { .. } => None,
-            // SAFETY: one scalar read of a published collector-traced slot.
-            ActiveFrameRefInner::Native(native) => unsafe {
-                native.frame.as_ref().arguments_object()
-            },
-        }
+        // SAFETY: one scalar read from a traced frame slot.
+        unsafe { self.frame.as_ref().arguments_object() }
     }
-
-    /// Read one published actual argument.
+    /// Read one checked actual argument.
     pub fn incoming_argument(&self, index: usize) -> Result<Value, VmError> {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { .. } => Err(VmError::InvalidOperand),
-            ActiveFrameRefInner::Native(native) => {
-                native.incoming.read(index).ok_or(VmError::InvalidOperand)
-            }
-        }
+        self.incoming.read(index).ok_or(VmError::InvalidOperand)
     }
-
-    /// Running function object's exact SELF value.
+    /// Exact running function object.
     #[must_use]
     pub fn self_value(&self) -> Value {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.self_value,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().self_value() },
-        }
+        // SAFETY: one scalar read from a traced frame slot.
+        unsafe { self.frame.as_ref().self_value() }
     }
-
-    /// Current `this` binding.
+    /// Current receiver binding.
     #[must_use]
     pub fn this_value(&self) -> Value {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.this_value,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().this_value() },
-        }
+        // SAFETY: one scalar read from a traced frame slot.
+        unsafe { self.frame.as_ref().this_value() }
     }
-
     /// Current `new.target` binding.
     #[must_use]
     pub fn new_target_value(&self) -> Value {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { new_target, .. } => *new_target,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().new_target() },
-        }
+        // SAFETY: one scalar read from a traced frame slot.
+        unsafe { self.frame.as_ref().new_target() }
     }
-
-    /// The context the running closure was created over: SELF's closure
-    /// context, or `undefined` when SELF is not a closure or closes over no
-    /// context.
+    /// Context of the exact running closure.
     #[must_use]
     pub fn closure_context(&self, heap: &otter_gc::GcHeap) -> Value {
         closure_context_of(self.self_value(), heap)
     }
 
-    /// Trace and rewrite a native-stack register window.
-    ///
-    /// Register-arena windows are traced by
-    /// [`crate::register_stack::RegisterStack`] and must not call this method.
-    /// Callers gate it with
-    /// [`crate::native_abi::NativeFrameFlags::STACK_REGISTERS`] so each tagged register is
-    /// visited exactly once.
+    /// Trace the published register and actual-argument windows exactly once.
     pub(crate) fn trace_stack_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        let ActiveFrameRefInner::Native(native) = &self.inner else {
-            return;
-        };
-        for window in [native.registers, native.incoming] {
+        for window in [self.registers, self.incoming] {
             for index in 0..window.len {
-                // SAFETY: the validated published window remains live until
-                // native activation pop. Stop-the-world tracing owns this
-                // short in-place relocation update and retains no reference
-                // afterward.
+                // SAFETY: initialized published slots remain live. Collector
+                // ownership permits a short in-place relocation update.
                 let slot = unsafe { window.base.as_ptr().add(index) };
                 unsafe { (&mut *slot).trace_value_slot_mut(visitor) };
             }
         }
     }
 
-    /// Trace non-register GC slots owned by this activation.
-    ///
-    /// Register-arena windows are traced once through their published prefix;
-    /// generated stack windows are handled separately by
-    /// [`Self::trace_stack_register_slots`]. This method owns SELF, `this`,
-    /// `new.target`, and the lazy arguments object for a native activation; an
-    /// interpreter frame delegates to its established frame tracer.
+    /// Trace SELF, receiver, new.target, and the cached arguments object.
     pub(crate) fn trace_non_register_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => frame.trace_frame_slots(visitor),
-            ActiveFrameRefInner::Native(native) => {
-                let frame = native.frame.as_ptr();
-                // SAFETY: Value is transparent over `u64`; native-frame
-                // publication guarantees valid boxed bits and stop-the-world
-                // tracing owns each short in-place relocation update. No
-                // reference to the enclosing NativeFrame is retained.
-                for bits in unsafe {
-                    [
-                        std::ptr::addr_of_mut!((*frame).self_value_bits),
-                        std::ptr::addr_of_mut!((*frame).this_value_bits),
-                        std::ptr::addr_of_mut!((*frame).new_target_bits),
-                    ]
-                } {
-                    unsafe { (&mut *bits.cast::<Value>()).trace_value_slot_mut(visitor) };
-                }
-                // The nullable compressed arguments handle is a frame-owned
-                // root slot. Rewrite the field itself so later generated
-                // operations observe the moved arguments object.
-                let arguments = unsafe { std::ptr::addr_of_mut!((*frame).arguments_object) };
-                if !unsafe { (*arguments).is_null() } {
-                    visitor(arguments.cast::<RawGc>());
-                }
-            }
-        }
+        // SAFETY: this view names a live published frame, and the collector
+        // owns the short relocation writes during this root walk.
+        unsafe { Frame::trace_fields(self.frame.as_ptr(), visitor) };
     }
 }
 
 impl<'a> ActiveFrameMut<'a> {
-    /// Wrap a materialized interpreter frame.
+    /// Borrow one initialized activation for logical mutator access.
     #[must_use]
-    pub fn materialized(frame: &'a mut Frame) -> Self {
-        Self::materialized_with_new_target(frame, Value::undefined())
+    pub fn from_frame(frame: &'a mut Frame) -> Self {
+        // SAFETY: exclusive frame ownership retains initialized windows.
+        unsafe { Self::from_ptr(frame) }.expect("initialized frame windows")
     }
 
-    /// Wrap a materialized interpreter frame and its immutable `new.target`
-    /// binding from the legacy cold sidecar.
-    #[must_use]
-    pub fn materialized_with_new_target(frame: &'a mut Frame, new_target: Value) -> Self {
-        debug_assert_eq!(
-            frame.registers.len(),
-            usize::from(frame.header.register_count)
-        );
-        Self {
-            inner: ActiveFrameMutInner::Materialized { frame, new_target },
-        }
-    }
-
-    /// Build an exclusive view over a machine-published native frame.
+    /// Open a mutable view over a published frame.
     ///
     /// # Safety
-    ///
-    /// `frame` must remain valid for `'a`. Its
-    /// register descriptor must point to initialized, stable storage with
-    /// exclusive logical mutator ownership for `'a`. No owner may reclaim or
-    /// move the window until the returned view is dropped. Boxed
-    /// fields must contain valid [`Value`] bit patterns. The view retains only
-    /// raw descriptors; each method opens at most one short scalar reference so
-    /// collector root access never aliases a long-lived Rust borrow.
-    pub unsafe fn from_native_ptr(frame: *mut NativeFrame) -> Result<Self, ActiveFrameError> {
-        validate_frame_pointer(frame.cast_const())?;
-        // SAFETY: null and alignment were validated above. The short reference
-        // is used only to copy scalar window descriptors.
-        let frame_ref = unsafe { &*frame };
-        let (registers, incoming) = checked_register_windows(frame_ref)?;
-        let frame = NonNull::new(frame).expect("validated native frame pointer");
+    /// The record and its initialized windows must remain stable and live for
+    /// `'a`, with exclusive logical mutator ownership. Collector rewrites use
+    /// the engine's safepoint protocol. No owner may reclaim the frame or its
+    /// windows while the view is live.
+    pub unsafe fn from_ptr(frame: *mut Frame) -> Result<Self, ActiveFrameError> {
+        // SAFETY: the caller supplies the stronger exclusive contract.
+        let shared = unsafe { ActiveFrameRef::from_ptr(frame) }?;
         Ok(Self {
-            inner: ActiveFrameMutInner::Native(NativeFrameMut {
-                frame,
-                registers,
-                incoming,
-            }),
+            frame: shared.frame,
+            registers: shared.registers,
+            incoming: shared.incoming,
+            _lifetime: PhantomData,
         })
     }
-
-    /// Shared reborrow of this active frame.
+    /// Shared reborrow of the same frame and windows.
     #[must_use]
     pub fn as_ref(&self) -> ActiveFrameRef<'_> {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, new_target } => {
-                ActiveFrameRef::materialized_with_new_target(frame, *new_target)
-            }
-            ActiveFrameMutInner::Native(native) => ActiveFrameRef {
-                inner: ActiveFrameRefInner::Native(NativeFrameRef {
-                    frame: native.frame,
-                    registers: native.registers,
-                    incoming: native.incoming,
-                }),
-            },
+        ActiveFrameRef {
+            frame: self.frame,
+            registers: self.registers,
+            incoming: self.incoming,
+            _lifetime: PhantomData,
         }
     }
-
-    /// Physical representation backing this view.
-    #[must_use]
-    pub fn storage(&self) -> ActiveFrameStorage {
-        self.as_ref().storage()
-    }
-
-    /// Common frame header.
+    /// Copy the current execution header.
     #[must_use]
     pub fn header(&self) -> VmFrameHeader {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.header,
-            // SAFETY: one copied scalar header under the native-view contract.
-            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().header },
-        }
+        self.as_ref().header()
     }
-
     /// Global function identity.
     #[must_use]
     pub fn function_id(&self) -> u32 {
         self.header().function_id
     }
-
     /// Canonical instruction-index resume PC.
     #[must_use]
     pub fn pc(&self) -> u32 {
         self.header().pc
     }
-
-    /// Set the canonical instruction-index resume PC.
+    /// Publish a canonical resume PC.
     pub fn set_pc(&mut self, pc: u32) {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.header.pc = pc,
-            // SAFETY: one scalar write under exclusive logical mutator access.
-            ActiveFrameMutInner::Native(native) => unsafe {
-                native.frame.as_mut().header.pc = pc;
-            },
+        // SAFETY: one scalar write under exclusive logical mutator ownership.
+        unsafe {
+            self.frame.as_mut().header.pc = pc;
         }
     }
-
-    /// Advance the canonical PC by one with overflow checking.
+    /// Advance the PC, rejecting integer overflow.
     pub fn advance_pc(&mut self) -> Result<(), VmError> {
-        let pc = self.pc().checked_add(1).ok_or(VmError::InvalidOperand)?;
-        self.set_pc(pc);
+        self.set_pc(self.pc().checked_add(1).ok_or(VmError::InvalidOperand)?);
         Ok(())
     }
-
-    /// Number of tagged registers in the published window.
+    /// Number of initialized tagged registers.
     #[must_use]
     pub fn register_count(&self) -> usize {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.registers.len(),
-            ActiveFrameMutInner::Native(native) => native.registers.len,
-        }
+        self.registers.len
     }
-
-    /// Number of actual arguments the generated caller published after the
-    /// register window, or `None` when this activation keeps them elsewhere.
+    /// Number of published actual arguments.
     #[must_use]
-    pub fn incoming_argument_count(&self) -> Option<usize> {
+    pub fn incoming_argument_count(&self) -> usize {
         self.as_ref().incoming_argument_count()
     }
-
-    /// Read one published actual argument.
+    /// Read one actual argument.
     pub fn incoming_argument(&self, index: usize) -> Result<Value, VmError> {
         self.as_ref().incoming_argument(index)
     }
-
-    /// Publish the single arguments identity of a native activation.
+    /// Publish the frame's single arguments identity.
     pub(crate) fn set_native_arguments_object(
         &mut self,
         object: crate::object::JsObject,
     ) -> Result<(), VmError> {
-        match &mut self.inner {
-            // SAFETY: one non-allocating write under logical mutator ownership.
-            ActiveFrameMutInner::Native(native) => unsafe {
-                native.frame.as_mut().set_arguments_object(Some(object));
-                Ok(())
-            },
-            ActiveFrameMutInner::Materialized { .. } => Err(VmError::InvalidOperand),
+        // SAFETY: one non-allocating write into a traced slot.
+        unsafe {
+            self.frame.as_mut().set_arguments_object(Some(object));
         }
+        Ok(())
     }
-
-    /// Write one actual-argument slot in an initialized native window.
-    /// Generated linkage uses this while the callee frame is still private.
+    /// Initialize one actual-argument slot before frame publication.
     pub(crate) fn write_incoming_argument(
         &mut self,
         index: usize,
         value: Value,
     ) -> Result<(), VmError> {
-        match &mut self.inner {
-            ActiveFrameMutInner::Native(native) if native.incoming.write(index, value) => Ok(()),
-            _ => Err(VmError::InvalidOperand),
-        }
+        self.incoming
+            .write(index, value)
+            .then_some(())
+            .ok_or(VmError::InvalidOperand)
     }
-
-    /// Raw base of the initialized tagged register window.
-    ///
-    /// This is a native integration descriptor, not an exclusive Rust borrow.
-    /// Do not manufacture a slice that spans allocating or reentrant VM work;
-    /// use [`Self::read`] and [`Self::write`] for semantic access.
+    /// Raw window base; no Rust slice may span allocation or JS reentry.
     #[must_use]
     pub fn register_base_ptr(&self) -> *mut Value {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.registers.as_mut_ptr(),
-            ActiveFrameMutInner::Native(native) => native.registers.base.as_ptr(),
-        }
+        self.registers.base.as_ptr()
     }
-
-    /// Address of one tagged register, bounds checked.
-    ///
-    /// The slot is a traced root of the published activation, so a moving
-    /// collection rewrites it in place; allocating kernels read a value they
-    /// need after allocation back through this address.
+    /// Bounds-checked address of a traced register slot.
     pub(crate) fn register_slot_ptr(&self, register: u16) -> Result<*const Value, VmError> {
         if usize::from(register) >= self.register_count() {
             return Err(VmError::InvalidOperand);
         }
-        // SAFETY: the index is within the published register window.
+        // SAFETY: the index is within the initialized window.
         Ok(unsafe { self.register_base_ptr().add(usize::from(register)) }.cast_const())
     }
-
-    /// Read one tagged register.
+    /// Read one checked register.
     pub fn read(&self, register: u16) -> Result<Value, VmError> {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame
-                .registers
-                .get(usize::from(register))
-                .copied()
-                .ok_or(VmError::InvalidOperand),
-            ActiveFrameMutInner::Native(native) => native
-                .registers
-                .read(usize::from(register))
-                .ok_or(VmError::InvalidOperand),
-        }
+        self.as_ref().read(register)
     }
-
-    /// Write one tagged register.
+    /// Write one checked register.
     pub fn write(&mut self, register: u16, value: Value) -> Result<(), VmError> {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => {
-                let slot = frame
-                    .registers
-                    .get_mut(usize::from(register))
-                    .ok_or(VmError::InvalidOperand)?;
-                *slot = value;
-                Ok(())
-            }
-            ActiveFrameMutInner::Native(native) => native
-                .registers
-                .write(usize::from(register), value)
-                .then_some(())
-                .ok_or(VmError::InvalidOperand),
-        }
+        self.registers
+            .write(usize::from(register), value)
+            .then_some(())
+            .ok_or(VmError::InvalidOperand)
     }
-
-    /// Running function object's exact SELF value.
+    /// Exact running function object.
     #[must_use]
     pub fn self_value(&self) -> Value {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.self_value,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().self_value() },
-        }
+        self.as_ref().self_value()
     }
-
-    /// Replace the running function object's SELF value.
+    /// Replace the exact running function object.
     pub fn set_self_value(&mut self, value: Value) {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.self_value = value,
-            // SAFETY: one scalar write under exclusive logical mutator access.
-            ActiveFrameMutInner::Native(native) => unsafe {
-                native.frame.as_mut().set_self_value(value);
-            },
+        // SAFETY: one traced-slot write under logical mutator ownership.
+        unsafe {
+            self.frame.as_mut().set_self_value(value);
         }
     }
-
-    /// Current `this` binding.
+    /// Current receiver binding.
     #[must_use]
     pub fn this_value(&self) -> Value {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.this_value,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().this_value() },
-        }
+        self.as_ref().this_value()
     }
-
-    /// Replace the current `this` binding.
+    /// Replace the receiver binding.
     pub fn set_this_value(&mut self, value: Value) {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => frame.this_value = value,
-            // SAFETY: one scalar write under exclusive logical mutator access.
-            ActiveFrameMutInner::Native(native) => unsafe {
-                native.frame.as_mut().set_this_value(value);
-            },
+        // SAFETY: one traced-slot write under logical mutator ownership.
+        unsafe {
+            self.frame.as_mut().set_this_value(value);
         }
     }
-
-    /// Current `new.target` binding.
+    /// Current new.target binding.
     #[must_use]
     pub fn new_target_value(&self) -> Value {
-        match &self.inner {
-            ActiveFrameMutInner::Materialized { new_target, .. } => *new_target,
-            // SAFETY: one scalar read under the native-view contract.
-            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().new_target() },
-        }
+        self.as_ref().new_target_value()
     }
-
-    /// The context the running closure was created over; see
-    /// [`ActiveFrameRef::closure_context`].
+    /// Context of the running closure.
     #[must_use]
     pub fn closure_context(&self, heap: &otter_gc::GcHeap) -> Value {
-        closure_context_of(self.self_value(), heap)
+        self.as_ref().closure_context(heap)
     }
-
-    /// Enter interpreter dispatch over this same canonical activation.
-    ///
-    /// The native register window is retained verbatim. A
-    /// materialized frame is already interpreter-owned and only normalizes its
-    /// tier marker.
+    /// Switch dispatch tier while retaining the same activation and windows.
     pub fn enter_interpreter(&mut self) -> Result<(), VmError> {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => {
-                frame.header.kind = NativeFrameKind::Interpreter;
-                Ok(())
-            }
-            // SAFETY: one non-safepointing scalar state transition.
-            ActiveFrameMutInner::Native(native) => unsafe {
-                native
-                    .frame
-                    .as_mut()
-                    .enter_interpreter()
-                    .then_some(())
-                    .ok_or(VmError::InvalidOperand)
-            },
-        }
+        // SAFETY: non-allocating execution-mode update.
+        unsafe { self.frame.as_mut().enter_interpreter() }
+            .then_some(())
+            .ok_or(VmError::InvalidOperand)
     }
-
-    /// Enter a compiled tier over this same canonical native activation.
-    ///
-    /// Materialized interpreter activations enter compiled code through the
-    /// JIT entry path, which constructs and publishes a native frame. This
-    /// borrowed materialized view cannot perform that ownership transition.
+    /// Switch to a compiled tier on the same activation.
     pub fn enter_compiled(&mut self, kind: NativeFrameKind) -> Result<(), VmError> {
-        match &mut self.inner {
-            ActiveFrameMutInner::Materialized { .. } => Err(VmError::InvalidOperand),
-            // SAFETY: one non-safepointing scalar state transition.
-            ActiveFrameMutInner::Native(native) => unsafe {
-                native
-                    .frame
-                    .as_mut()
-                    .enter_compiled(kind)
-                    .then_some(())
-                    .ok_or(VmError::InvalidOperand)
-            },
-        }
+        // SAFETY: non-allocating execution-mode update.
+        unsafe { self.frame.as_mut().enter_compiled(kind) }
+            .then_some(())
+            .ok_or(VmError::InvalidOperand)
     }
 }
 
@@ -808,11 +454,11 @@ fn closure_context_of(self_value: Value, heap: &otter_gc::GcHeap) -> Value {
     }
 }
 
-fn validate_frame_pointer(frame: *const NativeFrame) -> Result<(), ActiveFrameError> {
+fn validate_frame_pointer(frame: *const Frame) -> Result<(), ActiveFrameError> {
     if frame.is_null() {
         return Err(ActiveFrameError::NullNativeFrame);
     }
-    if !(frame as usize).is_multiple_of(mem::align_of::<NativeFrame>()) {
+    if !(frame as usize).is_multiple_of(mem::align_of::<Frame>()) {
         return Err(ActiveFrameError::MisalignedNativeFrame);
     }
     Ok(())
@@ -864,21 +510,19 @@ mod tests {
     }
 
     fn materialized_frame(slots: &mut [Value]) -> Frame {
-        Frame {
-            header: header(slots.len() as u16),
-            registers: crate::RegisterWindow::attached(slots.as_mut_ptr(), slots.len(), 0),
-            self_value: Value::function(7),
-            this_value: Value::number_i32(9),
-            return_register: None,
-            cold: None,
-        }
+        Frame::new(
+            header(slots.len() as u16),
+            slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::number_i32(9),
+        )
     }
 
     #[test]
     fn native_window_access_is_slot_scoped_across_gc_relocation() {
         let mut native_slots = [Value::number_i32(1), Value::undefined()];
         let native_base = native_slots.as_mut_ptr();
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             header(native_slots.len() as u16),
             native_base as u64,
             Value::function(7),
@@ -887,8 +531,7 @@ mod tests {
         {
             // SAFETY: `native` and `native_slots` remain exclusively live for
             // the view and match the published descriptors above.
-            let mut active = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }.unwrap();
-            assert_eq!(active.storage(), ActiveFrameStorage::Native);
+            let mut active = unsafe { ActiveFrameMut::from_ptr(&mut native) }.unwrap();
             assert_eq!(active.register_base_ptr(), native_base);
             assert_eq!(active.register_count(), 2);
             assert_eq!(active.read(0).unwrap(), Value::number_i32(1));
@@ -913,11 +556,45 @@ mod tests {
         assert_eq!(native.header.pc, 4);
         assert_eq!(native.self_value(), Value::function(17));
         assert_eq!(native.header.kind, NativeFrameKind::Optimizing);
-        assert_eq!(native.register_base, native_base as u64);
+        assert_eq!(native.register_base(), native_base as u64);
     }
 
     #[test]
-    fn incoming_argument_window_follows_the_registers_and_is_traced() {
+    fn actual_arguments_keep_their_address_across_register_window_changes() {
+        let mut slots = [
+            Value::number_i32(1),
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+            Value::number_i32(30),
+            Value::number_i32(40),
+        ];
+        let mut frame = Frame::new(
+            header(4),
+            slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::UNDEFINED,
+        );
+
+        let actuals = unsafe { slots.as_mut_ptr().add(4) };
+        frame.set_incoming_arguments(actuals, 2);
+        frame.header.register_count = 1;
+        for initialized in [1, 4] {
+            frame.header.register_count = initialized;
+            let active = unsafe { ActiveFrameRef::from_ptr(&frame) }.unwrap();
+            assert_eq!(active.register_count(), initialized as usize);
+            assert_eq!(active.incoming_argument(0).unwrap(), Value::number_i32(30));
+            assert_eq!(active.incoming_argument(1).unwrap(), Value::number_i32(40));
+        }
+        frame.header.register_count = 5;
+        assert!(matches!(
+            unsafe { ActiveFrameRef::from_ptr(&frame) },
+            Err(ActiveFrameError::WindowOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn incoming_argument_window_is_named_by_the_frame_and_traced() {
         let mut slots = [
             Value::number_i32(1),
             Value::number_i32(2),
@@ -925,19 +602,20 @@ mod tests {
             Value::number_i32(40),
             Value::number_i32(50),
         ];
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             header(2),
             slots.as_mut_ptr() as u64,
             Value::function(7),
             Value::undefined(),
         );
-        native.set_stack_registers();
-        native.set_incoming_arguments(3);
+
+        let actuals = unsafe { slots.as_mut_ptr().add(2) };
+        native.set_incoming_arguments(actuals, 3);
         // SAFETY: the frame, its two registers, and the three published
         // arguments remain live for the view.
-        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
+        let active = unsafe { ActiveFrameRef::from_ptr(&native) }.unwrap();
         assert_eq!(active.register_count(), 2);
-        assert_eq!(active.incoming_argument_count(), Some(3));
+        assert_eq!(active.incoming_argument_count(), 3);
         assert_eq!(active.incoming_argument(0).unwrap(), Value::number_i32(30));
         assert_eq!(active.incoming_argument(2).unwrap(), Value::number_i32(50));
         assert!(matches!(
@@ -949,34 +627,18 @@ mod tests {
             visited += 1;
         });
         assert_eq!(visited, 0, "tagged integers carry no heap slot");
-
-        let mut plain = NativeFrame::new(
-            header(2),
-            slots.as_mut_ptr() as u64,
-            Value::function(7),
-            Value::undefined(),
-        );
-        plain.header.flags = NativeFrameFlags::from_bits(NativeFrameFlags::INCOMING_ARGUMENTS);
-        plain.argument_count = 3;
-        // SAFETY: the frame record is valid; the unowned argument window is
-        // rejected before any window is formed.
-        let unowned = unsafe { ActiveFrameRef::from_native_ptr(&plain) };
-        assert!(matches!(
-            unowned,
-            Err(ActiveFrameError::UnownedIncomingArguments)
-        ));
     }
 
     #[test]
     fn native_pointer_validation_rejects_invalid_descriptors() {
         // SAFETY: constructor validates null before dereferencing it.
-        let null = unsafe { ActiveFrameMut::from_native_ptr(std::ptr::null_mut()) };
+        let null = unsafe { ActiveFrameMut::from_ptr(std::ptr::null_mut()) };
         assert!(matches!(null, Err(ActiveFrameError::NullNativeFrame)));
 
-        let mut native = NativeFrame::new(header(1), 0, Value::function(7), Value::undefined());
+        let mut native = Frame::new(header(1), 0, Value::function(7), Value::undefined());
         // SAFETY: the frame record is valid; its deliberately missing register
         // window is rejected before a slice is formed.
-        let missing = unsafe { ActiveFrameMut::from_native_ptr(&mut native) };
+        let missing = unsafe { ActiveFrameMut::from_ptr(&mut native) };
         assert!(matches!(
             missing,
             Err(ActiveFrameError::MissingRegisterWindow)
@@ -986,14 +648,14 @@ mod tests {
     #[test]
     fn native_single_slot_access_is_bounds_checked() {
         let mut slots = [Value::undefined()];
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             header(slots.len() as u16),
             slots.as_mut_ptr() as u64,
             Value::function(7),
             Value::undefined(),
         );
         // SAFETY: frame and its one initialized slot remain live for the view.
-        let mut active = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }.unwrap();
+        let mut active = unsafe { ActiveFrameMut::from_ptr(&mut native) }.unwrap();
         assert!(matches!(active.read(1), Err(VmError::InvalidOperand)));
         assert!(matches!(
             active.write(1, Value::undefined()),
@@ -1004,7 +666,7 @@ mod tests {
     #[test]
     fn native_arguments_cache_is_rewritten_in_place() {
         let mut slots = [Value::undefined()];
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             header(1),
             slots.as_mut_ptr() as u64,
             Value::function(7),
@@ -1015,7 +677,7 @@ mod tests {
         let after = unsafe { crate::object::JsObject::from_offset(0x2000) };
         native.set_arguments_object(Some(before));
         // SAFETY: the frame and initialized window remain live throughout tracing.
-        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
+        let active = unsafe { ActiveFrameRef::from_ptr(&native) }.unwrap();
         let mut rewrites = 0;
         active.trace_non_register_slots(&mut |slot| unsafe {
             if (*slot).0 == before.offset() {
@@ -1028,56 +690,75 @@ mod tests {
     }
 
     #[test]
-    fn closure_context_reads_self_on_both_representations() {
-        let mut heap = otter_gc::GcHeap::new().expect("heap");
-        let context = crate::context::alloc_context_with_roots(
-            &mut heap,
-            crate::context::ContextShape {
-                scope_function_id: 7,
-                scope_index: 0,
-                slot_count: 1,
-                has_extension: false,
-            },
-            Value::undefined(),
-            |_| false,
-            &mut |_| {},
-        )
-        .expect("context");
-        let closure =
-            crate::closure::alloc_closure(&mut heap, 7, Value::context(context), None, None)
-                .expect("closure");
-        let mut slots = [Value::undefined()];
-        let mut native = NativeFrame::new(
-            header(1),
-            slots.as_mut_ptr() as u64,
-            Value::closure(closure),
-            Value::undefined(),
-        );
-        // SAFETY: the frame and its window remain live for the view.
-        let active = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
-        assert_eq!(active.closure_context(&heap), Value::context(context));
-        native.set_self_value(Value::function(7));
-        // SAFETY: as above.
-        let bare = unsafe { ActiveFrameRef::from_native_ptr(&native) }.unwrap();
-        assert!(bare.closure_context(&heap).is_undefined());
-
-        let mut frame_slots = [Value::undefined()];
-        let mut frame = materialized_frame(&mut frame_slots);
-        frame.self_value = Value::closure(closure);
-        assert_eq!(
-            ActiveFrameRef::materialized(&frame).closure_context(&heap),
-            Value::context(context)
-        );
+    fn closure_context_reads_self_through_checked_views() {
+        let mut interp = crate::Interpreter::new();
+        interp
+            .with_handle_scope(|interp, scope| {
+                let context = crate::context::alloc_context_with_roots(
+                    &mut interp.gc_heap,
+                    crate::context::ContextShape {
+                        scope_function_id: 7,
+                        scope_index: 0,
+                        slot_count: 1,
+                        has_extension: false,
+                    },
+                    Value::undefined(),
+                    |_| false,
+                    &mut |_| {},
+                )?;
+                let context = interp.scoped_value(scope, Value::context(context));
+                let parent = interp.escape_scoped(context);
+                let closure =
+                    crate::closure::alloc_closure(&mut interp.gc_heap, 7, parent, None, None)?;
+                let mut slots = [Value::undefined()];
+                let mut frame = Frame::new(
+                    header(1),
+                    slots.as_mut_ptr() as u64,
+                    Value::closure(closure),
+                    Value::undefined(),
+                );
+                // SAFETY: the initialized frame and its window remain stationary.
+                let active = unsafe { ActiveFrameRef::from_ptr(&frame) }.unwrap();
+                assert_eq!(
+                    active.closure_context(&interp.gc_heap),
+                    interp.escape_scoped(context)
+                );
+                assert_eq!(
+                    ActiveFrameRef::from_frame(&frame).closure_context(&interp.gc_heap),
+                    interp.escape_scoped(context)
+                );
+                frame.set_self_value(Value::function(7));
+                assert!(
+                    ActiveFrameRef::from_frame(&frame)
+                        .closure_context(&interp.gc_heap)
+                        .is_undefined()
+                );
+                Ok::<(), otter_gc::OutOfMemory>(())
+            })
+            .expect("rooted frame fixture");
     }
 
     #[test]
-    fn parked_frames_keep_self_and_registers_across_park_and_resume() {
+    fn parked_frames_preserve_call_bindings_and_arguments_identity() {
         let mut slots = [Value::number_i32(5)];
         let mut frame = materialized_frame(&mut slots);
         frame.self_value = Value::function(41);
-        let (parked, window) = crate::frame_state::ParkedFrameState::copy_from_active(frame);
-        let restored = parked.into_active(window);
+        frame.set_new_target(Value::function(42));
+        frame.set_derived_constructor();
+        // SAFETY: the synthetic handle is compared only, never dereferenced.
+        let arguments = unsafe { crate::JsObject::from_offset(0x1000) };
+        frame.set_arguments_object(Some(arguments));
+        let parked = crate::frame_state::ParkedFrameState::copy_from_active(&frame);
+        let restored = parked.into_prepared();
         assert_eq!(restored.self_value, Value::function(41));
-        assert_eq!(restored.registers[0], Value::number_i32(5));
+        assert_eq!(restored.new_target_value, Value::function(42));
+        assert!(
+            restored
+                .header
+                .flags
+                .contains(NativeFrameFlags::DERIVED_CONSTRUCTOR)
+        );
+        assert_eq!(restored.arguments_object, arguments);
+        assert_eq!(restored.initial_registers[0], Value::number_i32(5));
     }
 }

@@ -189,8 +189,8 @@ pub enum NativeResultStatus {
     SideExit = 1,
     /// JavaScript abrupt completion.
     Throw = 2,
-    /// A structured exception transition committed and generated fallthrough
-    /// remains authoritative.
+    /// Resume the owning state machine: execute a pending call in the
+    /// execution domain, or keep committed structured-exception fallthrough.
     Continue = 3,
     /// A probe/allocation boundary could not allocate.
     OutOfMemory = 4,
@@ -218,6 +218,8 @@ pub enum NativeResultDomain {
     Committed = 3,
     /// Pre-effect leaf/allocation probe.
     Probe = 4,
+    /// Resumable JavaScript execution controlled by the call trampoline.
+    Execution = 5,
 }
 
 /// The sole fixed two-register native result.
@@ -293,9 +295,12 @@ impl NativeResultPair {
         }
     }
 
-    /// Keep generated fallthrough after a committed structured transition.
+    /// Continue the state machine owned by the result domain.
+    ///
+    /// An execution entry requests `JitCtx::pending_call`; a structured
+    /// exception transition keeps generated fallthrough after its effect.
     #[must_use]
-    pub const fn continue_generated() -> Self {
+    pub const fn continue_execution() -> Self {
         Self {
             payload_bits: 0,
             status: NativeResultStatus::Continue as u64,
@@ -339,6 +344,14 @@ impl NativeResultPair {
             _ => return None,
         };
         let valid = match domain {
+            NativeResultDomain::Execution => match status {
+                NativeResultStatus::Success | NativeResultStatus::Throw => true,
+                NativeResultStatus::Continue => self.payload_bits == 0,
+                NativeResultStatus::Fatal => {
+                    self.payload_bits == crate::Value::UNDEFINED.to_abi_bits()
+                }
+                _ => false,
+            },
             NativeResultDomain::None => false,
             NativeResultDomain::Compiled => match status {
                 NativeResultStatus::Success | NativeResultStatus::Throw => true,
@@ -429,6 +442,7 @@ mod tests {
             NativeResultDomain::ExceptionTransition,
             NativeResultDomain::Committed,
             NativeResultDomain::Probe,
+            NativeResultDomain::Execution,
         ] {
             assert_eq!(success.validate(domain), Some(NativeResultStatus::Success));
             assert_eq!(success.payload_value(), value);
@@ -504,6 +518,7 @@ mod tests {
             NativeResultDomain::Compiled,
             NativeResultDomain::ExceptionTransition,
             NativeResultDomain::Committed,
+            NativeResultDomain::Execution,
         ] {
             assert_eq!(pure.validate(domain), Some(NativeResultStatus::Throw));
             assert_eq!(pure.payload_value(), exception);
@@ -520,9 +535,13 @@ mod tests {
 
     #[test]
     fn continue_and_out_of_memory_are_domain_exclusive() {
-        let continued = NativeResultPair::continue_generated();
+        let continued = NativeResultPair::continue_execution();
         assert_eq!(
             continued.validate(NativeResultDomain::ExceptionTransition),
+            Some(NativeResultStatus::Continue)
+        );
+        assert_eq!(
+            continued.validate(NativeResultDomain::Execution),
             Some(NativeResultStatus::Continue)
         );
         for domain in [
@@ -565,6 +584,7 @@ mod tests {
             NativeResultDomain::ExceptionTransition,
             NativeResultDomain::Committed,
             NativeResultDomain::Probe,
+            NativeResultDomain::Execution,
         ] {
             assert_eq!(raw_yield.validate(domain), None);
             assert_eq!(unknown.validate(domain), None);

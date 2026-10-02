@@ -1353,28 +1353,6 @@ pub(crate) fn pack_register_lanes(registers: &[u16]) -> u64 {
     packed
 }
 
-/// Decode a call's argument-register list from its packed word.
-///
-/// Up to [`PACKED_REGISTER_LANES`] registers travel inline as four u16 lanes; a
-/// longer list travels as the address of a register table inside the
-/// executing code object's decoded-operand buffer, which stays alive for the
-/// code's whole lifetime (the emitter bakes the address after the buffer is
-/// frozen).
-pub(crate) fn decode_register_list(
-    argc: usize,
-    packed: u64,
-    inline: &mut [u16; PACKED_REGISTER_LANES],
-) -> &[u16] {
-    if argc <= PACKED_REGISTER_LANES {
-        *inline = unpack_register_lanes(packed);
-        &inline[..argc]
-    } else {
-        // SAFETY: emitted code passes the baked address of an `argc`-length
-        // register table owned by the executing code object.
-        unsafe { std::slice::from_raw_parts(packed as *const u16, argc) }
-    }
-}
-
 /// Unpack fixed-operand register indices from one word.
 pub(crate) fn unpack_register_lanes(packed: u64) -> [u16; PACKED_REGISTER_LANES] {
     [

@@ -31,6 +31,9 @@ pub(super) mod arm64;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 
+#[cfg(test)]
+mod guard_tests;
+
 use super::{
     CallDescriptor, CallEffects, CallTarget, ExceptionalEdge, MachineInstruction,
     MachineRepresentation, OperandConstraint, OperandPurpose, SafepointKind, TargetCapability,
@@ -49,7 +52,7 @@ pub(crate) fn supports_site(
     };
     // A plain call passes no receiver word, so an entry reading `this` is
     // lowered only by the explicit-receiver probe.
-    view.native_ref_byte != 0
+    view.native_call_layout.identity_byte != 0
         && !declaration.this_operand
         && argument_count == usize::from(declaration.argument_count)
         && target.argument_count == declaration.argument_count

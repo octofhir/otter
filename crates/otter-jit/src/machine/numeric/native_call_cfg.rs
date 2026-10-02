@@ -110,7 +110,7 @@ pub(super) fn method_hit(
     if call.safepoint_id != otter_vm::native_abi::NO_SAFEPOINT
         || !call.method_value_byte.is_multiple_of(8)
         || view.cage_base == 0
-        || view.native_ref_byte == 0
+        || view.native_call_layout.identity_byte == 0
         || argument_count != usize::from(call.argument_count)
     {
         return None;
@@ -166,7 +166,7 @@ pub(super) fn resolved_hit(
 ) -> Option<HitKind> {
     let declaration = otter_vm::jit_static_native::jit_leaf_builtin(call.leaf_stub_id)?;
     if view.cage_base == 0
-        || view.native_ref_byte == 0
+        || view.native_call_layout.identity_byte == 0
         || argument_count != usize::from(declaration.argument_count)
         || call.argument_count != declaration.argument_count
     {

@@ -28,7 +28,7 @@ use std::sync::{
 
 use otter_vm::{
     Interpreter, JitArtifactBundle, JitCompileError, JitCompileRequest, JitCompileStatus,
-    JitCompilerHook, JitExecOutcome, JitFunctionCode, JitRuntimeStubBinding, VmRuntimeActivation,
+    JitCompilerHook, JitFunctionCode, JitRuntimeStubBinding,
 };
 
 use crate::OtterJitCompiler;
@@ -342,14 +342,6 @@ struct ObservedJitCode {
     returned_entries: Arc<AtomicU64>,
 }
 
-impl ObservedJitCode {
-    fn note(&self, outcome: Option<&JitExecOutcome>) {
-        if matches!(outcome, Some(JitExecOutcome::Returned(_))) {
-            self.returned_entries.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 impl JitFunctionCode for ObservedJitCode {
     fn metadata(&self) -> otter_vm::native_abi::CodeObjectMetadata {
         self.code.metadata()
@@ -359,12 +351,8 @@ impl JitFunctionCode for ObservedJitCode {
         self.code.native_frame_kind()
     }
 
-    fn generated_stack_frame_bytes(&self) -> Option<u32> {
-        self.code.generated_stack_frame_bytes()
-    }
-
-    fn generated_entry_uses_parameter_prefix(&self) -> bool {
-        self.code.generated_entry_uses_parameter_prefix()
+    fn call_entry_addr(&self) -> Option<usize> {
+        self.code.call_entry_addr()
     }
 
     fn dependencies(&self) -> &[otter_vm::native_abi::CodeDependency] {
@@ -394,35 +382,14 @@ impl JitFunctionCode for ObservedJitCode {
         self.code.safepoint_record(safepoint_id)
     }
 
-    fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
-        let outcome = self.code.run_entry(activation);
-        self.note(Some(&outcome));
-        outcome
+    fn osr_entry_addr(&self, logical_pc: u32) -> Option<usize> {
+        self.code.osr_entry_addr(logical_pc)
     }
 
-    fn run_optimized_entry(&self, activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
-        let outcome = self.code.run_optimized_entry(activation);
-        self.note(outcome.as_ref());
-        outcome
-    }
-
-    fn run_optimized_osr_entry(
-        &self,
-        activation: VmRuntimeActivation,
-        logical_pc: u32,
-    ) -> Option<JitExecOutcome> {
-        let outcome = self.code.run_optimized_osr_entry(activation, logical_pc);
-        self.note(outcome.as_ref());
-        outcome
-    }
-
-    fn osr_entry(
-        &self,
-        activation: VmRuntimeActivation,
-        logical_pc: u32,
-    ) -> Option<JitExecOutcome> {
-        let outcome = self.code.osr_entry(activation, logical_pc);
-        self.note(outcome.as_ref());
-        outcome
+    fn note_completion(&self, status: otter_vm::native_abi::NativeResultStatus) {
+        self.code.note_completion(status);
+        if status == otter_vm::native_abi::NativeResultStatus::Success {
+            self.returned_entries.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

@@ -640,7 +640,7 @@ mod tests {
         let source = TargetSpec::aarch64();
         let allocation = sequence(&source).allocate(&source).expect("allocation");
         assert_eq!(
-            TargetSpec::x86_64().frame_layout(&allocation, 0, 0),
+            TargetSpec::x86_64().frame_layout(&allocation, 0, 0, 0),
             Err(FrameLayoutError::TargetMismatch)
         );
     }

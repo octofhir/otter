@@ -719,7 +719,7 @@ mod tests {
         .expect("source");
         let context = empty_context();
         let module = empty_module();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])
@@ -748,7 +748,8 @@ mod tests {
     fn array_of_uses_stack_rooted_result_allocation() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: ActivationStack = ActivationStack::new();
+        let mut stack: crate::test_support::FrameChainFixture =
+            crate::test_support::FrameChainFixture::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])
@@ -775,7 +776,8 @@ mod tests {
     fn array_construct_length_uses_stack_rooted_shell_and_growth() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: ActivationStack = ActivationStack::new();
+        let mut stack: crate::test_support::FrameChainFixture =
+            crate::test_support::FrameChainFixture::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])
@@ -810,7 +812,8 @@ mod tests {
     fn array_construct_moderate_length_materializes_dense_holes() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: ActivationStack = ActivationStack::new();
+        let mut stack: crate::test_support::FrameChainFixture =
+            crate::test_support::FrameChainFixture::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])

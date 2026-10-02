@@ -1,279 +1,356 @@
-//! Materialized interpreter activation stack.
-//!
-//! The stack owns bytecode-interpreter frames while register storage lives in
-//! the separate reservation-stable [`crate::RegisterStack`]. The frame vector
-//! may therefore grow and move: consumers keep indices and register windows,
-//! never `Frame` addresses, across a push.
+//! Non-owning view of the common native JavaScript frame chain.
 //!
 //! # Contents
-//! - [`ActivationStack`] — the frame stack and its stack-discipline API.
-//! - [`ActivationFloor`] — a lexical lower bound for nested VM execution.
-//! - Direct GC tracing of the live activation range and cold side records.
+//! - [`ActivationStack`] indexes caller-linked frames published by execution.
+//! - [`ActivationFloor`] bounds one execution region.
+//! - Queued call ownership and runtime-turn root publication.
 //!
 //! # Invariants
-//! - No reference or pointer to a `Frame` survives an operation that can push.
-//! - Register windows remain stable independently of frame-vector growth.
-//! - GC tracing visits every live frame exactly once, in push order.
-//! - A rooted runtime turn marks the exact stack published through
-//!   `RawFrameRoots`; nested dispatch cannot borrow rootedness from another
-//!   activation stack.
+//! The trampoline owns active frames and registers. This view owns only a
+//! prepared input packet and borrows the execution context's frame cell.
+//! Completing a frame changes its logical visibility while its physical roots
+//! remain published until the trampoline returns. Host frames keep their
+//! caller's depth and are skipped: they are physical, not logical, activations. Iteration never changes
+//! linkage. Queued input and cold records stay rooted before native entry.
 //!
 //! # See also
-//! - [`crate::frame_state::Frame`] — the frame payload and `trace_frame_slots`.
-//! - [`crate::cold_frame`] — cold side records traced separately from hot frame
-//!   state.
+//! - [`crate::native_abi::call_trampoline`] for stack storage and dispatch.
+//! - [`crate::prepared_call`] for inputs before publication.
 
-use crate::{Interpreter, frame_state::Frame, runtime_cx::RuntimeTurn};
+use crate::{
+    Interpreter, PreparedCall,
+    native_abi::{Frame, JitCtx},
+    runtime_cx::RuntimeTurn,
+};
 use otter_gc::raw::RawGc;
 
-/// Growable stack of materialized interpreter call [`Frame`]s.
-///
-/// Stack-discipline surface (`push` / `pop` / `last` /
-/// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `clear` /
-/// `iter` / `iter_mut`) plus `Index` / `IndexMut`.
+/// First frame at or below `frame` that is a JavaScript activation. Host
+/// frames carry their caller's depth and are not logical activations.
+fn skip_host_frames(mut frame: *mut Frame) -> *mut Frame {
+    // SAFETY: published frames link only to live caller records.
+    while !frame.is_null()
+        && unsafe { (*frame).header.kind } == crate::native_abi::NativeFrameKind::Host
+    {
+        frame = unsafe { (*frame).caller_frame() };
+    }
+    frame
+}
+
+/// View of caller-linked JavaScript activations for one mutator turn.
 #[derive(Debug)]
 pub struct ActivationStack {
-    frames: Vec<Frame>,
+    context: *mut JitCtx,
+    pending: Option<PreparedCall>,
+    /// Classify request awaiting the trampoline; its span is `staged`.
+    request: Option<crate::native_abi::CallRequest>,
+    /// Actual arguments of `request`, copied by the trampoline before any
+    /// allocation. Cleared by the next execution turn.
+    staged: smallvec::SmallVec<[crate::Value; 8]>,
     runtime_root_owner: Option<usize>,
 }
 
-/// Panic-safe lexical marker for the exact stack published to the collector.
-///
-/// Construction is private to this module, where
-/// [`Interpreter::with_runtime_turn`] also installs the matching
-/// `RawFrameRoots`. Other VM modules can inspect the marker but cannot forge
-/// it by merely observing that some unrelated frame provider exists.
 struct RuntimeRootedStack<'a> {
     stack: &'a mut ActivationStack,
 }
-
 impl RuntimeRootedStack<'_> {
-    #[inline]
     fn as_ptr(&self) -> *const ActivationStack {
-        self.stack as *const ActivationStack
+        self.stack
     }
-
-    #[inline]
     fn as_mut(&mut self) -> &mut ActivationStack {
         self.stack
     }
 }
-
 impl Drop for RuntimeRootedStack<'_> {
     fn drop(&mut self) {
-        debug_assert!(self.stack.runtime_root_owner.is_some());
         self.stack.runtime_root_owner = None;
     }
 }
 
-/// Immutable lower bound of one nested execution region.
-///
-/// Frames below this depth belong to the caller and must remain visible to GC,
-/// diagnostics, and stack traces while the nested region runs. The token is a
-/// scalar snapshot; opening a region performs no allocation.
+/// Number of caller frames below an execution region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivationFloor {
     depth: usize,
 }
-
 impl ActivationFloor {
-    /// Root execution region; no caller-owned materialized frames exist below it.
+    /// Empty caller region.
     pub const ROOT: Self = Self { depth: 0 };
-
-    /// Absolute number of caller-owned frames below this region.
-    #[must_use]
+    /// Number of caller-owned frames.
     pub const fn depth(self) -> usize {
         self.depth
     }
+    pub(crate) const fn at_depth(depth: usize) -> Self {
+        Self { depth }
+    }
 }
-
 impl Default for ActivationStack {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl ActivationStack {
-    /// A new empty stack. Capacity grows only with observed call depth.
-    #[must_use]
+    /// Empty activation view; native execution binds its frame cell.
     pub fn new() -> Self {
         Self {
-            frames: Vec::new(),
+            context: std::ptr::null_mut(),
+            pending: None,
+            request: None,
+            staged: smallvec::SmallVec::new(),
             runtime_root_owner: None,
         }
     }
-
-    #[inline]
     fn enter_runtime_rooted(&mut self, owner: usize) -> RuntimeRootedStack<'_> {
-        assert!(
-            self.runtime_root_owner.is_none(),
-            "the same ActivationStack cannot publish duplicate RawFrameRoots"
-        );
+        assert!(self.runtime_root_owner.is_none());
         self.runtime_root_owner = Some(owner);
         RuntimeRootedStack { stack: self }
     }
-
-    /// Whether this exact stack is rooted by `interp`'s collector.
-    ///
-    /// The address is used only as an opaque lexical identity token; it is
-    /// never dereferenced and is cleared before the `&mut Interpreter` borrow
-    /// ends. This prevents safe crate code from pairing a stack published by
-    /// one isolate with another isolate's heap.
-    #[inline]
-    #[must_use]
     pub(crate) fn is_runtime_rooted_by(&self, interp: &Interpreter) -> bool {
         self.runtime_root_owner == Some(interp as *const Interpreter as usize)
     }
-
-    /// Mark the current absolute depth as the lower bound of nested execution.
-    #[inline]
-    #[must_use]
-    pub fn floor(&self) -> ActivationFloor {
-        ActivationFloor { depth: self.len() }
+    pub(crate) unsafe fn bind_context(&mut self, context: *mut JitCtx) -> *mut JitCtx {
+        std::mem::replace(&mut self.context, context)
+    }
+    pub(crate) fn restore_context(&mut self, previous: *mut JitCtx) {
+        self.context = previous;
+    }
+    pub(crate) fn clear_completion(&mut self) {
+        if self.context.is_null() {
+            return;
+        }
+        let current = unsafe { (*self.context).native_frame };
+        if let Some(frame) = unsafe { current.as_mut() } {
+            let completed = crate::native_abi::NativeFrameFlags::COMPLETED;
+            let bits = frame.header.flags.bits() & !completed;
+            frame.header.flags = crate::native_abi::NativeFrameFlags::from_bits(bits);
+        }
+    }
+    pub(crate) fn execution_context(&self) -> *mut JitCtx {
+        self.context
+    }
+    pub(crate) fn pending_mut(&mut self) -> Option<&mut PreparedCall> {
+        self.pending.as_mut()
     }
 
-    /// Number of frames owned by the region above `floor`.
-    #[inline]
-    #[must_use]
+    pub(crate) fn has_pending_call(&self) -> bool {
+        self.pending.is_some() || self.request.is_some()
+    }
+
+    /// Whether owned inputs for a VM-selected entry are queued.
+    pub(crate) fn has_prepared_call(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Queue an ordinary `[[Call]]` (or `[[Construct]]` when `new_target` is
+    /// present) for the trampoline to classify. Nothing about the callee is
+    /// inspected here.
+    pub(crate) fn stage_call(
+        &mut self,
+        callee: crate::Value,
+        receiver: crate::Value,
+        new_target: Option<crate::Value>,
+        arguments: impl IntoIterator<Item = crate::Value>,
+        return_register: Option<u16>,
+    ) {
+        assert!(
+            !self.has_pending_call(),
+            "one pending call per execution boundary"
+        );
+        self.staged.clear();
+        self.staged.extend(arguments);
+        let mut request = crate::native_abi::CallRequest::EMPTY;
+        request.callee = callee;
+        request.receiver = receiver;
+        if let Some(new_target) = new_target {
+            request.new_target = new_target;
+            request.header.flags = crate::native_abi::NativeFrameFlags::from_bits(
+                crate::native_abi::NativeFrameFlags::CONSTRUCT,
+            );
+        }
+        request.return_destination = return_register.map_or(u32::MAX, u32::from);
+        self.request = Some(request);
+    }
+
+    /// Stage only the actual span of a request a generated caller writes
+    /// itself. Returns the span; it stays valid until the next staging.
+    pub(crate) fn stage_arguments(
+        &mut self,
+        arguments: impl IntoIterator<Item = crate::Value>,
+    ) -> Option<(*const crate::Value, u32)> {
+        assert!(
+            self.request.is_none(),
+            "one pending call per execution boundary"
+        );
+        self.staged.clear();
+        self.staged.extend(arguments);
+        Some((self.staged.as_ptr(), u32::try_from(self.staged.len()).ok()?))
+    }
+
+    /// The staged classify request, if any.
+    pub(crate) fn staged_request_mut(&mut self) -> Option<&mut crate::native_abi::CallRequest> {
+        self.request.as_mut()
+    }
+
+    /// Hand the staged request to the trampoline. Its span stays valid until
+    /// the next staging or [`Self::clear_staged`].
+    pub(crate) fn take_request(&mut self) -> Option<crate::native_abi::CallRequest> {
+        let mut request = self.request.take()?;
+        request.arguments = self.staged.as_ptr();
+        request.argument_count = u32::try_from(self.staged.len()).ok()?;
+        Some(request)
+    }
+
+    /// Drop a consumed request span so it retains no values.
+    pub(crate) fn clear_staged(&mut self) {
+        if self.request.is_none() {
+            self.staged.clear();
+        }
+    }
+    pub(crate) fn pending_packet(&self) -> Option<crate::native_abi::CallRequest> {
+        self.pending.as_ref().map(PreparedCall::packet)
+    }
+    pub(crate) fn consume_pending(&mut self) -> crate::prepared_call::ResumeInput {
+        if let Some(mut call) = self.pending.take() {
+            self.pending = call.child.take().map(|child| *child);
+            call.resume
+        } else {
+            crate::prepared_call::ResumeInput::Normal
+        }
+    }
+    pub(crate) fn take_pending(&mut self) -> Option<PreparedCall> {
+        self.pending.take()
+    }
+    pub(crate) fn push(&mut self, call: PreparedCall) {
+        assert!(
+            self.pending.is_none(),
+            "one pending call per execution boundary"
+        );
+        self.pending = Some(call);
+    }
+    fn top_pointer(&self) -> *mut Frame {
+        if self.context.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the execution extent binds a live context and frame chain.
+        let mut current = unsafe { (*self.context).native_frame };
+        if !current.is_null()
+            && unsafe {
+                (*current)
+                    .header
+                    .flags
+                    .contains(crate::native_abi::NativeFrameFlags::COMPLETED)
+            }
+        {
+            current = unsafe { (*current).caller_frame() };
+        }
+        skip_host_frames(current)
+    }
+    fn frame_pointer(&self, index: usize) -> *mut Frame {
+        let mut frame = self.top_pointer();
+        while !frame.is_null() {
+            let depth = unsafe { (*frame).depth } as usize;
+            if depth == index + 1 {
+                return frame;
+            }
+            if depth <= index {
+                break;
+            }
+            frame = skip_host_frames(unsafe { (*frame).caller_frame() });
+        }
+        std::ptr::null_mut()
+    }
+    /// Total live logical depth in the published chain.
+    pub fn len(&self) -> usize {
+        unsafe { self.top_pointer().as_ref() }.map_or(0, |f| f.depth as usize)
+    }
+    /// Whether this view has no live logical activation.
+    pub fn is_empty(&self) -> bool {
+        self.top_pointer().is_null()
+    }
+    /// Mark the current activation as logically complete. Physical ownership
+    /// and root publication remain with the trampoline until its entry returns.
+    pub(crate) fn pop(&mut self) -> Option<&mut Frame> {
+        let frame = self.top_pointer();
+        if frame.is_null() {
+            return None;
+        }
+        assert_eq!(
+            frame,
+            unsafe { (*self.context).native_frame },
+            "an entry completes only its own activation"
+        );
+        unsafe {
+            (*frame).header.flags = crate::native_abi::NativeFrameFlags::from_bits(
+                (*frame).header.flags.bits() | crate::native_abi::NativeFrameFlags::COMPLETED,
+            );
+        }
+        unsafe { frame.as_mut() }
+    }
+    /// Innermost live logical frame.
+    pub fn last(&self) -> Option<&Frame> {
+        unsafe { self.top_pointer().as_ref() }
+    }
+    /// Mutable innermost live logical frame.
+    pub fn last_mut(&mut self) -> Option<&mut Frame> {
+        unsafe { self.top_pointer().as_mut() }
+    }
+    /// Frame at an absolute chain index.
+    pub fn get(&self, index: usize) -> Option<&Frame> {
+        unsafe { self.frame_pointer(index).as_ref() }
+    }
+    /// Mutable frame at an absolute chain index.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Frame> {
+        unsafe { self.frame_pointer(index).as_mut() }
+    }
+    /// Innermost frame without a null check.
+    /// # Safety
+    /// The logical chain must be non-empty.
+    pub unsafe fn top_unchecked(&self) -> &Frame {
+        unsafe { &*self.top_pointer() }
+    }
+    /// Mutable innermost frame without a null check.
+    /// # Safety
+    /// The logical chain must be non-empty and exclusively mutator-owned.
+    pub unsafe fn top_unchecked_mut(&mut self) -> &mut Frame {
+        unsafe { &mut *self.top_pointer() }
+    }
+    /// Current caller depth marker.
+    pub fn floor(&self) -> ActivationFloor {
+        ActivationFloor::at_depth(self.len())
+    }
+    /// Frames above a caller marker.
     pub fn len_above(&self, floor: ActivationFloor) -> usize {
         self.len().saturating_sub(floor.depth)
     }
-
-    /// Whether no frame owned by the region above `floor` remains.
-    #[inline]
-    #[must_use]
+    /// Whether no logical frame remains above a caller marker.
     pub fn is_at_floor(&self, floor: ActivationFloor) -> bool {
         self.len() <= floor.depth
     }
-
-    /// Drop all frames but retain capacity for the next execution turn.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.frames.clear();
-    }
-
-    /// Total number of live frames.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.frames.len()
-    }
-
-    /// `true` when no frames are live.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-
-    /// Push `frame` onto the stack.
-    ///
-    /// The frame is fully constructed before it is published (its register
-    /// window is already `Value::undefined()`-filled by
-    /// [`Frame::for_code_block`] and friends), so it is never visible to
-    /// GC in a partially-initialized state.
-    #[inline]
-    pub fn push(&mut self, frame: Frame) {
-        self.frames.push(frame);
-    }
-
-    /// Pop and return the top frame, or `None` when empty.
-    #[inline]
-    pub fn pop(&mut self) -> Option<Frame> {
-        self.frames.pop()
-    }
-
-    /// Shared reference to the top frame.
-    #[inline]
-    #[must_use]
-    pub fn last(&self) -> Option<&Frame> {
-        self.frames.last()
-    }
-
-    /// Mutable reference to the top frame.
-    #[inline]
-    #[must_use]
-    pub fn last_mut(&mut self) -> Option<&mut Frame> {
-        self.frames.last_mut()
-    }
-
-    /// Shared reference to the top frame without a bounds check.
-    ///
-    /// # Safety
-    /// The stack must be non-empty. The dispatch loop calls this only after its
-    /// `is_empty()` guard at the top of each tick, so a live top frame is
-    /// guaranteed. The reference must not survive a push/pop. Avoids the
-    /// `Index`/`last` bounds check on the hottest per-instruction read.
-    #[inline]
-    #[must_use]
-    pub unsafe fn top_unchecked(&self) -> &Frame {
-        let len = self.frames.len();
-        debug_assert!(len > 0, "top_unchecked on empty stack");
-        unsafe { self.frames.get_unchecked(len - 1) }
-    }
-
-    /// Mutable counterpart to [`Self::top_unchecked`].
-    ///
-    /// # Safety
-    /// Same contract: the stack must be non-empty.
-    #[inline]
-    #[must_use]
-    pub unsafe fn top_unchecked_mut(&mut self) -> &mut Frame {
-        let len = self.frames.len();
-        debug_assert!(len > 0, "top_unchecked_mut on empty stack");
-        unsafe { self.frames.get_unchecked_mut(len - 1) }
-    }
-
-    /// Shared reference to the frame at index `i` (`0` is the bottom `<main>`
-    /// frame), or `None` if out of range.
-    #[inline]
-    #[must_use]
-    pub fn get(&self, i: usize) -> Option<&Frame> {
-        self.frames.get(i)
-    }
-
-    /// Mutable reference to the frame at index `i`, or `None`.
-    #[inline]
-    #[must_use]
-    pub fn get_mut(&mut self, i: usize) -> Option<&mut Frame> {
-        self.frames.get_mut(i)
-    }
-
-    /// Drop frames until exactly `new_len` remain. No-op if already shorter.
-    /// Each removed [`Frame`] is dropped, matching `Vec::truncate`.
-    #[inline]
-    pub fn truncate(&mut self, new_len: usize) {
-        self.frames.truncate(new_len);
-    }
-
-    /// Iterate live frames bottom-to-top (push order). Double-ended so callers
-    /// (e.g. backtrace snapshotting) can walk it innermost-first with `.rev()`.
-    #[inline]
+    /// Iterate the native chain from outermost to innermost.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Frame> {
-        self.frames.iter()
+        (0..self.len()).map(move |index| self.get(index).expect("complete caller chain"))
     }
-
-    /// Mutably iterate live frames bottom-to-top.
-    #[inline]
+    /// Mutably iterate distinct native frames from outermost to innermost.
     pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Frame> {
-        self.frames.iter_mut()
+        let len = self.len();
+        let stack = std::ptr::from_mut(self);
+        (0..len).map(move |index| unsafe { &mut *(*stack).frame_pointer(index) })
     }
-
-    /// Trace every non-register root owned by live materialized activations and
-    /// every cold side record. Register windows are traced once by the separate
-    /// [`crate::register_stack::RegisterStack`] live-prefix walk.
-    ///
-    /// The complete cold pool is intentional: frame construction can populate a
-    /// cold record before publishing the corresponding activation.
     pub(crate) fn trace_roots(
         &self,
-        cold_frames: &crate::cold_frame::ColdFramePool,
+        cold: &crate::cold_frame::ColdFramePool,
         visitor: &mut dyn FnMut(*mut RawGc),
     ) {
-        for frame in self.iter() {
-            frame.trace_frame_slots(visitor);
+        if let Some(call) = &self.pending {
+            call.trace_slots(visitor);
         }
-        cold_frames.trace_all(visitor);
+        if let Some(request) = &self.request {
+            for value in [&request.callee, &request.receiver, &request.new_target] {
+                value.trace_value_slots(visitor);
+            }
+        }
+        for value in &self.staged {
+            value.trace_value_slots(visitor);
+        }
+        cold.trace_all(visitor);
     }
 }
 
@@ -289,6 +366,13 @@ impl Interpreter {
         stack: &mut ActivationStack,
         body: impl FnOnce(RuntimeTurn<'_>) -> R,
     ) -> R {
+        let enclosing_cell = self.jit_frame_cell;
+        if let Some(context) = unsafe { stack.execution_context().as_mut() } {
+            if context.native_frame.is_null() {
+                context.native_frame = self.jit_innermost_native_frame();
+            }
+            self.jit_frame_cell = Some(std::ptr::NonNull::from(&mut context.native_frame).cast());
+        }
         let owner = self as *const Interpreter as usize;
         let cold_frames = &self.cold_frames as *const crate::cold_frame::ColdFramePool;
         let mut rooted = stack.enter_runtime_rooted(owner);
@@ -312,232 +396,19 @@ impl Interpreter {
         }
         drop(extra_roots_guard);
         drop(frame_roots_guard);
+        self.jit_frame_cell = enclosing_cell;
         result
     }
 }
 
 impl std::ops::Index<usize> for ActivationStack {
     type Output = Frame;
-
-    #[inline]
-    fn index(&self, i: usize) -> &Frame {
-        &self.frames[i]
+    fn index(&self, index: usize) -> &Frame {
+        self.get(index).expect("live activation index")
     }
 }
-
 impl std::ops::IndexMut<usize> for ActivationStack {
-    #[inline]
-    fn index_mut(&mut self, i: usize) -> &mut Frame {
-        &mut self.frames[i]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Value;
-    use otter_bytecode::{
-        BytecodeModule, Function, Instruction, SourceKind as BcSourceKind, SpanEntry,
-    };
-
-    /// Minimal single-function module whose `<main>` has one scratch register,
-    /// so `Frame::for_function` yields a 1-register frame we can stamp with an
-    /// identity tag.
-    fn one_register_module() -> BytecodeModule {
-        BytecodeModule {
-            module: "activation-stack-test.ts".to_string(),
-            template_sites: Vec::new(),
-            source_kind: BcSourceKind::TypeScript,
-            functions: vec![Function {
-                id: 0,
-                name: "<main>".to_string(),
-                span: (0, 0),
-                locals: 0,
-                scratch: 1,
-                param_count: 0,
-                length: 0,
-                scopes: Vec::new(),
-                is_strict: false,
-                is_arrow: false,
-                is_method: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_derived_constructor: false,
-                is_module: false,
-                needs_arguments: false,
-                uses_arguments_callee: false,
-                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
-                mapped_argument_bindings: Vec::new(),
-                source_text_range: None,
-                source_text_span: None,
-                module_url: String::new(),
-                contains_direct_eval: false,
-                code: Vec::<Instruction>::new().into(),
-                spans: Vec::<SpanEntry>::new(),
-                number_hint_sites: Vec::new(),
-                class_hint_sites: Vec::new(),
-            }],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        }
-    }
-
-    /// A frame whose single register holds `tag`.
-    fn tagged_frame(
-        function: &Function,
-        tag: i32,
-        registers: &mut crate::register_stack::RegisterStack,
-    ) -> Frame {
-        let window = registers.allocate(1).unwrap();
-        let mut frame = Frame::for_function(
-            function,
-            None,
-            Value::function(function.id),
-            Value::undefined(),
-            window,
-        );
-        frame.registers[0] = Value::number_i32(tag);
-        frame
-    }
-
-    #[test]
-    fn push_pop_len_and_order() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = ActivationStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-        assert!(stack.is_empty());
-
-        for tag in 0..5 {
-            stack.push(tagged_frame(f, tag, &mut registers));
-        }
-        assert_eq!(stack.len(), 5);
-
-        for (i, frame) in stack.iter().enumerate() {
-            assert_eq!(frame.registers[0], Value::number_i32(i as i32));
-            assert_eq!(stack[i].registers[0], Value::number_i32(i as i32));
-        }
-
-        assert_eq!(stack.last().unwrap().registers[0], Value::number_i32(4));
-        let popped = stack.pop().unwrap();
-        assert_eq!(popped.registers[0], Value::number_i32(4));
-        assert_eq!(stack.len(), 4);
-    }
-
-    #[test]
-    fn floor_is_a_zero_allocation_nested_execution_boundary() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = ActivationStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-
-        stack.push(tagged_frame(f, 10, &mut registers));
-        stack.push(tagged_frame(f, 11, &mut registers));
-        let capacity = stack.frames.capacity();
-        let floor = stack.floor();
-
-        assert_eq!(floor.depth(), 2);
-        assert!(stack.is_at_floor(floor));
-        assert_eq!(stack.len_above(floor), 0);
-        assert_eq!(stack.frames.capacity(), capacity);
-
-        stack.push(tagged_frame(f, 20, &mut registers));
-        assert!(!stack.is_at_floor(floor));
-        assert_eq!(stack.len_above(floor), 1);
-        assert_eq!(stack[0].registers[0], Value::number_i32(10));
-        assert_eq!(stack[1].registers[0], Value::number_i32(11));
-
-        stack.pop();
-        assert!(stack.is_at_floor(floor));
-        assert_eq!(stack.len(), floor.depth());
-    }
-
-    #[test]
-    fn capacity_grows_with_observed_depth_without_moving_register_windows() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = ActivationStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-        assert_eq!(stack.frames.capacity(), 0);
-        let n = 32;
-
-        for tag in 0..n {
-            stack.push(tagged_frame(f, tag as i32, &mut registers));
-        }
-        assert!(stack.frames.capacity() >= n);
-        assert!(stack.frames.capacity() < crate::DEFAULT_MAX_STACK_DEPTH as usize);
-        for i in 0..n {
-            assert_eq!(stack[i].registers[0], Value::number_i32(i as i32));
-        }
-    }
-
-    #[test]
-    fn truncate_drops_to_target() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = ActivationStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-        for tag in 0..100 {
-            stack.push(tagged_frame(f, tag, &mut registers));
-        }
-
-        stack.truncate(40);
-        assert_eq!(stack.len(), 40);
-        assert_eq!(stack.last().unwrap().registers[0], Value::number_i32(39));
-
-        // Truncate longer-than-len is a no-op.
-        stack.truncate(10_000);
-        assert_eq!(stack.len(), 40);
-
-        stack.truncate(0);
-        assert!(stack.is_empty());
-    }
-
-    #[test]
-    fn get_and_get_mut_bounds() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = ActivationStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-        for tag in 0..3 {
-            stack.push(tagged_frame(f, tag, &mut registers));
-        }
-        assert!(stack.get(3).is_none());
-        assert!(stack.get_mut(3).is_none());
-        stack.get_mut(1).unwrap().registers[0] = Value::number_i32(99);
-        assert_eq!(stack[1].registers[0], Value::number_i32(99));
-    }
-
-    #[test]
-    fn iter_traces_every_live_frame() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = ActivationStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-        let n = 200;
-        for tag in 0..n as i32 {
-            stack.push(tagged_frame(f, tag, &mut registers));
-        }
-
-        // Mirrors how `ActivationStack::trace_roots` walks the live stack for GC:
-        // iterate every frame and trace its slots. number_i32 registers carry
-        // no GC pointer, so a correct walk visits zero raw-GC slots and reaches
-        // every live frame without panicking. The closure is scoped so its
-        // borrow of `visited_slots` releases before the assert.
-        let mut visited_slots = 0usize;
-        {
-            let mut visitor = |_p: *mut otter_gc::raw::RawGc| {
-                visited_slots += 1;
-            };
-            for frame in stack.iter() {
-                frame.trace_frame_slots(&mut visitor);
-            }
-        }
-        assert_eq!(visited_slots, 0);
-        assert_eq!(stack.len(), n);
+    fn index_mut(&mut self, index: usize) -> &mut Frame {
+        self.get_mut(index).expect("live activation index")
     }
 }

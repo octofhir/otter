@@ -1,30 +1,19 @@
-//! Representation-neutral active-frame opcode kernels.
-//!
-//! Hot binding operations consume [`ActiveFrameMut`] and therefore run over
-//! either a materialized [`Frame`] or the canonical [`crate::native_abi::NativeFrame`]
-//! without copying registers or reconstructing a [`ActivationStack`]. Kernels never
-//! advance the PC: interpreter dispatch, baseline code, and optimizing code
-//! each own their continuation coordinate.
+//! Opcode kernels over the published JavaScript frame.
 //!
 //! # Contents
-//! - Representation-neutral `this` load.
-//! - Explicit materialized-frame operations for rest arguments and
-//!   structured-exception cold state.
+//! - Current `this` binding and rest-array materialization.
+//! - Cold exception-handler and finally state.
 //!
 //! # Invariants
-//! - Inputs are decoded from the executable instruction format before reaching
-//!   these helpers.
-//! - Hot kernels do not inspect [`ActivationStack`] or [`crate::cold_frame::ColdFrame`].
-//! - `this` is the activation's own binding: an arrow's copy of its creating
-//!   activation's `this`, or a derived constructor's frame-held binding.
-//!   A derived-constructor `this` captured by an arrow or visible to a direct
-//!   eval lives in a context slot and is read by the context kernels instead.
-//! - Callers advance or replace the PC only after a kernel commits.
+//! Kernels receive decoded inputs and keep register access scoped. Rest values
+//! come from the immutable actual-argument window after the register capacity.
+//! A derived frame holds a hole until `super()` binds its own `this`; captured
+//! lexical bindings live in contexts. Callers own PC advancement after effects.
 //!
 //! # See also
-//! - [`crate::active_frame`]
-//! - [`crate::context_ops`]
-//! - [`crate::executable`]
+//! - [`crate::active_frame`] for register and actual-window access.
+//! - [`crate::context_ops`] for captured bindings.
+//! - [`crate::cold_frame`] for exception state.
 
 use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
@@ -48,36 +37,32 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// Materialize a legacy cold-sidecar rest-argument buffer.
-    ///
-    /// This helper remains ActivationStack-specific because allocation must trace the
-    /// complete materialized stack and because the buffer is owned by
-    /// [`crate::cold_frame::ColdFrame`]. It still leaves PC ownership to the
-    /// caller.
-    pub(crate) fn materialized_collect_rest(
+    /// Allocate a rest array from the published actual-argument suffix.
+    /// The runtime turn roots the complete physical chain across allocation.
+    pub(crate) fn collect_rest(
         &mut self,
         stack: &mut ActivationStack,
         top_idx: usize,
+        parameter_count: u16,
         dst: u16,
     ) -> Result<(), VmError> {
-        // Drain rather than clone: the rest array is built once per call and
-        // CollectRest is the single consumer.
-        let elements: SmallVec<[Value; 4]> = self
-            .frame_cold_mut(&mut stack[top_idx])
-            .map(|c| std::mem::take(&mut c.rest_args))
-            .unwrap_or_default();
+        let frame = crate::ActiveFrameRef::from_frame(&stack[top_idx]);
+        let count = frame.incoming_argument_count();
+        let elements: SmallVec<[Value; 4]> = (usize::from(parameter_count)..count)
+            .map(|index| frame.incoming_argument(index))
+            .collect::<Result<_, _>>()?;
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
-        ActiveFrameMut::materialized(&mut stack[top_idx]).write(dst, Value::array(array))
+        ActiveFrameMut::from_frame(&mut stack[top_idx]).write(dst, Value::array(array))
     }
 
-    /// Install a verified exception region in a materialized cold sidecar.
-    pub(crate) fn materialized_enter_try_region(
+    /// Install a verified exception region in the frame's cold record.
+    pub(crate) fn frame_enter_try_region(
         &mut self,
         frame: &mut Frame,
         region: crate::executable::code_block_cfg::CodeBlockExceptionRegion,
     ) -> Result<(), VmError> {
         debug_assert_eq!(region.enter_pc, frame.pc);
-        self.materialized_enter_try_handler(
+        self.frame_enter_try_handler(
             frame,
             TryHandler {
                 catch_pc: region.catch_pc,
@@ -87,8 +72,8 @@ impl Interpreter {
         )
     }
 
-    /// Install a decoded handler in a materialized cold sidecar.
-    pub(crate) fn materialized_enter_try_handler(
+    /// Install a decoded handler in the frame's cold record.
+    pub(crate) fn frame_enter_try_handler(
         &mut self,
         frame: &mut Frame,
         handler: TryHandler,
@@ -97,8 +82,8 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Drop abandoned finally completions from materialized cold state.
-    pub(crate) fn materialized_pop_parked_finally(
+    /// Drop abandoned finally completions from cold state.
+    pub(crate) fn frame_pop_parked_finally(
         &mut self,
         frame: &mut Frame,
         count: usize,
@@ -111,8 +96,8 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Leave the innermost handler in a materialized cold sidecar.
-    pub(crate) fn materialized_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
+    /// Leave the innermost handler in the frame's cold record.
+    pub(crate) fn frame_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
         let popped = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
         let Some(handler) = popped else {
             return Err(VmError::InvalidOperand);
@@ -134,10 +119,7 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        RegisterWindow,
-        native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader},
-    };
+    use crate::native_abi::{Frame, NativeFrameFlags, NativeFrameKind, VmFrameHeader};
 
     fn header(register_count: usize) -> VmFrameHeader {
         VmFrameHeader {
@@ -149,65 +131,45 @@ mod tests {
         }
     }
 
-    fn materialized_frame(slots: &mut [Value], self_value: Value, this_value: Value) -> Frame {
-        Frame {
-            header: header(slots.len()),
-            registers: RegisterWindow::attached(slots.as_mut_ptr(), slots.len(), 0),
+    fn frame_fixture(slots: &mut [Value], self_value: Value, this_value: Value) -> Frame {
+        Frame::new(
+            header(slots.len()),
+            slots.as_mut_ptr() as u64,
             self_value,
             this_value,
-            return_register: None,
-            cold: None,
-        }
+        )
     }
 
     #[test]
-    fn binding_kernels_match_materialized_and_native_frames() {
+    fn binding_kernels_preserve_the_pc_in_every_tier() {
         let interpreter = Interpreter::new();
         let self_value = Value::function(31);
         let this_value = Value::number_i32(17);
-
-        let mut materialized_slots = [Value::undefined(); 2];
-        let mut materialized = materialized_frame(&mut materialized_slots, self_value, this_value);
-        {
-            let mut active = ActiveFrameMut::materialized(&mut materialized);
+        for kind in [
+            NativeFrameKind::Interpreter,
+            NativeFrameKind::Baseline,
+            NativeFrameKind::Optimizing,
+        ] {
+            let mut slots = [Value::UNDEFINED; 2];
+            let mut header = header(slots.len());
+            header.kind = kind;
+            let mut frame = Frame::new(header, slots.as_mut_ptr() as u64, self_value, this_value);
+            let mut active = ActiveFrameMut::from_frame(&mut frame);
             interpreter
                 .frame_load_this(&mut active, 0)
-                .expect("materialized this");
-            let self_value = active.self_value();
-            active.write(1, self_value).expect("materialized SELF");
+                .expect("this binding");
+            active.write(1, active.self_value()).expect("SELF binding");
+            assert_eq!(slots, [this_value, self_value]);
+            assert_eq!(frame.header.pc, 3);
         }
-
-        let mut native_slots = [Value::undefined(); 2];
-        let mut native = NativeFrame::new(
-            header(native_slots.len()),
-            native_slots.as_mut_ptr() as u64,
-            self_value,
-            this_value,
-        );
-        {
-            // SAFETY: the native frame and its initialized register window
-            // remain exclusively live and unmoved for this scoped view.
-            let mut active = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
-                .expect("valid native frame");
-            interpreter
-                .frame_load_this(&mut active, 0)
-                .expect("native this");
-            let self_value = active.self_value();
-            active.write(1, self_value).expect("native SELF");
-        }
-
-        assert_eq!(materialized_slots, native_slots);
-        assert_eq!(materialized_slots, [this_value, self_value]);
-        assert_eq!(materialized.header.pc, 3);
-        assert_eq!(native.header.pc, 3);
     }
 
     #[test]
     fn derived_this_hole_is_the_named_reference_error() {
         let interpreter = Interpreter::new();
         let mut slots = [Value::undefined()];
-        let mut frame = materialized_frame(&mut slots, Value::function(7), Value::hole());
-        let mut active = ActiveFrameMut::materialized(&mut frame);
+        let mut frame = frame_fixture(&mut slots, Value::function(7), Value::hole());
+        let mut active = ActiveFrameMut::from_frame(&mut frame);
         let error = interpreter
             .frame_load_this(&mut active, 0)
             .expect_err("derived this before super()");

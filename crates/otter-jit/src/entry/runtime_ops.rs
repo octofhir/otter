@@ -2,7 +2,6 @@
 //!
 //! # Contents
 //! - Fixed-operand descriptor operations and compile-owned variadic entries.
-//! - [`calls`] — native activation and generated-call deoptimization.
 //! - [`reentry`] — exception, coercion, and non-call reentrant completion.
 //! - [`literals`] — committed allocation from boxed-value spans.
 //! - [`vm_ops`] — typed VM operations.
@@ -11,7 +10,7 @@
 //! - No entry accepts a byte PC. Most operands are decoded during compilation;
 //!   fixed-value named-property entries retain source identity in their IC
 //!   cells. Bindings use the published function/logical-PC identity. Shared
-//!   code/safepoint recipes publish inline descendants before cold operations.
+//!   code/safepoint recipes describe inline sources during cold operations.
 //! - Raw metadata pointers target immutable boxed slices retained by the
 //!   active code object for the executable mapping's full lifetime.
 //! - JS values remain in the published frame window or its precise safepoint
@@ -29,13 +28,12 @@ use otter_vm::{VmError, native_abi::NativeResultStatus};
 
 use super::JitCtx;
 
-mod calls;
+mod deopt;
 mod forward_arguments;
-mod inline_frames;
 mod literals;
 mod reentry;
 mod vm_ops;
-pub(crate) use calls::*;
+pub(crate) use deopt::*;
 pub(crate) use forward_arguments::*;
 pub(crate) use literals::*;
 pub(crate) use reentry::*;

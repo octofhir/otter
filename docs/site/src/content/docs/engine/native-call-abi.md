@@ -3,9 +3,9 @@ title: "Otter Native Call Contract"
 ---
 
 This document is the authoritative contract for every native-Rust function
-that the Otter VM invokes from JS. It is the surface that the macro layer
-(Phase 4) and a future JIT (Phase 2+) target. Bindings outside this
-contract are not portable across those layers and will not be accepted.
+that the Otter VM invokes from JS. Builtins, generated surfaces and host
+bindings use this same mutator-bound entry. Compiled execution reaches the
+high-level native context through the engine call boundary.
 
 ## Entry shape
 
@@ -26,6 +26,41 @@ pub type NativeFastFn =
 Otter keeps one current native call shape. The dispatcher, macros, builtins,
 tests, and documentation change together when the shape changes; no parallel
 compatibility ABI is retained inside the active runtime.
+
+## Compiled activation ownership
+
+Interpreter, Template and Machine execution share one published native frame
+chain. Every bytecode function generation is entered through one JavaScript
+call ABI: the context, the callee, the receiver as given, `new.target`
+(`undefined` exactly for `[[Call]]`), the actual count and the actual span on
+the caller's stack, padded with `undefined` to the callee's formal count.
+
+- A compiled generation's entry builds its one native frame in the callee
+  prologue, publishes the activation record inside it, binds the receiver,
+  and unpublishes the record and completes `[[Construct]]` in its epilogue.
+  The record names the caller's span as its actual arguments; nothing is
+  copied for the callee.
+- A Template frame carries the interpreter register window it executes on.
+  A Machine frame has none: its moving values live in safepoint root homes,
+  and a side exit reserves and writes the window before the interpreter
+  continues on the same record.
+- A caller that proved its callee enters the current generation through the
+  target's permanent function entry cell. The proof is one compare against
+  the call site's identity cell, which the code object retains and the
+  collector rewrites: it holds the last callee the full identity proof
+  accepted there, and any other value takes that proof and replaces it.
+- Every other callee, and every interpreter destination, enters the generic
+  entry. A bytecode function with a compiled generation and enough actuals
+  is entered directly; anything else is classified in the call trampoline:
+  bound and class wrappers, host frames for native, proxy and other
+  callables, and interpreter frames with their windows.
+
+Inlined functions retain source positions and moving roots in code-owned
+safepoint recipes. Committed runtime operations resolve their source function
+and PC from those recipes; they do not create temporary physical frames.
+Exact deoptimization creates missing interpreter activations through the same
+trampoline. Stack diagnostics recover inline sources from the current code
+object and safepoint.
 
 ## Receiver and `new.target`
 
@@ -70,7 +105,7 @@ For constructors (`is_construct_call()` is `true`):
 - Returning `Ok(Value::object(obj))` (or any object-shaped value) hands
   the caller that value.
 - Returning a non-object completion is replaced by the
-  `construct_target` (the freshly allocated `this`) — exactly per
+  activation's receiver (`this`), as required by
   §10.2.1.4.2 step 14.
 
 ## Throw protocol

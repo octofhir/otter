@@ -17,7 +17,7 @@
 //!
 //! # See also
 //! - `otter_vm::runtime_activation` for stack-owned semantic operations.
-//! - `otter-jit::arm64::direct_call` for generated frame publication.
+//! - `otter-jit::arm64::js_call` for generated calls.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -270,11 +270,9 @@ struct CounterDelta {
     generated_template_entries: u64,
     generated_template_returns: u64,
     generated_template_deopts: u64,
-    generated_template_throws: u64,
     generated_optimizing_entries: u64,
     generated_optimizing_returns: u64,
     generated_optimizing_deopts: u64,
-    generated_optimizing_throws: u64,
     optimized_deopts: u64,
     to_rust_call_transitions: u64,
     alloc_value_stub_ok: u64,
@@ -297,16 +295,12 @@ impl CounterDelta {
                 - before.jit_generated_template_returns,
             generated_template_deopts: after.jit_generated_template_deopts
                 - before.jit_generated_template_deopts,
-            generated_template_throws: after.jit_generated_template_throws
-                - before.jit_generated_template_throws,
             generated_optimizing_entries: after.jit_generated_optimizing_entries
                 - before.jit_generated_optimizing_entries,
             generated_optimizing_returns: after.jit_generated_optimizing_returns
                 - before.jit_generated_optimizing_returns,
             generated_optimizing_deopts: after.jit_generated_optimizing_deopts
                 - before.jit_generated_optimizing_deopts,
-            generated_optimizing_throws: after.jit_generated_optimizing_throws
-                - before.jit_generated_optimizing_throws,
             optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
             to_rust_call_transitions: after.jit_to_rust_call_transitions
                 - before.jit_to_rust_call_transitions,
@@ -332,10 +326,6 @@ impl CounterDelta {
 
     fn generated_deopts(self) -> u64 {
         self.generated_template_deopts + self.generated_optimizing_deopts
-    }
-
-    fn generated_throws(self) -> u64 {
-        self.generated_template_throws + self.generated_optimizing_throws
     }
 }
 
@@ -714,7 +704,6 @@ fn assert_clean_generated_returns(delta: CounterDelta, expected_calls: u64) {
     assert_eq!(delta.generated_returns(), expected_calls, "{delta:?}");
     assert_eq!(delta.generated_call_deopts, 0, "{delta:?}");
     assert_eq!(delta.generated_deopts(), 0, "{delta:?}");
-    assert_eq!(delta.generated_throws(), 0, "{delta:?}");
     assert_eq!(delta.optimized_deopts, 0, "{delta:?}");
     assert_eq!(delta.to_rust_call_transitions, 0, "{delta:?}");
 }
@@ -806,8 +795,8 @@ fn invalid_length_throws_range_error_once_and_reuses_the_generated_caller() {
     assert_eq!(delta.generated_calls, 2, "{delta:?}");
     assert_eq!(delta.generated_entries(), 2, "{delta:?}");
     assert_eq!(delta.generated_returns(), 1, "{delta:?}");
-    // The cold-deoptimized callee resumes to a throw: both transitions count.
-    assert_eq!(delta.generated_throws(), 1, "{delta:?}");
+    // The cold-deoptimized callee resumes to a throw; its entry completed
+    // through the deopt, not a return.
     assert_eq!(delta.generated_call_deopts, 1, "{delta:?}");
     assert_eq!(delta.generated_deopts(), 1, "{delta:?}");
     assert_eq!(delta.optimized_deopts, 1, "{delta:?}");

@@ -1,51 +1,31 @@
-//! Typed access to one compiled VM activation and its inlined descendants.
+//! Typed semantic access to the currently published JavaScript activation.
 //!
 //! # Contents
-//! - [`RuntimeCall`] is the short-lived JIT-to-VM semantic boundary.
-//! - `exceptions` resolves static catch-only handlers for stack-owned frames
-//!   through the same CodeBlock metadata used by exact deoptimization.
-//! - A private frame identity distinguishes an interpreter-owned root from a
-//!   generated stack-owned activation.
-//! - Focused `control` and `value_ops` implementations expose typed
-//!   operations instead of raw interpreter, stack, context, or frame handles.
-//! - `inline_activations` publishes boxed callee recipes only for committed
-//!   cold reentry and returns to the same compiled body without interpretation.
-//! - `call_source` resolves boxed calls within virtual inline descendants.
+//! - [`RuntimeCall`] binds VM services, function context and one native frame.
+//! - Focused modules implement bindings, values, classes, calls and exceptions.
+//! - Code-owned inline recipes identify sources for committed cold reentry.
 //!
 //! # Invariants
-//! - Construction reads and validates scalar descriptors from the published
-//!   runtime record and current [`NativeFrame`], resolves that function's
-//!   owning chunk, and retains only owned context/`NonNull` service identities,
-//!   never references to either owner container or a copied frame record.
-//! - No method returns the interpreter, materialized stack, native frame,
-//!   register pointer, or an [`ActiveFrameMut`] view. Frame views exist only
-//!   inside one typed method and never survive a VM transition.
-//! - A semantic operation may open the VM/context reference required by the
-//!   existing exclusive-mutator contract. Native-frame and stack slot views
-//!   remain operation-scoped and are not retained across that call.
-//! - A native frame's ownership flags are decoded once. The few genuinely
-//!   materialized-only cold operations reject non-materialized frames before
-//!   mutating state; total value-level operations never side-exit for
-//!   representation.
-//! - Register windows stay published across allocating operations;
-//!   slot access remains checked and scoped through [`ActiveFrameMut`].
-//! - Binding allocates no wrapper, lock, side table, or thread-local state.
-//!   Scoped inline reentry owns temporary native records;
-//!   every such record is removed before its storage is released.
+//! Binding validates the register and actual-argument descriptors and resolves
+//! the function's owning context. Frame views stay local to one operation;
+//! no slot borrow survives allocation or JavaScript reentry. Every tier uses
+//! the same physical frame identity and caller chain. Logical inline sources
+//! remain recipes until an exact deoptimization creates their activations.
 //!
 //! # See also
-//! - [`crate::jit::VmRuntimeActivation`] owns the opaque entry-lifetime record.
-//! - [`crate::active_frame`] validates the machine-published frame windows.
+//! - [`crate::jit::VmRuntimeActivation`] for entry-lifetime service pointers.
+//! - [`crate::active_frame`] for checked, short-lived window access.
+//! - [`crate::native_abi::call_trampoline`] for call ownership.
 
 mod bindings;
-mod call_source;
 mod class_ops;
 mod committed_values;
 mod control;
+mod deopt;
 mod exceptions;
 mod forward_arguments;
-mod inline_activations;
 mod iterators;
+mod semantic_source;
 mod value_loads;
 mod value_ops;
 
@@ -61,18 +41,8 @@ use std::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
     ActivationStack, ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError,
-    jit::VmRuntimeActivation,
-    native_abi::{NativeFrame, NativeFrameFlags},
+    jit::VmRuntimeActivation, native_abi::Frame,
 };
-
-/// Physical ownership decoded from the native frame and runtime activation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeFrameIdentity {
-    /// Compiled view of an existing interpreter activation.
-    Materialized(usize),
-    /// Generated-code stack window rooted by the published native frame.
-    StackOwned,
-}
 
 /// Exclusive, short-lived semantic view of one compiled activation.
 ///
@@ -85,8 +55,7 @@ pub struct RuntimeCall<'a> {
     pub(super) vm: NonNull<Interpreter>,
     pub(super) stack: NonNull<ActivationStack>,
     pub(super) context: ExecutionContext,
-    pub(super) frame: NonNull<NativeFrame>,
-    identity: RuntimeFrameIdentity,
+    pub(super) frame: NonNull<Frame>,
     _exclusive: PhantomData<&'a mut ()>,
 }
 
@@ -104,7 +73,7 @@ impl<'a> RuntimeCall<'a> {
     /// the returned call's lifetime.
     pub unsafe fn bind(
         activation: NonNull<VmRuntimeActivation>,
-        frame: NonNull<NativeFrame>,
+        frame: NonNull<Frame>,
     ) -> Result<Self, VmError> {
         // SAFETY: the caller keeps the activation record live for `'a`. Copy
         // only its opaque pointers; no reference is retained across a VM call.
@@ -115,40 +84,8 @@ impl<'a> RuntimeCall<'a> {
         // Validate both published windows before exposing any semantic method.
         // SAFETY: the entry contract retains the initialized raw descriptor for
         // `'a`; ActiveFrameRef itself stores no native Rust reference.
-        unsafe { ActiveFrameRef::from_native_ptr(frame.as_ptr()) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        // Read only the scalars needed for ownership validation. Retaining a
-        // copied frame would create a second, stale-looking carrier for its GC
-        // slots even though no allocation occurs during this bind.
-        // SAFETY: the validated frame remains initialized for `'a`.
-        let (flags, function_id, register_count, register_base) = {
-            // SAFETY: one operation-scoped shared view; every retained value is
-            // scalar and the view ends before any semantic VM entry.
-            let frame = unsafe { frame.as_ref() };
-            (
-                frame.header.flags,
-                frame.header.function_id,
-                frame.header.register_count,
-                frame.register_base,
-            )
-        };
-        let identity = if flags.contains(NativeFrameFlags::STACK_REGISTERS) {
-            RuntimeFrameIdentity::StackOwned
-        } else {
-            let frame_index = activation.frame_index();
-            // SAFETY: the opaque stack pointer was validated above and the
-            // activation contract keeps the stack live for this bind.
-            let materialized = unsafe { stack.as_ref() }
-                .get(frame_index)
-                .ok_or(VmError::InvalidOperand)?;
-            if materialized.function_id != function_id
-                || materialized.registers.len() != usize::from(register_count)
-                || materialized.registers.as_ptr() as u64 != register_base
-            {
-                return Err(VmError::InvalidOperand);
-            }
-            RuntimeFrameIdentity::Materialized(frame_index)
-        };
+        unsafe { ActiveFrameRef::from_ptr(frame.as_ptr()) }.map_err(|_| VmError::InvalidOperand)?;
+        let function_id = unsafe { frame.as_ref().header.function_id };
         let context = ambient
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)?;
@@ -158,22 +95,22 @@ impl<'a> RuntimeCall<'a> {
             stack,
             context,
             frame,
-            identity,
             _exclusive: PhantomData,
         })
     }
 
-    /// Current physical owner for boundary tests.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn identity(&self) -> RuntimeFrameIdentity {
-        self.identity
+    /// Absolute index in the one physical activation chain.
+    fn frame_index(&self) -> Result<usize, VmError> {
+        usize::try_from(unsafe { self.frame.as_ref().depth })
+            .ok()
+            .and_then(|depth| depth.checked_sub(1))
+            .ok_or(VmError::InvalidOperand)
     }
 
     /// Read one checked register and end the frame borrow before returning.
     pub fn read(&self, register: u16) -> Result<Value, VmError> {
         // SAFETY: construction validated the published frame and its windows.
-        unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }
+        unsafe { ActiveFrameRef::from_ptr(self.frame.as_ptr()) }
             .map_err(|_| VmError::InvalidOperand)?
             .read(register)
     }
@@ -212,9 +149,7 @@ impl<'a> RuntimeCall<'a> {
         arg1: u64,
         arg2: u64,
     ) -> Result<(), VmError> {
-        let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
-            return Err(VmError::InvalidOperand);
-        };
+        let frame_index = self.frame_index()?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = self.context.clone();
@@ -242,9 +177,7 @@ impl<'a> RuntimeCall<'a> {
         arg1: u64,
         arg2: u64,
     ) -> Result<(), VmError> {
-        let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
-            return Err(VmError::InvalidOperand);
-        };
+        let frame_index = self.frame_index()?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = self.context.clone();
@@ -266,9 +199,7 @@ impl<'a> RuntimeCall<'a> {
     /// `packed_registers` carries the `dst`, `src`, and `ctx` registers in
     /// 16-bit lanes; `flags` is the instruction's flags immediate.
     pub fn eval_op(&mut self, packed_registers: u64, flags: u64) -> Result<(), VmError> {
-        let RuntimeFrameIdentity::Materialized(frame_index) = self.identity else {
-            return Err(VmError::InvalidOperand);
-        };
+        let frame_index = self.frame_index()?;
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = &self.context;
@@ -280,7 +211,7 @@ impl<'a> RuntimeCall<'a> {
         operation: impl FnOnce(&mut ActiveFrameMut<'_>) -> Result<T, VmError>,
     ) -> Result<T, VmError> {
         // SAFETY: construction validated the frame and owns it exclusively.
-        let mut frame = unsafe { ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
+        let mut frame = unsafe { ActiveFrameMut::from_ptr(self.frame.as_ptr()) }
             .map_err(|_| VmError::InvalidOperand)?;
         operation(&mut frame)
     }
@@ -330,14 +261,14 @@ mod tests {
     #[test]
     fn identity_is_decoded_once_and_slot_access_is_checked() {
         let mut vm = Interpreter::new();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
             "runtime-call-test.js",
         ))
         .expect("valid bytecode fixture");
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [Value::number_i32(3), Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 11,
@@ -349,14 +280,13 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
 
         // SAFETY: the local activation, frame, and register array stay live and
         // exclusively owned for the RuntimeCall scope.
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
                 .unwrap();
-        assert_eq!(call.identity(), RuntimeFrameIdentity::StackOwned);
+        assert_eq!(call.function_id(), frame.header.function_id);
         assert_eq!(call.read(0).unwrap(), Value::number_i32(3));
         call.write(1, Value::boolean(true)).unwrap();
         assert!(matches!(call.read(2), Err(VmError::InvalidOperand)));
@@ -364,83 +294,64 @@ mod tests {
     }
 
     #[test]
-    fn materialized_identity_must_resolve_the_published_stack_slot() {
+    fn binding_rejects_an_unknown_function_identity() {
         let mut vm = Interpreter::new();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "runtime-call-materialized-test.js",
+            "runtime-call-unknown-function-test.js",
         ))
         .expect("valid bytecode fixture");
         let mut registers = [Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
-                function_id: 0,
+                function_id: u32::MAX,
                 pc: 0,
                 register_count: 1,
                 kind: NativeFrameKind::Baseline,
                 flags: Default::default(),
             },
             registers.as_mut_ptr() as u64,
-            Value::function(0),
+            Value::function(u32::MAX),
             Value::undefined(),
         );
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
 
         assert!(matches!(
             // SAFETY: pointers are live; the test deliberately supplies a
-            // materialized identity that cannot resolve in the empty stack.
+            // function identity absent from the linked execution context.
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) },
             Err(VmError::InvalidOperand)
         ));
     }
 
     #[test]
-    fn runtime_activation_mirrors_call_state_and_writes_back_arguments_identity() {
+    fn runtime_call_uses_the_physical_frame_without_writeback() {
         let (context, function) = bind_this_fixture();
         let mut vm = Interpreter::new();
-        let arguments = vm
-            .alloc_host_object_with_roots(&[], &[])
-            .expect("arguments identity");
-        let mut materialized = vm
-            .test_frame_for_function(&function)
-            .expect("materialized frame");
-        let cold = vm.frame_ensure_cold(&mut materialized);
-        cold.new_target = Some(Value::function(99));
-        cold.is_derived_constructor = true;
-        let mut stack = ActivationStack::new();
-        stack.push(materialized);
-
-        let activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
-        let mut registers = [Value::undefined()];
-        let mut native = NativeFrame::new(
-            VmFrameHeader {
-                function_id: function.id,
-                pc: 0,
-                register_count: 1,
-                kind: NativeFrameKind::Baseline,
-                flags: Default::default(),
-            },
-            registers.as_mut_ptr() as u64,
-            Value::function(function.id),
-            Value::undefined(),
-        );
-        activation
-            .initialize_native_frame_state(&mut native)
-            .expect("non-lexical state mirror");
-
-        assert_eq!(native.new_target(), Value::function(99));
-        assert!(native.is_derived_constructor());
-        let returned = unsafe {
-            activation.with_native_frame_extent(std::ptr::addr_of_mut!(native), || {
-                native.set_arguments_object(Some(arguments));
-                7_u8
-            })
+        let arguments = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
+        let mut frame = vm.test_frame_for_function(&function).unwrap();
+        frame.set_new_target(Value::function(99));
+        frame.set_derived_constructor();
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        stack.push(frame);
+        let physical = std::ptr::from_mut(&mut stack[0]);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut call = unsafe {
+            RuntimeCall::bind(
+                NonNull::from(&mut activation),
+                NonNull::new(physical).unwrap(),
+            )
         }
-        .expect("native frame extent");
-        assert_eq!(returned, 7);
-        let cold = vm.frame_cold(&stack[0]).expect("cold record");
-        assert_eq!(cold.arguments_object, Some(Value::object(arguments)));
-        assert_eq!(std::mem::size_of_val(&activation), 32);
+        .unwrap();
+        call.with_frame(|frame| {
+            frame.set_native_arguments_object(arguments)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::ptr::from_ref(&stack[0]), physical.cast_const());
+        assert_eq!(stack[0].new_target(), Value::function(99));
+        assert!(stack[0].is_derived_constructor());
+        assert_eq!(stack[0].arguments_object(), Some(arguments));
     }
 
     #[test]
@@ -457,14 +368,14 @@ mod tests {
         vm.pending_uncaught_frames = Some(nested_frames.clone());
         let _ = vm.err_uncaught("stale committed detail".into());
 
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
             "runtime-call-throw-test.js",
         ))
         .expect("valid bytecode fixture");
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 0,
@@ -476,7 +387,6 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
 
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
@@ -519,14 +429,14 @@ mod tests {
     fn wrong_committed_site_is_fatal_before_semantic_entry() {
         let mut vm = Interpreter::new();
         let before = vm.jit_runtime_stats();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let context = ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
             "runtime-call-wrong-site-test.js",
         ))
         .expect("valid bytecode fixture");
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 37,
@@ -538,7 +448,6 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
 
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
@@ -554,36 +463,25 @@ mod tests {
     }
 
     #[test]
-    fn committed_materialized_bind_this_never_advances_the_published_pc() {
+    fn committed_bind_this_keeps_the_physical_frame_pc() {
         let (context, function) = bind_this_fixture();
         let mut vm = Interpreter::new();
-        let mut materialized = vm
+        let mut physical = vm
             .test_frame_for_function(&function)
-            .expect("materialized frame");
-        materialized.this_value = Value::hole();
-        vm.frame_ensure_cold(&mut materialized)
-            .is_derived_constructor = true;
-        let register_base = materialized.registers.as_mut_ptr() as u64;
-        let mut native = NativeFrame::new(
-            VmFrameHeader {
-                function_id: 0,
-                pc: 0,
-                register_count: 1,
-                kind: NativeFrameKind::Baseline,
-                flags: Default::default(),
-            },
-            register_base,
-            Value::function(0),
-            Value::hole(),
-        );
-        native.set_derived_constructor();
-        let mut stack = ActivationStack::new();
-        stack.push(materialized);
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+            .expect("derived frame");
+        physical.this_value = Value::hole();
+        physical.set_derived_constructor();
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        stack.push(physical);
+        let native = std::ptr::from_mut(&mut stack[0]);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let bound = Value::number_i32(41);
 
         let mut call = unsafe {
-            RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut native))
+            RuntimeCall::bind(
+                NonNull::from(&mut activation),
+                NonNull::new(native).unwrap(),
+            )
         }
         .expect("runtime call");
         assert_eq!(
@@ -591,23 +489,23 @@ mod tests {
                 .expect("committed bind"),
             bound
         );
-        assert_eq!(native.header.pc, 0);
+        assert_eq!(unsafe { (*native).header.pc }, 0);
         assert_eq!(stack[0].pc, 0);
-        assert_eq!(native.this_value(), bound);
+        assert_eq!(unsafe { (*native).this_value() }, bound);
         assert_eq!(stack[0].this_value, bound);
 
         assert!(matches!(
             call.scalar_values(Value::number_i32(42), Value::undefined()),
             Err(CommittedValueError::JavaScript(VmError::ThisUninitialized))
         ));
-        assert_eq!(native.header.pc, 0);
+        assert_eq!(unsafe { (*native).header.pc }, 0);
         assert_eq!(stack[0].pc, 0);
-        assert_eq!(native.this_value(), bound);
+        assert_eq!(unsafe { (*native).this_value() }, bound);
         assert_eq!(stack[0].this_value, bound);
     }
 
     #[test]
-    fn committed_materialized_bind_never_reaches_an_enclosing_derived_frame() {
+    fn committed_bind_keeps_the_enclosing_derived_frame_uninitialized() {
         let (base_context, outer_function) = bind_this_fixture();
         let inner_function = Function {
             id: 1,
@@ -646,36 +544,26 @@ mod tests {
             .test_frame_for_function(&outer_function)
             .expect("outer derived frame");
         outer.this_value = Value::hole();
-        vm.frame_ensure_cold(&mut outer).is_derived_constructor = true;
+        outer.set_derived_constructor();
         let mut inner = vm
             .test_frame_for_function(&inner_function)
             .expect("nested lexical frame");
         inner.this_value = Value::hole();
-        let inner_register_base = inner.registers.as_mut_ptr() as u64;
-
-        let mut native = NativeFrame::new(
-            VmFrameHeader {
-                function_id: 1,
-                pc: 0,
-                register_count: 1,
-                kind: NativeFrameKind::Baseline,
-                flags: Default::default(),
-            },
-            inner_register_base,
-            Value::function(1),
-            Value::hole(),
-        );
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         stack.push(outer);
         stack.push(inner);
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 1);
+        let native = std::ptr::from_mut(&mut stack[1]);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let bound = Value::number_i32(71);
 
         let mut call = unsafe {
-            RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut native))
+            RuntimeCall::bind(
+                NonNull::from(&mut activation),
+                NonNull::new(native).unwrap(),
+            )
         }
         .expect("nested runtime call");
-        assert_eq!(call.identity(), RuntimeFrameIdentity::Materialized(1));
+        assert_eq!(call.frame_index().unwrap(), 1);
         // A frame-held `this` binds only in its own derived constructor: an
         // arrow's `super()` binds a context slot instead, so a nested
         // non-derived frame is a catchable error and the outer binding stays
@@ -684,10 +572,10 @@ mod tests {
             call.scalar_values(bound, Value::undefined()),
             Err(CommittedValueError::JavaScript(VmError::ThisUninitialized))
         ));
-        assert_eq!(native.header.pc, 0);
+        assert_eq!(unsafe { (*native).header.pc }, 0);
         assert!(stack[0].this_value.is_hole());
         assert!(stack[1].this_value.is_hole());
-        assert!(native.this_value().is_hole());
+        assert!(unsafe { (*native).this_value() }.is_hole());
     }
 
     #[test]
@@ -695,9 +583,9 @@ mod tests {
         let (context, _) = bind_this_fixture();
         let mut vm = Interpreter::new();
         let before = vm.jit_runtime_stats();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let mut registers = [Value::undefined()];
-        let mut native = NativeFrame::new(
+        let mut native = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 0,
@@ -709,8 +597,8 @@ mod tests {
             Value::function(0),
             Value::hole(),
         );
-        native.set_stack_registers();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
 
         let mut call = unsafe {
             RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut native))

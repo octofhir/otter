@@ -42,6 +42,8 @@
 //!   loaded through GC-traced prototype words in retained root shapes.
 //! - Generated stores reject watched prototype receivers before any effect;
 //!   canonical mutation invalidates every subscribed chain.
+//! - Native identity is the external-ref index in the one C callable header;
+//!   it names exactly one entry, and so its kind.
 //!
 //! # See also
 //! - `otter_vm::cache_ir` owns the runtime proof and immutable snapshot.
@@ -1364,7 +1366,7 @@ pub(crate) fn native_leaf_call_is_supported(
     let Some(declaration) = otter_vm::jit_static_native::jit_leaf_builtin(stub_id) else {
         return false;
     };
-    view.native_ref_byte != 0
+    view.native_call_layout.identity_byte != 0
         && !declaration.this_operand
         && argc == usize::from(declaration.argument_count)
         && leaf_no_alloc_stub2_by_id(stub_id).is_some()
@@ -1391,7 +1393,7 @@ pub(crate) fn guarded_method_call_is_supported(
     call: &JitGuardedMethodCall,
 ) -> bool {
     view.cage_base != 0
-        && view.native_ref_byte != 0
+        && view.native_call_layout.identity_byte != 0
         && native_entry_call_is_supported(call.entry_stub_id, call.safepoint_id)
 }
 
@@ -1465,7 +1467,7 @@ pub(crate) fn emit_native_leaf_guard(
         ; ldrb w14, [X(callee_x)]
         ; cmp w14, native_type_tag
         ; b.ne =>bail
-        ; ldr w14, [X(callee_x), view.native_ref_byte]
+        ; ldr w14, [X(callee_x), view.native_call_layout.identity_byte]
     );
     emit_native_ref_compare(ops, builtin_native_ref);
     dynasm!(ops
@@ -1743,7 +1745,7 @@ fn emit_guarded_method_guard_impl(
     miss: DynamicLabel,
     preserve_receiver: bool,
 ) -> Result<(), Unsupported> {
-    if view.cage_base == 0 || view.native_ref_byte == 0 {
+    if view.cage_base == 0 || view.native_call_layout.identity_byte == 0 {
         return Err(Unsupported::OperandShape("guarded method call layout"));
     }
     match call.receiver {
@@ -2047,7 +2049,7 @@ pub(crate) fn emit_builtin_identity_guard(
     miss: DynamicLabel,
 ) {
     let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
-    let native_ref_byte = view.native_ref_byte;
+    let native_ref_byte = view.native_call_layout.identity_byte;
     dynasm!(ops
         ; .arch aarch64
         ; ldr w9, [x15, method_value_byte]

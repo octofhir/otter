@@ -154,7 +154,7 @@ fn generated_spread_wrapper_completes_without_entry_deopt() {
         .filter(|event| {
             matches!(
                 event,
-                JitDebugEvent::GeneratedCallDeopt { exit_reason, .. }
+                JitDebugEvent::EnteredGenerationDeopt { exit_reason, .. }
                     if *exit_reason != otter_vm::native_abi::ExitReason::Interrupt
             )
         })

@@ -191,14 +191,6 @@ impl Interpreter {
                 }
             }),
         );
-        push(
-            "lean_callback_roots",
-            count(|v| {
-                for root in self.lean_callback_roots_for_trace() {
-                    root.trace_slots(v);
-                }
-            }),
-        );
         push("handle_arena", count(|v| self.handle_arena_trace(v)));
         push(
             "persistent_roots",
@@ -316,9 +308,6 @@ impl Interpreter {
         push(
             "pending_throws",
             count(|v| {
-                if let Some(value) = self.pending_generator_throw_for_trace() {
-                    value.trace_value_slots(v);
-                }
                 if let Some(value) = self.pending_uncaught_throw_for_trace() {
                     value.trace_value_slots(v);
                 }
@@ -336,7 +325,6 @@ impl Interpreter {
             "rejection_tracker",
             count(|v| self.rejection_tracker_for_trace().trace(v)),
         );
-        push("register_stack", count(|v| self.trace_reg_stack(v)));
         push(
             "native_jit_activations",
             count(|v| self.trace_native_jit_activations(v)),

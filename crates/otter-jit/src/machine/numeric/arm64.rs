@@ -91,6 +91,8 @@
 // register encoding. Clippy sees the macro expansion as an identity conversion.
 #![allow(clippy::useless_conversion)]
 
+mod activation;
+mod call;
 mod forward_call;
 mod instanceof;
 mod loose_equality;
@@ -98,7 +100,7 @@ mod megamorphic_property;
 mod number_probe;
 mod truthiness;
 mod value_span;
-use value_span::emit_value_span_arguments;
+use value_span::{emit_value_span_arguments, emit_value_span_words};
 
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
@@ -111,8 +113,7 @@ use otter_vm::{
         ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
         RuntimeStubResultAbi, RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC,
         STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE,
-        STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_DEOPT_WRITEBACK,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
         STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY,
         STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_STRICT_EQ_LEAF,
         STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
@@ -124,14 +125,13 @@ use super::super::{
     CallTarget, ContextField, DeoptId, DirectCallArgumentMode, DirectCallKind, ExceptionalEdge,
     InstructionSequence, MachineBindingTarget, MachineCallGuard, MachineFrameLayout,
     MachineInstructionId, MachineOpcode, MachineOsrType, MachineRepresentation,
-    MachineSafepointSite, MachineSafepointTable, OperandPurpose, binding_target_matches_semantics,
+    MachineSafepointSite, MachineSafepointTable, binding_target_matches_semantics,
     is_explicit_committed_runtime_call,
 };
 use crate::{
     CompiledCode, Unsupported,
     arm64::{
-        DirectCallArguments, DirectCallForm, DirectCallSite, GENERATED_POLL_BATCH,
-        emit_direct_call_with_access, emit_method_guard_from_tagged_register,
+        GENERATED_POLL_BATCH, emit_method_guard_from_tagged_register,
     },
     artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
     entry::{
@@ -139,12 +139,12 @@ use crate::{
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, GLOBAL_THIS_OFFSET_PTR_OFFSET,
         NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_MACHINE_ROOTS_OFFSET, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-        NATIVE_FRAME_REGISTER_COUNT_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-        NUMBER_TAG_HI16, PropertySourceCell, THREAD_OFFSET, TransitionTable, VALUE_HOLE,
-        VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-        VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, PropertySourceCell, THREAD_OFFSET,
+        TransitionTable, VALUE_HOLE, VALUE_NULL, VALUE_UNDEFINED,
+        VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_GLOBAL_LEXICAL_EPOCH_CELL_OFFSET,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
         DenseIndexForm, emit_check_shape_identity, emit_element_address_from_dense_view,
@@ -168,6 +168,10 @@ use super::super::target::{
 pub(super) const GPR_BUDGET: u16 = AARCH64_DEOPT_GPR_BUDGET;
 pub(super) const FP_BUDGET: u16 = AARCH64_DEOPT_FP_BUDGET;
 const BASE_FIXED_FRAME_BYTES: u32 = AARCH64_BASE_FIXED_FRAME_BYTES;
+/// Boxed int32 tag, a logical immediate: the top 15 bits.
+const NUMBER_TAG: u64 = otter_vm::value::tag::NUMBER_TAG;
+/// Shift that leaves exactly the int32 tag bits.
+const NUMBER_TAG_SHIFT: u32 = NUMBER_TAG.trailing_zeros();
 const DEOPT_DUMP_BYTES: u32 = (GPR_BUDGET as u32 + FP_BUDGET as u32) * 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,8 +214,11 @@ impl SavedFrame {
 }
 
 pub(super) struct Emission {
+    /// The finalized body; its entry is the tier entry over a published
+    /// interpreter frame.
     pub(super) code: CompiledCode,
-    pub(super) generated_stack_frame_bytes: u32,
+    /// Offset of the JavaScript call ABI entry.
+    pub(super) call_entry: usize,
     pub(super) relocations: RelocationCapture,
     pub(super) osr_headers: BTreeSet<u32>,
     pub(super) osr_regions: Vec<(u32, usize, usize)>,
@@ -342,7 +349,7 @@ pub(super) fn frame_layout(
     root_slots: u16,
 ) -> Result<MachineFrameLayout, Unsupported> {
     super::TargetSpec::aarch64()
-        .frame_layout(allocation, root_slots, 0)
+        .frame_layout(allocation, root_slots, 0, 0)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
 }
 
@@ -1020,6 +1027,7 @@ const VENEER_ISLAND_INTERVAL: usize = 256 * 1024;
 
 pub(super) fn emit(
     view: &JitCompileSnapshot,
+    code_object_id: u64,
     sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
     frame: MachineFrameLayout,
@@ -1028,12 +1036,6 @@ pub(super) fn emit(
     transitions: &TransitionTable,
     poll_entry: u64,
     deopt_writeback_entry: u64,
-    deopt_stack_call_entry: u64,
-    resolve_direct_entry: u64,
-    try_prepare_construct_entry: u64,
-    prepare_construct_entry: u64,
-    derived_construct_result_entry: u64,
-    copy_spread_arguments_entry: u64,
     string_concat_entry: u64,
     array_construct_entry: u64,
     number_rem_entry: u64,
@@ -1042,18 +1044,15 @@ pub(super) fn emit(
     _number_to_int32_entry: u64,
     strict_eq_entry: u64,
     to_boolean_entry: u64,
-    call_method_value_entry: u64,
-    call_with_this_value_entry: u64,
-    construct_value_entry: u64,
     load_ic_cells: &mut [PropertySourceCell],
     store_ic_cells: &mut [PropertySourceCell],
-    vm_register_count: u16,
     capture_artifacts: bool,
 ) -> Result<Emission, Unsupported> {
     // Near branches are one instruction; only a body whose control flow
     // spans more than a conditional branch reaches pays for the far form.
     match emit_with_reach(
         view,
+        code_object_id,
         sequence,
         allocation,
         frame,
@@ -1062,12 +1061,6 @@ pub(super) fn emit(
         transitions,
         poll_entry,
         deopt_writeback_entry,
-        deopt_stack_call_entry,
-        resolve_direct_entry,
-        try_prepare_construct_entry,
-        prepare_construct_entry,
-        derived_construct_result_entry,
-        copy_spread_arguments_entry,
         string_concat_entry,
         array_construct_entry,
         number_rem_entry,
@@ -1075,12 +1068,8 @@ pub(super) fn emit(
         _number_to_int32_entry,
         strict_eq_entry,
         to_boolean_entry,
-        call_method_value_entry,
-        call_with_this_value_entry,
-        construct_value_entry,
         load_ic_cells,
         store_ic_cells,
-        vm_register_count,
         capture_artifacts,
         false,
     ) {
@@ -1089,6 +1078,7 @@ pub(super) fn emit(
             store_ic_cells.fill(PropertySourceCell::default());
             emit_with_reach(
                 view,
+                code_object_id,
                 sequence,
                 allocation,
                 frame,
@@ -1097,12 +1087,6 @@ pub(super) fn emit(
                 transitions,
                 poll_entry,
                 deopt_writeback_entry,
-                deopt_stack_call_entry,
-                resolve_direct_entry,
-                try_prepare_construct_entry,
-                prepare_construct_entry,
-                derived_construct_result_entry,
-                copy_spread_arguments_entry,
                 string_concat_entry,
                 array_construct_entry,
                 number_rem_entry,
@@ -1110,12 +1094,8 @@ pub(super) fn emit(
                 _number_to_int32_entry,
                 strict_eq_entry,
                 to_boolean_entry,
-                call_method_value_entry,
-                call_with_this_value_entry,
-                construct_value_entry,
                 load_ic_cells,
                 store_ic_cells,
-                vm_register_count,
                 capture_artifacts,
                 true,
             )
@@ -1131,6 +1111,7 @@ pub(super) fn emit(
 /// pool V8's arm64 assembler emits for out-of-range branches.
 fn emit_with_reach(
     view: &JitCompileSnapshot,
+    code_object_id: u64,
     sequence: &InstructionSequence,
     allocation: &AllocatedSequence,
     frame: MachineFrameLayout,
@@ -1139,12 +1120,6 @@ fn emit_with_reach(
     transitions: &TransitionTable,
     poll_entry: u64,
     deopt_writeback_entry: u64,
-    deopt_stack_call_entry: u64,
-    resolve_direct_entry: u64,
-    try_prepare_construct_entry: u64,
-    prepare_construct_entry: u64,
-    derived_construct_result_entry: u64,
-    copy_spread_arguments_entry: u64,
     string_concat_entry: u64,
     array_construct_entry: u64,
     number_rem_entry: u64,
@@ -1153,12 +1128,8 @@ fn emit_with_reach(
     _number_to_int32_entry: u64,
     strict_eq_entry: u64,
     to_boolean_entry: u64,
-    call_method_value_entry: u64,
-    call_with_this_value_entry: u64,
-    construct_value_entry: u64,
     load_ic_cells: &mut [PropertySourceCell],
     store_ic_cells: &mut [PropertySourceCell],
-    vm_register_count: u16,
     capture_artifacts: bool,
     far_branches: bool,
 ) -> Result<Emission, Unsupported> {
@@ -1171,6 +1142,17 @@ fn emit_with_reach(
     }
     let mut ops = dynasmrt::aarch64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
+    let shape = activation::EntryShape::of(
+        view,
+        code_object_id,
+        otter_vm::native_abi::NativeFrameKind::Optimizing,
+        !safepoints.records().is_empty(),
+    )?;
+    let exits = activation::ExitLabels {
+        plain: ops.new_dynamic_label(),
+        construct: shape.completes_construct().then(|| ops.new_dynamic_label()),
+    };
+    let body = ops.new_dynamic_label();
     let mut bail = ops.new_dynamic_label();
     let mut finish_error = ops.new_dynamic_label();
     let mut throw_value = ops.new_dynamic_label();
@@ -1213,7 +1195,14 @@ fn emit_with_reach(
         .iter()
         .any(|instruction| instruction.opcode == MachineOpcode::BackedgePoll);
 
-    emit_prologue(&mut ops, frame, saved);
+    // The tier entry continues a published interpreter frame; the call entry
+    // builds this function's record and falls through into the body.
+    let tier_entry = activation::emit_tier_entry(&mut ops, frame, saved, body);
+    let (call_entry, call_entry_cold) =
+        activation::emit_call_entry(&mut ops, view, frame, saved, shape);
+    structural_regions.push(("machineTierEntry", None, tier_entry.0, call_entry.0));
+    structural_regions.push(("machineCallEntry", None, call_entry.0, ops.offset().0));
+    dynasm!(ops ; .arch aarch64 ; =>body);
     if has_backedge_poll {
         dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
     }
@@ -1417,8 +1406,7 @@ fn emit_with_reach(
                 let start = ops.offset().0;
                 let miss = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                let flags = otter_vm::native_abi::NativeFrameFlags::STACK_REGISTERS
-                    | otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
+                let flags = otter_vm::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR;
                 dynasm!(ops ; .arch aarch64
                     ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
                     ; ldrb w15, [x16, crate::entry::NATIVE_FRAME_FLAGS_OFFSET]
@@ -2309,8 +2297,7 @@ fn emit_with_reach(
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov W(destination), W(source)
-                    ; movz x16, NUMBER_TAG_HI16, lsl #48
-                    ; orr X(destination), X(destination), x16
+                    ; orr XSP(destination), X(destination), NUMBER_TAG
                 );
             }
             MachineOpcode::BoxUint32 => emit_box_uint32(
@@ -3460,7 +3447,7 @@ fn emit_with_reach(
                     ; mov x0, X(source)
                     ; movz x1, NativeResultStatus::Success as u32
                 );
-                emit_epilogue(&mut ops, frame, saved);
+                activation::emit_return(&mut ops, frame, saved, exits, far_branches);
             }
             MachineOpcode::Jump => {
                 let block = &sequence.blocks()[block_index];
@@ -3637,24 +3624,16 @@ fn emit_with_reach(
                     kind,
                     argument_mode,
                     candidates,
-                    caller_function_id,
-                    logical_pc,
                     byte_pc,
+                    ..
                 } = &descriptor.target
                 {
                     let site = safepoints
                         .site(id)
                         .filter(|site| instruction.safepoint == Some(site.id))
                         .ok_or(Unsupported::OperandShape("scalar direct call safepoint"))?;
-                    let deopt = instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?;
                     let direct_done = ops.new_dynamic_label();
                     let direct_threw = ops.new_dynamic_label();
-                    let direct_bail = ops.new_dynamic_label();
-                    let transition = instruction_deopt_label(
-                        instruction.exit_id(ExitReason::RuntimeTransition),
-                        &deopt_targets,
-                    )?;
-                    let final_method_guard_miss = ops.new_dynamic_label();
                     if *kind == DirectCallKind::Forward {
                         emit_publish_forwarded_formals_context(
                             &mut ops,
@@ -3666,404 +3645,37 @@ fn emit_with_reach(
                     }
                     emit_save_safepoint_roots(&mut ops, frame, site)?;
                     emit_stamp_call_site(&mut ops, site);
-                    let result_index = descriptor.arguments.len();
-                    // An explicit-receiver call carries its receiver as
-                    // operand one; the linkage takes it through the call form
-                    // rather than the argument list.
-                    let first_argument = if matches!(
-                        kind,
-                        DirectCallKind::CallWithThis | DirectCallKind::FunctionCall
-                    ) {
-                        2
-                    } else {
-                        1
-                    };
-                    let call_with_this_guard_miss = ops.new_dynamic_label();
-                    if *kind == DirectCallKind::Forward {
-                        let start = ops.offset().0;
-                        forward_call::emit(
-                            &mut ops,
-                            &mut relocations,
+                    let start = ops.offset().0;
+                    call::emit(
+                        &mut ops,
+                        &mut relocations,
+                        &call::CallSite {
                             view,
                             transitions,
+                            sequence,
                             instruction,
                             frame,
                             site,
                             locations,
-                            result_index,
-                            *logical_pc,
-                            *byte_pc,
-                            call_with_this_guard_miss,
-                            finish_error,
-                            direct_threw,
+                            result_index: descriptor.arguments.len(),
+                            call_pc: safepoints.records()[site.id.0 as usize].call_pc,
+                            deopt: instruction_deopt_label(instruction.deopt_id(), &deopt_targets)?,
+                            threw: direct_threw,
                             fatal,
-                            direct_done,
-                        )?;
-                        structural_regions.push((
-                            "machineForwardCall",
-                            Some(*byte_pc),
-                            start,
-                            ops.offset().0,
-                        ));
-                    }
-                    let arguments = (first_argument..result_index)
-                        .map(|index| {
-                            u16::try_from(index).map_err(|_| {
-                                Unsupported::OperandShape("scalar direct call argument count")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let arguments = match argument_mode {
-                        DirectCallArgumentMode::Fixed => DirectCallArguments::Fixed(&arguments),
-                        DirectCallArgumentMode::Spread => DirectCallArguments::Spread(1),
-                    };
-                    let construct_receiver = instruction
-                        .operands
-                        .iter()
-                        .position(|operand| operand.purpose == OperandPurpose::RuntimeRoot)
-                        .map(|index| {
-                            u16::try_from(index).map_err(|_| {
-                                Unsupported::OperandShape("scalar construct receiver root")
-                            })
-                        })
-                        .transpose()?;
-                    for (candidate_index, candidate) in candidates.iter().enumerate() {
-                        let candidate_start = ops.offset().0;
-                        let next_method_candidate = (*kind == DirectCallKind::Method
-                            && candidate_index + 1 != candidates.len())
-                        .then(|| ops.new_dynamic_label());
-                        let method_guard_miss =
-                            next_method_candidate.unwrap_or(final_method_guard_miss);
-                        let form = match kind {
-                            DirectCallKind::Forward => {
-                                return Err(Unsupported::OperandShape(
-                                    "forward call has no baked candidates",
-                                ));
-                            }
-                            DirectCallKind::Plain => DirectCallForm::Plain { callable: 0 },
-                            DirectCallKind::CallWithThis | DirectCallKind::FunctionCall => {
-                                DirectCallForm::CallWithThis {
-                                    callable: 0,
-                                    receiver: 1,
-                                }
-                            }
-                            DirectCallKind::Method => {
-                                let guard = candidate.guard.as_ref().ok_or(
-                                    Unsupported::OperandShape("scalar method candidate guard"),
-                                )?;
-                                let receiver = instruction
-                                    .operands
-                                    .first()
-                                    .ok_or(Unsupported::OperandShape("scalar method receiver"))?;
-                                let guard_start = ops.offset().0;
-                                // The ordinary receiver input is an early use,
-                                // while its TaggedRoot metadata is late. Root
-                                // publication uses caller-saved scratch between
-                                // those allocation points, so only the canonical
-                                // published save home is valid here.
-                                emit_load_safepoint_root(
-                                    &mut ops,
-                                    frame,
-                                    site,
-                                    receiver.value,
-                                    9,
-                                    0,
-                                )?;
-                                emit_method_guard_from_tagged_register(
-                                    &mut ops,
-                                    &mut relocations,
-                                    view,
-                                    guard,
-                                    9,
-                                    17,
-                                    None,
-                                    method_guard_miss,
-                                )?;
-                                structural_regions.push((
-                                    "machineDirectMethodGuard",
-                                    Some(*byte_pc),
-                                    guard_start,
-                                    ops.offset().0,
-                                ));
-                                DirectCallForm::Method {
-                                    callable: 17,
-                                    receiver: 0,
-                                }
-                            }
-                            DirectCallKind::Construct => DirectCallForm::Construct {
-                                callable: 0,
-                                receiver: construct_receiver.ok_or(Unsupported::OperandShape(
-                                    "scalar construct receiver root",
-                                ))?,
-                            },
-                            DirectCallKind::DerivedConstruct => {
-                                DirectCallForm::DerivedConstruct { callable: 0 }
-                            }
-                            DirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
-                                callable: 0,
-                                receiver: construct_receiver.ok_or(Unsupported::OperandShape(
-                                    "scalar super receiver root",
-                                ))?,
-                            },
-                            DirectCallKind::DerivedSuperConstruct => {
-                                DirectCallForm::DerivedSuperConstruct { callable: 0 }
-                            }
-                        };
-                        emit_direct_call_with_access(
-                            &mut ops,
-                            &mut relocations,
-                            view,
-                            DirectCallSite {
-                                target: &candidate.callee,
-                                target_index: candidate.target_index,
-                                target_count: candidate.target_count,
-                                caller_function_id: *caller_function_id,
-                                logical_pc: *logical_pc,
-                                byte_pc: *byte_pc,
-                                dst: u16::try_from(result_index).map_err(|_| {
-                                    Unsupported::OperandShape("scalar direct call result")
-                                })?,
-                                form,
-                                arguments,
-                            },
-                            deopt_stack_call_entry,
-                            resolve_direct_entry,
-                            try_prepare_construct_entry,
-                            prepare_construct_entry,
-                            derived_construct_result_entry,
-                            copy_spread_arguments_entry,
-                            0,
-                            None,
-                            if *kind == DirectCallKind::CallWithThis {
-                                call_with_this_guard_miss
-                            } else {
-                                direct_bail
-                            },
-                            transition,
-                            finish_error,
-                            direct_threw,
-                            fatal,
-                            direct_done,
-                            19,
-                            |ops, source, target, sp_bias| {
-                                let operand = instruction.operands.get(usize::from(source)).ok_or(
-                                    Unsupported::OperandShape("scalar direct call source"),
-                                )?;
-                                // A moving safepoint rewrites the canonical save
-                                // slot named by the late TaggedRoot metadata. Read
-                                // that slot directly after receiver preparation;
-                                // its allocator early/late homes may differ and
-                                // either register may have been clobbered meanwhile.
-                                if let Some(root) =
-                                    site.roots.iter().find(|root| root.value == operand.value)
-                                {
-                                    let offset = root_offset(frame, root.save_slot)?
-                                        .checked_add(sp_bias)
-                                        .ok_or(Unsupported::OperandShape(
-                                            "scalar direct call canonical root offset",
-                                        ))?;
-                                    emit_frame_ldr_x(ops, target, offset);
-                                    return Ok(());
-                                }
-                                let location = locations[usize::from(source)];
-                                emit_load_allocated_tagged(ops, frame, location, target, sp_bias)
-                            },
-                            |ops, destination, source, sp_bias| {
-                                let location = *locations.get(usize::from(destination)).ok_or(
-                                    Unsupported::OperandShape("scalar direct call destination"),
-                                )?;
-                                emit_store_allocated_tagged(ops, frame, location, source, sp_bias)
-                            },
-                            |ops| {
-                                // x17 is outside regalloc2's allocatable bank and
-                                // survives the activation-root descriptor cleanup.
-                                dynasm!(ops ; .arch aarch64 ; mov x17, x0);
-                                emit_reload_safepoint_roots(ops, frame, site)?;
-                                dynasm!(ops ; .arch aarch64 ; mov x0, x17);
-                                Ok(())
-                            },
-                            |ops, source, sp_bias| {
-                                let receiver = instruction
-                                    .operands
-                                    .get(result_index + 1)
-                                    .ok_or(Unsupported::OperandShape(
-                                        "scalar construct receiver operand",
-                                    ))?
-                                    .value;
-                                let root = site
-                                    .roots
-                                    .iter()
-                                    .find(|root| root.value == receiver)
-                                    .ok_or(Unsupported::OperandShape(
-                                        "scalar construct receiver save home",
-                                    ))?;
-                                let offset = root_offset(frame, root.save_slot)?
-                                    .checked_add(sp_bias)
-                                    .ok_or(Unsupported::OperandShape(
-                                        "scalar construct linkage root offset",
-                                    ))?;
-                                emit_frame_str_x(ops, source, offset);
-                                Ok(())
-                            },
-                            |ops, sp_bias| {
-                                emit_reload_safepoint_roots_with_bias(ops, frame, site, sp_bias)
-                            },
-                            |_, _, _| {
-                                Err(Unsupported::OperandShape(
-                                    "Machine forwarding operands not lowered",
-                                ))
-                            },
-                        )?;
-                        if *kind == DirectCallKind::Method {
-                            structural_regions.push((
-                                "machineDirectMethodCandidate",
-                                Some(*byte_pc),
-                                candidate_start,
-                                ops.offset().0,
-                            ));
-                        }
-                        if let Some(next_method_candidate) = next_method_candidate {
-                            dynasm!(ops ; .arch aarch64 ; =>next_method_candidate);
-                        }
-                    }
-                    if matches!(
-                        kind,
-                        DirectCallKind::Method
-                            | DirectCallKind::CallWithThis
-                            | DirectCallKind::Forward
-                    ) || (*kind == DirectCallKind::Construct && candidates.is_empty())
-                    {
-                        if *kind == DirectCallKind::Method {
-                            dynasm!(ops ; .arch aarch64 ; =>final_method_guard_miss);
-                        } else if matches!(
-                            kind,
-                            DirectCallKind::CallWithThis | DirectCallKind::Forward
-                        ) {
-                            // A candidate reaches the loop's end with its
-                            // roots still published. The linkage's guard miss
-                            // restored the allocator registers and cleared
-                            // the record, so it publishes again before the
-                            // generic call.
-                            let generic_ready = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; b =>generic_ready
-                                ; =>call_with_this_guard_miss
-                            );
-                            emit_save_safepoint_roots(&mut ops, frame, site)?;
-                            emit_stamp_call_site(&mut ops, site);
-                            dynasm!(ops ; .arch aarch64 ; =>generic_ready);
-                        }
-                        if *kind == DirectCallKind::Forward {
-                            forward_call::emit_cold_source_admission(
-                                &mut ops,
-                                &mut relocations,
-                                transitions,
-                                instruction,
-                                frame,
-                                site,
-                                direct_bail,
-                            )?;
-                        }
-                        let (generic_entry, generic_stub, generic_region) = match kind {
-                            DirectCallKind::Forward => (
-                                transitions
-                                    .entry(otter_vm::native_abi::STUB_JIT_CALL_FORWARD_ARGUMENTS),
-                                otter_vm::native_abi::STUB_JIT_CALL_FORWARD_ARGUMENTS,
-                                "machineGenericForwardCall",
-                            ),
-                            DirectCallKind::Method => (
-                                call_method_value_entry,
-                                STUB_JIT_CALL_METHOD_VALUE,
-                                "machineGenericMethodCall",
-                            ),
-                            DirectCallKind::Construct => (
-                                construct_value_entry,
-                                STUB_JIT_CONSTRUCT_VALUE,
-                                "machineGenericConstruct",
-                            ),
-                            _ => (
-                                call_with_this_value_entry,
-                                STUB_JIT_CALL_WITH_THIS_VALUE,
-                                "machineGenericCallWithThis",
-                            ),
-                        };
-                        if *argument_mode == DirectCallArgumentMode::Fixed {
-                            let generic_start = ops.offset().0;
-                            emit_value_span_arguments(
-                                &mut ops,
-                                sequence,
-                                frame,
-                                site,
-                                instruction.operands[..result_index]
-                                    .iter()
-                                    .map(|operand| operand.value),
-                            )?;
-                            let published_pc = safepoints.records()[site.id.0 as usize].call_pc;
-                            emit_load_u64(&mut ops, 15, u64::from(published_pc));
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
-                                ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
-                                ; mov x0, x19
-                            );
-                            emit_load_symbolic_u64(
-                                &mut ops,
-                                &mut relocations,
-                                16,
-                                generic_entry,
-                                RelocationTarget::runtime_stub(generic_stub),
-                            );
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; blr x16
-                                ; mov x17, x0
-                                ; mov x15, x1
-                            );
-                            emit_reload_safepoint_roots(&mut ops, frame, site)?;
-                            let generic_threw = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; cbz x15, >generic_method_completed
-                                ; cmp x15, NativeResultStatus::Throw as u32
-                                ; b.eq =>generic_threw
-                                ; b =>fatal
-                                ; generic_method_completed:
-                            );
-                            emit_store_allocated_tagged(
-                                &mut ops,
-                                frame,
-                                locations[result_index],
-                                17,
-                                0,
-                            )?;
-                            dynasm!(ops
-                                ; .arch aarch64
-                                ; b =>direct_done
-                                ; =>generic_threw
-                                ; mov x0, x17
-                                ; b =>direct_threw
-                            );
-                            structural_regions.push((
-                                generic_region,
-                                Some(*byte_pc),
-                                generic_start,
-                                ops.offset().0,
-                            ));
-                        } else {
-                            // Spread packets need canonical iterator expansion
-                            // and remain exact pre-effect exits.
-                            emit_reload_safepoint_roots(&mut ops, frame, site)?;
-                            dynasm!(ops ; .arch aarch64 ; b =>deopt);
-                        }
-                    }
-                    dynasm!(ops ; .arch aarch64 ; b =>direct_bail);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; =>direct_bail
-                        ; b =>deopt
-                        ; =>direct_threw
-                    );
+                            done: direct_done,
+                        },
+                        *kind,
+                        *argument_mode,
+                        candidates,
+                    )?;
+                    structural_regions.push((
+                        "machineCallTrampoline",
+                        Some(*byte_pc),
+                        start,
+                        ops.offset().0,
+                    ));
+                    dynasm!(ops ; .arch aarch64 ; =>direct_threw);
+                    let result_index = descriptor.arguments.len();
                     match descriptor.exceptional {
                         super::super::ExceptionalEdge::LandingPad(target) => {
                             emit_landing_pad_transfer(
@@ -4546,19 +4158,37 @@ fn emit_with_reach(
         dynasm!(ops ; .arch aarch64 ; =>skip);
         [bail, finish_error, throw_value, fatal] = final_exits;
     }
-    dynasm!(ops ; .arch aarch64 ; =>bail);
-    emit_materialize_vm_window(&mut ops, vm_register_count);
+    // An entry guard exit resumes the interpreter at PC zero with the
+    // formals: a called record gets its window first.
     let entry_bail = SideExit::new(0, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits();
+    let tier_bail = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
+        ; =>bail
         ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
         ; str wzr, [x17, NATIVE_FRAME_PC_OFFSET]
     );
     emit_load_u64(&mut ops, 0, entry_bail);
-    dynasm!(ops ; .arch aarch64 ; movz x1, NativeResultStatus::SideExit as u32);
-    emit_epilogue(&mut ops, frame, saved);
+    activation::emit_branch_if_tier_frame(&mut ops, frame, tier_bail);
+    activation::emit_reserve_window(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        frame,
+        saved,
+        shape.register_count,
+    );
+    activation::emit_entry_window_state(&mut ops, shape);
+    emit_load_u64(&mut ops, 0, entry_bail);
+    activation::emit_resume_interpreter(&mut ops, &mut relocations, transitions, frame, saved, exits);
+    dynasm!(ops ; .arch aarch64 ; =>tier_bail ; movz x1, NativeResultStatus::SideExit as u32);
+    activation::emit_plain_return(&mut ops, frame, saved);
 
+    // A parked error finishes at this frame's boundary. A local handler of a
+    // tier-entered frame continues in its interpreter; a called record has
+    // no interpreter state to land in, so the resume rejects it.
     let compiled_pair_exit = ops.new_dynamic_label();
+    let pair_side_exit = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; =>finish_error
@@ -4575,7 +4205,7 @@ fn emit_with_reach(
         ; .arch aarch64
         ; blr x16
         ; cmp x1, NativeResultStatus::SideExit as u32
-        ; b.eq =>compiled_pair_exit
+        ; b.eq =>pair_side_exit
         ; cmp x1, NativeResultStatus::Throw as u32
         ; b.eq =>compiled_pair_exit
         ; cmp x1, NativeResultStatus::Fatal as u32
@@ -4591,8 +4221,34 @@ fn emit_with_reach(
         ; .arch aarch64
         ; movz x1, NativeResultStatus::Fatal as u32
         ; =>compiled_pair_exit
+        ; =>exits.plain
     );
-    emit_epilogue(&mut ops, frame, saved);
+    activation::emit_plain_return(&mut ops, frame, saved);
+    let pair_tier = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; =>pair_side_exit);
+    activation::emit_branch_if_tier_frame(&mut ops, frame, pair_tier);
+    activation::emit_resume_interpreter(&mut ops, &mut relocations, transitions, frame, saved, exits);
+    dynasm!(ops ; .arch aarch64 ; =>pair_tier);
+    activation::emit_plain_return(&mut ops, frame, saved);
+
+    activation::emit_construct_completion(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        view,
+        frame,
+        shape,
+        exits,
+    );
+    activation::emit_call_entry_cold(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        frame,
+        saved,
+        exits,
+        call_entry_cold,
+    );
 
     if !deopt_labels.is_empty() {
         for (index, &label) in deopt_labels.iter().enumerate() {
@@ -4608,67 +4264,37 @@ fn emit_with_reach(
             );
         }
 
-        // Dump layout consumed by `jit_deopt_writeback_stub`: physical x0..x29
-        // followed by d0..d15 at ascending addresses. x15..x18 and x29 are
-        // namespace holes; x19 retains the context across the call.
-        dynasm!(ops
-            ; .arch aarch64
-            ; =>shared_deopt
-            ; stp d14, d15, [sp, #-16]!
-            ; stp d12, d13, [sp, #-16]!
-            ; stp d10, d11, [sp, #-16]!
-            ; stp d8, d9, [sp, #-16]!
-            ; stp d6, d7, [sp, #-16]!
-            ; stp d4, d5, [sp, #-16]!
-            ; stp d2, d3, [sp, #-16]!
-            ; stp d0, d1, [sp, #-16]!
-            ; stp x28, xzr, [sp, #-16]!
-            ; stp x26, x27, [sp, #-16]!
-            ; stp x24, x25, [sp, #-16]!
-            ; stp x22, x23, [sp, #-16]!
-            ; stp x20, x21, [sp, #-16]!
-            ; stp x18, x19, [sp, #-16]!
-            ; stp x16, x17, [sp, #-16]!
-            ; stp x14, x15, [sp, #-16]!
-            ; stp x12, x13, [sp, #-16]!
-            ; stp x10, x11, [sp, #-16]!
-            ; stp x8, x9, [sp, #-16]!
-            ; stp x6, x7, [sp, #-16]!
-            ; stp x4, x5, [sp, #-16]!
-            ; stp x2, x3, [sp, #-16]!
-            ; stp x0, x1, [sp, #-16]!
-            ; mov x0, x19
-            ; mov w1, w17
-        );
-        emit_load_symbolic_u64(
+        // A called record without a window gets one first, above the dump;
+        // a tier-entered frame writes back into its interpreter window.
+        let tier_deopt = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; =>shared_deopt);
+        activation::emit_branch_if_tier_frame(&mut ops, frame, tier_deopt);
+        activation::emit_reserve_window(
             &mut ops,
             &mut relocations,
-            2,
-            std::ptr::from_ref::<DeoptRuntime>(deopt_runtime) as u64,
-            RelocationTarget::DeoptRuntimeData,
+            transitions,
+            frame,
+            saved,
+            shape.register_count,
         );
+        emit_deopt_writeback(&mut ops, &mut relocations, deopt_runtime, deopt_writeback_entry);
+        // `sp` is the window base: the interpreter continues on the record
+        // unless an inline chain already completed it.
+        let completed = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
-            ; mov x3, sp
-            ; add x4, sp, DEOPT_DUMP_BYTES
-            ; ldr x5, [x19, NATIVE_FRAME_OFFSET]
-            ; ldr x5, [x5, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+            ; cmp x1, NativeResultStatus::SideExit as u32
+            ; b.ne =>completed
         );
-        emit_load_symbolic_u64(
-            &mut ops,
-            &mut relocations,
-            16,
-            deopt_writeback_entry,
-            RelocationTarget::runtime_stub(STUB_JIT_DEOPT_WRITEBACK),
-        );
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; add sp, sp, DEOPT_DUMP_BYTES
-        );
-        emit_epilogue(&mut ops, frame, saved);
+        activation::emit_resume_interpreter(&mut ops, &mut relocations, transitions, frame, saved, exits);
+        dynasm!(ops ; .arch aarch64 ; =>completed);
+        activation::emit_return_from_record(&mut ops, frame, saved, exits);
+        dynasm!(ops ; .arch aarch64 ; =>tier_deopt ; mov x15, xzr);
+        emit_deopt_writeback(&mut ops, &mut relocations, deopt_runtime, deopt_writeback_entry);
+        activation::emit_plain_return(&mut ops, frame, saved);
     }
 
+    // OSR exits leave a tier-entered frame only.
     for (bail, logical_pc) in osr_bails {
         dynasm!(ops ; .arch aarch64 ; =>bail);
         emit_load_u64(&mut ops, 16, u64::from(logical_pc));
@@ -4681,31 +4307,88 @@ fn emit_with_reach(
             SideExit::new(logical_pc, ExitReason::TypeMismatch, ExitAction::Recompile).to_bits();
         emit_load_u64(&mut ops, 0, osr_bail);
         dynasm!(ops ; .arch aarch64 ; movz x1, NativeResultStatus::SideExit as u32);
-        emit_epilogue(&mut ops, frame, saved);
+        activation::emit_plain_return(&mut ops, frame, saved);
     }
 
     let buffer = crate::entry::finalize_assembler(ops)?;
-    let deopt_cold_bytes = if deopt_labels.is_empty() {
-        0
-    } else {
-        DEOPT_DUMP_BYTES
-    };
-    let cold_dump_bytes = deopt_cold_bytes;
-    let generated_stack_frame_bytes =
-        frame
-            .frame_bytes()
-            .checked_add(cold_dump_bytes)
-            .ok_or(Unsupported::OperandShape(
-                "numeric generated stack frame bytes",
-            ))?;
     Ok(Emission {
-        code: CompiledCode::new(buffer, AssemblyOffset(0)),
-        generated_stack_frame_bytes,
+        code: CompiledCode::new(buffer, tier_entry),
+        call_entry: call_entry.0,
         relocations,
         osr_headers,
         osr_regions,
         structural_regions,
     })
+}
+
+/// Dump the allocatable registers above `sp` and write the exit's
+/// interpreter state back into the published frame's window; the exit index
+/// is in `w17` and `x15` holds the window bytes reserved between the dump and
+/// the spill base. Returns the writeback's `x0`/`x1` with the dump released.
+fn emit_deopt_writeback(
+    ops: &mut dynasmrt::aarch64::Assembler,
+    relocations: &mut RelocationCapture,
+    deopt_runtime: &DeoptRuntime,
+    deopt_writeback_entry: u64,
+) {
+    // Dump layout consumed by the generated deopt writeback entry: physical
+    // x0..x29 followed by d0..d15 at ascending addresses. x15..x18 and x29 are
+    // namespace holes; x19 retains the context across the call.
+    dynasm!(ops
+        ; .arch aarch64
+        ; stp d14, d15, [sp, #-16]!
+        ; stp d12, d13, [sp, #-16]!
+        ; stp d10, d11, [sp, #-16]!
+        ; stp d8, d9, [sp, #-16]!
+        ; stp d6, d7, [sp, #-16]!
+        ; stp d4, d5, [sp, #-16]!
+        ; stp d2, d3, [sp, #-16]!
+        ; stp d0, d1, [sp, #-16]!
+        ; stp x28, xzr, [sp, #-16]!
+        ; stp x26, x27, [sp, #-16]!
+        ; stp x24, x25, [sp, #-16]!
+        ; stp x22, x23, [sp, #-16]!
+        ; stp x20, x21, [sp, #-16]!
+        ; stp x18, x19, [sp, #-16]!
+        ; stp x16, x17, [sp, #-16]!
+        ; stp x14, x15, [sp, #-16]!
+        ; stp x12, x13, [sp, #-16]!
+        ; stp x10, x11, [sp, #-16]!
+        ; stp x8, x9, [sp, #-16]!
+        ; stp x6, x7, [sp, #-16]!
+        ; stp x4, x5, [sp, #-16]!
+        ; stp x2, x3, [sp, #-16]!
+        ; stp x0, x1, [sp, #-16]!
+        ; mov x0, x19
+        ; mov w1, w17
+    );
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        2,
+        std::ptr::from_ref::<DeoptRuntime>(deopt_runtime) as u64,
+        RelocationTarget::DeoptRuntimeData,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x3, sp
+        ; add x4, sp, DEOPT_DUMP_BYTES
+        ; add x4, x4, x15
+        ; ldr x5, [x19, NATIVE_FRAME_OFFSET]
+        ; ldr x5, [x5, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+    );
+    emit_load_symbolic_u64(
+        ops,
+        relocations,
+        16,
+        deopt_writeback_entry,
+        RelocationTarget::runtime_stub(STUB_JIT_DEOPT_WRITEBACK),
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; add sp, sp, DEOPT_DUMP_BYTES
+    );
 }
 
 fn is_exceptional_successor(
@@ -4956,37 +4639,6 @@ fn emit_store_allocated_integer(
     emit_store_allocated_tagged(ops, frame, location, source, sp_bias)
 }
 
-/// Expand a parameter-prefix frame before shared VM machinery can observe it.
-///
-/// This is cold, allocation-free, and publishes the full count only after all
-/// newly visible slots contain canonical tagged `undefined` values.
-fn emit_materialize_vm_window(ops: &mut dynasmrt::aarch64::Assembler, register_count: u16) {
-    let done = ops.new_dynamic_label();
-    let loop_label = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
-        ; ldrh w16, [x17, NATIVE_FRAME_REGISTER_COUNT_OFFSET]
-        ; movz w15, register_count as u32
-        ; cmp w16, w15
-        ; b.eq =>done
-        ; ldr x14, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]
-        ; add x14, x14, x16, lsl #3
-        ; sub w15, w15, w16
-    );
-    emit_load_u64(ops, 16, VALUE_UNDEFINED);
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>loop_label
-        ; str x16, [x14], #8
-        ; subs w15, w15, #1
-        ; b.ne =>loop_label
-        ; movz w16, register_count as u32
-        ; strh w16, [x17, NATIVE_FRAME_REGISTER_COUNT_OFFSET]
-        ; =>done
-    );
-}
-
 fn block_for_instruction(
     sequence: &InstructionSequence,
     instruction: MachineInstructionId,
@@ -5125,11 +4777,11 @@ fn emit_decode_int32(
     source: u8,
     bail: dynasmrt::DynamicLabel,
 ) {
+    // The int32 tag is the top 15 bits all set: an arithmetic shift leaves -1.
     dynasm!(ops
         ; .arch aarch64
-        ; movz x16, NUMBER_TAG_HI16, lsl #48
-        ; and x17, X(source), x16
-        ; cmp x17, x16
+        ; asr x17, X(source), NUMBER_TAG_SHIFT
+        ; cmn x17, 1
         ; b.ne =>bail
     );
 }
@@ -5192,56 +4844,6 @@ fn emit_box_boolean(ops: &mut dynasmrt::aarch64::Assembler, source: u8, destinat
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>is_false);
     emit_load_u64(ops, destination, Value::boolean(false).to_bits());
     dynasm!(ops ; .arch aarch64 ; =>done);
-}
-
-fn emit_prologue(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    frame: MachineFrameLayout,
-    saved: SavedFrame,
-) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; stp x29, x30, [sp, #-16]!
-    );
-    if saved.gpr_count == 0 {
-        dynasm!(ops ; .arch aarch64 ; str x19, [sp, #-16]!);
-    } else {
-        dynasm!(ops ; .arch aarch64 ; stp x19, x20, [sp, #-16]!);
-    }
-    for pair in 0..(saved.gpr_count.saturating_sub(1) / 2) {
-        let first = 21 + pair * 2;
-        dynasm!(ops ; .arch aarch64 ; stp X(first), X(first + 1), [sp, #-16]!);
-    }
-    if !saved.gpr_count.saturating_sub(1).is_multiple_of(2) {
-        let last = 19 + saved.gpr_count;
-        dynasm!(ops ; .arch aarch64 ; str X(last), [sp, #-16]!);
-    }
-    for pair in 0..(saved.fp_count / 2) {
-        let first = 8 + pair * 2;
-        dynasm!(ops ; .arch aarch64 ; stp D(first), D(first + 1), [sp, #-16]!);
-    }
-    if !saved.fp_count.is_multiple_of(2) {
-        let last = 7 + saved.fp_count;
-        dynasm!(ops ; .arch aarch64 ; str D(last), [sp, #-16]!);
-    }
-    emit_reserve_spill_area(ops, frame.spill_area_bytes());
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x19, x0
-        ; ldr x17, [x19, NATIVE_FRAME_OFFSET]
-    );
-    // Publish the root-home base once; call sites then name only their
-    // safepoint.
-    if let Ok(roots) = frame.root_offset(0) {
-        if roots <= 4095 {
-            dynasm!(ops ; .arch aarch64 ; add x16, sp, roots);
-        } else {
-            emit_load_u64(ops, 16, u64::from(roots));
-            dynasm!(ops ; .arch aarch64 ; add x16, sp, x16);
-        }
-        dynasm!(ops ; .arch aarch64 ; str x16, [x17, NATIVE_FRAME_MACHINE_ROOTS_OFFSET]);
-    }
-    dynasm!(ops ; .arch aarch64 ; ldr x17, [x17, NATIVE_FRAME_REGISTER_BASE_OFFSET]);
 }
 
 /// Store the forwarding function's parameter-scope context, the forward
@@ -5438,40 +5040,6 @@ fn emit_osr_value(
             emit_store_osr_integer(ops, frame, location)
         }
     }
-}
-
-fn emit_epilogue(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    frame: MachineFrameLayout,
-    saved: SavedFrame,
-) {
-    emit_release_spill_area(ops, frame.spill_area_bytes());
-    if !saved.fp_count.is_multiple_of(2) {
-        let last = 7 + saved.fp_count;
-        dynasm!(ops ; .arch aarch64 ; ldr D(last), [sp], #16);
-    }
-    for pair in (0..(saved.fp_count / 2)).rev() {
-        let first = 8 + pair * 2;
-        dynasm!(ops ; .arch aarch64 ; ldp D(first), D(first + 1), [sp], #16);
-    }
-    if !saved.gpr_count.saturating_sub(1).is_multiple_of(2) {
-        let last = 19 + saved.gpr_count;
-        dynasm!(ops ; .arch aarch64 ; ldr X(last), [sp], #16);
-    }
-    for pair in (0..(saved.gpr_count.saturating_sub(1) / 2)).rev() {
-        let first = 21 + pair * 2;
-        dynasm!(ops ; .arch aarch64 ; ldp X(first), X(first + 1), [sp], #16);
-    }
-    if saved.gpr_count == 0 {
-        dynasm!(ops ; .arch aarch64 ; ldr x19, [sp], #16);
-    } else {
-        dynasm!(ops ; .arch aarch64 ; ldp x19, x20, [sp], #16);
-    }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldp x29, x30, [sp], #16
-        ; ret
-    );
 }
 
 fn emit_reserve_spill_area(ops: &mut dynasmrt::aarch64::Assembler, bytes: u32) {
@@ -6066,6 +5634,7 @@ mod tests {
             let mut store_ic_cells = [];
             let emission = emit(
                 &view,
+                1,
                 &sequence,
                 &allocation,
                 frame,
@@ -6081,22 +5650,12 @@ mod tests {
                 1,
                 1,
                 1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
                 &mut load_ic_cells,
                 &mut store_ic_cells,
-                3,
                 true,
             )
             .expect("committed-runtime emission");
-            assert_eq!(emission.generated_stack_frame_bytes, frame.frame_bytes());
+            assert!(emission.call_entry > 0);
             assert!(
                 emission
                     .structural_regions
@@ -6156,6 +5715,7 @@ mod tests {
         let mut store_ic_cells = [];
         let emission = emit(
             &view,
+            1,
             &sequence,
             &allocation,
             frame,
@@ -6171,18 +5731,8 @@ mod tests {
             1,
             1,
             1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
             &mut load_ic_cells,
             &mut store_ic_cells,
-            4,
             true,
         )
         .expect("committed-runtime landing emission");

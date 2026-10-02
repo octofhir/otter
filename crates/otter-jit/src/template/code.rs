@@ -17,21 +17,14 @@
 //!   status contract.
 
 use crate::CompiledCode;
-use crate::entry::enter_compiled;
+use otter_vm::JitFunctionCode;
 use otter_vm::native_abi::{CodeDependency, CodeObjectMetadata, SafepointRecord};
-use otter_vm::{JitExecOutcome, JitFunctionCode, VmRuntimeActivation};
 
 /// Finalized template machine code for one function.
 pub struct TemplateCode {
     code: CompiledCode,
     /// Frozen VM-owned metadata validated before every entry selection.
     metadata: CodeObjectMetadata,
-    /// Installed code-object identity published in native frames.
-    code_object_id: u64,
-    /// Source function id published in this code's native frames.
-    function_id: u32,
-    /// Tagged register-window width published in the native frame.
-    register_count: u16,
     /// Exact installed callee generations entered by emitted direct edges.
     dependencies: Box<[CodeDependency]>,
     /// Stable decoded register buffer shared by variadic operation sites.
@@ -50,6 +43,9 @@ pub struct TemplateCode {
     safepoint_records: Box<[SafepointRecord]>,
     /// Loop-header logical PC → assembler offset of its OSR-entry trampoline.
     osr_entries: std::collections::BTreeMap<u32, usize>,
+    /// Offset of the JavaScript call ABI entry, which builds this function's
+    /// own frame; absent for a body entered only over an interpreter frame.
+    call_entry: Option<usize>,
     /// `true` when unsupported opcodes were lowered to exact side exits;
     /// entry selection skips such code and only loop OSR uses it.
     osr_only: bool,
@@ -61,13 +57,13 @@ impl TemplateCode {
         code: CompiledCode,
         code_object_id: u64,
         function_id: u32,
-        register_count: u16,
         dependencies: Box<[CodeDependency]>,
         register_operands: Box<[u16]>,
         load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         safepoint_records: Box<[SafepointRecord]>,
         osr_entries: std::collections::BTreeMap<u32, usize>,
+        call_entry: Option<usize>,
         osr_only: bool,
     ) -> Self {
         let metadata = CodeObjectMetadata {
@@ -83,15 +79,13 @@ impl TemplateCode {
         Self {
             code,
             metadata,
-            code_object_id,
-            function_id,
-            register_count,
             dependencies,
             register_operands,
             load_ic_cells,
             store_ic_cells,
             safepoint_records,
             osr_entries,
+            call_entry,
             osr_only,
         }
     }
@@ -145,19 +139,10 @@ impl JitFunctionCode for TemplateCode {
         )
     }
 
-    fn generated_stack_frame_bytes(&self) -> Option<u32> {
-        #[cfg(target_arch = "aarch64")]
-        {
-            Some(super::arm64::NATIVE_FRAME_BYTES)
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            Some(super::x86_64::NATIVE_FRAME_BYTES)
-        }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            None
-        }
+    fn call_entry_addr(&self) -> Option<usize> {
+        // SAFETY: the assembler recorded this entry in the live mapping.
+        self.call_entry
+            .map(|offset| unsafe { self.code.ptr_at(offset) as usize })
     }
 
     fn dependencies(&self) -> &[CodeDependency] {
@@ -186,48 +171,10 @@ impl JitFunctionCode for TemplateCode {
             .map(|index| &self.safepoint_records[index])
     }
 
-    fn osr_entry(
-        &self,
-        activation: VmRuntimeActivation,
-        logical_pc: u32,
-    ) -> Option<JitExecOutcome> {
+    fn osr_entry_addr(&self, logical_pc: u32) -> Option<usize> {
         let offset = *self.osr_entries.get(&logical_pc)?;
-        // SAFETY: `offset` is an assembler offset recorded for this buffer and
-        // points at a prologue trampoline emitted with the shared entry ABI.
-        let entry = unsafe { self.code.ptr_at(offset) };
-        // SAFETY: same reentry contract as `run_entry`.
-        Some(unsafe {
-            enter_compiled(
-                activation,
-                entry,
-                self.code_object_id,
-                self.function_id,
-                self.register_count,
-                otter_vm::native_abi::NativeFrameKind::Baseline,
-                !self.safepoint_records.is_empty(),
-                None,
-            )
-        })
-    }
-
-    fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
-        // SAFETY: the mapping is live and the main entry was emitted with the
-        // shared compiled-entry ABI.
-        let entry = unsafe { self.code.entry_ptr() };
-        // SAFETY: `entry` points into the live mapping; `activation` upholds
-        // the reentry contract (valid, non-aliased for the call).
-        unsafe {
-            enter_compiled(
-                activation,
-                entry,
-                self.code_object_id,
-                self.function_id,
-                self.register_count,
-                otter_vm::native_abi::NativeFrameKind::Baseline,
-                !self.safepoint_records.is_empty(),
-                None,
-            )
-        }
+        // SAFETY: the assembler recorded this OSR prologue in the live mapping.
+        Some(unsafe { self.code.ptr_at(offset) as usize })
     }
 }
 

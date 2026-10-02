@@ -21,13 +21,11 @@
 //!   advance the recorded-sample clock.
 //!
 //! # See also
-//! - [`crate::stack_snapshot::visit_frame_snapshots`]
+//! - `crate::native_stack_snapshot` for the common physical and inline frame walk.
 //! - [`crate::run_control::StackFrameSnapshot`]
 
 use serde::{Deserialize, Serialize};
 
-use crate::activation_stack::ActivationStack;
-use crate::stack_snapshot::visit_frame_snapshots;
 use crate::{ExecutionContext, StackFrameSnapshot};
 
 /// Maximum retained samples across one installed profiler's lifetime.
@@ -102,7 +100,7 @@ impl CpuProfiler {
     /// loop-invariant "profiler installed" branch, and inlining the sampling
     /// body there costs hot-loop registers and instruction cache.
     #[inline(never)]
-    pub(crate) fn maybe_sample(&mut self, context: &ExecutionContext, stack: &ActivationStack) {
+    pub(crate) fn maybe_sample(&mut self, vm: &crate::Interpreter, context: &ExecutionContext) {
         if self.ticks_until_sample > 1 {
             self.ticks_until_sample -= 1;
             return;
@@ -123,7 +121,7 @@ impl CpuProfiler {
         let frame_budget = remaining
             .min(CPU_PROFILE_SAMPLE_BYTE_LIMIT)
             .saturating_sub(CPU_PROFILE_SAMPLE_OVERHEAD_BYTES);
-        let capture = match capture_sample(context, stack, frame_budget) {
+        let capture = match capture_sample(vm, context, frame_budget) {
             Ok(capture) => capture,
             Err(()) => {
                 self.record_drop();
@@ -212,11 +210,16 @@ struct CapturedSample {
 }
 
 fn capture_sample(
+    vm: &crate::Interpreter,
     context: &ExecutionContext,
-    stack: &ActivationStack,
     byte_limit: usize,
 ) -> Result<CapturedSample, ()> {
-    let frame_count = stack.len().min(CPU_PROFILE_MAX_FRAMES);
+    let mut total_frames = 0;
+    vm.visit_active_frame_snapshots(context, usize::MAX, |_| {
+        total_frames += 1;
+        true
+    });
+    let frame_count = total_frames.min(CPU_PROFILE_MAX_FRAMES);
     let minimum_bytes = frame_count
         .checked_mul(std::mem::size_of::<StackFrameSnapshot>())
         .ok_or(())?;
@@ -234,7 +237,7 @@ fn capture_sample(
     }
 
     let mut failed = false;
-    visit_frame_snapshots(context, stack, frame_count, |frame| {
+    vm.visit_active_frame_snapshots(context, frame_count, |frame| {
         let Some(requested) = frame
             .function_name
             .len()
@@ -282,7 +285,7 @@ fn capture_sample(
     Ok(CapturedSample {
         frames,
         retained_bytes,
-        truncated_frames: u64::try_from(stack.len().saturating_sub(frame_count))
+        truncated_frames: u64::try_from(total_frames.saturating_sub(frame_count))
             .unwrap_or(u64::MAX),
     })
 }

@@ -532,34 +532,6 @@ impl Interpreter {
         self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &[])
     }
 
-    /// [`Self::alloc_stack_rooted_object_with_extra_roots`] with room for
-    /// `capacity` in-object slots.
-    pub(crate) fn alloc_stack_rooted_object_with_capacity(
-        &mut self,
-        stack: &ActivationStack,
-        root: crate::object::ShapeHandle,
-        extra_roots: &[&Value],
-        capacity: usize,
-    ) -> Result<crate::object::JsObject, VmError> {
-        let roots = self.collect_allocation_roots(stack);
-        let shape_root = root;
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for value in extra_roots {
-                value.trace_value_slots(visitor);
-            }
-        };
-        crate::object::alloc_object_with_shape_roots(
-            &mut self.gc_heap,
-            shape_root,
-            capacity,
-            &mut external_visit,
-        )
-        .map_err(VmError::from)
-    }
-
     /// Allocate an ordinary object while forwarding caller-owned mutable
     /// `Value` slots in place.
     ///

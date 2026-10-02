@@ -49,15 +49,12 @@ use super::ic_probe::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    emit_box_double, emit_box_int32, emit_box_number, emit_load_reg, emit_load_runtime_stub,
-    emit_load_symbol_u64, emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
+    emit_box_double, emit_box_int32, emit_box_number, emit_load_reg,
+    emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
 };
-use crate::arm64::{
-    DirectCallArguments, DirectCallForm, DirectCallSite, MethodGuardSite, direct_call_artifact,
-    direct_call_target_is_supported, emit_direct_call, emit_method_guard,
-};
+use crate::arm64::{MethodGuardSite, emit_method_guard};
 use crate::artifact::relocation::{
-    RelocationCapture, RelocationTarget, TemplateOperandArena, TemplateOperandRole,
+    RelocationCapture,
 };
 use crate::artifact::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
@@ -66,7 +63,7 @@ use crate::artifact::{
 use crate::entry::{NUMBER_TAG_HI16, Unsupported, VALUE_UNDEFINED};
 use crate::template::{
     ACCUMULATOR_DREG, ArithKind, FusedArithKind, FusedChainStep, InlineEntryValue, InlineLeafPlan,
-    InlineScratchSlot, TemplateOp, TemplatePlan, TemplateTail,
+    InlineScratchSlot, TemplateOp, TemplatePlan,
 };
 
 fn inline_scratch_artifact(
@@ -822,32 +819,6 @@ fn try_emit_inline_numeric_callee(
     Ok(true)
 }
 
-fn emit_packed_args(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    register: u8,
-    packed_args: u64,
-    tail: Option<TemplateTail>,
-    role: TemplateOperandRole,
-) {
-    if let Some(tail) = tail {
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            register,
-            packed_args,
-            RelocationTarget::TemplateOperandSlice {
-                arena: TemplateOperandArena::Registers,
-                role,
-                start: u32::try_from(tail.start).expect("template operand offset fits u32"),
-                len: u32::try_from(tail.len).expect("template operand length fits u32"),
-            },
-        );
-    } else {
-        emit_load_u64(ops, register, packed_args);
-    }
-}
-
 /// Emit `dst = callee(args…)` (plain `Op::Call`).
 ///
 /// A baked monomorphic pure leaf gets an exact guarded splice. Otherwise a
@@ -871,10 +842,8 @@ pub(super) fn emit_call(
     logical_pc: u32,
     byte_pc: u32,
     bail: DynamicLabel,
-    transition: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
-    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_call_with_receiver(
         ops,
@@ -891,10 +860,8 @@ pub(super) fn emit_call(
         logical_pc,
         byte_pc,
         bail,
-        transition,
         threw,
         throw_value,
-        fatal,
     )
 }
 
@@ -918,17 +885,15 @@ pub(super) fn emit_call_with_receiver(
     logical_pc: u32,
     byte_pc: u32,
     bail: DynamicLabel,
-    transition: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
-    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     if let Some(receiver) = receiver
         && let Some(target) = view.static_native_calls.get(&byte_pc)
         && let Some(declaration) =
             otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)
-        && view.native_ref_byte != 0
+        && view.native_call_layout.identity_byte != 0
         && usize::from(argc) == usize::from(declaration.argument_count)
         && otter_vm::runtime_stubs::leaf_entry_shape(target.leaf_stub_id)
             .is_some_and(|shape| declaration.operand_words() <= usize::from(shape.words))
@@ -967,16 +932,23 @@ pub(super) fn emit_call_with_receiver(
         let leaf_end = ops.offset().0;
         // Static-native feedback names no bytecode callee, so the ordinary
         // call is the generic transition, exactly as for an unsupported arity.
-        emit_generic_call_transition(
+        emit_trampoline_call(
             ops,
             relocations,
             table,
-            dst,
-            callee,
+            view,
+            None,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            CallCallee::Register(callee),
             Some(receiver),
-            argument_registers,
+            CallNewTarget::None,
+            CallActuals::Fixed(argument_registers),
+            None,
+            dst,
             throw_value,
-            fatal,
+            threw,
         )?;
         dynasm!(ops ; .arch aarch64 ; =>hit);
         let name = native_leaf_call_name(target.leaf_stub_id);
@@ -1071,16 +1043,23 @@ pub(super) fn emit_call_with_receiver(
                 },
             );
         }
-        return emit_generic_call_transition(
+        return emit_trampoline_call(
             ops,
             relocations,
             table,
-            dst,
-            callee,
+            view,
+            code_map,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            CallCallee::Register(callee),
             receiver,
-            argument_registers,
+            CallNewTarget::None,
+            CallActuals::Fixed(argument_registers),
+            None,
+            dst,
             throw_value,
-            fatal,
+            threw,
         );
     }
     let direct_target = view
@@ -1106,7 +1085,7 @@ pub(super) fn emit_call_with_receiver(
             bail,
         )?
     {
-        if let (Some(events), Some(target)) = (direct_call_events.as_deref_mut(), direct_target) {
+        if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
             events.insert(
                 (byte_pc, 0),
                 direct_call_lowering_event(
@@ -1124,138 +1103,257 @@ pub(super) fn emit_call_with_receiver(
         return Ok(());
     }
 
-    if let Some(target) = direct_target.filter(|target| direct_call_target_is_supported(target)) {
-        emit_direct_call(
-            ops,
-            relocations,
-            view,
-            DirectCallSite {
-                target,
-                target_index: 0,
-                target_count: 1,
-                caller_function_id: view.code_block.id,
-                logical_pc,
-                byte_pc,
-                dst,
-                form: match receiver {
-                    None => DirectCallForm::Plain { callable: callee },
-                    Some(receiver) => DirectCallForm::CallWithThis {
-                        callable: callee,
-                        receiver,
-                    },
-                },
-                arguments: DirectCallArguments::Fixed(argument_registers),
-            },
-            table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
-            table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
-            code_map,
-            bail,
-            transition,
-            threw,
-            throw_value,
-            fatal,
-            done,
-        )?;
-        if let Some(events) = direct_call_events.as_deref_mut() {
-            events.insert(
-                (byte_pc, 0),
-                direct_call_lowering_event(
-                    otter_vm::JitDirectCallKind::Plain,
-                    logical_pc,
-                    byte_pc,
-                    target,
-                    0,
-                    1,
-                    otter_vm::JitDirectCallLoweringOutcome::Generated {
-                        code_object_id: target.plan.code_object_id,
-                        target_tier: direct_call_target_tier(target),
-                        this_mode: target.plan.this_mode,
-                    },
-                ),
-            );
-        }
-        dynasm!(ops ; .arch aarch64 ; =>done);
-        return Ok(());
-    }
-
-    if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
-        events.insert(
-            (byte_pc, 0),
-            direct_call_lowering_event(
-                otter_vm::JitDirectCallKind::Plain,
-                logical_pc,
-                byte_pc,
-                target,
-                0,
-                1,
-                otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                    reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
-                },
-            ),
-        );
-    }
-    emit_generic_call_transition(
+    emit_trampoline_call(
         ops,
         relocations,
         table,
-        dst,
-        callee,
+        view,
+        code_map,
+        view.code_block.id,
+        logical_pc,
+        byte_pc,
+        CallCallee::Register(callee),
         receiver,
-        argument_registers,
+        CallNewTarget::None,
+        CallActuals::Fixed(argument_registers),
+        direct_target
+            .filter(|_| view.direct_callees.get(&byte_pc).is_some_and(|targets| targets.len() == 1))
+            .map(|target| target.plan),
+        dst,
         throw_value,
-        fatal,
+        threw,
     )
 }
 
-/// Complete `Op::Call` / `Op::CallWithThis` through the callee-carrying value
-/// transition when the site owns no generated edge.
+/// Deliver a trampoline completion in `x0`/`x1`: success to `dst`, a throw
+/// to `throw_value`, a parked error to `threw`.
+pub(super) fn emit_call_completion(
+    ops: &mut Assembler,
+    dst: u16,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let abrupt = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64 ; cbnz x1, =>abrupt);
+    emit_store_reg(ops, 0, dst)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; b =>done
+        ; =>abrupt
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>threw
+        ; =>done
+    );
+    Ok(())
+}
+
+/// Callee operand of a classified call.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CallCallee {
+    /// A caller register.
+    Register(u16),
+    /// The callable a method guard left in `x17`.
+    GuardedMethod,
+    /// The callable the method resolution entry returned in `x0`.
+    ResolvedMethod,
+}
+
+/// `new.target` operand of a classified call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallNewTarget {
+    /// `[[Call]]`.
+    None,
+    /// `new C(...)`: the constructor itself.
+    Callee,
+    /// `super(...)`: the frame's `new.target`, or the parent outside a
+    /// construct.
+    Super,
+}
+
+/// Actual arguments of a classified call.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CallActuals<'a> {
+    /// Caller registers, pushed in order.
+    Fixed(&'a [u16]),
+    /// A staging entry already wrote the span.
+    Staged,
+}
+
+/// Call one callee and deliver its completion to `dst`.
 ///
-/// The packet is `[callee, receiver, arguments…]`; a plain call passes
-/// `undefined` as the receiver and the callee's own binding rules apply. The
-/// transition completes against the published native frame, so it works
-/// identically for a materialized activation and for a stack-owned generated
-/// callee; the site never side-exits merely because it has no direct target.
-pub(super) fn emit_generic_call_transition(
+/// A proven bytecode target is entered through its current generation after
+/// its identity guard; every other callee through the generic entry. The
+/// callee owns its activation, receiver binding, constructor completion and
+/// deoptimization. A throw reaches `throw_value` with the exception in `x0`;
+/// any other abrupt completion parks its error and reaches `threw`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_trampoline_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    dst: u16,
-    callee: u16,
+    view: &JitCompileSnapshot,
+    code_map: Option<&mut CodeMapCapture>,
+    caller_function_id: u32,
+    logical_pc: u32,
+    byte_pc: u32,
+    callee: CallCallee,
     receiver: Option<u16>,
-    argument_registers: &[u16],
+    new_target: CallNewTarget,
+    actuals: CallActuals<'_>,
+    known: Option<otter_vm::jit::JitDirectCallPlan>,
+    dst: u16,
     throw_value: DynamicLabel,
-    fatal: DynamicLabel,
+    threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let mut words = Vec::with_capacity(argument_registers.len() + 2);
-    words.push(PacketWord::Register(callee));
-    words.push(receiver.map_or(PacketWord::Undefined, PacketWord::Register));
-    words.extend(
-        argument_registers
-            .iter()
-            .map(|&register| PacketWord::Register(register)),
-    );
-    emit_value_packet_transition(
-        ops,
-        relocations,
-        table,
-        abi::STUB_JIT_CALL_WITH_THIS_VALUE,
-        &words,
-        dst,
-        throw_value,
-        fatal,
-    )
-}
-
-pub(super) fn direct_call_target_tier(
-    target: &otter_vm::JitDirectCallee,
-) -> otter_vm::JitDebugTier {
-    match target.plan.tier {
-        abi::NativeFrameKind::Baseline => otter_vm::JitDebugTier::Template,
-        abi::NativeFrameKind::Optimizing => otter_vm::JitDebugTier::Optimizing,
-        abi::NativeFrameKind::Interpreter => {
-            unreachable!("interpreter has no entry-capable code generation")
+    use crate::arm64::js_call::{
+        CallTarget, emit_call, emit_pop_arguments, emit_push_arguments, emit_staged_call,
+    };
+    let start = ops.offset().0;
+    let done = ops.new_dynamic_label();
+    // `[[Construct]]` enters a proven target directly only when it has the
+    // internal method; classification throws otherwise.
+    let known = known.filter(|plan| {
+        new_target == CallNewTarget::None
+            || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
+    });
+    if let (Some(plan), CallActuals::Fixed(arguments)) = (known, actuals) {
+        let generic = ops.new_dynamic_label();
+        match callee {
+            CallCallee::Register(callee) => emit_load_reg(ops, 9, callee)?,
+            CallCallee::GuardedMethod => dynasm!(ops ; .arch aarch64 ; mov x9, x17),
+            CallCallee::ResolvedMethod => dynasm!(ops ; .arch aarch64 ; mov x9, x0),
+        }
+        crate::arm64::inline_guard::emit_cached_identity(
+            ops,
+            relocations,
+            view,
+            plan,
+            logical_pc,
+            generic,
+        );
+        // The proven method callable stays in `x12` through the span push.
+        if !matches!(callee, CallCallee::Register(_)) {
+            dynasm!(ops ; .arch aarch64 ; mov x12, x9);
+        }
+        let count = arguments.len();
+        let pushed = count.max(usize::from(plan.param_count));
+        let bytes = emit_push_arguments(ops, pushed, |ops, index, register, _| {
+            match arguments.get(index) {
+                Some(&source) => emit_load_reg(ops, register, source)?,
+                None => emit_load_u64(ops, register, VALUE_UNDEFINED),
+            }
+            Ok(register)
+        })?;
+        emit_trampoline_operands(ops, callee, receiver, new_target)?;
+        let count = u32::try_from(count).map_err(|_| Unsupported::OperandShape("call actual count"))?;
+        emit_call(
+            ops,
+            relocations,
+            table,
+            20,
+            12,
+            receiver.map(|_| 13),
+            (new_target != CallNewTarget::None).then_some(14),
+            count,
+            CallTarget::Known {
+                entry_cell: plan.entry_cell,
+                function_id: plan.function_id,
+            },
+        );
+        emit_pop_arguments(ops, bytes);
+        emit_call_completion(ops, dst, throw_value, threw)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>generic);
+    }
+    // The method callable survives the span push: it clobbers only x15/x16.
+    match callee {
+        CallCallee::GuardedMethod => dynasm!(ops ; .arch aarch64 ; mov x12, x17),
+        CallCallee::ResolvedMethod => dynasm!(ops ; .arch aarch64 ; mov x12, x0),
+        CallCallee::Register(_) => {}
+    }
+    match actuals {
+        CallActuals::Fixed(arguments) => {
+            let bytes = emit_push_arguments(ops, arguments.len(), |ops, index, register, _| {
+                emit_load_reg(ops, register, arguments[index])?;
+                Ok(register)
+            })?;
+            let count = u32::try_from(arguments.len())
+                .map_err(|_| Unsupported::OperandShape("call actual count"))?;
+            emit_trampoline_operands(ops, callee, receiver, new_target)?;
+            emit_call(
+                ops,
+                relocations,
+                table,
+                20,
+                12,
+                receiver.map(|_| 13),
+                (new_target != CallNewTarget::None).then_some(14),
+                count,
+                CallTarget::Generic,
+            );
+            emit_pop_arguments(ops, bytes);
+        }
+        CallActuals::Staged => {
+            emit_trampoline_operands(ops, callee, receiver, new_target)?;
+            emit_staged_call(
+                ops,
+                relocations,
+                table,
+                20,
+                12,
+                receiver.map(|_| 13),
+                (new_target != CallNewTarget::None).then_some(14),
+            );
         }
     }
+    emit_call_completion(ops, dst, throw_value, threw)?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    if let Some(code_map) = code_map {
+        code_map.record(CodeRegion::call_structural(
+            "callTrampoline",
+            start,
+            ops.offset().0,
+            caller_function_id,
+            logical_pc,
+            byte_pc,
+            known.map(|plan| plan.function_id),
+        ));
+    }
+    Ok(())
+}
+
+/// Load the callee into `x12`, the receiver into `x13` and `new.target` into
+/// `x14`. A method callable already sits in `x12`.
+fn emit_trampoline_operands(
+    ops: &mut Assembler,
+    callee: CallCallee,
+    receiver: Option<u16>,
+    new_target: CallNewTarget,
+) -> Result<(), Unsupported> {
+    if let CallCallee::Register(callee) = callee {
+        emit_load_reg(ops, 12, callee)?;
+    }
+    if let Some(receiver) = receiver {
+        emit_load_reg(ops, 13, receiver)?;
+    }
+    match new_target {
+        CallNewTarget::None => {}
+        CallNewTarget::Callee => dynasm!(ops ; .arch aarch64 ; mov x14, x12),
+        CallNewTarget::Super => {
+            let ready = ops.new_dynamic_label();
+            emit_load_u64(ops, 15, VALUE_UNDEFINED);
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x14, [x21, crate::entry::NATIVE_FRAME_NEW_TARGET_OFFSET]
+                ; cmp x14, x15
+                ; b.ne =>ready
+                ; mov x14, x12
+                ; =>ready
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn direct_call_lowering_event(
@@ -1278,178 +1376,47 @@ pub(super) fn direct_call_lowering_event(
     }
 }
 
-/// Emit fixed-arity `new callee(args…)` or `super(args…)`.
-///
-/// A baked target uses the shared stack-owned generated linkage. An unplanned
-/// site completes through the single generic in-place construct transition,
-/// which runs the interpreter's own `Construct` synchronously and writes
-/// `dst`. `Success` continues, `Throw` enters the parked-error epilogue, and
-/// `SideExit` (a non-constructor callee) leaves before effects so the
-/// interpreter owns the `TypeError`.
+/// Emit fixed-arity `new callee(args…)` or `super(args…)` through the call
+/// trampoline, which classifies the constructor, creates or passes its
+/// receiver and applies the constructor completion.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_construct(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
-    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
-    argc: u16,
-    packed_args: u64,
-    packed_args_tail: Option<TemplateTail>,
     argument_registers: &[u16],
     super_construct: bool,
     logical_pc: u32,
     byte_pc: u32,
-    bail: DynamicLabel,
-    transition: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
-    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    // Keep fixed `super()` on the in-place transition until template entry
-    // tiering accounts for a generated superclass edge. Entering it directly
-    // here starves the derived body of the feedback/hotness that currently
-    // publishes its Machine IR super linkage. Ordinary fixed `new` has no such
-    // tier-policy dependency and uses the shared generated path below.
-    let direct_target = (!super_construct)
-        .then(|| view.direct_constructs.get(&byte_pc))
-        .flatten();
-    if let Some(target) = direct_target.filter(|target| direct_call_target_is_supported(target)) {
-        let done = ops.new_dynamic_label();
-        let kind = match (super_construct, target.plan.is_derived_constructor) {
-            (false, false) => otter_vm::JitDirectCallKind::Construct,
-            (false, true) => otter_vm::JitDirectCallKind::DerivedConstruct,
-            (true, false) => otter_vm::JitDirectCallKind::SuperConstruct,
-            (true, true) => otter_vm::JitDirectCallKind::DerivedSuperConstruct,
-        };
-        let form = match kind {
-            otter_vm::JitDirectCallKind::Construct => DirectCallForm::Construct {
-                callable: callee,
-                receiver: dst,
-            },
-            otter_vm::JitDirectCallKind::DerivedConstruct => {
-                DirectCallForm::DerivedConstruct { callable: callee }
-            }
-            otter_vm::JitDirectCallKind::SuperConstruct => DirectCallForm::SuperConstruct {
-                callable: callee,
-                receiver: dst,
-            },
-            otter_vm::JitDirectCallKind::DerivedSuperConstruct => {
-                DirectCallForm::DerivedSuperConstruct { callable: callee }
-            }
-            _ => unreachable!("fixed construct kind"),
-        };
-        crate::arm64::emit_direct_call_with_access(
-            ops,
-            relocations,
-            view,
-            DirectCallSite {
-                target,
-                target_index: 0,
-                target_count: 1,
-                caller_function_id: view.code_block.id,
-                logical_pc,
-                byte_pc,
-                dst,
-                form,
-                arguments: DirectCallArguments::Fixed(argument_registers),
-            },
-            table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
-            table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
-            table.entry(abi::STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
-            table.entry(abi::STUB_JIT_PREPARE_BASE_CONSTRUCT),
-            table.entry(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT),
-            0,
-            0,
-            code_map,
-            bail,
-            transition,
-            threw,
-            throw_value,
-            fatal,
-            done,
-            20,
-            |ops, source, target, _| emit_load_reg(ops, target, source),
-            |ops, destination, source, _| emit_store_reg(ops, source, destination),
-            |_| Ok(()),
-            |ops, source, _| emit_store_reg(ops, source, dst),
-            |_, _| Ok(()),
-            |_, _, _| {
-                Err(Unsupported::OperandShape(
-                    "forward bindings outside forwarding site",
-                ))
-            },
-        )?;
-        if let Some(events) = direct_call_events {
-            events.insert(
-                (byte_pc, 0),
-                direct_call_lowering_event(
-                    kind,
-                    logical_pc,
-                    byte_pc,
-                    target,
-                    0,
-                    1,
-                    otter_vm::JitDirectCallLoweringOutcome::Generated {
-                        code_object_id: target.plan.code_object_id,
-                        target_tier: direct_call_target_tier(target),
-                        this_mode: target.plan.this_mode,
-                    },
-                ),
-            );
-        }
-        dynasm!(ops ; .arch aarch64 ; =>done);
-        return Ok(());
-    }
-
-    if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
-        events.insert(
-            (byte_pc, 0),
-            direct_call_lowering_event(
-                if super_construct {
-                    otter_vm::JitDirectCallKind::SuperConstruct
-                } else {
-                    otter_vm::JitDirectCallKind::Construct
-                },
-                logical_pc,
-                byte_pc,
-                target,
-                0,
-                1,
-                otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                    reason: otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
-                },
-            ),
-        );
-    }
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov x0, x20
-        ; movz x1, dst as u32
-        ; movz x2, callee as u32
-    );
-    emit_load_u64(ops, 3, u64::from(argc) | (u64::from(super_construct) << 63));
-    emit_packed_args(
+    emit_trampoline_call(
         ops,
         relocations,
-        4,
-        packed_args,
-        packed_args_tail,
-        TemplateOperandRole::ConstructArguments,
-    );
-    emit_load_runtime_stub(
-        ops,
-        relocations,
-        16,
-        table.entry(abi::STUB_JIT_CONSTRUCT),
-        abi::STUB_JIT_CONSTRUCT,
-    );
-    dynasm!(ops ; .arch aarch64 ; blr x16);
-    super::transitions::emit_status_word_result(ops, Some(bail), threw, fatal);
-    Ok(())
+        table,
+        view,
+        code_map,
+        view.code_block.id,
+        logical_pc,
+        byte_pc,
+        CallCallee::Register(callee),
+        None,
+        if super_construct {
+            CallNewTarget::Super
+        } else {
+            CallNewTarget::Callee
+        },
+        CallActuals::Fixed(argument_registers),
+        view.direct_constructs.get(&byte_pc).map(|target| target.plan),
+        dst,
+        throw_value,
+        threw,
+    )
 }
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
@@ -1466,7 +1433,7 @@ pub(super) fn emit_method_call(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     view: &JitCompileSnapshot,
-    mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
@@ -1476,7 +1443,6 @@ pub(super) fn emit_method_call(
     arg0: Option<u16>,
     arg1: Option<u16>,
     bail: DynamicLabel,
-    transition: DynamicLabel,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
     fatal: DynamicLabel,
@@ -1519,7 +1485,6 @@ pub(super) fn emit_method_call(
         );
     }
     let planned_methods = view.direct_methods.get(&byte_pc);
-    let mut inlined_target: Option<u32> = None;
     // A monomorphic inlinable body keeps its receiver guard as a fall-through
     // to the layers below, exactly as the polymorphic chain does: an unseen
     // shape reaches the direct call or the generic packet instead of pinning
@@ -1547,7 +1512,7 @@ pub(super) fn emit_method_call(
             bail,
         )? {
             if let (Some(events), Some(target)) = (
-                direct_call_events.as_deref_mut(),
+                direct_call_events,
                 planned_methods.and_then(|methods| methods.first()),
             ) {
                 events.insert(
@@ -1562,7 +1527,6 @@ pub(super) fn emit_method_call(
                         otter_vm::JitDirectCallLoweringOutcome::Inlined,
                     ),
                 );
-                inlined_target = Some(target.target_index);
             }
             dynasm!(ops ; .arch aarch64 ; =>inline_miss);
         }
@@ -1594,47 +1558,10 @@ pub(super) fn emit_method_call(
             dynasm!(ops ; .arch aarch64 ; =>next_candidate);
         }
     }
+    // A planned method chain proves the callable from exact receiver and
+    // holder identities; the trampoline then enters it like any callee.
     for method in planned_methods.into_iter().flatten() {
-        if !direct_call_target_is_supported(&method.callee) {
-            // An inlined body already owns this target's lowering record; its
-            // guard-miss layer is not a second outcome.
-            if let Some(events) = direct_call_events.as_deref_mut()
-                && inlined_target != Some(method.target_index)
-            {
-                events.insert(
-                    (byte_pc, method.target_index),
-                    direct_call_lowering_event(
-                        otter_vm::JitDirectCallKind::Method,
-                        logical_pc,
-                        byte_pc,
-                        &method.callee,
-                        method.target_index,
-                        method.target_count,
-                        otter_vm::JitDirectCallLoweringOutcome::Rejected {
-                            reason:
-                                otter_vm::JitDirectCallLoweringRejectionReason::LayoutUnsupported,
-                        },
-                    ),
-                );
-            }
-            continue;
-        }
         let next_target = ops.new_dynamic_label();
-        let direct_site = DirectCallSite {
-            target: &method.callee,
-            target_index: method.target_index,
-            target_count: method.target_count,
-            caller_function_id: view.code_block.id,
-            logical_pc,
-            byte_pc,
-            dst,
-            form: DirectCallForm::Method {
-                callable: 17,
-                receiver,
-            },
-            arguments: DirectCallArguments::Fixed(argument_registers),
-        };
-        let direct_call = direct_call_artifact(view, direct_site)?;
         let guard_start = ops.offset().0;
         emit_method_guard(
             ops,
@@ -1650,70 +1577,64 @@ pub(super) fn emit_method_call(
         )?;
         if let Some(code_map) = code_map.as_deref_mut() {
             code_map.record(CodeRegion::method_call_structural(
-                "directMethodGuard",
+                "methodGuard",
                 guard_start,
                 ops.offset().0,
-                direct_site.caller_function_id,
-                direct_site.logical_pc,
-                direct_site.byte_pc,
-                direct_call,
+                view.code_block.id,
+                logical_pc,
+                byte_pc,
                 receiver,
                 &method.guard,
             ));
         }
-        emit_direct_call(
+        emit_trampoline_call(
             ops,
             relocations,
+            table,
             view,
-            direct_site,
-            table.entry(abi::STUB_JIT_DEOPT_STACK_CALL),
-            table.entry(abi::STUB_JIT_RESOLVE_DIRECT_ENTRY),
             code_map.as_deref_mut(),
-            bail,
-            transition,
-            threw,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            CallCallee::GuardedMethod,
+            Some(receiver),
+            CallNewTarget::None,
+            CallActuals::Fixed(argument_registers),
+            Some(method.callee.plan),
+            dst,
             throw_value,
-            fatal,
-            done,
+            threw,
         )?;
-        if let Some(events) = direct_call_events.as_deref_mut()
-            && inlined_target != Some(method.target_index)
-        {
-            events.insert(
-                (byte_pc, method.target_index),
-                direct_call_lowering_event(
-                    otter_vm::JitDirectCallKind::Method,
-                    logical_pc,
-                    byte_pc,
-                    &method.callee,
-                    method.target_index,
-                    method.target_count,
-                    otter_vm::JitDirectCallLoweringOutcome::Generated {
-                        code_object_id: method.callee.plan.code_object_id,
-                        target_tier: direct_call_target_tier(&method.callee),
-                        this_mode: otter_vm::JitDirectCallThisMode::MethodReceiver,
-                    },
-                ),
-            );
-        }
-        dynasm!(ops ; .arch aarch64 ; =>next_target);
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>next_target);
     }
-    let mut words = Vec::with_capacity(argument_registers.len() + 1);
-    words.push(PacketWord::Register(receiver));
-    words.extend(
-        argument_registers
-            .iter()
-            .map(|&register| PacketWord::Register(register)),
-    );
+    // Every other receiver resolves its method through the shared caches.
     emit_value_packet_transition(
         ops,
         relocations,
         table,
-        abi::STUB_JIT_CALL_METHOD_VALUE,
-        &words,
-        dst,
+        abi::STUB_JIT_RESOLVE_METHOD,
+        &[PacketWord::Register(receiver)],
+        None,
         throw_value,
         fatal,
+    )?;
+    emit_trampoline_call(
+        ops,
+        relocations,
+        table,
+        view,
+        code_map,
+        view.code_block.id,
+        logical_pc,
+        byte_pc,
+        CallCallee::ResolvedMethod,
+        Some(receiver),
+        CallNewTarget::None,
+        CallActuals::Fixed(argument_registers),
+        None,
+        dst,
+        throw_value,
+        threw,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())

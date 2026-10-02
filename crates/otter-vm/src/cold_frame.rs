@@ -29,11 +29,11 @@ use std::num::NonZeroU32;
 
 use otter_gc::raw::SlotVisitor;
 
+use crate::Value;
 use crate::frame_state::{
     AsyncFrameState, PendingBindFunction, PendingGetIterator, PendingIteratorNext,
     PendingToPrimitive, TryHandler,
 };
-use crate::{JsObject, Value};
 use smallvec::SmallVec;
 
 /// A non-throw abrupt completion (`return` / `break` / `continue`)
@@ -118,6 +118,9 @@ pub struct ColdFrame {
     /// proving that costs a walk of every field, and the collector pays it for
     /// the whole pool on every collection. One flag turns that into a branch.
     acquired: bool,
+    /// Loop header that initiated the current native OSR entry. Consumed on
+    /// compiled completion before interpreter execution resumes.
+    pub osr_origin: Option<u32>,
     /// Result promise owned by a regular async-function invocation. Return and
     /// uncaught-throw paths settle it instead of writing into a caller window.
     pub async_state: Option<AsyncFrameState>,
@@ -143,27 +146,6 @@ pub struct ColdFrame {
     /// unwind walks and by `Op::LeaveTry` on a finally handler
     /// (normal entry); popped by `Op::EndFinally`.
     pub parked_finally: SmallVec<[(ParkedFinally, u32); 2]>,
-    /// Newly-allocated receiver when this frame was entered via
-    /// `Op::New`. On return, the dispatcher substitutes this object
-    /// for any non-object return value so constructors that don't
-    /// `return` a replacement still hand the caller the fresh instance.
-    pub construct_target: Option<JsObject>,
-    /// `new.target` visible to the active function body. Set only for
-    /// frames entered through `[[Construct]]`.
-    pub new_target: Option<Value>,
-    /// Trailing arguments past the declared `param_count`. Populated
-    /// by the call dispatcher only when the callee declares a rest
-    /// parameter; consumed by `Op::CollectRest`.
-    pub rest_args: SmallVec<[Value; 4]>,
-    /// Full incoming-argument list captured at call entry. Populated
-    /// only when the callee was compiled with `needs_arguments`;
-    /// consumed by `Op::CollectArguments` and `Op::CallForwardArguments`.
-    pub incoming_args: SmallVec<[Value; 4]>,
-    /// The activation's arguments exotic object once materialized. A body
-    /// that only forwards `arguments` builds it lazily, and only when the
-    /// resolved `apply` is not the intrinsic; every later use in the same
-    /// activation observes the same object.
-    pub arguments_object: Option<Value>,
     /// Active try-handler stack. Pushed by `Op::EnterTry`, popped by
     /// `Op::LeaveTry` or by exception unwind landing on a matching
     /// catch / finally. Innermost handler on top.
@@ -178,18 +160,6 @@ pub struct ColdFrame {
     /// innermost-first when a parked generator is resumed with
     /// `.return()`.
     pub active_iterator_closers: SmallVec<[(Value, u32); 2]>,
-    /// `true` when this frame runs a *derived* class constructor.
-    /// Its `this` starts in the TDZ (a `Value::hole()` in
-    /// `Frame::this_value`) until `super(...)` binds it — through
-    /// [`otter_bytecode::Op::BindThisValue`] for a frame-held `this`, or
-    /// into the `DerivedThis` context slot that
-    /// [`Self::derived_this_slot`] names. The return path (`pop_frame`)
-    /// consults this to apply
-    /// §10.2.2 derived constructor return semantics: an object return is
-    /// honoured verbatim, an undefined return yields the bound `this`, and
-    /// an undefined return with `this` still in the TDZ is a
-    /// `ReferenceError`.
-    pub is_derived_constructor: bool,
     /// The `DerivedThis` context slot a [`otter_bytecode::Op::ReturnDerived`]
     /// completion named: the context value and the slot coordinate relative
     /// to it. The frame reads the slot when it actually pops, after crossed
@@ -224,18 +194,6 @@ impl ColdFrame {
                 ParkedFinally::Normal | ParkedFinally::Abrupt(AbruptKind::Jump(_), _) => {}
             }
         }
-        if let Some(value) = &self.new_target {
-            crate::code_liveness::visit_value(value, visitor);
-        }
-        for value in &self.rest_args {
-            crate::code_liveness::visit_value(value, visitor);
-        }
-        for value in &self.incoming_args {
-            crate::code_liveness::visit_value(value, visitor);
-        }
-        if let Some(value) = &self.arguments_object {
-            crate::code_liveness::visit_value(value, visitor);
-        }
         for (value, _) in &self.active_iterator_closers {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -255,14 +213,8 @@ impl ColdFrame {
             && self.pending_get_iterator.is_none()
             && self.pending_iterator_next.is_none()
             && self.parked_finally.is_empty()
-            && self.construct_target.is_none()
-            && self.new_target.is_none()
-            && self.rest_args.is_empty()
-            && self.incoming_args.is_empty()
-            && self.arguments_object.is_none()
             && self.handlers.is_empty()
             && self.active_iterator_closers.is_empty()
-            && !self.is_derived_constructor
             && self.derived_this_slot.is_none()
     }
 
@@ -282,6 +234,7 @@ impl ColdFrame {
     pub(crate) fn supports_static_catch_rebuild(&self) -> bool {
         let Self {
             acquired,
+            osr_origin: _,
             async_state,
             generator_owner,
             pending_to_primitive,
@@ -289,25 +242,11 @@ impl ColdFrame {
             pending_get_iterator,
             pending_iterator_next,
             parked_finally,
-            construct_target,
-            new_target,
-            rest_args,
-            incoming_args,
-            arguments_object,
             handlers,
             active_iterator_closers,
-            is_derived_constructor,
             derived_this_slot,
         } = self;
-        let _preserved = (
-            acquired,
-            construct_target,
-            new_target,
-            rest_args,
-            incoming_args,
-            arguments_object,
-            is_derived_constructor,
-        );
+        let _preserved = acquired;
 
         async_state.is_none()
             && generator_owner.is_none()
@@ -359,22 +298,6 @@ impl ColdFrame {
                 }
                 ParkedFinally::Normal | ParkedFinally::Abrupt(AbruptKind::Jump(_), _) => {}
             }
-        }
-        if let Some(obj) = &self.construct_target {
-            let p = obj as *const JsObject as *mut otter_gc::raw::RawGc;
-            visitor(p);
-        }
-        if let Some(v) = &self.new_target {
-            v.trace_value_slots(visitor);
-        }
-        for v in &self.rest_args {
-            v.trace_value_slots(visitor);
-        }
-        for v in &self.incoming_args {
-            v.trace_value_slots(visitor);
-        }
-        if let Some(v) = &self.arguments_object {
-            v.trace_value_slots(visitor);
         }
         for (v, _) in &self.active_iterator_closers {
             v.trace_value_slots(visitor);

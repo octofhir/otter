@@ -18,7 +18,7 @@
 //!
 //! # See also
 //! - [`super::safepoints`] for code-object-owned root tables.
-//! - [`super::frame::NativeFrame`] for the active code-object id.
+//! - [`super::frame::Frame`] for the active code-object id.
 
 /// Stable identity of the array-index accessor protector epoch.
 pub const ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY: u32 = 0;

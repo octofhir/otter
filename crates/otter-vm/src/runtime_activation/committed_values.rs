@@ -425,63 +425,6 @@ impl Interpreter {
 }
 
 impl RuntimeCall<'_> {
-    pub(super) fn published_opcode(&self) -> Result<Op, VmError> {
-        let function_id = self.function_id();
-        let instruction_pc = self.pc();
-        let context = &self.context;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let instruction = function
-            .instr_at_index(instruction_pc as usize)
-            .ok_or(VmError::InvalidOperand)?;
-        if instruction.instruction_pc != instruction_pc {
-            return Err(VmError::InvalidOperand);
-        }
-        Ok(function.op(instruction))
-    }
-
-    /// The published instruction's string-constant operand at `operand`.
-    pub(super) fn published_const_index(&self, operand: u8) -> Result<u32, VmError> {
-        let function_id = self.function_id();
-        let instruction_pc = self.pc();
-        let context = &self.context;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let instruction = function
-            .instr_at_index(instruction_pc as usize)
-            .ok_or(VmError::InvalidOperand)?;
-        if instruction.instruction_pc != instruction_pc {
-            return Err(VmError::InvalidOperand);
-        }
-        // Binding opcodes may carry more than the inline operand words (the
-        // snapshot forms have five), so resolve through the owning CodeBlock,
-        // which consults the overflow table.
-        function
-            .const_index(instruction, usize::from(operand))
-            .ok_or(VmError::InvalidOperand)
-    }
-
-    /// The published instruction's signed immediate operand at `operand`.
-    pub(super) fn published_imm32(&self, operand: u8) -> Result<i32, VmError> {
-        let function_id = self.function_id();
-        let instruction_pc = self.pc();
-        let context = &self.context;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let instruction = function
-            .instr_at_index(instruction_pc as usize)
-            .ok_or(VmError::InvalidOperand)?;
-        if instruction.instruction_pc != instruction_pc {
-            return Err(VmError::InvalidOperand);
-        }
-        function
-            .imm32(instruction, usize::from(operand))
-            .ok_or(VmError::InvalidOperand)
-    }
-
     /// Complete the exact published object-protocol site over boxed values.
     pub fn object_protocol_values(
         &mut self,
@@ -553,11 +496,8 @@ impl RuntimeCall<'_> {
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
             if vm.pending_uncaught_frames.is_none() {
-                vm.pending_uncaught_frames = Some(vm.snapshot_active_frames(
-                    &self.context,
-                    unsafe { self.stack.as_ref() },
-                    usize::MAX,
-                ));
+                vm.pending_uncaught_frames =
+                    Some(vm.snapshot_active_frames(&self.context, usize::MAX));
             }
             return Ok(value0);
         }
@@ -616,7 +556,7 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
         // SAFETY: construction validated the frame and owns it exclusively.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(self.frame.as_ptr()) }
             .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
         // §10.2.1.1 — an arrow closes over the enclosing activation's
         // `new.target`; undefined is the unbound state.

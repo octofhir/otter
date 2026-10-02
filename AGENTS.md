@@ -516,7 +516,7 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `inline-frames` recipes in `optimized-ir.txt`: descendant register/this/closure/new.target
     values are boxed only in cold CFG and retained as explicit safepoint roots.
     Enclosing helper splices keep residual generated calls. Their
-    `safepoints.json` records set `inlineFramesVirtual`: the parents are never
+    `safepoints.json` records own `inlineFrames`: the parents are never
     published as NativeFrames; stack walks describe them from the call site's
     recipe, and runtime decoders do not reconstruct them. The direct-call
     source function can differ from its code-object owner. Callee deopt

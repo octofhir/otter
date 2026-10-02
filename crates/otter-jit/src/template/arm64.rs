@@ -30,7 +30,7 @@
 //! - Machine-visible offsets come only from the shared entry-ABI module and
 //!   frozen value-tag contracts; no Rust container layout is probed.
 //! - `x19` retains the tagged register-window base, `x20` retains `JitCtx`,
-//!   and `x21` retains the current `NativeFrame`. All three are callee-saved,
+//!   and `x21` retains the current `Frame`. All three are callee-saved,
 //!   so exact-PC publication and frame-field reads never reload the frame
 //!   pointer from the context inside the instruction stream.
 //! - A branch may skip general tagged truthiness only when its condition's
@@ -49,6 +49,7 @@
 // intentionally redundant and outside the source-level emitter's control.
 #![allow(clippy::useless_conversion)]
 
+mod activation;
 pub(crate) mod arith;
 mod binding;
 mod calls;
@@ -96,8 +97,8 @@ use crate::artifact::{
     relocation::RelocationCapture,
 };
 use crate::entry::{
-    CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-    NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+    CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+    NATIVE_FRAME_THIS_OFFSET,
     NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
     VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
     VM_THREAD_INTERRUPT_CELL_OFFSET, reg_offset,
@@ -110,8 +111,6 @@ const VALUE_FALSE_IMM: u32 = VALUE_FALSE as u32;
 const VALUE_NULL_IMM: u32 = VALUE_NULL as u32;
 const VALUE_UNDEFINED_IMM: u32 = VALUE_UNDEFINED as u32;
 
-/// Persistent machine-stack reservation held by [`emit_prologue`].
-pub(super) const NATIVE_FRAME_BYTES: u32 = 48;
 
 /// Bytes of code between two veneer islands. A conditional branch or
 /// `cbz`/`cbnz` reaches ±1 MiB; every exit label a segment names is defined
@@ -246,8 +245,24 @@ fn compile_with_reach(
         })
         .collect::<BTreeSet<_>>();
 
+    let shape = activation::EntryShape::of(
+        view,
+        code_object_id,
+        abi::NativeFrameKind::Baseline,
+        !plan.safepoint_records.is_empty(),
+    )?;
+    let activation_exits = activation::ActivationExits {
+        construct: ops.new_dynamic_label(),
+        side_exit: ops.new_dynamic_label(),
+    };
+    // The tier entry continues a published interpreter frame; the call entry
+    // builds this function's record and window and falls through.
     let entry = ops.offset();
-    emit_prologue(&mut ops);
+    let body = ops.new_dynamic_label();
+    activation::emit_tier_prologue(&mut ops);
+    dynasm!(ops ; .arch aarch64 ; b =>body);
+    let call_entry = (!plan.osr_only).then(|| activation::emit_call_entry(&mut ops, view, shape));
+    dynasm!(ops ; .arch aarch64 ; =>body);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "entryPrologue",
@@ -796,11 +811,9 @@ fn compile_with_reach(
                     &mut relocations,
                     transitions,
                     view,
-                    direct_call_events.as_mut(),
                     code_map.as_mut(),
                     instr.pc,
                     [dst, method, receiver, this_value],
-                    identity_guard_exit,
                     threw,
                     committed_throw,
                     fatal,
@@ -977,10 +990,8 @@ fn compile_with_reach(
                     instr.pc,
                     byte_pc,
                     identity_guard_exit,
-                    runtime_transition_exit,
                     threw,
                     committed_throw,
-                    fatal,
                 )?;
             }
             TemplateOp::CallWithThis {
@@ -992,50 +1003,24 @@ fn compile_with_reach(
                 byte_pc,
             } => {
                 let argument_registers = plan.call_argument_registers(argc, packed_args);
-                // A monomorphic site takes the generated direct-call edge and a
-                // declared static native its leaf; everything else completes
-                // through the callee-carrying value transition, which never
-                // side-exits.
-                if view.static_native_calls.contains_key(&byte_pc)
-                    || view
-                        .direct_callees
-                        .get(&byte_pc)
-                        .and_then(|targets| targets.first())
-                        .is_some_and(crate::arm64::direct_call_target_is_supported)
-                {
-                    calls::emit_call_with_receiver(
-                        &mut ops,
-                        &mut relocations,
-                        transitions,
-                        view,
-                        direct_call_events.as_mut(),
-                        code_map.as_mut(),
-                        dst,
-                        callee,
-                        Some(this_value),
-                        argc,
-                        &argument_registers,
-                        instr.pc,
-                        byte_pc,
-                        identity_guard_exit,
-                        runtime_transition_exit,
-                        threw,
-                        committed_throw,
-                        fatal,
-                    )?;
-                } else {
-                    calls::emit_generic_call_transition(
-                        &mut ops,
-                        &mut relocations,
-                        transitions,
-                        dst,
-                        callee,
-                        Some(this_value),
-                        &argument_registers,
-                        committed_throw,
-                        fatal,
-                    )?;
-                }
+                calls::emit_call_with_receiver(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    view,
+                    direct_call_events.as_mut(),
+                    code_map.as_mut(),
+                    dst,
+                    callee,
+                    Some(this_value),
+                    argc,
+                    &argument_registers,
+                    instr.pc,
+                    byte_pc,
+                    identity_guard_exit,
+                    threw,
+                    committed_throw,
+                )?;
             }
             TemplateOp::Construct {
                 dst,
@@ -1046,28 +1031,20 @@ fn compile_with_reach(
                 byte_pc,
             } => {
                 let argument_registers = plan.call_argument_registers(argc, packed_args);
-                let (packed_args, packed_args_tail) = plan.resolve_packed_args(argc, packed_args);
                 calls::emit_construct(
                     &mut ops,
                     &mut relocations,
                     transitions,
                     view,
-                    direct_call_events.as_mut(),
                     code_map.as_mut(),
                     dst,
                     callee,
-                    argc,
-                    packed_args,
-                    packed_args_tail,
                     &argument_registers,
                     super_construct,
                     instr.pc,
                     byte_pc,
-                    identity_guard_exit,
-                    runtime_transition_exit,
                     threw,
                     committed_throw,
-                    fatal,
                 )?;
             }
             TemplateOp::MethodCall {
@@ -1094,7 +1071,6 @@ fn compile_with_reach(
                     arg0,
                     arg1,
                     identity_guard_exit,
-                    runtime_transition_exit,
                     threw,
                     committed_throw,
                     fatal,
@@ -1528,7 +1504,6 @@ fn compile_with_reach(
                     &mut relocations,
                     transitions,
                     view,
-                    direct_call_events.as_mut(),
                     code_map.as_mut(),
                     opcode,
                     arg0,
@@ -1536,11 +1511,8 @@ fn compile_with_reach(
                     arg2,
                     instr.pc,
                     instr.byte_pc,
-                    bail,
-                    bail,
                     threw,
                     committed_throw,
-                    fatal,
                 )?;
             }
             TemplateOp::ClassValueOp {
@@ -1740,7 +1712,7 @@ fn compile_with_reach(
         ; =>returned
         ; movz x1, abi::NativeResultStatus::Success as u32
     );
-    emit_epilogue(&mut ops);
+    activation::emit_epilogue(&mut ops, activation_exits);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "returnEpilogue",
@@ -1754,36 +1726,42 @@ fn compile_with_reach(
     let bail_start = ops.offset().0;
     emit_side_exit_epilogue(
         &mut ops,
+        activation_exits.side_exit,
         type_mismatch_exit,
         abi::ExitReason::TypeMismatch,
         abi::ExitAction::Recompile,
     );
     emit_side_exit_epilogue(
         &mut ops,
+        activation_exits.side_exit,
         identity_guard_exit,
         abi::ExitReason::IdentityGuard,
         abi::ExitAction::Recompile,
     );
     emit_side_exit_epilogue(
         &mut ops,
+        activation_exits.side_exit,
         allocation_miss_exit,
         abi::ExitReason::AllocationMiss,
         abi::ExitAction::Resume,
     );
     emit_side_exit_epilogue(
         &mut ops,
+        activation_exits.side_exit,
         unsupported_exit,
         abi::ExitReason::UnsupportedOperation,
         abi::ExitAction::Recompile,
     );
     emit_side_exit_epilogue(
         &mut ops,
+        activation_exits.side_exit,
         runtime_transition_exit,
         abi::ExitReason::RuntimeTransition,
         abi::ExitAction::Resume,
     );
     emit_side_exit_epilogue(
         &mut ops,
+        activation_exits.side_exit,
         backedge_relink_exit,
         abi::ExitReason::Interrupt,
         abi::ExitAction::Resume,
@@ -1855,14 +1833,31 @@ fn compile_with_reach(
         ; =>propagate_throw
         ; movz x1, abi::NativeResultStatus::Throw as u32
     );
-    emit_epilogue(&mut ops);
+    activation::emit_epilogue(&mut ops, activation_exits);
     dynasm!(ops
         ; .arch aarch64
         ; =>fatal
     );
     emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; movz x1, abi::NativeResultStatus::Fatal as u32);
-    emit_epilogue(&mut ops);
+    activation::emit_epilogue(&mut ops, activation_exits);
+    activation::emit_exits(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        view,
+        shape.derived,
+        activation_exits,
+    );
+    if let Some((_, cold)) = call_entry {
+        activation::emit_call_entry_cold(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            activation_exits,
+            cold,
+        );
+    }
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "throwEpilogue",
@@ -1888,7 +1883,7 @@ fn compile_with_reach(
             continue;
         };
         let offset = ops.offset().0;
-        emit_prologue(&mut ops);
+        activation::emit_tier_prologue(&mut ops);
         dynasm!(ops ; .arch aarch64 ; b =>target);
         if let Some(code_map) = code_map.as_mut() {
             code_map.record_osr(header_pc, offset, ops.offset().0);
@@ -1899,7 +1894,6 @@ fn compile_with_reach(
     let buf = crate::entry::finalize_assembler(ops)?;
     let tier_input = artifact_request.as_ref().map(|_| plan.render_artifact());
     let TemplatePlan {
-        register_count,
         register_operands,
         mut safepoint_records,
         osr_only,
@@ -1925,13 +1919,13 @@ fn compile_with_reach(
         compiled_code,
         code_object_id,
         view.code_block.id,
-        register_count,
         Box::new([]),
         register_operands,
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
         osr_entries,
+        call_entry.map(|(offset, _)| offset.0),
         osr_only,
     );
     Ok(NativeCompileOutput {
@@ -2024,35 +2018,9 @@ fn branch_condition_is_canonical_boolean(
     false
 }
 
-/// Emit the function prologue: save fp/lr + callee-saved bases, then retain
-/// `JitCtx`, its current `NativeFrame`, and that frame's register window.
-fn emit_prologue(ops: &mut Assembler) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; stp x29, x30, [sp, #-48]!
-        ; stp x19, x20, [sp, #16]
-        ; str x21, [sp, #32]
-        ; mov x29, sp
-        ; mov x20, x0
-        ; ldr x21, [x20, NATIVE_FRAME_OFFSET]
-        ; ldr x19, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET]
-    );
-}
-
-/// Emit the function epilogue (restore callee-saved + frame, return). `x0`
-/// (value) and `x1` (status) must already be set.
-fn emit_epilogue(ops: &mut Assembler) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x21, [sp, #32]
-        ; ldp x19, x20, [sp, #16]
-        ; ldp x29, x30, [sp], #48
-        ; ret
-    );
-}
-
 fn emit_side_exit_epilogue(
     ops: &mut Assembler,
+    side_exit: DynamicLabel,
     label: DynamicLabel,
     reason: abi::ExitReason,
     action: abi::ExitAction,
@@ -2067,9 +2035,8 @@ fn emit_side_exit_epilogue(
     dynasm!(ops
         ; .arch aarch64
         ; orr x0, x0, x16
-        ; movz x1, abi::NativeResultStatus::SideExit as u32
+        ; b =>side_exit
     );
-    emit_epilogue(ops);
 }
 
 /// Publish the canonical instruction-index PC into the active native frame.

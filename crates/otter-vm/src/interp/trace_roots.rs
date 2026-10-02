@@ -26,9 +26,6 @@ impl Interpreter {
         for value in self.bigint_constant_cache.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
-        for root in &self.lean_callback_roots {
-            root.visit_function_ids(visitor);
-        }
         self.handle_arena.visit_function_ids(visitor);
         self.microtasks.visit_function_ids(visitor);
         for value in self
@@ -37,8 +34,8 @@ impl Interpreter {
             .filter_map(|record| record.evaluation_error.as_ref())
             .chain(self.function_prototype_overrides.values())
             .chain(self.function_prototype_slots_for_trace())
-            .chain(self.pending_generator_throw.iter())
             .chain(self.pending_uncaught_throw.iter())
+            .chain(self.completed_activation_result.iter())
             .chain(std::iter::once(&self.async_context))
             .chain(self.iteration_anchors.iter())
         {
@@ -318,13 +315,6 @@ impl Interpreter {
 }
 
 impl Interpreter {
-    /// Borrow the pending-generator-throw side-channel slot.
-    /// The GC root walker traces and rewrites the contained value.
-    #[must_use]
-    pub fn pending_generator_throw_for_trace(&self) -> Option<&Value> {
-        self.pending_generator_throw.as_ref()
-    }
-
     /// The live async context, for the root walk.
     #[must_use]
     pub fn async_context_for_trace(&self) -> &Value {
@@ -356,6 +346,11 @@ impl Interpreter {
     #[must_use]
     pub fn pending_uncaught_throw_for_trace(&self) -> Option<&Value> {
         self.pending_uncaught_throw.as_ref()
+    }
+
+    /// Absorbed async completion awaiting its activation's exit.
+    pub(crate) fn completed_activation_result_for_trace(&self) -> Option<&Value> {
+        self.completed_activation_result.as_ref()
     }
 
     /// Borrow the iteration-anchor stack for GC root tracing.

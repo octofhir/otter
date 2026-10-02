@@ -1,23 +1,19 @@
 //! Shared System V x86-64 emission primitives used by every native JIT tier.
 //!
 //! # Contents
-//! - [`emit_runtime_forward`] — runtime-selected generated argument forwarding.
+//! - [`js_call`] — generated JavaScript calls.
+//! - [`activation`] — call-entry pieces shared by both tiers.
 //! - [`allocation`] — nursery carves shared by both tiers.
 //!
 //! # Invariants
 //! - Shared emitters consume the target-neutral VM descriptors and native-frame
 //!   contract; Template and Machine provide only their value-home accessors.
-//! - A forwarding miss occurs before call effects. Once a callee frame is
-//!   published, completion restores the caller and never replays the call.
-//! - Dynamic frames initialize every traced word before allocation or publication.
 //!
 //! # See also
-//! - `crate::arm64::direct_call::runtime_forward` — peer target implementation.
-//! - `otter_vm::runtime_activation::forward_arguments` — admission and copy rules.
+//! - `crate::arm64` — peer target implementation.
 
+pub(crate) mod activation;
 pub(crate) mod allocation;
-mod runtime_forward;
-
-pub(crate) use runtime_forward::emit_runtime_forward;
+pub(crate) mod js_call;
 
 pub(crate) mod arguments;

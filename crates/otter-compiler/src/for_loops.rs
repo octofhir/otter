@@ -19,26 +19,24 @@
 
 use crate::*;
 
-/// Lower `for (let x of expr) { body }` to the foundation
-/// iterator-protocol shape:
+/// Lower `for (x of expr) body` (§14.7.5.6 ForIn/OfBodyEvaluation):
 ///
 /// ```text
-///   tmp_iter = GetIterator(expr)
-///   loop_top:
-///   IteratorNext value, done, tmp_iter
-///   JumpIfTrue done -> loop_exit
-///   <bind value into the loop variable>
-///   <body>
-///   Jump -> loop_top
-///   loop_exit:
+///   iter = GetIterator(expr)            ; GetAsyncIterator for `for await`
+///   top:
+///   IteratorNext value, done, iter      ; `next()` + Await for `for await`
+///   JumpIfTrue done -> exit
+///   <bind value> <body>                 ; protected: lands at `landing`
+///   Jump -> top
+///   landing: close iter for a throw, rethrow
+///   <one exit per break / continue / return leaving the body:
+///    close iter, continue the command outside the loop>
+///   exit:
 /// ```
 ///
-/// The loop variable lives in a fresh scope per iteration so a
-/// `let`-declared binding does not leak between iterations or to
-/// the outside. `break` lands at `loop_exit`; `continue` jumps to
-/// the top so a fresh value is fetched. Real iterator-close
-/// semantics (running an `[@@return]` hook on early termination)
-/// land alongside generators in a later slice.
+/// The head is outside the protected range: §7.4.8 leaves an iterator whose
+/// `next` or result getters threw alone. `continue` to this loop re-iterates
+/// without closing.
 pub(crate) fn compile_for_of_statement(
     cx: &mut Compiler,
     s: &oxc_ast::ast::ForOfStatement<'_>,
@@ -65,14 +63,8 @@ pub(crate) fn compile_for_of_statement(
             span,
         );
     }
-
-    // §7.4.11 AsyncIteratorClose — a throw out of the loop body closes the
-    // async iterator, and closing it is an `await`, which the synchronous
-    // unwind close cannot perform. The body therefore runs inside a handler
-    // whose landing closes the iterator and re-throws what was in flight. The
-    // head is outside it: §7.4.8 leaves an iterator whose `next` threw alone.
-    let close_exc_reg = is_for_await.then(|| cx.alloc_scratch());
-
+    // The unwinder writes a throw out of the body here.
+    let exc_reg = cx.alloc_scratch();
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
 
@@ -83,23 +75,10 @@ pub(crate) fn compile_for_of_statement(
     let completion_reg = cx.alloc_completion_reg(span);
 
     cx.push_loop_frame(LoopFrame::iteration());
-    // §7.4.9 — register this iterator so abrupt completions (`break`,
-    // labelled `continue`, `return`) that exit the loop emit
-    // IteratorClose at the jump site. Async iterators need
-    // AsyncIteratorClose (await on the result) which the synchronous
-    // close path cannot perform, so leave `for await` to the existing
-    // break-only handling below.
-    if !is_for_await && let Some(frame) = cx.loops.last_mut() {
-        frame.iterator_close_reg = Some(iter_reg);
-    }
-    // §7.4.9 — open the iterator's close region so a throw inside the
-    // body runs its `[[return]]` during unwind (`IteratorCloseEnd` at
-    // the loop exit closes the region on normal / `break` completion;
-    // an exhausted iterator is already done and must not be re-closed).
-    // `break` / `continue` / `return` close inline at the jump site, so
-    // this region only covers the dynamic throw-unwind path.
-    if !is_for_await {
-        cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
+    cx.enter_iterator_scope(iter_reg, is_for_await);
+    let depth = cx.control.len();
+    if let Some(frame) = cx.loops.last_mut() {
+        frame.continue_depth = depth;
     }
     let loop_top = cx.next_pc();
     if is_for_await {
@@ -139,24 +118,14 @@ pub(crate) fn compile_for_of_statement(
     }
     let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
 
-    // §14.7.5.6 step `for await … of` — async iterators already
-    // produced an awaited result record above; ordinary `for-of`
-    // uses the synchronous `IteratorNext` value directly.
-    // <https://tc39.es/ecma262/#sec-for-in-and-for-of-statements>
-    let bind_source = value_reg;
-
     // §14.7.5.6 ForIn/OfBodyEvaluation: `let`/`const` re-bind per
     // iteration in a fresh lexical scope; `var` writes back into
     // the function-scope binding pre-hoisted at function entry.
     // AssignmentTarget heads reassign without a fresh scope per
     // step (no per-iteration binding to materialize).
-    let close_handler = close_exc_reg.map(|exc_reg| {
-        let handler = cx.emit_enter_try(0, otter_bytecode::NO_HANDLER_OFFSET, exc_reg, span);
-        cx.active_handlers += 1;
-        handler
-    });
+    let body_start = cx.next_pc();
     enter_iteration_scope(cx, &head_names, span)?;
-    bind_for_in_of_head(cx, &s.left, bind_source, span)?;
+    bind_for_in_of_head(cx, &s.left, value_reg, span)?;
     if let Some(body_reg) = compile_statement(cx, &s.body)? {
         // Record this iteration's non-empty completion as `V`. A
         // `break` / `continue` jumps out of the body before reaching
@@ -164,32 +133,31 @@ pub(crate) fn compile_for_of_statement(
         cx.store_completion(completion_reg, body_reg, span);
     }
     cx.exit_scope();
-    if close_handler.is_some() {
-        cx.emit(Op::LeaveTry, vec![], span);
-        cx.active_handlers -= 1;
-    }
-
     let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
     cx.patch_branch(back_jmp, loop_top);
+    let landing = cx.protect(body_start, exc_reg);
 
-    // The landing, reached only by the unwinder — the jump above never falls
-    // into it. §7.4.11 step 6 answers with the original throw completion
-    // before anything the close itself produced is looked at, so a `return`
-    // that throws, or an awaited result that is not an Object, leaves the
-    // in-flight throw untouched.
-    if let (Some(handler), Some(exc_reg)) = (close_handler, close_exc_reg) {
-        cx.patch_enter_try_offset(handler, /* catch */ true);
-        let swallow_exc = cx.alloc_scratch();
-        let swallow = cx.emit_enter_try(0, otter_bytecode::NO_HANDLER_OFFSET, swallow_exc, span);
-        cx.active_handlers += 1;
-        emit_async_iterator_close(cx, iter_reg, false, span);
-        cx.emit(Op::LeaveTry, vec![], span);
-        cx.active_handlers -= 1;
-        let closed = cx.emit_branch_placeholder(Op::Jump, None, span);
-        cx.patch_enter_try_offset(swallow, /* catch */ true);
-        cx.patch_branch_to_here(closed);
+    // §7.4.11 step 6 — a throw out of the body closes the iterator and
+    // answers with the original throw before anything the close produced
+    // is looked at.
+    if let Some(landing) = landing {
+        cx.patch_handler_to_here(landing);
+        if is_for_await {
+            // The close is an `await`, and whatever it raises is dropped.
+            let swallow_exc = cx.alloc_scratch();
+            let start = cx.next_pc();
+            emit_async_iterator_close(cx, iter_reg, false, span);
+            let closed = cx.emit_branch_placeholder(Op::Jump, None, span);
+            if let Some(swallow) = cx.protect(start, swallow_exc) {
+                cx.patch_handler_to_here(swallow);
+            }
+            cx.patch_branch_to_here(closed);
+        } else {
+            cx.emit(Op::IteratorCloseThrow, [Operand::Register(iter_reg)], span);
+        }
         cx.emit(Op::Throw, [Operand::Register(exc_reg)], span);
     }
+    cx.leave_iterator_scope(span);
 
     let frame = cx.loops.pop().expect("for-of loop frame");
     // `continue` re-iterates without closing the iterator (§14.7.5.6 —
@@ -197,39 +165,20 @@ pub(crate) fn compile_for_of_statement(
     for pc in frame.continue_patches {
         cx.patch_branch(pc, loop_top);
     }
-    // §14.7.5.6 ForIn/OfBodyEvaluation — a `break` is an abrupt
-    // completion that must run IteratorClose. For synchronous `for…of`
-    // the close is emitted at the `break` / labelled-`continue` /
-    // `return` site (see `compile_break_with_iterator_close` and
-    // friends), so the break target here just lands at the exit. The
-    // exhausted-iterator exit (`done` true) must NOT close. `for await`
-    // still closes at the target (its sites are not annotated, pending
-    // AsyncIteratorClose support).
-    let had_breaks = !frame.break_patches.is_empty();
+    // A break reaches here after its exit closed the iterator; the
+    // exhausted-iterator exit must not close it.
     for pc in frame.break_patches {
         cx.patch_branch_to_here(pc);
     }
-    if is_for_await && had_breaks {
-        // A break completion: the awaited result must be an Object
-        // (§7.4.11 step 8), because nothing else is in flight to keep.
-        emit_async_iterator_close(cx, iter_reg, true, span);
-    }
     cx.patch_branch_to_here(exit_jmp);
-    // Close the throw-unwind region: both the exhausted-iterator exit
-    // and a `break` reach here. Removing the registration prevents an
-    // already-finished (or inline-closed) iterator from being closed a
-    // second time by a later throw further up the same frame.
-    if !is_for_await {
-        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    }
     Ok(completion_reg)
 }
 
 /// §7.4.11 AsyncIteratorClose — call the iterator's `return` and await its
 /// result. `check_result` requires that result to be an Object, which the spec
 /// asks for only when there is no throw completion already in flight.
-fn emit_async_iterator_close(
-    cx: &mut Compiler,
+pub(crate) fn emit_async_iterator_close(
+    cx: &mut FunctionContext,
     iter_reg: u16,
     check_result: bool,
     span: (u32, u32),

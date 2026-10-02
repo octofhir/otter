@@ -259,7 +259,7 @@ pub(crate) fn compile_yield(
                 span,
             );
         }
-        cx.emit(Op::ReturnValue, [Operand::Register(recv_reg)], span);
+        cx.emit_abrupt(crate::control::Command::Return, Some(recv_reg), span);
 
         // Common: innerResult must be an Object.
         cx.patch_branch_to_here(next_to_check);
@@ -367,7 +367,7 @@ pub(crate) fn compile_yield(
             span,
         );
         let not_return = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(final_is_return), span);
-        cx.emit(Op::ReturnValue, [Operand::Register(dst)], span);
+        cx.emit_abrupt(crate::control::Command::Return, Some(dst), span);
         cx.patch_branch_to_here(not_return);
         return Ok(dst);
     }
@@ -379,12 +379,38 @@ pub(crate) fn compile_yield(
             r
         }
     };
+    // §27.5.3.7 GeneratorYield — the resume kind decides how the yield
+    // completes: `next` with the sent value, `throw` by throwing it, and
+    // `return` by returning it through every enclosing finally block and
+    // open iterator. An async generator's runtime awaits a returned value
+    // before it resumes the body (§27.6.3.5.1).
+    let kind = cx.alloc_scratch();
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::Yield,
-        [Operand::Register(dst), Operand::Register(src)],
+        [
+            Operand::Register(kind),
+            Operand::Register(dst),
+            Operand::Register(src),
+        ],
         span,
     );
+    let resumed = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(kind), span);
+    let is_throw = cx.alloc_scratch();
+    cx.emit(
+        Op::EqualImm,
+        [
+            Operand::Register(is_throw),
+            Operand::Register(kind),
+            Operand::Imm32(1),
+        ],
+        span,
+    );
+    let returned = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_throw), span);
+    cx.emit(Op::Throw, [Operand::Register(dst)], span);
+    cx.patch_branch_to_here(returned);
+    cx.emit_abrupt(crate::control::Command::Return, Some(dst), span);
+    cx.patch_branch_to_here(resumed);
     Ok(dst)
 }
 

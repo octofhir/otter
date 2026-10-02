@@ -72,14 +72,6 @@ pub use wordcode::{
 
 use serde::{Deserialize, Serialize};
 
-/// Sentinel offset value that means "this try block does not have
-/// a catch (or finally) clause". Picked as `i32::MIN` so any real
-/// PC delta the compiler emits stays clear of it. The dispatcher
-/// translates the sentinel to `Option::None` when reading
-/// [`Op::EnterTry`] operands; the compiler installs it for the
-/// absent clause when emitting the instruction.
-pub const NO_HANDLER_OFFSET: i32 = i32::MIN;
-
 /// The canonical engine opcode set.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -414,32 +406,12 @@ pub enum Op {
     /// `[[Construct]]`. Operand: `dst`.
     LoadNewTarget,
     /// Throw `r<src>` as an exception. Operand: `Register(src)`.
-    /// Walks the frame's handler stack; on miss, pops the frame and
-    /// continues the search in the caller. An exception that
-    /// reaches the bottom of the call stack surfaces through the
-    /// public API as `OtterError::Runtime` with `code = "UNCAUGHT"`.
+    /// The innermost entry of the function's handler table covering this
+    /// instruction receives the value; with none, the frame is popped and
+    /// the search continues in the caller. An exception that reaches the
+    /// bottom of the call stack surfaces through the public API as
+    /// `OtterError::Runtime` with `code = "UNCAUGHT"`.
     Throw,
-    /// Push a try-handler entry onto the current frame's handler
-    /// stack. Operands:
-    /// `Imm32(catch_offset), Imm32(finally_offset), Register(exc_dst)`.
-    /// Offsets are signed PC deltas relative to the **next**
-    /// instruction (matching `Op::Jump`'s convention). A negative
-    /// or sentinel `i32::MIN` offset means "no such handler"; the
-    /// dispatcher treats absent offsets accordingly. `exc_dst` is
-    /// the register the catch clause expects the thrown value in;
-    /// for try/finally without a catch, the compiler still picks a
-    /// scratch register but the dispatcher leaves it untouched on
-    /// the finally path.
-    EnterTry,
-    /// Pop the most recent try-handler entry pushed by
-    /// [`Op::EnterTry`] in the current frame. No operands.
-    LeaveTry,
-    /// Re-throw any in-flight exception that was parked on the
-    /// frame when a throw routed through a `finally` block. No
-    /// operands. When no throw is parked the dispatcher falls
-    /// through, so a `finally` running on the success path is a
-    /// silent no-op.
-    EndFinally,
     /// `r<dst> = new Error(r<msg>)`. Operands:
     /// `Register(dst), Register(msg)`. Materialises a foundation
     /// `Error` object with `name = "Error"` and `message = msg`,
@@ -469,14 +441,15 @@ pub enum Op {
     /// `done_dst`; once `done_dst` is `true` the value is
     /// `undefined` and further calls keep returning `done = true`.
     IteratorNext,
-    /// Close an iterator. Operands: `Register(iter)`.
+    /// §7.4.11 IteratorClose for a normal completion: a done iterator is
+    /// left alone; otherwise its `return` runs and must produce an Object.
+    /// Operands: `Register(iter)`.
     IteratorClose,
-    /// Register an iterator for abrupt close while the frame is parked.
-    /// Operands: `Register(iter)`.
-    IteratorCloseStart,
-    /// Remove a registered iterator after destructuring completes.
-    /// Operands: `Register(iter)`.
-    IteratorCloseEnd,
+    /// §7.4.11 IteratorClose for a throw completion: a done iterator is
+    /// left alone; otherwise its `return` runs and every error it raises
+    /// is discarded, so the caller rethrows the original value. Operands:
+    /// `Register(iter)`.
+    IteratorCloseThrow,
     /// §7.4.11 AsyncIteratorClose steps 3-5: read the iterator's
     /// `return`, and call it when it is neither `undefined` nor `null`.
     /// Operands: `Register(result_dst), Register(called_dst),
@@ -558,12 +531,6 @@ pub enum Op {
     /// [`Self::SetSuperProperty`]. Operands: `Register(home),
     /// Register(key), Register(value)`.
     SetSuperElement,
-    /// `break` / `continue` that crosses one or more `finally` blocks
-    /// (§14.15.3). Operands: `Imm32(offset), Imm32(floor)`. Runs the
-    /// crossed `finally` blocks (popping the frame's try-handlers down
-    /// to `floor`), then jumps to `pc + 1 + offset`. `offset` is
-    /// patched like an ordinary branch target.
-    JumpViaFinally,
     /// `r<dst> = bool` — whether the global environment currently has a
     /// binding named by the string constant (script lexicals or a
     /// global-object property, own or inherited). Snapshot taken when a
@@ -577,11 +544,6 @@ pub enum Op {
     /// ReferenceError even if the RHS created the property meanwhile.
     /// Operands: `Register(value), ConstIndex(name), Register(exists)`.
     StoreGlobalChecked,
-    /// Discard the innermost `count` completions parked by enclosing
-    /// `finally` blocks (§14.15.3 — a `break`/`continue` that exits a
-    /// finally body abandons the completion that finally had parked).
-    /// Operands: `Imm32(count)`.
-    PopParkedFinally,
     /// `r<dst> = ClassConstructor { ctor, prototype, statics }`.
     /// Operands: `Register(dst), Register(ctor), Register(prototype),
     /// Register(statics)`. Used by class lowering to package the
@@ -1181,14 +1143,14 @@ pub enum Op {
     DataViewCall,
     /// `yield r<src>` inside a generator body — pause the running
     /// frame and surface `r<src>` to the caller's `.next()` /
-    /// iteration step. Operands: `Register(dst), Register(src)`.
+    /// iteration step. Operands:
+    /// `Register(kind_dst), Register(value_dst), Register(src)`.
     ///
-    /// `dst` receives the value passed to the matching `.next(arg)`
-    /// (or `undefined` when the iterator was driven by a `for-of`
-    /// loop with no explicit argument). When the generator is
-    /// resumed via `.throw(err)`, the dispatcher routes `err`
-    /// through the surrounding handler stack rather than writing
-    /// it into `dst`.
+    /// On resume the runtime writes the resume kind into `kind_dst`
+    /// (0 = next, 1 = throw, 2 = return) and the resume argument into
+    /// `value_dst`, then continues at the next instruction. Abrupt
+    /// resumes do not unwind anything themselves: the compiled code
+    /// after the yield throws the value or performs the return.
     ///
     /// Only legal inside a function whose
     /// [`Function::is_generator`] flag is `true`; the compiler
@@ -1563,19 +1525,15 @@ impl Op {
             Op::LoadThis => "LOAD_THIS",
             Op::LoadNewTarget => "LOAD_NEW_TARGET",
             Op::Throw => "THROW",
-            Op::EnterTry => "ENTER_TRY",
-            Op::LeaveTry => "LEAVE_TRY",
-            Op::EndFinally => "END_FINALLY",
             Op::NewError => "NEW_ERROR",
             Op::GeneratorStart => "GENERATOR_START",
             Op::GetIterator => "GET_ITERATOR",
             Op::GetAsyncIterator => "GET_ASYNC_ITERATOR",
             Op::IteratorNext => "ITERATOR_NEXT",
             Op::IteratorClose => "ITERATOR_CLOSE",
+            Op::IteratorCloseThrow => "ITERATOR_CLOSE_THROW",
             Op::AsyncIteratorReturn => "ASYNC_ITERATOR_RETURN",
             Op::CheckIteratorResult => "CHECK_ITERATOR_RESULT",
-            Op::IteratorCloseStart => "ITERATOR_CLOSE_START",
-            Op::IteratorCloseEnd => "ITERATOR_CLOSE_END",
             Op::ArrayPush => "ARRAY_PUSH",
             Op::CallSpread => "CALL_SPREAD",
             Op::New => "NEW",
@@ -1587,8 +1545,6 @@ impl Op {
             Op::LoadSuperElement => "LOAD_SUPER_ELEMENT",
             Op::SetSuperProperty => "SET_SUPER_PROPERTY",
             Op::SetSuperElement => "SET_SUPER_ELEMENT",
-            Op::JumpViaFinally => "JUMP_VIA_FINALLY",
-            Op::PopParkedFinally => "POP_PARKED_FINALLY",
             Op::GlobalBindingExists => "GLOBAL_BINDING_EXISTS",
             Op::StoreGlobalChecked => "STORE_GLOBAL_CHECKED",
             Op::MakeClass => "MAKE_CLASS",
@@ -1875,7 +1831,6 @@ impl Op {
                 | Op::ReturnUndefined
                 | Op::ReturnDerived
                 | Op::Throw
-                | Op::EndFinally
                 | Op::Await
                 | Op::Yield
         )
@@ -2109,6 +2064,10 @@ pub struct Function {
     pub source_text_span: Option<(u32, u32)>,
     /// Authoritative execution wordcode.
     pub code: FunctionCode,
+    /// Exception handlers, innermost first: a throw at instruction `pc`
+    /// lands in the first entry whose range covers `pc`.
+    #[serde(default)]
+    pub handlers: Vec<ExceptionHandler>,
     /// `pc -> source span` table.
     pub spans: Vec<SpanEntry>,
     /// Instruction PCs of arithmetic / comparison sites whose operands are
@@ -2131,6 +2090,32 @@ pub struct Function {
     /// that guard once and the recorded shape supersedes the seed.
     #[serde(default)]
     pub class_hint_sites: Vec<ClassHintSite>,
+}
+
+/// One entry of a function's exception handler table.
+///
+/// A throw raised by an instruction in `start..end` writes the thrown value
+/// into register `exception` and continues at `target`. Ranges of one table
+/// nest or are disjoint, and an inner range precedes every range enclosing
+/// it, so the first covering entry is the innermost handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExceptionHandler {
+    /// First covered instruction PC.
+    pub start: u32,
+    /// One past the last covered instruction PC.
+    pub end: u32,
+    /// Instruction PC the handler starts at.
+    pub target: u32,
+    /// Register receiving the thrown value.
+    pub exception: u16,
+}
+
+impl ExceptionHandler {
+    /// Whether a throw by the instruction at `pc` lands here.
+    #[must_use]
+    pub const fn covers(&self, pc: u32) -> bool {
+        self.start <= pc && pc < self.end
+    }
 }
 
 /// One property site whose receiver carries a class-typed annotation.

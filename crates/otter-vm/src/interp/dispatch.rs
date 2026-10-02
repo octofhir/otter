@@ -47,11 +47,45 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Run the activation above `floor` until it returns, stages a call, or
+    /// fails.
+    ///
+    /// On a failure the activation's PC is the failing instruction, and
+    /// while a staged call runs it is the staging instruction, whatever the
+    /// instruction had already done to the PC: the handler table is keyed by
+    /// those instructions.
     pub(crate) fn dispatch_loop_inner(
         &mut self,
         entry_context: &ExecutionContext,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
+    ) -> Result<DispatchOutcome, VmError> {
+        let mut tick_pc = u32::MAX;
+        let outcome = self.dispatch_ticks(entry_context, stack, floor, &mut tick_pc);
+        let staged = matches!(outcome, Ok(DispatchOutcome::Call));
+        if (staged || outcome.is_err())
+            && tick_pc != u32::MAX
+            && !stack.is_at_floor(floor)
+            && let Some(frame) = stack.last_mut()
+            && frame.pc != tick_pc
+        {
+            if staged {
+                frame.header.flags = frame
+                    .header
+                    .flags
+                    .with(crate::native_abi::NativeFrameFlags::ADVANCE_ON_RESUME);
+            }
+            frame.pc = tick_pc;
+        }
+        outcome
+    }
+
+    fn dispatch_ticks(
+        &mut self,
+        entry_context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+        tick_pc: &mut u32,
     ) -> Result<DispatchOutcome, VmError> {
         // One stack can interleave frames from several code chunks
         // (closures escaped from `eval` / `new Function` / sibling
@@ -141,6 +175,7 @@ impl Interpreter {
                 let top = unsafe { stack.top_unchecked() };
                 (top.function_id, top.pc)
             };
+            *tick_pc = pc;
             // Reuse the cached frame state when the top frame is the same one as
             // the previous tick (same id *and* depth pin the exact live frame —
             // tail-call keeps the depth but swaps the id, recursion keeps the id
@@ -260,32 +295,32 @@ impl Interpreter {
                         .get(src as usize)
                         .cloned()
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    if let Some(popped) = self.return_running_finally_above(stack, floor, value)? {
+                    if let Some(popped) = self.pop_frame_above(stack, floor, value, None)? {
                         return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
                 }
                 Op::ReturnUndefined => {
                     if let Some(popped) =
-                        self.return_running_finally_above(stack, floor, Value::undefined())?
+                        self.pop_frame_above(stack, floor, Value::undefined(), None)?
                     {
                         return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
                 }
                 // §10.2.2 [[Construct]] steps 10–12 for a derived constructor:
-                // both registers are read now, but the `DerivedThis` slot is
-                // read when the frame pops, after any crossed `finally`
-                // (which may still call `super()`).
+                // the completion reads `this` from the `DerivedThis` slot.
                 Op::ReturnDerived => {
                     let (value_reg, ctx_reg) = (instr.reg(0), instr.reg(1));
                     let coord = otter_bytecode::ContextCoord::from_imm32(instr.imm(2))
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
+                    let frame = &stack[top_idx];
                     let value = *read_register(frame, value_reg)?;
                     let ctx = *read_register(frame, ctx_reg)?;
-                    self.frame_ensure_cold(frame).derived_this_slot = Some((ctx, coord));
-                    if let Some(popped) = self.return_running_finally_above(stack, floor, value)? {
+                    let derived_this = self.derived_this_slot_value(ctx, coord)?;
+                    if let Some(popped) =
+                        self.pop_frame_above(stack, floor, value, Some(derived_this))?
+                    {
                         return Ok(DispatchOutcome::Returned(popped));
                     }
                     continue;
@@ -731,7 +766,14 @@ impl Interpreter {
                         self.pending_uncaught_frames =
                             Some(self.snapshot_active_frames(context, usize::MAX));
                     }
-                    let unwind = self.unwind_throw_above(context, stack, floor, value);
+                    let unwind =
+                        self.unwind_throw_above(
+                            context,
+                            stack,
+                            floor,
+                            value,
+                            crate::activation_stack::ThrowSite::Instruction,
+                        );
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
                     } else {
@@ -742,43 +784,6 @@ impl Interpreter {
                         self.pending_uncaught_throw = Some(value);
                     }
                     unwind?;
-                    continue;
-                }
-                Op::EndFinally => {
-                    let parked = self
-                        .frame_cold_mut(&mut stack[top_idx])
-                        .and_then(|c| c.parked_finally.pop());
-                    match parked {
-                        Some((crate::cold_frame::ParkedFinally::Throw(value), _)) => {
-                            if self.pending_uncaught_frames.is_none() {
-                                self.pending_uncaught_frames =
-                                    Some(self.snapshot_active_frames(context, usize::MAX));
-                            }
-                            let unwind = self.unwind_throw_above(context, stack, floor, value);
-                            if unwind.is_ok() {
-                                self.pending_uncaught_frames = None;
-                            } else {
-                                self.pending_uncaught_throw = Some(value);
-                            }
-                            unwind?;
-                        }
-                        Some((
-                            crate::cold_frame::ParkedFinally::Abrupt(completion, handler_floor),
-                            _,
-                        )) => {
-                            // Resume the parked `return`/`break`/`continue`:
-                            // run the next enclosing `finally`, or perform
-                            // the completion when none remain.
-                            if let Some(popped) =
-                                self.unwind_abrupt_above(stack, floor, completion, handler_floor)?
-                            {
-                                return Ok(DispatchOutcome::Returned(popped));
-                            }
-                        }
-                        Some((crate::cold_frame::ParkedFinally::Normal, _)) | None => {
-                            stack[top_idx].advance_pc()?;
-                        }
-                    }
                     continue;
                 }
                 Op::Await => {
@@ -853,8 +858,7 @@ impl Interpreter {
                     return Ok(DispatchOutcome::Returned(Value::undefined()));
                 }
                 Op::Yield => {
-                    let dst = instr.reg(0);
-                    let src = instr.reg(1);
+                    let (kind_dst, value_dst, src) = instr.reg3();
                     let yielded = *read_register(&stack[top_idx], src)?;
                     let owner = self
                         .frame_generator_owner(&stack[top_idx])
@@ -864,7 +868,14 @@ impl Interpreter {
                     let popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(popped);
                     let popped = self.park_active_frame(popped);
-                    owner.park_after_yield(&mut self.gc_heap, popped, detached_cold, dst, yielded);
+                    owner.park_after_yield(
+                        &mut self.gc_heap,
+                        popped,
+                        detached_cold,
+                        kind_dst,
+                        value_dst,
+                        yielded,
+                    );
                     // §27.6 — async-generator yield settles the
                     // outer `.next()` promise immediately with
                     // `{value, done: false}`. Sync generators bubble
@@ -958,11 +969,9 @@ impl Interpreter {
                 // `done`.
                 // <https://tc39.es/ecma262/#sec-iteratornext>
                 Op::IteratorNext => {
-                    // §7.4.8 IteratorStep — if `next` throws, the
-                    // iterator record is set `[[done]]` and IteratorClose
-                    // is *not* run for it. Deregister the iterator from
-                    // the §7.4.9 closer set before propagating so the
-                    // throw-unwind does not invoke `[[return]]`.
+                    // §7.4.8 IteratorStepValue — a throw out of `next` or out
+                    // of the result's getters sets the record's [[Done]], so
+                    // a handler's IteratorClose leaves it alone.
                     let iter_reg = instr.reg(2);
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     let operands = function.operand_view(instr);
@@ -970,7 +979,7 @@ impl Interpreter {
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(e) => {
-                            self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
+                            self.iterator_mark_done(iterator);
                             return Err(e);
                         }
                     }
@@ -980,52 +989,23 @@ impl Interpreter {
                     if let Err(e) =
                         self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)
                     {
-                        self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
+                        self.iterator_mark_done(iterator);
                         return Err(e);
                     }
                     continue;
                 }
+                // §7.4.11 IteratorClose for a normal completion.
                 Op::IteratorClose => {
-                    let iter_reg = instr.reg(0);
-                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
-                    // §7.4.9 — the handler depth this iterator's region opened
-                    // at, recorded by `Op::IteratorCloseStart`.
-                    let region_depth = self.frame_cold(&stack[top_idx]).and_then(|cold| {
-                        cold.active_iterator_closers
-                            .iter()
-                            .rfind(|(value, _)| *value == iterator)
-                            .map(|(_, depth)| *depth as usize)
-                    });
-                    // §7.4.9 — mark the iterator done *before* running its
-                    // `[[return]]`: if `return` throws, the unwind must
-                    // not close it again (it is already closing).
-                    self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
-                    match self.iterator_close_value_sync(stack, context, iterator) {
-                        Ok(()) => {}
-                        Err(err) => {
-                            // The abrupt `break` / `continue` / `return` that
-                            // reached this close has already left every `try`
-                            // scope inside the loop body, so `[[return]]` throws
-                            // from outside them: a `catch` in the body cannot see
-                            // it. Their `finally` blocks still run — leaving the
-                            // try is what triggers them — so disarm the catch
-                            // arms rather than dropping the handlers.
-                            if let Some(depth) = region_depth
-                                && let Some(cold) = self.frame_cold_mut(&mut stack[top_idx])
-                            {
-                                let mut index = cold.handlers.len();
-                                while index > depth {
-                                    index -= 1;
-                                    if cold.handlers[index].finally_pc.is_some() {
-                                        cold.handlers[index].catch_pc = None;
-                                    } else {
-                                        cold.handlers.remove(index);
-                                    }
-                                }
-                            }
-                            return Err(err);
-                        }
-                    }
+                    let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
+                    self.iterator_close_value_sync(stack, context, iterator)?;
+                    stack[top_idx].advance_pc()?;
+                    continue;
+                }
+                // §7.4.11 IteratorClose for a throw completion: the handler
+                // rethrows its own value next.
+                Op::IteratorCloseThrow => {
+                    let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
+                    self.iterator_close_for_throw(stack, context, iterator)?;
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -1036,7 +1016,6 @@ impl Interpreter {
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     // §7.4.11 steps 3-5: an iterator without a `return`
                     // is already closed, and the caller skips the await.
-                    self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
                     let outcome = self.async_iterator_return_call(stack, context, iterator)?;
                     let frame = &mut stack[top_idx];
                     match outcome {
@@ -1061,35 +1040,6 @@ impl Interpreter {
                         return Err(self.err_type(
                             ("iterator `return` did not yield an object".to_string()).into(),
                         ));
-                    }
-                    stack[top_idx].advance_pc()?;
-                    continue;
-                }
-                Op::IteratorCloseStart => {
-                    let iter_reg = instr.reg(0);
-                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
-                    // §7.4.9 — record the handler depth so throw-unwind
-                    // can tell whether a catching handler sits inside or
-                    // outside this iterator's region.
-                    let handler_depth = self
-                        .frame_cold(&stack[top_idx])
-                        .map_or(0, |c| c.handlers.len() as u32);
-                    self.frame_ensure_cold(&mut stack[top_idx])
-                        .active_iterator_closers
-                        .push((iterator, handler_depth));
-                    stack[top_idx].advance_pc()?;
-                    continue;
-                }
-                Op::IteratorCloseEnd => {
-                    let iter_reg = instr.reg(0);
-                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
-                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx])
-                        && let Some(pos) = cold
-                            .active_iterator_closers
-                            .iter()
-                            .rposition(|(value, _)| *value == iterator)
-                    {
-                        cold.active_iterator_closers.remove(pos);
                     }
                     stack[top_idx].advance_pc()?;
                     continue;
@@ -2121,25 +2071,18 @@ impl Interpreter {
                     self.run_private_set_reg(context, stack, top_idx, obj_reg, key_reg, value_reg)?;
                     continue;
                 }
-                // §7.1.3 ToNumeric on an already-primitive operand:
-                // Number / BigInt pass through, Symbol throws, the
-                // rest convert via ToNumber. Emitted between the two
-                // ToPrimitive coercions of a numeric binary operator
-                // so ToNumeric(lhs) throws before rhs `valueOf` runs.
+                // §7.1.3 ToNumeric: Number / BigInt pass through, an
+                // object runs ToPrimitive(number) first, Symbol throws,
+                // the rest convert via ToNumber. A postfix update keeps
+                // this as its result value.
                 Op::ToNumeric => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let value = *read_register(&stack[top_idx], src)?;
-                    let result = if value.is_number() || value.is_big_int() {
+                    let result = if value.is_number() {
                         value
-                    } else if value.is_symbol() {
-                        return Err(self.err_type(
-                            ("Cannot convert a Symbol value to a number".to_string()).into(),
-                        ));
                     } else {
-                        Value::number(crate::number::NumberValue::from_f64(
-                            crate::number::parse::to_number_value(&value, &self.gc_heap),
-                        ))
+                        crate::coerce::to_numeric_or_throw(self, stack, context, &value)?
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
@@ -2330,21 +2273,6 @@ impl Interpreter {
                     self.run_temporal_load_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
-                Op::EnterTry => {
-                    let region = function
-                        .exception_region(instr.instruction_pc)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.frame_enter_try_region(frame, region)?;
-                    frame.advance_pc()?;
-                    continue;
-                }
-                Op::LeaveTry => {
-                    let frame = &mut stack[top_idx];
-                    self.frame_leave_try(frame)?;
-                    frame.advance_pc()?;
-                    continue;
-                }
                 Op::GlobalBindingExists => {
                     let dst = instr.reg(0);
                     let name_idx = const_operand(function.operand(instr, 1))?;
@@ -2358,34 +2286,6 @@ impl Interpreter {
                     self.run_store_global_checked_reg(
                         context, stack, top_idx, value_reg, name_idx, exists_reg,
                     )?;
-                    continue;
-                }
-                Op::PopParkedFinally => {
-                    // §14.15.3 — a break/continue leaving `count`
-                    // finally bodies abandons the completions those
-                    // finallys parked (innermost on top).
-                    let count = instr.imm(0).max(0) as usize;
-                    self.frame_pop_parked_finally(&mut stack[top_idx], count)?;
-                    stack[top_idx].advance_pc()?;
-                    continue;
-                }
-                Op::JumpViaFinally => {
-                    // §14.15.3 — `break`/`continue` crossing `finally`
-                    // blocks: run them (down to `floor`), then jump.
-                    let offset = instr.imm(0);
-                    let handler_floor = instr.imm(1) as u32;
-                    let next_pc = (stack[top_idx].pc as i64 + 1).saturating_add(offset as i64);
-                    if !(0..=u32::MAX as i64).contains(&next_pc) {
-                        return Err(VmError::InvalidOperand);
-                    }
-                    if let Some(popped) = self.unwind_abrupt_above(
-                        stack,
-                        floor,
-                        crate::cold_frame::AbruptKind::Jump(next_pc as u32),
-                        handler_floor,
-                    )? {
-                        return Ok(DispatchOutcome::Returned(popped));
-                    }
                     continue;
                 }
                 Op::Jump => {
@@ -2687,17 +2587,13 @@ impl Interpreter {
                 Op::Neg => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    // SAFETY: live top frame (see the `is_at_floor` guard).
-                    let frame = unsafe { stack.top_unchecked_mut() };
-                    self.run_neg_regs(frame, dst, src, feedback)?;
+                    self.run_neg_regs(stack, context, top_idx, dst, src, feedback)?;
                     continue;
                 }
                 Op::BitwiseNot => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    // SAFETY: live top frame (see the `is_at_floor` guard).
-                    let frame = unsafe { stack.top_unchecked_mut() };
-                    self.run_bitwise_not_regs(frame, dst, src)?;
+                    self.run_bitwise_not_regs(stack, context, top_idx, dst, src)?;
                     continue;
                 }
                 Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual | Op::SameValue => {

@@ -55,6 +55,7 @@ mod chain;
 mod class;
 mod compiled_module;
 mod compiler;
+mod control;
 mod destructuring;
 mod entry;
 mod errors;
@@ -794,71 +795,51 @@ mod tests {
     }
 
     #[test]
-    fn try_catch_emits_enter_and_leave() {
+    fn try_catch_records_one_handler_over_the_try_block() {
         let module = compile_script_src("try { throw new Error(\"x\"); } catch (e) { e; }");
         let main = module.main();
-        assert!(main.code.iter().any(|i| i.op == Op::EnterTry));
-        assert!(main.code.iter().any(|i| i.op == Op::LeaveTry));
-        // No finally → no EndFinally.
-        assert!(!main.code.iter().any(|i| i.op == Op::EndFinally));
+        assert_eq!(main.handlers.len(), 1, "{:?}", main.handlers);
+        let handler = main.handlers[0];
+        assert!(main.code.iter().skip(handler.start as usize).take((handler.end - handler.start) as usize).any(|i| i.op == Op::Throw));
+        assert!(handler.target >= handler.end);
     }
 
     #[test]
-    fn try_finally_emits_end_finally() {
+    fn try_finally_enters_the_block_with_a_token() {
         let module = compile_script_src("try { 1; } finally { 2; }");
         let main = module.main();
-        assert!(main.code.iter().any(|i| i.op == Op::EnterTry));
-        assert!(main.code.iter().any(|i| i.op == Op::EndFinally));
+        assert_eq!(main.handlers.len(), 1, "{:?}", main.handlers);
+        // The code after the block rethrows a throw it was entered with.
+        assert!(main.code.iter().any(|i| i.op == Op::Throw));
     }
 
     #[test]
-    fn try_catch_finally_emits_two_enter_try_blocks() {
+    fn try_catch_finally_nests_the_catch_inside_the_finally_range() {
         let module =
             compile_script_src("try { throw new Error(\"x\"); } catch (e) { e; } finally { 1; }");
         let main = module.main();
-        let enters = main.code.iter().filter(|i| i.op == Op::EnterTry).count();
-        assert_eq!(
-            enters, 2,
-            "try/catch/finally should emit two EnterTry blocks: {:?}",
-            main.code
-        );
-        assert!(main.code.iter().any(|i| i.op == Op::EndFinally));
+        assert_eq!(main.handlers.len(), 2, "{:?}", main.handlers);
+        let (catch, finally) = (main.handlers[0], main.handlers[1]);
+        assert!(finally.start <= catch.start && catch.end < finally.end);
     }
 
     #[test]
-    fn loop_exits_unwind_catch_only_handlers() {
+    fn loop_exits_and_iterator_closes_verify() {
         let sources = [
-            ("while (true) { try { break; } catch (e) {} }", true),
-            (
-                "let i = 0; while (i++ < 1) { try { continue; } catch (e) {} }",
-                true,
-            ),
-            ("for (const x of [1]) { try { break; } catch (e) {} }", true),
-            (
-                "for (const x of [1]) { try { continue; } catch (e) {} }",
-                true,
-            ),
-            (
-                "for (const x of [1]) { try { throw x; } catch (e) { break; } }",
-                false,
-            ),
+            "while (true) { try { break; } catch (e) {} }",
+            "let i = 0; while (i++ < 1) { try { continue; } catch (e) {} }",
+            "for (const x of [1]) { try { break; } catch (e) {} }",
+            "for (const x of [1]) { try { continue; } catch (e) {} }",
+            "for (const x of [1]) { try { throw x; } catch (e) { break; } }",
+            "outer: for (const x of [1]) { for (const y of [2]) { try { continue outer; } finally { x; } } }",
+            "function f() { for (const x of [1]) { try { return x; } finally { x; } } }",
+            "function* g() { try { yield 1; } finally { 2; } }",
+            "let [a, b] = [1, 2];",
         ];
-
-        for (source, requires_handler_unwind) in sources {
+        for source in sources {
             let module = compile_script_src(source);
-            let main = module.main();
-            if requires_handler_unwind {
-                assert!(
-                    main.code
-                        .iter()
-                        .any(|instruction| instruction.op == Op::JumpViaFinally),
-                    "loop exit crossing a catch-only handler must unwind it: {source}\n{:?}",
-                    main.code
-                );
-            }
-            otter_bytecode::encoding::verify_wordcode_function(&main.code).unwrap_or_else(
-                |error| panic!("compiler emitted invalid wordcode for {source}: {error}"),
-            );
+            otter_bytecode::verify_module(&module)
+                .unwrap_or_else(|error| panic!("compiler emitted invalid bytecode for {source}: {error}"));
         }
     }
 

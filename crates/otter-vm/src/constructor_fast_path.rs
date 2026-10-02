@@ -308,6 +308,7 @@ mod tests {
                 contains_direct_eval: false,
                 code: code.into(),
                 spans: Vec::new(),
+                handlers: Vec::new(),
                 number_hint_sites: Vec::new(),
                 class_hint_sites: Vec::new(),
             }],

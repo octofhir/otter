@@ -694,6 +694,7 @@ mod tests {
                     pc: 0,
                     span: (0, 0),
                 }],
+                handlers: Vec::new(),
                 number_hint_sites: Vec::new(),
                 class_hint_sites: Vec::new(),
             }],

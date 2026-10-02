@@ -2,7 +2,14 @@
 //!
 //! # Contents
 //! - [`compile_unary`] — lowers unary expressions.
-//! - [`compile_update`] — lowers prefix and postfix update expressions.
+//! - [`compile_update`] — lowers prefix and postfix update expressions;
+//!   [`UpdateUse`] says whether the value is read.
+//!
+//! # Invariants
+//! - The numeric operators run their own ToPrimitive / ToNumeric ladder, so
+//!   no separate coercion instruction precedes them.
+//! - An update emits `ToNumeric` only when it is postfix and its value is
+//!   read; a mutable own register binding is rewritten in place.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -250,22 +257,11 @@ pub(crate) fn compile_unary(
             });
         }
     };
-    // §13.5.4–13.5.7 — unary `+`, `-`, `~` apply
-    // ToPrimitive(number) before ToNumeric so an object
-    // operand goes through `[Symbol.toPrimitive]` /
-    // `valueOf` / `toString`. LogicalNot and TypeOf do
-    // not coerce; they take their argument as-is.
+    // §13.5.4–13.5.7 — unary `+`, `-`, `~` run the full ToNumber /
+    // ToNumeric ladder (ToPrimitive(number) for an object) inside the
+    // operator; LogicalNot and TypeOf take their argument as-is.
     // <https://tc39.es/ecma262/#sec-unary-operators>
-    // A provably-primitive operand skips ToPrimitive (no observable
-    // valueOf / [Symbol.toPrimitive]); the op's own ToNumeric still runs.
-    let inner_in = match op {
-        Op::Neg | Op::ToNumber | Op::BitwiseNot
-            if !crate::expr::binary::expr_is_primitive(&u.argument) =>
-        {
-            emit_to_primitive(cx, inner, "number", span)
-        }
-        _ => inner,
-    };
+    let inner_in = inner;
     cx.reset_scratch(mark);
     let dst = cx.alloc_scratch();
     cx.emit(
@@ -369,13 +365,27 @@ fn emit_delete_super_reference_error(cx: &mut Compiler, span: (u32, u32)) -> u16
     result
 }
 
+/// Whether the value of an update expression is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateUse {
+    /// The expression's value flows on.
+    Value,
+    /// Only the store happens; nothing reads the result.
+    Discarded,
+}
+
 pub(crate) fn compile_update(
     cx: &mut Compiler,
     u: &UpdateExpression<'_>,
     span: (u32, u32),
+    use_: UpdateUse,
 ) -> Result<u16, CompileError> {
     let _ = span;
     let span = (u.span.start, u.span.end);
+    let delta = match u.operator {
+        UpdateOperator::Increment => 1,
+        UpdateOperator::Decrement => -1,
+    };
     // §13.4 UpdateExpression — applies to identifiers,
     // static / computed member access, and (private-field
     // access — deferred). Refactor: compute a load + store
@@ -439,6 +449,13 @@ pub(crate) fn compile_update(
                 return finish_immutable_update(cx, &name, old, u, span, throws);
             }
             let reference = cx.resolve_ref(&name);
+            if cx.active_with_envs.is_empty()
+                && let Some(reg) = cx.plain_register_binding(&reference)
+            {
+                return Ok(update_register_binding(
+                    cx, &name, reg, u.prefix, delta, use_, span,
+                ));
+            }
             let active_with_envs = cx.active_with_envs.clone();
             let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
             // §13.15.2 — the reference resolves before ToNumeric can run
@@ -583,28 +600,25 @@ pub(crate) fn compile_update(
         }
     };
 
-    // §13.4 step 3 — ToNumeric applies ToPrimitive(number) first,
-    // so an object operand fires `[Symbol.toPrimitive]` / `valueOf`
-    // / `toString` before the numeric coercion.
-    let old_prim = emit_to_primitive(cx, old, "number", span);
-    // §13.4.2 — ToNumeric preserves BigInt operands; the VM applies
-    // the ±1 in the operand's own numeric type.
-    let cur = cx.alloc_scratch();
-    cx.emit(
-        Op::ToNumeric,
-        [Operand::Register(cur), Operand::Register(old_prim)],
-        span,
-    );
-    let delta = match u.operator {
-        UpdateOperator::Increment => 1,
-        UpdateOperator::Decrement => -1,
-    };
+    // §13.4.2.1 / §13.4.3.1 — the new value is ToNumeric(old) ± 1 in the
+    // operand's own numeric type, and `Increment` runs that ToNumeric
+    // itself. Only a postfix update whose value is read keeps
+    // ToNumeric(old) as a value of its own.
+    let postfix_value = (!u.prefix && use_ == UpdateUse::Value).then(|| {
+        let cur = cx.alloc_scratch();
+        cx.emit(
+            Op::ToNumeric,
+            [Operand::Register(cur), Operand::Register(old)],
+            span,
+        );
+        cur
+    });
     let next = cx.alloc_scratch();
     cx.emit(
         Op::Increment,
         vec![
             Operand::Register(next),
-            Operand::Register(cur),
+            Operand::Register(postfix_value.unwrap_or(old)),
             Operand::Imm32(delta),
         ],
         span,
@@ -699,10 +713,63 @@ pub(crate) fn compile_update(
             );
         }
     }
-    // §13.4.2.1 / 13.4.3.1 — postfix returns the pre-
-    // update value (post-ToNumber); prefix returns the
-    // new value.
-    Ok(if u.prefix { next } else { cur })
+    // §13.4.2.1 / 13.4.3.1 — postfix returns the pre-update value
+    // (after ToNumeric); prefix returns the new value.
+    Ok(postfix_value.unwrap_or(next))
+}
+
+/// Update of a mutable own binding held in frame register `reg`, rewritten
+/// in place.
+///
+/// A read result is a fresh register: the caller may evaluate a sibling
+/// operand that reassigns the binding before it reads the value.
+fn update_register_binding(
+    cx: &mut Compiler,
+    name: &str,
+    reg: u16,
+    prefix: bool,
+    delta: i32,
+    use_: UpdateUse,
+    span: (u32, u32),
+) -> u16 {
+    let increment = |cx: &mut Compiler, src: u16| {
+        cx.emit(
+            Op::Increment,
+            vec![
+                Operand::Register(reg),
+                Operand::Register(src),
+                Operand::Imm32(delta),
+            ],
+            span,
+        );
+        cx.emit_module_export_mirror(name, reg, span);
+    };
+    match (use_, prefix) {
+        (UpdateUse::Discarded, _) => {
+            increment(cx, reg);
+            reg
+        }
+        (UpdateUse::Value, true) => {
+            increment(cx, reg);
+            let value = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadLocal,
+                [Operand::Register(value), Operand::Imm32(i32::from(reg))],
+                span,
+            );
+            value
+        }
+        (UpdateUse::Value, false) => {
+            let value = cx.alloc_scratch();
+            cx.emit(
+                Op::ToNumeric,
+                [Operand::Register(value), Operand::Register(reg)],
+                span,
+            );
+            increment(cx, value);
+            value
+        }
+    }
 }
 
 /// §13.4.2-5 — update on a `const` binding: the old value still loads
@@ -717,11 +784,10 @@ fn finish_immutable_update(
     throws: bool,
 ) -> Result<u16, CompileError> {
     let _ = u;
-    let old_prim = emit_to_primitive(cx, old, "number", span);
     let cur = cx.alloc_scratch();
     cx.emit(
         Op::ToNumeric,
-        [Operand::Register(cur), Operand::Register(old_prim)],
+        [Operand::Register(cur), Operand::Register(old)],
         span,
     );
     if throws {

@@ -185,13 +185,6 @@ impl Interpreter {
         Ok(parked.into_prepared())
     }
 
-    pub(crate) fn prepared_cold(
-        &self,
-        call: &crate::PreparedCall,
-    ) -> Option<&cold_frame::ColdFrame> {
-        call.cold.map(|index| self.cold_frames.get(index))
-    }
-
     pub(crate) fn prepared_set_async_state(
         &mut self,
         call: &mut crate::PreparedCall,
@@ -204,10 +197,10 @@ impl Interpreter {
     pub(crate) fn prepared_attach_cold(
         &mut self,
         call: &mut crate::PreparedCall,
-        cold: Box<cold_frame::ColdFrame>,
+        cold: cold_frame::ColdFrame,
     ) {
         assert!(call.cold.is_none());
-        call.cold = Some(self.cold_frames.attach(*cold));
+        call.cold = Some(self.cold_frames.attach(cold));
     }
 
     /// Innermost published native frame, or null when none is published.
@@ -509,38 +502,54 @@ impl Interpreter {
     /// terminal async completion therefore means "back at the region floor",
     /// not necessarily an empty stack.  A frame carrying a return register is
     /// malformed when its caller would sit below the floor.
+    ///
+    /// `derived_this` is the `DerivedThis` slot value a `ReturnDerived`
+    /// read; `None` uses the frame's own `this`. A failure after the frame
+    /// is gone reaches the caller as the call's throw completion.
     pub(crate) fn pop_frame_above(
         &mut self,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
         value: Value,
+        derived_this: Option<Value>,
     ) -> Result<Option<Value>, VmError> {
         if stack.is_at_floor(floor) {
             return Err(VmError::InvalidOperand);
         }
         let popped = stack.pop().ok_or_else(|| VmError::InvalidOperand)?;
+        match self.complete_popped_frame(popped, value, derived_this) {
+            Ok(PoppedCompletion::Value(value)) => Ok(Some(value)),
+            // An async activation's completion is its promise, which only a
+            // caller at the region floor still needs.
+            Ok(PoppedCompletion::Promise(promise)) => Ok(stack.is_at_floor(floor).then_some(promise)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The return-value semantics of a frame [`Self::pop_frame_above`] just
+    /// removed.
+    fn complete_popped_frame(
+        &mut self,
+        popped: &mut Frame,
+        value: Value,
+        derived_this: Option<Value>,
+    ) -> Result<PoppedCompletion, VmError> {
         // An ordinary synchronous frame owns no cold record, so the whole
         // construct/derived/async completion vocabulary resolves from one
         // pool probe rather than from a probe per question.
         let construct_target = popped.is_construct().then_some(popped.this_value);
         let is_derived_ctor = popped.is_derived_constructor();
-        let mut derived_this_slot = None;
         let mut async_state = None;
         if let Some(idx) = popped.cold.take() {
             let cold = self.cold_frames.get_mut(idx);
-            derived_this_slot = cold.derived_this_slot.take();
             async_state = cold.async_state.take();
             // Release the cold slot now so the pool can reuse it; every
             // remaining cold-record read already happened.
             self.cold_frames.release(idx);
         }
         // A derived constructor's `this`: the frame-held binding, or the
-        // `DerivedThis` context slot `ReturnDerived` named, read now that every
-        // crossed `finally` has run.
-        let derived_this = match derived_this_slot {
-            Some((ctx, coord)) => self.derived_this_slot_value(ctx, coord)?,
-            None => popped.this_value,
-        };
+        // `DerivedThis` context slot `ReturnDerived` read.
+        let derived_this = derived_this.unwrap_or(popped.this_value);
         // The frame is terminal — return its spilled register window to the
         // pool. Nothing below reads `popped.registers`.
         let resolved = if is_derived_ctor {
@@ -583,127 +592,18 @@ impl Interpreter {
             let promise = self.iteration_anchor(anchor);
             self.pop_iteration_anchors_to(anchor);
             settled?;
-            if stack.is_at_floor(floor) {
-                return Ok(Some(promise));
-            }
-            return Ok(None);
+            return Ok(PoppedCompletion::Promise(promise));
         }
-        Ok(Some(resolved))
+        Ok(PoppedCompletion::Value(resolved))
     }
+}
 
-    /// §14.15.3 — run the `finally` blocks between an abrupt `return` /
-    /// `break` / `continue` and its target, then perform the
-    /// completion. Pops handlers off the top frame until the handler
-    /// stack reaches `floor`; the first `finally` found parks the
-    /// completion (`pending_abrupt`) and jumps to the finally body —
-    /// `Op::EndFinally` resumes this walk. With no remaining `finally`,
-    /// a `Jump` sets the target pc and a `Return` pops the frame.
-    /// Advance an abrupt completion without crossing `activation_floor`.
-    pub(crate) fn unwind_abrupt_above(
-        &mut self,
-        stack: &mut ActivationStack,
-        activation_floor: ActivationFloor,
-        completion: crate::cold_frame::AbruptKind,
-        handler_floor: u32,
-    ) -> Result<Option<Value>, VmError> {
-        if stack.is_at_floor(activation_floor) {
-            return Err(VmError::InvalidOperand);
-        }
-        let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
-        match self.advance_abrupt_frame(&mut stack[top_idx], completion, handler_floor)? {
-            crate::cold_frame::AbruptFrameOutcome::Resume => Ok(None),
-            crate::cold_frame::AbruptFrameOutcome::Return(value) => {
-                self.pop_frame_above(stack, activation_floor, value)
-            }
-        }
-    }
-
-    /// Advance one abrupt completion inside a live frame without changing the
-    /// ActivationStack shape. Compiled code uses the same handler walk, then returns
-    /// a normal completion to the VM-owned frame-pop boundary when necessary.
-    pub(crate) fn advance_abrupt_frame(
-        &mut self,
-        frame: &mut Frame,
-        completion: crate::cold_frame::AbruptKind,
-        floor: u32,
-    ) -> Result<crate::cold_frame::AbruptFrameOutcome, VmError> {
-        use crate::cold_frame::{AbruptFrameOutcome, AbruptKind};
-        loop {
-            let handler_count = self
-                .frame_cold(frame)
-                .map(|c| c.handlers.len() as u32)
-                .unwrap_or(0);
-            if handler_count <= floor {
-                return match completion {
-                    AbruptKind::Jump(pc) => {
-                        frame.pc = pc;
-                        Ok(AbruptFrameOutcome::Resume)
-                    }
-                    AbruptKind::Return(v) => Ok(AbruptFrameOutcome::Return(v)),
-                };
-            }
-            let handler = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
-            // §14.15.3 — discard completions parked by `finally`
-            // blocks this completion abandons (depth above the
-            // remaining handler stack).
-            if let Some(cold) = self.frame_cold_mut(frame) {
-                let len = cold.handlers.len() as u32;
-                cold.parked_finally.retain(|(_, depth)| *depth <= len);
-            }
-            match handler {
-                Some(h) if h.finally_pc.is_some() => {
-                    let finally_pc = h.finally_pc.expect("finally_pc checked");
-                    let cold = self.frame_ensure_cold(frame);
-                    let depth = cold.handlers.len() as u32;
-                    cold.parked_finally.push((
-                        crate::cold_frame::ParkedFinally::Abrupt(completion, floor),
-                        depth,
-                    ));
-                    frame.pc = finally_pc;
-                    return Ok(AbruptFrameOutcome::Resume);
-                }
-                // Catch-only handler crossed by the abrupt completion:
-                // pop it (cleanup) and keep walking.
-                Some(_) => continue,
-                None => {
-                    return match completion {
-                        AbruptKind::Jump(pc) => {
-                            frame.pc = pc;
-                            Ok(AbruptFrameOutcome::Resume)
-                        }
-                        AbruptKind::Return(v) => Ok(AbruptFrameOutcome::Return(v)),
-                    };
-                }
-            }
-        }
-    }
-
-    /// Return `value` from the top frame above `floor`, first running any
-    /// enclosing `finally` blocks (§14.15.3).
-    pub(crate) fn return_running_finally_above(
-        &mut self,
-        stack: &mut ActivationStack,
-        floor: ActivationFloor,
-        value: Value,
-    ) -> Result<Option<Value>, VmError> {
-        if stack.is_at_floor(floor) {
-            return Err(VmError::InvalidOperand);
-        }
-        let top_idx = stack.len() - 1;
-        let has_finally = self
-            .frame_cold(&stack[top_idx])
-            .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
-        if has_finally {
-            self.unwind_abrupt_above(
-                stack,
-                floor,
-                crate::cold_frame::AbruptKind::Return(value),
-                0,
-            )
-        } else {
-            self.pop_frame_above(stack, floor, value)
-        }
-    }
+/// What completing a popped frame produced.
+enum PoppedCompletion {
+    /// The value its caller receives.
+    Value(Value),
+    /// The settled result promise of an async activation.
+    Promise(Value),
 }
 
 #[cfg(test)]
@@ -745,7 +645,7 @@ mod tests {
         let floor = stack.floor();
         stack.push(child);
         let result = interp
-            .pop_frame_above(&mut stack, floor, Value::number_i32(42))
+            .pop_frame_above(&mut stack, floor, Value::number_i32(42), None)
             .unwrap();
         assert_eq!(result, Some(Value::number_i32(42)));
         assert_eq!(stack.len(), floor.depth());

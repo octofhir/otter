@@ -84,7 +84,7 @@ pub struct GeneratorBody {
     /// Detached cold record for the suspended frame. Acquired by
     /// the interpreter at yield time via
     /// [`crate::Interpreter::frame_detach_cold`]; re-attached on
-    /// resume so try handlers, async parking, and other cold state
+    /// resume so async parking and other cold state
     /// survive the suspension.
     #[pelt(via = trace_generator_cold)]
     pub cold: Option<Box<crate::cold_frame::ColdFrame>>,
@@ -92,16 +92,14 @@ pub struct GeneratorBody {
     #[pelt(skip)]
     pub resume_dst: u16,
     /// Register receiving the resume KIND (0 = next, 1 = throw,
-    /// 2 = return) when the frame is parked on `Op::YieldDelegate`
-    /// (§27.5.3.7 `yield*` — abrupt resumes forward to the inner
-    /// iterator instead of unwinding the generator body).
+    /// 2 = return) when the frame is parked on `Op::Yield` or
+    /// `Op::YieldDelegate`: abrupt resumes are data the compiled code
+    /// after the suspension acts on.
     #[pelt(skip)]
     pub resume_kind_dst: u16,
     /// `true` while the frame is parked on `Op::YieldDelegate`: the
     /// yielded value is the inner iterator result and must surface
-    /// from `.next()` verbatim (no re-wrapping), and `.throw()` /
-    /// `.return()` resume the body with a kind code instead of
-    /// throwing / completing.
+    /// from `.next()` verbatim (no re-wrapping).
     #[pelt(skip)]
     pub delegating: bool,
     /// `true` once the body has returned, thrown, or had `.return()`
@@ -433,13 +431,16 @@ impl JsGenerator {
         })
     }
 
-    /// Store a saved frame, its detached cold record, and resume metadata.
+    /// Park the frame on an `Op::Yield` suspension (§27.5.3.7). Resume
+    /// writes the kind code into `kind_dst` and the resume argument into
+    /// `value_dst`; the compiled code after the yield acts on them.
     pub fn park_after_yield(
         &self,
         heap: &mut otter_gc::GcHeap,
         frame: ParkedFrameState,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
-        resume_dst: u16,
+        kind_dst: u16,
+        value_dst: u16,
         yielded: crate::Value,
     ) {
         let barrier_value = yielded;
@@ -447,7 +448,8 @@ impl JsGenerator {
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.cold = cold;
-            body.resume_dst = resume_dst;
+            body.resume_kind_dst = kind_dst;
+            body.resume_dst = value_dst;
             body.yielded = Some(yielded);
             body.delegating = false;
         });
@@ -493,7 +495,7 @@ impl JsGenerator {
     }
 
     /// Clear the delegating flag (called when the frame is taken
-    /// for a delegating resume).
+    /// for a resume).
     pub fn clear_delegating(&self, heap: &mut otter_gc::GcHeap) {
         heap.with_payload(self.inner, |body| body.delegating = false);
     }

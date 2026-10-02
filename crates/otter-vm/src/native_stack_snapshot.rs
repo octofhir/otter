@@ -6,9 +6,10 @@
 //!
 //! # Invariants
 //! Each physical JavaScript activation is visited once; host frames carry no
-//! source position and are skipped. Compiled PCs identify the current
-//! source operation; suspended interpreter callers need a one-instruction
-//! adjustment. Inline parents have recipes rather than physical frames. The
+//! source position and are skipped. Every activation's PC identifies its
+//! current source operation: a compiled frame publishes it, and an
+//! interpreter frame waiting on a call stands at the call instruction.
+//! Inline parents have recipes rather than physical frames. The
 //! walk reads scalar metadata without allocation in the GC heap or JS reentry.
 //!
 //! # See also
@@ -67,18 +68,12 @@ impl Interpreter {
                 .map(|record| record.call_pc)
                 .filter(|&pc| pc != crate::native_abi::NO_CALL_PC)
                 .unwrap_or(native.header.pc);
-            let exact = native.header.kind != crate::native_abi::NativeFrameKind::Interpreter;
-            sites.push((native.header.function_id, pc, exact));
+            sites.push((native.header.function_id, pc));
             if let Some(record) = call.filter(|record| !record.inline_frames.is_empty()) {
                 push_virtual_inline_sites(context, record, &mut sites);
             }
         }
-        for (depth, (function, pc, exact)) in sites.into_iter().rev().take(limit).enumerate() {
-            let pc = if exact || depth == 0 {
-                pc
-            } else {
-                pc.saturating_sub(1)
-            };
+        for (function, pc) in sites.into_iter().rev().take(limit) {
             if !crate::stack_snapshot::visit_frame_snapshot(
                 context,
                 function,
@@ -105,7 +100,7 @@ impl Interpreter {
 fn push_virtual_inline_sites(
     context: &ExecutionContext,
     record: &crate::native_abi::SafepointRecord,
-    sites: &mut Vec<(u32, u32, bool)>,
+    sites: &mut Vec<(u32, u32)>,
 ) {
     for frame in &record.inline_frames {
         let Ok(owner) = context.for_function(frame.function_id) else {
@@ -118,7 +113,7 @@ fn push_virtual_inline_sites(
             .find(|&index| function.instruction_byte_pc(index) == Some(frame.byte_pc))
             .and_then(|index| u32::try_from(index).ok())
         {
-            sites.push((frame.function_id, pc, true));
+            sites.push((frame.function_id, pc));
         }
     }
 }

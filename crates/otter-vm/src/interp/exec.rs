@@ -20,6 +20,7 @@
 //! then tombstones a payload proven free of ids and retained contexts.
 #![allow(unused_imports)]
 use super::call_dispatch::DispatchOutcome;
+use crate::activation_stack::ThrowSite;
 use crate::*;
 
 impl Interpreter {
@@ -865,20 +866,27 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
+    ///
+    /// `resume_error` fails the resumption itself; `resume_site` says where
+    /// the activation's PC stands for it.
     pub(super) fn dispatch_current_activation(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
         mut resume_error: Option<VmError>,
+        resume_site: ThrowSite,
     ) -> Result<DispatchOutcome, VmError> {
         debug_assert!(stack.is_runtime_rooted_by(self));
         self.ensure_method_feedback_context(context);
         (|| -> Result<DispatchOutcome, VmError> {
             loop {
-                let step = match resume_error.take() {
-                    Some(error) => Err(error),
-                    None => self.dispatch_loop_inner(context, stack, floor),
+                let (step, site) = match resume_error.take() {
+                    Some(error) => (Err(error), resume_site),
+                    None => (
+                        self.dispatch_loop_inner(context, stack, floor),
+                        ThrowSite::Instruction,
+                    ),
                 };
                 match step {
                     Ok(value) => break Ok(value),
@@ -891,7 +899,8 @@ impl Interpreter {
                                 self.pending_uncaught_frames =
                                     Some(self.snapshot_active_frames(context, usize::MAX));
                             }
-                            let unwind = self.unwind_throw_above(context, stack, floor, thrown);
+                            let unwind =
+                                self.unwind_throw_above(context, stack, floor, thrown, site);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
                             } else {
@@ -931,7 +940,7 @@ impl Interpreter {
                                     Some(self.snapshot_active_frames(context, usize::MAX));
                             }
                             let unwind = self.unwind_throw_with_uncaught_above(
-                                context, stack, floor, thrown, uncaught,
+                                context, stack, floor, thrown, uncaught, site,
                             );
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;

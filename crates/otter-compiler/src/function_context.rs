@@ -56,6 +56,7 @@ pub(crate) struct FinishedCode {
     pub(crate) uses_closure_context: bool,
     pub(crate) number_hint_sites: Vec<u32>,
     pub(crate) class_hint_sites: Vec<(u32, u32)>,
+    pub(crate) handlers: Vec<otter_bytecode::ExceptionHandler>,
 }
 
 /// Per-function compilation context.
@@ -133,10 +134,11 @@ pub(crate) struct FunctionContext {
     pub(crate) is_async_generator: bool,
     /// Stack of enclosing loops; the innermost is on top.
     pub(crate) loops: Vec<LoopFrame>,
-    /// Count of active `try` handlers at the current compile point.
-    pub(crate) active_handlers: u32,
-    /// Subset of [`Self::active_handlers`] that carry a `finally` block.
-    pub(crate) active_finally: u32,
+    /// Constructs an abrupt completion from the current point passes,
+    /// innermost last.
+    pub(crate) control: Vec<crate::control::ControlScope>,
+    /// Exception handler table, innermost first.
+    pub(crate) handlers: Vec<otter_bytecode::ExceptionHandler>,
     /// Label deposited by the immediately-enclosing
     /// `LabeledStatement` waiting to be consumed by the next pushed
     /// loop / switch frame.
@@ -182,8 +184,6 @@ pub(crate) struct FunctionContext {
     pub(crate) completion_reg: Option<u16>,
     /// `true` while lowering a `finally` block body.
     pub(crate) completion_suppressed: bool,
-    /// Number of `finally` block BODIES currently being lowered.
-    pub(crate) finally_body_depth: u32,
     /// Instruction PCs whose operands are statically `number`.
     pub(crate) number_hint_sites: Vec<u32>,
     /// Property sites whose receiver is a class-annotated binding.
@@ -216,8 +216,8 @@ impl FunctionContext {
             module_url: String::new(),
             is_async_generator: false,
             loops: Vec::new(),
-            active_handlers: 0,
-            active_finally: 0,
+            control: Vec::new(),
+            handlers: Vec::new(),
             pending_label: None,
             hoisted_function_names: HashSet::new(),
             annex_b_var_targets: std::collections::HashMap::new(),
@@ -234,7 +234,6 @@ impl FunctionContext {
             strict_class_parts: false,
             completion_reg: None,
             completion_suppressed: false,
-            finally_body_depth: 0,
             number_hint_sites: Vec::new(),
             class_hint_sites: Vec::new(),
         }
@@ -333,9 +332,8 @@ impl FunctionContext {
         if frame.label.is_none() {
             frame.label = self.pending_label.take();
         }
-        frame.handler_floor = self.active_handlers;
-        frame.finally_floor = self.active_finally;
-        frame.finally_body_floor = self.finally_body_depth;
+        frame.break_depth = self.control.len();
+        frame.continue_depth = self.control.len();
         self.loops.push(frame);
     }
 
@@ -364,43 +362,6 @@ impl FunctionContext {
     pub(crate) fn mark_class_hint_site(&mut self, name: u32) {
         let pc = self.next_pc();
         self.class_hint_sites.push((pc, name));
-    }
-
-    /// Emit an [`Op::EnterTry`] with placeholder catch / finally
-    /// offsets and an exception register. Returns the instruction pc.
-    pub(crate) fn emit_enter_try(
-        &mut self,
-        catch_offset: i32,
-        finally_offset: i32,
-        exc_reg: u16,
-        span: (u32, u32),
-    ) -> u32 {
-        let pc = self.next_pc();
-        self.code.push(
-            Op::EnterTry,
-            &[
-                Operand::Imm32(catch_offset),
-                Operand::Imm32(finally_offset),
-                Operand::Register(exc_reg),
-            ],
-        );
-        self.spans.push(SpanEntry { pc, span });
-        pc
-    }
-
-    /// Patch a previously emitted [`Op::EnterTry`] so that one of
-    /// its offsets targets the **current** `next_pc`.
-    pub(crate) fn patch_enter_try_offset(&mut self, enter_pc: u32, is_catch: bool) {
-        let target = self.next_pc();
-        let offset = target as i64 - (enter_pc as i64 + 1);
-        let offset = i32::try_from(offset).expect("EnterTry offset out of i32 range");
-        debug_assert_eq!(self.code.op(enter_pc), Some(Op::EnterTry));
-        let slot_idx = if is_catch { 0 } else { 1 };
-        assert!(
-            self.code
-                .set_operand(enter_pc, slot_idx, Operand::Imm32(offset)),
-            "EnterTry operand at index {slot_idx} not Imm32"
-        );
     }
 
     /// Emit a placeholder branch and return its instruction index
@@ -755,13 +716,15 @@ impl FunctionContext {
     /// hand back the code, spans, and scope table.
     ///
     /// Branch offsets are PC-relative, so the prepended instruction shifts
-    /// every target uniformly; source spans and hint sites shift by one.
+    /// every target uniformly; source spans, hint sites, and handler PCs
+    /// shift by one.
     pub(crate) fn finish_code(&mut self, entry_span: (u32, u32)) -> FinishedCode {
         let mut scratch = self.scratch_window();
         let mut code = std::mem::take(&mut self.code);
         let mut spans = std::mem::take(&mut self.spans);
         let mut number_hint_sites = std::mem::take(&mut self.number_hint_sites);
         let mut class_hint_sites = std::mem::take(&mut self.class_hint_sites);
+        let mut handlers = std::mem::take(&mut self.handlers);
         let uses_closure_context = !self.closure_ctx_patches.is_empty();
         if uses_closure_context {
             let reg = scratch;
@@ -801,6 +764,11 @@ impl FunctionContext {
             for (pc, _) in &mut class_hint_sites {
                 *pc += 1;
             }
+            for handler in &mut handlers {
+                handler.start += 1;
+                handler.end += 1;
+                handler.target += 1;
+            }
             self.closure_ctx_patches.clear();
         }
         FinishedCode {
@@ -811,6 +779,7 @@ impl FunctionContext {
             uses_closure_context,
             number_hint_sites,
             class_hint_sites,
+            handlers,
         }
     }
 }

@@ -7,9 +7,13 @@
 //! # Contents
 //! - `Op::Await` parking for async functions and async generators.
 //! - Microtask-driven async function and async-generator resume.
-//! - Try/catch/finally throw unwinding and async rejection absorption.
+//! - Throw unwinding through each frame's handler table, and async rejection
+//!   absorption.
 //!
 //! # Invariants
+//! - A throw lands in the first handler-table entry covering the throwing
+//!   instruction: the top frame's own instruction, or the call instruction
+//!   of every caller.
 //! - Await parking advances the frame PC before removing it from the active
 //!   stack.
 //! - Rejected awaits re-enter through the same throw-unwind path as
@@ -21,9 +25,9 @@
 //! # See also
 //! - [`crate::microtask`]
 //! - [`crate::promise_dispatch`]
+//! - [`otter_bytecode::ExceptionHandler`]
 
-use crate::activation_stack::{ActivationFloor, ActivationStack};
-use smallvec::SmallVec;
+use crate::activation_stack::{ActivationFloor, ActivationStack, ThrowSite};
 
 use crate::promise::JsPromise;
 use crate::{ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch};
@@ -238,7 +242,7 @@ impl Interpreter {
     ) -> Result<(), RunError> {
         let mut frame = self.resume_parked_frame(*frame).map_err(RunError::bare)?;
         if let Some(c) = cold {
-            self.prepared_attach_cold(&mut frame, c);
+            self.prepared_attach_cold(&mut frame, *c);
         }
         let mut stack: ActivationStack = ActivationStack::new();
         let floor = stack.floor();
@@ -376,7 +380,7 @@ impl Interpreter {
     ) -> Result<(), RunError> {
         let mut frame = self.resume_parked_frame(*frame).map_err(RunError::bare)?;
         if let Some(c) = cold {
-            self.prepared_attach_cold(&mut frame, c);
+            self.prepared_attach_cold(&mut frame, *c);
         }
         let mut stack: ActivationStack = ActivationStack::new();
         let floor = stack.floor();
@@ -414,39 +418,32 @@ impl Interpreter {
         result
     }
 
-    /// Walk the live frame stack looking for a try-handler that
-    /// can absorb an in-flight throw.
+    /// Walk the live frame stack looking for a handler that absorbs an
+    /// in-flight throw.
     ///
     /// # Algorithm
-    /// 1. Inspect the top frame:
-    ///    - **Catch handler hit** — write the thrown value into
-    ///      the handler's `exc_register`, jump pc to the catch
-    ///      entry, pop the handler, return `Ok(())` so dispatch
-    ///      resumes in that frame.
-    ///    - **Finally-only handler hit** — park the value on the
-    ///      frame's `parked_finally` stack (tagged with the handler
-    ///      depth), jump pc to the finally entry, pop the handler,
-    ///      return `Ok(())`. [`otter_bytecode::Op::EndFinally`]
-    ///      re-throws unless a later unwind discarded the entry.
-    ///    - **No handler in this frame** — if the cold record owns an async
-    ///      result promise, settle it
-    ///      as rejected, drain the resulting jobs into the
-    ///      microtask queue, pop the frame, and stop unwinding.
-    ///      The caller is in a different "logical thread" — its pc
-    ///      was advanced past the call site at entry and the
-    ///      result promise was already in its register.
-    ///    - **Otherwise** — pop the frame and continue.
+    /// For each frame from the top, `site` first and every caller after it
+    /// past its call instruction:
+    /// - **Handler hit** — the first entry of the function's handler table
+    ///   covering the throwing instruction receives the value in its
+    ///   register and the frame continues at its target.
+    /// - **No handler, async frame** — settle its result promise as
+    ///   rejected, drain the resulting jobs into the microtask queue, pop
+    ///   the frame, and stop: the caller already holds the promise.
+    /// - **Otherwise** — pop the frame and continue.
     ///
     /// # Errors
     /// - [`VmError::Uncaught`] when the root execution region empties without
     ///   a handler and no async-frame absorbed the throw.
+    #[cfg(test)]
     pub(crate) fn unwind_throw(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         value: Value,
+        site: ThrowSite,
     ) -> Result<(), VmError> {
-        self.unwind_throw_above(context, stack, ActivationFloor::ROOT, value)
+        self.unwind_throw_above(context, stack, ActivationFloor::ROOT, value, site)
     }
 
     /// Unwind only frames owned by the execution region above `floor`.
@@ -461,8 +458,9 @@ impl Interpreter {
         stack: &mut ActivationStack,
         floor: ActivationFloor,
         value: Value,
+        site: ThrowSite,
     ) -> Result<(), VmError> {
-        self.unwind_throw_with_uncaught_above(context, stack, floor, value, None)
+        self.unwind_throw_with_uncaught_above(context, stack, floor, value, None, site)
     }
 
     /// Structured-error variant of [`Self::unwind_throw_above`].
@@ -477,172 +475,85 @@ impl Interpreter {
         floor: ActivationFloor,
         value: Value,
         mut uncaught_error: Option<VmError>,
+        site: ThrowSite,
     ) -> Result<(), VmError> {
         if floor.depth() > stack.len() {
             return Err(VmError::InvalidOperand);
         }
-
         let display = self.render_thrown(&value);
-        let mut payload = value;
-        let mut payload_root = otter_gc::RootScope::new(&mut self.gc_heap);
-        // SAFETY: `payload` precedes the scope and remains stationary until
-        // throw routing completes. IteratorClose may reenter JavaScript and
-        // collect before the value reaches a catch slot or pending-throw root.
+        let mut value = value;
+        let mut value_root = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: `value` precedes the scope and stays in place until it
+        // lands in a register, a pending-throw root, or a rejected promise;
+        // settling a promise allocates.
         unsafe {
-            crate::rooting::RootScopeExt::add_value(&mut payload_root, &mut payload);
+            crate::rooting::RootScopeExt::add_value(&mut value_root, &mut value);
         }
+        let mut site = site;
         loop {
             if stack.is_at_floor(floor) {
                 if uncaught_error.is_none() {
-                    self.pending_uncaught_throw = Some(payload);
+                    self.pending_uncaught_throw = Some(value);
                 }
                 return Err(uncaught_error
                     .take()
                     .unwrap_or(self.err_uncaught((display).into())));
             }
-            let popped_handler = {
-                let frame = stack.last_mut().expect("frame present");
-                self.frame_cold_mut(frame).and_then(|c| c.handlers.pop())
-            };
-            let Some(handler) = popped_handler else {
-                // No in-frame try-handler: this frame's entire body is
-                // exited, so §7.4.9 IteratorClose runs for every
-                // iterator it left open (floor `-1` takes all depths)
-                // before the frame is discarded.
-                let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), -1);
-                self.close_unwind_iterators(stack, context, closers);
-                // Async frames absorb their own unhandled throws into the
-                // result promise as a rejection — spec §27.7.5.3
-                // step 1.h.iii.
-                if self.frame_has_async_state(stack.last().expect("frame still present")) {
-                    let popped = stack.pop().expect("frame existed at last");
-                    let result_promise = self
-                        .frame_take_async_state(popped)
-                        .expect("async ownership checked just above")
-                        .result_promise;
-                    self.frame_release_cold(popped);
-                    // The rejected promise is the activation's completion.
-                    self.completed_activation_result = Some(Value::promise(result_promise));
-                    let jobs = result_promise.reject(&mut self.gc_heap, payload);
-                    self.note_settle_rejection(&jobs);
-                    for j in jobs.jobs {
-                        self.microtasks.enqueue(j);
-                    }
-                    return Ok(());
-                }
-                let popped = stack.pop().expect("frame still present");
-                self.frame_release_cold(popped);
-                continue;
-            };
-            // Landing in this frame's catch / finally: §7.4.9 closes the
-            // iterators whose region sits inside the handler just popped
-            // (registered at a deeper handler depth than the remaining
-            // floor). An iterator opened *outside* the matched handler —
-            // e.g. a `try`/`catch` nested inside the loop body — stays
-            // open so iteration can resume.
-            let handler_floor = self
-                .frame_cold(stack.last().expect("frame"))
-                .map_or(0, |c| c.handlers.len() as i64);
-            // §14.15.3 — completions parked by `finally` blocks this
-            // throw abandons (their handler depth sits above the
-            // landing handler) are replaced by the new throw.
-            if let Some(cold) = self.frame_cold_mut(stack.last_mut().expect("frame")) {
-                cold.parked_finally
-                    .retain(|(_, depth)| i64::from(*depth) <= handler_floor);
-            }
-            let closers =
-                self.take_frame_closers_above(stack.last_mut().expect("frame"), handler_floor);
-            self.close_unwind_iterators(stack, context, closers);
-            let frame = stack.last_mut().expect("frame still present");
-            if let Some(catch_pc) = handler.catch_pc {
-                frame.pc = catch_pc;
+            let frame = stack.last_mut().expect("frame present");
+            if let Some(handler) = frame_handler(context, frame, site)? {
+                frame.pc = handler.target;
                 let slot = frame
                     .registers
-                    .get_mut(handler.exc_register as usize)
+                    .get_mut(usize::from(handler.exception))
                     .ok_or(VmError::InvalidOperand)?;
-                *slot = payload;
+                *slot = value;
                 return Ok(());
             }
-            let finally_pc = handler.finally_pc.ok_or(VmError::InvalidOperand)?;
-            frame.pc = finally_pc;
-            let cold = self.frame_ensure_cold(frame);
-            let depth = cold.handlers.len() as u32;
-            cold.parked_finally
-                .push((crate::cold_frame::ParkedFinally::Throw(payload), depth));
-            return Ok(());
-        }
-    }
-
-    /// Drain the top frame's iterator closers whose recorded handler
-    /// depth is strictly greater than `floor`, returning them
-    /// innermost-first (last registered runs first). Used by
-    /// [`Self::unwind_throw_with_uncaught`] to decide which §7.4.9
-    /// IteratorClose hooks the in-flight throw crosses.
-    fn take_frame_closers_above(&mut self, frame: &mut Frame, floor: i64) -> SmallVec<[Value; 2]> {
-        let mut out: SmallVec<[Value; 2]> = SmallVec::new();
-        if let Some(cold) = self.frame_cold_mut(frame) {
-            let mut i = 0;
-            while i < cold.active_iterator_closers.len() {
-                if i64::from(cold.active_iterator_closers[i].1) > floor {
-                    out.push(cold.active_iterator_closers.remove(i).0);
-                } else {
-                    i += 1;
+            site = ThrowSite::AfterCall;
+            // Async frames absorb their own unhandled throws into the
+            // result promise as a rejection — spec §27.7.5.3 step 1.h.iii.
+            if self.frame_has_async_state(stack.last().expect("frame still present")) {
+                let popped = stack.pop().expect("frame existed at last");
+                let result_promise = self
+                    .frame_take_async_state(popped)
+                    .expect("async ownership checked just above")
+                    .result_promise;
+                self.frame_release_cold(popped);
+                // The rejected promise is the activation's completion.
+                self.completed_activation_result = Some(Value::promise(result_promise));
+                let jobs = result_promise.reject(&mut self.gc_heap, value);
+                self.note_settle_rejection(&jobs);
+                for j in jobs.jobs {
+                    self.microtasks.enqueue(j);
                 }
+                return Ok(());
             }
+            let popped = stack.pop().expect("frame still present");
+            self.frame_release_cold(popped);
         }
-        out.reverse();
-        out
     }
+}
 
-    /// Run `[[return]]` on each iterator crossed by an in-flight throw.
-    /// A secondary throw from `return` is swallowed — §7.4.9 keeps the
-    /// original (throw) completion.
-    fn close_unwind_iterators(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        closers: SmallVec<[Value; 2]>,
-    ) {
-        for iterator in closers {
-            let _ = self.iterator_close_value_sync(stack, context, iterator);
-        }
+/// The handler a throw lands in within `frame`, whose PC stands at `site`.
+fn frame_handler(
+    context: &ExecutionContext,
+    frame: &Frame,
+    site: ThrowSite,
+) -> Result<Option<otter_bytecode::ExceptionHandler>, VmError> {
+    let resolved = context
+        .for_function(frame.function_id)
+        .map_err(|_| VmError::InvalidOperand)?;
+    let function = resolved
+        .exec_function(frame.function_id)
+        .ok_or(VmError::InvalidOperand)?;
+    if function.control_flow().handlers().is_empty() {
+        return Ok(None);
     }
-
-    /// Drop `iterator` from the top frame's §7.4.9 closer registry.
-    /// Called when the iterator becomes `[[Done]]` — its `next`
-    /// returned `done: true`, or an explicit `Op::IteratorClose`
-    /// already ran — so a later throw-unwind does not invoke
-    /// `[[return]]` a second time (IteratorClose is a no-op on a done
-    /// iterator).
-    pub(crate) fn deregister_frame_iterator_closer(&mut self, frame: &mut Frame, iterator: Value) {
-        if let Some(cold) = self.frame_cold_mut(frame)
-            && let Some(pos) = cold
-                .active_iterator_closers
-                .iter()
-                .rposition(|(v, _)| *v == iterator)
-        {
-            cold.active_iterator_closers.remove(pos);
-        }
-    }
-
-    /// Re-arm `iterator` in the top frame's §7.4.9 closer registry at
-    /// the current handler depth. Called after a user `next` returns
-    /// `done: false` (the closer was dropped for the span of the call
-    /// so a throwing `next` would not trigger IteratorClose). A no-op
-    /// when the iterator is already registered.
-    pub(crate) fn register_frame_iterator_closer(&mut self, frame: &mut Frame, iterator: Value) {
-        let depth = self
-            .frame_cold(frame)
-            .map_or(0, |c| c.handlers.len() as u32);
-        let cold = self.frame_ensure_cold(frame);
-        if !cold
-            .active_iterator_closers
-            .iter()
-            .any(|(v, _)| *v == iterator)
-        {
-            cold.active_iterator_closers.push((iterator, depth));
-        }
-    }
+    let pc = match site {
+        ThrowSite::Instruction => frame.pc,
+        ThrowSite::AfterCall => frame.pc.checked_sub(1).ok_or(VmError::InvalidOperand)?,
+    };
+    Ok(function.control_flow().handler_at(pc))
 }
 
 #[cfg(test)]
@@ -650,7 +561,7 @@ mod tests {
     use super::*;
     use otter_bytecode::Function;
 
-    use crate::frame_state::{AsyncFrameState, ParkedFrameState, TryHandler};
+    use crate::frame_state::{AsyncFrameState, ParkedFrameState};
 
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
@@ -705,14 +616,6 @@ mod tests {
         (parked, cold, owner)
     }
 
-    fn malformed_catch() -> TryHandler {
-        TryHandler {
-            catch_pc: Some(0),
-            finally_pc: None,
-            exc_register: 1,
-        }
-    }
-
     fn assert_invalid_resume_cleanup(interp: &Interpreter, error: RunError) {
         assert!(matches!(error.error, VmError::InvalidOperand));
         assert_eq!(interp.cold_frames.live_len(), 0);
@@ -751,54 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn async_resume_malformed_handler_releases_cold_record_and_window() {
-        let mut interp = Interpreter::new();
-        let context = empty_context();
-        let frame = interp.test_frame_for_function(&function(1)).unwrap();
-        let (parked, mut cold) = park_regular_async_frame(&mut interp, &context, frame);
-        cold.as_mut()
-            .expect("async frame owns a cold record")
-            .handlers
-            .push(malformed_catch());
-
-        assert_eq!(interp.cold_frames.live_len(), 0);
-
-        let error = interp
-            .run_async_resume(&context, parked, cold, 0, false, Value::number_i32(11))
-            .unwrap_err();
-
-        assert_invalid_resume_cleanup(&interp, error);
-    }
-
-    #[test]
-    fn async_generator_resume_malformed_handler_releases_cold_record_and_window() {
-        let mut interp = Interpreter::new();
-        let context = empty_context();
-        let frame = interp.test_frame_for_function(&function(1)).unwrap();
-        let (parked, mut cold, owner) = park_async_generator_frame(&mut interp, frame);
-        cold.as_mut()
-            .expect("generator frame owns a cold record")
-            .handlers
-            .push(malformed_catch());
-
-        assert_eq!(interp.cold_frames.live_len(), 0);
-
-        let error = interp
-            .run_async_gen_resume(
-                &context,
-                parked,
-                cold,
-                0,
-                false,
-                Value::number_i32(11),
-                owner,
-            )
-            .unwrap_err();
-
-        assert_invalid_resume_cleanup(&interp, error);
-    }
-
-    #[test]
     fn floor_unwind_preserves_caller_frame_window_and_thrown_identity() {
         let mut interp = Interpreter::new();
         let context = empty_context();
@@ -817,7 +672,7 @@ mod tests {
 
         let thrown = Value::number_i32(41);
         let error = interp
-            .unwind_throw_above(&context, &mut stack, floor, thrown)
+            .unwind_throw_above(&context, &mut stack, floor, thrown, ThrowSite::Instruction)
             .unwrap_err();
 
         assert!(matches!(error, VmError::Uncaught));

@@ -354,11 +354,11 @@ pub struct DeoptFrame<Slot = DeoptSlot> {
 /// a whole chain of frames: the outermost function first, then each inlined
 /// callee it was executing, innermost last.
 ///
-/// Only the innermost frame resumes at the instruction that exited. Every
-/// caller in the chain had already advanced past its call before its callee's
-/// frame was pushed, so a caller's `byte_pc` names the instruction *after* the
-/// call, and the register the call writes is left to the ordinary return
-/// protocol rather than restored here.
+/// Only the innermost frame resumes at the instruction that exited. A
+/// caller's `byte_pc` names the instruction *after* its call; reconstruction
+/// stands it on the call instruction until the callee returns, and the
+/// register the call writes is left to the ordinary return protocol rather
+/// than restored here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameState<Slot = DeoptSlot> {
     /// Frames to rebuild, outermost first and innermost last. Never empty.

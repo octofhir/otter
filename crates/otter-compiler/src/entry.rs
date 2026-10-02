@@ -1020,6 +1020,7 @@ pub(crate) fn compile_program_parts(
         m.functions[0].number_hint_sites = finished.number_hint_sites;
         crate::type_hints::resolve_class_hint_sites(&cx, &mut m.functions);
         m.functions[0].code = finished.code;
+        m.functions[0].handlers = finished.handlers;
         m.functions[0].spans = finished.spans;
     }
     drop(cx);
@@ -1625,6 +1626,7 @@ pub fn compile_module_program(
         m.functions[0].number_hint_sites = finished.number_hint_sites;
         crate::type_hints::resolve_class_hint_sites(&cx, &mut m.functions);
         m.functions[0].code = finished.code;
+        m.functions[0].handlers = finished.handlers;
         m.functions[0].spans = finished.spans;
     }
     // Capture deferred import specifiers before dropping the compiler

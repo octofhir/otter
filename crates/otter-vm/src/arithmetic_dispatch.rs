@@ -787,28 +787,34 @@ impl Interpreter {
 
     pub(crate) fn run_neg_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
         dst: u16,
         src: u16,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let value = *read_register(frame, src)?;
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let value = *read_register(unsafe { stack.top_unchecked() }, src)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, value);
         }
-        let result = self.neg_value(value)?;
-        commit_frame_result(frame, dst, result)
+        let result = self.neg_value(stack, context, value)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     pub(crate) fn run_bitwise_not_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        top_idx: usize,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let value = *read_register(frame, src)?;
-        let result = self.bitwise_not_value(value)?;
-        commit_frame_result(frame, dst, result)
+        // SAFETY: see `run_numeric_regs` — `top_idx` is the live top frame.
+        let value = *read_register(unsafe { stack.top_unchecked() }, src)?;
+        let result = self.bitwise_not_value(stack, context, value)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     /// Execute one update-expression numeric step through the same semantic
@@ -951,16 +957,24 @@ impl Interpreter {
             NumericRuntimeOp::GreaterEq { .. } => {
                 compare_value(self, stack, context, lhs, binary_rhs()?, Op::GreaterEq)
             }
-            NumericRuntimeOp::Neg => self.neg_value(lhs),
-            NumericRuntimeOp::BitwiseNot => self.bitwise_not_value(lhs),
+            NumericRuntimeOp::Neg => self.neg_value(stack, context, lhs),
+            NumericRuntimeOp::BitwiseNot => self.bitwise_not_value(stack, context, lhs),
             NumericRuntimeOp::Increment { delta } => {
                 self.increment_value(stack, context, lhs, delta)
             }
         }
     }
 
-    pub(crate) fn neg_value(&mut self, value: Value) -> Result<Value, VmError> {
-        match abstract_ops::to_numeric_kind(&value, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+    /// §13.5.5 unary `-`: ToNumeric (with the object ladder), then the
+    /// operand type's own negation.
+    pub(crate) fn neg_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
+        match abstract_ops::to_numeric_kind(&numeric, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
             abstract_ops::NumericKind::Num(number_value) => {
                 Ok(Value::number(number::neg(number_value)))
             }
@@ -973,8 +987,16 @@ impl Interpreter {
         }
     }
 
-    fn bitwise_not_value(&mut self, value: Value) -> Result<Value, VmError> {
-        match abstract_ops::to_numeric_kind(&value, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+    /// §13.5.6 `~`: ToNumeric (with the object ladder), then the operand
+    /// type's own complement.
+    fn bitwise_not_value(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &crate::execution_context::ExecutionContext,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
+        match abstract_ops::to_numeric_kind(&numeric, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
             abstract_ops::NumericKind::Num(number_value) => {
                 Ok(Value::number(number::bitwise_not(number_value)))
             }
@@ -994,13 +1016,8 @@ impl Interpreter {
         value: Value,
         delta: i32,
     ) -> Result<Value, VmError> {
-        let primitive = self.evaluate_to_primitive(
-            stack,
-            context,
-            &value,
-            abstract_ops::ToPrimitiveHint::Number,
-        )?;
-        let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
+        let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
+        let kind = abstract_ops::to_numeric_kind(&numeric, &self.gc_heap)
             .ok_or(VmError::TypeMismatch)?;
         match kind {
             abstract_ops::NumericKind::Num(number_value) => Ok(Value::number(

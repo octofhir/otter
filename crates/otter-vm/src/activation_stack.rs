@@ -49,6 +49,17 @@ pub struct ActivationStack {
     runtime_root_owner: Option<usize>,
 }
 
+/// Where an activation's PC stands when a throw starts unwinding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThrowSite {
+    /// At the instruction that raised the throw, or that is waiting on the
+    /// call that raised it.
+    Instruction,
+    /// One past the call instruction, or suspension, whose completion raised
+    /// it.
+    AfterCall,
+}
+
 struct RuntimeRootedStack<'a> {
     stack: &'a mut ActivationStack,
 }

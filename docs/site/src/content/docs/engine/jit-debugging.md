@@ -321,14 +321,15 @@ Separate
 plan and lowering events keep feedback selection distinct from emitted machine
 code.
 
-A stack-owned Template activation keeps catch-only handler state in the
-verified CodeBlock region table. `EnterTry` and `LeaveTry` do not materialize a
-cold frame. A committed getter or callee throw selects the innermost catch,
-writes its exception register, and exits at the catch PC; the source operation
-is not replayed. Exact deoptimization reconstructs only the handlers still
-active there. Finally and dynamic completion operations keep their pre-effect
-canonical continuation. Function metadata resolves through its owning context,
-including when a later script calls an earlier generated function.
+Exception handlers are a static table on each function: a range of
+instructions, the handler's PC, and the register that receives the thrown
+value. A `finally` block is ordinary code entered with a completion token, so no
+tier keeps handler or completion state at run time. A committed getter or
+callee throw in generated code selects the handler covering the published PC,
+writes its exception register, and exits at the handler PC; the source operation
+is not replayed, and exact deoptimization has no handler state to rebuild.
+Function metadata resolves through its owning context, including when a later
+script calls an earlier generated function.
 
 `generatedCallDeopt` is emitted only when an already-started generated callee
 bails into cold interpreter continuation. It records baked `callKind`, exact

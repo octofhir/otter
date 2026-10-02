@@ -1,8 +1,8 @@
 //! Call-frame and pending-dispatch state for the VM interpreter.
 //!
 //! This module owns the data carried between dispatch-loop ticks: register
-//! windows and resumable dispatch state. Async/generator ownership, active try
-//! handlers, and protocol ladders live in the lazily attached cold record.
+//! windows and resumable dispatch state. Async/generator ownership and
+//! protocol ladders live in the lazily attached cold record.
 //!
 //! # Contents
 //! - Active register windows and owned parked-frame snapshots.
@@ -244,26 +244,6 @@ pub struct AsyncFrameState {
     /// when the async body returns (fulfil) or throws an
     /// unhandled error (reject).
     pub result_promise: JsPromiseHandle,
-}
-
-/// One active try-handler descriptor — the runtime counterpart to
-/// the compiler's `TRY_BEGIN … TRY_END` block. Each
-/// [`Op::EnterTry`] dispatch pushes one of these onto the
-/// owning frame; throw unwinding pops back to the innermost match.
-#[derive(Debug, Clone, Copy)]
-pub struct TryHandler {
-    /// Catch clause entry pc, or `None` for `try { … } finally { … }`
-    /// without a catch.
-    pub catch_pc: Option<u32>,
-    /// Finally clause entry pc, or `None` when there is no
-    /// finally. The unwinder routes the in-flight exception
-    /// through finally even when a catch is present, so the
-    /// compiler emits the catch body first and chains its
-    /// completion through finally.
-    pub finally_pc: Option<u32>,
-    /// Register that the catch clause expects the thrown value in.
-    /// Ignored when `catch_pc` is `None`.
-    pub exc_register: u16,
 }
 
 impl Frame {

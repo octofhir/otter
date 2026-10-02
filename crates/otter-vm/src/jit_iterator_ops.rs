@@ -4,14 +4,13 @@
 //! - Synchronous `GetIterator`/`GetAsyncIterator` acquisition, including user
 //!   `[Symbol.iterator]()` methods driven through the shared reentrant path.
 //! - Full `IteratorNext` completion through the VM iterator engine.
-//! - Iterator-close and closer-registry lifetime transitions.
+//! - Iterator close for normal and throw completions.
 //!
 //! # Invariants
 //! - Every successful transition has committed its source opcode; the
 //!   generated caller only falls through and never replays it.
-//! - Reentrant `next` calls temporarily disarm an already-active closer, so a
-//!   throwing `next` observes IteratorStep's no-close rule; a live iterator is
-//!   re-armed exactly once on success.
+//! - A throw out of `next` sets the record's `[[Done]]`, so a handler's
+//!   close leaves it alone (§7.4.8).
 //! - All user callbacks run through the existing ActivationStack/VmThread reentry
 //!   path and values remain rooted by the published frame.
 //!
@@ -60,28 +59,11 @@ impl Interpreter {
                     return Err(VmError::TypeMismatch);
                 }
 
-                // `IteratorNext` normally leaves an active closer alone for
-                // builtin steps.  A full completion may call user code, so
-                // disarm only an already-registered closer for that span;
-                // otherwise a throw from `next` would incorrectly run
-                // IteratorClose during unwind.
-                let was_registered = self.frame_cold(&stack[frame_index]).is_some_and(|cold| {
-                    cold.active_iterator_closers
-                        .iter()
-                        .any(|(value, _)| *value == iterator)
-                });
-                if was_registered {
-                    self.deregister_frame_iterator_closer(&mut stack[frame_index], iterator);
-                }
-
                 let (value, done) = match iterator.as_iterator() {
                     Some(handle) => self.iterator_next_full(context, stack, &handle),
                     None => Err(VmError::TypeMismatch),
-                }?;
-                if was_registered && !done {
-                    let iterator = *read_register(&stack[frame_index], iter_reg)?;
-                    self.register_frame_iterator_closer(&mut stack[frame_index], iterator);
                 }
+                .inspect_err(|_| self.iterator_mark_done(iterator))?;
                 write_register(&mut stack[frame_index], value_dst, value)?;
                 write_register(
                     &mut stack[frame_index],
@@ -93,20 +75,13 @@ impl Interpreter {
             }
             value if value == Op::IteratorClose as u8 => {
                 let iterator = *read_register(&stack[frame_index], arg0 as u16)?;
-                self.deregister_frame_iterator_closer(&mut stack[frame_index], iterator);
                 self.iterator_close_value_sync(stack, context, iterator)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }
-            value if value == Op::IteratorCloseStart as u8 => {
+            value if value == Op::IteratorCloseThrow as u8 => {
                 let iterator = *read_register(&stack[frame_index], arg0 as u16)?;
-                self.register_frame_iterator_closer(&mut stack[frame_index], iterator);
-                stack[frame_index].pc = saved_pc;
-                Ok(())
-            }
-            value if value == Op::IteratorCloseEnd as u8 => {
-                let iterator = *read_register(&stack[frame_index], arg0 as u16)?;
-                self.deregister_frame_iterator_closer(&mut stack[frame_index], iterator);
+                self.iterator_close_for_throw(stack, context, iterator)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }

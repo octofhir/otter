@@ -49,6 +49,9 @@ mod artifact;
 mod call_linkage;
 mod code;
 mod entry;
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+mod graph;
 pub mod machine;
 mod measurement;
 pub mod optimizing;

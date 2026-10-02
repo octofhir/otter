@@ -28,8 +28,7 @@
 //!   instruction uses the CodeBlock-owned overflow table; no parallel active
 //!   wordcode array or per-instruction reference count remains.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
-//!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
-//!   try-handler slots by the serialized verifier.
+//!   the next instruction.
 //! - Named property IC sites receive dense VM-local ids during build; the
 //!   bytecode JSON dump stays unchanged.
 //! - A tier-neutral [`crate::feedback::FeedbackVector`] owns both dense
@@ -53,7 +52,7 @@ use otter_bytecode::{
 };
 use std::sync::Arc;
 
-use code_block_cfg::{CodeBlockControlFlow, CodeBlockExceptionRegion};
+use code_block_cfg::CodeBlockControlFlow;
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
@@ -534,6 +533,7 @@ impl CodeBlock {
         param_count: u16,
         register_count: u16,
         instructions: &[crate::jit::JitTestInstruction],
+        handlers: &[otter_bytecode::ExceptionHandler],
     ) -> Arc<Self> {
         let mut wordcode_builder = FunctionCodeBuilder::new();
         for instr in instructions {
@@ -562,7 +562,7 @@ impl CodeBlock {
         let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
             instructions.iter().map(|instruction| instruction.op),
         );
-        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
+        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode, handlers);
         Arc::new(Self {
             id,
             param_count,
@@ -746,12 +746,6 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn loop_latch(&self, header_pc: u32) -> Option<u32> {
         self.control_flow.loop_latch(header_pc)
-    }
-
-    /// Resolved handlers installed by an `EnterTry` instruction.
-    #[must_use]
-    pub(crate) fn exception_region(&self, enter_pc: u32) -> Option<CodeBlockExceptionRegion> {
-        self.control_flow.exception_region(enter_pc)
     }
 
     /// Number of schema-typed operands on this instruction.
@@ -1142,7 +1136,8 @@ impl CodeBlock {
         let register_count = proof.register_count();
         let code_byte_len = proof.layout().total_bytes;
         let instr_to_byte_pc = proof.layout().instr_to_byte_pc.clone();
-        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&function.code);
+        let control_flow =
+            CodeBlockControlFlow::from_verified_wordcode(&function.code, &function.handlers);
         let mut overflow_operand_words = Vec::new();
         let code = function
             .code

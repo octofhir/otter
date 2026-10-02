@@ -417,26 +417,11 @@ pub(crate) enum TemplateOp {
         argc: u16,
         packed_args: u64,
     },
-    /// Install one pre-resolved structured-exception handler.
-    EnterTry {
-        catch_pc: Option<u32>,
-        finally_pc: Option<u32>,
-        exception_register: u16,
-    },
-    /// Leave the innermost handler, parking normal-finally completion when
-    /// required.
-    LeaveTry,
     /// Throw `r<src>` through the canonical VM unwind implementation.
     Throw { src: u16 },
     /// Materialize and throw the interpreter's TDZ `ReferenceError` for the
     /// encoded local index through the canonical VM unwind implementation.
     TdzError { local_index: u32 },
-    /// Resume the completion parked by the active finally body.
-    EndFinally,
-    /// Abandon `count` parked finally completions.
-    PopParkedFinally { count: u32 },
-    /// Run finally bodies down to `floor`, then jump to `target`.
-    JumpViaFinally { target: u32, floor: u32 },
     /// Advance an iterator through the VM's complete iterator transition.
     /// User `next`, generator resume, iterator helpers, and result-record
     /// accessors all complete in place through one reentrant runtime stub.
@@ -448,10 +433,9 @@ pub(crate) enum TemplateOp {
     /// Complete `IteratorClose` through the VM's full `return`/generator/
     /// helper semantics.
     IteratorClose { iterator: u16 },
-    /// Register an iterator for abrupt close in the current frame.
-    IteratorCloseStart { iterator: u16 },
-    /// Remove an iterator from the current frame's abrupt-close registry.
-    IteratorCloseEnd { iterator: u16 },
+    /// Complete `IteratorClose` for a throw completion, discarding whatever
+    /// the iterator's `return` raises.
+    IteratorCloseThrow { iterator: u16 },
     /// Obtain an iterator through the VM's full observable `@@iterator`
     /// transition: built-in iterables, user `[Symbol.iterator]()` methods
     /// (called synchronously through the shared reentrant path), and
@@ -749,23 +733,20 @@ impl TemplatePlan {
 
 impl TemplatePlan {
     pub(crate) fn build(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
+        Self::build_with_fusion(view, true)
+    }
+
+    /// The plan with one operation sequence per instruction: no fused
+    /// numeric chains span several instructions.
+    pub(crate) fn build_unfused(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
+        Self::build_with_fusion(view, false)
+    }
+
+    fn build_with_fusion(view: &JitCompileSnapshot, fuse: bool) -> Result<Self, Unsupported> {
         let lowering = BaselinePlan::build(view)?;
         let mut instructions = Vec::with_capacity(lowering.instructions.len());
         let mut register_operands: Vec<u16> = Vec::new();
         let mut osr_only = false;
-        // §14.15.3 — a `return` inside a `try` whose region owns a
-        // `finally` must run that finally before the frame completes.
-        // Generated code returns straight through its epilogue, so such
-        // a return takes the exact side exit at its own PC and the
-        // interpreter owns the completion.
-        let finally_protected: Vec<(u32, u32)> = view
-            .code_block
-            .control_flow()
-            .exception_regions()
-            .iter()
-            .filter(|region| region.finally_pc.is_some())
-            .map(|region| (region.enter_pc, region.end_pc))
-            .collect();
         for (meta, lowered) in view.instructions.iter().zip(&lowering.instructions) {
             let pc = lowered.instruction_pc;
             // The immediate-right binary operators carry no tier opcode: expand
@@ -1278,34 +1259,12 @@ impl TemplatePlan {
                         packed_args: pack_register_lanes(arguments),
                     }
                 }
-                Op::EnterTry => {
-                    let operands = lowered.exception_region_operands()?;
-                    TemplateOp::EnterTry {
-                        catch_pc: operands.catch_pc,
-                        finally_pc: operands.finally_pc,
-                        exception_register: operands.exception_register,
-                    }
-                }
-                Op::LeaveTry => TemplateOp::LeaveTry,
                 Op::Throw => TemplateOp::Throw {
                     src: lowered.source_operands()?.src,
                 },
                 Op::TdzError => TemplateOp::TdzError {
                     local_index: lowered.immediate_operands()?.value as u32,
                 },
-                Op::EndFinally => TemplateOp::EndFinally,
-                Op::PopParkedFinally => {
-                    let count = u32::try_from(lowered.immediate_operands()?.value)
-                        .map_err(|_| Unsupported::OperandShape("PopParkedFinally count"))?;
-                    TemplateOp::PopParkedFinally { count }
-                }
-                Op::JumpViaFinally => {
-                    let operands = lowered.jump_via_finally_operands()?;
-                    TemplateOp::JumpViaFinally {
-                        target: operands.target,
-                        floor: operands.floor,
-                    }
-                }
                 Op::IteratorNext => {
                     let operands = lowered.triple_operands()?;
                     TemplateOp::IteratorNext {
@@ -1317,10 +1276,7 @@ impl TemplatePlan {
                 Op::IteratorClose => TemplateOp::IteratorClose {
                     iterator: lowered.source_operands()?.src,
                 },
-                Op::IteratorCloseStart => TemplateOp::IteratorCloseStart {
-                    iterator: lowered.source_operands()?.src,
-                },
-                Op::IteratorCloseEnd => TemplateOp::IteratorCloseEnd {
+                Op::IteratorCloseThrow => TemplateOp::IteratorCloseThrow {
                     iterator: lowered.source_operands()?.src,
                 },
                 Op::GetIterator => {
@@ -1858,14 +1814,6 @@ impl TemplatePlan {
                         hint: operands.hint,
                     }
                 }
-                Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::ReturnDerived
-                    if finally_protected
-                        .iter()
-                        .any(|(enter, end)| pc > *enter && pc <= *end) =>
-                {
-                    osr_only = true;
-                    TemplateOp::UnsupportedBail
-                }
                 Op::Return | Op::ReturnValue => TemplateOp::Return {
                     src: lowered.source_operands()?.src,
                 },
@@ -1894,7 +1842,11 @@ impl TemplatePlan {
                 op,
             });
         }
-        let (instructions, chain_steps, chain_leaves) = fuse_numeric_chains(view, instructions);
+        let (instructions, chain_steps, chain_leaves) = if fuse {
+            fuse_numeric_chains(view, instructions)
+        } else {
+            (instructions, Vec::new(), Vec::new())
+        };
         Ok(Self {
             instructions,
             register_count: view.code_block.register_count,
@@ -2609,56 +2561,25 @@ mod tests {
     }
 
     #[test]
-    fn plan_maps_structured_exception_region_completion() {
+    fn plan_maps_throw_and_tdz_completion() {
         let v = view(&[
-            (
-                Op::EnterTry,
-                vec![
-                    Operand::Imm32(1),
-                    Operand::Imm32(otter_vm::NO_HANDLER_OFFSET),
-                    Operand::Register(3),
-                ],
-            ),
-            (Op::LeaveTry, vec![]),
             (Op::Throw, vec![Operand::Register(1)]),
-            (Op::EndFinally, vec![]),
-            (Op::PopParkedFinally, vec![Operand::Imm32(1)]),
-            (
-                Op::JumpViaFinally,
-                vec![Operand::Imm32(0), Operand::Imm32(0)],
-            ),
+            (Op::TdzError, vec![Operand::Imm32(4)]),
             (Op::ReturnUndefined, vec![]),
         ]);
         let plan = TemplatePlan::build(&v).expect("exception plan");
         assert!(!plan.osr_only);
+        assert_eq!(plan.instructions[0].op, TemplateOp::Throw { src: 1 });
         assert_eq!(
-            plan.instructions[0].op,
-            TemplateOp::EnterTry {
-                catch_pc: Some(2),
-                finally_pc: None,
-                exception_register: 3,
-            }
-        );
-        assert_eq!(plan.instructions[1].op, TemplateOp::LeaveTry);
-        assert_eq!(plan.instructions[2].op, TemplateOp::Throw { src: 1 });
-        assert_eq!(plan.instructions[3].op, TemplateOp::EndFinally);
-        assert_eq!(
-            plan.instructions[4].op,
-            TemplateOp::PopParkedFinally { count: 1 }
-        );
-        assert_eq!(
-            plan.instructions[5].op,
-            TemplateOp::JumpViaFinally {
-                target: 6,
-                floor: 0,
-            }
+            plan.instructions[1].op,
+            TemplateOp::TdzError { local_index: 4 }
         );
     }
 
     #[test]
     fn plan_maps_iterator_lifecycle_completion() {
         let v = view(&[
-            (Op::IteratorCloseStart, vec![Operand::Register(1)]),
+            (Op::IteratorCloseThrow, vec![Operand::Register(1)]),
             (
                 Op::IteratorNext,
                 vec![
@@ -2668,7 +2589,7 @@ mod tests {
                 ],
             ),
             (Op::IteratorClose, vec![Operand::Register(1)]),
-            (Op::IteratorCloseEnd, vec![Operand::Register(1)]),
+            (Op::Nop, vec![]),
             (
                 Op::GetAsyncIterator,
                 vec![Operand::Register(4), Operand::Register(1)],
@@ -2683,7 +2604,7 @@ mod tests {
         assert!(!plan.osr_only);
         assert_eq!(
             plan.instructions[0].op,
-            TemplateOp::IteratorCloseStart { iterator: 1 }
+            TemplateOp::IteratorCloseThrow { iterator: 1 }
         );
         assert_eq!(
             plan.instructions[1].op,
@@ -2696,10 +2617,6 @@ mod tests {
         assert_eq!(
             plan.instructions[2].op,
             TemplateOp::IteratorClose { iterator: 1 }
-        );
-        assert_eq!(
-            plan.instructions[3].op,
-            TemplateOp::IteratorCloseEnd { iterator: 1 }
         );
         assert_eq!(
             plan.instructions[4].op,

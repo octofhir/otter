@@ -9,7 +9,8 @@
 //! An interpreter entry never dispatches its caller or child. Child requests
 //! return to assembly after all Rust borrows end. A resumed payload is homed
 //! before allocation. The native frame chain stays published throughout error
-//! conversion, finally execution and suspension cleanup.
+//! conversion and suspension cleanup. An activation waiting on a call it
+//! staged stands at the staging instruction until the call completes.
 //!
 //! # See also
 //! - [`super::dispatch`] for bytecode execution.
@@ -105,6 +106,19 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
             NativeResultPair::fatal_internal()
         };
     }
+    // A call this activation staged has completed. The activation stands
+    // at the staging instruction; a call instruction moves past it on a
+    // normal completion. Only a frame waiting on its call carries the bit.
+    let advance_on_resume = !tier_completion && {
+        let header = unsafe { &mut (*frame).header };
+        let staged_past = header
+            .flags
+            .contains(crate::native_abi::NativeFrameFlags::ADVANCE_ON_RESUME);
+        header.flags = header
+            .flags
+            .without(crate::native_abi::NativeFrameFlags::ADVANCE_ON_RESUME);
+        staged_past
+    };
     let resume_error = if tier_completion {
         match vm.complete_compiled_entry(stack, context, floor, completion) {
             Ok(Some(value)) => return NativeResultPair::success(value),
@@ -128,10 +142,18 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
                         return NativeResultPair::fatal_internal();
                     }
                 }
+                if advance_on_resume {
+                    let header = unsafe { &mut (*frame).header };
+                    let Some(next) = header.pc.checked_add(1) else {
+                        return NativeResultPair::fatal_internal();
+                    };
+                    header.pc = next;
+                }
                 None
             }
             Some(NativeResultStatus::Throw) => {
                 vm.set_pending_uncaught_throw(completion.payload_value());
+                vm.abandon_pending_ladders(unsafe { &mut *frame });
                 Some(VmError::Uncaught)
             }
             Some(NativeResultStatus::Fatal) => Some(
@@ -143,25 +165,18 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         }
     };
     let mut resume_error = resume_error;
-    match resume {
-        crate::prepared_call::ResumeInput::Normal => {}
-        crate::prepared_call::ResumeInput::Throw(reason) => {
-            // The thrown value unwinds the resumed body like any throw: a
-            // handler or `finally` may consume or replace it, so only the
-            // completion that escapes the body reaches the resumer.
-            vm.set_pending_uncaught_throw(reason);
-            resume_error = Some(VmError::Uncaught);
-        }
-        crate::prepared_call::ResumeInput::Return(value) => {
-            match vm.return_running_finally_above(stack, floor, value) {
-                Ok(Some(value)) => return NativeResultPair::success(value),
-                Ok(None) => {}
-                Err(error) => resume_error = Some(error),
-            }
-        }
+    let mut resume_site = crate::activation_stack::ThrowSite::Instruction;
+    if let crate::prepared_call::ResumeInput::Throw(reason) = resume {
+        // The thrown value unwinds the resumed body like any throw: a
+        // handler may consume or replace it, so only the completion that
+        // escapes the body reaches the resumer. The body is parked past its
+        // `Await` or `GeneratorStart`.
+        vm.set_pending_uncaught_throw(reason);
+        resume_error = Some(VmError::Uncaught);
+        resume_site = crate::activation_stack::ThrowSite::AfterCall;
     }
     // A first entry is the only interpreter entry that starts at PC zero:
-    // every resumed caller has advanced past its call.
+    // every resumed caller stands at or past its call.
     if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
         vm.record_runtime_bytecode_call();
     }
@@ -179,7 +194,7 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
             Err(error) => resume_error = Some(error),
         }
     }
-    match vm.dispatch_current_activation(context, stack, floor, resume_error) {
+    match vm.dispatch_current_activation(context, stack, floor, resume_error, resume_site) {
         Ok(DispatchOutcome::Call) => {
             match stack.take_request().or_else(|| stack.pending_packet()) {
                 Some(packet) => {

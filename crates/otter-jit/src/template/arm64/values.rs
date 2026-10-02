@@ -91,7 +91,7 @@ pub(crate) fn emit_prototype_validity_guard(
 }
 
 /// Materialize a validated runtime-stub entry and attach its descriptor.
-pub(super) fn emit_load_runtime_stub(
+pub(crate) fn emit_load_runtime_stub(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     t: u8,

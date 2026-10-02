@@ -176,6 +176,11 @@ impl NativeFrameFlags {
     /// Activation uses derived-constructor return and `this` binding
     /// semantics across every execution tier.
     pub const DERIVED_CONSTRUCTOR: u8 = 1 << 2;
+    /// An interpreter activation waiting on a call it staged stands at the
+    /// staging instruction; a normal completion of the call moves it past
+    /// that instruction. Without the bit the instruction runs again (a
+    /// protocol ladder resuming its parked state).
+    pub const ADVANCE_ON_RESUME: u8 = 1 << 3;
     /// The optimizing tier is entered at a loop header rather than at the
     /// function's start: the header's canonical PC is the frame's `pc`, and
     /// every live register holds the interpreter's current value. The
@@ -208,6 +213,18 @@ impl NativeFrameFlags {
     #[must_use]
     pub const fn contains(self, mask: u8) -> bool {
         self.0 & mask == mask
+    }
+
+    /// This set with `mask` added.
+    #[must_use]
+    pub const fn with(self, mask: u8) -> Self {
+        Self(self.0 | mask)
+    }
+
+    /// This set with `mask` removed.
+    #[must_use]
+    pub const fn without(self, mask: u8) -> Self {
+        Self(self.0 & !mask)
     }
 }
 

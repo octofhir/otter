@@ -170,6 +170,61 @@ pub(crate) fn destructure_pattern(
     }
 }
 
+/// How an array pattern's steps left its iterator.
+pub(crate) enum IteratorTail {
+    /// A rest element drained it.
+    Drained,
+    /// The last step's `done` register says whether it is exhausted.
+    Done(u16),
+    /// No step ran.
+    Open,
+}
+
+/// Run `steps` — the iterator steps and element targets of an array pattern
+/// (§8.6.3 IteratorBindingInitialization, §13.15.5.5) — with `iterator`
+/// open. A throw out of them closes it with a throw completion; a `return`
+/// out of them (a `yield` resumed by `return`) closes it on the way out;
+/// the normal completion closes it unless it is done.
+pub(crate) fn with_open_iterator(
+    cx: &mut Compiler,
+    iterator: u16,
+    span: (u32, u32),
+    steps: impl FnOnce(&mut Compiler) -> Result<IteratorTail, CompileError>,
+) -> Result<(), CompileError> {
+    let exc_reg = cx.alloc_scratch();
+    cx.enter_iterator_scope(iterator, false);
+    let start = cx.next_pc();
+    let tail = steps(cx);
+    let landing = cx.protect(start, exc_reg);
+    let tail = match tail {
+        Ok(tail) => tail,
+        Err(error) => {
+            cx.control.pop();
+            return Err(error);
+        }
+    };
+    match tail {
+        IteratorTail::Drained => {}
+        IteratorTail::Done(done_reg) => {
+            let skip_close = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+            cx.emit(Op::IteratorClose, [Operand::Register(iterator)], span);
+            cx.patch_branch_to_here(skip_close);
+        }
+        IteratorTail::Open => {
+            cx.emit(Op::IteratorClose, [Operand::Register(iterator)], span);
+        }
+    }
+    let after = cx.emit_branch_placeholder(Op::Jump, None, span);
+    if let Some(landing) = landing {
+        cx.patch_handler_to_here(landing);
+        cx.emit(Op::IteratorCloseThrow, [Operand::Register(iterator)], span);
+        cx.emit(Op::Throw, [Operand::Register(exc_reg)], span);
+    }
+    cx.leave_iterator_scope(span);
+    cx.patch_branch_to_here(after);
+    Ok(())
+}
+
 pub(crate) fn destructure_array_inner(
     parent: &mut Compiler,
     src_reg: u16,
@@ -183,28 +238,30 @@ pub(crate) fn destructure_array_inner(
         [Operand::Register(iter_reg), Operand::Register(src_reg)],
         span,
     );
-    parent.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
-    let mut last_done_reg = None;
-    for elem in &pattern.elements {
-        let value_reg = parent.alloc_scratch();
-        let done_reg = parent.alloc_scratch();
-        parent.emit(
-            Op::IteratorNext,
-            vec![
-                Operand::Register(value_reg),
-                Operand::Register(done_reg),
-                Operand::Register(iter_reg),
-            ],
-            span,
-        );
-        last_done_reg = Some(done_reg);
-        // A hole (`,,`) leaves the slot unbound — nothing to emit.
-        let Some(inner) = elem else {
-            continue;
+    with_open_iterator(parent, iter_reg, span, |parent| {
+        let mut last_done_reg = None;
+        for elem in &pattern.elements {
+            let value_reg = parent.alloc_scratch();
+            let done_reg = parent.alloc_scratch();
+            parent.emit(
+                Op::IteratorNext,
+                vec![
+                    Operand::Register(value_reg),
+                    Operand::Register(done_reg),
+                    Operand::Register(iter_reg),
+                ],
+                span,
+            );
+            last_done_reg = Some(done_reg);
+            // A hole (`,,`) leaves the slot unbound — nothing to emit.
+            let Some(inner) = elem else {
+                continue;
+            };
+            destructure_pattern(parent, value_reg, inner, span, assign_existing)?;
+        }
+        let Some(rest) = &pattern.rest else {
+            return Ok(last_done_reg.map_or(IteratorTail::Open, IteratorTail::Done));
         };
-        destructure_pattern(parent, value_reg, inner, span, assign_existing)?;
-    }
-    if let Some(rest) = &pattern.rest {
         // Drain the rest of the iterator into a fresh array.
         let arr_reg = parent.alloc_scratch();
         parent.emit(
@@ -234,17 +291,8 @@ pub(crate) fn destructure_array_inner(
         parent.patch_branch(back, loop_top);
         parent.patch_branch_to_here(exit);
         destructure_pattern(parent, arr_reg, &rest.argument, span, assign_existing)?;
-        parent.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    } else if let Some(done_reg) = last_done_reg {
-        let skip_close = parent.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
-        parent.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
-        parent.patch_branch_to_here(skip_close);
-        parent.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    } else {
-        parent.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
-        parent.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
-    }
-    Ok(())
+        Ok(IteratorTail::Drained)
+    })
 }
 
 pub(crate) fn destructure_object_inner(

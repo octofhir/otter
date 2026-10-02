@@ -18,6 +18,7 @@
 //!   a [`crate::string::JsString`] without losing WTF-16 code units when
 //!   the primitive result is already a JavaScript string.
 //! - [`to_number_or_throw`] — §7.1.4 `ToNumber(argument)`.
+//! - [`to_numeric_or_throw`] — §7.1.3 `ToNumeric(value)`.
 //! - [`to_index_or_throw`] — §7.1.22 `ToIndex(value)`.
 //!
 //! # Invariants
@@ -247,6 +248,28 @@ pub(crate) fn to_number_or_throw(
         interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
     };
     primitive_to_number(interp, &primitive)
+}
+
+/// §7.1.3 `ToNumeric(value)`: a Number or BigInt value. Objects flow
+/// through `ToPrimitive(value, "number")` first; Symbol raises TypeError.
+pub(crate) fn to_numeric_or_throw(
+    interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    context: &ExecutionContext,
+    input: &Value,
+) -> Result<Value, VmError> {
+    if input.is_number() || input.is_big_int() {
+        return Ok(*input);
+    }
+    let primitive = if abstract_ops::is_primitive(input) {
+        *input
+    } else {
+        interp.evaluate_to_primitive(stack, context, input, ToPrimitiveHint::Number)?
+    };
+    if primitive.is_number() || primitive.is_big_int() {
+        return Ok(primitive);
+    }
+    primitive_to_number(interp, &primitive).map(Value::number)
 }
 
 /// §7.1.4 `ToNumber` restricted to primitive operands — the

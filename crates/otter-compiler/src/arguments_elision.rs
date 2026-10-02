@@ -43,8 +43,8 @@ fn register(operand: Operand) -> Option<usize> {
 }
 
 /// Prove that the implicit object is consumed only by copies, `.length` and
-/// indexed reads. Eligibility for eval, parameter mapping and suspension is
-/// checked by the function compiler before this pass.
+/// indexed reads. Eligibility for eval, parameter mapping, suspension and
+/// exception handlers is checked by the function compiler before this pass.
 pub(crate) fn analyze(
     code: &FunctionCodeBuilder,
     constants: &[Constant],
@@ -65,13 +65,9 @@ pub(crate) fn analyze(
             return None;
         }
         let schema = opcode_schema(op);
-        // Handler/resumption edges need their own transfer rules. Keeping the
-        // object in these functions is conservative and preserves the oracle.
-        if matches!(
-            schema.control_flow,
-            ControlFlow::Suspend | ControlFlow::ExceptionRegion
-        ) || matches!(op, Op::JumpViaFinally | Op::Eval)
-        {
+        // Resumption edges need their own transfer rules. Keeping the object
+        // in these functions is conservative and preserves the oracle.
+        if schema.control_flow == ControlFlow::Suspend || op == Op::Eval {
             return None;
         }
         let mut edges = Vec::with_capacity(2);

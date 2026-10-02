@@ -1,12 +1,16 @@
 //! Try, catch, and finally statement lowering.
 //!
 //! # Contents
-//! - try-region emission
+//! - [`compile_try_statement`] — protected ranges, the catch landing, and
+//!   the finally block with its exits.
 //! - catch binding setup
-//! - finally finalization
+//! - finally completion-value handling
 //!
 //! # Invariants
-//! - Every entered try region is paired with explicit leave or finalizer handling.
+//! - A catch clause lands from the handler table entry covering its try
+//!   block; a finally block is entered from its protected range (try block
+//!   and catch clause) with a completion token, then resumes that
+//!   completion (see `control`).
 //! - The try, catch, and finally blocks each run BlockDeclarationInstantiation
 //!   (§14.2.3): lexical declarations and hoisted functions of the block bind
 //!   in its own scope, whose context each entry creates afresh. The catch
@@ -14,111 +18,55 @@
 //!
 //! # See also
 //! - `statements` for dispatch
+//! - `control` for abrupt-completion routing
 
+use crate::control::ControlScope;
 use crate::*;
 
-/// Lower `try { … } catch (e) { … } finally { … }` per ES spec
-/// completion-record semantics (the foundation slice approximates
-/// it with a `pending_throw` slot on the frame; see
-/// [`Frame::pending_throw`](otter_vm::Frame)). The lowering picks
-/// one of three shapes:
+/// Lower `try { A } catch (e) { B } finally { C }` (§14.15.3).
 ///
-/// - `try { A } catch (e) { B }` (no finally): one [`Op::EnterTry`]
-///   with `catch_pc = C` and `finally_pc = NO_HANDLER_OFFSET`. The
-///   try body is followed by [`Op::LeaveTry`] and a forward jump
-///   past the catch landing.
-/// - `try { A } finally { C }` (no catch): one `EnterTry` with
-///   `catch_pc = NO_HANDLER_OFFSET` and `finally_pc = F`. The try
-///   body is followed by `LeaveTry` and falls through into `C`,
-///   which terminates with [`Op::EndFinally`].
-/// - `try { A } catch (e) { B } finally { C }`: two nested
-///   `EnterTry`s — the outer one routes any throw inside `A` or
-///   `B` through `C`, the inner one routes throws inside `A` to
-///   the catch landing. After `B` runs, control falls through into
-///   `C`; `EndFinally` re-throws any exception parked on the frame.
-///
-/// `finally`-rethrow rule (per the task spec): if `finally` itself
-/// throws, the new exception replaces the in-flight one. The
-/// runtime implements this by overwriting `pending_throw` whenever
-/// a fresh `Throw` walks into a finally handler.
+/// - The catch clause is a handler table entry over `A` whose landing binds
+///   the thrown value and runs `B`.
+/// - The finally block is protected-range code: `A` (and `B`) run inside a
+///   finally scope, and every way out of that range — falling out, a throw,
+///   a `break` / `continue` / `return` — enters `C` with a token that the
+///   code after `C` dispatches on.
 pub(crate) fn compile_try_statement(
     cx: &mut Compiler,
     s: &oxc_ast::ast::TryStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
-    use otter_bytecode::NO_HANDLER_OFFSET;
-
     let span = (s.span.start, s.span.end);
     cx.emit_completion_reset(span);
-    let has_catch = s.handler.is_some();
-    let has_finally = s.finalizer.is_some();
-    if !has_catch && !has_finally {
-        return Err(CompileError::Unsupported {
-            node: "TryStatement without catch or finally".to_string(),
-            span,
-        });
-    }
-
-    // Reserve the exception register up front so its index survives
-    // every branch — the unwinder writes the thrown value into it
-    // before jumping to the catch landing.
-    let exc_reg = cx.alloc_scratch();
     let body_span = (s.block.span.start, s.block.span.end);
+    let finally_start = s.finalizer.is_some().then(|| cx.enter_finally());
 
-    if has_catch && has_finally {
-        let outer = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
-        // The outer handler carries the `finally`; track both depths so
-        // `break`/`continue` inside the body or catch can route through
-        // it (§14.15.3).
-        cx.active_handlers += 1;
-        cx.active_finally += 1;
-        let inner = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
-        cx.active_handlers += 1;
-
-        compile_try_block(cx, &s.block)?;
-        cx.emit(Op::LeaveTry, vec![], span);
-        cx.active_handlers -= 1; // inner catch handler left
-        let success_jump = cx.emit_branch_placeholder(Op::Jump, None, span);
-
-        cx.patch_enter_try_offset(inner, /* catch */ true);
-        compile_catch_clause(cx, s.handler.as_ref().unwrap(), exc_reg, body_span)?;
-
-        cx.patch_branch_to_here(success_jump);
-
-        cx.emit(Op::LeaveTry, vec![], span);
-        cx.active_handlers -= 1; // outer finally handler left
-        cx.active_finally -= 1;
-        cx.patch_enter_try_offset(outer, /* finally */ false);
-        compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
-        cx.emit(Op::EndFinally, vec![], span);
-        return Ok(None);
+    match &s.handler {
+        Some(handler) => {
+            // The unwinder writes the thrown value here before the landing.
+            let exc_reg = cx.alloc_scratch();
+            let start = cx.next_pc();
+            cx.control.push(ControlScope::Catch);
+            let block = compile_try_block(cx, &s.block);
+            cx.control.pop();
+            block?;
+            // A try block that emits nothing cannot throw: its catch clause
+            // is still compiled (its early errors stand) but never entered.
+            let landing = cx.protect(start, exc_reg);
+            let skip_catch = cx.emit_branch_placeholder(Op::Jump, None, span);
+            if let Some(landing) = landing {
+                cx.patch_handler_to_here(landing);
+            }
+            compile_catch_clause(cx, handler, exc_reg, body_span)?;
+            cx.patch_branch_to_here(skip_catch);
+        }
+        None => compile_try_block(cx, &s.block)?,
     }
 
-    if has_catch {
-        let handler_pc = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
-        cx.active_handlers += 1;
-        compile_try_block(cx, &s.block)?;
-        cx.emit(Op::LeaveTry, vec![], span);
-        cx.active_handlers -= 1;
-        let skip_catch = cx.emit_branch_placeholder(Op::Jump, None, span);
-
-        cx.patch_enter_try_offset(handler_pc, true);
-        compile_catch_clause(cx, s.handler.as_ref().unwrap(), exc_reg, body_span)?;
-
-        cx.patch_branch_to_here(skip_catch);
-        return Ok(None);
+    if let (Some(start), Some(finalizer)) = (finally_start, &s.finalizer) {
+        let scope = cx.leave_finally_range(start, span);
+        compile_finalizer(cx, finalizer)?;
+        cx.emit_finally_exits(scope, span);
     }
-
-    // try / finally only.
-    let handler_pc = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
-    cx.active_handlers += 1;
-    cx.active_finally += 1;
-    compile_try_block(cx, &s.block)?;
-    cx.emit(Op::LeaveTry, vec![], span);
-    cx.active_handlers -= 1;
-    cx.active_finally -= 1;
-    cx.patch_enter_try_offset(handler_pc, false);
-    compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
-    cx.emit(Op::EndFinally, vec![], span);
     Ok(None)
 }
 
@@ -220,14 +168,12 @@ pub(crate) fn compile_finalizer(
         _ => None,
     };
     let saved = cx.completion_suppressed;
-    cx.top_mut().finally_body_depth += 1;
     // §14.2.3 — the finally Block instantiates its declarations like any
     // other block.
     let fspan = (finalizer.span.start, finalizer.span.end);
     cx.enter_scope(otter_bytecode::ScopeKind::Block);
     let result = compile_block_statements(cx, &finalizer.body, fspan).map(drop);
     cx.exit_scope();
-    cx.top_mut().finally_body_depth -= 1;
     cx.top_mut().completion_suppressed = saved;
     if let Some((creg, snapshot)) = completion_restore {
         cx.emit(

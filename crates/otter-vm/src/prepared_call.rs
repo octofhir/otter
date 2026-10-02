@@ -30,7 +30,6 @@ pub(crate) enum ResumeInput {
     #[default]
     Normal,
     Throw(Value),
-    Return(Value),
 }
 
 #[derive(Debug)]
@@ -120,9 +119,7 @@ impl PreparedCall {
 
     fn trace_inputs(&self, visitor: &mut SlotVisitor<'_>) {
         match &self.resume {
-            ResumeInput::Throw(value) | ResumeInput::Return(value) => {
-                value.trace_value_slots(visitor)
-            }
+            ResumeInput::Throw(value) => value.trace_value_slots(visitor),
             ResumeInput::Normal => {}
         }
         self.self_value.trace_value_slots(visitor);

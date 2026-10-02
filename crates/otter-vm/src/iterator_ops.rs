@@ -504,14 +504,6 @@ impl Interpreter {
         let (value, done) = step_iterator(iter, &mut self.gc_heap)?;
         write_register(frame, value_dst, value)?;
         write_register(frame, done_dst, Value::boolean(done))?;
-        if done {
-            // §7.4.9 — an exhausted iterator is `[[Done]]`; drop it from
-            // the closer registry so a later throw-unwind treats
-            // IteratorClose as the spec no-op rather than re-running
-            // `[[return]]`.
-            let iterator = *read_register(frame, iter_reg)?;
-            self.deregister_frame_iterator_closer(frame, iterator);
-        }
         frame.advance_pc()?;
         Ok(())
     }
@@ -2532,6 +2524,34 @@ impl Interpreter {
         })
     }
 
+    /// Set an iterator record's `[[Done]]`: a later close is a no-op.
+    pub(crate) fn iterator_mark_done(&mut self, iterator: Value) {
+        if let Some(handle) = iterator.as_iterator() {
+            self.gc_heap.with_payload(handle, |state| state.exhaust());
+        }
+    }
+
+    /// §7.4.11 IteratorClose with a throw completion: an open iterator runs
+    /// its `return`, and whatever that raises is discarded so the caller
+    /// rethrows the original value. Only an interrupt propagates.
+    pub(crate) fn iterator_close_for_throw(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        iterator: Value,
+    ) -> Result<(), VmError> {
+        match self.iterator_close_value_sync(stack, context, iterator) {
+            Ok(()) => Ok(()),
+            Err(VmError::Interrupted) => Err(VmError::Interrupted),
+            Err(_) => {
+                self.pending_uncaught_throw = None;
+                self.pending_uncaught_frames = None;
+                let _ = self.take_error_detail();
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn iterator_close_value_sync(
         &mut self,
         stack: &mut ActivationStack,
@@ -2561,7 +2581,7 @@ impl Interpreter {
             None,
         }
         let action = if let Some(handle) = iterator.as_iterator() {
-            self.gc_heap.read_payload(handle, |state| match state {
+            let action = self.gc_heap.read_payload(handle, |state| match state {
                 IteratorState::User { iterator, .. } => CloseAction::User(*iterator),
                 // §7.4.9 — a generator's `return` resumes the suspended
                 // body with a return completion so its `finally` blocks
@@ -2609,7 +2629,13 @@ impl Interpreter {
                 // expose no `return`, so IteratorClose is a no-op.
                 IteratorState::Exhausted { .. } => CloseAction::None,
                 _ => CloseAction::Builtin,
-            })
+            });
+            // A closing record is done: a close it triggers again, or a
+            // throw out of its `return`, finds nothing left to close.
+            if matches!(action, CloseAction::User(_) | CloseAction::Generator(_)) {
+                self.gc_heap.with_payload(handle, |state| state.exhaust());
+            }
+            action
         } else {
             CloseAction::User(iterator)
         };
@@ -3227,14 +3253,11 @@ impl Interpreter {
     /// `{value, done: false}`) or the body runs to completion (returning
     /// `{value: returnValue, done: true}`).
     ///
-    /// `kind` selects the entry behaviour per §27.5.3:
-    /// - `Next(arg)`: write `arg` into the previous yield's dst and continue.
-    /// - `Return(arg)`: act as if the body executed `return arg;` from the
-    ///   current pc. Active `finally` handlers run before the generator
-    ///   completes, and may replace that completion.
-    /// - `Throw(reason)`: re-enter the body and immediately throw `reason`
-    ///   from the current pc; finally / catch handlers take over per the
-    ///   unwind machinery.
+    /// `kind` selects the entry behaviour per §27.5.3. A body suspended at a
+    /// yield receives the kind code and argument in the yield's registers
+    /// and its compiled code continues, throws, or returns. A body that has
+    /// not started discards a `next` argument, completes on `return`, and
+    /// throws a `throw` reason without running.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-generator.prototype.next>
@@ -3286,15 +3309,14 @@ impl Interpreter {
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(frame.as_ref()));
         if let Some(c) = cold {
-            self.prepared_attach_cold(&mut frame, c);
+            self.prepared_attach_cold(&mut frame, *c);
         }
-        // §27.5.3.7 — a frame parked on `Op::YieldDelegate` receives
-        // every resume kind as data (kind code + argument) so the
-        // compiled `yield*` loop can forward it to the inner
-        // iterator's next / throw / return method instead of the
-        // generator unwinding or completing.
-        let delegating = handle.is_delegating(&self.gc_heap);
-        if delegating {
+        // §27.5.3.7 — a frame parked on a yield receives every resume kind
+        // as data (kind code + argument): the compiled code after the
+        // suspension continues, throws the argument, or returns it through
+        // its finally blocks and open iterators, and a `yield*` forwards it
+        // to the inner iterator.
+        if resume_dst != crate::generator::JsGenerator::RESUME_DST_NONE {
             handle.clear_delegating(&mut self.gc_heap);
             let kind_dst = handle.resume_kind_dst(&self.gc_heap);
             let (code, arg) = match &kind {
@@ -3313,77 +3335,30 @@ impl Interpreter {
             stack.push(*frame);
             return self.finish_generator_dispatch(stack, floor, context, handle, is_async);
         }
-        // Apply the resume operation to the frame before re-entering
-        // dispatch.
-        let mut throw_value: Option<Value> = None;
-        let mut return_value: Option<Value> = None;
+        // Suspended at the start (§27.5.3.3/.4): the body has not run, so
+        // the value of a first `next()` is discarded, a `return` completes
+        // without resuming, and a `throw` leaves the body at once.
         match &kind {
-            GeneratorResumeKind::Next(arg) => {
-                // §27.5.3.3 — the value passed to the first `next()`
-                // (frame parked at GeneratorStart) is discarded.
-                if frame.pc != 0 && resume_dst != crate::generator::JsGenerator::RESUME_DST_NONE {
-                    frame.seed_register(resume_dst, *arg)?;
-                }
-            }
+            GeneratorResumeKind::Next(_) => {}
             GeneratorResumeKind::Return(arg) => {
-                let closers = self
-                    .prepared_cold(&frame)
-                    .map(|cold| cold.active_iterator_closers.clone())
-                    .unwrap_or_default();
-                for (iterator, _) in closers.iter().rev() {
-                    if let Err(err) = self.iterator_close_value_sync(stack, context, *iterator) {
-                        // §7.4.11 IteratorClose throwing (a `return` method
-                        // yielding a non-object, or itself throwing) turns
-                        // this resumption into a throw completion. An async
-                        // generator answers through its queued request —
-                        // the error must reject that promise, never escape
-                        // as a bare VmError that leaves it forever pending.
-                        if handle.is_async(&self.gc_heap) {
-                            let reason = self.take_pending_uncaught_throw().unwrap_or_else(|| {
-                                crate::promise_dispatch::rejection_value_for(self, &err)
-                            });
-                            handle.mark_done(&mut self.gc_heap);
-                            self.async_generator_complete_step(context, handle, Err(reason), true)?;
-                            self.async_generator_drain_done(stack, context, handle)?;
-                            return Ok(Value::undefined());
-                        }
-                        return Err(err);
-                    }
+                handle.mark_done(&mut self.gc_heap);
+                // An async generator answers through the request its caller
+                // queued, not through this return value — the caller was
+                // handed that request's promise and has already gone. The
+                // whole queue completes the way a finished body completes
+                // it: the front request with the value `return` carried,
+                // and every request behind it as done.
+                if handle.is_async(&self.gc_heap) {
+                    self.async_generator_complete_step(context, handle, Ok(*arg), true)?;
+                    self.async_generator_drain_done(stack, context, handle)?;
+                    return Ok(Value::undefined());
                 }
-                // §27.5.3.4 GeneratorResumeAbrupt(return) — if the body
-                // is suspended inside a `try` with a `finally`, resume
-                // it so those blocks run (a finally may even override
-                // the completion). With no active finally, complete
-                // immediately.
-                let has_finally = self
-                    .prepared_cold(&frame)
-                    .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
-                if !has_finally {
-                    handle.mark_done(&mut self.gc_heap);
-                    // An async generator answers through the request its caller
-                    // queued, not through this return value — the caller was
-                    // handed that request's promise and has already gone. The
-                    // whole queue completes the way a finished body completes
-                    // it: the front request with the value `return` carried,
-                    // and every request behind it as done.
-                    if handle.is_async(&self.gc_heap) {
-                        self.async_generator_complete_step(context, handle, Ok(*arg), true)?;
-                        self.async_generator_drain_done(stack, context, handle)?;
-                        return Ok(Value::undefined());
-                    }
-                    return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
-                }
-                return_value = Some(*arg);
+                return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
             }
             GeneratorResumeKind::Throw(reason) => {
-                throw_value = Some(*reason);
+                frame.resume = crate::prepared_call::ResumeInput::Throw(*reason);
             }
         }
-        frame.resume = match (throw_value, return_value) {
-            (Some(reason), _) => crate::prepared_call::ResumeInput::Throw(reason),
-            (_, Some(value)) => crate::prepared_call::ResumeInput::Return(value),
-            _ => crate::prepared_call::ResumeInput::Normal,
-        };
         let floor = stack.floor();
         drop(input_roots);
         stack.push(*frame);
@@ -3718,13 +3693,6 @@ impl Interpreter {
             if done && let Some(rc) = state.iterator.as_iterator() {
                 self.gc_heap.with_payload(rc, |state| state.exhaust());
             }
-            if !done {
-                // §7.4.9 — `next` produced a value without throwing, so
-                // the iterator is live again: re-arm its closer (cleared
-                // before the call) so a body abrupt completion runs
-                // `[[return]]`.
-                self.register_frame_iterator_closer(&mut stack[top_idx], state.iterator);
-            }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
@@ -3860,13 +3828,10 @@ impl Interpreter {
         if !is_callable(&next_fn) {
             return Err(VmError::TypeMismatch);
         }
-        // §7.4.9 / IteratorStepValue — a throw out of `next` (or out
-        // of reading the result record) sets [[Done]] and skips
-        // IteratorClose. The call runs in a pushed frame, so its
-        // throw unwinds without ever returning `Err` to this opcode:
-        // disarm the closer for the span of the call; the resume path
-        // re-arms it once `next` yields `done: false`.
-        self.deregister_frame_iterator_closer(&mut stack[top_idx], iter_value);
+        // §7.4.9 / IteratorStepValue — a throw out of `next` sets
+        // [[Done]]. The call runs in a pushed frame, so its throw reaches
+        // this activation as an abandoned ladder, which marks the parked
+        // iterator done (`abandon_pending_ladders`).
         // Park the state and push a call. `result_reg` reuses the
         // `value_dst` slot — the resume step overwrites it with
         // the unpacked value before the user code observes it.

@@ -2159,7 +2159,8 @@ impl Interpreter {
                             native_abi::NativeFrameKind::Optimizing => {
                                 jit_debug::JitDebugTier::Optimizing
                             }
-                            native_abi::NativeFrameKind::Interpreter | native_abi::NativeFrameKind::Host => {
+                            native_abi::NativeFrameKind::Interpreter
+                            | native_abi::NativeFrameKind::Host => {
                                 jit_debug::JitDebugTier::Interpreter
                             }
                         },
@@ -2311,7 +2312,8 @@ impl Interpreter {
                                     native_abi::NativeFrameKind::Optimizing => {
                                         jit_debug::JitDebugTier::Optimizing
                                     }
-                                    native_abi::NativeFrameKind::Interpreter | native_abi::NativeFrameKind::Host => {
+                                    native_abi::NativeFrameKind::Interpreter
+                                    | native_abi::NativeFrameKind::Host => {
                                         jit_debug::JitDebugTier::Interpreter
                                     }
                                 },

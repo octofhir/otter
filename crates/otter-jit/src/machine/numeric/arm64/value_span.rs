@@ -22,9 +22,15 @@ pub(super) fn emit_value_span_arguments(
     arguments: impl ExactSizeIterator<Item = super::super::super::MachineValue>,
 ) -> Result<(), Unsupported> {
     let arguments = arguments.collect::<Vec<_>>();
-    emit_value_span_words(ops, sequence, frame, arguments.len(), |ops, index, register| {
-        emit_load_safepoint_root(ops, frame, site, arguments[index], register, 0)
-    })
+    emit_value_span_words(
+        ops,
+        sequence,
+        frame,
+        arguments.len(),
+        |ops, index, register| {
+            emit_load_safepoint_root(ops, frame, site, arguments[index], register, 0)
+        },
+    )
 }
 
 /// Fill a `count`-word packet through `load(ops, index, register)`, which

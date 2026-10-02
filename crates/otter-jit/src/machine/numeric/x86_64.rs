@@ -39,7 +39,6 @@ mod number_probe;
 #[path = "x86_64/receiver_allocation.rs"]
 mod receiver_allocation;
 
-
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_bytecode::opcode_schema::{BindingRead, BindingSemantics, BindingWrite};
 use otter_vm::{
@@ -552,7 +551,12 @@ pub(super) fn emit(
             MachineOpcode::AllocateObject { plan, byte_pc } => {
                 let start = ops.offset().0;
                 load_integer(&mut ops, frame, loc[0], 2)?;
-                receiver_allocation::emit_receiver_candidate_probe(&mut ops, &mut relocations, view, plan);
+                receiver_allocation::emit_receiver_candidate_probe(
+                    &mut ops,
+                    &mut relocations,
+                    view,
+                    plan,
+                );
                 store_integer(&mut ops, frame, loc[1], 0)?;
                 store_integer(&mut ops, frame, loc[2], 1)?;
                 structural_regions.push((
@@ -2884,7 +2888,9 @@ fn publish_forwarded_formals_context(
     let context = *argument_count
         .checked_sub(1)
         .and_then(|index| locations.get(index))
-        .ok_or(Unsupported::OperandShape("x86-64 forwarded formals context"))?;
+        .ok_or(Unsupported::OperandShape(
+            "x86-64 forwarded formals context",
+        ))?;
     // r11 is the only integer scratch; borrow rax around the store.
     dynasm!(ops ; .arch x64 ; push rax);
     load_integer_with_bias(ops, frame, context, 11, 8)?;
@@ -2952,8 +2958,6 @@ fn maybe_deopt(
     })
     .transpose()
 }
-
-
 
 fn edits(
     ops: &mut Assembler,
@@ -4351,8 +4355,6 @@ fn root_offset(frame: MachineFrameLayout, slot: u16) -> Result<u32, Unsupported>
         .root_offset(slot)
         .map_err(|_| Unsupported::OperandShape("x86-64 root-save offset"))
 }
-
-
 
 /// Read interpreter frame register `frame_register` into `location` as
 /// `value_type`, jumping to `reject` when the tagged value lies outside it.

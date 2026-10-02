@@ -65,15 +65,18 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
     let len = i64::try_from(code.len()).map_err(|_| VerifyError::FunctionTooLarge)?;
     let (instructions, overflow_operand_words) = code.raw_parts();
     let mut next_overflow_offset = 0;
-    let mut decoded_operands = Vec::with_capacity(instructions.len());
+    let mut decoded_operands = DecodedOperands::with_capacity(instructions.len());
     for (instruction_index, instr) in instructions.iter().enumerate() {
-        let operands = decode_wordcode_operands(
+        let start = decoded_operands.operands.len();
+        decode_wordcode_operands(
             instr,
             overflow_operand_words,
             &mut next_overflow_offset,
             instruction_index,
+            &mut decoded_operands.operands,
         )?;
-        verify_operand_shape(instr.op, &operands).map_err(|error| {
+        let operands = &decoded_operands.operands[start..];
+        verify_operand_shape(instr.op, operands).map_err(|error| {
             VerifyError::InvalidOperandShape {
                 instruction_index,
                 error,
@@ -82,7 +85,7 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
         let schema = opcode_schema(instr.op);
         for successor in schema.successor_shape.exact() {
             if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
-                verify_wordcode_target(&operands, instruction_index, *operand_index, None, len)?;
+                verify_wordcode_target(operands, instruction_index, *operand_index, None, len)?;
             }
         }
         for successor in schema.exception_successor_shape.exact() {
@@ -92,7 +95,7 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
                     absent_value,
                     ..
                 } => verify_wordcode_target(
-                    &operands,
+                    operands,
                     instruction_index,
                     *operand_index,
                     Some(*absent_value),
@@ -102,7 +105,7 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
                     floor_operand_index,
                 } => {
                     let floor = checked_wordcode_imm32_operand(
-                        &operands,
+                        operands,
                         instruction_index,
                         *floor_operand_index,
                     )?;
@@ -120,11 +123,35 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
                 | ExceptionSuccessorSpec::RunFinallyHandlersToFrameReturn => {}
             }
         }
-        decoded_operands.push(operands.into_boxed_slice());
+        decoded_operands.ends.push(decoded_operands.operands.len());
     }
     verify_wordcode_overflow_consumed(next_overflow_offset, overflow_operand_words.len())?;
     verify_wordcode_control_flow(instructions, &decoded_operands)?;
     Ok(())
+}
+
+/// Every instruction's decoded operands in one buffer, delimited by the end
+/// offset of each instruction's run.
+struct DecodedOperands {
+    operands: Vec<Operand>,
+    ends: Vec<usize>,
+}
+
+impl DecodedOperands {
+    fn with_capacity(instructions: usize) -> Self {
+        Self {
+            operands: Vec::with_capacity(instructions.saturating_mul(3)),
+            ends: Vec::with_capacity(instructions),
+        }
+    }
+
+    /// Operands of instruction `index`.
+    fn of(&self, index: usize) -> &[Operand] {
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous]);
+        &self.operands[start..self.ends[index]]
+    }
 }
 
 fn verify_wordcode_target(
@@ -202,7 +229,8 @@ fn decode_wordcode_operands(
     overflow_operand_words: &[u32],
     next_overflow_offset: &mut usize,
     instruction_index: usize,
-) -> Result<Vec<Operand>, VerifyError> {
+    operands: &mut Vec<Operand>,
+) -> Result<(), VerifyError> {
     let (op, raw_operand_count, inline_operand_words, raw_overflow_offset) =
         instruction.raw_parts();
     let operand_count = usize::from(raw_operand_count);
@@ -302,7 +330,7 @@ fn decode_wordcode_operands(
         });
     }
 
-    let mut operands = Vec::with_capacity(operand_count);
+    operands.reserve(operand_count);
     for (operand_index, word) in operand_words.iter().copied().enumerate() {
         let Some(kind) = operand_kind_at(op, operand_index) else {
             let expected = opcode_schema(op)
@@ -329,7 +357,7 @@ fn decode_wordcode_operands(
         };
         operands.push(operand);
     }
-    Ok(operands)
+    Ok(())
 }
 
 fn verify_wordcode_overflow_consumed(
@@ -364,7 +392,7 @@ struct HandlerLayout {
 impl HandlerLayout {
     fn build(
         instructions: &[WordInstruction],
-        operands: &[Box<[Operand]>],
+        operands: &DecodedOperands,
     ) -> Result<Self, VerifyError> {
         let instruction_count =
             i64::try_from(instructions.len()).map_err(|_| VerifyError::FunctionTooLarge)?;
@@ -379,14 +407,14 @@ impl HandlerLayout {
             match instruction.op {
                 Op::EnterTry => {
                     let catch_target = resolve_wordcode_target(
-                        &operands[instruction_index],
+                        operands.of(instruction_index),
                         instruction_index,
                         0,
                         Some(NO_HANDLER_OFFSET),
                         instruction_count,
                     )?;
                     let finally_target = resolve_wordcode_target(
-                        &operands[instruction_index],
+                        operands.of(instruction_index),
                         instruction_index,
                         1,
                         Some(NO_HANDLER_OFFSET),
@@ -629,7 +657,7 @@ struct IncomingWordcodeFlowState {
 
 struct WordcodeControlFlowVerifier<'a> {
     instructions: &'a [WordInstruction],
-    operands: &'a [Box<[Operand]>],
+    operands: &'a DecodedOperands,
     layout: HandlerLayout,
     parked_stacks: ParkedStacks,
     incoming: Vec<Option<IncomingWordcodeFlowState>>,
@@ -641,7 +669,7 @@ struct WordcodeControlFlowVerifier<'a> {
 impl<'a> WordcodeControlFlowVerifier<'a> {
     fn new(
         instructions: &'a [WordInstruction],
-        operands: &'a [Box<[Operand]>],
+        operands: &'a DecodedOperands,
     ) -> Result<Self, VerifyError> {
         let layout = HandlerLayout::build(instructions, operands)?;
         let mut incoming = vec![None; instructions.len().saturating_add(1)];
@@ -768,7 +796,7 @@ impl<'a> WordcodeControlFlowVerifier<'a> {
             }
             Op::PopParkedFinally => {
                 let count = checked_wordcode_imm32_operand(
-                    &self.operands[instruction_index],
+                    self.operands.of(instruction_index),
                     instruction_index,
                     0,
                 )?;
@@ -804,7 +832,7 @@ impl<'a> WordcodeControlFlowVerifier<'a> {
             Op::JumpViaFinally => {
                 let target = self.relative_target(instruction_index, 0)?;
                 let floor = checked_wordcode_imm32_operand(
-                    &self.operands[instruction_index],
+                    self.operands.of(instruction_index),
                     instruction_index,
                     1,
                 )?;
@@ -845,7 +873,7 @@ impl<'a> WordcodeControlFlowVerifier<'a> {
         operand_index: usize,
     ) -> Result<usize, VerifyError> {
         resolve_wordcode_target(
-            &self.operands[instruction_index],
+            self.operands.of(instruction_index),
             instruction_index,
             operand_index,
             None,
@@ -1082,7 +1110,7 @@ impl<'a> WordcodeControlFlowVerifier<'a> {
 
 fn verify_wordcode_control_flow(
     instructions: &[WordInstruction],
-    operands: &[Box<[Operand]>],
+    operands: &DecodedOperands,
 ) -> Result<(), VerifyError> {
     WordcodeControlFlowVerifier::new(instructions, operands)?.verify()
 }
@@ -1688,12 +1716,15 @@ pub fn measure_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, 
     let mut instr_to_byte_pc = Vec::with_capacity(code.len());
     let (instructions, overflow_operand_words) = code.raw_parts();
     let mut next_overflow_offset = 0;
+    let mut operands = Vec::new();
     for (instruction_index, instruction) in instructions.iter().enumerate() {
-        let operands = decode_wordcode_operands(
+        operands.clear();
+        decode_wordcode_operands(
             instruction,
             overflow_operand_words,
             &mut next_overflow_offset,
             instruction_index,
+            &mut operands,
         )?;
         verify_operand_shape(instruction.op, &operands).map_err(|error| {
             VerifyError::InvalidOperandShape {
@@ -1703,7 +1734,7 @@ pub fn measure_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, 
         })?;
         instr_to_byte_pc.push(byte_pc);
         let mut byte_len = 2_u32;
-        for operand in operands {
+        for operand in &operands {
             let operand_len = match operand {
                 Operand::Register(_) => 3,
                 Operand::ConstIndex(_) | Operand::Imm32(_) => 5,
@@ -2608,7 +2639,8 @@ mod tests {
     fn wordcode_abrupt_analysis_budget_is_typed() {
         let code = build_wordcode(vec![(Op::ReturnUndefined, vec![])]);
         let (instructions, _) = code.raw_parts();
-        let operands = vec![Vec::<Operand>::new().into_boxed_slice()];
+        let mut operands = DecodedOperands::with_capacity(1);
+        operands.ends.push(0);
         let mut verifier = WordcodeControlFlowVerifier::new(instructions, &operands).unwrap();
         verifier.abrupt_transitions = MAX_WORDCODE_ABRUPT_TRANSITIONS;
 

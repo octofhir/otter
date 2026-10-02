@@ -187,7 +187,9 @@ pub(super) fn emit_call_entry(
             ; lea rax, [rsp + roots as i32]
             ; mov [r11 + NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], rax
         ),
-        Err(_) => dynasm!(ops ; .arch x64 ; mov QWORD [r11 + NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], 0),
+        Err(_) => {
+            dynasm!(ops ; .arch x64 ; mov QWORD [r11 + NATIVE_FRAME_MACHINE_ROOTS_OFFSET as i32], 0)
+        }
     }
     dynasm!(ops
         ; .arch x64
@@ -351,7 +353,12 @@ pub(super) fn emit_construct_completion(
     dynasm!(ops ; .arch x64 ; =>primitive);
     if shape.derived {
         dynasm!(ops ; .arch x64 ; mov rsi, rax ; mov rdi, r15);
-        emit_stub(ops, relocations, transitions, STUB_JIT_DERIVED_CONSTRUCT_RESULT);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        );
     } else {
         dynasm!(ops ; .arch x64 ; mov rax, [rsp + record(frame) + NATIVE_FRAME_THIS_OFFSET as i32]);
     }
@@ -464,7 +471,15 @@ pub(super) fn emit_bail(
         ; cmp r10, r11
         ; jne =>tier
     );
-    emit_reserve_window(ops, relocations, transitions, frame, saved, shape.register_count, 0);
+    emit_reserve_window(
+        ops,
+        relocations,
+        transitions,
+        frame,
+        saved,
+        shape.register_count,
+        0,
+    );
     dynasm!(ops
         ; .arch x64
         ; mov rax, [r10 + ACTUALS]

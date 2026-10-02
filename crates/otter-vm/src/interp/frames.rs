@@ -122,7 +122,10 @@ impl Interpreter {
                 crate::promise_dispatch::PromiseBuilder::with_context(owner.clone())
                     .pending_stack_rooted(self, stack, &[], &[])?;
             let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-            self.frame_set_async_state(frame, crate::frame_state::AsyncFrameState { result_promise });
+            self.frame_set_async_state(
+                frame,
+                crate::frame_state::AsyncFrameState { result_promise },
+            );
         }
         Ok(())
     }
@@ -143,7 +146,9 @@ impl Interpreter {
             let owner = context
                 .for_function(function_id)
                 .map_err(|_| VmError::InvalidOperand)?;
-            let closure = self.iteration_anchor(callee_anchor).as_closure(&self.gc_heap);
+            let closure = self
+                .iteration_anchor(callee_anchor)
+                .as_closure(&self.gc_heap);
             let proto =
                 self.function_property_get(stack, &owner, closure, function_id, "prototype")?;
             let generator = self

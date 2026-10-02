@@ -47,12 +47,7 @@ pub(super) enum CallNewTarget {
 
 /// Deliver a completion in `rax`/`rdx`: success to `dst`, a throw to
 /// `throw_value`, a parked error to `threw`.
-fn emit_completion(
-    ops: &mut Assembler,
-    dst: u16,
-    throw_value: DynamicLabel,
-    threw: DynamicLabel,
-) {
+fn emit_completion(ops: &mut Assembler, dst: u16, throw_value: DynamicLabel, threw: DynamicLabel) {
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
@@ -149,8 +144,7 @@ pub(super) fn emit_call(
     // `[[Construct]]` enters a proven target directly only when it has the
     // internal method; classification throws otherwise.
     let known = known.filter(|plan| {
-        new_target == CallNewTarget::None
-            || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
+        new_target == CallNewTarget::None || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
     });
     if let Some(callee) = callee {
         emit_load_reg(ops, 9, callee);
@@ -297,9 +291,21 @@ pub(super) fn emit_spread_call_op(
                 CallNewTarget::None,
             )
         } else if opcode == otter_bytecode::Op::NewSpread as u8 {
-            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Callee)
+            (
+                arg0 as u16,
+                arg1 as u16,
+                None,
+                arg2 as u16,
+                CallNewTarget::Callee,
+            )
         } else if opcode == otter_bytecode::Op::SuperConstructSpread as u8 {
-            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Super)
+            (
+                arg0 as u16,
+                arg1 as u16,
+                None,
+                arg2 as u16,
+                CallNewTarget::Super,
+            )
         } else {
             return Err(Unsupported::OperandShape("x86-64 spread call opcode"));
         };

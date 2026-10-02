@@ -116,6 +116,7 @@ impl Interpreter {
                     super_property_allowed,
                     super_call_allowed,
                     function_constructor: false,
+                    cache_specifier: None,
                 },
                 ctx_reg,
                 in_class_field_initializer,
@@ -410,6 +411,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         module_url: &str,
         body: &str,
+        builtin: bool,
     ) -> Result<Value, VmError> {
         // Node-style wrapper with the entire prologue on line 1, so a
         // source line `N` maps to wrapped line `N`: stack-trace line
@@ -417,22 +419,34 @@ impl Interpreter {
         // prologue offset — the same quirk Node has).
         let source =
             format!("(function (exports, require, module, __filename, __dirname) {{ {body}\n}})");
-        let mut module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
-        // Stamp the synthesized module + its functions with the file URL
-        // so frames captured for `Error.prototype.stack` report the file
-        // rather than the synthetic eval name.
-        module.module = module_url.to_string();
-        for function in &mut module.functions {
-            function.module_url = module_url.to_string();
-        }
+        // A builtin body is identical on every launch, so the host may
+        // reuse its verified compile.
+        let options = EvalCompileOptions {
+            cache_specifier: builtin.then(|| format!("<commonjs:{module_url}>")),
+            ..EvalCompileOptions::default()
+        };
+        let compiled = self.compile_eval_source(&source, options)?;
         // Register the wrapped source so frame spans resolve to
         // `(line, column)` against it. The wrapper is VM-synthesized, so it
         // is admitted against the registry's source budget here.
         self.register_module_source_owned(module_url.to_string(), source)
             .map_err(|_| VmError::InvalidOperand)?;
-        let context = self
-            .link_evictable_module(module)
-            .map_err(|_| VmError::InvalidOperand)?;
+        // Stamp the synthesized module + its functions with the file URL
+        // so frames captured for `Error.prototype.stack` report the file
+        // rather than the synthetic eval name.
+        let context = match compiled {
+            crate::CompiledEvalSource::Fresh(mut module) => {
+                module.module = module_url.to_string();
+                for function in &mut module.functions {
+                    function.module_url = module_url.to_string();
+                }
+                self.link_evictable_module(module)
+            }
+            crate::CompiledEvalSource::Verified(verified) => {
+                self.link_evictable_verified_module(verified.with_module_url(module_url))
+            }
+        }
+        .map_err(|_| VmError::InvalidOperand)?;
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
         // completion).
@@ -565,7 +579,7 @@ impl Interpreter {
         source: &str,
         options: EvalCompileOptions,
     ) -> Result<BytecodeModule, VmError> {
-        let mut module = self.compile_eval_source(source, options)?;
+        let mut module = self.compile_eval_source(source, options)?.into_module();
         crate::eval_source::decode_module(&mut module);
         Ok(module)
     }
@@ -574,7 +588,7 @@ impl Interpreter {
         &self,
         source: &str,
         options: EvalCompileOptions,
-    ) -> Result<BytecodeModule, VmError> {
+    ) -> Result<crate::CompiledEvalSource, VmError> {
         let hook = self.eval_hook.as_ref().ok_or_else(|| {
             self.err_syntax(
                 ("eval / new Function are disabled (no compiler hook installed)".to_string())
@@ -673,7 +687,7 @@ mod tests {
     fn direct_eval_shared_stack_reclaims_every_nested_completion_path() {
         let mut interp = Interpreter::new();
         interp.set_eval_hook(Some(std::sync::Arc::new(|source, _| {
-            Ok(eval_module(source))
+            Ok(crate::CompiledEvalSource::Fresh(eval_module(source)))
         })));
 
         // Register 1 holds the caller's (absent) context.

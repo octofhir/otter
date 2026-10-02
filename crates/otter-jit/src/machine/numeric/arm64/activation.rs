@@ -154,6 +154,8 @@ fn emit_branch_ne(ops: &mut dynasmrt::aarch64::Assembler, target: DynamicLabel, 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CallEntryCold {
     overflow: DynamicLabel,
+    /// The outermost generated callee: no caller record to count from.
+    outermost: (DynamicLabel, DynamicLabel),
     construct: Option<(DynamicLabel, DynamicLabel)>,
     prepare: Option<(DynamicLabel, DynamicLabel)>,
 }
@@ -177,8 +179,7 @@ pub(super) fn emit_call_entry(
         ; .arch aarch64
         ; mov x19, x0
         ; ldr x9, [x19, crate::entry::NATIVE_STACK_LIMIT_OFFSET]
-        ; mov x10, sp
-        ; cmp x10, x9
+        ; cmp sp, x9
         ; b.lo =>overflow
     );
     // Receiver binding. A conversion the entry cannot decide inline runs
@@ -195,12 +196,11 @@ pub(super) fn emit_call_entry(
         emit_load_u64(ops, 2, VALUE_HOLE);
     }
     // Depth from the caller's record; the outermost generated callee is one.
-    let have_depth = ops.new_dynamic_label();
+    let (outermost, have_depth) = (ops.new_dynamic_label(), ops.new_dynamic_label());
     dynasm!(ops
         ; .arch aarch64
         ; ldr x10, [x19, NATIVE_FRAME_OFFSET]
-        ; movz w11, 1
-        ; cbz x10, =>have_depth
+        ; cbz x10, =>outermost
         ; ldr w11, [x10, DEPTH]
         ; add w11, w11, 1
         ; =>have_depth
@@ -261,6 +261,7 @@ pub(super) fn emit_call_entry(
         start,
         CallEntryCold {
             overflow,
+            outermost: (outermost, have_depth),
             construct,
             prepare,
         },
@@ -278,6 +279,8 @@ pub(super) fn emit_call_entry_cold(
     exits: ExitLabels,
     cold: CallEntryCold,
 ) {
+    let (outermost, have_depth) = cold.outermost;
+    dynasm!(ops ; .arch aarch64 ; =>outermost ; movz w11, 1 ; b =>have_depth);
     // [[Construct]] of a base constructor: mark the record and create the
     // receiver unless the caller allocated it. Receiver conversion does not
     // apply to the created receiver.
@@ -387,8 +390,15 @@ pub(super) fn emit_return(
             emit_sp_address(ops, 9, flags);
             dynasm!(ops ; .arch aarch64 ; ldrb w9, [x9]);
         }
-        dynasm!(ops ; .arch aarch64 ; tst w9, u32::from(NativeFrameFlags::CONSTRUCT));
-        emit_branch_ne(ops, construct, far);
+        if far {
+            dynasm!(ops ; .arch aarch64 ; tst w9, u32::from(NativeFrameFlags::CONSTRUCT));
+            emit_branch_ne(ops, construct, far);
+        } else {
+            dynasm!(ops
+                ; .arch aarch64
+                ; tbnz w9, NativeFrameFlags::CONSTRUCT.trailing_zeros(), =>construct
+            );
+        }
     }
     emit_plain_return(ops, frame, saved);
 }
@@ -425,7 +435,12 @@ pub(super) fn emit_construct_completion(
     dynasm!(ops ; .arch aarch64 ; =>primitive);
     if shape.derived {
         dynasm!(ops ; .arch aarch64 ; mov x1, x0 ; mov x0, x19);
-        emit_stub(ops, relocations, transitions, STUB_JIT_DERIVED_CONSTRUCT_RESULT);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        );
     } else {
         emit_frame_ldr_x(ops, 0, frame.record_offset() + NATIVE_FRAME_THIS_OFFSET);
     }

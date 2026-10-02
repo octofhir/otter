@@ -38,8 +38,7 @@ use yaxpeax_arm::armv8::a64::ARMv8;
 
 use super::relocation::{
     DirectBranch, DirectBranchKind, GuardedHeapComponent, PropertySourceAccess, RelocationTarget,
-    ValidatedRelocation, ValidatedRelocations,
-    decode_direct_branch,
+    ValidatedRelocation, ValidatedRelocations, decode_direct_branch,
 };
 use super::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,

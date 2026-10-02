@@ -277,7 +277,15 @@ pub(super) fn emit(
             // The guard proved the loaded method's function identity.
             let plan = candidate.callee.plan;
             dynasm!(ops ; .arch aarch64 ; mov x12, x17);
-            emit_invoke(ops, relocations, call, form, Some(plan), Callee::Register(12), true)?;
+            emit_invoke(
+                ops,
+                relocations,
+                call,
+                form,
+                Some(plan),
+                Callee::Register(12),
+                true,
+            )?;
             dynasm!(ops ; .arch aarch64 ; =>next);
         }
         let receiver = call
@@ -286,11 +294,25 @@ pub(super) fn emit(
             .first()
             .ok_or(Unsupported::OperandShape("scalar method receiver"))?
             .value;
-        emit_value_span_arguments(ops, call.sequence, call.frame, call.site, [receiver].into_iter())?;
+        emit_value_span_arguments(
+            ops,
+            call.sequence,
+            call.frame,
+            call.site,
+            [receiver].into_iter(),
+        )?;
         call.emit_stub_call(ops, relocations, STUB_JIT_RESOLVE_METHOD);
         call.emit_staging_status(ops)?;
         dynasm!(ops ; .arch aarch64 ; mov x12, x0);
-        return emit_invoke(ops, relocations, call, form, None, Callee::Register(12), false);
+        return emit_invoke(
+            ops,
+            relocations,
+            call,
+            form,
+            None,
+            Callee::Register(12),
+            false,
+        );
     }
     // One proven bytecode target enters its current generation; any other
     // callee enters the generic entry.
@@ -309,7 +331,15 @@ pub(super) fn emit(
             call.call_pc,
             generic,
         );
-        emit_invoke(ops, relocations, call, form, Some(plan), Callee::Operand, true)?;
+        emit_invoke(
+            ops,
+            relocations,
+            call,
+            form,
+            Some(plan),
+            Callee::Operand,
+            true,
+        )?;
         dynasm!(ops ; .arch aarch64 ; =>generic);
     }
     emit_invoke(ops, relocations, call, form, None, Callee::Operand, true)

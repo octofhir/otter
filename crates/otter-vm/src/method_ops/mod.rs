@@ -239,7 +239,9 @@ fn read_method_call_values(
     let receiver = *read_register(frame, receiver_register)?;
     let mut arguments = SmallVec::with_capacity(argc);
     for index in 0..argc {
-        let register = operands.register(4 + index).ok_or(VmError::InvalidOperand)?;
+        let register = operands
+            .register(4 + index)
+            .ok_or(VmError::InvalidOperand)?;
         arguments.push(*read_register(frame, register)?);
     }
     Ok((receiver, arguments))
@@ -639,7 +641,8 @@ impl Interpreter {
             };
             if route_to_invoke {
                 stack[top_idx].advance_pc()?;
-                let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                let (recv_value, arg_values) =
+                    read_method_call_values(stack, top_idx, operands, argc)?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
             if recv_value.is_iterator() {
@@ -710,7 +713,8 @@ impl Interpreter {
                 && self.is_callable_runtime(&method)
             {
                 stack[top_idx].advance_pc()?;
-                let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                let (recv_value, arg_values) =
+                    read_method_call_values(stack, top_idx, operands, argc)?;
                 self.invoke(stack, context, &method, recv_value, arg_values, dst)?;
                 return Ok(());
             }
@@ -774,7 +778,8 @@ impl Interpreter {
                     && self.is_callable_runtime(&method)
                 {
                     stack[top_idx].advance_pc()?;
-                    let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                    let (recv_value, arg_values) =
+                        read_method_call_values(stack, top_idx, operands, argc)?;
                     return self.invoke(stack, context, &method, recv_value, arg_values, dst);
                 }
                 // No IC site (an interpreted call site allocates none) or an IC
@@ -806,7 +811,8 @@ impl Interpreter {
                 };
                 if self.is_callable_runtime(&method) {
                     stack[top_idx].advance_pc()?;
-                    let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                    let (recv_value, arg_values) =
+                        read_method_call_values(stack, top_idx, operands, argc)?;
                     return self.invoke(stack, context, &method, recv_value, arg_values, dst);
                 }
             }
@@ -876,7 +882,8 @@ impl Interpreter {
                         return Err(VmError::NotCallable);
                     }
                     stack[top_idx].advance_pc()?;
-                    let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                    let (recv_value, arg_values) =
+                        read_method_call_values(stack, top_idx, operands, argc)?;
                     return self.invoke(stack, context, &method, recv_value, arg_values, dst);
                 }
             }
@@ -989,7 +996,8 @@ impl Interpreter {
                         function_prototype_intrinsic(name),
                     )
                 {
-                    let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                    let (recv_value, arg_values) =
+                        read_method_call_values(stack, top_idx, operands, argc)?;
                     return self.dispatch_function_method(
                         stack,
                         context,
@@ -1000,7 +1008,8 @@ impl Interpreter {
                     );
                 }
                 stack[top_idx].advance_pc()?;
-                let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                let (recv_value, arg_values) =
+                    read_method_call_values(stack, top_idx, operands, argc)?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
         }
@@ -1119,7 +1128,8 @@ impl Interpreter {
                     function_prototype_intrinsic(name),
                 )
             {
-                let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+                let (recv_value, arg_values) =
+                    read_method_call_values(stack, top_idx, operands, argc)?;
                 return self.dispatch_function_method(
                     stack,
                     context,

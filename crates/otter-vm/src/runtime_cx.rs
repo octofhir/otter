@@ -922,15 +922,17 @@ impl<'rt> NativeCtx<'rt> {
     ///
     /// The synthesized module executes above an activation floor on this
     /// context's shared stack, so nested `require` never publishes a detached
-    /// frame stack.
+    /// frame stack. A `builtin` body is byte-identical on every launch, so its
+    /// compile may be served from the host's compile cache.
     pub fn create_commonjs_wrapper(
         &mut self,
         module_url: &str,
         body: &str,
+        builtin: bool,
     ) -> Result<Value, NativeError> {
         self.cx.with_parts(|interp, stack| {
             interp
-                .create_commonjs_wrapper(stack, module_url, body)
+                .create_commonjs_wrapper(stack, module_url, body, builtin)
                 .map_err(|error| {
                     native_function::vm_to_native_error(interp, error, "CommonJS wrapper")
                 })
@@ -3052,7 +3054,18 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         module_url: &str,
         body: &str,
     ) -> Result<Local<'scope>, NativeError> {
-        let wrapper = self.ctx.create_commonjs_wrapper(module_url, body)?;
+        let wrapper = self.ctx.create_commonjs_wrapper(module_url, body, false)?;
+        Ok(self.value(wrapper))
+    }
+
+    /// [`Self::commonjs_wrapper`] for a builtin module body, whose compile
+    /// the host may serve from its compile cache.
+    pub fn builtin_commonjs_wrapper(
+        &mut self,
+        module_url: &str,
+        body: &str,
+    ) -> Result<Local<'scope>, NativeError> {
+        let wrapper = self.ctx.create_commonjs_wrapper(module_url, body, true)?;
         Ok(self.value(wrapper))
     }
 

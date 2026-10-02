@@ -169,15 +169,7 @@ pub(crate) fn emit_inline_explicit_this(
         dynasm!(ops ; .arch aarch64 ; cmp x12, x14 ; b.eq =>global_this);
         emit_load_u64(ops, 14, value_tag::VALUE_NULL);
         dynasm!(ops ; .arch aarch64 ; cmp x12, x14 ; b.eq =>global_this);
-        super::emit_object_type_branch(
-            ops,
-            relocations,
-            view,
-            12,
-            [10, 11, 14],
-            done,
-            bail,
-        );
+        super::emit_object_type_branch(ops, relocations, view, 12, [10, 11, 14], done, bail);
         dynasm!(ops ; .arch aarch64 ; =>global_this);
         emit_load_sloppy_global_this(ops, relocations, view, context_register);
     }

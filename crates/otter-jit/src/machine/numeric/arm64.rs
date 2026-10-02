@@ -113,10 +113,10 @@ use otter_vm::{
         ExitAction, ExitReason, NativeResultDomain, NativeResultStatus, RuntimeStubDescriptor,
         RuntimeStubResultAbi, RuntimeStubSignature, STUB_ARRAY_CONSTRUCT_ALLOC,
         STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW, STUB_JIT_BACKEDGE_POLL, STUB_JIT_BINDING_VALUE,
-        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK,
-        STUB_JIT_FINISH_ERROR, STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY,
-        STUB_NUMBER_POW_F64_LEAF, STUB_NUMBER_REM_F64_LEAF, STUB_STRICT_EQ_LEAF,
-        STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF, SideExit,
+        STUB_JIT_CLASS_SUPER_CONSTRUCTOR, STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_FINISH_ERROR,
+        STUB_JIT_LOAD_PROPERTY, STUB_JIT_STORE_PROPERTY, STUB_NUMBER_POW_F64_LEAF,
+        STUB_NUMBER_REM_F64_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC,
+        STUB_TO_BOOLEAN_LEAF, SideExit,
     },
 };
 
@@ -130,9 +130,7 @@ use super::super::{
 };
 use crate::{
     CompiledCode, Unsupported,
-    arm64::{
-        GENERATED_POLL_BATCH, emit_method_guard_from_tagged_register,
-    },
+    arm64::{GENERATED_POLL_BATCH, emit_method_guard_from_tagged_register},
     artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget},
     entry::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
@@ -172,6 +170,132 @@ const BASE_FIXED_FRAME_BYTES: u32 = AARCH64_BASE_FIXED_FRAME_BYTES;
 const NUMBER_TAG: u64 = otter_vm::value::tag::NUMBER_TAG;
 /// Shift that leaves exactly the int32 tag bits.
 const NUMBER_TAG_SHIFT: u32 = NUMBER_TAG.trailing_zeros();
+
+/// Signed int32 condition a fused compare leaves in the flags.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntCondition {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl IntCondition {
+    const fn inverted(self) -> Self {
+        match self {
+            Self::Eq => Self::Ne,
+            Self::Ne => Self::Eq,
+            Self::Lt => Self::Ge,
+            Self::Le => Self::Gt,
+            Self::Gt => Self::Le,
+            Self::Ge => Self::Lt,
+        }
+    }
+
+    fn emit_branch(self, ops: &mut dynasmrt::aarch64::Assembler, target: DynamicLabel) {
+        match self {
+            Self::Eq => dynasm!(ops ; .arch aarch64 ; b.eq =>target),
+            Self::Ne => dynasm!(ops ; .arch aarch64 ; b.ne =>target),
+            Self::Lt => dynasm!(ops ; .arch aarch64 ; b.lt =>target),
+            Self::Le => dynasm!(ops ; .arch aarch64 ; b.le =>target),
+            Self::Gt => dynasm!(ops ; .arch aarch64 ; b.gt =>target),
+            Self::Ge => dynasm!(ops ; .arch aarch64 ; b.ge =>target),
+        }
+    }
+
+    fn emit_set(self, ops: &mut dynasmrt::aarch64::Assembler, destination: u8) {
+        match self {
+            Self::Eq => dynasm!(ops ; .arch aarch64 ; cset W(destination), eq),
+            Self::Ne => dynasm!(ops ; .arch aarch64 ; cset W(destination), ne),
+            Self::Lt => dynasm!(ops ; .arch aarch64 ; cset W(destination), lt),
+            Self::Le => dynasm!(ops ; .arch aarch64 ; cset W(destination), le),
+            Self::Gt => dynasm!(ops ; .arch aarch64 ; cset W(destination), gt),
+            Self::Ge => dynasm!(ops ; .arch aarch64 ; cset W(destination), ge),
+        }
+    }
+}
+
+/// Compare `W(source)` with an immediate: one instruction for a 12-bit
+/// magnitude, otherwise through `w16`.
+fn emit_compare_immediate(ops: &mut dynasmrt::aarch64::Assembler, source: u8, immediate: i32) {
+    if (0..4096).contains(&immediate) {
+        dynasm!(ops ; .arch aarch64 ; cmp WSP(source), immediate as u32);
+    } else if (-4095..0).contains(&immediate) {
+        dynasm!(ops ; .arch aarch64 ; cmn WSP(source), immediate.unsigned_abs());
+    } else {
+        emit_load_u64(ops, 16, immediate as u32 as u64);
+        dynasm!(ops ; .arch aarch64 ; cmp W(source), w16);
+    }
+}
+
+/// Whether `block` starts at the instruction right after `index`, so control
+/// falling out of `index` reaches it.
+fn laid_out_next(
+    sequence: &InstructionSequence,
+    index: usize,
+    block: crate::machine::MachineBlock,
+) -> bool {
+    sequence
+        .blocks()
+        .get(block.0 as usize)
+        .is_some_and(|data| data.first.0 as usize == index + 1)
+}
+
+/// Whether the boolean the compare at `index` defines is read only by the
+/// conditional branch that immediately follows it. Moves the allocator places
+/// before that branch do not touch the flags.
+fn branch_consumes_only(
+    sequence: &InstructionSequence,
+    use_counts: &[u32],
+    index: usize,
+    far_branches: bool,
+) -> bool {
+    if far_branches {
+        return false;
+    }
+    let instructions = sequence.instructions();
+    let Some(defined) = instructions[index]
+        .operands
+        .iter()
+        .find(|operand| operand.role == super::super::OperandRole::Definition)
+        .map(|operand| operand.value)
+    else {
+        return false;
+    };
+    let Some(branch) = instructions.get(index + 1) else {
+        return false;
+    };
+    matches!(branch.opcode, MachineOpcode::BranchIf(_))
+        && branch
+            .operands
+            .first()
+            .is_some_and(|operand| operand.value == defined)
+        && use_counts.get(defined.0 as usize) == Some(&1)
+}
+
+/// Uses of every value: instruction operands and successor arguments.
+fn value_use_counts(sequence: &InstructionSequence) -> Vec<u32> {
+    let mut counts = vec![0_u32; sequence.representations().len()];
+    for instruction in sequence.instructions() {
+        for operand in &instruction.operands {
+            if operand.role == super::super::OperandRole::Use
+                && let Some(count) = counts.get_mut(operand.value.0 as usize)
+            {
+                *count += 1;
+            }
+        }
+    }
+    for block in sequence.blocks() {
+        for value in block.successor_arguments.iter().flatten() {
+            if let Some(count) = counts.get_mut(value.0 as usize) {
+                *count += 1;
+            }
+        }
+    }
+    counts
+}
 const DEOPT_DUMP_BYTES: u32 = (GPR_BUDGET as u32 + FP_BUDGET as u32) * 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1207,6 +1331,11 @@ fn emit_with_reach(
         dynasm!(ops ; .arch aarch64 ; movz w29, GENERATED_POLL_BATCH);
     }
 
+    let use_counts = value_use_counts(sequence);
+    // A compare whose only use is the branch right after it leaves its
+    // condition in the flags instead of a boolean register.
+    let mut fused_condition = None::<IntCondition>;
+
     for (index, instruction) in sequence.instructions().iter().enumerate() {
         if far_branches && ops.offset().0 - island_base >= VENEER_ISLAND_INTERVAL {
             let island_start = ops.offset().0;
@@ -2015,19 +2144,17 @@ fn emit_with_reach(
             | MachineOpcode::IntegerNotEqualImmediate(immediate) => {
                 let source = integer_register(locations[0])?;
                 let destination = integer_register(locations[1])?;
-                emit_load_u64(&mut ops, 16, immediate as u32 as u64);
-                dynasm!(ops ; .arch aarch64 ; cmp W(source), w16);
-                match instruction.opcode {
-                    MachineOpcode::IntegerLessThanImmediate(_) => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), lt);
-                    }
-                    MachineOpcode::IntegerEqualImmediate(_) => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), eq);
-                    }
-                    MachineOpcode::IntegerNotEqualImmediate(_) => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ne);
-                    }
+                emit_compare_immediate(&mut ops, source, immediate);
+                let condition = match instruction.opcode {
+                    MachineOpcode::IntegerLessThanImmediate(_) => IntCondition::Lt,
+                    MachineOpcode::IntegerEqualImmediate(_) => IntCondition::Eq,
+                    MachineOpcode::IntegerNotEqualImmediate(_) => IntCondition::Ne,
                     _ => unreachable!("matched immediate integer comparison"),
+                };
+                if branch_consumes_only(sequence, &use_counts, index, far_branches) {
+                    fused_condition = Some(condition);
+                } else {
+                    condition.emit_set(&mut ops, destination);
                 }
             }
             MachineOpcode::IntegerEqual
@@ -2040,26 +2167,19 @@ fn emit_with_reach(
                 let right = integer_register(locations[1])?;
                 let destination = integer_register(locations[2])?;
                 dynasm!(ops ; .arch aarch64 ; cmp W(left), W(right));
-                match instruction.opcode {
-                    MachineOpcode::IntegerEqual => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), eq);
-                    }
-                    MachineOpcode::IntegerNotEqual => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ne);
-                    }
-                    MachineOpcode::IntegerLessThan => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), lt);
-                    }
-                    MachineOpcode::IntegerLessEqual => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), le);
-                    }
-                    MachineOpcode::IntegerGreaterThan => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), gt);
-                    }
-                    MachineOpcode::IntegerGreaterEqual => {
-                        dynasm!(ops ; .arch aarch64 ; cset W(destination), ge);
-                    }
+                let condition = match instruction.opcode {
+                    MachineOpcode::IntegerEqual => IntCondition::Eq,
+                    MachineOpcode::IntegerNotEqual => IntCondition::Ne,
+                    MachineOpcode::IntegerLessThan => IntCondition::Lt,
+                    MachineOpcode::IntegerLessEqual => IntCondition::Le,
+                    MachineOpcode::IntegerGreaterThan => IntCondition::Gt,
+                    MachineOpcode::IntegerGreaterEqual => IntCondition::Ge,
                     _ => unreachable!("matched int32 comparison"),
+                };
+                if branch_consumes_only(sequence, &use_counts, index, far_branches) {
+                    fused_condition = Some(condition);
+                } else {
+                    condition.emit_set(&mut ops, destination);
                 }
             }
             MachineOpcode::IntegerToBoolean => {
@@ -3442,11 +3562,10 @@ fn emit_with_reach(
             }
             MachineOpcode::Return => {
                 let source = integer_register(locations[0])?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; mov x0, X(source)
-                    ; movz x1, NativeResultStatus::Success as u32
-                );
+                if source != 0 {
+                    dynasm!(ops ; .arch aarch64 ; mov x0, X(source));
+                }
+                dynasm!(ops ; .arch aarch64 ; movz x1, NativeResultStatus::Success as u32);
                 activation::emit_return(&mut ops, frame, saved, exits, far_branches);
             }
             MachineOpcode::Jump => {
@@ -3457,18 +3576,33 @@ fn emit_with_reach(
                     .copied()
                     .find(|&successor| !is_exceptional_successor(sequence, block_index, successor))
                     .ok_or(Unsupported::OperandShape("numeric jump successors"))?;
-                let target = block_labels[successor.0 as usize];
-                dynasm!(ops ; .arch aarch64 ; b =>target);
+                if !laid_out_next(sequence, index, successor) {
+                    let target = block_labels[successor.0 as usize];
+                    dynasm!(ops ; .arch aarch64 ; b =>target);
+                }
             }
             MachineOpcode::BranchIf(when_true) => {
                 let condition = integer_register(locations[0])?;
                 let block = &sequence.blocks()[block_index];
-                let [taken, fallthrough] = block.successors.as_slice() else {
+                let [taken_block, fallthrough_block] = block.successors.as_slice() else {
                     return Err(Unsupported::OperandShape("numeric branch successors"));
                 };
-                let taken = block_labels[taken.0 as usize];
-                let fallthrough = block_labels[fallthrough.0 as usize];
-                if far_branches {
+                let taken = block_labels[taken_block.0 as usize];
+                let fallthrough = block_labels[fallthrough_block.0 as usize];
+                if let Some(fused) = fused_condition.take() {
+                    // The flags of the compare right before decide the branch.
+                    let taken_condition = if when_true { fused } else { fused.inverted() };
+                    if laid_out_next(sequence, index, *taken_block) {
+                        taken_condition
+                            .inverted()
+                            .emit_branch(&mut ops, fallthrough);
+                    } else {
+                        taken_condition.emit_branch(&mut ops, taken);
+                        if !laid_out_next(sequence, index, *fallthrough_block) {
+                            dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
+                        }
+                    }
+                } else if far_branches {
                     let not_taken = ops.new_dynamic_label();
                     if when_true {
                         dynasm!(ops ; .arch aarch64 ; cbz W(condition), =>not_taken);
@@ -3476,12 +3610,17 @@ fn emit_with_reach(
                         dynasm!(ops ; .arch aarch64 ; cbnz W(condition), =>not_taken);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>taken ; =>not_taken);
-                } else if when_true {
-                    dynasm!(ops ; .arch aarch64 ; cbnz W(condition), =>taken);
+                    dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
                 } else {
-                    dynasm!(ops ; .arch aarch64 ; cbz W(condition), =>taken);
+                    if when_true {
+                        dynasm!(ops ; .arch aarch64 ; cbnz W(condition), =>taken);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; cbz W(condition), =>taken);
+                    }
+                    if !laid_out_next(sequence, index, *fallthrough_block) {
+                        dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
+                    }
                 }
-                dynasm!(ops ; .arch aarch64 ; b =>fallthrough);
             }
             MachineOpcode::BranchNativeStatus => {
                 let status = integer_register(locations[0])?;
@@ -4180,7 +4319,14 @@ fn emit_with_reach(
     );
     activation::emit_entry_window_state(&mut ops, shape);
     emit_load_u64(&mut ops, 0, entry_bail);
-    activation::emit_resume_interpreter(&mut ops, &mut relocations, transitions, frame, saved, exits);
+    activation::emit_resume_interpreter(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        frame,
+        saved,
+        exits,
+    );
     dynasm!(ops ; .arch aarch64 ; =>tier_bail ; movz x1, NativeResultStatus::SideExit as u32);
     activation::emit_plain_return(&mut ops, frame, saved);
 
@@ -4227,7 +4373,14 @@ fn emit_with_reach(
     let pair_tier = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>pair_side_exit);
     activation::emit_branch_if_tier_frame(&mut ops, frame, pair_tier);
-    activation::emit_resume_interpreter(&mut ops, &mut relocations, transitions, frame, saved, exits);
+    activation::emit_resume_interpreter(
+        &mut ops,
+        &mut relocations,
+        transitions,
+        frame,
+        saved,
+        exits,
+    );
     dynasm!(ops ; .arch aarch64 ; =>pair_tier);
     activation::emit_plain_return(&mut ops, frame, saved);
 
@@ -4277,7 +4430,12 @@ fn emit_with_reach(
             saved,
             shape.register_count,
         );
-        emit_deopt_writeback(&mut ops, &mut relocations, deopt_runtime, deopt_writeback_entry);
+        emit_deopt_writeback(
+            &mut ops,
+            &mut relocations,
+            deopt_runtime,
+            deopt_writeback_entry,
+        );
         // `sp` is the window base: the interpreter continues on the record
         // unless an inline chain already completed it.
         let completed = ops.new_dynamic_label();
@@ -4286,11 +4444,23 @@ fn emit_with_reach(
             ; cmp x1, NativeResultStatus::SideExit as u32
             ; b.ne =>completed
         );
-        activation::emit_resume_interpreter(&mut ops, &mut relocations, transitions, frame, saved, exits);
+        activation::emit_resume_interpreter(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            frame,
+            saved,
+            exits,
+        );
         dynasm!(ops ; .arch aarch64 ; =>completed);
         activation::emit_return_from_record(&mut ops, frame, saved, exits);
         dynasm!(ops ; .arch aarch64 ; =>tier_deopt ; mov x15, xzr);
-        emit_deopt_writeback(&mut ops, &mut relocations, deopt_runtime, deopt_writeback_entry);
+        emit_deopt_writeback(
+            &mut ops,
+            &mut relocations,
+            deopt_runtime,
+            deopt_writeback_entry,
+        );
         activation::emit_plain_return(&mut ops, frame, saved);
     }
 
@@ -4475,12 +4645,62 @@ fn emit_allocating_call(
     Ok(())
 }
 
+/// Two register-held roots with adjacent homes: `(first, second, offset)`.
+type RootPair = (u8, u8, u32);
+
+/// Register-held roots whose homes are adjacent words, in home order: each
+/// pair moves with one `stp`/`ldp`. Returns the pairs and the indices of the
+/// roots the pairs cover.
+fn paired_register_roots(
+    frame: MachineFrameLayout,
+    site: &MachineSafepointSite,
+    sp_bias: u32,
+) -> Result<(Vec<RootPair>, Vec<usize>), Unsupported> {
+    let mut registers = site
+        .roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, root)| match root.source {
+            AllocatedLocation::Register(register) if register.is_integer() => {
+                Some((index, register.encoding(), root.save_slot))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    registers.sort_by_key(|&(_, _, slot)| slot);
+    let mut pairs = Vec::new();
+    let mut covered = Vec::new();
+    let mut position = 0;
+    while position + 1 < registers.len() {
+        let (first_index, first, first_slot) = registers[position];
+        let (second_index, second, second_slot) = registers[position + 1];
+        let offset = root_offset(frame, first_slot)?
+            .checked_add(sp_bias)
+            .ok_or(Unsupported::OperandShape("scalar paired root offset"))?;
+        if second_slot == first_slot + 1 && offset <= 504 && offset % 8 == 0 {
+            pairs.push((first, second, offset));
+            covered.extend([first_index, second_index]);
+            position += 2;
+        } else {
+            position += 1;
+        }
+    }
+    Ok((pairs, covered))
+}
+
 fn emit_save_safepoint_roots(
     ops: &mut dynasmrt::aarch64::Assembler,
     frame: MachineFrameLayout,
     site: &MachineSafepointSite,
 ) -> Result<(), Unsupported> {
-    for root in &site.roots {
+    let (pairs, covered) = paired_register_roots(frame, site, 0)?;
+    for (first, second, offset) in pairs {
+        dynasm!(ops ; .arch aarch64 ; stp X(first), X(second), [sp, offset as i32]);
+    }
+    for (index, root) in site.roots.iter().enumerate() {
+        if covered.contains(&index) {
+            continue;
+        }
         let destination = root_offset(frame, root.save_slot)?;
         match root.source {
             AllocatedLocation::Register(register) if register.is_integer() => {
@@ -4537,7 +4757,14 @@ fn emit_reload_safepoint_roots_with_bias(
     site: &MachineSafepointSite,
     sp_bias: u32,
 ) -> Result<(), Unsupported> {
-    for root in &site.roots {
+    let (pairs, covered) = paired_register_roots(frame, site, sp_bias)?;
+    for (first, second, offset) in pairs {
+        dynasm!(ops ; .arch aarch64 ; ldp X(first), X(second), [sp, offset as i32]);
+    }
+    for (index, root) in site.roots.iter().enumerate() {
+        if covered.contains(&index) {
+            continue;
+        }
         let source = root_offset(frame, root.save_slot)?
             .checked_add(sp_bias)
             .ok_or(Unsupported::OperandShape("scalar root reload stack bias"))?;

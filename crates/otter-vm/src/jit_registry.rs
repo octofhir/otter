@@ -165,7 +165,13 @@ impl JitCodeRegistry {
             .function_entry_cells
             .entry(function_id)
             .or_insert_with(|| {
-                FunctionEntryCell::new(function_id, param_count, register_count, call_flags, realm_id)
+                FunctionEntryCell::new(
+                    function_id,
+                    param_count,
+                    register_count,
+                    call_flags,
+                    realm_id,
+                )
             });
         assert_eq!(
             cell.param_count, param_count,
@@ -254,9 +260,9 @@ impl JitCodeRegistry {
         }
         // A body without a call entry is reached only through classification,
         // which runs a suspendable function's interpreter destination.
-        let call_entry = code.call_entry_addr().unwrap_or(
-            crate::native_abi::call_generic_entry as *const () as usize,
-        );
+        let call_entry = code
+            .call_entry_addr()
+            .unwrap_or(crate::native_abi::call_generic_entry as *const () as usize);
         let entry_cell = Box::new(CodeEntryCell::new(
             call_entry,
             code_object_id,
@@ -941,7 +947,6 @@ mod tests {
         fn native_frame_kind(&self) -> NativeFrameKind {
             self.tier
         }
-
 
         fn code_len(&self) -> usize {
             4

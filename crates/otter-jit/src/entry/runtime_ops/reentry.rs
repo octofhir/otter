@@ -273,9 +273,8 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -311,9 +310,8 @@ pub(crate) extern "C" fn jit_static_call_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -391,9 +389,8 @@ pub(crate) extern "C" fn jit_class_value_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -429,9 +426,8 @@ pub(crate) extern "C" fn jit_module_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -467,9 +463,8 @@ pub(crate) extern "C" fn jit_variadic_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -555,9 +550,8 @@ pub(crate) extern "C" fn jit_structural_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -608,9 +602,8 @@ pub(crate) extern "C" fn jit_construct_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -700,9 +693,8 @@ pub(crate) extern "C" fn jit_private_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -738,9 +730,8 @@ pub(crate) extern "C" fn jit_super_op_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -886,9 +877,8 @@ pub(crate) extern "C" fn jit_bind_function_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };
@@ -949,9 +939,8 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe {
-        activation.owner_context((*ctx.native_frame).header.function_id)
-    }) else {
+    let Some(owner) = (unsafe { activation.owner_context((*ctx.native_frame).header.function_id) })
+    else {
         park_jit_error(ctx, VmError::InvalidOperand);
         return NativeResultStatus::Throw as u64;
     };

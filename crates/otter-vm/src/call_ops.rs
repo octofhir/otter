@@ -1020,9 +1020,11 @@ impl Interpreter {
         let callee = callee
             .as_class_constructor()
             .map_or(callee, |class| class.ctor(&self.gc_heap));
-        callee
-            .as_function()
-            .or_else(|| callee.as_closure(&self.gc_heap).map(|closure| closure.function_id()))
+        callee.as_function().or_else(|| {
+            callee
+                .as_closure(&self.gc_heap)
+                .map(|closure| closure.function_id())
+        })
     }
 
     /// Handle `Op::Call`: stage the callee with an `undefined` receiver for
@@ -1131,7 +1133,13 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
         dst: u16,
     ) {
-        stack.stage_call(callee, Value::undefined(), Some(new_target), args, Some(dst));
+        stack.stage_call(
+            callee,
+            Value::undefined(),
+            Some(new_target),
+            args,
+            Some(dst),
+        );
     }
 
     /// Handle `Op::New`.
@@ -1164,8 +1172,8 @@ impl Interpreter {
         let argc = operands.const_index(2)? as usize;
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let args =
-            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc).to_smallvec8()?;
+        let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc)
+            .to_smallvec8()?;
         stack[top_idx].advance_pc()?;
         self.stage_construct(stack, callee, callee, args, dst);
         Ok(())
@@ -1175,7 +1183,11 @@ impl Interpreter {
     /// own, or the parent constructor itself outside a construct.
     fn super_new_target(frame: &crate::Frame, callee: Value) -> Value {
         let target = frame.new_target();
-        if target.is_undefined() { callee } else { target }
+        if target.is_undefined() {
+            callee
+        } else {
+            target
+        }
     }
 
     /// Handle fixed-arity `Op::SuperConstruct`.
@@ -1192,8 +1204,8 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
         let new_target = Self::super_new_target(&stack[top_idx], callee);
-        let args =
-            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc).to_smallvec8()?;
+        let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc)
+            .to_smallvec8()?;
         stack[top_idx].advance_pc()?;
         self.stage_construct(stack, callee, new_target, args, dst);
         Ok(())
@@ -1201,9 +1213,11 @@ impl Interpreter {
 
     fn spread_call_arguments(&self, value: Value) -> Result<SmallVec<[Value; 8]>, VmError> {
         let array = value.as_array().ok_or(VmError::TypeMismatch)?;
-        Ok(crate::array::with_elements(array, &self.gc_heap, |elements| {
-            elements.iter().copied().collect()
-        }))
+        Ok(crate::array::with_elements(
+            array,
+            &self.gc_heap,
+            |elements| elements.iter().copied().collect(),
+        ))
     }
 
     pub(crate) fn do_construct_spread(
@@ -1275,8 +1289,8 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
         let this_value = *read_register(&stack[top_idx], this_reg)?;
-        let args =
-            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 4, argc).to_smallvec8()?;
+        let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 4, argc)
+            .to_smallvec8()?;
         stack[top_idx].advance_pc()?;
         stack.stage_call(callee, this_value, None, args, Some(dst));
         Ok(())

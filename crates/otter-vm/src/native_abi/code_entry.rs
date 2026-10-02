@@ -74,7 +74,8 @@ pub const FUNCTION_CALL_SUSPENDABLE: u32 = 1 << 3;
 pub const FUNCTION_CALL_LEXICAL_THIS: u32 = 1 << 4;
 
 /// Byte offset of the immutable call flags in [`FunctionEntryCell`].
-pub const FUNCTION_ENTRY_CALL_FLAGS_OFFSET: usize = std::mem::offset_of!(FunctionEntryCell, call_flags);
+pub const FUNCTION_ENTRY_CALL_FLAGS_OFFSET: usize =
+    std::mem::offset_of!(FunctionEntryCell, call_flags);
 /// Byte offset of the formal parameter count in [`FunctionEntryCell`].
 pub const FUNCTION_ENTRY_PARAM_COUNT_OFFSET: usize =
     std::mem::offset_of!(FunctionEntryCell, param_count);
@@ -187,7 +188,9 @@ pub struct CodeEntryCell {
 impl CodeEntryCell {
     fn interpreter(function_id: u32, register_count: u16) -> Self {
         Self {
-            entry_addr: AtomicU64::new(super::call_trampoline::call_generic_entry as *const () as u64),
+            entry_addr: AtomicU64::new(
+                super::call_trampoline::call_generic_entry as *const () as u64,
+            ),
             code_object_id: 0,
             flags: 0,
             active_count: AtomicU32::new(0),

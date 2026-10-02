@@ -1650,7 +1650,6 @@ pub const STUB_JIT_RESOLVE_METHOD: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
-
 /// Generic entry of the JavaScript call ABI: classify any callee through the
 /// call trampoline and complete the call. Also the entry of every
 /// interpreter destination.
@@ -2096,7 +2095,7 @@ mod tests {
         assert_status_words(
             &[
                 STUB_JIT_LOOSE_EQ,
-                            STUB_JIT_ITERATOR_OP,
+                STUB_JIT_ITERATOR_OP,
                 STUB_JIT_BIND_FUNCTION,
                 STUB_JIT_DELETE_OP,
                 STUB_JIT_SUPER_OP,
@@ -2107,7 +2106,7 @@ mod tests {
                 STUB_JIT_CLASS_OP,
                 STUB_JIT_VARIADIC_OP,
                 STUB_JIT_STATIC_CALL_OP,
-                            STUB_JIT_CLASS_VALUE_OP,
+                STUB_JIT_CLASS_VALUE_OP,
                 STUB_JIT_MODULE_OP,
             ],
             RuntimeStubException::Status,

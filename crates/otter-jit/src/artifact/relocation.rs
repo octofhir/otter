@@ -1019,13 +1019,29 @@ fn branch_target_ordinal(
 pub(super) enum DirectBranchKind {
     B,
     Bl,
-    BCond { condition: u8 },
-    Cbz { is_64_bit: bool, register: u8 },
-    Cbnz { is_64_bit: bool, register: u8 },
-    Tbz { bit: u8, register: u8 },
-    Tbnz { bit: u8, register: u8 },
+    BCond {
+        condition: u8,
+    },
+    Cbz {
+        is_64_bit: bool,
+        register: u8,
+    },
+    Cbnz {
+        is_64_bit: bool,
+        register: u8,
+    },
+    Tbz {
+        bit: u8,
+        register: u8,
+    },
+    Tbnz {
+        bit: u8,
+        register: u8,
+    },
     /// Code-relative address materialization (`adr`).
-    Adr { register: u8 },
+    Adr {
+        register: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

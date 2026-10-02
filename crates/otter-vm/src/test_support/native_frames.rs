@@ -118,7 +118,8 @@ impl FrameFixture {
         self.frame.registers = crate::RegisterWindow::attached(slots.as_mut_ptr(), count);
         // SAFETY: the actuals follow the `count` registers in the same slice.
         let actuals = unsafe { slots.as_mut_ptr().add(count) };
-        self.frame.set_incoming_arguments(actuals, arguments.len() as u32);
+        self.frame
+            .set_incoming_arguments(actuals, arguments.len() as u32);
         self._slots = Some(slots);
     }
 }

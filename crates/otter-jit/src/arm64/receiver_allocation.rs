@@ -302,7 +302,6 @@ pub(crate) fn emit_receiver_publication_effect(
 /// three scratch registers are clobbered; `value` is preserved.
 pub(crate) fn emit_object_type_branch(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     value: u8,
     scratch: [u8; 3],
@@ -312,19 +311,8 @@ pub(crate) fn emit_object_type_branch(
     let [a, b, c] = scratch;
     let non_cell = ops.new_dynamic_label();
     emit_cell_test(ops, value, a, CellTest::IsNotCell, non_cell);
-    dynasm!(ops ; .arch aarch64 ; mov W(b), W(value));
-    crate::template::arm64::values::emit_load_symbol_u64(
-        ops,
-        relocations,
-        c,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add X(b), X(c), X(b)
-        ; ldrb W(b), [X(b)]
-    );
+    // A cell value is its header's full address.
+    dynasm!(ops ; .arch aarch64 ; ldrb W(b), [X(value)]);
     for tag in view.primitive_cell_type_tags {
         emit_load_u64(ops, c, u64::from(tag));
         dynasm!(ops ; .arch aarch64 ; cmp W(b), W(c) ; b.eq =>primitive);

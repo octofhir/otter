@@ -341,10 +341,9 @@ impl TargetSpec {
             },
             clobbers: [
                 scalar_call.clone(),
-                (9..=16)
-                    .map(integer)
-                    .chain([float(30), float(31)])
-                    .collect(),
+                // Element operations work on their allocated registers with
+                // the x15–x17/v30–v31 scratch outside the allocation file.
+                Box::new([]),
                 (9..=16).map(integer).collect(),
                 scalar_call.clone(),
                 (9..=16).map(integer).collect(),
@@ -623,14 +622,9 @@ mod tests {
     }
 
     #[test]
-    fn element_number_canonicalization_declares_every_scratch() {
+    fn aarch64_element_operations_clobber_no_allocatable_register() {
         let target = TargetSpec::aarch64();
-        let clobbers = target.clobbers(TargetClobberSet::Element);
-        for register in 9..=16 {
-            assert!(clobbers.contains(&PhysicalRegister::integer(register)));
-        }
-        assert!(clobbers.contains(&PhysicalRegister::float(30)));
-        assert!(clobbers.contains(&PhysicalRegister::float(31)));
+        assert!(target.clobbers(TargetClobberSet::Element).is_empty());
     }
 
     #[test]

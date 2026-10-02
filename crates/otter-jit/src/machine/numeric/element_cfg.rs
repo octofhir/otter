@@ -130,7 +130,6 @@ pub(super) fn select_probe(
     access: Option<otter_vm::JitElementAccess>,
     inputs: Inputs,
     values: Values,
-    representations: &mut [MachineRepresentation],
     instructions: &mut Vec<MachineInstruction>,
 ) -> Result<(), super::super::VerificationError> {
     let Some(access) = access else {
@@ -151,7 +150,7 @@ pub(super) fn select_probe(
     let mut view = MachineInstruction::plain(
         MachineOpcode::ElementView { byte_pc, access },
         vec![
-            MachineOperand::location_input(inputs.receiver),
+            MachineOperand::register_input(inputs.receiver),
             MachineOperand::register_output(values.base),
             MachineOperand::register_output(values.length),
             MachineOperand::register_output(values.view_hit),
@@ -162,13 +161,9 @@ pub(super) fn select_probe(
     let mut address = MachineInstruction::plain(
         MachineOpcode::ElementAddress { byte_pc, access },
         vec![
-            MachineOperand::location_input(values.base),
-            MachineOperand::location_input(values.length),
-            if representations[inputs.index.0 as usize] == MachineRepresentation::Float64 {
-                MachineOperand::register_input(inputs.index)
-            } else {
-                MachineOperand::location_input(inputs.index)
-            },
+            MachineOperand::register_input(values.base),
+            MachineOperand::register_input(values.length),
+            MachineOperand::register_input(inputs.index),
             MachineOperand::register_input(values.view_hit),
             MachineOperand::register_output(values.address),
             MachineOperand::register_output(values.address_hit),
@@ -180,8 +175,8 @@ pub(super) fn select_probe(
         MachineInstruction::plain(
             MachineOpcode::ElementValueGuard { byte_pc, access },
             vec![
-                MachineOperand::location_input(values.address),
-                MachineOperand::location_input(stored),
+                MachineOperand::register_input(values.address),
+                MachineOperand::register_input(stored),
                 MachineOperand::register_input(values.address_hit),
                 MachineOperand::register_output(values.hit),
             ],
@@ -190,7 +185,7 @@ pub(super) fn select_probe(
         MachineInstruction::plain(
             MachineOpcode::ElementValueLoad { byte_pc, access },
             vec![
-                MachineOperand::location_input(values.address),
+                MachineOperand::register_input(values.address),
                 MachineOperand::register_input(values.address_hit),
                 MachineOperand::register_output(values.fast_payload),
                 MachineOperand::register_output(values.hit),
@@ -232,7 +227,7 @@ pub(super) fn select_guarded(
             MachineInstruction::plain(
                 MachineOpcode::ElementProof { byte_pc, access },
                 vec![
-                    MachineOperand::location_input(inputs.receiver),
+                    MachineOperand::register_input(inputs.receiver),
                     MachineOperand::register_output(length),
                     MachineOperand::register_output(view_hit),
                 ],
@@ -245,7 +240,7 @@ pub(super) fn select_guarded(
             MachineInstruction::plain(
                 MachineOpcode::ElementView { byte_pc, access },
                 vec![
-                    MachineOperand::location_input(inputs.receiver),
+                    MachineOperand::register_input(inputs.receiver),
                     MachineOperand::register_output(base),
                     MachineOperand::register_output(length),
                     MachineOperand::register_output(view_hit),
@@ -258,20 +253,16 @@ pub(super) fn select_guarded(
     proof.clobbers = element_clobbers(target_spec);
     instructions.push(proof);
     let mut operands = vec![
-        MachineOperand::location_input(base),
-        MachineOperand::location_input(length),
-        if representations[inputs.index.0 as usize] == MachineRepresentation::Float64 {
-            MachineOperand::register_input(inputs.index)
-        } else {
-            MachineOperand::location_input(inputs.index)
-        },
+        MachineOperand::register_input(base),
+        MachineOperand::register_input(length),
+        MachineOperand::register_input(inputs.index),
         MachineOperand::register_input(view_hit),
     ];
     let address = inputs
         .stored_fast
         .map(|_| push_value(representations, MachineRepresentation::Int64));
     let opcode = if let (Some(stored), Some(address)) = (inputs.stored_fast, address) {
-        operands.push(MachineOperand::location_input(stored));
+        operands.push(MachineOperand::register_input(stored));
         operands.push(MachineOperand::register_output(address));
         MachineOpcode::ElementCheckedAddress { byte_pc, access }
     } else {
@@ -291,8 +282,8 @@ pub(super) fn select_guarded(
         let mut effect = MachineInstruction::plain(
             MachineOpcode::ElementValueStore { byte_pc, access },
             vec![
-                MachineOperand::location_input(address),
-                MachineOperand::location_input(stored),
+                MachineOperand::register_input(address),
+                MachineOperand::register_input(stored),
             ],
         );
         effect.clobbers = element_clobbers(target_spec);
@@ -346,8 +337,8 @@ pub(super) fn select_block(
                     let mut effect = MachineInstruction::plain(
                         MachineOpcode::ElementValueStore { byte_pc, access },
                         vec![
-                            MachineOperand::location_input(values.address),
-                            MachineOperand::location_input(stored),
+                            MachineOperand::register_input(values.address),
+                            MachineOperand::register_input(stored),
                         ],
                     );
                     effect.clobbers = element_clobbers(target_spec);

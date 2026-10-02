@@ -480,6 +480,9 @@ impl CodeBlock {
                         }
                         bits => crate::feedback::ArithFeedback::from_bits(bits),
                     },
+                    arith_cell: self
+                        .feedback_at(index)
+                        .map_or(0, crate::feedback::InstructionFeedback::arith_cell_address),
                 })
                 .collect(),
             // Baked by `Interpreter::bake_global_lexical_loads`, which owns the

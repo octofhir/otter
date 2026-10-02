@@ -1248,7 +1248,15 @@ pub(super) fn emit(
                     RelocationTarget::GcCageBase,
                 );
                 load64(&mut ops, 10, u64::from(root));
-                dynasm!(ops ; .arch x64 ; mov r10d, [r11 + r10 + view.shape_prototype_byte as i32] ; =>done);
+                // The holder is a tagged value: decompress the shape's
+                // prototype word into its full cell address.
+                dynasm!(ops ; .arch x64
+                    ; mov r10d, [r11 + r10 + view.shape_prototype_byte as i32]
+                    ; test r10d, r10d
+                    ; jz =>done
+                    ; add r10, r11
+                    ; =>done
+                );
                 store_integer(&mut ops, frame, loc[1], 10)?;
                 store_integer(&mut ops, frame, loc[2], 9)?;
                 structural_regions.push((
@@ -3571,6 +3579,19 @@ fn box_bool(ops: &mut Assembler, src: u8, dst: u8) {
     dynasm!(ops ; .arch x64 ; =>done);
 }
 
+/// Bytes the poll's runtime call reserves below `rsp` for the allocatable
+/// caller-saved file: eight integer registers and `xmm0..=xmm14` (one pad
+/// word).
+const POLL_SAVE_BYTES: i32 = 8 * 8 + 16 * 8;
+const POLL_SAVED_GPRS: [u8; 8] = [0, 1, 2, 6, 7, 8, 9, 10];
+
+/// Emit the backedge interrupt/budget poll.
+///
+/// The batched counter is the whole hot path. The rare runtime call saves
+/// and restores every allocatable caller-saved register itself, so the poll
+/// clobbers no register an allocation can hold. The stub neither collects
+/// nor reenters JavaScript, so a tagged value saved here is still current
+/// when it is restored.
 fn poll(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -3587,37 +3608,45 @@ fn poll(
         ; sub ebp, 1
         ; jne =>batched
         ; mov ebp, crate::GENERATED_POLL_BATCH as i32
-        ; push r10
-        ; mov r10, [r15 + THREAD_OFFSET as i32]
-        ; mov r11, [r10 + VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
+        ; mov r11, [r15 + THREAD_OFFSET as i32]
+        ; mov r11, [r11 + VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
         ; cmp BYTE [r11], 0
         ; jne =>interrupted
-        ; mov r11, [r10 + VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET as i32]
+        ; mov r11, [r15 + THREAD_OFFSET as i32]
+        ; mov r11, [r11 + VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET as i32]
         ; sub QWORD [r11], crate::GENERATED_POLL_BATCH as i32
-        ; jg >fuel_ready
-        ; pop r10
-        ; mov rdi, r15
+        ; jg =>done
+        ; sub rsp, POLL_SAVE_BYTES
     );
+    for (slot, register) in POLL_SAVED_GPRS.into_iter().enumerate() {
+        dynasm!(ops ; .arch x64 ; mov [rsp + (slot * 8) as i32], Rq(register));
+    }
+    for register in 0..15u8 {
+        dynasm!(ops ; .arch x64 ; movsd [rsp + 64 + i32::from(register) * 8], Rx(register));
+    }
+    dynasm!(ops ; .arch x64 ; mov rdi, r15);
     runtime(ops, relocations, entry, STUB_JIT_BACKEDGE_POLL);
+    dynasm!(ops ; .arch x64 ; call r11 ; mov r11d, eax);
+    for (slot, register) in POLL_SAVED_GPRS.into_iter().enumerate() {
+        dynasm!(ops ; .arch x64 ; mov Rq(register), [rsp + (slot * 8) as i32]);
+    }
+    for register in 0..15u8 {
+        dynasm!(ops ; .arch x64 ; movsd Rx(register), [rsp + 64 + i32::from(register) * 8]);
+    }
     dynasm!(ops
         ; .arch x64
-        ; call r11
-        ; cmp eax, NativeResultStatus::Success as i32
+        ; add rsp, POLL_SAVE_BYTES
+        ; cmp r11d, NativeResultStatus::Success as i32
         ; je =>done
-        ; cmp eax, NativeResultStatus::Yield as i32
+        ; cmp r11d, NativeResultStatus::Yield as i32
         ; je =>done
-        ; cmp eax, NativeResultStatus::Throw as i32
+        ; cmp r11d, NativeResultStatus::Throw as i32
         ; je =>finish_error
         ; jmp =>fatal
-        ; fuel_ready:
-        ; pop r10
+        ; =>interrupted
+        ; jmp =>bailout
         ; =>done
         ; =>batched
-        ; jmp >poll_complete
-        ; =>interrupted
-        ; pop r10
-        ; jmp =>bailout
-        ; poll_complete:
     );
 }
 

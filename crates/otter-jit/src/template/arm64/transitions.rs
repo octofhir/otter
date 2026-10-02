@@ -28,7 +28,7 @@ use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::ic_probe::{
-    DenseIndexForm, element_access_for, emit_element_address, emit_element_read, emit_element_write,
+    element_access_for, emit_element_address, emit_element_read, emit_element_write,
 };
 use super::values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg};
 pub(super) use crate::entry::TransitionTable;
@@ -356,7 +356,6 @@ pub(super) fn emit_load_element(
             access,
             |ops, register| emit_load_reg(ops, register, receiver),
             |ops, register| emit_load_reg(ops, register, index),
-            DenseIndexForm::Tagged,
             miss,
         )?;
         emit_element_read(ops, access.element, miss);
@@ -415,7 +414,6 @@ pub(super) fn emit_store_element(
             access,
             |ops, register| emit_load_reg(ops, register, receiver),
             |ops, register| emit_load_reg(ops, register, index),
-            DenseIndexForm::Tagged,
             miss,
         )?;
         emit_element_read(ops, access.element, miss);

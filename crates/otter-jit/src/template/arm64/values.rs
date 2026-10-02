@@ -521,32 +521,16 @@ pub(crate) fn emit_typeof_kind(
 /// `X(scratch_a)` and `X(scratch_b)`.
 pub(crate) fn emit_html_dda_candidate_exit(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     value: u8,
     scratch_a: u8,
     scratch_b: u8,
     exit: DynamicLabel,
 ) {
-    if view.cage_base == 0 {
-        emit_cell_test(ops, value, scratch_a, CellTest::IsCell, exit);
-        return;
-    }
     let fall_through = ops.new_dynamic_label();
     emit_cell_test(ops, value, scratch_a, CellTest::IsNotCell, fall_through);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        scratch_a,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov W(scratch_b), W(value)
-        ; add X(scratch_a), X(scratch_a), X(scratch_b)
-        ; ldrb W(scratch_b), [X(scratch_a)]
-    );
+    // A cell value is its header's full address.
+    dynasm!(ops ; .arch aarch64 ; ldrb W(scratch_b), [X(value)]);
     emit_load_u64(
         ops,
         scratch_a,
@@ -613,19 +597,11 @@ pub(crate) fn emit_write_barrier_with_context(
         ; b.ne =>done
         // An old, unrecorded parent: only a nursery child owes the remembered
         // set an entry.
-        ; mov w15, W(child)
     );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        14,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
+    // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
-        ; add x14, x14, x15
-        ; ldrb w14, [x14, flags_byte]
+        ; ldrb w14, [X(child), flags_byte]
         ; movz w15, young
         ; tst w14, w15
         ; b.eq =>done

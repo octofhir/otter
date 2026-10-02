@@ -390,15 +390,10 @@ pub(super) fn emit_return(
             emit_sp_address(ops, 9, flags);
             dynasm!(ops ; .arch aarch64 ; ldrb w9, [x9]);
         }
-        if far {
-            dynasm!(ops ; .arch aarch64 ; tst w9, u32::from(NativeFrameFlags::CONSTRUCT));
-            emit_branch_ne(ops, construct, far);
-        } else {
-            dynasm!(ops
-                ; .arch aarch64
-                ; tbnz w9, NativeFrameFlags::CONSTRUCT.trailing_zeros(), =>construct
-            );
-        }
+        // The completion tail follows the body, so `tbnz` (±32 KiB) cannot
+        // reach it from a large function.
+        dynasm!(ops ; .arch aarch64 ; tst w9, u32::from(NativeFrameFlags::CONSTRUCT));
+        emit_branch_ne(ops, construct, far);
     }
     emit_plain_return(ops, frame, saved);
 }

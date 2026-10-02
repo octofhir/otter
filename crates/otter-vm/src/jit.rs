@@ -1776,6 +1776,9 @@ pub struct JitInstructionMetadata {
     pub call_attempted: bool,
     /// Arithmetic representation observations frozen for this canonical PC.
     pub(crate) arith_feedback: ArithFeedback,
+    /// Address of the live arithmetic observation byte baseline code
+    /// records into, or zero when the instruction has no feedback cell.
+    pub arith_cell: u64,
 }
 
 impl JitInstructionMetadata {
@@ -1788,6 +1791,7 @@ impl JitInstructionMetadata {
             load_number: None,
             call_attempted: false,
             arith_feedback: ArithFeedback::default(),
+            arith_cell: 0,
         }
     }
 }

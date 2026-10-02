@@ -15,8 +15,6 @@
 
 #![allow(clippy::useless_conversion)]
 
-use super::emit_load_symbolic_u64;
-use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
 use dynasmrt::aarch64::Assembler;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
@@ -24,7 +22,6 @@ use otter_vm::{JitCompileSnapshot, Value};
 
 pub(super) fn emit(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     source: u8,
     result: u8,
@@ -51,26 +48,16 @@ pub(super) fn emit(
         dynasm!(ops ; .arch aarch64 ; cmp X(source), x16 ; b.eq =>target);
     }
     emit_cell_test(ops, source, 16, CellTest::IsNotCell, miss);
-    if view.cage_base == 0 {
-        dynasm!(ops ; .arch aarch64 ; b =>miss);
-    } else {
-        emit_load_symbolic_u64(
-            ops,
-            relocations,
-            16,
-            view.cage_base as u64,
-            RelocationTarget::GcCageBase,
-        );
-        dynasm!(ops ; .arch aarch64 ; mov w15, W(source) ; add x16, x16, x15 ; ldrb w15, [x16]);
-        for tag in view
-            .primitive_cell_type_tags
-            .into_iter()
-            .chain([view.collection_layout.native_function_type_tag])
-        {
-            dynasm!(ops ; .arch aarch64 ; cmp w15, u32::from(tag) ; b.eq =>miss);
-        }
-        dynasm!(ops ; .arch aarch64 ; b =>truthy);
+    // A cell value is its header's full address.
+    dynasm!(ops ; .arch aarch64 ; ldrb w15, [X(source)]);
+    for tag in view
+        .primitive_cell_type_tags
+        .into_iter()
+        .chain([view.collection_layout.native_function_type_tag])
+    {
+        dynasm!(ops ; .arch aarch64 ; cmp w15, u32::from(tag) ; b.eq =>miss);
     }
+    dynasm!(ops ; .arch aarch64 ; b =>truthy);
     dynasm!(ops ; .arch aarch64 ; =>int ; cbz W(source), =>falsy ; b =>truthy ; =>double);
     emit_load_u64(ops, 16, otter_vm::value::tag::DOUBLE_ENCODE_OFFSET);
     dynasm!(ops ; .arch aarch64 ; sub x15, X(source), x16 ; cbz x15, =>falsy);

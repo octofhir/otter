@@ -4319,7 +4319,7 @@ fn lower_instruction(
                     | NumericBinaryOp::Sub
                     | NumericBinaryOp::Mul
                     | NumericBinaryOp::Rem
-            ) && feedback.is_int32_only()
+            ) && feedback.speculates_int32()
             {
                 TaggedNumericDecode::Int32
             } else {
@@ -4348,7 +4348,7 @@ fn lower_instruction(
                     | NumericBinaryOp::Sub
                     | NumericBinaryOp::Mul
                     | NumericBinaryOp::Rem
-            ) && feedback.is_int32_only()
+            ) && feedback.speculates_int32()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
@@ -4380,7 +4380,7 @@ fn lower_instruction(
             }
             let immediate = instruction.imm32(code, 2)?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            let tagged_decode = if feedback.is_int32_only() {
+            let tagged_decode = if feedback.speculates_int32() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -4393,7 +4393,7 @@ fn lower_instruction(
                 register(instruction, code, 1)?,
                 tagged_decode,
             )?;
-            if feedback.is_int32_only() && value_type(nodes, source)? == NumericType::Int32 {
+            if feedback.speculates_int32() && value_type(nodes, source)? == NumericType::Int32 {
                 match op {
                     Op::Increment | Op::AddImm => {
                         NumericNode::IntegerAddImmediate(source, immediate)
@@ -4431,7 +4431,7 @@ fn lower_instruction(
                 return None;
             }
             let immediate = instruction.imm32(code, 2)?;
-            let tagged_decode = if feedback.is_int32_only() {
+            let tagged_decode = if feedback.speculates_int32() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -4444,7 +4444,7 @@ fn lower_instruction(
                 register(instruction, code, 1)?,
                 tagged_decode,
             )?;
-            if feedback.is_int32_only() && value_type(nodes, source)? == NumericType::Int32 {
+            if feedback.speculates_int32() && value_type(nodes, source)? == NumericType::Int32 {
                 match op {
                     Op::LessThanImm => NumericNode::IntegerLessThanImmediate(source, immediate),
                     Op::EqualImm => NumericNode::IntegerEqualImmediate(source, immediate),
@@ -4506,7 +4506,7 @@ fn lower_instruction(
                 note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
-            let tagged_decode = if feedback.is_int32_only() {
+            let tagged_decode = if feedback.speculates_int32() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -4520,7 +4520,7 @@ fn lower_instruction(
                 tagged_decode,
             )?;
             *arithmetic_op_count = arithmetic_op_count.checked_add(1)?;
-            if feedback.is_int32_only() && value_type(nodes, source)? == NumericType::Int32 {
+            if feedback.speculates_int32() && value_type(nodes, source)? == NumericType::Int32 {
                 NumericNode::IntegerNeg(source)
             } else {
                 NumericNode::Neg(widen_to_number(source, nodes, block_nodes)?)
@@ -4606,7 +4606,7 @@ fn lower_instruction(
                 )?;
                 return Some(());
             }
-            let tagged_decode = if feedback.is_int32_only() {
+            let tagged_decode = if feedback.speculates_int32() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -4627,7 +4627,7 @@ fn lower_instruction(
                 register(instruction, code, 2)?,
                 tagged_decode,
             )?;
-            if feedback.is_int32_only()
+            if feedback.speculates_int32()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
@@ -4652,7 +4652,7 @@ fn lower_instruction(
                 note_decline(decline, op, logical_pc, "non-numeric arithmetic feedback");
                 return None;
             }
-            let tagged_decode = if feedback.is_int32_only() {
+            let tagged_decode = if feedback.speculates_int32() {
                 TaggedNumericDecode::Int32
             } else {
                 TaggedNumericDecode::Number
@@ -4673,7 +4673,7 @@ fn lower_instruction(
                 register(instruction, code, 2)?,
                 tagged_decode,
             )?;
-            if feedback.is_int32_only()
+            if feedback.speculates_int32()
                 && value_type(nodes, left)? == NumericType::Int32
                 && value_type(nodes, right)? == NumericType::Int32
             {
@@ -7165,7 +7165,7 @@ mod tests {
     }
 
     #[test]
-    fn unseen_immediate_comparisons_decode_tagged_numbers_at_the_exact_site() {
+    fn unseen_immediate_comparisons_speculate_int32_at_the_exact_site() {
         for op in [Op::LessThanImm, Op::EqualImm, Op::NotEqualImm] {
             let hir = NumericFunction::build(&unseen_immediate_numeric_view(op))
                 .expect("guarded unseen immediate comparison HIR");
@@ -7183,23 +7183,19 @@ mod tests {
                 })
                 .map(NumericValue)
                 .expect("unseen input remains tagged");
+            // No tier recorded another representation, so the site speculates
+            // int32 and a wrong guess exits and widens it.
             let decode = hir
                 .nodes
                 .iter()
-                .position(|node| *node == NumericNode::TaggedToNumber(parameter))
+                .position(|node| *node == NumericNode::TaggedToInt32(parameter))
                 .map(NumericValue)
-                .expect("exact tagged-number decode");
-            let immediate = hir
-                .nodes
-                .iter()
-                .position(|node| *node == NumericNode::Constant(7.0))
-                .map(NumericValue)
-                .expect("Float64 immediate");
+                .expect("exact tagged-int32 decode");
             assert!(hir.nodes.iter().any(|node| match (op, node) {
-                (Op::LessThanImm, NumericNode::LessThan(left, right))
-                | (Op::EqualImm, NumericNode::Equal(left, right))
-                | (Op::NotEqualImm, NumericNode::NotEqual(left, right)) => {
-                    (*left, *right) == (decode, immediate)
+                (Op::LessThanImm, NumericNode::IntegerLessThanImmediate(source, 7))
+                | (Op::EqualImm, NumericNode::IntegerEqualImmediate(source, 7))
+                | (Op::NotEqualImm, NumericNode::IntegerNotEqualImmediate(source, 7)) => {
+                    *source == decode
                 }
                 _ => false,
             }));
@@ -7281,22 +7277,29 @@ mod tests {
                     node,
                     NumericNode::ElementGuardedLoad { index, byte_pc: 8, .. }
                         | NumericNode::ElementGuardedStore { index, byte_pc: 16, .. }
-                        if matches!(speculative.nodes[index.0], NumericNode::Mul(..))
+                        if matches!(
+                            speculative.nodes[index.0],
+                            NumericNode::Mul(..) | NumericNode::IntegerMul(..)
+                        )
                 )
             })
             .count();
-        assert_eq!(guarded, 2, "both sites speculate on the Number product");
+        assert_eq!(guarded, 2, "both sites speculate on the product");
 
         let mut view = number_index_element_view();
         exited_at(&mut view, &[1, 2]);
         let hir = NumericFunction::build(&view).expect("Number-index element HIR");
+        // An unseen product speculates int32; either numeric product indexes.
         let product = hir
             .nodes
             .iter()
-            .position(|node| matches!(node, NumericNode::Mul(..)))
+            .position(|node| matches!(node, NumericNode::Mul(..) | NumericNode::IntegerMul(..)))
             .map(NumericValue)
-            .expect("guarded Float64 product");
-        assert_eq!(hir.nodes[product.0].value_type(), NumericType::Number);
+            .expect("guarded product");
+        assert!(matches!(
+            hir.nodes[product.0].value_type(),
+            NumericType::Number | NumericType::Int32
+        ));
 
         let load = hir
             .nodes
@@ -7368,9 +7371,9 @@ mod tests {
         let product = hir
             .nodes
             .iter()
-            .position(|node| matches!(node, NumericNode::Mul(..)))
+            .position(|node| matches!(node, NumericNode::Mul(..) | NumericNode::IntegerMul(..)))
             .map(NumericValue)
-            .expect("guarded Float64 product");
+            .expect("guarded product");
         let load = hir
             .nodes
             .iter()

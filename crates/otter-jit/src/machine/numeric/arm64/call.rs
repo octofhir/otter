@@ -257,36 +257,51 @@ pub(super) fn emit(
         // A candidate's guard proves the loaded method; a proven bytecode
         // method enters its current generation, any other receiver resolves
         // the method without calling it.
-        for candidate in candidates {
-            let guard = candidate
-                .guard
-                .as_ref()
-                .ok_or(Unsupported::OperandShape("scalar method candidate guard"))?;
-            let next = ops.new_dynamic_label();
+        // One receiver decode switches on its hidden class; the selected
+        // candidate proves its chain, slot and method identity.
+        if !candidates.is_empty() {
+            let guards = candidates
+                .iter()
+                .map(|candidate| {
+                    candidate
+                        .guard
+                        .as_ref()
+                        .ok_or(Unsupported::OperandShape("scalar method candidate guard"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let hits = candidates
+                .iter()
+                .map(|_| ops.new_dynamic_label())
+                .collect::<Vec<_>>();
+            let resolve = ops.new_dynamic_label();
             let receiver = call.operand_register(ops, 0, 9, 0, true)?;
-            emit_method_guard_from_tagged_register(
-                ops,
-                relocations,
-                call.view,
-                guard,
-                receiver,
-                17,
-                None,
-                next,
+            crate::arm64::emit_method_shape_dispatch(
+                ops, call.view, &guards, receiver, &hits, resolve,
             )?;
-            // The guard proved the loaded method's function identity.
-            let plan = candidate.callee.plan;
-            dynasm!(ops ; .arch aarch64 ; mov x12, x17);
-            emit_invoke(
-                ops,
-                relocations,
-                call,
-                form,
-                Some(plan),
-                Callee::Register(12),
-                true,
-            )?;
-            dynasm!(ops ; .arch aarch64 ; =>next);
+            for ((candidate, guard), hit) in candidates.iter().zip(&guards).zip(&hits) {
+                let plan = candidate.callee.plan;
+                dynasm!(ops ; .arch aarch64 ; =>*hit);
+                crate::arm64::emit_method_target(
+                    ops,
+                    relocations,
+                    call.view,
+                    guard,
+                    plan,
+                    call.call_pc,
+                    12,
+                    resolve,
+                )?;
+                emit_invoke(
+                    ops,
+                    relocations,
+                    call,
+                    form,
+                    Some(plan),
+                    Callee::Register(12),
+                    true,
+                )?;
+            }
+            dynasm!(ops ; .arch aarch64 ; =>resolve);
         }
         let receiver = call
             .instruction

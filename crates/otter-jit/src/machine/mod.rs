@@ -3646,7 +3646,7 @@ impl InstructionSequence {
                     let [receiver, base, length, hit] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let valid = *receiver == MachineOperand::location_input(receiver.value)
+                    let valid = *receiver == MachineOperand::register_input(receiver.value)
                         && *base == MachineOperand::register_output(base.value)
                         && *length == MachineOperand::register_output(length.value)
                         && *hit == MachineOperand::register_output(hit.value)
@@ -3667,7 +3667,7 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
                     let valid = matches!(access.base, otter_vm::JitElementBase::InBody { .. })
-                        && *receiver == MachineOperand::location_input(receiver.value)
+                        && *receiver == MachineOperand::register_input(receiver.value)
                         && *length == MachineOperand::register_output(length.value)
                         && *hit == MachineOperand::register_output(hit.value)
                         && self.representations[receiver.value.0 as usize]
@@ -3693,7 +3693,7 @@ impl InstructionSequence {
                     let index_representation = self.representations[index.value.0 as usize];
                     let valid = [base, length]
                         .into_iter()
-                        .all(|operand| *operand == MachineOperand::location_input(operand.value))
+                        .all(|operand| *operand == MachineOperand::register_input(operand.value))
                         && *active == MachineOperand::register_input(active.value)
                         && *address == MachineOperand::register_output(address.value)
                         && *hit == MachineOperand::register_output(hit.value)
@@ -3708,12 +3708,7 @@ impl InstructionSequence {
                                 | MachineRepresentation::Uint32
                                 | MachineRepresentation::Float64
                         )
-                        && *index
-                            == if index_representation == MachineRepresentation::Float64 {
-                                MachineOperand::register_input(index.value)
-                            } else {
-                                MachineOperand::location_input(index.value)
-                            }
+                        && *index == MachineOperand::register_input(index.value)
                         && self.representations[active.value.0 as usize]
                             == MachineRepresentation::Boolean
                         && self.representations[address.value.0 as usize]
@@ -3728,7 +3723,7 @@ impl InstructionSequence {
                     let [address, active, value, hit] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let valid = *address == MachineOperand::location_input(address.value)
+                    let valid = *address == MachineOperand::register_input(address.value)
                         && *active == MachineOperand::register_input(active.value)
                         && *value == MachineOperand::register_output(value.value)
                         && *hit == MachineOperand::register_output(hit.value)
@@ -3751,8 +3746,8 @@ impl InstructionSequence {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
                     let value_representation = self.representations[value.value.0 as usize];
-                    let valid = *address == MachineOperand::location_input(address.value)
-                        && *value == MachineOperand::location_input(value.value)
+                    let valid = *address == MachineOperand::register_input(address.value)
+                        && *value == MachineOperand::register_input(value.value)
                         && *active == MachineOperand::register_input(active.value)
                         && *hit == MachineOperand::register_output(hit.value)
                         && self.representations[address.value.0 as usize]
@@ -3770,8 +3765,8 @@ impl InstructionSequence {
                     let [address, value] = instruction.operands.as_slice() else {
                         return Err(VerificationError::OpcodeSignatureMismatch(id));
                     };
-                    let valid = *address == MachineOperand::location_input(address.value)
-                        && *value == MachineOperand::location_input(value.value)
+                    let valid = *address == MachineOperand::register_input(address.value)
+                        && *value == MachineOperand::register_input(value.value)
                         && self.representations[address.value.0 as usize]
                             == MachineRepresentation::Int64
                         && element::valid_store(
@@ -3803,7 +3798,7 @@ impl InstructionSequence {
                     let mut frame_values = std::collections::BTreeSet::new();
                     let operands_valid = [base, length]
                         .into_iter()
-                        .all(|operand| *operand == MachineOperand::location_input(operand.value))
+                        .all(|operand| *operand == MachineOperand::register_input(operand.value))
                         && self.representations[base.value.0 as usize]
                             == if matches!(access.base, otter_vm::JitElementBase::InBody { .. }) {
                                 MachineRepresentation::Tagged
@@ -3819,12 +3814,7 @@ impl InstructionSequence {
                                 | MachineRepresentation::Uint32
                                 | MachineRepresentation::Float64
                         )
-                        && *index
-                            == if index_representation == MachineRepresentation::Float64 {
-                                MachineOperand::register_input(index.value)
-                            } else {
-                                MachineOperand::location_input(index.value)
-                            }
+                        && *index == MachineOperand::register_input(index.value)
                         && *active == MachineOperand::register_input(active.value)
                         && self.representations[active.value.0 as usize]
                             == MachineRepresentation::Boolean
@@ -3837,7 +3827,7 @@ impl InstructionSequence {
                                 )
                         } else {
                             let (stored, address) = (&fixed_operands[4], &fixed_operands[5]);
-                            *stored == MachineOperand::location_input(stored.value)
+                            *stored == MachineOperand::register_input(stored.value)
                                 && element::valid_store(
                                     access.element,
                                     self.representations[stored.value.0 as usize],

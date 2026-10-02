@@ -722,26 +722,6 @@ impl TemplatePlan {
         &self.register_operands[tail.start..tail.start + tail.len]
     }
 
-    /// Resolve a call's packed-argument word for emission: a spilled list
-    /// (`argc > PACKED_REGISTER_LANES`) becomes the baked address of its table in
-    /// the frozen decoded-operand buffer and returns its stable logical range
-    /// for relocation metadata; an inline pack passes through without a range.
-    pub(crate) fn resolve_packed_args(
-        &self,
-        argc: u16,
-        packed_args: u64,
-    ) -> (u64, Option<TemplateTail>) {
-        if usize::from(argc) > PACKED_REGISTER_LANES {
-            let tail = TemplateTail {
-                start: packed_args as usize,
-                len: usize::from(argc),
-            };
-            (self.register_tail(tail).as_ptr() as u64, Some(tail))
-        } else {
-            (packed_args, None)
-        }
-    }
-
     /// Decode one call site's immutable caller-register operands for generated
     /// native frame construction.
     pub(crate) fn call_argument_registers(&self, argc: u16, packed_args: u64) -> Vec<u16> {

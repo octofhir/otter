@@ -19,9 +19,7 @@
 //! - [`crate::jit_spread_call_ops`] — committed runtime completion.
 //! - [`crate::runtime_activation`] — compiled-frame access boundary.
 
-use crate::{
-    ActivationStack, ActiveFrameMut, ActiveFrameRef, CodeBlock, Interpreter, Value, VmError,
-};
+use crate::{ActiveFrameMut, ActiveFrameRef, CodeBlock, Interpreter, Value, VmError};
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind};
 
 impl CodeBlock {
@@ -56,76 +54,37 @@ impl CodeBlock {
 }
 
 impl Interpreter {
-    pub(crate) fn elided_forward_argument_count(
-        &self,
-        stack: &ActivationStack,
-        frame: &ActiveFrameRef<'_>,
-        materialized: Option<usize>,
-    ) -> Option<u32> {
-        let materialized = materialized.and_then(|index| stack.get(index));
-        let cold = materialized.and_then(|frame| self.frame_cold(frame));
-        if frame.native_arguments_object().is_some()
-            || cold.is_some_and(|cold| cold.arguments_object.is_some())
-        {
+    pub(crate) fn elided_forward_argument_count(&self, frame: &ActiveFrameRef<'_>) -> Option<u32> {
+        if frame.native_arguments_object().is_some() {
             return None;
         }
-        // A materialized frame entered without actuals never allocates its
-        // cold record: absent incoming arguments are the empty list.
-        let count = match frame.incoming_argument_count() {
-            Some(count) => count,
-            None => {
-                materialized?;
-                cold.map_or(0, |cold| cold.incoming_args.len())
-            }
-        };
-        u32::try_from(count).ok()
+        u32::try_from(frame.incoming_argument_count()).ok()
     }
 
     pub(crate) fn copy_forwarded_argument_window(
         &self,
         function: &CodeBlock,
-        stack: &ActivationStack,
         source: &ActiveFrameRef<'_>,
-        materialized: Option<usize>,
         destination: &mut ActiveFrameMut<'_>,
         parameter_count: u16,
     ) -> Result<Option<u32>, VmError> {
-        let Some(count) = self.elided_forward_argument_count(stack, source, materialized) else {
+        let Some(count) = self.elided_forward_argument_count(source) else {
             return Ok(None);
         };
         let count = count as usize;
         let incoming = destination.incoming_argument_count();
-        if usize::from(parameter_count) > destination.register_count()
-            || incoming.is_some_and(|length| length != count)
-        {
+        if usize::from(parameter_count) > destination.register_count() || incoming != count {
             return Ok(None);
         }
-        let cold = materialized
-            .and_then(|index| stack.get(index))
-            .and_then(|frame| self.frame_cold(frame));
-        let native = source.incoming_argument_count().is_some();
         let mut write = |index: usize, value: Value| -> Result<(), VmError> {
             if index < usize::from(parameter_count) {
                 destination.write(index as u16, value)?;
             }
-            if incoming.is_some() {
-                destination.write_incoming_argument(index, value)?;
-            }
+            destination.write_incoming_argument(index, value)?;
             Ok(())
         };
-        let copied = if incoming.is_some() {
-            count
-        } else {
-            count.min(usize::from(parameter_count))
-        };
-        for index in 0..copied {
-            let value = if native {
-                source.incoming_argument(index)?
-            } else {
-                *cold
-                    .and_then(|cold| cold.incoming_args.get(index))
-                    .ok_or(VmError::InvalidOperand)?
-            };
+        for index in 0..count {
+            let value = source.incoming_argument(index)?;
             write(index, value)?;
         }
         for (argument_index, storage) in function.forwarded_argument_bindings() {

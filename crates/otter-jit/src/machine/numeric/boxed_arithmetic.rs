@@ -244,7 +244,12 @@ pub(super) fn visit_inputs(
                 NumericDirectCallArguments::Fixed { start, count } => {
                     span(function, start, count, true, &mut visit)?
                 }
-                NumericDirectCallArguments::Spread(value) => visit(value, false),
+                NumericDirectCallArguments::Spread { receiver, array } => {
+                    if let Some(receiver) = receiver {
+                        visit(receiver, true);
+                    }
+                    visit(array, false);
+                }
             }
         }
         NativeCall {

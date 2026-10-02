@@ -199,7 +199,7 @@ pub(super) fn emit_new_object(
         table,
         abi::STUB_JIT_NEW_OBJECT,
         &[],
-        dst,
+        Some(dst),
         throw_value,
         fatal,
     )
@@ -245,7 +245,7 @@ pub(super) fn emit_new_array(
         table,
         abi::STUB_JIT_NEW_ARRAY,
         &words,
-        dst,
+        Some(dst),
         throw_value,
         fatal,
     )
@@ -271,7 +271,7 @@ pub(super) fn emit_new_object_literal(
         table,
         abi::STUB_JIT_NEW_OBJECT_LITERAL,
         &words,
-        dst,
+        Some(dst),
         throw_value,
         fatal,
     )

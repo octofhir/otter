@@ -1,4 +1,4 @@
-//! Owned and borrowed views of the active JavaScript stack.
+//! Source resolution for owned and borrowed JavaScript stack views.
 //!
 //! Error reporting needs a complete owned stack, while bounded diagnostic
 //! samplers must inspect frame metadata before allocating owned strings. This
@@ -6,9 +6,7 @@
 //!
 //! # Contents
 //! - [`visit_frame_snapshot`] — resolve one exact source instruction.
-//! - [`visit_frame_snapshots`] — visit materialized frames, innermost first.
-//! - [`snapshot_frames`] — collect the materialized stack into owned DTOs.
-//! - `native_stack_snapshot` merges compiled owners through this same resolver.
+//! - `native_stack_snapshot` uses this source resolver for owned and borrowed walks.
 //!
 //! # Invariants
 //! - Foreign function ids are resolved through their owning execution context.
@@ -21,7 +19,7 @@
 //! - [`crate::run_control::StackFrameSnapshot`]
 //! - [`crate::cpu_profile`]
 
-use crate::{ActivationStack, ExecutionContext, StackFrameSnapshot};
+use crate::ExecutionContext;
 
 /// Borrowed metadata for one active JavaScript frame.
 #[derive(Debug, Clone, Copy)]
@@ -34,46 +32,6 @@ pub(crate) struct StackFrameSnapshotView<'a> {
     pub(crate) module: &'a str,
     /// Source byte span at the sampled instruction.
     pub(crate) span: (u32, u32),
-}
-
-/// Visit up to `limit` active frames, innermost first.
-///
-/// Returning `false` from `visit` stops the walk. The callback must not retain
-/// borrowed strings after it returns.
-pub(crate) fn visit_frame_snapshots(
-    context: &ExecutionContext,
-    stack: &ActivationStack,
-    limit: usize,
-    mut visit: impl FnMut(StackFrameSnapshotView<'_>) -> bool,
-) {
-    for (depth, frame) in stack.iter().rev().take(limit).enumerate() {
-        let instruction = if depth == 0 {
-            frame.pc
-        } else {
-            frame.pc.saturating_sub(1)
-        };
-        if !visit_frame_snapshot(context, frame.function_id, instruction as usize, &mut visit) {
-            break;
-        }
-    }
-}
-
-/// Capture the complete active JavaScript stack into owned DTOs.
-pub(crate) fn snapshot_frames(
-    context: &ExecutionContext,
-    stack: &ActivationStack,
-) -> Vec<StackFrameSnapshot> {
-    let mut frames = Vec::with_capacity(stack.len());
-    visit_frame_snapshots(context, stack, usize::MAX, |frame| {
-        frames.push(StackFrameSnapshot {
-            function_id: frame.function_id,
-            function_name: frame.function_name.to_owned(),
-            module: frame.module.to_owned(),
-            span: frame.span,
-        });
-        true
-    });
-    frames
 }
 
 /// Resolve one exact logical instruction into the shared borrowed stack view.

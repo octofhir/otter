@@ -45,7 +45,7 @@
 //!
 //! # See also
 //!
-//! - [`crate::native_abi::NativeFrame`] — fixed-width native activation ABI.
+//! - [`crate::native_abi::Frame`] — fixed-width native activation ABI.
 //! - [`crate::jit::JitCompileSnapshot`] — publishes the closure byte offsets
 //!   to native backends.
 //! - [`crate::closure_construct`] — the rare record.
@@ -104,13 +104,6 @@ pub struct ClosureCallHeader {
     pub flags: u32,
     /// The context this closure was created over, or `undefined`.
     pub context: Value,
-}
-
-/// Allocation-neutral closure state consumed by call preparation.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ClosureCallState {
-    pub(crate) bound_this: Option<Value>,
-    pub(crate) bound_new_target: Option<Value>,
 }
 
 impl ClosureCallHeader {
@@ -336,13 +329,6 @@ impl JsClosureBody {
             .then(|| unsafe { *self.bound_words_ptr().add(1) })
     }
 
-    fn call_state(&self) -> ClosureCallState {
-        ClosureCallState {
-            bound_this: self.bound_this_option(),
-            bound_new_target: self.bound_new_target_option(),
-        }
-    }
-
     /// The rare record, if allocated.
     #[inline]
     pub(crate) fn rare(&self) -> Option<ClosureRareHandle> {
@@ -476,12 +462,6 @@ impl JsClosure {
     #[must_use]
     pub fn call_header(self, heap: &GcHeap) -> ClosureCallHeader {
         heap.read_payload(self.handle, |body| body.call_header)
-    }
-
-    /// Copy the bound values in one payload read.
-    #[must_use]
-    pub(crate) fn call_state(self, heap: &GcHeap) -> ClosureCallState {
-        heap.read_payload(self.handle, JsClosureBody::call_state)
     }
 
     /// Whether native linkage must use the call-setup runtime stub before
@@ -965,8 +945,11 @@ mod tests {
         .expect("alloc");
         assert_eq!(closure.bound_this(&heap), Some(Value::undefined()));
         assert_eq!(closure.bound_new_target(&heap), None);
-        let state = closure.call_state(&heap);
-        assert_eq!(state.bound_this, Some(Value::undefined()));
+        assert!(
+            closure
+                .call_header(&heap)
+                .has_flag(CLOSURE_CALL_FLAG_BOUND_THIS)
+        );
         assert!(closure.context(&heap).is_undefined());
     }
 

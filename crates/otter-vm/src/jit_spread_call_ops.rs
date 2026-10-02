@@ -37,7 +37,10 @@ use crate::{
 };
 
 impl Interpreter {
-    pub(crate) fn jit_runtime_method_call_values(
+    /// Resolve the callable of one published `CallMethodValue` site through
+    /// the interpreter's method caches and record its method/call feedback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn jit_runtime_resolve_method(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
@@ -45,25 +48,15 @@ impl Interpreter {
         call_pc: u32,
         receiver: Value,
         name_index: u32,
-        args: SmallVec<[Value; 8]>,
+        args_len: usize,
     ) -> Result<Value, VmError> {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         self.record_call_attempt_feedback(function, call_pc, function_id);
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        self.jit_runtime_stats.jit_to_rust_call_transitions = self
-            .jit_runtime_stats
-            .jit_to_rust_call_transitions
-            .saturating_add(1);
         let receiver_anchor = self.push_iteration_anchor(receiver) - 1;
-        let anchor_base = receiver_anchor;
-        let args_start = receiver_anchor + 1;
-        let args_len = args.len();
-        for value in args {
-            self.push_iteration_anchor(value);
-        }
-        let call = |interp: &mut Self, stack: &mut ActivationStack| {
+        let resolve = |interp: &mut Self, stack: &mut ActivationStack| {
             let mut receiver = interp.iteration_anchor(receiver_anchor);
             if receiver.is_nullish() {
                 let label = if receiver.is_null() {
@@ -88,7 +81,7 @@ impl Interpreter {
                 .flatten();
             // Shape migration may allocate and relocate the receiver. The
             // iteration anchor is the canonical root used by all resolution
-            // and call steps below.
+            // steps below.
             interp.set_iteration_anchor(receiver_anchor, receiver);
             // The compiled site shares the interpreter's method-resolution
             // caches: a shape-guarded own-slot hit, then the load-IC-backed
@@ -192,45 +185,61 @@ impl Interpreter {
                 };
                 interp.commit_method_call_feedback_transition(function, function_id, changed);
             }
+            // `f.call(thisArg, ...)` with the intrinsic `call` runs `f`: the
+            // site records that target for the optimizing tier.
             let receiver = interp.iteration_anchor(receiver_anchor);
-            let mut rooted_args = SmallVec::with_capacity(args_len);
-            for index in args_start..args_start + args_len {
-                rooted_args.push(interp.iteration_anchor(index));
-            }
-            // `f.call(thisArg, ...args)` with the intrinsic `call`: invoke `f`
-            // itself (§20.2.3.3) instead of entering the intrinsic, which
-            // would only repeat this call one Rust frame deeper.
             if method.as_native_function().is_some_and(|native| {
                 native.is_vm_intrinsic(
                     &interp.gc_heap,
                     crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall,
                 )
             }) && interp.is_callable_runtime(&receiver)
+                && let Some(target) = interp.function_prototype_call_target(method, receiver)
             {
-                if let Some(target) = interp.function_prototype_call_target(method, receiver) {
-                    let transition =
-                        interp.record_ordinary_call_feedback(function, call_pc, target);
-                    if transition.evict_for_reopt() {
-                        interp.evict_compiled_for_reopt(function_id);
-                    }
+                let transition = interp.record_ordinary_call_feedback(function, call_pc, target);
+                if transition.evict_for_reopt() {
+                    interp.evict_compiled_for_reopt(function_id);
                 }
-                let this = if rooted_args.is_empty() {
-                    Value::undefined()
-                } else {
-                    rooted_args.remove(0)
-                };
-                return interp.run_callable_sync_rooted(
-                    stack,
-                    context,
-                    &receiver,
-                    this,
-                    rooted_args,
-                );
             }
-            interp.run_callable_sync_rooted(stack, context, &method, receiver, rooted_args)
+            Ok(method)
         };
-        let result = call(self, stack);
-        self.pop_iteration_anchors_to(anchor_base);
+        let result = resolve(self, stack);
+        self.pop_iteration_anchors_to(receiver_anchor);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn jit_runtime_method_call_values(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        function_id: u32,
+        call_pc: u32,
+        receiver: Value,
+        name_index: u32,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        let base = self.push_iteration_anchor(receiver) - 1;
+        for &value in &args {
+            self.push_iteration_anchor(value);
+        }
+        let result = (|| {
+            let method = self.jit_runtime_resolve_method(
+                context,
+                stack,
+                function_id,
+                call_pc,
+                receiver,
+                name_index,
+                args.len(),
+            )?;
+            let receiver = self.iteration_anchor(base);
+            let rooted: SmallVec<[Value; 8]> = (0..args.len())
+                .map(|index| self.iteration_anchor(base + 1 + index))
+                .collect();
+            self.run_rooted_call_values(stack, context, method, receiver, rooted)
+        })();
+        self.pop_iteration_anchors_to(base);
         result
     }
 
@@ -258,7 +267,6 @@ impl Interpreter {
             .jit_to_rust_call_transitions
             .saturating_add(1);
         self.record_resolved_call_feedback(function, call_pc, function_id, callee, receiver);
-        self.note_generic_call_target(context, function_id, callee);
         self.run_rooted_call_values(stack, context, callee, receiver, args)
     }
 
@@ -316,7 +324,6 @@ impl Interpreter {
             &mut new_target,
             &mut args,
         )?;
-        self.note_generic_call_target(context, function_id, callee);
         self.run_rooted_construct_values(stack, context, callee, callee, args)
     }
 
@@ -443,7 +450,7 @@ impl Interpreter {
     }
 
     /// The interpreter frame's arguments exotic object, built on first use
-    /// and kept in the cold record so every later use in the activation
+    /// and kept in the common frame so every later use in the activation
     /// observes the same object.
     pub(crate) fn materialize_frame_arguments_object(
         &mut self,
@@ -451,11 +458,8 @@ impl Interpreter {
         stack: &mut ActivationStack,
         frame_index: usize,
     ) -> Result<Value, VmError> {
-        if let Some(existing) = self
-            .frame_cold(&stack[frame_index])
-            .and_then(|cold| cold.arguments_object)
-        {
-            return Ok(existing);
+        if let Some(existing) = stack[frame_index].arguments_object() {
+            return Ok(Value::object(existing));
         }
         let (elements, kind, mapped_entries, callee) = {
             let function_id = stack[frame_index].function_id;
@@ -463,13 +467,11 @@ impl Interpreter {
                 .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
             let frame = &mut stack[frame_index];
-            // The cold record keeps its copy: §B.3.6.2 `fn.arguments` reads
-            // the same incoming values from a frame that has already built
-            // its own arguments object.
-            let elements: SmallVec<[Value; 4]> = self
-                .frame_cold_mut(frame)
-                .map(|cold| cold.incoming_args.clone())
-                .unwrap_or_default();
+            let view = crate::ActiveFrameRef::from_frame(frame);
+            let count = view.incoming_argument_count();
+            let elements: SmallVec<[Value; 4]> = (0..count)
+                .map(|index| view.incoming_argument(index))
+                .collect::<Result<_, _>>()?;
             let mapped_entries = Self::mapped_arguments(function, elements.len(), |reg| {
                 frame.registers.get(usize::from(reg)).copied()
             });
@@ -481,8 +483,7 @@ impl Interpreter {
             )
         };
         let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
-        self.frame_ensure_cold(&mut stack[frame_index])
-            .arguments_object = Some(value);
+        stack[frame_index].set_arguments_object(value.as_object());
         Ok(value)
     }
 
@@ -497,11 +498,9 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame: &mut crate::ActiveFrameMut<'_>,
-        materialized_frame_index: Option<usize>,
         dst: u16,
     ) -> Result<(), VmError> {
-        let value =
-            self.jit_materialize_arguments(context, stack, frame, materialized_frame_index)?;
+        let value = self.jit_materialize_arguments(context, stack, frame)?;
         frame.write(dst, value)
     }
 
@@ -510,18 +509,8 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         frame: &mut crate::ActiveFrameMut<'_>,
-        materialized_frame_index: Option<usize>,
     ) -> Result<Value, VmError> {
-        let existing = frame
-            .as_ref()
-            .native_arguments_object()
-            .map(Value::object)
-            .or_else(|| {
-                materialized_frame_index
-                    .and_then(|index| stack.get(index))
-                    .and_then(|frame| self.frame_cold(frame))
-                    .and_then(|cold| cold.arguments_object)
-            });
+        let existing = frame.as_ref().native_arguments_object().map(Value::object);
         if let Some(value) = existing {
             frame.set_native_arguments_object(value.as_object().ok_or(VmError::InvalidOperand)?)?;
             return Ok(value);
@@ -529,29 +518,16 @@ impl Interpreter {
         let function = context
             .exec_function(frame.function_id())
             .ok_or(VmError::InvalidOperand)?;
-        let elements: SmallVec<[Value; 4]> =
-            match (frame.incoming_argument_count(), materialized_frame_index) {
-                (Some(count), _) => (0..count)
-                    .map(|index| frame.incoming_argument(index))
-                    .collect::<Result<_, _>>()?,
-                (None, Some(frame_index)) => {
-                    let materialized = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
-                    self.frame_cold_mut(materialized)
-                        .map(|cold| cold.incoming_args.clone())
-                        .unwrap_or_default()
-                }
-                (None, None) => return Err(VmError::InvalidOperand),
-            };
+        let count = frame.incoming_argument_count();
+        let elements: SmallVec<[Value; 4]> = (0..count)
+            .map(|index| frame.incoming_argument(index))
+            .collect::<Result<_, _>>()?;
         let mapped_entries =
             Self::mapped_arguments(function, elements.len(), |reg| frame.read(reg).ok());
         let callee = frame.self_value();
         let kind = function.arguments_object_kind;
         let value = self.collect_arguments_value(stack, elements, kind, mapped_entries, callee)?;
         frame.set_native_arguments_object(value.as_object().ok_or(VmError::InvalidOperand)?)?;
-        if let Some(index) = materialized_frame_index {
-            self.frame_ensure_cold(stack.get_mut(index).ok_or(VmError::InvalidOperand)?)
-                .arguments_object = Some(value);
-        }
         Ok(value)
     }
 
@@ -795,9 +771,14 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
         let new_target = if super_construct {
-            self.frame_cold(&stack[frame_index])
-                .and_then(|cold| cold.new_target)
-                .unwrap_or(callee)
+            {
+                let target = stack[frame_index].new_target();
+                if target.is_undefined() {
+                    callee
+                } else {
+                    target
+                }
+            }
         } else {
             callee
         };

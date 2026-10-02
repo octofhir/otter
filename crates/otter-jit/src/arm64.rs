@@ -22,8 +22,10 @@
 // conversion is intentionally redundant.
 #![allow(clippy::useless_conversion)]
 
+pub(crate) mod activation;
 pub(crate) mod allocation;
-mod direct_call;
+pub(crate) mod js_call;
+mod receiver_allocation;
 pub(crate) mod inline_guard;
 mod method_guard;
 
@@ -51,11 +53,8 @@ pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, d
 /// countdown expires, keeping accounting and interrupt latency aligned.
 pub(crate) use crate::GENERATED_POLL_BATCH;
 
-pub(crate) use direct_call::{
-    DirectCallArguments, DirectCallForm, DirectCallSite, direct_call_artifact, emit_direct_call,
-    emit_direct_call_with_access, emit_object_type_branch, emit_receiver_candidate_probe,
-    emit_receiver_publication_effect, emit_runtime_forward,
-    target_is_supported as direct_call_target_is_supported,
+pub(crate) use receiver_allocation::{
+    emit_object_type_branch, emit_receiver_candidate_probe, emit_receiver_publication_effect,
 };
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,

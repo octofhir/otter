@@ -423,12 +423,6 @@ fn publish_chunk(space: &CodeSpace, chunk: Arc<CodeChunk>) {
 }
 
 impl CodeSpace {
-    /// Current registry publication epoch for turn-local owner caches.
-    #[inline]
-    pub(crate) fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
-    }
-
     /// Rebase `module` onto this registry's id space and append it as a new
     /// immutable chunk. Returns the chunk's [`ExecutionContext`] bound to this
     /// code space.
@@ -621,6 +615,30 @@ impl CodeSpace {
             .executable
             .function(function_id - function_base)
             .map(crate::executable::CodeBlock::feedback_epoch)
+    }
+
+    /// Visit live immutable function layouts while the linked directory is held.
+    /// The visitor must neither enter JavaScript nor mutate this code space.
+    pub(crate) fn visit_live_functions(
+        &self,
+        mut visitor: impl FnMut(&crate::executable::CodeBlock),
+    ) {
+        for chunk in self.chunks().iter() {
+            let payload = chunk
+                .payload
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(payload) = payload.as_ref() {
+                for index in 0..chunk.function_count {
+                    visitor(
+                        payload
+                            .executable
+                            .function(index)
+                            .expect("verified linked function"),
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {

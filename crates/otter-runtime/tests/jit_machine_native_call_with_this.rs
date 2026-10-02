@@ -136,7 +136,6 @@ fn assert_hot(before: RuntimeExecutionStats, after: RuntimeExecutionStats) {
         before.jit_generated_call_deopts
     );
     assert_eq!(after.jit_code_generations, before.jit_code_generations);
-    assert_eq!(after.jit_feedback_refreshes, before.jit_feedback_refreshes);
     assert_eq!(
         (
             after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions,

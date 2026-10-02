@@ -30,7 +30,7 @@ use otter_bytecode::{
 };
 
 use crate::executable::CodeBlock;
-use crate::{ExecutionContext, NumberValue, Value};
+use crate::ExecutionContext;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SimpleConstructorInit {
@@ -40,7 +40,6 @@ pub(crate) struct SimpleConstructorInit {
 #[derive(Clone, Debug)]
 pub(crate) struct SimpleConstructorField {
     pub(crate) name: String,
-    pub(crate) source: SimpleConstructorSource,
 }
 
 /// One named store whose receiver is proven to be the current constructor's
@@ -51,30 +50,13 @@ pub(crate) struct ConstructorShapeStore {
     pub(crate) name: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum SimpleConstructorSource {
-    Param(usize),
-    Int32(i32),
-    Undefined,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegisterValue {
     Unknown,
     This,
-    Param(usize),
-    Int32(i32),
+    Param,
+    Int32,
     Undefined,
-}
-
-impl SimpleConstructorSource {
-    pub(crate) fn resolve(self, args: &[Value]) -> Value {
-        match self {
-            Self::Param(index) => args.get(index).copied().unwrap_or_else(Value::undefined),
-            Self::Int32(value) => Value::number(NumberValue::Smi(value)),
-            Self::Undefined => Value::undefined(),
-        }
-    }
 }
 
 pub(crate) fn match_simple_constructor_init(
@@ -96,12 +78,8 @@ pub(crate) fn match_simple_constructor_init(
     }
 
     let mut registers = vec![RegisterValue::Unknown; function.register_count as usize];
-    for (index, slot) in registers
-        .iter_mut()
-        .take(function.param_count as usize)
-        .enumerate()
-    {
-        *slot = RegisterValue::Param(index);
+    for slot in registers.iter_mut().take(function.param_count as usize) {
+        *slot = RegisterValue::Param;
     }
 
     let mut fields: Vec<SimpleConstructorField> = Vec::new();
@@ -131,8 +109,8 @@ pub(crate) fn match_simple_constructor_init(
             }
             Op::LoadInt32 => {
                 let dst = context.exec_register(instr, 0)? as usize;
-                let value = context.exec_imm32(instr, 1)?;
-                *registers.get_mut(dst)? = RegisterValue::Int32(value);
+                context.exec_imm32(instr, 1)?;
+                *registers.get_mut(dst)? = RegisterValue::Int32;
             }
             Op::LoadUndefined => {
                 let dst = context.exec_register(instr, 0)? as usize;
@@ -149,13 +127,13 @@ pub(crate) fn match_simple_constructor_init(
                     return None;
                 }
                 let src = context.exec_register(instr, 2)? as usize;
-                let source = match *registers.get(src)? {
-                    RegisterValue::Param(index) => SimpleConstructorSource::Param(index),
-                    RegisterValue::Int32(value) => SimpleConstructorSource::Int32(value),
-                    RegisterValue::Undefined => SimpleConstructorSource::Undefined,
+                // Only parameters and immediates admit installing the final
+                // shape before the body: neither can observe the receiver.
+                match *registers.get(src)? {
+                    RegisterValue::Param | RegisterValue::Int32 | RegisterValue::Undefined => {}
                     RegisterValue::Unknown | RegisterValue::This => return None,
-                };
-                fields.push(SimpleConstructorField { name, source });
+                }
+                fields.push(SimpleConstructorField { name });
             }
             Op::ReturnUndefined => {
                 return (!fields.is_empty()).then_some(SimpleConstructorInit { fields });
@@ -281,7 +259,7 @@ mod tests {
     };
 
     use super::{
-        SimpleConstructorSource, match_constructor_shape_stores, match_simple_constructor_init,
+        match_constructor_shape_stores, match_simple_constructor_init,
     };
     use crate::ExecutionContext;
 
@@ -428,20 +406,8 @@ mod tests {
         let init = match_simple_constructor_init(&context, function).expect("matches");
         assert_eq!(init.fields.len(), 3);
         assert_eq!(init.fields[0].name, "x");
-        assert!(matches!(
-            init.fields[0].source,
-            SimpleConstructorSource::Param(0)
-        ));
         assert_eq!(init.fields[1].name, "y");
-        assert!(matches!(
-            init.fields[1].source,
-            SimpleConstructorSource::Param(1)
-        ));
         assert_eq!(init.fields[2].name, "tag");
-        assert!(matches!(
-            init.fields[2].source,
-            SimpleConstructorSource::Int32(0)
-        ));
     }
 
     #[test]

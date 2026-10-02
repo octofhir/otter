@@ -817,28 +817,6 @@ impl Interpreter {
         Ok(Some(object))
     }
 
-    pub(crate) fn this_for_bytecode_call_runtime_rooted(
-        &mut self,
-        function: &CodeBlock,
-        this_value: Value,
-        slice_roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        if function.is_strict || function.is_arrow {
-            return Ok(this_value);
-        }
-        // The dominant sloppy-method case is an object receiver (`recv.m()`),
-        // which is its own `this` — return it before the primitive-wrapper ladder.
-        if this_value.as_object().is_some() {
-            return Ok(this_value);
-        }
-        match this_value {
-            v if v.is_undefined() || v.is_null() => {
-                Ok(Value::object(self.global_this_for_function(function.id)))
-            }
-            other => self.box_sloppy_this_primitive_runtime_rooted(other, slice_roots),
-        }
-    }
-
     pub(crate) fn this_for_bytecode_call_stack_rooted(
         &mut self,
         function: &CodeBlock,

@@ -309,6 +309,7 @@ impl CliExecutionConfig {
             for (ordinal, bundle) in batch.bundles().iter().enumerate() {
                 let manifest = bundle.manifest();
                 let tier = match manifest.tier() {
+                    JitDebugTier::Interpreter => "interpreter",
                     JitDebugTier::Template => "template",
                     JitDebugTier::Optimizing => "optimizing",
                 };

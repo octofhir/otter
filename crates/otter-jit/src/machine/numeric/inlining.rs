@@ -12,8 +12,8 @@
 //!   residual plain, method, explicit-receiver and construct calls keep
 //!   generated linkage; their spliced parents are never published, the call
 //!   site's recipe describes them to stack walks. Other allocations keep
-//!   ordinary call linkage. Named-property cold calls publish exact inline
-//!   frames without replaying completed effects.
+//!   ordinary call linkage. Cold calls retain logical inline sources in
+//!   safepoint recipes without replaying completed effects.
 //! - A site whose earlier generation failed an identity guard is not spliced
 //!   again; it keeps its generated call.
 //! - A spliced body has no native frame: its SELF is the guarded callable of
@@ -198,7 +198,7 @@ fn splice_tree(
                 return Err("callee requires loop or throw CFG".into());
             }
             let plan = &target.candidates[0].callee.plan;
-            if plan.needs_incoming_arguments {
+            if candidate.code_block.requires_argument_frame() {
                 return Err("callee requires activation entry setup".into());
             }
             if target.kind == NumericDirectCallKind::Method

@@ -7,14 +7,14 @@
 //! # Invariants
 //! - Identity branching stays in the VM boundary rather than leaking
 //!   interpreter stack indices to the JIT.
-//! - Only a baseline frame is asked to relink: its registers already live in
-//!   the interpreter window, so resuming at the loop header replays nothing.
+//! - Only a baseline frame leaves for optimizing OSR: its complete register
+//!   window is already rooted, and the loop header owns the tier transition.
 //! - A poll from any other frame runs under an always-allocate scope: the
 //!   frame's live registers are not rooted at the poll, so tier-up work that
 //!   allocates must not start a collection.
 //!
 //! # See also
-//! - `Interpreter::take_backedge_relink` owns the relink decision.
+//! - [`crate::native_abi::Frame`] owns the canonical register window.
 
 use crate::VmError;
 use crate::native_abi::NativeFrameKind;
@@ -29,11 +29,8 @@ pub enum BackedgePollOutcome {
     Continue,
     /// The work budget rotated its slice; the loop still continues.
     Yield,
-    /// Resume the interpreter at the loop header: either the running baseline
-    /// body was compiled before some of its call targets owned entry code and
-    /// the VM discarded it, or the loop became hot enough for optimizing OSR,
-    /// which the interpreter enters at the header's next back-edge.
-    Relink,
+    /// Resume at the loop header to enter optimizing OSR.
+    EnterOptimizing,
 }
 
 impl RuntimeCall<'_> {
@@ -51,12 +48,11 @@ impl RuntimeCall<'_> {
         let _no_collection =
             (header.kind != NativeFrameKind::Baseline).then(|| vm.gc_heap.always_allocate_scope());
         let batch = vm.jit_backedge_fuel_window;
-        let checkpoint = vm.jit_backedge_poll(context)?;
+        let checkpoint = vm.jit_backedge_poll()?;
         if header.kind == NativeFrameKind::Baseline
-            && (vm.take_backedge_relink(context, header.function_id)
-                || vm.baseline_backedges_reach_osr(context, header.function_id, header.pc, batch))
+            && vm.baseline_backedges_reach_osr(context, header.function_id, header.pc, batch)
         {
-            return Ok(BackedgePollOutcome::Relink);
+            return Ok(BackedgePollOutcome::EnterOptimizing);
         }
         Ok(if checkpoint == WorkBudgetCheckpoint::Yield {
             BackedgePollOutcome::Yield

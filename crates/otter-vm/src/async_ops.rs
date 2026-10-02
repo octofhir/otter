@@ -26,10 +26,7 @@ use crate::activation_stack::{ActivationFloor, ActivationStack};
 use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
-use crate::{
-    ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch,
-    snapshot_frames,
-};
+use crate::{ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch};
 
 impl Interpreter {
     /// §27.7.5.3 Await step 2 — `PromiseResolve(%Promise%, value)`.
@@ -125,8 +122,8 @@ impl Interpreter {
         let outcome = (|this: &mut Self| -> Result<(), VmError> {
             let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .capability_stack_rooted(this, stack, &[], &[])?;
-            let mut parked = stack.pop().expect("top frame existed");
-            let detached_cold = this.frame_detach_cold(&mut parked);
+            let parked = stack.pop().expect("top frame existed");
+            let detached_cold = this.frame_detach_cold(parked);
             let parked = this.park_active_frame(parked);
             let parked =
                 crate::generator::alloc_parked_frame(&mut this.gc_heap, parked, detached_cold)?;
@@ -183,8 +180,8 @@ impl Interpreter {
                 return Err(err.into());
             }
         };
-        let mut parked = stack.pop().expect("top frame existed");
-        let detached_cold = self.frame_detach_cold(&mut parked);
+        let parked = stack.pop().expect("top frame existed");
+        let detached_cold = self.frame_detach_cold(parked);
         let parked = self.park_active_frame(parked);
         let parked =
             match crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold) {
@@ -239,10 +236,9 @@ impl Interpreter {
         value: Value,
         owner: crate::generator::JsGenerator,
     ) -> Result<(), RunError> {
-        let _window_rollback = self.register_window_rollback();
         let mut frame = self.resume_parked_frame(*frame).map_err(RunError::bare)?;
         if let Some(c) = cold {
-            self.frame_attach_cold(&mut frame, c);
+            self.prepared_attach_cold(&mut frame, c);
         }
         let mut stack: ActivationStack = ActivationStack::new();
         let floor = stack.floor();
@@ -261,63 +257,19 @@ impl Interpreter {
                     .iteration_anchor(owner_anchor)
                     .as_generator()
                     .ok_or_else(|| RunError::bare(VmError::InvalidOperand))?;
+                let call = stack
+                    .pending_mut()
+                    .ok_or_else(|| RunError::bare(VmError::InvalidOperand))?;
                 if fulfilled {
-                    let valid_destination = stack
-                        .last()
-                        .is_some_and(|frame| frame.registers.get(await_dst as usize).is_some());
-                    if !valid_destination {
-                        return Err(RunError {
-                            error: VmError::InvalidOperand,
-                            frames: snapshot_frames(context, stack),
-                            detail: interp.take_error_detail(),
-                        });
-                    }
-                    *stack
-                        .last_mut()
-                        .and_then(|frame| frame.registers.get_mut(await_dst as usize))
-                        .expect("await destination was validated") = value;
+                    call.seed_register(await_dst, value)
+                        .map_err(RunError::bare)?;
+                } else {
+                    call.resume = crate::prepared_call::ResumeInput::Throw(value);
                 }
                 owner.set_async_state(
                     &mut interp.gc_heap,
                     crate::generator::AsyncGeneratorState::Executing,
                 );
-                if !fulfilled {
-                    if let Err(error) = interp.unwind_throw(context, stack, value) {
-                        // Unhandled anywhere in the parked gen body —
-                        // §27.6.3 AsyncGenerator resumption settles the
-                        // front request as rejected instead of letting the
-                        // throw escape the dispatch tick.
-                        if matches!(error, VmError::Uncaught) {
-                            let reason = interp.take_pending_uncaught_throw().unwrap_or(value);
-                            owner.mark_done(&mut interp.gc_heap);
-                            interp
-                                .async_generator_complete_step(context, &owner, Err(reason), true)
-                                .map_err(RunError::bare)?;
-                            interp
-                                .async_generator_drain_done(stack, context, &owner)
-                                .map_err(RunError::bare)?;
-                            return Ok(());
-                        }
-                        let frames = snapshot_frames(context, stack);
-                        return Err(RunError {
-                            error,
-                            frames,
-                            detail: interp.take_error_detail(),
-                        });
-                    }
-                    if stack.is_empty() {
-                        // Throw drained out of the gen body; settle the
-                        // front request as rejected.
-                        interp
-                            .async_generator_complete_step(context, &owner, Err(value), true)
-                            .map_err(RunError::bare)?;
-                        owner.mark_done(&mut interp.gc_heap);
-                        interp
-                            .async_generator_drain_done(stack, context, &owner)
-                            .map_err(RunError::bare)?;
-                        return Ok(());
-                    }
-                }
                 match interp.dispatch_loop_above_rooted(context, stack, floor) {
                     Ok(value) => {
                         let yielded_already = owner.has_yielded(&interp.gc_heap);
@@ -374,7 +326,7 @@ impl Interpreter {
                                 .map_err(RunError::bare)?;
                             Ok(())
                         } else {
-                            let frames = snapshot_frames(context, stack);
+                            let frames = interp.snapshot_active_frames(context, usize::MAX);
                             Err(RunError {
                                 error,
                                 frames,
@@ -422,10 +374,9 @@ impl Interpreter {
         fulfilled: bool,
         value: Value,
     ) -> Result<(), RunError> {
-        let _window_rollback = self.register_window_rollback();
         let mut frame = self.resume_parked_frame(*frame).map_err(RunError::bare)?;
         if let Some(c) = cold {
-            self.frame_attach_cold(&mut frame, c);
+            self.prepared_attach_cold(&mut frame, c);
         }
         let mut stack: ActivationStack = ActivationStack::new();
         let floor = stack.floor();
@@ -435,44 +386,19 @@ impl Interpreter {
             let (interp, stack) = turn.into_parts();
             let result = (|| -> Result<(), RunError> {
                 let value = interp.iteration_anchor(value_anchor);
+                let call = stack
+                    .pending_mut()
+                    .ok_or_else(|| RunError::bare(VmError::InvalidOperand))?;
                 if fulfilled {
-                    let valid_destination = stack
-                        .last()
-                        .is_some_and(|frame| frame.registers.get(await_dst as usize).is_some());
-                    if !valid_destination {
-                        return Err(RunError {
-                            error: VmError::InvalidOperand,
-                            frames: snapshot_frames(context, stack),
-                            detail: interp.take_error_detail(),
-                        });
-                    }
-                    *stack
-                        .last_mut()
-                        .and_then(|frame| frame.registers.get_mut(await_dst as usize))
-                        .expect("await destination was validated") = value;
-                }
-                if !fulfilled {
-                    // Inject the rejection as a throw so the parked frame
-                    // observes it through its `try`/`catch`/`finally`
-                    // structure exactly as a synchronous throw would.
-                    if let Err(error) = interp.unwind_throw(context, stack, value) {
-                        let frames = snapshot_frames(context, stack);
-                        return Err(RunError {
-                            error,
-                            frames,
-                            detail: interp.take_error_detail(),
-                        });
-                    }
-                    if stack.is_empty() {
-                        // The rejection drained through the async frame's
-                        // result promise — nothing left to dispatch.
-                        return Ok(());
-                    }
+                    call.seed_register(await_dst, value)
+                        .map_err(RunError::bare)?;
+                } else {
+                    call.resume = crate::prepared_call::ResumeInput::Throw(value);
                 }
                 match interp.dispatch_loop_above_rooted(context, stack, floor) {
                     Ok(_) => Ok(()),
                     Err(error) => {
-                        let frames = snapshot_frames(context, stack);
+                        let frames = interp.snapshot_active_frames(context, usize::MAX);
                         Err(RunError {
                             error,
                             frames,
@@ -589,13 +515,14 @@ impl Interpreter {
                 // result promise as a rejection — spec §27.7.5.3
                 // step 1.h.iii.
                 if self.frame_has_async_state(stack.last().expect("frame still present")) {
-                    let mut popped = stack.pop().expect("frame existed at last");
+                    let popped = stack.pop().expect("frame existed at last");
                     let result_promise = self
-                        .frame_take_async_state(&mut popped)
+                        .frame_take_async_state(popped)
                         .expect("async ownership checked just above")
                         .result_promise;
-                    self.frame_release_cold(&mut popped);
-                    self.reclaim_registers(&mut popped);
+                    self.frame_release_cold(popped);
+                    // The rejected promise is the activation's completion.
+                    self.completed_activation_result = Some(Value::promise(result_promise));
                     let jobs = result_promise.reject(&mut self.gc_heap, payload);
                     self.note_settle_rejection(&jobs);
                     for j in jobs.jobs {
@@ -603,9 +530,8 @@ impl Interpreter {
                     }
                     return Ok(());
                 }
-                let mut popped = stack.pop().expect("frame still present");
-                self.frame_release_cold(&mut popped);
-                self.reclaim_registers(&mut popped);
+                let popped = stack.pop().expect("frame still present");
+                self.frame_release_cold(popped);
                 continue;
             };
             // Landing in this frame's catch / finally: §7.4.9 closes the
@@ -743,7 +669,7 @@ mod tests {
     fn park_regular_async_frame(
         interp: &mut Interpreter,
         context: &ExecutionContext,
-        mut frame: Frame,
+        mut frame: crate::test_support::FrameFixture,
     ) -> (
         Box<ParkedFrameState>,
         Option<Box<crate::cold_frame::ColdFrame>>,
@@ -753,19 +679,19 @@ mod tests {
             .unwrap();
         interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
         let cold = interp.frame_detach_cold(&mut frame);
-        let parked = Box::new(interp.park_active_frame(frame));
+        let parked = Box::new(interp.park_active_frame(&frame));
         (parked, cold)
     }
 
     fn park_async_generator_frame(
         interp: &mut Interpreter,
-        frame: Frame,
+        frame: crate::test_support::FrameFixture,
     ) -> (
         Box<ParkedFrameState>,
         Option<Box<crate::cold_frame::ColdFrame>>,
         crate::generator::JsGenerator,
     ) {
-        let parked = interp.park_active_frame(frame);
+        let parked = interp.park_active_frame(&frame);
         let owner = crate::generator::JsGenerator::new_with_prototype(
             &mut interp.gc_heap,
             parked,
@@ -790,7 +716,6 @@ mod tests {
     fn assert_invalid_resume_cleanup(interp: &Interpreter, error: RunError) {
         assert!(matches!(error.error, VmError::InvalidOperand));
         assert_eq!(interp.cold_frames.live_len(), 0);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
     }
 
     #[test]
@@ -801,7 +726,6 @@ mod tests {
         let (parked, cold) = park_regular_async_frame(&mut interp, &context, frame);
 
         assert_eq!(interp.cold_frames.live_len(), 0);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
 
         let error = interp
             .run_async_resume(&context, parked, cold, 1, true, Value::number_i32(7))
@@ -818,7 +742,6 @@ mod tests {
         let (parked, cold, owner) = park_async_generator_frame(&mut interp, frame);
 
         assert_eq!(interp.cold_frames.live_len(), 0);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
 
         let error = interp
             .run_async_gen_resume(&context, parked, cold, 1, true, Value::number_i32(7), owner)
@@ -839,7 +762,6 @@ mod tests {
             .push(malformed_catch());
 
         assert_eq!(interp.cold_frames.live_len(), 0);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
 
         let error = interp
             .run_async_resume(&context, parked, cold, 0, false, Value::number_i32(11))
@@ -860,7 +782,6 @@ mod tests {
             .push(malformed_catch());
 
         assert_eq!(interp.cold_frames.live_len(), 0);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
 
         let error = interp
             .run_async_gen_resume(
@@ -881,7 +802,7 @@ mod tests {
     fn floor_unwind_preserves_caller_frame_window_and_thrown_identity() {
         let mut interp = Interpreter::new();
         let context = empty_context();
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
 
         let mut caller = interp.test_frame_for_function(&function(1)).unwrap();
         caller.pc = 19;
@@ -893,7 +814,6 @@ mod tests {
         nested.registers[0] = Value::number_i32(11);
         nested.registers[1] = Value::number_i32(13);
         stack.push(nested);
-        assert_eq!(interp.register_stack.checkpoint(), 3);
 
         let thrown = Value::number_i32(41);
         let error = interp
@@ -907,11 +827,9 @@ mod tests {
             stack.last().expect("caller retained").registers[0],
             Value::number_i32(7)
         );
-        assert_eq!(interp.register_stack.checkpoint(), 1);
+
         assert_eq!(interp.take_pending_uncaught_throw(), Some(thrown));
 
-        let mut caller = stack.pop().expect("caller retained");
-        interp.reclaim_registers(&mut caller);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
+        let _caller = stack.pop().expect("caller retained");
     }
 }

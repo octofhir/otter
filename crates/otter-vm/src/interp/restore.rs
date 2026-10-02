@@ -119,7 +119,6 @@ impl Interpreter {
             small_int_string_cache: vec![None; Self::SMALL_INT_STRING_CACHE as usize]
                 .into_boxed_slice(),
             bigint_constant_cache: rustc_hash::FxHashMap::default(),
-            lean_callback_roots: Vec::new(),
             pending_error_detail: std::cell::RefCell::new(None),
             handle_arena: crate::handles::HandleArena::new(),
             host_atoms: crate::HostAtomInterner::new(),
@@ -153,7 +152,6 @@ impl Interpreter {
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
-            jit_materialized_generated_calls: Vec::new(),
             allow_blocking_atomics_wait: false,
             microtasks: crate::MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
@@ -179,9 +177,6 @@ impl Interpreter {
             jit_call_counts: rustc_hash::FxHashMap::default(),
             optimizing_tier_policy: crate::tier_policy::TierPolicy::default(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
-            jit_feedback_refresh_attempted: rustc_hash::FxHashSet::default(),
-            jit_pending_direct_targets: rustc_hash::FxHashMap::default(),
-            jit_relinked_direct_targets: rustc_hash::FxHashSet::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_trigger: None,
@@ -201,7 +196,6 @@ impl Interpreter {
             runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
-            register_stack: crate::register_stack::RegisterStack::new(),
             jit_frame_cell: None,
             jit_detached_frame: 0,
             work_budget: crate::WorkBudget::default(),
@@ -220,8 +214,8 @@ impl Interpreter {
             function_realm_ids: rustc_hash::FxHashMap::default(),
             active_realm_is_extra: false,
             eval_hook: None,
-            pending_generator_throw: None,
             pending_uncaught_throw: None,
+            completed_activation_result: None,
             uncaught_from_promise_rejection: false,
             async_context: crate::Value::undefined(),
             iteration_anchors: Vec::new(),
@@ -267,6 +261,10 @@ impl Interpreter {
             tracer: None,
             cpu_profiler: None,
         };
+
+        interp
+            .code_space
+            .visit_live_functions(|function| interp.jit_code_registry.link_function(function, 0));
 
         // Write the captured fixed roots back through the same walk that
         // collected them, relocated to the restored pages.

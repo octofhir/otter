@@ -316,7 +316,7 @@ pub(crate) fn read_register(frame: &Frame, idx: u16) -> Result<&Value, VmError> 
 }
 
 pub(crate) fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmError> {
-    crate::ActiveFrameMut::materialized(frame).write(idx, value)
+    crate::ActiveFrameMut::from_frame(frame).write(idx, value)
 }
 
 /// Read a register operand the build-time verifier already proved in range.

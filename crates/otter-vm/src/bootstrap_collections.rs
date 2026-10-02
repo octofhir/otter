@@ -1051,8 +1051,6 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "no active execution context".to_string(),
         })?;
     // Enter the callback above a floor on this native call's current turn.
-    // The callback state owns only reusable frame storage and traced closure
-    // metadata; it never attaches a second activation stack.
     ctx.with_turn_parts(|interp, stack| {
         const MAP: usize = 0;
         const CALLBACK: usize = 1;
@@ -1062,8 +1060,6 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         interp.push_iteration_anchor(callback);
         interp.push_iteration_anchor(this_arg);
         let result = (|| {
-            let callback = interp.iteration_anchor(anchor_base + CALLBACK);
-            let mut lean = interp.acquire_lean_callback_stack(&context, callback);
             let mut index = 0;
             let mut err: Option<VmError> = None;
             loop {
@@ -1081,28 +1077,15 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
                 };
                 index += 1;
                 let this_arg = interp.iteration_anchor(anchor_base + THIS_ARG);
-                let outcome = match lean {
-                    Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
-                        stack,
-                        state,
-                        &context,
-                        this_arg,
-                        &[v, k, map_value],
-                    ),
-                    None => {
-                        let callback = interp.iteration_anchor(anchor_base + CALLBACK);
-                        let cb_args: smallvec::SmallVec<[Value; 8]> =
-                            smallvec::smallvec![v, k, map_value];
-                        interp
-                            .run_callable_sync_rooted(stack, &context, &callback, this_arg, cb_args)
-                    }
-                };
+                let callback = interp.iteration_anchor(anchor_base + CALLBACK);
+                let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, k, map_value];
+                let outcome =
+                    interp.run_callable_sync_rooted(stack, &context, &callback, this_arg, cb_args);
                 if let Err(e) = outcome {
                     err = Some(e);
                     break;
                 }
             }
-            interp.release_lean_callback_stack(lean);
             if let Some(e) = err {
                 return Err(vm_to_native(interp, e, "Map.prototype.forEach"));
             }
@@ -1228,8 +1211,6 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         interp.push_iteration_anchor(callback);
         interp.push_iteration_anchor(this_arg);
         let result = (|| {
-            let callback = interp.iteration_anchor(anchor_base + CALLBACK);
-            let mut lean = interp.acquire_lean_callback_stack(&context, callback);
             let mut index = 0;
             let mut err: Option<VmError> = None;
             loop {
@@ -1247,28 +1228,15 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
                 };
                 index += 1;
                 let this_arg = interp.iteration_anchor(anchor_base + THIS_ARG);
-                let outcome = match lean {
-                    Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
-                        stack,
-                        state,
-                        &context,
-                        this_arg,
-                        &[v, v, set_value],
-                    ),
-                    None => {
-                        let callback = interp.iteration_anchor(anchor_base + CALLBACK);
-                        let cb_args: smallvec::SmallVec<[Value; 8]> =
-                            smallvec::smallvec![v, v, set_value];
-                        interp
-                            .run_callable_sync_rooted(stack, &context, &callback, this_arg, cb_args)
-                    }
-                };
+                let callback = interp.iteration_anchor(anchor_base + CALLBACK);
+                let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, v, set_value];
+                let outcome =
+                    interp.run_callable_sync_rooted(stack, &context, &callback, this_arg, cb_args);
                 if let Err(e) = outcome {
                     err = Some(e);
                     break;
                 }
             }
-            interp.release_lean_callback_stack(lean);
             if let Some(e) = err {
                 return Err(vm_to_native(interp, e, "Set.prototype.forEach"));
             }

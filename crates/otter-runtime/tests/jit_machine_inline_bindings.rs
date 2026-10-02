@@ -10,8 +10,9 @@
 //! - A dictionary global object is proven by its slot layout: appending a key
 //!   keeps every existing key at its slot, while delete / redefine / re-entry
 //!   into dictionary mode retire the proof.
-//! - A failed inlined read deoptimizes through both source frames before any
-//!   effect, so getters run once with the callee's source stack.
+//! - Committed inline binding calls retain logical source recipes across
+//!   getter reentry and moving GC. Speculative exits reconstruct source frames
+//!   before any effect, so getters run once with the callee's source stack.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 
@@ -208,5 +209,107 @@ JSON.stringify(observed);
     assert_eq!(
         result.completion_string(),
         "[60000,\"ReferenceError\",220000,20000,140000]"
+    );
+}
+
+#[test]
+fn inline_binding_cold_calls_keep_logical_sources_without_physical_frames() {
+    let mut runtime = Runtime::builder()
+        .jit_selection(JitSelection::ProductionTiered)
+        .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .build()
+        .unwrap();
+    let warm = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var captureInlineStack=false,inlineStack='',inlineReads=0,inlineFailure;
+Object.defineProperty(globalThis,'inlineAccessor',{
+    configurable:true,
+    get(){inlineReads++;if(captureInlineStack)inlineStack=new Error('probe').stack;if(inlineFailure!==undefined)throw inlineFailure;return 3.25;}
+});
+function accessorLeaf(x){return inlineAccessor+x;}
+function accessorCaller(x,mark){mark.before++;var value=accessorLeaf(x);mark.after++;return value;}
+var accessorMark={before:0,after:0};
+for(var i=0;i<70000;i++){try{accessorCaller(1.25,accessorMark);}catch(error){throw error;}}
+"#,
+            ),
+            "inline-binding-cold-warm.js",
+        )
+        .unwrap();
+    let bundle = warm
+        .jit_artifacts()
+        .unwrap()
+        .bundles()
+        .iter()
+        .find(|bundle| {
+            bundle.manifest().function_name() == "accessorCaller"
+                && bundle.file(JitArtifactFileName::OptimizedIr).is_some()
+        })
+        .expect("caller must compile through Machine");
+    let ir = String::from_utf8_lossy(
+        bundle
+            .file(JitArtifactFileName::OptimizedIr)
+            .unwrap()
+            .contents(),
+    );
+    assert!(ir.contains("GuardCallTarget { guard: Plain"), "{ir}");
+    assert!(!ir.contains("Direct {"), "callee must be spliced: {ir}");
+    let safepoints: serde_json::Value = serde_json::from_slice(
+        bundle
+            .file(JitArtifactFileName::Safepoints)
+            .unwrap()
+            .contents(),
+    )
+    .unwrap();
+    assert!(
+        safepoints["safepoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|point| !point["inlineFrames"].as_array().unwrap().is_empty()),
+        "committed binding must retain its logical source: {safepoints}"
+    );
+    runtime.force_gc().unwrap();
+    let before = runtime.execution_stats();
+    let probe = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+var previousReads=inlineReads,previousBefore=accessorMark.before,previousAfter=accessorMark.after;
+captureInlineStack=true;
+var coldResult=accessorCaller(1.25,accessorMark);
+JSON.stringify([coldResult,inlineReads-previousReads,
+    accessorMark.before-previousBefore,accessorMark.after-previousAfter,
+    inlineStack.indexOf('accessorLeaf')>=0,
+    inlineStack.indexOf('accessorCaller')>inlineStack.indexOf('accessorLeaf')]);
+"#,
+            ),
+            "inline-binding-cold-probe.js",
+        )
+        .unwrap();
+    assert_eq!(probe.completion_string(), "[4.5,1,1,1,true,true]");
+    let thrown = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+inlineFailure={token:'binding-throw'};
+var previousReads=inlineReads,previousBefore=accessorMark.before,previousAfter=accessorMark.after,caught;
+try{accessorCaller(1.25,accessorMark);}catch(error){caught=error;}
+JSON.stringify([caught===inlineFailure,inlineReads-previousReads,
+    accessorMark.before-previousBefore,accessorMark.after-previousAfter,
+    inlineStack.indexOf('accessorLeaf')>=0,
+    inlineStack.indexOf('accessorCaller')>inlineStack.indexOf('accessorLeaf')]);
+"#,
+            ),
+            "inline-binding-cold-throw.js",
+        )
+        .unwrap();
+    assert_eq!(thrown.completion_string(), "[true,1,1,0,true,true]");
+    let after = runtime.execution_stats();
+    assert_eq!(after.jit_optimized_deopts, before.jit_optimized_deopts);
+    assert_eq!(
+        after.jit_generated_call_deopts,
+        before.jit_generated_call_deopts
     );
 }

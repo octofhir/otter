@@ -525,7 +525,7 @@ pub enum MachineCallGuard {
 /// The VM may retain a larger bounded feedback chain for other tiers. Machine
 /// lowering never truncates one: a site is selected only when its entire dense
 /// chain fits this limit.
-pub const MAX_MACHINE_DIRECT_METHOD_TARGETS: usize = 4;
+pub const MAX_MACHINE_DIRECT_METHOD_TARGETS: usize = 8;
 
 /// One member of a complete compiler-generated call target chain.
 #[derive(Debug, Clone, PartialEq, Eq)]

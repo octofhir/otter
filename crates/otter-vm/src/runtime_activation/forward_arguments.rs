@@ -15,10 +15,8 @@
 //! # See also
 //! - [`crate::forward_arguments`] — source semantics and mapped bindings.
 
-use super::{RuntimeCall, RuntimeFrameIdentity};
-use crate::{
-    ActiveFrameMut, ActiveFrameRef, feedback::OrdinaryCallTarget, native_abi::NativeFrame,
-};
+use super::RuntimeCall;
+use crate::{ActiveFrameMut, ActiveFrameRef, feedback::OrdinaryCallTarget, native_abi::Frame};
 
 impl RuntimeCall<'_> {
     /// Count elided live actuals for an already-resolved intrinsic apply.
@@ -27,8 +25,7 @@ impl RuntimeCall<'_> {
         // SAFETY: the bound activation owns these live services and windows;
         // this leaf neither allocates nor reenters.
         let vm = unsafe { self.vm.as_ref() };
-        let stack = unsafe { self.stack.as_ref() };
-        let frame = unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }.ok()?;
+        let frame = unsafe { ActiveFrameRef::from_ptr(self.frame.as_ptr()) }.ok()?;
         if !crate::method_ops::is_function_prototype_intrinsic_value(
             method,
             &vm.gc_heap,
@@ -36,29 +33,25 @@ impl RuntimeCall<'_> {
         ) {
             return None;
         }
-        let materialized = match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => Some(index),
-            RuntimeFrameIdentity::StackOwned => None,
-        };
-        vm.elided_forward_argument_count(stack, &frame, materialized)
+        vm.elided_forward_argument_count(&frame)
     }
 
     /// Whether the committed value boundary can complete this source without
     /// first materializing a stack-owned caller. This probe has no JS effects.
-    pub fn forward_call_can_complete(&self, method: crate::Value) -> bool {
-        matches!(self.identity, RuntimeFrameIdentity::Materialized(_))
-            || self.forward_argument_count(method).is_some()
+    pub fn forward_call_can_complete(&self, _method: crate::Value) -> bool {
+        self.frame_index().is_ok()
     }
 
-    /// Complete one forwarded call from `[method, callee, receiver, register
-    /// bindings…, formals context]`. Register bindings follow the immutable
-    /// CodeBlock mapping order; the trailing context word is present exactly
-    /// when a mapped formal is context-held. No interpreter destination
-    /// crosses this API.
-    pub fn call_forward_values(
+    /// Resolve one forwarded call from `[method, callee, receiver, register
+    /// bindings…, formals context]` into its callee, receiver and actuals.
+    /// Register bindings follow the immutable CodeBlock mapping order; the
+    /// trailing context word is present exactly when a mapped formal is
+    /// context-held. The caller stages the result before any allocation.
+    pub fn stage_forward_values(
         &mut self,
         values: &[crate::Value],
-    ) -> Result<crate::Value, crate::VmError> {
+    ) -> Result<(crate::Value, crate::Value, smallvec::SmallVec<[crate::Value; 8]>), crate::VmError>
+    {
         // SAFETY: the bound activation owns the context and published frame;
         // the checked source borrows no managed slice across reentrant work.
         let context = &self.context;
@@ -84,22 +77,18 @@ impl RuntimeCall<'_> {
         {
             return Err(crate::VmError::InvalidOperand);
         }
-        let materialized = match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => Some(index),
-            RuntimeFrameIdentity::StackOwned => None,
-        };
-        let source = unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }
+        let source = unsafe { ActiveFrameRef::from_ptr(self.frame.as_ptr()) }
             .map_err(|_| crate::VmError::InvalidOperand)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        vm.jit_runtime_forward_values(context, stack, &source, materialized, values)
+        vm.jit_runtime_forward_request(context, stack, &source, values)
     }
 
     /// Resolve a runtime-selected ordinary bytecode target.
     ///
-    /// Function admission is shared with compile-time call baking and may
-    /// compile a fresh baseline generation while the published caller owns all
-    /// moving roots. The result contains stable engine metadata only; receiver
+    /// Function admission is shared with compile-time call baking. Every linked
+    /// bytecode target already owns an interpreter or compiled destination.
+    /// The result contains stable engine metadata only; receiver
     /// binding and native-stack reservation must still be proved before the
     /// callee is published.
     pub fn forwarded_call_plan(
@@ -110,7 +99,7 @@ impl RuntimeCall<'_> {
         // caller stays published across optional compilation, and no
         // JavaScript reentry occurs during lookup.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let source = unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }.ok()?;
+        let source = unsafe { ActiveFrameRef::from_ptr(self.frame.as_ptr()) }.ok()?;
         let context = &self.context;
         let caller = context.exec_function(source.function_id())?;
         let call_pc = unsafe { self.frame.as_ref() }.header.pc;
@@ -141,7 +130,7 @@ impl RuntimeCall<'_> {
         if transition.evict_for_reopt() {
             vm.recompile_active_caller_for_feedback(context, source.function_id());
         }
-        vm.ensure_runtime_forward_callee_plan(&callee_context, function)
+        vm.current_direct_callee_plan(function)
     }
 
     /// Copy incoming actuals and live captured aliases into a private callee.
@@ -154,34 +143,22 @@ impl RuntimeCall<'_> {
     /// live for this non-allocating call. The callee must not yet be published.
     pub unsafe fn copy_forwarded_argument_window(
         &self,
-        destination: *mut NativeFrame,
+        destination: *mut Frame,
         parameter_count: u16,
     ) -> Option<u32> {
         // SAFETY: the bound caller and the caller-owned private destination are
         // live and disjoint; checked views retain no Rust slice across VM work.
         let vm = unsafe { self.vm.as_ref() };
-        let stack = unsafe { self.stack.as_ref() };
-        let Ok(source) = (unsafe { ActiveFrameRef::from_native_ptr(self.frame.as_ptr()) }) else {
+        let Ok(source) = (unsafe { ActiveFrameRef::from_ptr(self.frame.as_ptr()) }) else {
             return None;
         };
         let context = &self.context;
-        let Ok(mut destination) = (unsafe { ActiveFrameMut::from_native_ptr(destination) }) else {
+        let Ok(mut destination) = (unsafe { ActiveFrameMut::from_ptr(destination) }) else {
             return None;
         };
         let function = context.exec_function(source.function_id())?;
-        let materialized = match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => Some(index),
-            RuntimeFrameIdentity::StackOwned => None,
-        };
-        vm.copy_forwarded_argument_window(
-            function,
-            stack,
-            &source,
-            materialized,
-            &mut destination,
-            parameter_count,
-        )
-        .ok()
-        .flatten()
+        vm.copy_forwarded_argument_window(function, &source, &mut destination, parameter_count)
+            .ok()
+            .flatten()
     }
 }

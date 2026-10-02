@@ -9,7 +9,7 @@
 //! - Every VM-success result represents a committed opcode; generated code
 //!   either falls through, resumes at the returned canonical PC, or exits with
 //!   its returned value. It never replays the source opcode.
-//! - Dynamic resume PCs are written to the published NativeFrame before the
+//! - Dynamic resume PCs are written to the published Frame before the
 //!   shared bailout epilogue runs.
 //!
 //! # See also

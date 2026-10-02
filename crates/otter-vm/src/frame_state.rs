@@ -13,7 +13,7 @@
 //! - Frame construction sizes registers from verified CodeBlock metadata.
 //! - Frame and pending-record PCs are dense CodeBlock instruction indexes.
 //! - Every active frame owns one attached [`RegisterWindow`].
-//! - Parked states own copied register snapshots and no arena pointers.
+//! - Parked states own copied register snapshots and no active frame pointers.
 //! - GC-bearing frame and parked-state fields are visited by their tracers.
 //! - Every frame is constructed with its exact SELF: the closure (or bare
 //!   function value) being executed. There is no default; context-reading
@@ -29,8 +29,8 @@
 //!
 //! - **Register window.** A frame's registers are a contiguous run of [`Value`]
 //!   slots. Register `r` lives at `window_base + r * size_of::<Value>()`; the
-//!   stride is 8 bytes ([`REGISTER_SLOT_BYTES`]). The base and arena offset
-//!   always come from the frame's attached [`RegisterWindow`].
+//!   stride is 8 bytes ([`REGISTER_SLOT_BYTES`]). The base and capacity
+//!   come from the frame's attached [`RegisterWindow`].
 //! - **Calling convention.** Argument `i` (declaration order) is delivered in
 //!   window register `i` for `i < arity`; the caller writes the arguments into
 //!   the callee window starting at register 0 before transferring control. The
@@ -39,7 +39,7 @@
 //! - **SELF / `this` are frame fields, not window registers.** They live in
 //!   [`Frame::self_value`] / [`Frame::this_value`] and are materialized into a
 //!   register on demand by the load opcodes, so a callee never reserves a
-//!   window slot for them. `new.target` remains optional cold call state.
+//!   window slot for them. `new.target` is stored in the same activation record.
 //! - **Header.** [`Frame::function_id`] + [`Frame::pc`] identify the resume
 //!   point; [`Frame::return_register`] names the caller register that receives
 //!   the completion value (`None` for `<main>`).
@@ -54,8 +54,8 @@ use otter_bytecode::Function;
 use otter_gc::raw::SlotVisitor;
 
 use crate::{
-    CodeBlock, JsPromiseHandle, RegisterWindow, Value, VmError, abstract_ops,
-    cold_frame::ColdFrameIdx, native_abi::VmFrameHeader,
+    JsPromiseHandle, RegisterWindow, Value, VmError, abstract_ops,
+    native_abi::{Frame, VmFrameHeader},
 };
 
 /// Byte stride between adjacent registers in a frame window. Register `r` sits
@@ -65,27 +65,12 @@ use crate::{
 pub(crate) const REGISTER_SLOT_BYTES: usize = std::mem::size_of::<Value>();
 const _: () = assert!(REGISTER_SLOT_BYTES == 8);
 
-// One current 56-byte materialized activation. Async/generator ownership and
-// all other uncommon protocol state live in `cold_frame::ColdFramePool` and are
-// reached lazily through `frame.cold`.
-const _: [(); 56] = [(); std::mem::size_of::<Frame>()];
-
 /// Owned register values of a suspended frame. This type deliberately cannot
-/// expose a [`RegisterWindow`]: parked state is independent of the active arena.
+/// expose a [`RegisterWindow`]: parked state is independent of the native stack.
 #[derive(Debug)]
 pub struct OwnedRegisterSnapshot(SmallVec<[Value; 8]>);
 
 impl OwnedRegisterSnapshot {
-    #[must_use]
-    pub(crate) fn copy_from(window: RegisterWindow) -> Self {
-        Self(SmallVec::from_slice(&window))
-    }
-
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
     pub(crate) fn trace_slots(&self, visitor: &mut SlotVisitor<'_>) {
         for value in &self.0 {
             value.trace_value_slots(visitor);
@@ -99,60 +84,20 @@ impl OwnedRegisterSnapshot {
     }
 }
 
-/// Materialized interpreter-owned frame.
-///
-/// Existing ActivationStack dispatch paths still own this compact record. New
-/// tier-neutral execution uses [`crate::ActiveFrameMut`] over the canonical
-/// [`crate::native_abi::NativeFrame`] and its register window, so interpreter/baseline/
-/// optimizer switches do not require constructing another Rust-owned frame.
-#[repr(C, align(8))]
-#[derive(Debug)]
-pub struct Frame {
-    /// Common interpreter/baseline machine-visible frame prefix.
-    pub header: VmFrameHeader,
-    /// Register window for this frame.
-    pub registers: RegisterWindow,
-    /// Exact function object executing this frame (SELF).
-    /// `LoadClosureContext`, `LoadSelf`, and `arguments.callee` read this
-    /// hot field so materialized and native frames share one
-    /// representation-neutral binding. Closure calls store that exact closure
-    /// instance; a bare function value appears only for functions whose code
-    /// never reads its closure context.
-    pub self_value: Value,
-    /// `this` value visible inside the body. `<main>` and free
-    /// `Op::Call` invocations both bind `Value::Undefined`
-    /// (foundation strict default). Method calls set the receiver,
-    /// `Op::CallWithThis` and `Op::CallMethodValue` thread a caller-
-    /// provided value, and arrow closures override with their
-    /// lexically-captured `this` regardless of the call site.
-    pub this_value: Value,
-    /// When `Some(reg)`, returning from this frame writes the
-    /// completion value into the **caller's** register `reg` and
-    /// resumes at the caller's next pc. `<main>` carries `None`
-    /// and propagates the value out as the script's completion.
-    pub return_register: Option<u16>,
-    /// Handle into the per-interpreter
-    /// [`crate::cold_frame::ColdFramePool`] when this frame has
-    /// acquired a cold side record (try handlers, async parking,
-    /// pending ToPrimitive/bind/iterator ladders, …). `None` until
-    /// the first opcode that needs cold state writes through
-    /// [`crate::Interpreter::frame_ensure_cold`].
-    pub cold: Option<ColdFrameIdx>,
-}
-
 /// GC-traceable off-stack frame ownership used by generators and async await.
-/// It contains no pointer into [`crate::register_stack::RegisterStack`].
+/// It owns copied values independently of the published native stack.
 #[derive(Debug)]
 pub struct ParkedFrameState {
     pub header: VmFrameHeader,
     registers: OwnedRegisterSnapshot,
+    arguments: SmallVec<[Value; 8]>,
+    parameter_count: u16,
     pub self_value: Value,
     pub this_value: Value,
+    pub new_target_value: Value,
+    pub arguments_object: crate::JsObject,
     pub return_register: Option<u16>,
 }
-
-const _: [(); 0] = [(); std::mem::offset_of!(Frame, header)];
-const _: [(); 16] = [(); std::mem::offset_of!(Frame, registers)];
 
 impl std::ops::Deref for Frame {
     type Target = VmFrameHeader;
@@ -325,11 +270,11 @@ impl Frame {
     /// Advance the canonical instruction-index program counter by one.
     /// Surfaces [`VmError::InvalidOperand`] on overflow.
     pub(crate) fn advance_pc(&mut self) -> Result<(), VmError> {
-        crate::ActiveFrameMut::materialized(self).advance_pc()
+        crate::ActiveFrameMut::from_frame(self).advance_pc()
     }
 
     /// Advance the canonical PC by one with a direct field write, skipping the
-    /// materialized-frame wrapper and the overflow branch of [`Self::advance_pc`].
+    /// interpreter dispatch wrapper and the overflow branch of [`Self::advance_pc`].
     /// A PC past the end of the instruction stream is caught by the next
     /// instruction fetch (`instr_at_index` → `MissingReturn`), so the hot path
     /// needs no explicit overflow check.
@@ -355,112 +300,120 @@ impl Frame {
             .saturating_add(function.locals)
             .saturating_add(function.scratch) as usize;
         debug_assert_eq!(window.len(), total);
-        Self {
-            header: VmFrameHeader::interpreter(function.id, total as u16),
-            registers: window,
-            return_register,
+        let mut frame = Self::new(
+            VmFrameHeader::interpreter(function.id, total as u16),
+            window.as_mut_ptr() as u64,
             self_value,
             this_value,
-            cold: None,
-        }
-    }
-
-    /// Frame for a verified [`CodeBlock`] with an explicit SELF and receiver.
-    #[must_use]
-    pub(crate) fn for_code_block(
-        function: &CodeBlock,
-        return_register: Option<u16>,
-        self_value: Value,
-        this_value: Value,
-        window: RegisterWindow,
-    ) -> Self {
-        debug_assert_eq!(
-            window.len(),
-            function.register_count as usize,
-            "register window must match the function's register_count"
         );
-        Self {
-            header: VmFrameHeader::interpreter(function.id, function.register_count),
-            registers: window,
-            return_register,
-            self_value,
-            this_value,
-            cold: None,
-        }
+        frame.registers = window;
+        frame.set_return_register(return_register);
+        frame
     }
 
-    /// Trace SELF and receiver state. Active register windows are traced once
-    /// by RegisterStack; async/generator ownership is traced through the
-    /// attached cold record.
+    /// Trace the common non-register roots of this published activation.
+    /// Register windows and cold protocol records are visited by their owners.
     pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        // Active register windows are traced once through RegisterStack's
-        // precisely published prefix. The frame walker owns scalar/header state.
-        self.self_value.trace_value_slots(visitor);
-        self.this_value.trace_value_slots(visitor);
-        // Cold-record GC slots (pending_to_primitive / pending_bind_function /
-        // pending_iterator_next) are traced separately by the caller through
-        // [`crate::cold_frame::ColdFrame::trace_cold_slots`] when
-        // `self.cold` is `Some`.
+        // SAFETY: activation publication keeps this record initialized and
+        // live. The collector owns all in-place relocation writes.
+        unsafe { Self::trace_fields(std::ptr::from_ref(self).cast_mut(), visitor) };
     }
 }
 
 impl ParkedFrameState {
-    /// Copy an active frame's values into owned suspension state. The caller
-    /// must release `frame.registers` immediately after this returns.
+    /// Copy a published activation into owned suspension data.
     #[must_use]
-    pub(crate) fn copy_from_active(frame: Frame) -> (Self, RegisterWindow) {
-        let window = frame.registers;
-        let registers = OwnedRegisterSnapshot::copy_from(window);
-        (
-            Self {
-                header: frame.header,
-                registers,
-                self_value: frame.self_value,
-                this_value: frame.this_value,
-                return_register: frame.return_register,
-            },
-            window,
+    pub(crate) fn copy_from_active(frame: &Frame) -> Self {
+        let view = crate::ActiveFrameRef::from_frame(frame);
+        let count = view.incoming_argument_count();
+        let arguments = (0..count)
+            .map(|index| {
+                view.incoming_argument(index)
+                    .expect("published argument bounds")
+            })
+            .collect();
+        Self::from_inputs(
+            frame.header,
+            SmallVec::from_slice(&frame.registers),
+            arguments,
+            0,
+            frame.self_value,
+            frame.this_value,
+            frame.new_target(),
+            frame.arguments_object,
+            frame.return_register(),
         )
     }
 
-    /// Move a parked snapshot into a newly reserved active window.
-    #[must_use]
-    pub(crate) fn into_active(self, mut window: RegisterWindow) -> Frame {
-        debug_assert_eq!(window.len(), self.registers.len());
-        window.copy_from_slice(&self.registers.0);
-        let Self {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_inputs(
+        header: VmFrameHeader,
+        registers: SmallVec<[Value; 8]>,
+        arguments: SmallVec<[Value; 8]>,
+        parameter_count: u16,
+        self_value: Value,
+        this_value: Value,
+        new_target_value: Value,
+        arguments_object: crate::JsObject,
+        return_register: Option<u16>,
+    ) -> Self {
+        Self {
             header,
-            registers: _,
+            registers: OwnedRegisterSnapshot(registers),
+            arguments,
+            parameter_count,
             self_value,
             this_value,
+            new_target_value,
+            arguments_object,
             return_register,
-        } = self;
-        Frame {
-            header,
-            registers: window,
-            self_value,
-            this_value,
-            return_register,
-            cold: None,
         }
     }
 
-    #[must_use]
-    pub(crate) fn register_count(&self) -> usize {
-        self.registers.len()
+    /// Resume through the same native-stack packet as an ordinary call.
+    pub(crate) fn into_prepared(self) -> crate::PreparedCall {
+        crate::PreparedCall {
+            header: self.header,
+            self_value: self.self_value,
+            this_value: self.this_value,
+            new_target_value: self.new_target_value,
+            arguments_object: self.arguments_object,
+            return_register: self.return_register,
+            cold: None,
+            parameter_count: self.parameter_count,
+            arguments: self.arguments,
+            initial_registers: self.registers.0,
+            child: None,
+            resume: crate::prepared_call::ResumeInput::Normal,
+        }
     }
 
     pub(crate) fn trace_slots(&self, visitor: &mut SlotVisitor<'_>) {
         self.registers.trace_slots(visitor);
+        for value in &self.arguments {
+            value.trace_value_slots(visitor);
+        }
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
+        self.new_target_value.trace_value_slots(visitor);
+        if !self.arguments_object.is_null() {
+            visitor(
+                std::ptr::addr_of!(self.arguments_object)
+                    .cast_mut()
+                    .cast::<otter_gc::raw::RawGc>(),
+            );
+        }
     }
 
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         visitor(self.header.function_id);
         self.registers.visit_function_ids(visitor);
+        for value in &self.arguments {
+            crate::code_liveness::visit_value(value, visitor);
+        }
         crate::code_liveness::visit_value(&self.self_value, visitor);
         crate::code_liveness::visit_value(&self.this_value, visitor);
+        crate::code_liveness::visit_value(&self.new_target_value, visitor);
     }
 
     #[cfg(test)]

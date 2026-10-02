@@ -98,123 +98,6 @@ pub(crate) struct InlineSiteArtifact {
     pub(crate) has_receiver_property: bool,
 }
 
-/// Native tier of one exact generated direct-call target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum DirectCallTierArtifact {
-    Template,
-    Optimizing,
-}
-
-#[cfg(any(test, target_arch = "aarch64"))]
-impl DirectCallTierArtifact {
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Template => "template",
-            Self::Optimizing => "optimizing",
-        }
-    }
-}
-
-/// Source opcode represented by one generated call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum DirectCallKindArtifact {
-    Plain,
-    Method,
-    Construct,
-    DerivedConstruct,
-    SuperConstruct,
-    DerivedSuperConstruct,
-}
-
-#[cfg(any(test, target_arch = "aarch64"))]
-impl DirectCallKindArtifact {
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Plain => "plain",
-            Self::Method => "method",
-            Self::Construct => "construct",
-            Self::DerivedConstruct => "derivedConstruct",
-            Self::SuperConstruct => "superConstruct",
-            Self::DerivedSuperConstruct => "derivedSuperConstruct",
-        }
-    }
-}
-
-/// How one generated call materializes its callee parameter prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-pub(crate) enum DirectCallArgumentModeArtifact {
-    Fixed,
-    Spread,
-    Forward,
-}
-
-#[cfg(any(test, target_arch = "aarch64"))]
-impl DirectCallArgumentModeArtifact {
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Fixed => "fixed",
-            Self::Spread => "spread",
-            Self::Forward => "forward",
-        }
-    }
-}
-
-/// ECMAScript receiver source used by one generated call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum DirectCallThisModeArtifact {
-    StrictOrLexical,
-    SloppyGlobal,
-    MethodReceiver,
-    ConstructReceiver,
-    DerivedConstructor,
-}
-
-#[cfg(any(test, target_arch = "aarch64"))]
-impl DirectCallThisModeArtifact {
-    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::StrictOrLexical => "strictOrLexical",
-            Self::SloppyGlobal => "sloppyGlobal",
-            Self::MethodReceiver => "methodReceiver",
-            Self::ConstructReceiver => "constructReceiver",
-            Self::DerivedConstructor => "derivedConstructor",
-        }
-    }
-}
-
-/// Exact target generation and stack contract baked into one direct-call site.
-///
-/// `target_code_object_id` is diagnostic identity for exact artifacts. Portable
-/// normalized code deliberately excludes it while retaining the semantic
-/// receiver mode, tier, and every layout field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DirectCallArtifact {
-    pub(crate) call_kind: DirectCallKindArtifact,
-    pub(crate) argument_mode: DirectCallArgumentModeArtifact,
-    pub(crate) target_function_id: u32,
-    pub(crate) target_index: u32,
-    pub(crate) target_count: u32,
-    pub(crate) target_code_object_id: u64,
-    pub(crate) target_tier: DirectCallTierArtifact,
-    pub(crate) this_mode: DirectCallThisModeArtifact,
-    pub(crate) callee_native_frame_bytes: u32,
-    /// Exact linkage bytes, or null when actual arity determines them at runtime.
-    pub(crate) linkage_bytes: Option<u32>,
-    /// Exact total reservation, or null for a dynamic argument window.
-    pub(crate) reserved_stack_bytes: Option<u32>,
-    pub(crate) callee_register_count: u16,
-}
-
 /// Exact heap facts re-read by one guarded monomorphic method edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -261,8 +144,9 @@ pub(crate) struct CodeRegion {
     inline_frame: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     function_id: Option<u32>,
+    /// Proven call target entered through its current generation.
     #[serde(skip_serializing_if = "Option::is_none")]
-    direct_call: Option<DirectCallArtifact>,
+    call_target_function_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     method_guard: Option<MethodGuardArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -293,7 +177,7 @@ impl CodeRegion {
             target_block: None,
             inline_frame: None,
             function_id: None,
-            direct_call: None,
+            call_target_function_id: None,
             method_guard: None,
             native_leaf_call: None,
             logical_pc: None,
@@ -337,7 +221,7 @@ impl CodeRegion {
             target_block: None,
             inline_frame,
             function_id: Some(function_id),
-            direct_call: None,
+            call_target_function_id: None,
             method_guard: None,
             native_leaf_call: None,
             logical_pc: Some(logical_pc),
@@ -366,8 +250,9 @@ impl CodeRegion {
 
     /// One compiler-generated call phase.
     ///
-    /// `function_id` remains the caller owning this code object. `direct_call`
-    /// carries the exact target generation and stack contract separately.
+    /// `function_id` remains the caller owning this code object;
+    /// `call_target_function_id` names a proven target entered through its
+    /// current generation.
     #[allow(clippy::too_many_arguments)]
     #[cfg(any(test, target_arch = "aarch64", target_arch = "x86_64"))]
     pub(crate) fn call_structural(
@@ -377,11 +262,11 @@ impl CodeRegion {
         caller_function_id: u32,
         logical_pc: u32,
         byte_pc: u32,
-        direct_call: impl Into<Option<DirectCallArtifact>>,
+        call_target_function_id: Option<u32>,
     ) -> Self {
         let mut region = Self::structural(kind, start, end);
         region.function_id = Some(caller_function_id);
-        region.direct_call = direct_call.into();
+        region.call_target_function_id = call_target_function_id;
         region.logical_pc = Some(logical_pc);
         region.byte_pc = Some(byte_pc);
         region
@@ -398,7 +283,6 @@ impl CodeRegion {
         caller_function_id: u32,
         logical_pc: u32,
         byte_pc: u32,
-        direct_call: DirectCallArtifact,
         receiver_register: u16,
         guard: &otter_vm::jit::JitMethodGuard,
     ) -> Self {
@@ -409,7 +293,7 @@ impl CodeRegion {
             caller_function_id,
             logical_pc,
             byte_pc,
-            direct_call,
+            None,
         );
         region.method_guard = Some(MethodGuardArtifact {
             receiver_register,
@@ -665,7 +549,6 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
         native_return_offset: Option<u64>,
         tagged_locations: Vec<Location>,
         inline_frames: &'a [otter_vm::deopt::DeoptFrame<Option<u16>>],
-        inline_frames_virtual: bool,
         call_pc: Option<u32>,
     }
 
@@ -679,7 +562,6 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
         .iter()
         .map(|record| Point {
             inline_frames: &record.inline_frames,
-            inline_frames_virtual: record.inline_frames_virtual,
             call_pc: (record.call_pc != otter_vm::native_abi::NO_CALL_PC).then_some(record.call_pc),
             id: record.id,
             frame_state: record.frame_state,
@@ -955,29 +837,16 @@ mod tests {
     }
 
     #[test]
-    fn code_map_direct_call_shape_names_exact_generation_and_stack_contract() {
+    fn code_map_call_region_names_the_linked_target() {
         let mut map = CodeMapCapture::default();
         map.record(CodeRegion::call_structural(
-            "directCallNativeEntry",
+            "machineCallTrampoline",
             20,
             28,
             7,
             2,
             19,
-            DirectCallArtifact {
-                call_kind: DirectCallKindArtifact::Plain,
-                argument_mode: DirectCallArgumentModeArtifact::Fixed,
-                target_function_id: 11,
-                target_index: 0,
-                target_count: 1,
-                target_code_object_id: 29,
-                target_tier: DirectCallTierArtifact::Optimizing,
-                this_mode: DirectCallThisModeArtifact::SloppyGlobal,
-                callee_native_frame_bytes: 160,
-                linkage_bytes: Some(112),
-                reserved_stack_bytes: Some(272),
-                callee_register_count: 6,
-            },
+            Some(11),
         ));
 
         let value: serde_json::Value =
@@ -986,17 +855,7 @@ mod tests {
         assert_eq!(region["functionId"], 7);
         assert_eq!(region["logicalPc"], 2);
         assert_eq!(region["bytePc"], 19);
-        assert_eq!(region["directCall"]["callKind"], "plain");
-        assert_eq!(region["directCall"]["targetFunctionId"], 11);
-        assert_eq!(region["directCall"]["targetIndex"], 0);
-        assert_eq!(region["directCall"]["targetCount"], 1);
-        assert_eq!(region["directCall"]["targetCodeObjectId"], 29);
-        assert_eq!(region["directCall"]["targetTier"], "optimizing");
-        assert_eq!(region["directCall"]["thisMode"], "sloppyGlobal");
-        assert_eq!(region["directCall"]["calleeNativeFrameBytes"], 160);
-        assert_eq!(region["directCall"]["linkageBytes"], 112);
-        assert_eq!(region["directCall"]["reservedStackBytes"], 272);
-        assert_eq!(region["directCall"]["calleeRegisterCount"], 6);
+        assert_eq!(region["callTargetFunctionId"], 11);
     }
 
     #[test]

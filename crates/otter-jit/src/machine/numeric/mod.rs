@@ -122,10 +122,6 @@ use arm64 as backend;
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as backend;
-#[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::emit_generated_receiver_allocation as emit_x86_64_generated_receiver_allocation;
-#[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::emit_increment_runtime_counter as emit_x86_64_increment_runtime_counter;
 mod boxed_arithmetic;
 mod constructor_effects;
 mod element_cfg;
@@ -147,11 +143,7 @@ use otter_vm::{
     deopt::{DeoptExitDescriptor, DeoptRuntime},
     native_abi::{
         ExitAction, ExitReason, STUB_ARRAY_CONSTRUCT_ALLOC, STUB_JIT_ACKNOWLEDGE_CAUGHT_THROW,
-        STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_METHOD_VALUE, STUB_JIT_CALL_WITH_THIS_VALUE,
-        STUB_JIT_CONSTRUCT_VALUE, STUB_JIT_COPY_SPREAD_ARGUMENTS, STUB_JIT_DEOPT_STACK_CALL,
-        STUB_JIT_DEOPT_WRITEBACK, STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-        STUB_JIT_PREPARE_BASE_CONSTRUCT, STUB_JIT_RESOLVE_DIRECT_ENTRY,
-        STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT,
+        STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_WRITEBACK,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -193,7 +185,7 @@ fn aarch64_test_frame(
     root_slots: u16,
 ) -> Result<super::MachineFrameLayout, Unsupported> {
     TargetSpec::aarch64()
-        .frame_layout(allocation, root_slots, 0)
+        .frame_layout(allocation, root_slots, 0, 0)
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))
 }
 
@@ -385,26 +377,6 @@ pub(crate) fn try_compile(
         }
     })?;
     inline_reentry::prepare_safepoints(view, &sequence, &mut machine_safepoints)?;
-    // Generated callers may publish only the parameter prefix: Machine code
-    // keeps locals in allocator homes, collecting calls root them at their
-    // call site, and every exit widens the window before the VM reads it.
-    // An actual-argument window sits after the complete register window, and
-    // a forwarding call writes its formals context into a local register, so
-    // either needs the whole window published.
-    let parameter_prefix_entry = !view.code_block.needs_arguments()
-        && !sequence.call_descriptors().iter().any(|descriptor| {
-            matches!(
-                descriptor.target,
-                CallTarget::Direct {
-                    kind: DirectCallKind::Forward,
-                    ..
-                }
-            )
-        })
-        && !hir
-            .frame_states
-            .iter()
-            .any(|state| matches!(state.point, NumericFramePoint::Backedge { .. }));
     let method_packet = value_packet_frame(&sequence)?;
     let frame = target_spec
         .frame_layout(
@@ -414,6 +386,14 @@ pub(crate) fn try_compile(
                 .raw_start
                 .checked_add(method_packet.raw_words)
                 .ok_or(Unsupported::OperandShape("scalar value-span packet frame"))?,
+            // Runtime semantics that read registers by index (mapped
+            // arguments, forwarded actuals) need the interpreter window for
+            // the whole activation; every other body has none.
+            if view.code_block.requires_argument_frame() {
+                view.code_block.register_count
+            } else {
+                0
+            },
         )
         .map_err(|_| Unsupported::OperandShape("scalar Machine IR frame layout"))?;
     let (gpr_budget, fp_budget) = target_spec.deopt_register_budgets();
@@ -479,6 +459,7 @@ pub(crate) fn try_compile(
     });
     let emission = backend::emit(
         view,
+        code_object_id,
         &sequence,
         &allocation,
         frame,
@@ -487,12 +468,6 @@ pub(crate) fn try_compile(
         transitions,
         transitions.entry(STUB_JIT_BACKEDGE_POLL),
         transitions.variadic_entry(STUB_JIT_DEOPT_WRITEBACK),
-        transitions.entry(STUB_JIT_DEOPT_STACK_CALL),
-        transitions.entry(STUB_JIT_RESOLVE_DIRECT_ENTRY),
-        transitions.entry(STUB_JIT_TRY_PREPARE_BASE_CONSTRUCT),
-        transitions.entry(STUB_JIT_PREPARE_BASE_CONSTRUCT),
-        transitions.entry(STUB_JIT_DERIVED_CONSTRUCT_RESULT),
-        transitions.entry(STUB_JIT_COPY_SPREAD_ARGUMENTS),
         otter_vm::runtime_stubs::STRING_CONCAT_ALLOC
             .entry_addr()
             .ok_or(Unsupported::OperandShape(
@@ -508,12 +483,8 @@ pub(crate) fn try_compile(
         otter_vm::runtime_stubs::NUMBER_TO_INT32_F64_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
         otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-        transitions.entry(STUB_JIT_CALL_METHOD_VALUE),
-        transitions.entry(STUB_JIT_CALL_WITH_THIS_VALUE),
-        transitions.entry(STUB_JIT_CONSTRUCT_VALUE),
         &mut load_ic_cells,
         &mut store_ic_cells,
-        view.code_block.register_count,
         artifact_request.is_some(),
     )?;
     let machine_register_count = u8::try_from(allocation.used_register_count())
@@ -522,7 +493,7 @@ pub(crate) fn try_compile(
 
     let backend::Emission {
         code: emitted_code,
-        generated_stack_frame_bytes,
+        call_entry,
         relocations,
         osr_headers,
         osr_regions,
@@ -580,7 +551,7 @@ pub(crate) fn try_compile(
 
     let code = OptimizedCode::new(
         emitted_code,
-        Some(generated_stack_frame_bytes),
+        call_entry,
         deopt_runtime,
         safepoints,
         osr_headers,
@@ -592,7 +563,6 @@ pub(crate) fn try_compile(
             function_id: view.code_block.id,
             param_count: view.code_block.param_count,
             register_count: view.code_block.register_count,
-            parameter_prefix_entry,
             machine_register_count,
             allocator_spill_slot_count: allocation.spill_slots(),
             spill_slot_count: allocation
@@ -3058,34 +3028,27 @@ fn select_with_loop_entries(
                                 .collect::<Vec<_>>();
                             (DirectCallArgumentMode::Fixed, arguments)
                         }
-                        NumericDirectCallArguments::Spread(argument) => (
+                        NumericDirectCallArguments::Spread { receiver, array } => (
                             DirectCallArgumentMode::Spread,
-                            vec![tagged_call_argument(
-                                hir,
-                                &values,
-                                &mut representations,
-                                &mut instructions,
-                                argument,
-                            )],
+                            receiver
+                                .into_iter()
+                                .chain([array])
+                                .map(|argument| {
+                                    tagged_call_argument(
+                                        hir,
+                                        &values,
+                                        &mut representations,
+                                        &mut instructions,
+                                        argument,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
                         ),
                     };
                     let target = hir
                         .direct_call_targets
                         .get(usize::from(target))
                         .ok_or(super::VerificationError::InvalidValue(result))?;
-                    let construct_receiver = matches!(
-                        &target.kind,
-                        NumericDirectCallKind::Construct | NumericDirectCallKind::SuperConstruct
-                    )
-                    .then(|| {
-                        let receiver =
-                            push_value(&mut representations, MachineRepresentation::Tagged);
-                        instructions.push(MachineInstruction::plain(
-                            MachineOpcode::TaggedConstant(otter_vm::Value::undefined().to_bits()),
-                            vec![MachineOperand::register_output(receiver)],
-                        ));
-                        receiver
-                    });
                     let descriptor = direct_call_descriptor(
                         target_spec,
                         target,
@@ -3113,20 +3076,13 @@ fn select_with_loop_entries(
                     let descriptor_index =
                         intern_call_descriptor(&mut call_descriptors, descriptor);
                     let mut operands = Vec::with_capacity(arguments.len() + 2);
-                    // Direct linkage consumes every boxed input from its
+                    // The call request reads every boxed input from its
                     // canonical safepoint home after root publication. Keep
                     // the semantic inputs allocator-visible through the call,
                     // but allow high-arity sites to remain in spill slots.
                     operands.push(MachineOperand::location_input(source_value));
                     operands.extend(arguments.into_iter().map(MachineOperand::location_input));
                     operands.push(MachineOperand::register_output(result));
-                    // A freshly allocated construct receiver is not part of
-                    // the pre-call interpreter state. Keep that one explicit
-                    // runtime root; ordinary arguments and frame values are
-                    // derived after the complete CFG is known.
-                    if let Some(receiver) = construct_receiver {
-                        operands.push(MachineOperand::runtime_root(receiver));
-                    }
                     let mut call = MachineInstruction::plain(
                         MachineOpcode::Call(descriptor_index as u32),
                         operands,
@@ -5465,7 +5421,7 @@ mod tests {
         jit::{BindingHitProof, JitDirectCallPlan, JitMethodGuard, JitTestInstruction},
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING, ArithFeedback},
         native_abi::{
-            NativeFrame, NativeFrameFlags, NativeFrameKind, NativeResultDomain, NativeResultPair,
+            Frame, NativeFrameFlags, NativeFrameKind, NativeResultDomain, NativeResultPair,
             NativeResultStatus, VmFrameHeader, VmThread,
         },
         value::tag,
@@ -5647,10 +5603,10 @@ mod tests {
                 tier: NativeFrameKind::Baseline,
                 this_mode: JitDirectCallThisMode::StrictOrLexical,
                 is_derived_constructor: false,
-                generated_stack_frame_bytes: Some(0),
+                call_flags: otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE,
                 param_count: 1,
                 register_count: 2,
-                needs_incoming_arguments: false,
+                callee_cell: 0,
             },
             receiver_allocation: None,
         }
@@ -8086,7 +8042,7 @@ mod tests {
     ) -> (NativeResultPair, Vec<u64>, u32, u16) {
         assert_eq!(frame.len(), code.metadata().register_count as usize);
         let metadata = code.metadata();
-        let mut native_frame = NativeFrame::new(
+        let mut native_frame = Frame::new(
             VmFrameHeader {
                 function_id: metadata.function_id,
                 pc: initial_pc,
@@ -8118,6 +8074,10 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
+            completion_destination: u32::MAX,
+            completion_generation: 0,
+            pending_call: otter_vm::native_abi::CallRequest::EMPTY,
+            completion: otter_vm::native_abi::NativeResultPair::success(otter_vm::Value::UNDEFINED),
         };
         unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         let result = entry(&mut ctx);
@@ -9329,14 +9289,18 @@ mod tests {
                 .method_fid += 1;
         });
         assert_invalid(valid.clone(), &|_, candidates| {
-            let mut fifth = candidates[3].clone();
-            fifth.target_index = 4;
-            fifth.target_count = 5;
-            fifth.guard.as_mut().expect("method guard").method_fid = fifth.callee.plan.function_id;
-            for candidate in candidates.iter_mut() {
-                candidate.target_count = 5;
+            let oversized = crate::machine::MAX_MACHINE_DIRECT_METHOD_TARGETS + 1;
+            let template = candidates[3].clone();
+            for index in candidates.len()..oversized {
+                let mut extra = template.clone();
+                extra.target_index = index as u32;
+                extra.guard.as_mut().expect("method guard").method_fid =
+                    extra.callee.plan.function_id;
+                candidates.push(extra);
             }
-            candidates.push(fifth);
+            for candidate in candidates.iter_mut() {
+                candidate.target_count = oversized as u32;
+            }
         });
         assert_invalid(valid, &|kind, candidates| {
             *kind = DirectCallKind::Plain;
@@ -10071,7 +10035,7 @@ mod tests {
         let heap = otter_gc::GcHeap::new().expect("execution-test heap");
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
-        let mut native_frame = NativeFrame::new(
+        let mut native_frame = Frame::new(
             VmFrameHeader {
                 function_id: metadata.function_id,
                 pc: 0,
@@ -10083,7 +10047,7 @@ mod tests {
             Value::undefined(),
             Value::undefined(),
         );
-        native_frame.self_value_bits = self_bits;
+        native_frame.set_self_value(Value::from_bits(self_bits));
         let mut thread = VmThread::empty();
         native_frame.code_object_id = u32::try_from(metadata.code_object_id).unwrap();
         thread.interrupt_cell = std::ptr::addr_of!(interrupt) as u64;
@@ -10100,6 +10064,10 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
+            completion_destination: u32::MAX,
+            completion_generation: 0,
+            pending_call: otter_vm::native_abi::CallRequest::EMPTY,
+            completion: otter_vm::native_abi::NativeResultPair::success(otter_vm::Value::UNDEFINED),
         };
         unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
         let result = entry(&mut ctx);
@@ -11098,7 +11066,6 @@ mod tests {
     #[test]
     fn small_numeric_leaf_is_not_hidden_behind_a_fixture_size_threshold() {
         let code = compile_output(&small_leaf_view(), None).code;
-        assert!(code.metadata().parameter_prefix_entry);
         let (ret, _, _) = execute(&code, &[tag::box_int32(9)], 0);
 
         assert_eq!(
@@ -11674,8 +11641,7 @@ mod tests {
         }));
 
         let code = compile_output(&view, None).code;
-        // Call-site roots keep the locals out of the published window.
-        assert!(code.metadata().parameter_prefix_entry);
+        // Safepoints use allocator homes within the complete frame extent.
         assert_eq!(JitFunctionCode::safepoint_count(&code), 2);
         assert_eq!(
             code.deopt_table()
@@ -11867,7 +11833,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_prefix_cold_exits_publish_a_complete_vm_window() {
+    fn complete_vm_window_is_preserved_on_return_and_guard_exits() {
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
 
@@ -11877,9 +11843,9 @@ mod tests {
         let (result, frame, _, register_count) = execute_at_with_register_count(
             &guard,
             guard_entry,
-            vec![tag::box_int32(9), 0xdead_beef_dead_beef],
+            vec![tag::box_int32(9), Value::undefined().to_bits()],
             91,
-            guard.metadata().param_count,
+            guard.metadata().register_count,
             Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
@@ -11890,15 +11856,15 @@ mod tests {
             Some(NativeResultStatus::Success)
         );
         assert_eq!(compiled_payload_bits(result), tag::box_int32(-9));
-        assert_eq!(register_count, guard.metadata().param_count);
-        assert_eq!(frame[1], 0xdead_beef_dead_beef);
+        assert_eq!(register_count, guard.metadata().register_count);
+        assert_eq!(frame[1], Value::undefined().to_bits());
 
         let (result, frame, pc, register_count) = execute_at_with_register_count(
             &guard,
             guard_entry,
-            vec![Value::undefined().to_bits(), 0xdead_beef_dead_beef],
+            vec![Value::undefined().to_bits(), Value::undefined().to_bits()],
             91,
-            guard.metadata().param_count,
+            guard.metadata().register_count,
             Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
@@ -11921,10 +11887,10 @@ mod tests {
             vec![
                 tag::box_int32(i32::MAX),
                 tag::box_int32(1),
-                0xdead_beef_dead_beef,
+                Value::undefined().to_bits(),
             ],
             91,
-            overflow.metadata().param_count,
+            overflow.metadata().register_count,
             Value::undefined(),
             std::ptr::addr_of!(interrupt),
             &mut fuel,
@@ -12163,10 +12129,7 @@ mod tests {
     fn executes_allocator_spills_through_the_shared_frame_layout() {
         let code = compile_output(&spill_pressure_view(), None).code;
         assert!(code.metadata().spill_slot_count > 0);
-        assert!(
-            JitFunctionCode::generated_stack_frame_bytes(&code)
-                .is_some_and(|frame_bytes| frame_bytes > 16)
-        );
+        assert!(JitFunctionCode::call_entry_addr(&code).is_some());
 
         let (ret, _, _) = execute(&code, &[tag::box_int32(0)], 0);
         assert_eq!(
@@ -12317,7 +12280,6 @@ mod tests {
             .expect("loop Machine IR allocation");
 
         let code = compile_output(&view, None).code;
-        assert!(!code.metadata().parameter_prefix_entry);
         for (input, expected) in [(-2, 1), (0, 1), (1, 1), (3, 3)] {
             let (result, _, _) = execute(&code, &[tag::box_int32(input)], 0);
             assert_eq!(

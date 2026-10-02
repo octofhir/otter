@@ -3,6 +3,7 @@
 //! Each file holds one cohesive `impl Interpreter` slice; `helpers` holds the
 //! free functions that back the dispatch loop. No public-API change: `lib.rs`
 //! re-exports the names that were previously defined at the crate root.
+pub(crate) mod call_dispatch;
 mod dispatch;
 mod errors;
 mod exec;
@@ -10,6 +11,7 @@ mod feedback;
 mod frames;
 pub(crate) mod helpers;
 mod host;
+pub(crate) mod host_call;
 mod init;
 mod jit_call;
 mod jit_compile;

@@ -5,8 +5,8 @@
 //! `this`, and a prefix of arguments. Subsequent calls dispatch
 //! through the wrapper and forward to `target` with
 //! `this = bound_this` and `prefix ++ caller_args` as the argument
-//! list. Chained `bind` flattens by re-wrapping at call time without
-//! unbounded recursion (one hop per layer).
+//! list. Bound prefixes live in collector-owned fixed-layout value slabs.
+//! Nested binds preserve the original wrapper chain and argument order.
 //!
 //! # Contents
 //! - [`BoundFunctionBody`] — GC payload.
@@ -15,17 +15,23 @@
 //!   / Deleted / Overridden) for the spec `name` and `length` slots.
 //! - [`BOUND_FUNCTION_BODY_TYPE_TAG`] — GC body type tag.
 //!
+//! # Invariants
+//! - The callable prefix has C layout; generated dispatch reads no Rust container.
+//! - Bound argument slabs are immutable after publication and traced in place.
+//! - Construction roots every input in a handle scope across allocations.
+//!
 //! # See also
+//! - [`crate::value_slab`] — shared collector-owned argument storage.
 //! - <https://tc39.es/ecma262/#sec-bound-function-exotic-objects>
 //! - <https://tc39.es/ecma262/#sec-function.prototype.bind>
 
 use otter_gc::raw::{RawGc, SlotVisitor};
 use smallvec::SmallVec;
 
-use crate::Value;
 use crate::function_metadata;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject};
+use crate::{Interpreter, Value, VmError};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`BoundFunctionBody`].
 pub const BOUND_FUNCTION_BODY_TYPE_TAG: u8 = 0x1c;
@@ -52,20 +58,18 @@ impl crate::pelt::PeltField for BoundFunctionMetadataProperty {
 /// GC-allocated storage for `Value::BoundFunction`. Constructed by
 /// the `Op::BindFunction` opcode and consumed by every call dispatch
 /// path (`Op::Call`, `Op::CallWithThis`, `Op::CallMethodValue`).
+#[repr(C)]
 #[derive(Debug, Clone, otter_macros::Pelt)]
 #[pelt(tag = BOUND_FUNCTION_BODY_TYPE_TAG)]
 pub struct BoundFunctionBody {
-    /// Underlying callable. Foundation slice keeps this as a `Value`;
-    /// chained `bind` flattens by re-wrapping at call time without
-    /// unbounded recursion (one hop per layer).
+    /// Underlying callable, including another bound function.
     pub target: Value,
     /// The `this` value the bound call receives. Overrides any
     /// receiver the caller supplies.
     pub bound_this: Value,
     /// Arguments prepended to the caller's argument list at every
-    /// invocation. Stored inline up to four entries to keep the usual
-    /// `f.bind(t, a, b)` shape off the heap.
-    pub(crate) bound_args: SmallVec<[Value; 4]>,
+    /// invocation. Null denotes an empty prefix.
+    pub(crate) bound_args: crate::value_slab::ValueSlabHandle,
     /// Bound function builtin `name`, computed once by `bind`.
     pub(crate) builtin_name: String,
     /// Bound function builtin `length`, computed once by `bind`.
@@ -84,13 +88,20 @@ pub struct BoundFunctionBody {
     pub(crate) prototype_override: Option<Value>,
 }
 
+/// Byte offset of the target callable in [`BoundFunctionBody`]'s payload.
+pub const BOUND_FUNCTION_BODY_TARGET_OFFSET: usize = std::mem::offset_of!(BoundFunctionBody, target);
+/// Byte offset of the bound `this` in [`BoundFunctionBody`]'s payload.
+pub const BOUND_FUNCTION_BODY_THIS_OFFSET: usize =
+    std::mem::offset_of!(BoundFunctionBody, bound_this);
+/// Byte offset of the compressed bound-argument slab handle (zero when the
+/// prefix is empty) in [`BoundFunctionBody`]'s payload.
+pub const BOUND_FUNCTION_BODY_ARGS_OFFSET: usize =
+    std::mem::offset_of!(BoundFunctionBody, bound_args);
+
 impl BoundFunctionBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         crate::code_liveness::visit_value(&self.target, visitor);
         crate::code_liveness::visit_value(&self.bound_this, visitor);
-        for value in &self.bound_args {
-            crate::code_liveness::visit_value(value, visitor);
-        }
         if let Some(value) = &self.prototype_override {
             crate::code_liveness::visit_value(value, visitor);
         }
@@ -103,8 +114,6 @@ impl BoundFunctionBody {
     }
 }
 
-fn no_extra_roots(_: &mut dyn FnMut(*mut RawGc)) {}
-
 /// Cheap-to-clone handle for [`BoundFunctionBody`].
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -113,95 +122,6 @@ pub struct BoundFunction {
 }
 
 impl BoundFunction {
-    /// Allocate a bound-function body on the GC heap.
-    pub fn new(
-        heap: &mut otter_gc::GcHeap,
-        target: Value,
-        bound_this: Value,
-        bound_args: SmallVec<[Value; 4]>,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        Self::new_with_metadata(
-            heap,
-            target,
-            bound_this,
-            bound_args,
-            function_metadata::BoundFunctionCreateMetadata {
-                name: "bound ".to_string(),
-                length: NumberValue::from_i32(0),
-            },
-        )
-    }
-
-    /// Build a bound function with spec-computed `name` / `length`
-    /// metadata captured at bind time.
-    pub(crate) fn new_with_metadata(
-        heap: &mut otter_gc::GcHeap,
-        target: Value,
-        bound_this: Value,
-        bound_args: SmallVec<[Value; 4]>,
-        metadata: function_metadata::BoundFunctionCreateMetadata,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        let mut external_visit = no_extra_roots;
-        Self::new_with_metadata_and_roots(
-            heap,
-            target,
-            bound_this,
-            bound_args,
-            metadata,
-            &mut external_visit,
-        )
-    }
-
-    /// Build a bound function while exposing caller-owned roots
-    /// across the function's ordinary property bag and body
-    /// allocations.
-    pub(crate) fn new_with_metadata_and_roots(
-        heap: &mut otter_gc::GcHeap,
-        target: Value,
-        bound_this: Value,
-        bound_args: SmallVec<[Value; 4]>,
-        metadata: function_metadata::BoundFunctionCreateMetadata,
-        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        let own_properties = {
-            let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                external_visit(visitor);
-                target.trace_value_slots(visitor);
-                bound_this.trace_value_slots(visitor);
-                for arg in &bound_args {
-                    arg.trace_value_slots(visitor);
-                }
-            };
-            object::alloc_dictionary_object_with_roots(heap, &mut visit)?
-        };
-        let own_properties_root = Value::object(own_properties);
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            own_properties_root.trace_value_slots(visitor);
-            target.trace_value_slots(visitor);
-            bound_this.trace_value_slots(visitor);
-            for arg in &bound_args {
-                arg.trace_value_slots(visitor);
-            }
-        };
-        Ok(Self {
-            inner: heap.alloc_with_roots(
-                BoundFunctionBody {
-                    target,
-                    bound_this,
-                    bound_args: bound_args.clone(),
-                    builtin_name: metadata.name,
-                    builtin_length: metadata.length,
-                    name_property: BoundFunctionMetadataProperty::Builtin,
-                    length_property: BoundFunctionMetadataProperty::Builtin,
-                    own_properties,
-                    prototype_override: None,
-                },
-                &mut visit,
-            )?,
-        })
-    }
-
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
     pub(crate) fn raw(&self) -> RawGc {
@@ -250,7 +170,16 @@ impl BoundFunction {
     #[must_use]
     pub fn parts(&self, heap: &otter_gc::GcHeap) -> (Value, Value, SmallVec<[Value; 4]>) {
         heap.read_payload(self.inner, |body| {
-            (body.target, body.bound_this, body.bound_args.clone())
+            let args =
+                crate::value_slab::body_of(body.bound_args).map_or_else(SmallVec::new, |slab| {
+                    // SAFETY: the bound function retains this slab, and the
+                    // immutable initialized prefix stays live for this read.
+                    let slab = unsafe { &*slab };
+                    SmallVec::from_slice(unsafe {
+                        std::slice::from_raw_parts(slab.values_ptr(), slab.len())
+                    })
+                });
+            (body.target, body.bound_this, args)
         })
     }
 
@@ -258,5 +187,57 @@ impl BoundFunction {
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = self as *const BoundFunction as *mut RawGc;
         visitor(p);
+    }
+}
+
+impl Interpreter {
+    /// Allocate the fixed-layout bound callable with every input scoped across
+    /// property-bag, argument-slab and callable-body allocations.
+    pub(crate) fn alloc_bound_function(
+        &mut self,
+        target: Value,
+        bound_this: Value,
+        bound_args: &[Value],
+        metadata: function_metadata::BoundFunctionCreateMetadata,
+        prototype: Option<Value>,
+    ) -> Result<BoundFunction, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let target = interp.scoped_value(scope, target);
+            let receiver = interp.scoped_value(scope, bound_this);
+            let prototype = prototype.map(|value| interp.scoped_value(scope, value));
+            let args: Vec<_> = bound_args
+                .iter()
+                .copied()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+            let default_prototype = interp.function_prototype_object().ok().map(Value::object);
+            let prototype =
+                prototype.filter(|value| Some(interp.escape_scoped(*value)) != default_prototype);
+            let own_properties =
+                object::alloc_dictionary_object_with_roots(&mut interp.gc_heap, &mut |_| {})?;
+            let own_properties = interp.scoped_value(scope, Value::object(own_properties));
+            let mut values: Vec<_> = args.iter().map(|arg| interp.escape_scoped(*arg)).collect();
+            let bound_args =
+                crate::value_slab::slab_from_values(&mut interp.gc_heap, &mut values, &mut |_| {})?;
+            let body = BoundFunctionBody {
+                target: interp.escape_scoped(target),
+                bound_this: interp.escape_scoped(receiver),
+                bound_args,
+                builtin_name: metadata.name,
+                builtin_length: metadata.length,
+                name_property: BoundFunctionMetadataProperty::Builtin,
+                length_property: BoundFunctionMetadataProperty::Builtin,
+                own_properties: interp
+                    .escape_scoped(own_properties)
+                    .as_object()
+                    .expect("bound callable property bag"),
+                prototype_override: prototype.map(|value| interp.escape_scoped(value)),
+            };
+            // The allocator traces the pending body, including its slab handle,
+            // before publishing it. No allocation separates slab and body setup.
+            Ok(BoundFunction {
+                inner: interp.gc_heap.alloc(body)?,
+            })
+        })
     }
 }

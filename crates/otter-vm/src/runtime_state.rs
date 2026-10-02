@@ -106,11 +106,6 @@ impl<'a> RuntimeState<'a> {
         for value in interp.bigint_constants_for_trace() {
             value.trace_value_slots(visitor);
         }
-        // Prepared native-loop callbacks cache resolved closure metadata between
-        // repeated invocations; every cached slot must move with the heap.
-        for root in interp.lean_callback_roots_for_trace() {
-            root.trace_slots(visitor);
-        }
         // 2b-quater) Shared scope-handle arena — native value-building and
         // serializer scratch roots.
         // Every collection that can run while a native call holds handles must
@@ -185,10 +180,10 @@ impl<'a> RuntimeState<'a> {
         // 8) Pending throw side-channels retain arbitrary JS values. They are
         //    roots even while no frame or job queue references the thrown
         //    value, and a moving collection must rewrite their slots in place.
-        if let Some(value) = interp.pending_generator_throw_for_trace() {
+        if let Some(value) = interp.pending_uncaught_throw_for_trace() {
             value.trace_value_slots(visitor);
         }
-        if let Some(value) = interp.pending_uncaught_throw_for_trace() {
+        if let Some(value) = interp.completed_activation_result_for_trace() {
             value.trace_value_slots(visitor);
         }
         // 8a) The async context is reachable only from here between jobs, and a
@@ -204,23 +199,8 @@ impl<'a> RuntimeState<'a> {
         // 8c) Promise-rejection tracker: rejected promises awaiting the
         //     unhandled-rejection checkpoint are roots until reported.
         interp.rejection_tracker_for_trace().trace(visitor);
-        // 9) Active call frames are NOT enumerated here. The
-        //    frame stack lives on the call stack of
-        //    `Interpreter::run_inner` (`ActivationStack`),
-        //    not on the [`Interpreter`] struct itself, so an
-        //    out-of-band GC triggered through `RuntimeState`
-        //    has no frame stack to walk. When the interpreter
-        //    starts triggering GCs from inside alloc paths
-        //    (task 76+), it will pass an additional
-        //    `external_visit` closure to
-        //    `GcHeap::collect_full` that walks the live
-        //    `&mut ActivationStack` directly. This
-        //    `RuntimeState` walker stays as-is.
-        // 9b) The flat JIT register stack DOES live on the `Interpreter`
-        //    struct, so its in-flight callee windows are traced here.
-        interp.trace_reg_stack(visitor);
-        // 9c) Native JIT contexts keep SELF/`this` in ABI scalar fields on the
-        // native stack. Their VM-owned descriptors expose those precise slots.
+        // Native activation windows, actuals and frame fields share one
+        // published chain across interpreter and compiled execution.
         interp.trace_native_jit_activations(visitor);
     }
 }

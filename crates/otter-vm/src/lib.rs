@@ -194,6 +194,7 @@ pub mod object_statics;
 mod operand_decode;
 pub mod pelt;
 pub mod persistent_roots;
+mod prepared_call;
 pub mod promise;
 pub mod promise_dispatch;
 mod promise_ops;
@@ -208,7 +209,7 @@ pub mod reflect;
 pub mod regexp;
 pub(crate) mod regexp_legacy;
 pub mod regexp_prototype;
-mod register_stack;
+mod register_window;
 pub mod root_census;
 #[doc(hidden)]
 pub mod rooting;
@@ -246,13 +247,13 @@ mod gc_invariants;
 #[cfg(test)]
 mod test_support;
 
-pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef, ActiveFrameStorage};
+pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef};
 pub use arithmetic_dispatch::NumericRuntimeOp;
 pub use code_space::BytecodeLinkError;
 pub use cpu_profile::CpuProfile;
 pub use execution_context::{CallFeedbackStats, ExecutionContext};
 pub use frame_state::{
-    AsyncFrameState, Frame, PendingBindFunction, PendingBindStage, PendingGetIterator,
+    AsyncFrameState, PendingBindFunction, PendingBindStage, PendingGetIterator,
     PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,
 };
 pub use jit_exception_ops::JitExceptionOutcome;
@@ -279,7 +280,6 @@ pub use executable::code_block_cfg::{
 };
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
 use operand_decode::{apply_branch, const_operand, register_operand};
-pub(crate) use stack_snapshot::snapshot_frames;
 
 pub use activation_stack::{ActivationFloor, ActivationStack};
 pub use array::JsArray;
@@ -300,11 +300,11 @@ pub use jit::{
     JitCodeGenerationSnapshot, JitCodeResidency, JitCollectionLayout, JitCompileError,
     JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitDirectCallKind,
     JitDirectCallThisMode, JitDirectCallee, JitElementAccess, JitElementBase, JitElementFamily,
-    JitElementRepr, JitExecOutcome, JitFunctionCallLookup, JitFunctionCode,
-    JitFunctionPrototypeCall, JitFunctionPrototypeCallSite, JitGuardWidth, JitGuardedMethodCall,
-    JitGuardedReceiver, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitMapTableLayout, JitMethodHolder, JitParameterWidening, JitRuntimeStubBinding,
-    JitStaticNativeCall, JitStringLayout, VmRuntimeActivation,
+    JitElementRepr, JitFunctionCallLookup, JitFunctionCode, JitFunctionPrototypeCall,
+    JitFunctionPrototypeCallSite, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
+    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitMapTableLayout, JitMethodHolder,
+    JitParameterWidening, JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout,
+    VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,
@@ -324,6 +324,7 @@ pub use js_surface::{
     PropertySpec,
 };
 pub use microtask::{Microtask, MicrotaskKind, MicrotaskQueue};
+pub use native_abi::Frame;
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
     native_value, native_value_static, native_value_with_captures,
@@ -331,12 +332,13 @@ pub use native_function::{
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
 pub use persistent_roots::{PersistentRootId, PersistentRoots};
+pub(crate) use prepared_call::PreparedCall;
 pub use promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseReaction, PromiseSettleJobs,
     PromiseState, PromiseThenOutcome, PurePromise, ReactionKind,
 };
 pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
-pub use register_stack::RegisterWindow;
+pub use register_window::RegisterWindow;
 pub use string::{JsString, MAX_ROPE_DEPTH};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
@@ -593,8 +595,6 @@ pub struct JitRuntimeStats {
     /// Generated callers invalidated because a callee generation changed.
     /// Stable function entry cells keep this at zero for tier publication.
     pub caller_invalidations: u64,
-    /// Stable function-entry probes that had to enter the cold resolver.
-    pub cold_entry_resolver_misses: u64,
     /// Call-family transitions from generated code into Rust completion paths.
     pub jit_to_rust_call_transitions: u64,
     /// Generated template-tier callee entries.
@@ -603,23 +603,16 @@ pub struct JitRuntimeStats {
     pub generated_template_returns: u64,
     /// Generated template-tier callees that cold-deoptimized.
     pub generated_template_deopts: u64,
-    /// Generated template-tier callees that propagated a throw.
-    pub generated_template_throws: u64,
     /// Generated optimizing-tier callee entries.
     pub generated_optimizing_entries: u64,
     /// Generated optimizing-tier callees that returned normally.
     pub generated_optimizing_returns: u64,
     /// Generated optimizing-tier callees that cold-deoptimized.
     pub generated_optimizing_deopts: u64,
-    /// Generated optimizing-tier callees that propagated a throw.
-    pub generated_optimizing_throws: u64,
     /// Function-entry compile attempts across native tiers.
     pub compile_attempts: u64,
     /// Successfully installed native code generations across tiers.
     pub code_generations: u64,
-    /// Successful hot baseline generations rebuilt once after call feedback and
-    /// callee entry generations have had time to mature.
-    pub feedback_refreshes: u64,
     /// Loop-OSR compile/entry attempts at threshold crossings.
     pub osr_attempts: u64,
     /// JIT property/method/element/global/context runtime stub calls.
@@ -838,7 +831,6 @@ pub struct Interpreter {
     /// pushes the exact callable and scalar closure state, release pops it.
     /// Runtime root tracing reaches the callback's context through the
     /// callable itself.
-    lean_callback_roots: Vec<call_ops::LeanCallbackRoot>,
     /// Owned dynamic payload for the most recently raised [`VmError`]. The
     /// error itself is `Copy` (no drop glue on the hot `Result` chain); its
     /// message / name / structured payload is stashed here by the raising
@@ -997,8 +989,6 @@ pub struct Interpreter {
     /// Published compiler-generated frames temporarily mirrored by cold
     /// interpreter materialization. Logical-depth reads subtract this transfer
     /// count from the innermost frame's depth. Each (native address,
-    /// materialized index) also identifies the same frame during stack capture.
-    jit_materialized_generated_calls: Vec<(usize, usize)>,
     /// Whether synchronous `Atomics.wait` may block this isolate's host thread.
     allow_blocking_atomics_wait: bool,
     /// Per-interpreter microtask queue. Plain field — accessed
@@ -1134,20 +1124,6 @@ pub struct Interpreter {
     /// hand-off, then interprets anyway. The cost policy evicts only after the
     /// measured loss repays compilation and executable-memory cost.
     jit_entry_bail_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// Function ids whose one-shot successful-baseline refresh has been
-    /// attempted. Unlike bail-driven recompilation, this refresh waits for hot
-    /// call feedback and callee entry generations to mature, then rebuilds the
-    /// caller even when its original generation never failed.
-    jit_feedback_refresh_attempted: rustc_hash::FxHashSet<u32>,
-    /// Entry-generation targets that were semantically eligible but not yet
-    /// installed when a baseline caller last compiled. The successful refresh
-    /// waits until every recorded target is live instead of blindly rebuilding
-    /// leaf functions or publishing another partial caller.
-    jit_pending_direct_targets: rustc_hash::FxHashMap<u32, rustc_hash::FxHashSet<u32>>,
-    /// `(caller, target)` pairs a back-edge relink already linked. Each pair
-    /// relinks at most once, which bounds rebuilds without blocking a site
-    /// that turns hot after an earlier relink of the same caller.
-    jit_relinked_direct_targets: rustc_hash::FxHashSet<(u32, u32)>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,
@@ -1236,8 +1212,6 @@ pub struct Interpreter {
     /// direct call by bumping `reg_top`, writing the callee's window into
     /// `reg_stack[reg_top..reg_top+regcount]`, and running the callee — no Rust
     /// VM-owned native register arena. Its published prefix is a precise GC
-    /// root set for in-flight compiled call windows.
-    register_stack: register_stack::RegisterStack,
     /// Innermost-frame cell of the live compiled entry (its
     /// `JitCtx::native_frame`), or `None` while no compiled entry runs.
     /// Generated linkage keeps the cell current; the frame chain hangs off it.
@@ -1305,16 +1279,6 @@ pub struct Interpreter {
     /// can opt out of dynamic code.
     #[allow(clippy::type_complexity)]
     eval_hook: Option<EvalHook>,
-    /// Side-channel for an unhandled JS-level throw originating
-    /// inside a generator body that resumed via
-    /// [`Self::resume_generator`]. The unwind machinery on the
-    /// generator's sub-stack converts the throw into
-    /// [`VmError::Uncaught`] (which loses the original `Value`); we
-    /// preserve the original here so the calling
-    /// [`Op::CallMethodValue`] arm can re-throw it on the outer
-    /// stack and let user-level `try` / `catch` observe the right
-    /// payload.
-    pending_generator_throw: Option<Value>,
     /// Side-channel for an unhandled JS-level throw escaping a
     /// synchronous sub-dispatch such as a Proxy trap or callback
     /// invoked via [`Self::run_callable_sync`]. The sub-stack can
@@ -1322,6 +1286,10 @@ pub struct Interpreter {
     /// original thrown value is preserved here until the outer
     /// dispatch loop re-throws it on the still-live caller stack.
     pending_uncaught_throw: Option<Value>,
+    /// Completion of an async activation whose throw was absorbed into its
+    /// result promise: that promise, delivered by the dispatch loop when the
+    /// activation leaves. A collector root.
+    completed_activation_result: Option<Value>,
     /// Whether the throw now escaping came from reporting a rejected promise
     /// nobody handled. Node names that origin `'unhandledRejection'` when it
     /// offers the throw to `process`, and the host reads this to tell the two
@@ -1670,13 +1638,6 @@ impl Interpreter {
     #[cfg(test)]
     fn bigint_constant_cache_len_for_test(&self) -> usize {
         self.bigint_constant_cache.len()
-    }
-
-    /// Root-tracing view of prepared lean callback state.
-    pub(crate) fn lean_callback_roots_for_trace(
-        &self,
-    ) -> impl Iterator<Item = &call_ops::LeanCallbackRoot> {
-        self.lean_callback_roots.iter()
     }
 
     /// Trace every live scope-handle slot as a GC root. Called from the runtime

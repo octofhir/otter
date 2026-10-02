@@ -156,6 +156,11 @@ impl ExecutionContext {
         self.function_base
     }
 
+    /// Exclusive end of this linked chunk's verified function range.
+    pub(crate) fn function_end(&self) -> u32 {
+        self.function_base + self.payload.module.functions.len() as u32
+    }
+
     /// Stable cache key prefix for constant-pool values owned by this linked
     /// chunk. Separately linked standalone modules can both start at function
     /// id zero, so constant caches must key by the shared module allocation

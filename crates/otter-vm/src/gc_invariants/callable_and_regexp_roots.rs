@@ -7,9 +7,7 @@ use crate::object::OBJECT_BODY_TYPE_TAG;
 use crate::regexp::REGEXP_BODY_TYPE_TAG;
 use crate::rooting::RootScopeExt;
 use crate::test_support::native_function_captures;
-use crate::{
-    BOUND_FUNCTION_BODY_TYPE_TAG, BoundFunction, Interpreter, Value, native_value_with_captures,
-};
+use crate::{BOUND_FUNCTION_BODY_TYPE_TAG, Interpreter, Value, native_value_with_captures};
 
 fn live_bytes(interp: &mut Interpreter, tag: u8) -> usize {
     interp.gc_heap_mut().gc_stats().by_type[tag as usize].live_bytes
@@ -40,7 +38,7 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
         Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this"));
     arg = Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("arg"));
     bound = Value::bound_function(
-        BoundFunction::new(interp.gc_heap_mut(), target, bound_this, smallvec![arg])
+        crate::test_support::alloc_bound_function(&mut interp, target, bound_this, &[arg])
             .expect("bound function"),
     );
 
@@ -154,11 +152,11 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
 
     let mut bound_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
-    let bound = BoundFunction::new(
-        interp.gc_heap_mut(),
+    let bound = crate::test_support::alloc_bound_function(
+        &mut interp,
         Value::object(bound_object),
         Value::object(bound_object),
-        smallvec![Value::object(bound_object)],
+        &[Value::object(bound_object)],
     )
     .expect("bound");
     crate::object::set(

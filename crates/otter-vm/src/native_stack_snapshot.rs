@@ -1,127 +1,98 @@
-//! Stack diagnostics across generated calls and interpreter reentry.
+//! Source diagnostics from the one published JavaScript caller chain.
 //!
 //! # Contents
-//! - Merging published native frames with their materialized activation owners.
-//! - Resolving source locations through the shared borrowed snapshot resolver.
+//! - Physical frame traversal and exact compiled source positions.
+//! - Virtual inline parents from code-owned safepoint recipes.
 //!
 //! # Invariants
-//! - Native PCs already identify the call or throw instruction; only suspended
-//!   interpreter PCs need the usual one-instruction adjustment.
-//! - Cold materialization supplies exact identity, never a function-name guess.
-//! - An OSR frame updates its materialized owner instead of duplicating it.
-//! - A frame making a generated call, or a committed runtime call with a
-//!   virtual recipe, reports its call site's recorded PC, followed by the
-//!   inline parents that call site's recipe describes; the parents have no
-//!   frames.
-//! - The walk reads scalar metadata only, neither collecting nor invoking JS.
+//! Each physical JavaScript activation is visited once; host frames carry no
+//! source position and are skipped. Compiled PCs identify the current
+//! source operation; suspended interpreter callers need a one-instruction
+//! adjustment. Inline parents have recipes rather than physical frames. The
+//! walk reads scalar metadata without allocation in the GC heap or JS reentry.
 //!
 //! # See also
-//! - [`crate::stack_snapshot`] — source resolution shared with interpreter views.
-//! - [`crate::Interpreter::jit_native_frames`] — the published frame chain.
+//! - [`crate::stack_snapshot`] for source resolution.
+//! - [`crate::Interpreter::jit_native_frames`] for the published chain.
 
-use crate::native_abi::NativeFrameFlags;
-use crate::{ActivationStack, ExecutionContext, Interpreter, StackFrameSnapshot};
+use crate::stack_snapshot::StackFrameSnapshotView;
+use crate::{ExecutionContext, Interpreter, StackFrameSnapshot};
 
 impl Interpreter {
     pub(crate) fn snapshot_active_frames(
         &self,
         context: &ExecutionContext,
-        stack: &ActivationStack,
         limit: usize,
     ) -> Vec<StackFrameSnapshot> {
-        let mut natives: Vec<_> = self.jit_native_frames().collect();
+        let mut result = Vec::new();
+        self.visit_active_frame_snapshots(context, limit, |frame| {
+            result.push(StackFrameSnapshot {
+                function_id: frame.function_id,
+                function_name: frame.function_name.to_owned(),
+                module: frame.module.to_owned(),
+                span: frame.span,
+            });
+            true
+        });
+        result
+    }
+
+    pub(crate) fn visit_active_frame_snapshots(
+        &self,
+        context: &ExecutionContext,
+        limit: usize,
+        mut visit: impl FnMut(StackFrameSnapshotView<'_>) -> bool,
+    ) {
+        // Host frames are physical boundaries for host bodies, not source
+        // activations.
+        let mut natives: Vec<_> = self
+            .jit_native_frames()
+            .filter(|&frame| {
+                // SAFETY: the published chain remains live for this walk.
+                let kind = unsafe { (*frame).header.kind };
+                kind != crate::native_abi::NativeFrameKind::Host
+            })
+            .collect();
         natives.reverse();
-        let mut sites = Vec::with_capacity(stack.len() + natives.len());
-        let mut owners = vec![None; stack.len()];
-        let mut cursor = 0;
+        let mut sites = Vec::with_capacity(natives.len());
         let native_count = natives.len();
         for (position, address) in natives.into_iter().enumerate() {
-            // SAFETY: publication keeps this header live through the complete
-            // metadata-only walk. No managed window is borrowed or dereferenced.
+            // SAFETY: the published chain remains live throughout this
+            // metadata-only walk.
             let native = unsafe { &*address };
-            // A frame with an inner native frame is making a generated call,
-            // and the innermost frame may be making a runtime call whose
-            // recipe is virtual: either call site names the call's PC and any
-            // inline parents.
             let call = self
                 .generated_call_record(native)
-                .filter(|record| position + 1 < native_count || record.inline_frames_virtual);
-            let native_pc = call
+                .filter(|record| position + 1 < native_count || !record.inline_frames.is_empty());
+            let pc = call
                 .map(|record| record.call_pc)
                 .filter(|&pc| pc != crate::native_abi::NO_CALL_PC)
                 .unwrap_or(native.header.pc);
-            let transferred =
-                self.jit_materialized_generated_calls
-                    .iter()
-                    .find_map(|&(materialized, index)| {
-                        (materialized == address as usize).then_some(index)
-                    });
-            let owner = transferred.or_else(|| {
-                (!native
-                    .header
-                    .flags
-                    .contains(NativeFrameFlags::STACK_REGISTERS))
-                .then(|| {
-                    stack.iter().position(|frame| {
-                        frame.function_id == native.header.function_id
-                            && frame.registers.as_ptr() as u64 == native.register_base
-                    })
-                })
-                .flatten()
-            });
-            if let Some(index) = owner.filter(|&index| index < stack.len()) {
-                while cursor < index {
-                    owners[cursor] = Some(sites.len());
-                    let frame = &stack[cursor];
-                    sites.push((frame.function_id, frame.pc, false));
-                    cursor += 1;
-                }
-                let site = if transferred.is_some() {
-                    let frame = &stack[index];
-                    (frame.function_id, frame.pc, false)
-                } else {
-                    (native.header.function_id, native_pc, true)
-                };
-                if let Some(position) = owners[index] {
-                    sites[position] = site;
-                } else {
-                    owners[index] = Some(sites.len());
-                    sites.push(site);
-                }
-                cursor = cursor.max(index + 1);
-            } else {
-                sites.push((native.header.function_id, native_pc, true));
-            }
-            if let Some(record) = call.filter(|record| record.inline_frames_virtual) {
+            let exact = native.header.kind != crate::native_abi::NativeFrameKind::Interpreter;
+            sites.push((native.header.function_id, pc, exact));
+            if let Some(record) = call.filter(|record| !record.inline_frames.is_empty()) {
                 push_virtual_inline_sites(context, record, &mut sites);
             }
         }
-        for frame in stack.iter().skip(cursor) {
-            sites.push((frame.function_id, frame.pc, false));
-        }
-        let mut result = Vec::with_capacity(sites.len().min(limit));
         for (depth, (function, pc, exact)) in sites.into_iter().rev().take(limit).enumerate() {
             let pc = if exact || depth == 0 {
                 pc
             } else {
                 pc.saturating_sub(1)
             };
-            crate::stack_snapshot::visit_frame_snapshot(context, function, pc as usize, |frame| {
-                result.push(StackFrameSnapshot {
-                    function_id: frame.function_id,
-                    function_name: frame.function_name.to_owned(),
-                    module: frame.module.to_owned(),
-                    span: frame.span,
-                });
-                true
-            });
+            if !crate::stack_snapshot::visit_frame_snapshot(
+                context,
+                function,
+                pc as usize,
+                &mut visit,
+            ) {
+                break;
+            }
         }
-        result
     }
 
     fn generated_call_record(
         &self,
-        native: &crate::native_abi::NativeFrame,
+        native: &crate::native_abi::Frame,
     ) -> Option<&crate::native_abi::SafepointRecord> {
         if native.call_site == crate::native_abi::NO_SAFEPOINT {
             return None;
@@ -137,7 +108,10 @@ fn push_virtual_inline_sites(
     sites: &mut Vec<(u32, u32, bool)>,
 ) {
     for frame in &record.inline_frames {
-        let Some(function) = context.exec_function(frame.function_id) else {
+        let Ok(owner) = context.for_function(frame.function_id) else {
+            continue;
+        };
+        let Some(function) = owner.exec_function(frame.function_id) else {
             continue;
         };
         if let Some(pc) = (0..function.code.len())

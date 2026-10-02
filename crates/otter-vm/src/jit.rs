@@ -67,6 +67,9 @@ use serde::Serialize;
 
 pub use crate::property_cache::jit::{JitPropertyLookupCache, JitStoreTransitionCache};
 
+mod native_callable;
+pub use native_callable::JitNativeCallLayout;
+
 /// Opaque collector-owned nursery window carried by the compiled-entry ABI.
 pub type JitMachineAllocationWindow = otter_gc::MachineAllocationWindow;
 /// Largest context (slots plus extension word) generated code carves inline;
@@ -228,7 +231,7 @@ use crate::{
     CodeBlock, CodeBlockInstruction,
     feedback::ArithFeedback,
     native_abi::{
-        CodeDependency, CodeLifetimeState, NativeFrameKind, NativeResultPair, SafepointId,
+        CodeDependency, CodeLifetimeState, NativeFrameKind, NativeResultStatus, SafepointId,
         SafepointRecord,
     },
 };
@@ -694,10 +697,8 @@ pub struct JitCompileSnapshot {
     /// Ready-to-use byte offsets and type tags for baseline collection method
     /// IC guards.
     pub collection_layout: JitCollectionLayout,
-    /// Byte offset from a decompressed native-function pointer to its
-    /// machine-readable static builtin identity: a `u32` index into the
-    /// isolate's external-reference table, not an entry address.
-    pub native_ref_byte: u32,
+    /// Complete native callable header and traced capture-slab offsets.
+    pub native_call_layout: JitNativeCallLayout,
     /// Instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
     /// Direct reads of permanent global-lexical cells keyed by the
@@ -1368,22 +1369,15 @@ pub struct JitDirectCallPlan {
     /// Whether the target enters with an uninitialized `this` binding and
     /// applies derived-constructor return semantics.
     pub is_derived_constructor: bool,
-    /// Persistent machine-stack bytes reserved by the target after native
-    /// entry, when that tier can safely cold-deopt from a stack-owned caller.
-    ///
-    /// `None` rejects compiler-generated stack linkage for this generation.
-    /// Existing VM-owned call paths may still enter it through their own
-    /// materialized-frame contract.
-    pub generated_stack_frame_bytes: Option<u32>,
+    /// The target's `FUNCTION_CALL_*` call semantics.
+    pub call_flags: u32,
     /// Number of formal parameter registers.
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
-    /// The body materializes an `arguments` object, so the generated caller
-    /// must publish every actual argument after the callee's register window
-    /// and flag the frame with
-    /// [`crate::native_abi::NativeFrameFlags::INCOMING_ARGUMENTS`].
-    pub needs_incoming_arguments: bool,
+    /// Address of the site's callee identity cell: the last callee value
+    /// proved to be this target. Zero when the site has none.
+    pub callee_cell: u64,
 }
 
 /// One baked compiler-native target in an ordinary-call candidate population.
@@ -1882,7 +1876,7 @@ impl JitCompileSnapshot {
             global_lexical_value_byte: 0,
             context_layout: JitContextLayout::current(),
             collection_layout: JitCollectionLayout::default(),
-            native_ref_byte: 0,
+            native_call_layout: JitNativeCallLayout::default(),
             instructions,
             global_lexical_loads: rustc_hash::FxHashMap::default(),
             string_constant_cells: rustc_hash::FxHashMap::default(),
@@ -2116,8 +2110,6 @@ pub struct VmRuntimeActivation {
     pub(crate) stack: *mut crate::ActivationStack,
     /// Linked execution context.
     pub(crate) context: *const crate::ExecutionContext,
-    /// Index of the executing (compiled) frame within `stack`.
-    frame_index: usize,
 }
 
 impl VmRuntimeActivation {
@@ -2126,14 +2118,8 @@ impl VmRuntimeActivation {
         vm: &mut crate::Interpreter,
         stack: &mut crate::ActivationStack,
         context: &crate::ExecutionContext,
-        frame_index: usize,
     ) -> Self {
-        Self {
-            vm,
-            stack,
-            context,
-            frame_index,
-        }
+        Self { vm, stack, context }
     }
 
     /// Owning interpreter address. Dereferencing requires the activation's
@@ -2149,125 +2135,28 @@ impl VmRuntimeActivation {
         self.stack
     }
 
-    /// Linked execution-context address.
-    #[must_use]
-    pub const fn context_ptr(self) -> *const crate::ExecutionContext {
-        self.context
-    }
-
-    /// Executing frame index.
-    #[must_use]
-    pub const fn frame_index(&self) -> usize {
-        self.frame_index
-    }
-
-    /// Complete generated execution through the VM-owned post-entry boundary.
-    ///
-    /// This notes exact generated-call feedback, defers all cold work while a
-    /// parent native activation remains published, and at the outer boundary
-    /// returns the sole result carrier with any validated boxed Return/Throw
-    /// payload rewritten by the collector. The JIT never observes a temporary
-    /// root index or token.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::VmError::InvalidOperand`] when the activation no longer
-    /// names its live interpreter or execution context.
-    #[doc(hidden)]
-    pub fn finish_compiled_entry(
-        &self,
-        result: NativeResultPair,
-        feedback_dirty: bool,
-    ) -> Result<NativeResultPair, crate::VmError> {
-        // SAFETY: `VmRuntimeActivation::new` stores frozen pointers for exactly
-        // this compiled-entry transaction; the JIT calls this only after its
-        // own native frame has been unpublished and before returning control.
-        let vm = unsafe { self.vm.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        // SAFETY: same dynamic activation contract; the immutable context
-        // outlives generated execution and the post-entry transaction.
-        let context = unsafe { self.context.as_ref() }.ok_or(crate::VmError::InvalidOperand)?;
-        vm.finish_compiled_entry_transaction(context, result, feedback_dirty)
-    }
-
-    /// Mirror non-lexical materialized call state into a fresh native frame.
-    ///
-    /// This is the sole materialized-entry bridge. The activation stores no
-    /// tagged or compressed GC handles: it re-reads the materialized frame's
-    /// cold call state immediately before the caller publishes `native_frame`.
-    /// The arguments identity flows back through
-    /// [`Self::with_native_frame_extent`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::VmError::InvalidOperand`] when the frozen activation
-    /// pointers or function identity do not match the destination frame.
-    #[doc(hidden)]
-    pub fn initialize_native_frame_state(
-        &self,
-        native_frame: &mut crate::native_abi::NativeFrame,
-    ) -> Result<(), crate::VmError> {
-        // SAFETY: `VmRuntimeActivation::new` stores live, frozen VM and stack
-        // pointers for this entry transaction.
-        let vm = unsafe { self.vm.as_ref() }.ok_or(crate::VmError::InvalidOperand)?;
-        let stack = unsafe { self.stack.as_ref() }.ok_or(crate::VmError::InvalidOperand)?;
-        let frame = stack
-            .get(self.frame_index)
-            .ok_or(crate::VmError::InvalidOperand)?;
-        if frame.header.function_id != native_frame.header.function_id {
-            return Err(crate::VmError::InvalidOperand);
-        }
-        if let Some(cold) = vm.frame_cold(frame) {
-            native_frame.set_new_target(cold.new_target.unwrap_or_else(crate::Value::undefined));
-            native_frame
-                .set_arguments_object(cold.arguments_object.and_then(|value| value.as_object()));
-            if cold.is_derived_constructor {
-                native_frame.set_derived_constructor();
-            }
-        }
-        Ok(())
-    }
-
-    /// Run one compiled dynamic extent over the native frame published for
-    /// this materialized activation, then write back the arguments identity
-    /// generated code materialized into the native frame.
+    /// Execution context that owns `function_id`. Chunk-local constants,
+    /// code and resolutions of a published frame resolve through its owner,
+    /// never through the entry's ambient context, which may name another chunk.
     ///
     /// # Safety
-    ///
-    /// `native_frame` must be the live frame just published for this exact
-    /// activation. `operation` may access it only through the generated-code
-    /// ABI and must return before the stack frame or native record is reclaimed.
+    /// The activation's context must remain live for this call.
+    #[must_use]
+    pub unsafe fn owner_context(self, function_id: u32) -> Option<crate::ExecutionContext> {
+        // SAFETY: forwarded from the caller's liveness contract.
+        let ambient = unsafe { self.context.as_ref() }?;
+        ambient
+            .for_function(function_id)
+            .ok()
+            .map(|owner| (*owner).clone())
+    }
+
+    /// Current VM-owned execution context for this dynamic entry.
+    /// Dereferencing requires the activation's exclusive-mutator contract.
     #[doc(hidden)]
-    pub unsafe fn with_native_frame_extent<T>(
-        &self,
-        native_frame: *mut crate::native_abi::NativeFrame,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, crate::VmError> {
-        let stack = unsafe { self.stack.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        let frame = stack
-            .get_mut(self.frame_index)
-            .ok_or(crate::VmError::InvalidOperand)?;
-        let native = unsafe { native_frame.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        if frame.header.function_id != native.header.function_id {
-            return Err(crate::VmError::InvalidOperand);
-        }
-
-        let result = operation();
-
-        // Re-resolve both owners after generated execution: nested calls and
-        // deopt continuations may grow the ActivationStack backing vector.
-        let stack = unsafe { self.stack.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        let frame = stack
-            .get_mut(self.frame_index)
-            .ok_or(crate::VmError::InvalidOperand)?;
-        let native = unsafe { native_frame.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-        if frame.header.function_id != native.header.function_id {
-            return Err(crate::VmError::InvalidOperand);
-        }
-        if let Some(object) = native.arguments_object() {
-            let vm = unsafe { self.vm.as_mut() }.ok_or(crate::VmError::InvalidOperand)?;
-            vm.frame_ensure_cold(frame).arguments_object = Some(crate::Value::object(object));
-        }
-        Ok(result)
+    pub fn execution_context_ptr(&self) -> *mut crate::native_abi::JitCtx {
+        unsafe { self.stack.as_ref() }
+            .map_or(std::ptr::null_mut(), |stack| stack.execution_context())
     }
 
     #[cfg(test)]
@@ -2276,39 +2165,15 @@ impl VmRuntimeActivation {
             vm,
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),
-            frame_index: 0,
         }
     }
 }
 
-const _: [(); 32] = [(); std::mem::size_of::<VmRuntimeActivation>()];
+const _: [(); 24] = [(); std::mem::size_of::<VmRuntimeActivation>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmRuntimeActivation>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmRuntimeActivation, vm)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmRuntimeActivation, stack)];
 const _: [(); 16] = [(); std::mem::offset_of!(VmRuntimeActivation, context)];
-const _: [(); 24] = [(); std::mem::offset_of!(VmRuntimeActivation, frame_index)];
-
-/// Outcome of executing compiled code for one function entry.
-///
-/// The compiled body runs over the entry frame's register window — which the
-/// VM keeps rooted on its frame stack, so closure allocation and recursive
-/// calls inside the body are GC-safe. It either runs to a `Return` (carrying
-/// the completion Value), hits a typed guard it cannot honor and bails (the VM
-/// re-runs on the interpreter), or a re-entered VM call threw.
-#[derive(Debug)]
-pub enum JitExecOutcome {
-    /// `Return`/`ReturnValue` reached; carries the completion Value.
-    Returned(crate::Value),
-    /// A typed guard (or an unsupported opcode emitted as a bail) was hit; the
-    /// VM resumes the interpreter at the carried byte-PC — the exact
-    /// instruction, so committed side effects are preserved.
-    Bailed(crate::native_abi::SideExit),
-    /// A generated callee propagated one pure JavaScript exception value.
-    Throw(crate::Value),
-    /// A structural engine failure escaped generated code. The exception
-    /// payload channel is never used for this outcome.
-    Fatal(crate::run_control::VmError),
-}
 
 /// Per-site optimizing exit evidence and current-generation pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2334,27 +2199,12 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         NativeFrameKind::Baseline
     }
 
-    /// Exact persistent native-frame reservation for stack-owned generated
-    /// calls, or `None` when this code generation cannot safely cold-deopt
-    /// through that entry contract.
-    ///
-    /// The value excludes the caller-owned [`crate::native_abi::NativeFrame`]
-    /// and tagged register window: the shared emitter accounts those
-    /// separately. A tier must return `None` unless all of its bailout paths
-    /// can resume from a stack-owned activation.
-    fn generated_stack_frame_bytes(&self) -> Option<u32> {
+    /// Entry of this generation in the JavaScript call ABI, which builds,
+    /// publishes and retires the function's own frame; see
+    /// [`crate::native_abi::CodeEntryCell::entry_addr`]. `None` for a body
+    /// entered only over an interpreter frame.
+    fn call_entry_addr(&self) -> Option<usize> {
         None
-    }
-
-    /// Whether stack-owned generated calls may initially publish only the
-    /// initialized formal-parameter prefix of the tagged register window.
-    ///
-    /// A tier may opt in only when no GC, throw, safepoint, or VM transition
-    /// can observe the abbreviated window. Every cold exit must materialize
-    /// the remaining slots and publish the full register count before handing
-    /// the frame back to shared VM machinery.
-    fn generated_entry_uses_parameter_prefix(&self) -> bool {
-        false
     }
 
     /// Immutable isolate-state dependencies declared by this code object.
@@ -2387,7 +2237,8 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         false
     }
 
-    /// Raw function-entry address for emitted direct calls.
+    /// Entry continuing an already published interpreter frame at PC zero
+    /// (`JitEntry`): the function-entry tier transfer.
     ///
     /// The pointer is owned by this code object and remains valid while the
     /// object is installed in the VM JIT code table.
@@ -2411,61 +2262,25 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
-    /// Execute the compiled function for the frame at
-    /// `activation.frame_index`.
+    /// Address of the generated OSR entry for this logical loop header.
     ///
-    /// Compiled code reads/writes that frame's register window in place and,
-    /// for typed runtime operations, re-enters the VM through entries reached
-    /// through the activation published by [`crate::native_abi::VmThread`].
-    /// The window stays rooted on the VM frame
-    /// stack throughout, so allocation/calls in the body are GC-safe.
-    fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome;
-
-    /// Execute this object through the optimizing entry ABI.
-    ///
-    /// The default identifies baseline/template objects. Optimized code owns
-    /// the unsafe machine entry and uses the activation to publish the same
-    /// runtime-capable context and native frame as [`Self::run_entry`].
-    fn run_optimized_entry(&self, _activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
+    /// The common trampoline enters it over the published frame after the
+    /// interpreter has returned. The code object owns no execution stack.
+    fn osr_entry_addr(&self, _logical_pc: u32) -> Option<usize> {
         None
     }
 
-    /// Whether [`Self::run_optimized_osr_entry`] can enter the loop header
-    /// whose logical PC is `logical_pc`. Optimized code is compiled for at
-    /// most one OSR header (the one whose back-edge requested it); an entry
-    /// compile has none.
-    fn enters_optimized_osr_header(&self, _logical_pc: u32) -> bool {
-        false
+    /// Whether an optimizing generation can enter this loop header.
+    fn enters_optimized_osr_header(&self, logical_pc: u32) -> bool {
+        self.native_frame_kind() == NativeFrameKind::Optimizing
+            && self.osr_entry_addr(logical_pc).is_some()
     }
 
-    /// Enter optimizing code at one loop header from an interpreter frame.
+    /// Observe a validated compiled completion without VM allocation or reentry.
     ///
-    /// The default identifies baseline/template objects. Optimized code uses
-    /// the current interpreter register window to materialize its allocated
-    /// machine state before branching to the requested header.
-    fn run_optimized_osr_entry(
-        &self,
-        _activation: VmRuntimeActivation,
-        _logical_pc: u32,
-    ) -> Option<JitExecOutcome> {
-        None
-    }
-
-    /// Enter compiled code mid-function at the loop header whose logical PC is
-    /// `logical_pc` (on-stack replacement). Returns `None` when this code has no
-    /// OSR entry for that PC (the VM keeps interpreting).
-    ///
-    /// The baseline keeps every live value in the frame register array at each
-    /// instruction boundary, so a loop header is a valid resume point: the
-    /// interpreter's live registers are exactly what the compiled code reads.
-    /// The default returns `None` for codes that do not support OSR.
-    fn osr_entry(
-        &self,
-        _activation: VmRuntimeActivation,
-        _logical_pc: u32,
-    ) -> Option<JitExecOutcome> {
-        None
-    }
+    /// Cold compiler measurement uses this scalar notification; production
+    /// code objects require no completion bookkeeping here.
+    fn note_completion(&self, _status: NativeResultStatus) {}
 }
 
 /// On-demand snapshot of executable code retained by one interpreter.
@@ -2520,8 +2335,6 @@ pub struct JitCodeGenerationSnapshot {
     pub generated_returns: u64,
     /// Generated entries that cold-deoptimized.
     pub generated_deopts: u64,
-    /// Generated entries that propagated a throw.
-    pub generated_throws: u64,
     /// Exact validity dependencies while executable metadata remains
     /// registered; `None` denotes a retired tombstone.
     pub dependencies: Option<Vec<CodeDependency>>,
@@ -2668,9 +2481,9 @@ mod layout_tests {
     }
 
     #[test]
-    fn runtime_activation_is_only_the_four_word_owner_link() {
-        assert_eq!(std::mem::size_of::<VmRuntimeActivation>(), 32);
+    fn runtime_activation_contains_only_execution_services() {
+        assert_eq!(std::mem::size_of::<VmRuntimeActivation>(), 24);
         assert_eq!(std::mem::align_of::<VmRuntimeActivation>(), 8);
-        assert_eq!(std::mem::offset_of!(VmRuntimeActivation, frame_index), 24);
+        assert_eq!(std::mem::offset_of!(VmRuntimeActivation, context), 16);
     }
 }

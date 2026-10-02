@@ -6,6 +6,8 @@
 //! and compile-time glue.
 //!
 //! # Contents
+//! - [`call_trampoline`] — native-stack frame creation and call continuations.
+//! - [`call_thread`] — the shared execution context and callable entry ABI.
 //! - [`code_entry`] — stable per-generation native entry cells.
 //! - [`frame`] — VM thread and activation layouts.
 //! - [`dispatch`] — tier and runtime-stub result/status layouts.
@@ -23,6 +25,8 @@
 //! - [`crate::active_frame`] for tier-neutral semantic frame access.
 //! - [`crate::jit`] for the compiler service boundary.
 
+mod call_thread;
+mod call_trampoline;
 mod code_entry;
 mod dispatch;
 mod frame;
@@ -30,6 +34,8 @@ mod metadata;
 mod runtime_stubs;
 mod safepoints;
 
+pub use call_thread::*;
+pub use call_trampoline::*;
 pub use code_entry::*;
 pub use dispatch::*;
 pub use frame::*;

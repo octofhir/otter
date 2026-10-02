@@ -37,9 +37,6 @@
 //! - Nested call/construct dispatch appends above an `ActivationFloor` on the
 //!   current rooted stack; native boundary slots are collector-rewritten in
 //!   their original storage.
-//! - Lean callback state owns reusable frame storage, never a detached stack;
-//!   caller argument slots remain traced through allocating frame setup, and
-//!   the callback's owning code payload stays retained for the loop.
 //! - Cross-chunk call resolution caches owned contexts only for one dispatch
 //!   and invalidates them against the code-space publication epoch.
 //! - A freshly-started generator remains in a moving GC root through observable
@@ -62,15 +59,14 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    AsyncFrameState, CodeBlock, ExecutionContext, Frame, Interpreter, JsObject, NativeCallInfo,
-    NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    CodeBlock, ExecutionContext, Interpreter, JsObject, NativeCallInfo, NativeCtx, NativeFunction,
+    Value, VmError, VmGetOutcome, VmPropertyKey,
     argument_window::{ArgumentOperands, BytecodeArgumentWindow},
     executable::OperandView,
-    is_constructor_runtime, native_to_vm_error_with_stack,
+    native_to_vm_error_with_stack,
     operand_decode::register_operand,
-    promise_dispatch, read_register,
+    read_register,
     runtime_cx::NativeCallRoots,
-    write_register,
 };
 
 /// Mutable root state for synchronous JS re-entry before a callee frame owns
@@ -103,52 +99,6 @@ impl JsCallRootSlot {
         // SAFETY: the collector is the only writer while this callback runs;
         // all ordinary state operations are short and cannot trigger GC.
         unsafe { (&mut *self.0.get()).trace_value_slot_mut(visitor) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_construct_argument_layout_does_not_acquire_cold_record() {
-        let function = CodeBlock::jit_test_stub(0, 2, 1, &[]);
-        let mut interp = Interpreter::new();
-        let receiver = interp
-            .alloc_host_object_with_roots(&[], &[])
-            .expect("construct receiver");
-        let window = interp.alloc_reg_window(1).expect("register window");
-        let mut frame = Frame::for_code_block(
-            &function,
-            None,
-            Value::function(0),
-            Value::object(receiver),
-            window,
-        );
-        let live_before = interp.cold_frames().live_len();
-
-        let error = interp
-            .bind_construct_arguments_and_publish_cold(
-                &function,
-                &mut frame,
-                smallvec::smallvec![Value::number_i32(1), Value::number_i32(2)],
-                false,
-                Some(receiver),
-                Value::function(0),
-            )
-            .expect_err("invalid register layout must fail");
-
-        assert!(matches!(error, VmError::InvalidOperand));
-        assert!(
-            frame.cold.is_none(),
-            "failed unpublished frame must not own a cold record"
-        );
-        assert_eq!(
-            interp.cold_frames().live_len(),
-            live_before,
-            "invalid construct metadata must not leak a cold-frame slot"
-        );
-        interp.reclaim_registers(&mut frame);
     }
 }
 
@@ -226,22 +176,6 @@ impl SyncJsCallRoots {
         unsafe { *self.args.get() = args };
     }
 
-    fn prepend_args(&self, prefix: &[Value]) {
-        if prefix.is_empty() {
-            return;
-        }
-        // SAFETY: this is one Rust-only mutation on the mutator thread.
-        // SmallVec may use Rust's allocator, but no JavaScript allocation or
-        // collection can overlap the temporary slice rearrangement.
-        unsafe {
-            let args = &mut *self.args.get();
-            let old_len = args.len();
-            args.resize(old_len + prefix.len(), Value::undefined());
-            args.copy_within(0..old_len, prefix.len());
-            args[..prefix.len()].copy_from_slice(prefix);
-        }
-    }
-
     pub(crate) fn take_args(&self) -> SmallVec<[Value; 8]> {
         // SAFETY: moving the SmallVec itself cannot run GC. The caller must
         // transfer it into traced frame storage or install a slice provider
@@ -268,7 +202,7 @@ impl otter_gc::ExtraRootSource for SyncJsCallRoots {
     }
 }
 
-fn invoke_native_call_with_roots(
+pub(crate) fn invoke_native_call_with_roots(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     context: &ExecutionContext,
@@ -300,150 +234,6 @@ fn invoke_native_call_with_roots(
         let raw = call.invoke(&mut ctx, args);
         raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
     }
-}
-
-/// `(function_id, this, new_target, closure)` resolved from a callable value
-/// for a bytecode call. `closure` is the exact SELF when the target is a
-/// closure; the callee reaches its context through it.
-pub(crate) type BytecodeCallTargetParts =
-    (u32, Value, Option<Value>, Option<crate::closure::JsClosure>);
-
-#[derive(Clone)]
-pub(crate) struct LeanCallbackRoot {
-    callback: Value,
-    function_id: u32,
-    bound_this: Option<Value>,
-    bound_new_target: Option<Value>,
-}
-
-impl LeanCallbackRoot {
-    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
-        visitor(self.function_id);
-        crate::code_liveness::visit_value(&self.callback, visitor);
-        for value in [self.bound_this, self.bound_new_target]
-            .into_iter()
-            .flatten()
-        {
-            crate::code_liveness::visit_value(&value, visitor);
-        }
-    }
-
-    fn from_callback(callback: Value, heap: &otter_gc::GcHeap) -> Option<Self> {
-        if let Some(function_id) = callback.as_function() {
-            return Some(Self {
-                callback,
-                function_id,
-                bound_this: None,
-                bound_new_target: None,
-            });
-        }
-        let closure = callback.as_closure(heap)?;
-        let function_id = closure.function_id();
-        let state = closure.call_state(heap);
-        Some(Self {
-            callback,
-            function_id,
-            bound_this: state.bound_this,
-            bound_new_target: state.bound_new_target,
-        })
-    }
-
-    pub(crate) fn trace_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        self.callback.trace_value_slots(visitor);
-        if let Some(value) = &self.bound_this {
-            value.trace_value_slots(visitor);
-        }
-        if let Some(value) = &self.bound_new_target {
-            value.trace_value_slots(visitor);
-        }
-    }
-}
-
-const FUNCTION_OWNER_CACHE_CAPACITY: usize = 4;
-
-/// Dispatch-local cache for resolving call targets owned by sibling chunks.
-///
-/// Entries are epoch-validated and live no longer than their activation
-/// dispatch, so they remove the payload read lock from repeated call sites
-/// without becoming between-turn liveness roots.
-pub(crate) struct FunctionOwnerCache {
-    epoch: u64,
-    entries: [Option<ExecutionContext>; FUNCTION_OWNER_CACHE_CAPACITY],
-    next: usize,
-}
-
-impl FunctionOwnerCache {
-    pub(crate) fn new(context: &ExecutionContext) -> Self {
-        Self {
-            epoch: context.space().epoch(),
-            entries: std::array::from_fn(|_| None),
-            next: 0,
-        }
-    }
-
-    fn resolve<'a>(
-        &'a mut self,
-        ambient: &'a ExecutionContext,
-        function_id: u32,
-    ) -> Result<&'a ExecutionContext, crate::execution_context::FunctionResolutionError> {
-        if ambient.covers_function(function_id) {
-            return Ok(ambient);
-        }
-        let epoch = ambient.space().epoch();
-        if self.epoch != epoch {
-            self.entries.fill(None);
-            self.epoch = epoch;
-            self.next = 0;
-        }
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry
-                .as_ref()
-                .is_some_and(|context| context.covers_function(function_id))
-        }) {
-            return Ok(self.entries[index]
-                .as_ref()
-                .expect("the matching owner-cache entry is present"));
-        }
-        let owner = match ambient.for_function(function_id)? {
-            crate::code_space::ResolvedCtx::Owned(owner) => owner,
-            crate::code_space::ResolvedCtx::Ambient(_) => {
-                unreachable!("foreign owner resolution returned the ambient context")
-            }
-        };
-        let slot = self.next;
-        self.entries[slot] = Some(owner);
-        self.next = (slot + 1) % FUNCTION_OWNER_CACHE_CAPACITY;
-        Ok(self.entries[slot]
-            .as_ref()
-            .expect("the newly cached owner is present"))
-    }
-}
-
-pub(crate) struct LeanCallbackState {
-    root_index: usize,
-    function_id: u32,
-    context: ExecutionContext,
-    /// Callee register-window length, read once from the executable function.
-    register_count: usize,
-    /// Number of formal parameters to bind on the lean path.
-    param_count: usize,
-    /// Strict and arrow callbacks use the incoming receiver directly.
-    this_passthrough: bool,
-    /// True when the callback carries no bound `new.target` — i.e. the
-    /// per-element frame needs no pooled cold record. The hot Array/Map/Set/TypedArray callbacks (plain
-    /// functions and arrows) all qualify, so they take the prepared-frame fast
-    /// path; anything else falls to the general per-element build.
-    fast_reuse: bool,
-    /// Installed baseline body for the callback, resolved once on the first
-    /// element that tiers up and reused for the rest of the loop. The lean
-    /// state lives only for a single builtin invocation, so no mid-loop
-    /// recompilation can stale this handle.
-    compiled: Option<std::sync::Arc<dyn crate::jit::JitFunctionCode>>,
-    /// Recycled callee frame for the prepared fast path: its register window
-    /// and frame shell are reused across elements instead of
-    /// being drawn, built, and dropped per element. `None` until the first
-    /// fast-path call builds it, and whenever a bail consumes it mid-loop.
-    reuse_frame: Option<Frame>,
 }
 
 impl Interpreter {
@@ -631,54 +421,6 @@ impl Interpreter {
         Ok((baked_field_count.max(sample.learned), sample))
     }
 
-    /// Storage a bytecode base constructor's receiver needs on the
-    /// interpreter's construct fast path, read before the receiver exists so
-    /// it is allocated with exactly that many in-object slots.
-    ///
-    /// The interpreter plans no transition program of its own; it applies the
-    /// capacity an earlier generated preparation already baked for this pair
-    /// and the instance size learned from the pair's previous receivers, so
-    /// fields the body or its callees add land in reserved slots exactly as
-    /// they do for a runtime-prepared receiver.
-    fn interpreter_construct_reservation(
-        &mut self,
-        function_id: u32,
-        new_target: Value,
-    ) -> (usize, ConstructorProfileSample) {
-        let sample = self.sample_constructor_profile(function_id, new_target);
-        let baked_field_count = self
-            .constructor_field_capacity_cache
-            .get(&sample.key)
-            .copied()
-            .unwrap_or(0);
-        (baked_field_count.max(sample.learned), sample)
-    }
-
-    /// Finish the interpreter fast path's receiver: move a receiver wider
-    /// than any in-object capacity to a reserved slab, then record it for the
-    /// constructor's instance-size profile. The receiver handle itself is the
-    /// root the slab allocation rewrites.
-    fn finish_interpreter_construct_receiver(
-        &mut self,
-        reserved_field_count: usize,
-        sample: ConstructorProfileSample,
-        stack: &ActivationStack,
-        callee_reg: u16,
-        mut receiver: JsObject,
-    ) -> Result<JsObject, VmError> {
-        if reserved_field_count > crate::object::MAX_INLINE_CAPACITY {
-            crate::object::reserve_fresh_object_slot_capacity(
-                &mut receiver,
-                &mut self.gc_heap,
-                reserved_field_count,
-            )
-            .map_err(VmError::from)?;
-        }
-        let new_target = *read_register(&stack[stack.len() - 1], callee_reg)?;
-        self.note_constructor_receiver(sample, new_target, receiver);
-        Ok(receiver)
-    }
-
     /// Resolve the hidden class a conservative generated constructor can own
     /// before its body begins.
     ///
@@ -727,6 +469,67 @@ impl Interpreter {
             &mut external_visit,
         )?;
         Ok(Some((shape, field_count)))
+    }
+
+    fn simple_constructor_init(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        function: &CodeBlock,
+    ) -> Option<crate::constructor_fast_path::SimpleConstructorInit> {
+        if let Some(cached) = self.simple_constructor_init_cache.get(&function_id) {
+            return cached.clone();
+        }
+        let init = crate::constructor_fast_path::match_simple_constructor_init(context, function);
+        self.simple_constructor_init_cache
+            .insert(function_id, init.clone());
+        init
+    }
+
+    /// The final hidden class of a simple constructor's receivers on
+    /// `root`'s lineage, cached per constructor and prototype root.
+    fn simple_constructor_shape_with_roots(
+        &mut self,
+        function_id: u32,
+        root: crate::object::ShapeHandle,
+        init: &crate::constructor_fast_path::SimpleConstructorInit,
+        external_visit: &mut dyn FnMut(&mut dyn FnMut(*mut RawGc)),
+    ) -> Result<crate::object::ShapeHandle, VmError> {
+        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
+        if let Some(shape) = self
+            .simple_constructor_shape_cache
+            .get(&(function_id, root_id))
+        {
+            return Ok(*shape);
+        }
+
+        let mut shape = root;
+        for field in &init.fields {
+            if let Some(child) = self.shape_runtime.child_if_cached(
+                &self.gc_heap,
+                shape,
+                &field.name,
+                crate::object::PropertyFlags::data_default(),
+                false,
+            ) {
+                shape = child;
+                continue;
+            }
+            shape = self
+                .shape_runtime
+                .child_with_roots(
+                    &mut self.gc_heap,
+                    shape,
+                    &field.name,
+                    crate::object::PropertyFlags::data_default(),
+                    false,
+                    external_visit,
+                )
+                .map_err(VmError::from)?;
+        }
+        self.simple_constructor_shape_cache
+            .insert((function_id, root_id), shape);
+        Ok(shape)
     }
 
     /// Prepare the receiver for one compiler-generated base constructor.
@@ -1099,13 +902,13 @@ impl Interpreter {
     ///
     /// # Safety
     ///
-    /// `frame` must name an initialized, exclusively owned [`NativeFrame`]
+    /// `frame` must name an initialized, exclusively owned [`Frame`]
     /// whose register window remains live for this call. It is deliberately
     /// not published until the generated caller completes this copy.
     pub unsafe fn jit_copy_spread_arguments(
         &self,
         arguments: Value,
-        frame: *mut crate::native_abi::NativeFrame,
+        frame: *mut crate::native_abi::Frame,
         parameter_count: u16,
     ) -> bool {
         let Some(array) = arguments.as_array() else {
@@ -1113,7 +916,7 @@ impl Interpreter {
         };
         // SAFETY: upheld by the generated-linkage caller; the view validates
         // the raw frame and window descriptors before exposing scalar writes.
-        let Ok(mut frame) = (unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }) else {
+        let Ok(mut frame) = (unsafe { crate::ActiveFrameMut::from_ptr(frame) }) else {
             return false;
         };
         if usize::from(parameter_count) > frame.register_count() {
@@ -1137,250 +940,17 @@ impl Interpreter {
     pub(crate) fn bind_bytecode_call_arguments(
         &mut self,
         function: &CodeBlock,
-        frame: &mut Frame,
+        frame: &mut crate::PreparedCall,
         args: SmallVec<[Value; 8]>,
     ) -> Result<(), VmError> {
-        let bind_count = (function.param_count as usize).min(args.len());
-        let total_args = args.len();
-        let incoming: Option<SmallVec<[Value; 4]>> = if function.needs_arguments {
-            Some(args.iter().cloned().collect())
-        } else {
-            None
-        };
-        let mut iter = args.into_iter();
-        for i in 0..bind_count {
-            let value = iter.next().expect("bind_count <= len");
-            let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
-            *slot = value;
-        }
-        let rest: Option<SmallVec<[Value; 4]>> =
-            if function.has_rest && total_args > function.param_count as usize {
-                Some(iter.collect())
-            } else {
-                None
-            };
-        if incoming.is_some() || rest.is_some() {
-            let cold = self.frame_ensure_cold(frame);
-            if let Some(v) = incoming {
-                cold.incoming_args = v;
-            }
-            if let Some(v) = rest {
-                cold.rest_args = v;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn bind_construct_arguments_and_publish_cold(
-        &mut self,
-        function: &CodeBlock,
-        frame: &mut Frame,
-        args: SmallVec<[Value; 8]>,
-        is_derived: bool,
-        receiver: Option<JsObject>,
-        new_target: Value,
-    ) -> Result<(), VmError> {
-        // Bind before acquiring constructor cold state. Invalid bytecode can
-        // reject an oversized parameter layout here; if cold storage were
-        // attached first, dropping this unpublished frame would leak the pool
-        // record and keep its receiver/new.target roots live indefinitely.
-        self.bind_bytecode_call_arguments(function, frame, args)?;
-        let cold = self.frame_ensure_cold(frame);
-        if is_derived {
-            cold.is_derived_constructor = true;
-        } else {
-            cold.construct_target = receiver;
-        }
-        cold.new_target = Some(new_target);
-        Ok(())
-    }
-
-    fn bind_lean_bytecode_call_arguments(
-        function: &CodeBlock,
-        frame: &mut Frame,
-        args: &[Value],
-    ) -> Result<(), VmError> {
-        debug_assert!(
-            !function.needs_arguments && !function.has_rest,
-            "lean callback path must not need argument materialization"
-        );
-        let bind_count = (function.param_count as usize).min(args.len());
-        for (i, value) in args.iter().copied().take(bind_count).enumerate() {
-            let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
-            *slot = value;
-        }
-        Ok(())
-    }
-
-    fn reset_and_bind_lean_bytecode_call_arguments(
-        param_count: usize,
-        frame: &mut Frame,
-        args: &[Value],
-    ) -> Result<(), VmError> {
-        let bind_count = param_count.min(args.len());
-        if bind_count > frame.registers.len() {
+        if function.param_count > function.register_count {
             return Err(VmError::InvalidOperand);
         }
-        for slot in frame.registers.iter_mut().skip(bind_count) {
-            *slot = Value::undefined();
-        }
-        for (i, value) in args.iter().copied().take(bind_count).enumerate() {
-            frame.registers[i] = value;
-        }
+        frame.arguments = args;
         Ok(())
     }
 
-    /// Resolve a bytecode call target: its function id, the `this` the
-    /// callee binds (an arrow's lexical copy wins over the call site), an
-    /// arrow's lexical `new.target`, and the exact closure (SELF) when the
-    /// target is one.
-    pub(crate) fn bytecode_call_target_parts(
-        current: Value,
-        effective_this: Value,
-        heap: &otter_gc::GcHeap,
-    ) -> Result<BytecodeCallTargetParts, VmError> {
-        if let Some(function_id) = current.as_function() {
-            return Ok((function_id, effective_this, None, None));
-        }
-        if let Some(handle) = current
-            .as_raw_gc()
-            .and_then(|raw| raw.checked_cast::<crate::closure::JsClosureBody>())
-        {
-            let (function_id, bound_this, bound_new_target) = heap.read_payload(handle, |body| {
-                (
-                    body.call_header.function_id,
-                    body.bound_this_option(),
-                    body.bound_new_target_option(),
-                )
-            });
-            let closure = crate::closure::JsClosure::from_parts(handle, function_id);
-            return Ok((
-                function_id,
-                bound_this.unwrap_or(effective_this),
-                bound_new_target,
-                Some(closure),
-            ));
-        }
-        Err(VmError::NotCallable)
-    }
-
-    fn bytecode_construct_target_function_id(
-        current: Value,
-        heap: &otter_gc::GcHeap,
-    ) -> Result<u32, VmError> {
-        if let Some(function_id) = current.as_function() {
-            return Ok(function_id);
-        }
-        if let Some(closure) = current.as_closure(heap) {
-            return Ok(closure.function_id());
-        }
-        Err(VmError::NotCallable)
-    }
-
-    fn build_construct_bytecode_frame(
-        &mut self,
-        context: &ExecutionContext,
-        current: Value,
-        receiver: Option<JsObject>,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
-        return_register: Option<u16>,
-    ) -> Result<Frame, VmError> {
-        let function_id = Self::bytecode_construct_target_function_id(current, &self.gc_heap)?;
-        let owner = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let context = &*owner;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // §10.2.5 — only ordinary functions get a [[Construct]] slot;
-        // async functions, generators, async generators, and
-        // MethodDefinition bodies are not constructors.
-        if function.is_async || function.is_generator || function.is_method {
-            return Err(self.err_type(("function is not a constructor".to_string()).into()));
-        }
-        // §10.2.2 — a derived constructor enters with `this` in the
-        // TDZ; `super(...)` binds it. A base constructor receives the
-        // freshly-allocated receiver as `this` immediately.
-        let is_derived = function.is_derived_constructor;
-        debug_assert!(
-            !is_derived || receiver.is_none(),
-            "derived construction must not materialize an outer receiver"
-        );
-        let this_value = if is_derived {
-            Value::hole()
-        } else {
-            Value::object(receiver.ok_or(VmError::InvalidOperand)?)
-        };
-        // Frame construction allocates no GC memory: the locals stay current.
-        let window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame =
-            Frame::for_code_block(function, return_register, current, this_value, window);
-        self.bind_construct_arguments_and_publish_cold(
-            function, &mut frame, args, is_derived, receiver, new_target,
-        )?;
-        window_rollback.commit();
-        Ok(frame)
-    }
-
-    fn build_construct_bytecode_frame_from_window(
-        &mut self,
-        context: &ExecutionContext,
-        current: Value,
-        receiver: Option<JsObject>,
-        new_target: Value,
-        args: &BytecodeArgumentWindow<'_, '_>,
-        return_register: Option<u16>,
-    ) -> Result<Frame, VmError> {
-        let function_id = Self::bytecode_construct_target_function_id(current, &self.gc_heap)?;
-        let owner = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let context = &*owner;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // §10.2.5 — async / generator functions and methods are not
-        // constructors.
-        if function.is_async || function.is_generator || function.is_method {
-            return Err(self.err_type(("function is not a constructor".to_string()).into()));
-        }
-        let is_derived = function.is_derived_constructor;
-        debug_assert!(
-            !is_derived || receiver.is_none(),
-            "derived construction must preserve the caller register window without a receiver"
-        );
-        let this_value = if is_derived {
-            Value::hole()
-        } else {
-            Value::object(receiver.ok_or(VmError::InvalidOperand)?)
-        };
-        let window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame =
-            Frame::for_code_block(function, return_register, current, this_value, window);
-        let extras = args.bind_into(function, &mut frame)?;
-        {
-            let cold = self.frame_ensure_cold(&mut frame);
-            if is_derived {
-                cold.is_derived_constructor = true;
-            } else {
-                cold.construct_target = receiver;
-            }
-            cold.new_target = Some(new_target);
-            if !extras.is_empty() {
-                cold.rest_args = extras.rest_args;
-                cold.incoming_args = extras.incoming_args;
-            }
-        }
-        window_rollback.commit();
-        Ok(frame)
-    }
-
-    fn invoke_native_construct_rooted(
+    pub(crate) fn invoke_native_construct_rooted(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
@@ -1443,532 +1013,42 @@ impl Interpreter {
         })
     }
 
-    /// Push a bytecode activation for `callee_closure` (or the bare
-    /// function). The closure is young and every step before the frame is
-    /// on the stack may allocate, so it rides an iteration anchor for the
-    /// whole call and SELF is read from that anchor.
-    #[allow(clippy::too_many_arguments)]
-    fn push_bytecode_call_frame(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee_closure: Option<crate::closure::JsClosure>,
-        function_id: u32,
-        this_for_callee: Value,
-        new_target_for_callee: Option<Value>,
-        effective_args: SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let callee_anchor = self.push_iteration_anchor(
-            callee_closure.map_or_else(|| Value::function(function_id), Value::closure),
-        ) - 1;
-        let result = self.push_anchored_bytecode_call_frame(
-            stack,
-            context,
-            callee_anchor,
-            function_id,
-            this_for_callee,
-            new_target_for_callee,
-            effective_args,
-            dst,
-        );
-        self.pop_iteration_anchors_to(callee_anchor);
-        result
+    /// Bytecode function a staged request's callee names, for call feedback.
+    /// A class wrapper names its constructor; every other kind names none.
+    pub(crate) fn staged_bytecode_target(&self, stack: &mut ActivationStack) -> Option<u32> {
+        let callee = stack.staged_request_mut()?.callee;
+        let callee = callee
+            .as_class_constructor()
+            .map_or(callee, |class| class.ctor(&self.gc_heap));
+        callee
+            .as_function()
+            .or_else(|| callee.as_closure(&self.gc_heap).map(|closure| closure.function_id()))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn push_anchored_bytecode_call_frame(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee_anchor: usize,
-        function_id: u32,
-        this_for_callee: Value,
-        new_target_for_callee: Option<Value>,
-        effective_args: SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        self.record_runtime_bytecode_call();
-        if self.logical_call_depth(stack) >= self.max_stack_depth {
-            return Err(VmError::StackOverflow {
-                limit: self.max_stack_depth,
-            });
-        }
-        let owner = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let context = &*owner;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // Async-call entry path (spec §27.7.5.1): synthesise a
-        // fresh pending result promise, write it into the caller's
-        // `dst` register *now* so the call expression's value is
-        // visible synchronously, and park the new frame with
-        // `return_register = None` so its eventual completion
-        // settles the promise instead of writing back.
-        let (return_register, async_state) = if function.is_async && !function.is_generator {
-            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_stack_rooted(
-                    self,
-                    stack,
-                    &[&this_for_callee],
-                    &[effective_args.as_slice()],
-                )?;
-            let promise_value = Value::promise(result_promise);
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, promise_value)?;
-            (None, Some(AsyncFrameState { result_promise }))
-        } else {
-            (Some(dst), None)
-        };
-        let this_for_callee = self.this_for_bytecode_call_stack_rooted(
-            function,
-            stack,
-            this_for_callee,
-            &[effective_args.as_slice()],
-        )?;
-        // SELF is the exact closure or the bare function, read from its
-        // anchor after the promise and `this` allocations above.
-        let self_value = self.iteration_anchor(callee_anchor);
-        // Frame construction allocates no GC memory: the locals stay current.
-        let window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut new_frame = Frame::for_code_block(
-            function,
-            return_register,
-            self_value,
-            this_for_callee,
-            window,
-        );
-        if let Some(async_state) = async_state {
-            self.frame_set_async_state(&mut new_frame, async_state);
-        }
-        if let Some(new_target) = new_target_for_callee {
-            let cold = self.frame_ensure_cold(&mut new_frame);
-            cold.new_target = Some(new_target);
-        }
-        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
-        // §27.5 Generator-call entry: instead of pushing the frame
-        // onto the dispatch stack, hand the caller a paused
-        // [`Value::Generator`] handle that owns the prepared frame.
-        // The body only runs when `.next()` resumes it.
-        if function.is_generator {
-            new_frame.return_register = None;
-            let async_gen = function.is_async_generator;
-            let generator_function_id = function.id;
-            let cold = self.frame_detach_cold(&mut new_frame);
-            let new_frame = self.park_active_frame(new_frame);
-            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
-                &mut self.gc_heap,
-                new_frame,
-                cold,
-                None,
-            )?;
-            gen_handle.set_async(&mut self.gc_heap, async_gen);
-            // Backlink the generator into the frame so `Op::Yield`
-            // can find its owner once execution starts.
-            gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            let generator_anchor = self.push_iteration_anchor(Value::generator(gen_handle)) - 1;
-            let result = (|| -> Result<(), VmError> {
-                let gen_handle = self
-                    .iteration_anchor(generator_anchor)
-                    .as_generator()
-                    .ok_or(VmError::InvalidOperand)?;
-                let (frame, cold) = gen_handle
-                    .take_frame(&mut self.gc_heap)
-                    .ok_or(VmError::InvalidOperand)?;
-                let mut frame = self.resume_parked_frame(*frame)?;
-                if let Some(cold) = cold {
-                    self.frame_attach_cold(&mut frame, cold);
-                }
-                let prologue_floor = stack.floor();
-                stack.push(frame);
-                let prologue = self.dispatch_loop_above_rooted(context, stack, prologue_floor);
-                self.release_frames_above(stack, prologue_floor);
-                prologue?;
-                self.resolve_generator_prototype(
-                    stack,
-                    context,
-                    callee_anchor,
-                    generator_function_id,
-                    generator_anchor,
-                )?;
-                let generator = self.iteration_anchor(generator_anchor);
-                let top_idx = stack.len() - 1;
-                write_register(&mut stack[top_idx], dst, generator)
-            })();
-            self.pop_iteration_anchors_to(generator_anchor);
-            return result;
-        }
-        stack.push(new_frame);
-        window_rollback.commit();
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_bytecode_call_frame_from_window(
-        &mut self,
-        stack: &ActivationStack,
-        function: &CodeBlock,
-        self_value: Value,
-        this_for_callee: Value,
-        new_target_for_callee: Option<Value>,
-        args: &BytecodeArgumentWindow<'_, '_>,
-        return_register: Option<u16>,
-        async_state: Option<AsyncFrameState>,
-    ) -> Result<Frame, VmError> {
-        let this_for_callee =
-            self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
-        // Frame construction allocates no GC memory: the locals stay current.
-        let window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame = Frame::for_code_block(
-            function,
-            return_register,
-            self_value,
-            this_for_callee,
-            window,
-        );
-        if let Some(async_state) = async_state {
-            self.frame_set_async_state(&mut frame, async_state);
-        }
-        let extras = args.bind_into(function, &mut frame)?;
-        if !extras.is_empty() {
-            let cold = self.frame_ensure_cold(&mut frame);
-            cold.rest_args = extras.rest_args;
-            cold.incoming_args = extras.incoming_args;
-        }
-        if let Some(new_target) = new_target_for_callee {
-            let cold = self.frame_ensure_cold(&mut frame);
-            cold.new_target = Some(new_target);
-        }
-        window_rollback.commit();
-        Ok(frame)
-    }
-
-    /// §27.5.1 step 3 / §9.1.14 — resolve a fresh generator's
-    /// [[Prototype]] from `fn.prototype` AFTER the prologue ran; a
-    /// non-object answer falls back (override `None`) to the realm's
-    /// shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%`.
-    fn resolve_generator_prototype(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee_anchor: usize,
-        function_id: u32,
-        generator_anchor: usize,
-    ) -> Result<(), VmError> {
-        // The owner is the invoked closure instance: `fn.prototype`
-        // materializes per closure, so resolving through the template
-        // bag would hand the generator a parallel prototype object that
-        // fails `Object.getPrototypeOf(gen) === fn.prototype`. It is read
-        // from its anchor because the prologue before this point allocates.
-        let owner = self
-            .iteration_anchor(callee_anchor)
-            .as_closure(&self.gc_heap);
-        let proto = self.function_property_get(stack, context, owner, function_id, "prototype")?;
-        let gen_handle = self
-            .iteration_anchor(generator_anchor)
-            .as_generator()
-            .ok_or(VmError::InvalidOperand)?;
-        gen_handle.set_prototype_override(
-            &mut self.gc_heap,
-            proto.as_object().is_some().then_some(proto),
-        );
-        Ok(())
-    }
-
-    /// Suspend a freshly prepared generator body into a generator object,
-    /// run its prologue, and leave the generator in `dst`.
-    ///
-    /// `generator_function_id` and `callee_closure` resolve the generator's
-    /// [[Prototype]] AFTER the prologue runs (§27.5.1 step 3:
-    /// FunctionDeclarationInstantiation precedes OrdinaryCreateFromConstructor,
-    /// so parameter side effects on `fn.prototype` are observable). The
-    /// prototype must be read through the invoked closure instance rather than
-    /// the template bag, or `Object.getPrototypeOf(gen) === fn.prototype` fails.
-    fn push_generator_bytecode_call_frame(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        dst: u16,
-        mut frame: Frame,
-        is_async_generator: bool,
-        generator_function_id: u32,
-        callee_anchor: usize,
-    ) -> Result<(), VmError> {
-        {
-            frame.return_register = None;
-            let cold = self.frame_detach_cold(&mut frame);
-            let frame = self.park_active_frame(frame);
-            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
-                &mut self.gc_heap,
-                frame,
-                cold,
-                None,
-            )?;
-            gen_handle.set_async(&mut self.gc_heap, is_async_generator);
-            gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            let generator_anchor = self.push_iteration_anchor(Value::generator(gen_handle)) - 1;
-            let result = (|| -> Result<(), VmError> {
-                let gen_handle = self
-                    .iteration_anchor(generator_anchor)
-                    .as_generator()
-                    .ok_or(VmError::InvalidOperand)?;
-                let (frame, cold) = gen_handle
-                    .take_frame(&mut self.gc_heap)
-                    .ok_or(VmError::InvalidOperand)?;
-                let mut frame = self.resume_parked_frame(*frame)?;
-                if let Some(cold) = cold {
-                    self.frame_attach_cold(&mut frame, cold);
-                }
-                let prologue_floor = stack.floor();
-                stack.push(frame);
-                let prologue = self.dispatch_loop_above_rooted(context, stack, prologue_floor);
-                self.release_frames_above(stack, prologue_floor);
-                prologue?;
-                self.resolve_generator_prototype(
-                    stack,
-                    context,
-                    callee_anchor,
-                    generator_function_id,
-                    generator_anchor,
-                )?;
-                let generator = self.iteration_anchor(generator_anchor);
-                let top_idx = stack.len() - 1;
-                write_register(&mut stack[top_idx], dst, generator)
-            })();
-            self.pop_iteration_anchors_to(generator_anchor);
-            result
-        }
-    }
-
-    fn try_push_bytecode_call_frame_from_window(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
-        callee: &Value,
-        this_value: Value,
-        operands: ArgumentOperands<'_>,
-        first_arg_operand: usize,
-        argc: usize,
-        dst: u16,
-    ) -> Result<bool, VmError> {
-        let current = *callee;
-        let effective_this = this_value;
-        let (function_id, this_for_callee, new_target_for_callee, _) =
-            match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
-                Ok(parts) => parts,
-                Err(_) if current.as_class_constructor().is_some() => {
-                    // §10.3.1 — a class constructor's [[Call]] always throws;
-                    // only [[Construct]] may enter it.
-                    return Err(self.err_type(
-                        ("Class constructor cannot be invoked without 'new'".to_string()).into(),
-                    ));
-                }
-                Err(_) => return Ok(false),
-            };
-        let context = owner_cache
-            .resolve(context, function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        self.record_runtime_bytecode_call();
-        if self.logical_call_depth(stack) >= self.max_stack_depth {
-            return Err(VmError::StackOverflow {
-                limit: self.max_stack_depth,
-            });
-        }
-        let top_idx = stack.len() - 1;
-        // The callee is young: it rides an anchor across the promise and
-        // generator allocations below and SELF is read back from it.
-        let callee_anchor = self.push_iteration_anchor(current) - 1;
-        let result = self.push_anchored_window_call_frame(
-            stack,
-            context,
-            function,
-            callee_anchor,
-            this_for_callee,
-            new_target_for_callee,
-            operands,
-            first_arg_operand,
-            argc,
-            dst,
-            top_idx,
-        );
-        self.pop_iteration_anchors_to(callee_anchor);
-        result.map(|()| true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn push_anchored_window_call_frame(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        function: &crate::CodeBlock,
-        callee_anchor: usize,
-        this_for_callee: Value,
-        new_target_for_callee: Option<Value>,
-        operands: ArgumentOperands<'_>,
-        first_arg_operand: usize,
-        argc: usize,
-        dst: u16,
-        top_idx: usize,
-    ) -> Result<(), VmError> {
-        let (return_register, async_state) = if function.is_async && !function.is_generator {
-            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_stack_rooted(self, stack, &[&this_for_callee], &[])?;
-            let promise_value = Value::promise(result_promise);
-            write_register(&mut stack[top_idx], dst, promise_value)?;
-            (None, Some(AsyncFrameState { result_promise }))
-        } else {
-            (Some(dst), None)
-        };
-        let current = self.iteration_anchor(callee_anchor);
-        // SELF is canonical hot frame state for both interpreter and native
-        // activations: the exact invoked closure, whose context the body
-        // reaches through `LoadClosureContext`.
-        let frame = {
-            let caller = &stack[top_idx];
-            let args =
-                BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
-            self.prepare_bytecode_call_frame_from_window(
-                stack,
-                function,
-                current,
-                this_for_callee,
-                new_target_for_callee,
-                &args,
-                return_register,
-                async_state,
-            )?
-        };
-        if function.is_generator {
-            self.push_generator_bytecode_call_frame(
-                stack,
-                context,
-                dst,
-                frame,
-                function.is_async_generator,
-                function.id,
-                callee_anchor,
-            )?;
-        } else {
-            stack.push(frame);
-        }
-        Ok(())
-    }
-
-    fn try_invoke_native_call_from_window(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee: &Value,
-        this_value: Value,
-        operands: ArgumentOperands<'_>,
-        first_arg_operand: usize,
-        argc: usize,
-        dst: u16,
-    ) -> Result<bool, VmError> {
-        let top_idx = stack.len() - 1;
-        let args = {
-            let caller = &stack[top_idx];
-            let window =
-                BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
-            window.to_smallvec8()?
-        };
-
-        if let Some(obj) = callee.as_object()
-            && let Some(native) =
-                crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
-        {
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
-                return Ok(false);
-            }
-            self.record_runtime_native_call()?;
-            let realm_global = self.native_target_realm_global(&native);
-            let result = invoke_native_call_with_roots(
-                self,
-                stack,
-                context,
-                call,
-                realm_global,
-                this_value,
-                &[callee],
-                args.as_slice(),
-            )?;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(true);
-        }
-
-        if let Some(native) = callee.as_native_function() {
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
-                return Ok(false);
-            }
-            self.record_runtime_native_call()?;
-            let realm_global = self.native_target_realm_global(&native);
-            let result = invoke_native_call_with_roots(
-                self,
-                stack,
-                context,
-                call,
-                realm_global,
-                this_value,
-                &[callee],
-                args.as_slice(),
-            )?;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    /// Handle `Op::Call`: push a new frame for the callee with
-    /// arguments copied into the parameter slots and `this` bound
-    /// to `Value::undefined()` (foundation strict default).
+    /// Handle `Op::Call`: stage the callee with an `undefined` receiver for
+    /// the trampoline, which classifies it and owns its activation.
     #[cfg(test)]
     pub(crate) fn do_call<'a>(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
-        let mut owner_cache = FunctionOwnerCache::new(context);
-        self.do_call_inner(
-            stack,
-            context,
-            &mut owner_cache,
-            ArgumentOperands::decoded(operands.into()),
-        )
+        self.do_call_inner(stack, ArgumentOperands::decoded(operands.into()))
     }
 
     pub(crate) fn do_call_exec(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
-        self.do_call_inner(
-            stack,
-            context,
-            owner_cache,
-            ArgumentOperands::execution(function, instruction),
-        )
+        self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))
     }
 
     fn do_call_inner(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
         operands: ArgumentOperands<'_>,
     ) -> Result<(), VmError> {
         // The call header (`dst`, callee, argc) reads from one operand-word
@@ -1983,335 +1063,125 @@ impl Interpreter {
                 operands.const_index(2)?,
             ),
         };
-
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        stack[top_idx].advance_pc()?;
-        if self.try_push_bytecode_call_frame_from_window(
-            stack,
-            context,
-            owner_cache,
-            &callee,
-            Value::undefined(),
-            operands,
-            3,
-            argc as usize,
-            dst,
-        )? {
-            return Ok(());
-        }
-        if self.try_invoke_native_call_from_window(
-            stack,
-            context,
-            &callee,
-            Value::undefined(),
-            operands,
-            3,
-            argc as usize,
-            dst,
-        )? {
-            return Ok(());
-        }
         let args =
             BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc as usize)
                 .to_smallvec8()?;
-        self.invoke(stack, context, &callee, Value::undefined(), args, dst)
+        stack[top_idx].advance_pc()?;
+        stack.stage_call(callee, Value::undefined(), None, args, Some(dst));
+        Ok(())
     }
 
-    /// §15.10.3 PrepareForTailCall — `Op::TailCall`. Discards the
-    /// current frame and runs the callee in its place so a strict-mode
-    /// tail call uses O(1) native stack.
-    ///
-    /// Operand layout matches [`Op::Call`] (`dst, callee, argc,
-    /// args...`); `this` defaults to `undefined`. The compiler only
-    /// emits this opcode for a call in a tail position that no
-    /// `try`/`finally` encloses, so the discarded frame never has live
-    /// handlers. Frames whose completion needs post-processing
-    /// (constructors, async result frames, or any frame that still
-    /// owns a handler/cold record) fall back to ordinary
-    /// [`Self::do_call_inner`], preserving behaviour at a small depth cost.
+    /// §15.10.3 PrepareForTailCall — `Op::TailCall`. The staged request
+    /// replaces this activation at the trampoline, so a strict-mode tail call
+    /// uses O(1) native stack. The compiler emits it only outside
+    /// `try`/`finally`; a frame whose completion needs post-processing
+    /// (constructors, suspension owners, live handlers) stages an ordinary
+    /// call instead.
     pub(crate) fn do_tail_call_exec(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
-        self.do_tail_call_inner(
-            stack,
-            context,
-            owner_cache,
-            ArgumentOperands::execution(function, instruction),
-        )
+        let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        let frame = &stack[top_idx];
+        let tail_safe = !self.frame_has_suspension_owner(frame)
+            && !frame.is_construct()
+            && self
+                .frame_cold(frame)
+                .is_none_or(|cold| cold.handlers.is_empty());
+        let return_destination = frame.return_destination;
+        self.do_call_inner(stack, ArgumentOperands::execution(function, instruction))?;
+        if tail_safe && let Some(request) = stack.staged_request_mut() {
+            request.return_destination = return_destination;
+            request.header.flags = crate::native_abi::NativeFrameFlags::from_bits(
+                request.header.flags.bits() | crate::native_abi::NativeFrameFlags::TAIL_CALL,
+            );
+            self.frame_release_cold(&mut stack[top_idx]);
+        }
+        Ok(())
     }
 
-    fn do_tail_call_inner(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
-        operands: ArgumentOperands<'_>,
-    ) -> Result<(), VmError> {
-        let callee_reg = operands.register(1)?;
-        let argc = operands.const_index(2)? as usize;
-        let top_idx = stack.len() - 1;
-
-        // Snapshot everything that lives in the doomed frame, and decide
-        // whether the frame may be discarded in place.
-        let (callee, args, ret_reg) = {
-            let frame = &stack[top_idx];
-            let tco_safe = frame.return_register.is_some()
-                && !self.frame_has_async_state(frame)
-                && match self.frame_cold(frame) {
-                    None => true,
-                    Some(cold) => {
-                        cold.handlers.is_empty()
-                            && cold.construct_target.is_none()
-                            && !cold.is_derived_constructor
-                    }
-                };
-            if !tco_safe {
-                // Restore ordinary call semantics: `do_call` advances the
-                // caller pc and pushes a fresh callee frame above this one.
-                return self.do_call_inner(stack, context, owner_cache, operands);
-            }
-            let callee = *read_register(frame, callee_reg)?;
-            let args =
-                BytecodeArgumentWindow::from_operands(frame, operands, 3, argc).to_smallvec8()?;
-            // `return_register` indexes the caller frame (one below this
-            // one); after the pop it becomes the new top frame, so the
-            // callee writes its result exactly where this frame would have.
-            (callee, args, frame.return_register.unwrap())
-        };
-
-        // Discard the current frame with the same cleanup `pop_frame`
-        // performs (release the cold record, return the spilled register
-        // window to the pool) but write no completion value — the tail
-        // callee produces it. The tail-called function correctly does not
-        // appear in the discarded frame's place in any later stack trace.
-        let mut popped = stack.pop().ok_or(VmError::InvalidOperand)?;
-        self.frame_release_cold(&mut popped);
-        self.reclaim_registers(&mut popped);
-
-        self.invoke(stack, context, &callee, Value::undefined(), args, ret_reg)
-    }
-
-    /// Invoke `callee` with the explicit receiver `this_value` and
-    /// the given argument list. Centralizes the BoundFunction
-    /// unwrapping, closure `bound_this` override, and frame push so
-    /// every call opcode (`Op::Call`, `Op::CallWithThis`,
-    /// `Op::CallMethodValue`) shares one path.
+    /// Stage `callee(...args)` with an explicit receiver; the completion is
+    /// delivered to the caller's `dst` when its activation resumes.
     ///
-    /// `dst` is the **caller's** register that should receive the
-    /// completion value when the callee returns. `caller_pc` must
-    /// already be advanced before this call so the post-pop
-    /// dispatch resumes after the originating instruction.
+    /// `caller_pc` must already be advanced so the resumed dispatch continues
+    /// after the originating instruction.
     pub(crate) fn invoke(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
-        // Walk through any number of `bind` layers, accumulating
-        // their bound arguments and overriding `this_value` with
-        // the innermost `bound_this`. The loop bound matches the
-        // JS-call stack-depth limit so a pathological self-bound
-        // chain still surfaces as `StackOverflow` rather than
-        // unbounded recursion.
-        let mut current = *callee;
-        let mut effective_this = this_value;
-        let mut effective_args = args;
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            if let Some(bound) = current.as_bound_function() {
-                hops += 1;
-                let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                let mut combined: SmallVec<[Value; 8]> =
-                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                combined.extend(bound_args);
-                combined.extend(effective_args);
-                effective_this = bound_this;
-                effective_args = combined;
-                current = target;
-                continue;
-            }
-            if current.as_class_constructor().is_some() {
-                // §10.2.1.1 / §10.3.1 — a class constructor's [[Call]]
-                // always throws, including when reached through a
-                // bound-function wrapper or Reflect/Function call
-                // forwarding. Only [[Construct]] may enter it.
-                return Err(self.err_type(
-                    ("Class constructor cannot be invoked without 'new'".to_string()).into(),
-                ));
-            }
-            break;
-        }
-        if current.is_function() || current.is_closure() {
-            let (function_id, this_for_callee, new_target_for_callee, callee_closure) =
-                Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
-            return self.push_bytecode_call_frame(
-                stack,
-                context,
-                callee_closure,
-                function_id,
-                this_for_callee,
-                new_target_for_callee,
-                effective_args,
-                dst,
-            );
-        }
-        // Native callables short-circuit the frame push: invoke
-        // the closure inline, write the result into the caller's
-        // dst, and advance pc on the caller frame. No stack frame
-        // is created — the closure cannot itself push frames.
-        if let Some(obj) = current.as_object()
-            && let Some(native) =
-                crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
-        {
-            let call = native.call_target(&self.gc_heap);
-            self.record_runtime_native_call()?;
-            let realm_global = self.native_target_realm_global(&native);
-            let result = invoke_native_call_with_roots(
-                self,
-                stack,
-                context,
-                call,
-                realm_global,
-                effective_this,
-                &[&current],
-                effective_args.as_slice(),
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        if let Some(native) = current.as_native_function() {
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                // A cross-realm intrinsic (a stamped extra-realm builtin)
-                // runs under its own realm, same as the boxed-native path
-                // below — species lookups and fresh intrinsics resolve
-                // there.
-                let realm_global = self.native_target_realm_global(&native);
-                let result = if let Some(global) = realm_global
-                    && global != self.global_this
-                {
-                    self.with_host_realm_global(global, |interp| {
-                        interp.run_vm_intrinsic_sync_rooted(
-                            stack,
-                            context,
-                            intrinsic,
-                            effective_this,
-                            effective_args,
-                        )
-                    })?
-                } else {
-                    self.run_vm_intrinsic_sync_rooted(
-                        stack,
-                        context,
-                        intrinsic,
-                        effective_this,
-                        effective_args,
-                    )?
-                };
-                let top_idx = stack.len() - 1;
-                write_register(&mut stack[top_idx], dst, result)?;
-                return Ok(());
-            }
-            self.record_runtime_native_call()?;
-            let realm_global = self.native_target_realm_global(&native);
-            let result = invoke_native_call_with_roots(
-                self,
-                stack,
-                context,
-                call,
-                realm_global,
-                effective_this,
-                &[&current],
-                effective_args.as_slice(),
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        // §28.2.4.13 Proxy.[[Call]] — delegate to the `apply`
-        // trap when present; otherwise call through to the
-        // target as a function. Reuse the same-stack rooted dispatcher rather
-        // than materialising an argv array before GetMethod: it captures the
-        // target in a dedicated root slot before the observable trap lookup,
-        // then allocates the arguments array only when a callable trap exists.
-        if current.as_proxy().is_some() {
-            let result = self.run_callable_sync_rooted(
-                stack,
-                context,
-                &current,
-                effective_this,
-                effective_args,
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        let (function_id, this_for_callee, new_target_for_callee, callee_closure) =
-            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
-        self.push_bytecode_call_frame(
-            stack,
-            context,
-            callee_closure,
-            function_id,
-            this_for_callee,
-            new_target_for_callee,
-            effective_args,
-            dst,
-        )
+        stack.stage_call(*callee, this_value, None, args, Some(dst));
+        Ok(())
     }
 
-    /// Handle `Op::New`: allocate a fresh receiver, set its
-    /// `[[Prototype]]` to `callee.prototype` (when present), and
-    /// invoke the callee with `this = receiver`. The caller's `dst`
-    /// register receives either the constructor's returned object
-    /// or the freshly allocated receiver — `pop_frame` performs
-    /// that swap so the unwind path is uniform across call shapes.
+    /// Stage `[[Construct]]` with an explicit `new.target`.
+    pub(crate) fn stage_construct(
+        &mut self,
+        stack: &mut ActivationStack,
+        callee: Value,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) {
+        stack.stage_call(callee, Value::undefined(), Some(new_target), args, Some(dst));
+    }
+
+    /// Handle `Op::New`.
     #[cfg(test)]
     pub(crate) fn do_construct<'a>(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
-        self.do_construct_inner(stack, context, ArgumentOperands::decoded(operands.into()))
+        self.do_construct_inner(stack, ArgumentOperands::decoded(operands.into()))
     }
 
     pub(crate) fn do_construct_exec(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
-        self.do_construct_inner(
-            stack,
-            context,
-            ArgumentOperands::execution(function, instruction),
-        )
+        self.do_construct_inner(stack, ArgumentOperands::execution(function, instruction))
     }
 
-    /// Handle fixed-arity `Op::SuperConstruct`: forward the current derived
-    /// frame's `new.target` while keeping arguments in their canonical caller
-    /// window until the construct dispatch takes ownership.
+    fn do_construct_inner(
+        &mut self,
+        stack: &mut ActivationStack,
+        operands: ArgumentOperands<'_>,
+    ) -> Result<(), VmError> {
+        let dst = operands.register(0)?;
+        let callee_reg = operands.register(1)?;
+        let argc = operands.const_index(2)? as usize;
+        let top_idx = stack.len() - 1;
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let args =
+            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc).to_smallvec8()?;
+        stack[top_idx].advance_pc()?;
+        self.stage_construct(stack, callee, callee, args, dst);
+        Ok(())
+    }
+
+    /// The `new.target` a `super(...)` call forwards: the derived frame's
+    /// own, or the parent constructor itself outside a construct.
+    fn super_new_target(frame: &crate::Frame, callee: Value) -> Value {
+        let target = frame.new_target();
+        if target.is_undefined() { callee } else { target }
+    }
+
+    /// Handle fixed-arity `Op::SuperConstruct`.
     pub(crate) fn do_super_construct_exec(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
         function: &CodeBlock,
         instruction: &crate::CodeBlockInstruction,
     ) -> Result<(), VmError> {
@@ -2321,401 +1191,24 @@ impl Interpreter {
         let argc = operands.const_index(2)? as usize;
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
-            return Err(VmError::NotCallable);
-        }
-        let new_target = self
-            .frame_cold(&stack[top_idx])
-            .and_then(|cold| cold.new_target)
-            .unwrap_or(callee);
-        let args = BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc)
-            .to_smallvec8()?;
-        stack[top_idx].advance_pc()?;
-        self.dispatch_construct_with_new_target(stack, context, callee, new_target, args, dst)
-    }
-
-    fn do_construct_inner(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        operands: ArgumentOperands<'_>,
-    ) -> Result<(), VmError> {
-        let dst = operands.register(0)?;
-        let callee_reg = operands.register(1)?;
-        let argc = operands.const_index(2)?;
-        let top_idx = stack.len() - 1;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
-            return Err(VmError::NotCallable);
-        }
-        stack[top_idx].advance_pc()?;
-        if self.try_dispatch_construct_from_window(
-            stack,
-            context,
-            callee,
-            callee_reg,
-            operands,
-            3,
-            argc as usize,
-            dst,
-        )? {
-            return Ok(());
-        }
+        let new_target = Self::super_new_target(&stack[top_idx], callee);
         let args =
-            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc as usize)
-                .to_smallvec8()?;
-        self.dispatch_construct(stack, context, callee, args, dst)
+            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 3, argc).to_smallvec8()?;
+        stack[top_idx].advance_pc()?;
+        self.stage_construct(stack, callee, new_target, args, dst);
+        Ok(())
     }
 
-    fn try_dispatch_construct_from_window(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee: Value,
-        callee_reg: u16,
-        operands: ArgumentOperands<'_>,
-        first_arg_operand: usize,
-        argc: usize,
-        dst: u16,
-    ) -> Result<bool, VmError> {
-        let mut current = callee;
-        let mut effective_new_target = current;
-        let is_direct_class_construct = current.as_class_constructor().is_some();
-        if let Some(class) = current.as_class_constructor() {
-            current = class.ctor(&self.gc_heap);
-        }
-        if !current.is_function() && !current.is_closure() {
-            return Ok(false);
-        }
-
-        self.record_runtime_construct_call()?;
-        let function_id = current
-            .as_function()
-            .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()));
-        if function_id.is_some_and(|id| {
-            context
-                .for_function(id)
-                .ok()
-                .and_then(|owner| {
-                    owner
-                        .exec_function(id)
-                        .map(|function| function.is_derived_constructor)
-                })
-                .unwrap_or(false)
-        }) {
-            // A derived constructor has no receiver until `super(...)`.
-            // Preserve the caller's stable argument window and push the frame
-            // directly: no prototype lookup, receiver allocation, or Vec copy
-            // belongs at this outer boundary.
-            let top_idx = stack.len() - 1;
-            let frame = {
-                let caller = &stack[top_idx];
-                let args = BytecodeArgumentWindow::from_operands(
-                    caller,
-                    operands,
-                    first_arg_operand,
-                    argc,
-                );
-                self.build_construct_bytecode_frame_from_window(
-                    context,
-                    current,
-                    None,
-                    effective_new_target,
-                    &args,
-                    Some(dst),
-                )?
-            };
-            stack.push(frame);
-            return Ok(true);
-        }
-
-        let proto = self.construct_prototype_for_callee(stack, context, &effective_new_target)?;
-        // An observable getter may have scavenged the caller's callee. Its
-        // register is the canonical traced slot for this fast path; refresh
-        // both values before any later use instead of trusting pre-Get locals.
-        let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
-        effective_new_target = rooted_callee;
-        current = if let Some(class) = rooted_callee.as_class_constructor() {
-            class.ctor(&self.gc_heap)
-        } else {
-            rooted_callee
-        };
-        // OrdinaryCreateFromConstructor — a missing or non-object
-        // `prototype` falls back to %Object.prototype% (§10.1.13).
-        let proto = match proto {
-            Some(proto) => proto,
-            None => self.constructor_prototype_value("Object")?,
-        };
-        // Root every local read after this allocation: a collection here
-        // moves young targets, and `current` / `effective_new_target` feed the
-        // frame build and the cold-frame `new_target` below — an unrooted copy
-        // would wire the constructor chain to a vacated cell. `proto` is parked
-        // on the traced iteration-anchor stack rather than passed as an ad-hoc
-        // value root: the collector rewrites a value root through a shared
-        // reference, which a stack local's register copy can outlive, so the
-        // relocated prototype is read back from the anchor slot instead.
-        // Size the receiver's in-object slots before it exists: the simple
-        // initializer's field count, the baked transition capacity and the
-        // instance size learned from this constructor pair.
-        let bytecode_base_function_id = current
-            .as_function()
-            .or_else(|| current.as_closure(&self.gc_heap).map(|c| c.function_id()))
-            .filter(|&function_id| {
-                context
-                    .exec_function(function_id)
-                    .is_some_and(|function| !function.is_derived_constructor)
-            });
-        let simple_init = if is_direct_class_construct
-            && let Some(function_id) = bytecode_base_function_id
-            && let Some(function) = context.exec_function(function_id)
-        {
-            self.simple_constructor_init(context, function_id, function)
-        } else {
-            None
-        };
-        let reservation = bytecode_base_function_id.map(|function_id| {
-            self.interpreter_construct_reservation(function_id, effective_new_target)
-        });
-        let field_count = simple_init
-            .as_ref()
-            .map_or(0, |init| init.fields.len())
-            .max(reservation.as_ref().map_or(0, |(reserved, _)| *reserved));
-        // The receiver is created on its prototype's lineage; finding the
-        // root never collects.
-        let root = self.value_root(proto)?;
-        let proto_anchor = self.push_iteration_anchor(proto) - 1;
-        let receiver = self.alloc_stack_rooted_object_with_capacity(
-            stack,
-            root,
-            &[&current, &effective_new_target],
-            crate::object::receiver_inline_capacity(field_count),
-        )?;
-        let proto = self.iteration_anchor(proto_anchor);
-        self.pop_iteration_anchors_to(proto_anchor);
-        // Receiver allocation can scavenge as well. Reload the dispatch values
-        // from the caller register before simple-init matching or frame setup.
-        let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
-        effective_new_target = rooted_callee;
-        current = if let Some(class) = rooted_callee.as_class_constructor() {
-            class.ctor(&self.gc_heap)
-        } else {
-            rooted_callee
-        };
-        if is_direct_class_construct
-            && let Some(function_id) = bytecode_base_function_id
-            && simple_init.is_some()
-        {
-            let top_idx = stack.len() - 1;
-            let args_window = BytecodeArgumentWindow::from_operands(
-                &stack[top_idx],
-                operands,
-                first_arg_operand,
-                argc,
-            );
-            let args = args_window.to_smallvec8()?;
-            let init = simple_init.clone();
-            if self.try_finish_simple_constructor_init(
-                stack,
-                function_id,
-                init,
-                receiver,
-                proto,
-                args.as_slice(),
-                dst,
-            )? {
-                return Ok(true);
-            }
-        }
-        // A receiver that runs a constructor body follows the shared storage
-        // contract: reserve the baked and learned slot capacity before the
-        // frame is built, so the body's own stores and those of its callees
-        // land in reserved slots.
-        let receiver = match reservation {
-            Some((reserved_field_count, sample)) => {
-                let receiver = self.finish_interpreter_construct_receiver(
-                    reserved_field_count,
-                    sample,
-                    stack,
-                    callee_reg,
-                    receiver,
-                )?;
-                let rooted_callee = *read_register(&stack[stack.len() - 1], callee_reg)?;
-                effective_new_target = rooted_callee;
-                current = if let Some(class) = rooted_callee.as_class_constructor() {
-                    class.ctor(&self.gc_heap)
-                } else {
-                    rooted_callee
-                };
-                receiver
-            }
-            None => receiver,
-        };
-        let top_idx = stack.len() - 1;
-        let frame = {
-            let caller = &stack[top_idx];
-            let args =
-                BytecodeArgumentWindow::from_operands(caller, operands, first_arg_operand, argc);
-            self.build_construct_bytecode_frame_from_window(
-                context,
-                current,
-                Some(receiver),
-                effective_new_target,
-                &args,
-                Some(dst),
-            )?
-        };
-        stack.push(frame);
-        Ok(true)
-    }
-
-    fn simple_constructor_init(
-        &mut self,
-        context: &ExecutionContext,
-        function_id: u32,
-        function: &CodeBlock,
-    ) -> Option<crate::constructor_fast_path::SimpleConstructorInit> {
-        if let Some(cached) = self.simple_constructor_init_cache.get(&function_id) {
-            return cached.clone();
-        }
-        let init = crate::constructor_fast_path::match_simple_constructor_init(context, function);
-        self.simple_constructor_init_cache
-            .insert(function_id, init.clone());
-        init
-    }
-
-    fn try_finish_simple_constructor_init(
-        &mut self,
-        stack: &mut ActivationStack,
-        function_id: u32,
-        init: Option<crate::constructor_fast_path::SimpleConstructorInit>,
-        receiver: JsObject,
-        proto: Value,
-        args: &[Value],
-        dst: u16,
-    ) -> Result<bool, VmError> {
-        let Some(init) = init else {
-            return Ok(false);
-        };
-        let Some(proto_obj) = proto.as_object() else {
-            return Ok(false);
-        };
-        if init.fields.iter().any(|field| {
-            !matches!(
-                crate::object::lookup(proto_obj, &self.gc_heap, &field.name),
-                crate::object::PropertyLookup::Absent
-            )
-        }) {
-            return Ok(false);
-        }
-
-        let values = init
-            .fields
-            .iter()
-            .map(|field| field.source.resolve(args))
-            .collect::<Vec<_>>();
-
-        let root = crate::object::shape(receiver, &self.gc_heap);
-        let shape = self.simple_constructor_shape(
-            function_id,
-            root,
-            stack,
-            &receiver,
-            proto,
-            values.as_slice(),
-            &init,
-        )?;
-
-        crate::object::install_fresh_shape_with_slots(
-            receiver,
-            &mut self.gc_heap,
-            shape,
-            values.as_slice(),
-            values.len(),
-        );
-
-        let top_idx = stack.len() - 1;
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::object(receiver))?;
-        Ok(true)
-    }
-
-    fn simple_constructor_shape(
-        &mut self,
-        function_id: u32,
-        root: crate::object::ShapeHandle,
-        stack: &ActivationStack,
-        receiver: &crate::object::JsObject,
-        proto: Value,
-        values: &[Value],
-        init: &crate::constructor_fast_path::SimpleConstructorInit,
-    ) -> Result<crate::object::ShapeHandle, VmError> {
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            // The receiver is not yet published to any register; the caller
-            // installs the shape into it right after this call, so it must
-            // survive (and follow) any collection the shape allocs trigger.
-            visitor(receiver as *const crate::object::JsObject as *mut RawGc);
-            proto.trace_value_slots(visitor);
-            for value in values {
-                value.trace_value_slots(visitor);
-            }
-        };
-        self.simple_constructor_shape_with_roots(function_id, root, init, &mut external_visit)
-    }
-
-    /// The final hidden class of a simple constructor's receivers on
-    /// `root`'s lineage, cached per constructor and prototype root.
-    fn simple_constructor_shape_with_roots(
-        &mut self,
-        function_id: u32,
-        root: crate::object::ShapeHandle,
-        init: &crate::constructor_fast_path::SimpleConstructorInit,
-        external_visit: &mut dyn FnMut(&mut dyn FnMut(*mut RawGc)),
-    ) -> Result<crate::object::ShapeHandle, VmError> {
-        let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
-        if let Some(shape) = self
-            .simple_constructor_shape_cache
-            .get(&(function_id, root_id))
-        {
-            return Ok(*shape);
-        }
-
-        let mut shape = root;
-        for field in &init.fields {
-            if let Some(child) = self.shape_runtime.child_if_cached(
-                &self.gc_heap,
-                shape,
-                &field.name,
-                crate::object::PropertyFlags::data_default(),
-                false,
-            ) {
-                shape = child;
-                continue;
-            }
-            shape = self
-                .shape_runtime
-                .child_with_roots(
-                    &mut self.gc_heap,
-                    shape,
-                    &field.name,
-                    crate::object::PropertyFlags::data_default(),
-                    false,
-                    external_visit,
-                )
-                .map_err(VmError::from)?;
-        }
-        self.simple_constructor_shape_cache
-            .insert((function_id, root_id), shape);
-        Ok(shape)
+    fn spread_call_arguments(&self, value: Value) -> Result<SmallVec<[Value; 8]>, VmError> {
+        let array = value.as_array().ok_or(VmError::TypeMismatch)?;
+        Ok(crate::array::with_elements(array, &self.gc_heap, |elements| {
+            elements.iter().copied().collect()
+        }))
     }
 
     pub(crate) fn do_construct_spread(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -2723,25 +1216,15 @@ impl Interpreter {
         let args_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
-            return Err(VmError::NotCallable);
-        }
-        let args_value = *read_register(&stack[top_idx], args_reg)?;
-        let Some(arr) = args_value.as_array() else {
-            return Err(VmError::TypeMismatch);
-        };
-        let args: SmallVec<[Value; 8]> =
-            crate::array::with_elements(arr, &self.gc_heap, |elements| {
-                elements.iter().cloned().collect()
-            });
+        let args = self.spread_call_arguments(*read_register(&stack[top_idx], args_reg)?)?;
         stack[top_idx].advance_pc()?;
-        self.dispatch_construct(stack, context, callee, args, dst)
+        self.stage_construct(stack, callee, callee, args, dst);
+        Ok(())
     }
 
     pub(crate) fn do_super_construct_spread(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -2749,333 +1232,115 @@ impl Interpreter {
         let args_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
-            return Err(VmError::NotCallable);
-        }
-        let new_target = self
-            .frame_cold(&stack[top_idx])
-            .and_then(|c| c.new_target)
-            .unwrap_or(callee);
-        let args_value = *read_register(&stack[top_idx], args_reg)?;
-        let Some(arr) = args_value.as_array() else {
-            return Err(VmError::TypeMismatch);
-        };
-        let args: SmallVec<[Value; 8]> =
-            crate::array::with_elements(arr, &self.gc_heap, |elements| {
-                elements.iter().cloned().collect()
-            });
+        let new_target = Self::super_new_target(&stack[top_idx], callee);
+        let args = self.spread_call_arguments(*read_register(&stack[top_idx], args_reg)?)?;
         stack[top_idx].advance_pc()?;
-        self.dispatch_construct_with_new_target(stack, context, callee, new_target, args, dst)
+        self.stage_construct(stack, callee, new_target, args, dst);
+        Ok(())
     }
 
-    pub(crate) fn dispatch_construct(
+    /// Handle `Op::CallSpread`: the receiver register holds the explicit
+    /// `this` value and the arguments array holds every actual.
+    pub(crate) fn do_call_spread(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee: Value,
-        args: SmallVec<[Value; 8]>,
-        dst: u16,
+        operands: OperandView<'_>,
     ) -> Result<(), VmError> {
-        self.dispatch_construct_with_new_target(stack, context, callee, callee, args, dst)
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let this_reg = register_operand(operands.get(2))?;
+        let args_reg = register_operand(operands.get(3))?;
+        let top_idx = stack.len() - 1;
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let this_value = *read_register(&stack[top_idx], this_reg)?;
+        let args = self.spread_call_arguments(*read_register(&stack[top_idx], args_reg)?)?;
+        stack[top_idx].advance_pc()?;
+        stack.stage_call(callee, this_value, None, args, Some(dst));
+        Ok(())
     }
 
-    fn dispatch_construct_with_new_target(
+    /// Handle `Op::CallWithThis`: `Op::Call` with an explicit receiver
+    /// register.
+    pub(crate) fn do_call_with_this_exec(
+        &mut self,
+        stack: &mut ActivationStack,
+        function: &CodeBlock,
+        instruction: &crate::CodeBlockInstruction,
+    ) -> Result<(), VmError> {
+        let operands = ArgumentOperands::execution(function, instruction);
+        let dst = operands.register(0)?;
+        let callee_reg = operands.register(1)?;
+        let this_reg = operands.register(2)?;
+        let argc = operands.const_index(3)? as usize;
+        let top_idx = stack.len() - 1;
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let this_value = *read_register(&stack[top_idx], this_reg)?;
+        let args =
+            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 4, argc).to_smallvec8()?;
+        stack[top_idx].advance_pc()?;
+        stack.stage_call(callee, this_value, None, args, Some(dst));
+        Ok(())
+    }
+
+    /// Synchronously invoke `callee(args)` with the given `this` and return
+    /// its completion, from a host callback with no enclosing turn.
+    pub fn run_callable_sync(
+        &mut self,
+        context: &ExecutionContext,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        let mut activations = ActivationStack::new();
+        self.with_runtime_turn(&mut activations, |turn| {
+            let (interp, stack) = turn.into_parts();
+            interp.run_callable_sync_rooted(stack, context, callee, this_value, args)
+        })
+    }
+
+    /// Synchronously invoke a callable above the current activation floor.
+    ///
+    /// The request enters the same classifying trampoline as a bytecode call;
+    /// this host callback retains only its own Rust frame while it runs.
+    pub(crate) fn run_callable_sync_rooted(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        callee: Value,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        if !stack.is_runtime_rooted_by(self) {
+            return Err(VmError::InvalidOperand);
+        }
+        self.enter_sync_reentry()?;
+        let floor = stack.floor();
+        stack.stage_call(*callee, this_value, None, args, None);
+        let result = self.execute_prepared_call(context, stack);
+        self.release_frames_above(stack, floor);
+        self.leave_sync_reentry();
+        result
+    }
+
+    /// Synchronously construct above the current rooted activation floor.
+    pub(crate) fn run_construct_sync_rooted(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        target: &Value,
         new_target: Value,
         args: SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        self.record_runtime_construct_call()?;
-        let roots = SyncJsCallRoots::construct(callee, new_target, args);
-        let _roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            if let Some(bound) = roots.target().as_bound_function() {
-                hops += 1;
-                let current = roots.target();
-                let effective_new_target = roots.new_target.get();
-                let (target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
-                roots.prepend_args(bound_args.as_slice());
-                if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
-                    roots.new_target.set(target);
-                }
-                roots.current.set(target);
-                continue;
-            }
-
-            // §28.2.4.14 Proxy.[[Construct]]. Keep the proxy, handler,
-            // new.target, and arguments in the registered slots through the
-            // observable trap lookup. A missing trap continues this same
-            // direct dispatch loop instead of synchronously executing a
-            // bytecode target.
-            if roots.target().as_proxy().is_some() {
-                hops += 1;
-                let proxy = roots
-                    .target()
-                    .as_proxy()
-                    .expect("checked direct construct proxy");
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(self.err_type(
-                        ("Cannot perform 'construct' on a revoked proxy".to_string()).into(),
-                    ));
-                }
-                // Proxy.[[Construct]] captures [[ProxyTarget]] before the
-                // observable GetMethod(handler, "construct"). The getter may
-                // revoke the proxy; both trap dispatch and the missing-trap
-                // fallback must still use this rooted pre-Get target.
-                roots.proxy_target.set(proxy.target(&self.gc_heap));
-                roots.scratch_0.set(proxy.handler(&self.gc_heap));
-                let trap_key = VmPropertyKey::String("construct");
-                let trap_value = {
-                    let handler = roots.scratch_0.get();
-                    match self.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
-                        VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => {
-                            let handler = roots.scratch_0.get();
-                            self.run_callable_sync_rooted(
-                                stack,
-                                context,
-                                &getter,
-                                handler,
-                                SmallVec::new(),
-                            )?
-                        }
-                    }
-                };
-                roots.scratch_1.set(trap_value);
-                if self.is_callable_runtime(&roots.scratch_1.get()) {
-                    // Move only at the root-aware array allocation boundary.
-                    // Its slice visitor rewrites this exact owned buffer; park
-                    // it back in the canonical slot before the observable
-                    // trap call.
-                    let effective_args = roots.take_args();
-                    let current = roots.target();
-                    let effective_new_target = roots.new_target.get();
-                    let handler = roots.scratch_0.get();
-                    let trap = roots.scratch_1.get();
-                    let argv_array = self.alloc_stack_rooted_array_from_values(
-                        stack,
-                        effective_args.iter().copied(),
-                        &[&current, &effective_new_target, &handler, &trap],
-                        effective_args.as_slice(),
-                    )?;
-                    roots.replace_args(effective_args);
-                    // Reload every value used after the allocation from its
-                    // collector-rewritten slot.
-                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                        roots.proxy_target.get(),
-                        Value::array(argv_array),
-                        roots.new_target.get(),
-                    ];
-                    let result = self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &roots.scratch_1.get(),
-                        roots.scratch_0.get(),
-                        trap_args,
-                    )?;
-                    if !result.is_object_type() {
-                        return Err(self.err_type(
-                            ("Proxy construct trap returned non-object".to_string()).into(),
-                        ));
-                    }
-                    let top_idx = stack.len() - 1;
-                    write_register(&mut stack[top_idx], dst, result)?;
-                    return Ok(());
-                }
-                if roots.scratch_1.get().is_nullish() {
-                    let target = roots.proxy_target.get();
-                    roots.current.set(target);
-                    roots.proxy_target.set(Value::undefined());
-                    roots.scratch_0.set(Value::undefined());
-                    roots.scratch_1.set(Value::undefined());
-                    continue;
-                }
-                return Err(
-                    self.err_type(("Proxy construct trap is not callable".to_string()).into())
-                );
-            }
-            break;
+    ) -> Result<Value, VmError> {
+        if !stack.is_runtime_rooted_by(self) {
+            return Err(VmError::InvalidOperand);
         }
-
-        // A derived bytecode constructor creates no receiver until its
-        // `super(...)` call. In particular, do not observe
-        // `new.target.prototype` or allocate a throwaway object at this outer
-        // boundary; the direct super-construct path below will perform the
-        // one OrdinaryCreateFromConstructor operation with the same rooted
-        // new.target.
-        let bytecode_callee = if let Some(class) = roots.target().as_class_constructor() {
-            class.ctor(&self.gc_heap)
-        } else {
-            roots.target()
-        };
-        if let Ok(function_id) =
-            Self::bytecode_construct_target_function_id(bytecode_callee, &self.gc_heap)
-            && context
-                .exec_function(function_id)
-                .is_some_and(|function| function.is_derived_constructor)
-        {
-            let new_target = roots.new_target.get();
-            let args = roots.take_args();
-            let frame = self.build_construct_bytecode_frame(
-                context,
-                bytecode_callee,
-                None,
-                new_target,
-                args,
-                Some(dst),
-            )?;
-            stack.push(frame);
-            return Ok(());
-        }
-
-        if let Some(native) = self.native_receiverless_constructor(&roots.target()) {
-            let new_target = roots.new_target.get();
-            let args = roots.take_args();
-            let constructed = self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &Value::undefined(),
-                &new_target,
-                false,
-                args.as_slice(),
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        // Allocate receiver and link its prototype before pushing
-        // the new frame. The constructor might mutate the receiver
-        // immediately, so the prototype link must already be in
-        // place.
-        let new_target = roots.new_target.get();
-        let proto = self.construct_prototype_for_callee(stack, context, &new_target)?;
-        let used_object_prototype_fallback = proto.is_none();
-        // OrdinaryCreateFromConstructor — a missing or non-object
-        // `prototype` falls back to %Object.prototype% (§10.1.13).
-        let proto = match proto {
-            Some(proto) => proto,
-            None => self.constructor_prototype_value("Object")?,
-        };
-        roots.scratch_0.set(proto);
-        let receiver = self.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
-        roots.receiver.set(Value::object(receiver));
-        let proto = roots.scratch_0.get();
-        crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        // Built-in constructor objects (`Number`, `Boolean`, …)
-        // surface as a `Value::Object` with an internal native
-        // constructor slot. Promote to the native-function construct
-        // path so the JS-visible callee can also carry own
-        // properties (statics + `prototype`) without leaking the
-        // implementation slot through reflection.
-        if let Some(obj) = roots.target().as_object()
-            && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
-                .and_then(|v| v.as_native_function())
-        {
-            let this_value = roots.receiver.get();
-            let new_target = roots.new_target.get();
-            let args = roots.take_args();
-            let constructed = self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &this_value,
-                &new_target,
-                used_object_prototype_fallback,
-                args.as_slice(),
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        // `Value::NativeFunction` carries `[[Construct]]` whenever
-        // the runtime needs the callable to behave as a constructor
-        // (e.g. `new Number(x)`). The native callback inspects
-        // `NativeCtx::is_construct_call()` to differentiate the
-        // call shape.
-        if let Some(native) = roots.target().as_native_function() {
-            let this_value = roots.receiver.get();
-            let new_target = roots.new_target.get();
-            let args = roots.take_args();
-            let constructed = self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &this_value,
-                &new_target,
-                used_object_prototype_fallback,
-                args.as_slice(),
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        if let Some(class) = roots.target().as_class_constructor()
-            && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
-        {
-            let this_value = roots.receiver.get();
-            let new_target = roots.new_target.get();
-            let args = roots.take_args();
-            let constructed = self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &this_value,
-                &new_target,
-                used_object_prototype_fallback,
-                args.as_slice(),
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        let bytecode_callee = if let Some(class) = roots.target().as_class_constructor() {
-            class.ctor(&self.gc_heap)
-        } else {
-            roots.target()
-        };
-        if bytecode_callee.is_function() || bytecode_callee.is_closure() {
-            let receiver = roots
-                .receiver
-                .get()
-                .as_object()
-                .ok_or(VmError::TypeMismatch)?;
-            let new_target = roots.new_target.get();
-            let args = roots.take_args();
-            let frame = self.build_construct_bytecode_frame(
-                context,
-                bytecode_callee,
-                Some(receiver),
-                new_target,
-                args,
-                Some(dst),
-            )?;
-            stack.push(frame);
-            return Ok(());
-        }
-        let callee = roots.target();
-        let this_value = roots.receiver.get();
-        let args = roots.take_args();
-        self.invoke(stack, context, &callee, this_value, args, dst)?;
-        // The pushed frame is now on top; mark it so `pop_frame`
-        // can substitute the receiver for any non-object return.
-        if let Some(top) = stack.last_mut() {
-            let cold = self.frame_ensure_cold(top);
-            cold.construct_target = roots.receiver.get().as_object();
-            cold.new_target = Some(roots.new_target.get());
-        }
-        Ok(())
+        self.enter_sync_reentry()?;
+        let floor = stack.floor();
+        stack.stage_call(*target, Value::undefined(), Some(new_target), args, None);
+        let result = self.execute_prepared_call(context, stack);
+        self.release_frames_above(stack, floor);
+        self.leave_sync_reentry();
+        result
     }
 
     pub(crate) fn construct_prototype_for_callee(
@@ -3175,8 +1440,11 @@ impl Interpreter {
     /// dynamic-function constructors (`Function` and friends) parse
     /// their source and only then run `GetPrototypeFromConstructor`
     /// (§20.2.1.1.1) — an eager `new.target.prototype` read here would
-    /// be observable before the SyntaxError a bad body must throw.
-    fn native_receiverless_constructor(&self, callee: &Value) -> Option<NativeFunction> {
+    /// be observable before the SyntaxError a bad body must throw. The
+    /// buffer, view and typed-array constructors validate their arguments
+    /// before `OrdinaryCreateFromConstructor` (§25.1.4.1, §25.3.2.1,
+    /// §23.2.5.1) and allocate their own exotic result.
+    pub(crate) fn native_receiverless_constructor(&self, callee: &Value) -> Option<NativeFunction> {
         let native = if let Some(native) = callee.as_native_function() {
             native
         } else {
@@ -3198,38 +1466,25 @@ impl Interpreter {
             "RegExp",
             "WeakRef",
             "FinalizationRegistry",
+            "ArrayBuffer",
+            "SharedArrayBuffer",
+            "DataView",
+            "Int8Array",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "Float16Array",
+            "Float32Array",
+            "Float64Array",
+            "BigInt64Array",
+            "BigUint64Array",
         ]
         .iter()
         .any(|expected| native.name(&self.gc_heap).eq_str(expected, &self.gc_heap))
         .then_some(native)
-    }
-
-    /// Handle `Op::CallSpread`: read the args array, fan it out
-    /// into the standard call path. The receiver register holds
-    /// the explicit `this` value (foundation lowers free spread
-    /// calls with `this = undefined`).
-    pub(crate) fn do_call_spread(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        operands: OperandView<'_>,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let this_reg = register_operand(operands.get(2))?;
-        let args_reg = register_operand(operands.get(3))?;
-        let top_idx = stack.len() - 1;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)?;
-        let args_array = read_register(&stack[top_idx], args_reg)?
-            .as_array()
-            .ok_or(VmError::TypeMismatch)?;
-        let args: SmallVec<[Value; 8]> =
-            crate::array::with_elements(args_array, &self.gc_heap, |elements| {
-                elements.iter().cloned().collect()
-            });
-        stack[top_idx].advance_pc()?;
-        self.invoke(stack, context, &callee, this_value, args, dst)
     }
 
     /// Handle `Op::CallForwardArguments`: `callee.apply(this_arg, arguments)`
@@ -3271,19 +1526,18 @@ impl Interpreter {
             if !self.is_callable_runtime(&callee) {
                 return Err(VmError::NotCallable);
             }
-            let existing = self
-                .frame_cold(&stack[top_idx])
-                .and_then(|cold| cold.arguments_object);
+            let existing = stack[top_idx].arguments_object().map(Value::object);
             let forwarded = if let Some(arguments) = existing {
                 self.create_list_from_array_like(stack, context, arguments)?
             } else {
-                let mut forwarded: SmallVec<[Value; 8]> = self
-                    .frame_cold(&stack[top_idx])
-                    .map(|cold| cold.incoming_args.iter().copied().collect())
-                    .unwrap_or_default();
+                let view = crate::ActiveFrameRef::from_frame(&stack[top_idx]);
+                let count = view.incoming_argument_count();
+                let mut forwarded: SmallVec<[Value; 8]> = (0..count)
+                    .map(|index| view.incoming_argument(index))
+                    .collect::<Result<_, _>>()?;
                 self.refresh_mapped_argument_values(
                     function,
-                    &crate::ActiveFrameRef::materialized(&stack[top_idx]),
+                    &crate::ActiveFrameRef::from_frame(&stack[top_idx]),
                     &mut forwarded,
                 )?;
                 forwarded
@@ -3302,1143 +1556,5 @@ impl Interpreter {
         stack[top_idx].advance_pc()?;
         let args: SmallVec<[Value; 8]> = [this_value, arguments_object].into_iter().collect();
         self.invoke(stack, context, &method, callee, args, dst)
-    }
-
-    /// Handle `Op::CallWithThis`: same as `do_call` but the call
-    /// site supplies an explicit `this` register. Used by
-    /// `Function.prototype.call` lowering and the array-literal
-    /// path of `Function.prototype.apply`.
-    pub(crate) fn do_call_with_this_exec(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
-        function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
-    ) -> Result<(), VmError> {
-        self.do_call_with_this_inner(
-            stack,
-            context,
-            owner_cache,
-            ArgumentOperands::execution(function, instruction),
-        )
-    }
-
-    fn do_call_with_this_inner(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        owner_cache: &mut FunctionOwnerCache,
-        operands: ArgumentOperands<'_>,
-    ) -> Result<(), VmError> {
-        let dst = operands.register(0)?;
-        let callee_reg = operands.register(1)?;
-        let this_reg = operands.register(2)?;
-        let argc = operands.const_index(3)?;
-        let top_idx = stack.len() - 1;
-        let callee = *read_register(&stack[top_idx], callee_reg)?;
-        let this_value = *read_register(&stack[top_idx], this_reg)?;
-        stack[top_idx].advance_pc()?;
-        if self.try_push_bytecode_call_frame_from_window(
-            stack,
-            context,
-            owner_cache,
-            &callee,
-            this_value,
-            operands,
-            4,
-            argc as usize,
-            dst,
-        )? {
-            return Ok(());
-        }
-        if self.try_invoke_native_call_from_window(
-            stack,
-            context,
-            &callee,
-            this_value,
-            operands,
-            4,
-            argc as usize,
-            dst,
-        )? {
-            return Ok(());
-        }
-        let args =
-            BytecodeArgumentWindow::from_operands(&stack[top_idx], operands, 4, argc as usize)
-                .to_smallvec8()?;
-        self.invoke(stack, context, &callee, this_value, args, dst)
-    }
-    /// Synchronously invoke `callee(args)` with the given `this` and
-    /// return the completion value.
-    ///
-    /// # Algorithm
-    /// 1. NativeFunction callees run inline — the foundation native
-    ///    surface is `Fn`, so calling them here is just a function
-    ///    pointer hop with `&mut self` access.
-    /// 2. BoundFunction layers are unwrapped iteratively, prepending
-    ///    bound args and replacing `this_value` with `bound_this`.
-    /// 3. Bytecode / closure callees push a frame whose
-    ///    `return_register` is `None`, which makes
-    ///    [`Self::dispatch_loop`] return the completion value when
-    ///    the frame pops.
-    ///
-    /// Used by collection `forEach` and other host-driven iteration
-    /// helpers.
-    pub fn run_callable_sync(
-        &mut self,
-        context: &ExecutionContext,
-        callee: &Value,
-        this_value: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        let mut activations = ActivationStack::new();
-        self.with_runtime_turn(&mut activations, |turn| {
-            let (interp, stack) = turn.into_parts();
-            interp.run_callable_sync_rooted(stack, context, callee, this_value, args)
-        })
-    }
-
-    /// Synchronously invoke a callable above the current activation floor.
-    ///
-    /// The exact stack is already published by the enclosing [`RuntimeTurn`].
-    /// Nested execution appends to it and releases back to the captured floor;
-    /// it never installs another frame provider or draws a detached stack.
-    pub(crate) fn run_callable_sync_rooted(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        callee: &Value,
-        this_value: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        if !stack.is_runtime_rooted_by(self) {
-            return Err(VmError::InvalidOperand);
-        }
-        self.enter_sync_reentry()?;
-        let floor = stack.floor();
-        let roots = SyncJsCallRoots::call(*callee, this_value, args);
-        let roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_callable_sync_inner_rooted(stack, context, &roots);
-        drop(roots_guard);
-        self.release_frames_above(stack, floor);
-        self.leave_sync_reentry();
-        result
-    }
-
-    fn run_callable_sync_inner_rooted(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        roots: &SyncJsCallRoots,
-    ) -> Result<Value, VmError> {
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            if let Some(bound) = roots.current.get().as_bound_function() {
-                hops += 1;
-                let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                let effective_args = roots.take_args();
-                let mut combined: SmallVec<[Value; 8]> =
-                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                combined.extend(bound_args);
-                combined.extend(effective_args);
-                roots.receiver.set(bound_this);
-                roots.replace_args(combined);
-                roots.current.set(target);
-            } else if roots.current.get().as_class_constructor().is_some() {
-                // §10.3.1 — class constructors reject [[Call]].
-                return Err(self.err_type(
-                    ("Class constructor cannot be invoked without 'new'".to_string()).into(),
-                ));
-            } else if let Some(proxy) = roots.current.get().as_proxy() {
-                // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
-                // fall through to target.[[Call]] when the trap is
-                // absent.
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(self.err_type(
-                        ("Cannot perform 'apply' on a proxy that has been revoked".to_string())
-                            .into(),
-                    ));
-                }
-                hops += 1;
-                // §10.5.12 captures [[ProxyTarget]] before observable
-                // GetMethod(handler, "apply"), just like [[Construct]] below.
-                roots.proxy_target.set(proxy.target(&self.gc_heap));
-                roots.scratch_0.set(proxy.handler(&self.gc_heap));
-                let trap_key = VmPropertyKey::String("apply");
-                let trap_value = {
-                    let handler = roots.scratch_0.get();
-                    match self.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
-                        VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => {
-                            let handler = roots.scratch_0.get();
-                            self.run_callable_sync_rooted(
-                                stack,
-                                context,
-                                &getter,
-                                handler,
-                                SmallVec::new(),
-                            )?
-                        }
-                    }
-                };
-                roots.scratch_1.set(trap_value);
-                if self.is_callable_runtime(&trap_value) {
-                    let effective_args = roots.take_args();
-                    let current = roots.current.get();
-                    let effective_this = roots.receiver.get();
-                    let handler = roots.scratch_0.get();
-                    let trap_value = roots.scratch_1.get();
-                    let argv_array = self.alloc_runtime_rooted_array_from_values(
-                        effective_args.iter().copied(),
-                        &[&current, &effective_this, &handler, &trap_value],
-                        &[effective_args.as_slice()],
-                    )?;
-                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                        roots.proxy_target.get(),
-                        roots.receiver.get(),
-                        Value::array(argv_array),
-                    ];
-                    return self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &roots.scratch_1.get(),
-                        roots.scratch_0.get(),
-                        trap_args,
-                    );
-                } else if trap_value.is_undefined() || trap_value.is_null() {
-                    roots.current.set(roots.proxy_target.get());
-                    roots.proxy_target.set(Value::undefined());
-                } else {
-                    return Err(
-                        self.err_type(("Proxy apply trap is not callable".to_string()).into())
-                    );
-                }
-            } else {
-                break;
-            }
-        }
-        if let Some(obj) = roots.current.get().as_object()
-            && let Some(native) =
-                crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
-        {
-            let call = native.call_target(&self.gc_heap);
-            self.record_runtime_native_call()?;
-            let realm_global = self.native_target_realm_global(&native);
-            let current = roots.current.get();
-            let receiver = roots.receiver.get();
-            let args = roots.take_args();
-            return invoke_native_call_with_roots(
-                self,
-                stack,
-                context,
-                call,
-                realm_global,
-                receiver,
-                &[&current],
-                args.as_slice(),
-            );
-        }
-        if let Some(native) = roots.current.get().as_native_function() {
-            let native = &native;
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                let receiver = roots.receiver.get();
-                let args = roots.take_args();
-                // A stamped cross-realm intrinsic runs under its own
-                // realm, same as the boxed-native path below.
-                let realm_global = self.native_target_realm_global(native);
-                if let Some(global) = realm_global
-                    && global != self.global_this
-                {
-                    return self.with_host_realm_global(global, |interp| {
-                        interp
-                            .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args)
-                    });
-                }
-                return self
-                    .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
-            }
-            self.record_runtime_native_call()?;
-            let realm_global = self.native_target_realm_global(native);
-            let current = roots.current.get();
-            let receiver = roots.receiver.get();
-            let args = roots.take_args();
-            return invoke_native_call_with_roots(
-                self,
-                stack,
-                context,
-                call,
-                realm_global,
-                receiver,
-                &[&current],
-                args.as_slice(),
-            );
-        }
-        self.run_bytecode_callable_committed_rooted(stack, context, roots)
-    }
-
-    /// Build and run the bytecode-callable frame for `current` on `inner` — the
-    /// committed tail of [`Self::run_callable_sync_inner`] once the
-    /// bound/proxy/native dispatch loop has resolved to a plain bytecode
-    /// function/closure.
-    ///
-    /// Extracted (not duplicated) so a hot native callback loop can reuse one
-    /// prepared callback state across elements instead of drawing/returning a
-    /// pooled stack, resolving closure metadata, and walking bound/proxy/native
-    /// wrappers per call. The state owns its reservation-stable stack; this
-    /// method leaves that stack empty on every completion path (the callee frame
-    /// is popped), so it is immediately reusable for the next call.
-    /// If `callback` is a plain bytecode function/closure eligible for the lean
-    /// per-element invoke path (not native/bound/proxy/generator/async/…), enter
-    /// the sync-reentry guard once, draw one reservation-stable stack, and push
-    /// the resolved callback metadata onto the interpreter's traced root stack;
-    /// otherwise `None`. The caller invokes the callback with the returned
-    /// state per element, and MUST pass the state to
-    /// [`Self::release_lean_callback_stack`] on every completion path.
-    /// `function_id` is shape-stable, so resolving eligibility once is valid for
-    /// the whole loop.
-    pub(crate) fn acquire_lean_callback_stack(
-        &mut self,
-        context: &ExecutionContext,
-        callback: Value,
-    ) -> Option<LeanCallbackState> {
-        let root = LeanCallbackRoot::from_callback(callback, &self.gc_heap)?;
-        let owner = context.for_function(root.function_id).ok()?;
-        let function = owner.exec_function(root.function_id).filter(|f| {
-            !f.is_generator
-                && !f.is_async
-                && !f.is_async_generator
-                && !f.needs_arguments
-                && !f.has_rest
-                && !f.makes_function
-                && !f.contains_direct_eval
-                && !f.is_derived_constructor
-        })?;
-        let register_count = function.register_count as usize;
-        let param_count = function.param_count as usize;
-        let this_passthrough = function.is_strict || function.is_arrow;
-        // A callback with no bound `new.target` needs no pooled cold record, so
-        // its per-element frame is a flat register window the prepared fast
-        // path can recycle in place. Its contexts are no obstacle: the body's
-        // own `CreateContext` prologue allocates fresh ones on every reuse,
-        // and its incoming context is SELF's, which reuse keeps.
-        let fast_reuse = root.bound_new_target.is_none();
-        if self.enter_sync_reentry().is_ok() {
-            let root_index = self.lean_callback_roots.len();
-            let function_id = root.function_id;
-            self.lean_callback_roots.push(root);
-            Some(LeanCallbackState {
-                root_index,
-                function_id,
-                context: (*owner).clone(),
-                register_count,
-                param_count,
-                this_passthrough,
-                fast_reuse,
-                compiled: None,
-                reuse_frame: None,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Release the lean-path state and leave the sync-reentry guard entered by
-    /// [`Self::acquire_lean_callback_stack`]. No-op for `None`.
-    pub(crate) fn release_lean_callback_stack(&mut self, state: Option<LeanCallbackState>) {
-        if let Some(mut state) = state {
-            // Return the recycled frame's spilled register backing to the pool;
-            // an inline window is dropped with the frame.
-            if let Some(mut frame) = state.reuse_frame.take() {
-                self.frame_release_cold(&mut frame);
-                self.reclaim_registers(&mut frame);
-            }
-            let root = self
-                .lean_callback_roots
-                .pop()
-                .expect("lean callback root stack underflow");
-            debug_assert_eq!(
-                root.function_id, state.function_id,
-                "lean callback roots must release in LIFO order"
-            );
-            self.leave_sync_reentry();
-        }
-    }
-
-    fn run_bytecode_callable_committed_rooted(
-        &mut self,
-        inner: &mut ActivationStack,
-        context: &ExecutionContext,
-        roots: &SyncJsCallRoots,
-    ) -> Result<Value, VmError> {
-        let (function_id, this_for_callee, _, _) = Self::bytecode_call_target_parts(
-            roots.target(),
-            roots.receiver_value(),
-            &self.gc_heap,
-        )?;
-        roots.set_receiver(this_for_callee);
-        let owner = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let context = &*owner;
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // §27.7.5.1 async-call entry for the synchronous re-entry path — a
-        // builtin invoking a user async function (e.g. the `Otter.serve`
-        // dispatch calling the fetch handler). Mirror the opcode call path:
-        // synthesise the pending result promise now and park the frame with
-        // `async_state` so its completion settles that promise. Without this
-        // an async callee runs as a plain frame and its first `Op::Await`
-        // finds a frame with no `async_state`, which `do_await` reports as
-        // `VmError::InvalidOperand`. The promise is allocated before receiver
-        // coercion (which also allocates), rooting the raw receiver and
-        // arguments exactly as the opcode path does.
-        let is_plain_async = function.is_async && !function.is_generator;
-        let async_result_promise = if is_plain_async {
-            Some(
-                promise_dispatch::PromiseBuilder::with_context(context.clone())
-                    .pending_stack_rooted(self, inner, &[], &[])?,
-            )
-        } else {
-            None
-        };
-        // The promise allocation above can collect. Read the target parts
-        // again from the registered target instead of using a detached
-        // pre-allocation snapshot.
-        let (_, this_for_callee, _, _) = Self::bytecode_call_target_parts(
-            roots.target(),
-            roots.receiver_value(),
-            &self.gc_heap,
-        )?;
-        roots.set_receiver(this_for_callee);
-        let this_for_callee =
-            self.this_for_bytecode_call_runtime_rooted(function, roots.receiver_value(), &[])?;
-        roots.set_receiver(this_for_callee);
-        let (_, _, new_target_for_callee, _) = Self::bytecode_call_target_parts(
-            roots.target(),
-            roots.receiver_value(),
-            &self.gc_heap,
-        )?;
-        let _window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut new_frame = Frame::for_code_block(
-            function,
-            None,
-            roots.target(),
-            roots.receiver_value(),
-            window,
-        );
-        if let Some(result_promise) = async_result_promise {
-            self.frame_set_async_state(
-                &mut new_frame,
-                crate::frame_state::AsyncFrameState { result_promise },
-            );
-        }
-        if let Some(new_target) = new_target_for_callee {
-            let cold = self.frame_ensure_cold(&mut new_frame);
-            cold.new_target = Some(new_target);
-        }
-        self.bind_bytecode_call_arguments(function, &mut new_frame, roots.take_args())?;
-        // §27.5.1 GeneratorFunction call evaluation returns a
-        // generator object without executing the body. `invoke`
-        // handles this for opcode calls; the synchronous re-entry
-        // helper must mirror it for builtins that call user
-        // functions, such as `GetSetRecord(...).[[Keys]]`.
-        // <https://tc39.es/ecma262/#sec-generatorfunction-objects>
-        if function.is_generator {
-            new_frame.return_register = None;
-            let async_gen = function.is_async_generator;
-            let cold = self.frame_detach_cold(&mut new_frame);
-            let new_frame = self.park_active_frame(new_frame);
-            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
-                &mut self.gc_heap,
-                new_frame,
-                cold,
-                None,
-            )?;
-            gen_handle.set_async(&mut self.gc_heap, async_gen);
-            gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            roots.set_scratch(0, Value::generator(gen_handle));
-            // §27.5 — run the generator prologue (mirroring the opcode
-            // `invoke` path) so the handle is primed to its
-            // suspended-start state. Without it a generator created
-            // through a builtin's synchronous re-entry (e.g. an
-            // `@@iterator` that is a generator function, driven by
-            // `Array.from` / `GetSetRecord` / the iterator helpers) is
-            // never started and reports `done` on its first `next`.
-            let result = (|| -> Result<Value, VmError> {
-                let gen_handle = roots
-                    .scratch(0)
-                    .as_generator()
-                    .ok_or(VmError::InvalidOperand)?;
-                let (frame, cold) = gen_handle
-                    .take_frame(&mut self.gc_heap)
-                    .ok_or(VmError::InvalidOperand)?;
-                let mut frame = self.resume_parked_frame(*frame)?;
-                if let Some(cold) = cold {
-                    self.frame_attach_cold(&mut frame, cold);
-                }
-                let prologue_floor = inner.floor();
-                inner.push(frame);
-                let prologue = self.dispatch_loop_above_rooted(context, inner, prologue_floor);
-                self.release_frames_above(inner, prologue_floor);
-                prologue?;
-                // §27.5.1 step 3 — resolve [[Prototype]] after the
-                // prologue (FunctionDeclarationInstantiation) ran, through
-                // the invoked closure's bag so the generator's prototype is
-                // the same object later `fn.prototype` reads observe.
-                let proto = self.function_property_get(
-                    inner,
-                    context,
-                    roots.target().as_closure(&self.gc_heap),
-                    function_id,
-                    "prototype",
-                )?;
-                let gen_handle = roots
-                    .scratch(0)
-                    .as_generator()
-                    .ok_or(VmError::InvalidOperand)?;
-                gen_handle.set_prototype_override(
-                    &mut self.gc_heap,
-                    proto.as_object().is_some().then_some(proto),
-                );
-                Ok(roots.scratch(0))
-            })();
-            roots.set_scratch(0, Value::undefined());
-            return result;
-        }
-        // The caller owns `inner` (a reservation-stable pooled stack): the entry
-        // frame may tier up and run compiled, and a compiled callee appends its
-        // frame directly onto this stack, so it must never reallocate. The frame
-        // is popped on every completion path, leaving `inner` empty + reusable.
-        let entry_floor = inner.floor();
-        inner.push(new_frame);
-        if let Some(result_promise) = async_result_promise {
-            // The async frame runs to its first `await` (which parks it off
-            // `inner`) or to completion (which settles the promise and pops
-            // the frame); either way `inner` is left empty and the dispatch
-            // loop returns. This call's value is the result promise, not the
-            // loop's terminal frame value. A suspending frame must never take
-            // the compiled sync-entry path, whose fast tier assumes the entry
-            // frame cannot suspend.
-            self.dispatch_loop_above_rooted(context, inner, entry_floor)?;
-            return Ok(Value::promise(result_promise));
-        }
-        // Tier-up the entry frame itself: a synchronously-entered callee reaches
-        // `dispatch_loop` directly (no `Op::Call`), so without this hook the
-        // entry level would always interpret while only its sub-calls JIT. This
-        // lets a hot recursion run compiled→compiled with no interpreted levels.
-        if let Some(value) = self.dispatch_jit_sync_entry(inner, context, entry_floor)? {
-            // The compiled entry frame ran to completion and is terminal
-            // (the integer subset cannot suspend or escape its frame), so
-            // return its spilled register window and its cold record to their
-            // pools. Reclaiming only the window left the cold slot acquired
-            // forever, and the collector traces the whole pool on every
-            // collection — a JIT-heavy run grew it without bound.
-            if let Some(mut done) = inner.pop() {
-                self.frame_release_cold(&mut done);
-                self.reclaim_registers(&mut done);
-            }
-            return Ok(value);
-        }
-        self.dispatch_loop_above_rooted(context, inner, entry_floor)
-    }
-
-    pub(crate) fn run_bytecode_callable_committed_lean_args(
-        &mut self,
-        stack: &mut ActivationStack,
-        state: &mut LeanCallbackState,
-        _context: &ExecutionContext,
-        effective_this: Value,
-        effective_args: &[Value],
-    ) -> Result<Value, VmError> {
-        let context = state.context.clone();
-        // Prepared fast path: a callback that needs no pooled cold record
-        // resolves its compiled body once and then re-enters that body with a
-        // recycled frame, so per element only the receiver coercion (cached),
-        // the SELF refresh, the register reset, and the argument bind run —
-        // no per-element frame allocation, register draw, tier probe, or
-        // dispatch envelope.
-        if state.fast_reuse {
-            let already_compiled = state.compiled.is_some();
-            if state.compiled.is_none() {
-                state.compiled = self.resolve_jit_code_for_fid(&context, state.function_id);
-            }
-            if let Some(code) = state.compiled.clone() {
-                if already_compiled {
-                    self.note_jit_function_entry(state.function_id);
-                }
-                return self.invoke_prepared_lean(
-                    stack,
-                    state,
-                    &context,
-                    &code,
-                    effective_this,
-                    effective_args,
-                );
-            }
-            // Still cold (below the tier-up threshold). The probe above already
-            // advanced the counter, so interpret this element directly without
-            // re-probing through the synchronous-entry path.
-            return self.invoke_cold_lean(
-                stack,
-                state,
-                &context,
-                effective_this,
-                effective_args,
-                false,
-            );
-        }
-        // Callback carries a bound `new.target`: build a fresh frame per
-        // element and tier up through
-        // the synchronous-entry path as before.
-        self.invoke_cold_lean(stack, state, &context, effective_this, effective_args, true)
-    }
-
-    /// Re-enter the callback's already-compiled body with the recycled frame
-    /// held in `state`. See [`Self::run_bytecode_callable_committed_lean_args`].
-    fn invoke_prepared_lean(
-        &mut self,
-        stack: &mut ActivationStack,
-        state: &mut LeanCallbackState,
-        context: &ExecutionContext,
-        code: &std::sync::Arc<dyn crate::jit::JitFunctionCode>,
-        effective_this: Value,
-        effective_args: &[Value],
-    ) -> Result<Value, VmError> {
-        let window_rollback = self.register_window_rollback();
-        // Refresh the GC-live inputs from the traced root every element: the
-        // recycled frame is held off-stack between calls and is not itself
-        // traced, so its SELF / receiver could be relocated by a moving
-        // collection the builtin triggers between elements. Reading them back
-        // from `lean_callback_roots` (which IS traced) keeps them current.
-        let bound_this = {
-            let root = self
-                .lean_callback_roots
-                .get(state.root_index)
-                .ok_or(VmError::InvalidOperand)?;
-            root.bound_this.unwrap_or(effective_this)
-        };
-        let this_for_callee = if state.this_passthrough {
-            bound_this
-        } else {
-            // OrdinaryCallBindThis performs ToObject for every sloppy call.
-            // Reusing a wrapper would be observably wrong (`this` identity
-            // must differ between callback invocations) and would retain an
-            // untraced young handle in the lean state across moving GC.
-            let function = context
-                .exec_function(state.function_id)
-                .ok_or(VmError::InvalidOperand)?;
-            self.this_for_bytecode_call_runtime_rooted(function, bound_this, &[effective_args])?
-        };
-        let register_count = state.register_count;
-        // Receiver coercion may collect. Re-read the exact SELF from the
-        // traced root afterwards; the callee reaches its context through it.
-        let self_value = self
-            .lean_callback_roots
-            .get(state.root_index)
-            .ok_or(VmError::InvalidOperand)?
-            .callback;
-        let mut frame = match state.reuse_frame.take() {
-            Some(mut frame) => {
-                debug_assert_eq!(frame.registers.len(), register_count);
-                frame.pc = 0;
-                frame.return_register = None;
-                frame.self_value = self_value;
-                frame.this_value = this_for_callee;
-                frame
-            }
-            None => {
-                let function = context
-                    .exec_function(state.function_id)
-                    .ok_or(VmError::InvalidOperand)?;
-                let window = self.alloc_reg_window(register_count)?;
-                Frame::for_code_block(function, None, self_value, this_for_callee, window)
-            }
-        };
-        if let Err(error) = Self::reset_and_bind_lean_bytecode_call_arguments(
-            state.param_count,
-            &mut frame,
-            effective_args,
-        ) {
-            self.frame_release_cold(&mut frame);
-            self.reclaim_registers(&mut frame);
-            return Err(error);
-        }
-        let entry_floor = stack.floor();
-        stack.push(frame);
-        let top_idx = stack.len() - 1;
-        let outcome = self
-            .run_optimized_frame(stack, context, top_idx)
-            .unwrap_or_else(|| self.run_compiled_frame(stack, context, top_idx, code));
-        match outcome {
-            crate::jit::JitExecOutcome::Returned(value) => {
-                // The body ran to completion and left its frame on the stack;
-                // recycle that frame (window + shell) for the next element.
-                if stack.len_above(entry_floor) != 1 {
-                    self.release_frames_above(stack, entry_floor);
-                    return Err(VmError::InvalidOperand);
-                }
-                state.reuse_frame = stack.pop();
-                window_rollback.commit();
-                Ok(value)
-            }
-            crate::jit::JitExecOutcome::Bailed(exit) => {
-                // Finish the partially-run frame in the interpreter. A bailout
-                // consumes the recyclable frame; the next element rebuilds it.
-                stack[top_idx].pc = exit.logical_pc();
-                let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
-                self.release_frames_above(stack, entry_floor);
-                result
-            }
-            crate::jit::JitExecOutcome::Throw(thrown) => {
-                let unwind = self.unwind_compiled_throw_above(context, stack, entry_floor, thrown);
-                if unwind.is_ok() && !stack.is_at_floor(entry_floor) {
-                    let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
-                    self.release_frames_above(stack, entry_floor);
-                    return result;
-                }
-                self.release_frames_above(stack, entry_floor);
-                match unwind {
-                    Ok(()) => Ok(Value::undefined()),
-                    Err(err) => Err(err),
-                }
-            }
-            crate::jit::JitExecOutcome::Fatal(err) => {
-                self.release_frames_above(stack, entry_floor);
-                Err(err)
-            }
-        }
-    }
-
-    /// Build a fresh callee frame for one lean-callback element. `probe` drives
-    /// tier-up through the synchronous-entry path (for callbacks not eligible
-    /// for the prepared fast path); when `false` the element is interpreted
-    /// directly because the caller already advanced the tier-up counter.
-    fn invoke_cold_lean(
-        &mut self,
-        stack: &mut ActivationStack,
-        state: &mut LeanCallbackState,
-        context: &ExecutionContext,
-        effective_this: Value,
-        effective_args: &[Value],
-        probe: bool,
-    ) -> Result<Value, VmError> {
-        let (function_id, this_for_callee) = {
-            let root = self
-                .lean_callback_roots
-                .get(state.root_index)
-                .ok_or(VmError::InvalidOperand)?;
-            (root.function_id, root.bound_this.unwrap_or(effective_this))
-        };
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        debug_assert!(
-            !function.is_generator
-                && !function.is_async
-                && !function.is_async_generator
-                && !function.needs_arguments
-                && !function.has_rest
-                && !function.makes_function
-                && !function.contains_direct_eval
-                && !function.is_derived_constructor,
-            "lean callback eligibility must be checked before the loop"
-        );
-        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
-            function,
-            this_for_callee,
-            &[effective_args],
-        )?;
-        // Coercion may collect; reload SELF and the lexical `new.target` from
-        // the traced root.
-        let (self_value, new_target_for_callee) = {
-            let root = self
-                .lean_callback_roots
-                .get(state.root_index)
-                .ok_or(VmError::InvalidOperand)?;
-            (root.callback, root.bound_new_target)
-        };
-        // Frame construction allocates no GC memory: the locals stay current.
-        let _window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut new_frame =
-            Frame::for_code_block(function, None, self_value, this_for_callee, window);
-        if let Some(new_target) = new_target_for_callee {
-            let cold = self.frame_ensure_cold(&mut new_frame);
-            cold.new_target = Some(new_target);
-        }
-        if let Err(error) =
-            Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)
-        {
-            self.frame_release_cold(&mut new_frame);
-            self.reclaim_registers(&mut new_frame);
-            return Err(error);
-        }
-        let entry_floor = stack.floor();
-        stack.push(new_frame);
-        if probe {
-            match self.dispatch_jit_sync_entry(stack, context, entry_floor) {
-                Ok(Some(value)) => {
-                    self.release_frames_above(stack, entry_floor);
-                    return Ok(value);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    self.release_frames_above(stack, entry_floor);
-                    return Err(err);
-                }
-            }
-        }
-        let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
-        self.release_frames_above(stack, entry_floor);
-        result
-    }
-
-    /// Synchronously construct above the current rooted activation floor.
-    pub(crate) fn run_construct_sync_rooted(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        target: &Value,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        if !stack.is_runtime_rooted_by(self) {
-            return Err(VmError::InvalidOperand);
-        }
-        self.enter_sync_reentry()?;
-        let floor = stack.floor();
-        let roots = SyncJsCallRoots::construct(*target, new_target, args);
-        let roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_construct_sync_inner_rooted(stack, context, &roots);
-        drop(roots_guard);
-        self.release_frames_above(stack, floor);
-        self.leave_sync_reentry();
-        result
-    }
-
-    fn run_construct_sync_inner_rooted(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        roots: &SyncJsCallRoots,
-    ) -> Result<Value, VmError> {
-        self.record_runtime_construct_call()?;
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            if let Some(bound) = roots.current.get().as_bound_function() {
-                hops += 1;
-                let (next_target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
-                let effective_args = roots.take_args();
-                let mut combined: SmallVec<[Value; 8]> =
-                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                combined.extend(bound_args);
-                combined.extend(effective_args);
-                if abstract_ops::same_value(
-                    &roots.current.get(),
-                    &roots.new_target.get(),
-                    &self.gc_heap,
-                ) {
-                    roots.new_target.set(next_target);
-                }
-                roots.current.set(next_target);
-                roots.replace_args(combined);
-            } else if let Some(proxy) = roots.current.get().as_proxy() {
-                // §10.5.13 Proxy [[Construct]].
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(self.err_type(
-                        ("Cannot perform 'construct' on a proxy that has been revoked".to_string())
-                            .into(),
-                    ));
-                }
-                hops += 1;
-                roots.proxy_target.set(proxy.target(&self.gc_heap));
-                roots.scratch_0.set(proxy.handler(&self.gc_heap));
-                let trap_key = VmPropertyKey::String("construct");
-                let trap_value = {
-                    let handler = roots.scratch_0.get();
-                    match self.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
-                        VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => {
-                            let handler = roots.scratch_0.get();
-                            self.run_callable_sync_rooted(
-                                stack,
-                                context,
-                                &getter,
-                                handler,
-                                SmallVec::new(),
-                            )?
-                        }
-                    }
-                };
-                roots.scratch_1.set(trap_value);
-                if self.is_callable_runtime(&trap_value) {
-                    let current = roots.current.get();
-                    let target_value = roots.proxy_target.get();
-                    let effective_new_target = roots.new_target.get();
-                    let handler = roots.scratch_0.get();
-                    let trap_value = roots.scratch_1.get();
-                    let effective_args = roots.take_args();
-                    let argv_array = self.alloc_runtime_rooted_array_from_values(
-                        effective_args.iter().copied(),
-                        &[
-                            &current,
-                            &target_value,
-                            &effective_new_target,
-                            &handler,
-                            &trap_value,
-                        ],
-                        &[effective_args.as_slice()],
-                    )?;
-                    // The allocation may relocate the captured target. Reload
-                    // it from its dedicated registered slot.
-                    let target_value = roots.proxy_target.get();
-                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                        target_value,
-                        Value::array(argv_array),
-                        roots.new_target.get(),
-                    ];
-                    let result = self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &roots.scratch_1.get(),
-                        roots.scratch_0.get(),
-                        trap_args,
-                    )?;
-                    if !result.is_object_type() {
-                        return Err(self.err_type(
-                            ("Proxy construct trap returned non-object".to_string()).into(),
-                        ));
-                    }
-                    return Ok(result);
-                } else if trap_value.is_undefined() || trap_value.is_null() {
-                    roots.current.set(roots.proxy_target.get());
-                    roots.proxy_target.set(Value::undefined());
-                } else {
-                    return Err(
-                        self.err_type(("Proxy construct trap is not callable".to_string()).into())
-                    );
-                }
-            } else {
-                break;
-            }
-        }
-
-        if let Some(native) = self.native_receiverless_constructor(&roots.current.get()) {
-            let effective_args = roots.take_args();
-            let new_target = roots.new_target.get();
-            return self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &Value::undefined(),
-                &new_target,
-                false,
-                effective_args.as_slice(),
-            );
-        }
-        if let Some(native) = roots.current.get().as_native_function()
-            && [
-                "ArrayBuffer",
-                "SharedArrayBuffer",
-                "DataView",
-                "Int8Array",
-                "Uint8Array",
-                "Uint8ClampedArray",
-                "Int16Array",
-                "Uint16Array",
-                "Int32Array",
-                "Uint32Array",
-                "Float16Array",
-                "Float32Array",
-                "Float64Array",
-                "BigInt64Array",
-                "BigUint64Array",
-            ]
-            .iter()
-            .any(|expected| native.name(&self.gc_heap).eq_str(expected, &self.gc_heap))
-        {
-            let effective_args = roots.take_args();
-            let new_target = roots.new_target.get();
-            return self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &Value::undefined(),
-                &new_target,
-                false,
-                effective_args.as_slice(),
-            );
-        }
-
-        let bytecode_callee = if let Some(class) = roots.current.get().as_class_constructor() {
-            class.ctor(&self.gc_heap)
-        } else {
-            roots.current.get()
-        };
-        if let Ok(function_id) =
-            Self::bytecode_construct_target_function_id(bytecode_callee, &self.gc_heap)
-            && context
-                .exec_function(function_id)
-                .is_some_and(|function| function.is_derived_constructor)
-        {
-            let new_target = roots.new_target.get();
-            let effective_args = roots.take_args();
-            let new_frame = self.build_construct_bytecode_frame(
-                context,
-                bytecode_callee,
-                None,
-                new_target,
-                effective_args,
-                None,
-            )?;
-            let floor = stack.floor();
-            stack.push(new_frame);
-            return self.dispatch_loop_above_rooted(context, stack, floor);
-        }
-
-        let effective_new_target = roots.new_target.get();
-        let mut proto =
-            self.construct_prototype_for_callee(stack, context, &effective_new_target)?;
-        let mut used_object_prototype_fallback = false;
-        if proto.is_none() {
-            if roots
-                .current
-                .get()
-                .as_native_function()
-                .is_some_and(|native| native.name_is(&self.gc_heap, "Date"))
-            {
-                proto = Some(self.constructor_prototype_value("Date")?);
-            } else {
-                proto = Some(self.constructor_prototype_value("Object")?);
-                used_object_prototype_fallback = true;
-            }
-        }
-        let proto = proto.expect("construct prototype fallback always resolves");
-        roots.scratch_0.set(proto);
-        // A base bytecode constructor takes the shared receiver contract its
-        // generated construct paths use; natives and derived constructors
-        // (whose `this` is bound by `super()`) keep the bare ordinary object.
-        let bytecode_base_constructor = {
-            let callable = roots
-                .current
-                .get()
-                .as_class_constructor()
-                .map(|class| class.ctor(&self.gc_heap))
-                .unwrap_or(roots.current.get());
-            callable
-                .as_function()
-                .or_else(|| {
-                    callable
-                        .as_closure(&self.gc_heap)
-                        .map(|closure| closure.function_id())
-                })
-                .filter(|&function_id| {
-                    context.for_function(function_id).ok().is_some_and(|owner| {
-                        owner
-                            .exec_function(function_id)
-                            .is_some_and(|function| !function.is_derived_constructor)
-                    })
-                })
-        };
-        let receiver = match bytecode_base_constructor {
-            Some(function_id) => self
-                .allocate_bytecode_constructor_receiver(context, function_id, roots)?
-                .as_object()
-                .ok_or(VmError::InvalidOperand)?,
-            None => {
-                let receiver = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
-                roots.receiver.set(Value::object(receiver));
-                let proto = roots.scratch_0.get();
-                crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-                receiver
-            }
-        };
-        // Keep arguments in `SyncJsCallRoots` through the observable
-        // new-target prototype lookup and receiver allocation. Taking the
-        // SmallVec earlier detached it from the registered root provider, so
-        // a getter-triggered scavenge left AggregateError's iterable stale.
-        // Every destination below either registers the slice immediately
-        // (native) or transfers it into a frame builder with its own roots.
-        let effective_args = roots.take_args();
-
-        if let Some(obj) = roots.current.get().as_object()
-            && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
-                .and_then(|v| v.as_native_function())
-        {
-            let this_value = roots.receiver.get();
-            let new_target = roots.new_target.get();
-            return self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &this_value,
-                &new_target,
-                used_object_prototype_fallback,
-                effective_args.as_slice(),
-            );
-        }
-        if let Some(native) = roots.current.get().as_native_function() {
-            let this_value = roots.receiver.get();
-            let new_target = roots.new_target.get();
-            return self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &this_value,
-                &new_target,
-                used_object_prototype_fallback,
-                effective_args.as_slice(),
-            );
-        }
-        if let Some(class) = roots.current.get().as_class_constructor()
-            && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
-        {
-            let this_value = roots.receiver.get();
-            let new_target = roots.new_target.get();
-            return self.invoke_native_construct_rooted(
-                stack,
-                context,
-                native,
-                &this_value,
-                &new_target,
-                used_object_prototype_fallback,
-                effective_args.as_slice(),
-            );
-        }
-        if let Some(class) = roots.current.get().as_class_constructor() {
-            roots.current.set(class.ctor(&self.gc_heap));
-        }
-
-        let current = roots.current.get();
-        let new_target = roots.new_target.get();
-        let new_frame = self.build_construct_bytecode_frame(
-            context,
-            current,
-            Some(receiver),
-            new_target,
-            effective_args,
-            None,
-        )?;
-        let floor = stack.floor();
-        stack.push(new_frame);
-        self.dispatch_loop_above_rooted(context, stack, floor)
     }
 }

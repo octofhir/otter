@@ -1,136 +1,58 @@
-//! Allocator-visible forwarding through the shared native call lifecycle.
+//! Argument forwarding staged for the common call trampoline.
 //!
 //! # Contents
-//! - Pre-effect source admission and current-target native dispatch.
-//! - Operand and mapped-binding reads from precise moving-root homes.
+//! - [`emit_stage`] — pre-effect source admission, then the staged request of
+//!   a `CallForwardArguments` site from its canonical operand homes.
 //!
 //! # Invariants
-//! - The ordinary call descriptor already owns clobbers, roots and exception CFG.
-//! - Source materialization exits precede call effects and restore caller roots.
-//! - A native target miss reaches the single committed boxed-value cold sibling.
-//! - Dynamic linkage uses the recovered caller base without changing SP over a
-//!   live private callee. Mapped bindings are loaded after capture allocation.
+//! - The packet is `[method, callee, receiver, register bindings…, formals
+//!   context]`; the formals context is read from the frame register it was
+//!   published to, every other word from its moving-root home.
+//! - A source the staging entry cannot complete exits before any effect.
+//!
+//! # See also
+//! - [`super::call`] — trampoline entry and completion routing.
 
 use super::*;
 
-pub(super) fn emit(
+pub(super) fn emit_stage(
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    transitions: &TransitionTable,
-    instruction: &crate::machine::MachineInstruction,
-    frame: MachineFrameLayout,
-    site: &MachineSafepointSite,
-    locations: &[AllocatedLocation],
-    result_index: usize,
-    logical_pc: u32,
-    byte_pc: u32,
-    cold: DynamicLabel,
-    finish_error: DynamicLabel,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-    done: DynamicLabel,
+    call: &call::CallSite<'_>,
 ) -> Result<(), Unsupported> {
-    emit_load_u64(ops, 15, u64::from(logical_pc));
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr x16, [x19, NATIVE_FRAME_OFFSET]
-        ; str w15, [x16, NATIVE_FRAME_PC_OFFSET]
-    );
-    crate::arm64::emit_runtime_forward(
-        ops,
-        relocations,
-        view,
-        transitions,
-        [
-            u16::try_from(result_index)
-                .map_err(|_| Unsupported::OperandShape("forward result index"))?,
-            0,
-            1,
-            2,
-        ],
-        logical_pc,
-        byte_pc,
-        None,
-        cold,
-        finish_error,
-        threw,
-        fatal,
-        done,
-        19,
-        |ops, source, target, bias| {
-            let value = instruction
-                .operands
-                .get(usize::from(source))
-                .ok_or(Unsupported::OperandShape("forward source operand"))?
-                .value;
-            emit_load_safepoint_root(ops, frame, site, value, target, bias)
-        },
-        |ops, destination, source, bias| {
-            let location = *locations
-                .get(usize::from(destination))
-                .ok_or(Unsupported::OperandShape("forward result location"))?;
-            emit_store_allocated_tagged(ops, frame, location, source, bias)
-        },
-        |ops| {
-            dynasm!(ops ; .arch aarch64 ; mov x17, x0);
-            emit_reload_safepoint_roots(ops, frame, site)?;
-            dynasm!(ops ; .arch aarch64 ; mov x0, x17);
-            Ok(())
-        },
-        |ops, register, base| {
-            let index = view
-                .code_block
-                .forwarded_argument_bindings()
-                .filter_map(|(_, storage)| match storage {
-                    otter_bytecode::ArgumentBindingStorage::Register { reg } => Some(reg),
-                    _ => None,
-                })
-                .position(|reg| reg == register)
-                .ok_or(Unsupported::OperandShape("forward binding operand"))?
-                + 3;
-            let value = instruction
-                .operands
-                .get(index)
-                .ok_or(Unsupported::OperandShape("forward binding input"))?
-                .value;
-            let root = site
-                .roots
-                .iter()
-                .find(|root| root.value == value)
-                .ok_or(Unsupported::OperandShape("forward binding root"))?;
-            let offset = root_offset(frame, root.save_slot)?;
-            emit_load_u64(ops, 16, u64::from(offset));
-            dynasm!(ops ; .arch aarch64 ; add x16, X(base), x16 ; ldr x14, [x16]);
-            Ok(())
-        },
-    )
+    emit_cold_source_admission(ops, relocations, call)?;
+    let words = call.result_index;
+    let context_register = call.view.code_block.forwarded_formals_context();
+    emit_value_span_words(ops, call.sequence, call.frame, words, |ops, index, register| {
+        match context_register {
+            Some(frame_register) if index + 1 == words => {
+                let offset = u32::from(frame_register) * 8;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr X(register), [x19, NATIVE_FRAME_OFFSET]
+                    ; ldr X(register), [X(register), NATIVE_FRAME_REGISTER_BASE_OFFSET]
+                    ; ldr X(register), [X(register), offset]
+                );
+                Ok(())
+            }
+            _ => call.load_operand(ops, index, register, 0),
+        }
+    })?;
+    call.emit_stub_call(ops, relocations, otter_vm::native_abi::STUB_JIT_STAGE_FORWARD);
+    call.emit_staging_status(ops)
 }
 
-/// Only a native miss needs caller-materialization admission. The native plan
-/// has already proved an elided intrinsic source, so a hit needs no second probe.
-pub(super) fn emit_cold_source_admission(
+/// Only an admitted source stages; any other exits before call effects.
+fn emit_cold_source_admission(
     ops: &mut dynasmrt::aarch64::Assembler,
     relocations: &mut RelocationCapture,
-    transitions: &TransitionTable,
-    instruction: &crate::machine::MachineInstruction,
-    frame: MachineFrameLayout,
-    site: &MachineSafepointSite,
-    bail: DynamicLabel,
+    call: &call::CallSite<'_>,
 ) -> Result<(), Unsupported> {
-    let abi_source = otter_vm::native_abi::STUB_JIT_FORWARD_SOURCE_READY;
-    emit_load_safepoint_root(ops, frame, site, instruction.operands[0].value, 1, 0)?;
-    dynasm!(ops ; .arch aarch64 ; mov x0, x19);
-    emit_load_symbolic_u64(
-        ops,
-        relocations,
-        16,
-        transitions.entry(abi_source),
-        RelocationTarget::runtime_stub(abi_source),
-    );
+    call.load_operand(ops, 0, 1, 0)?;
+    call.emit_stub_call(ops, relocations, otter_vm::native_abi::STUB_JIT_FORWARD_SOURCE_READY);
     let admitted = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; blr x16 ; cbnz x0, =>admitted);
-    emit_reload_safepoint_roots(ops, frame, site)?;
-    dynasm!(ops ; .arch aarch64 ; b =>bail ; =>admitted);
+    dynasm!(ops ; .arch aarch64 ; cbnz x0, =>admitted);
+    emit_reload_safepoint_roots(ops, call.frame, call.site)?;
+    dynasm!(ops ; .arch aarch64 ; b =>call.deopt ; =>admitted);
     Ok(())
 }

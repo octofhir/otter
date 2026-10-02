@@ -353,7 +353,7 @@ mod tests {
             .allocate(target)
             .expect("deopt sequence allocation");
         let layout = target
-            .frame_layout(&allocation, 0, 0)
+            .frame_layout(&allocation, 0, 0, 0)
             .expect("deopt frame layout");
         (sequence, allocation, layout)
     }

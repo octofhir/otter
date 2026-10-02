@@ -17,62 +17,12 @@
 
 use super::JitCtx;
 
-pub(crate) extern "C" fn jit_forward_argument_count_stub(ctx: *mut JitCtx, method: u64) -> u64 {
-    // SAFETY: generated code supplies its live entry-lifetime context.
-    let ctx = unsafe { &mut *ctx };
-    ctx.runtime_call()
-        .ok()
-        .and_then(|runtime| runtime.forward_argument_count(otter_vm::Value::from_bits(method)))
-        .map_or(u64::MAX, u64::from)
-}
-
-pub(crate) extern "C" fn jit_copy_forwarded_arguments_stub(
-    ctx: *mut JitCtx,
-    destination: *mut otter_vm::native_abi::NativeFrame,
-    parameter_count: u64,
-) -> u64 {
-    let Ok(parameter_count) = u16::try_from(parameter_count) else {
-        return u64::MAX;
-    };
-    // SAFETY: generated code supplies its live entry-lifetime context.
-    let ctx = unsafe { &mut *ctx };
-    let Ok(runtime) = ctx.runtime_call() else {
-        return u64::MAX;
-    };
-    // SAFETY: shared generated linkage owns a complete initialized private
-    // destination frame and keeps it disjoint from the published caller.
-    unsafe { runtime.copy_forwarded_argument_window(destination, parameter_count) }
-        .map_or(u64::MAX, u64::from)
-}
-
-/// Write the existing engine plan into caller-owned native scratch. The metadata
-/// contains no moving value; a miss leaves scratch unread and has no JS effect.
-pub(crate) extern "C" fn jit_forward_call_plan_stub(
-    ctx: *mut JitCtx,
-    method: u64,
-    callee: u64,
-    output: *mut otter_vm::jit::JitDirectCallPlan,
-) -> u64 {
-    // SAFETY: generated linkage owns the live context and an aligned, disjoint
-    // plan-sized scratch reservation. This leaf never allocates or reenters.
-    let ctx = unsafe { &mut *ctx };
-    let Ok(runtime) = ctx.runtime_call() else {
-        return u64::MAX;
-    };
-    let Some(count) = runtime.forward_argument_count(otter_vm::Value::from_bits(method)) else {
-        return u64::MAX;
-    };
-    let Some(plan) = runtime.forwarded_call_plan(otter_vm::Value::from_bits(callee)) else {
-        return u64::MAX;
-    };
-    // SAFETY: the private scratch is initialized exactly once before any read.
-    unsafe { output.write(plan) };
-    u64::from(count)
-}
-
-/// Complete an admitted forwarding source from explicit values. The packet is
-/// copied before binding runtime services; its words never become extra roots.
-pub(crate) extern "C" fn jit_call_forward_arguments_stub(
+/// Stage the complete pending call request of an admitted forwarding site.
+///
+/// The packet is `[method, callee, receiver, register bindings…, formals
+/// context]`. Resolution may materialize the arguments object; the request is
+/// written only after that, and the generated caller enters the trampoline.
+pub(crate) extern "C" fn jit_stage_forward_stub(
     ctx: *mut JitCtx,
     packet: *const otter_vm::Value,
     count: u32,
@@ -92,10 +42,15 @@ pub(crate) extern "C" fn jit_call_forward_arguments_stub(
     };
     // SAFETY: generated code supplies its live entry-lifetime context.
     let ctx = unsafe { &mut *ctx };
-    let result = copied.and_then(|values| {
-        ctx.runtime_call()
-            .and_then(|mut runtime| runtime.call_forward_values(&values))
-    });
+    let result = copied
+        .and_then(|values| {
+            ctx.runtime_call()
+                .and_then(|mut runtime| runtime.stage_forward_values(&values))
+        })
+        .and_then(|(callee, receiver, arguments)| {
+            ctx.stage_call_request(callee, receiver, arguments)
+        })
+        .map(|()| otter_vm::Value::undefined());
     super::committed_vm_result(ctx, result)
 }
 

@@ -30,7 +30,6 @@ use crate::{
     ExecutionContext, Frame, Interpreter, TryHandler, Value, VmError,
     activation_stack::ActivationStack,
     cold_frame::{AbruptFrameOutcome, AbruptKind, ParkedFinally},
-    snapshot_frames,
 };
 
 /// Result of a committed exception-region operation in compiled code.
@@ -119,7 +118,7 @@ impl Interpreter {
                     let pc = bits as u32;
                     (pc != u32::MAX).then_some(pc)
                 };
-                self.materialized_enter_try_handler(
+                self.frame_enter_try_handler(
                     &mut stack[frame_index],
                     TryHandler {
                         catch_pc: decode_pc(arg0),
@@ -131,12 +130,12 @@ impl Interpreter {
                 Ok(JitExceptionOutcome::Continue)
             }
             value if value == Op::LeaveTry as u8 => {
-                self.materialized_leave_try(&mut stack[frame_index])?;
+                self.frame_leave_try(&mut stack[frame_index])?;
                 stack[frame_index].pc = saved_pc;
                 Ok(JitExceptionOutcome::Continue)
             }
             value if value == Op::PopParkedFinally as u8 => {
-                self.materialized_pop_parked_finally(&mut stack[frame_index], arg0 as usize)?;
+                self.frame_pop_parked_finally(&mut stack[frame_index], arg0 as usize)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(JitExceptionOutcome::Continue)
             }
@@ -193,7 +192,7 @@ impl Interpreter {
     ) -> Result<JitExceptionOutcome, VmError> {
         let captured_frames = self.pending_uncaught_frames.is_none();
         if captured_frames {
-            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+            self.pending_uncaught_frames = Some(self.snapshot_active_frames(context, usize::MAX));
         }
         let has_handler = self
             .frame_cold(&stack[frame_index])

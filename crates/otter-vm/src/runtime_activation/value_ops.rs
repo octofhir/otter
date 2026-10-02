@@ -17,7 +17,7 @@
 //! receives only the completed identities it must publish into frame slots.
 //!
 //! # See also
-//! `call_source` keeps source calls distinct from physical frame positions.
+//! `semantic_source` keeps source operations distinct from physical frame positions.
 
 use smallvec::SmallVec;
 
@@ -26,54 +26,22 @@ use crate::{
     deopt::{VirtualMaterializationValue, VirtualObject},
 };
 
-use super::{RuntimeCall, RuntimeFrameIdentity};
+use super::RuntimeCall;
 
 impl RuntimeCall<'_> {
     /// Bind the boxed `super()` result carried by the committed-value boundary.
     pub fn bind_derived_this_value(&mut self, value: Value) -> Result<(), CommittedValueError> {
-        if let RuntimeFrameIdentity::Materialized(frame_index) = self.identity {
-            let frame_ptr = self.frame.as_ptr();
-            let stack = unsafe { &mut *self.stack.as_ptr() };
-            let vm = unsafe { &mut *self.vm.as_ptr() };
-            vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-            vm.record_jit_derived_this_bind_transition();
-            let bound_this = match vm.bind_this_value(stack, frame_index, value) {
-                Ok(bound_this) => bound_this,
-                Err(error @ VmError::ThisUninitialized) => {
-                    return Err(CommittedValueError::JavaScript(error));
-                }
-                Err(error) => return Err(CommittedValueError::Fatal(error)),
-            };
-            // SAFETY: the descriptor was validated before the non-allocating,
-            // non-reentrant bind and remains published by the RuntimeCall.
-            let mut native = unsafe { crate::ActiveFrameMut::from_native_ptr(frame_ptr) }
-                .expect("published materialized frame remains valid after bind-only kernel");
-            native.set_this_value(bound_this);
-            return Ok(());
-        }
-        let frame_ptr = self.frame.as_ptr();
-        // SAFETY: RuntimeCall exclusively owns the validated published frame;
-        // validation and frame-kind classification precede semantic entry.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame_ptr) }
-            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        let flags = frame.header().flags;
+        let frame_index = self.frame_index().map_err(CommittedValueError::Fatal)?;
+        let stack = unsafe { &mut *self.stack.as_ptr() };
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        if !flags.contains(crate::native_abi::NativeFrameFlags::DERIVED_CONSTRUCTOR) {
-            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
-        }
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         vm.record_jit_derived_this_bind_transition();
-        if !frame.this_value().is_hole() {
-            return Err(CommittedValueError::JavaScript(
-                vm.err_this_uninit(
-                    "super constructor may only be called once"
-                        .to_string()
-                        .into(),
-                ),
-            ));
-        }
-        frame.set_this_value(value);
-        Ok(())
+        vm.bind_this_value(stack, frame_index, value)
+            .map(|_| ())
+            .map_err(|error| match error {
+                VmError::ThisUninitialized => CommittedValueError::JavaScript(error),
+                _ => CommittedValueError::Fatal(error),
+            })
     }
 
     /// Complete the exact published `New` from boxed SSA values: `values[0]`
@@ -81,7 +49,7 @@ impl RuntimeCall<'_> {
     /// is the constructor itself, as for any direct `new` expression.
     pub fn construct_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (callee, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
-        let (function_id, call_pc) = self.value_call_source()?;
+        let (function_id, call_pc) = self.semantic_source()?;
         let context = self
             .context
             .for_function(function_id)
@@ -118,7 +86,7 @@ impl RuntimeCall<'_> {
     pub fn call_with_this_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (callee, rest) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let (receiver, args) = rest.split_first().ok_or(VmError::InvalidOperand)?;
-        let (function_id, call_pc) = self.value_call_source()?;
+        let (function_id, call_pc) = self.semantic_source()?;
         let context = self
             .context
             .for_function(function_id)
@@ -166,7 +134,7 @@ impl RuntimeCall<'_> {
     /// keeps this boundary effect-once even when lookup or the callee throws.
     pub fn call_method_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (receiver, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
-        let (function_id, call_pc) = self.value_call_source()?;
+        let (function_id, call_pc) = self.semantic_source()?;
         let context = self
             .context
             .for_function(function_id)
@@ -210,13 +178,56 @@ impl RuntimeCall<'_> {
         )
     }
 
+    /// Resolve the callable of the exact published `CallMethodValue` from
+    /// `[receiver]`, recording the site's method and call feedback. The
+    /// generated caller enters the call trampoline with the result.
+    pub fn resolve_method_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
+        let [receiver] = values else {
+            return Err(VmError::InvalidOperand);
+        };
+        let (function_id, call_pc) = self.semantic_source()?;
+        let context = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let instruction = function
+            .instr_at_index(call_pc as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        if instruction.instruction_pc != call_pc
+            || function.op(instruction) != otter_bytecode::Op::CallMethodValue
+        {
+            return Err(VmError::InvalidOperand);
+        }
+        let name_index = function
+            .const_index(instruction, 2)
+            .ok_or(VmError::InvalidOperand)?;
+        let argument_count = function
+            .const_index(instruction, 3)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(VmError::InvalidOperand)?;
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let stack = unsafe { &mut *self.stack.as_ptr() };
+        vm.jit_runtime_resolve_method(
+            &context,
+            stack,
+            function_id,
+            call_pc,
+            *receiver,
+            name_index,
+            argument_count,
+        )
+    }
+
     /// Load one realm builtin error constructor.
     pub fn load_builtin_error(&mut self, dst: u16, kind_index: u32) -> Result<(), VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns this validated descriptor.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_load_builtin_error(context, &mut frame, dst, kind_index)
     }
@@ -233,7 +244,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall owns the canonical published descriptor.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_define_data_property(stack, context, &mut frame, object, key, value)
     }
@@ -251,7 +262,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns this validated descriptor.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_define_own_property(stack, context, &mut frame, target, key, descriptor)
     }
@@ -270,7 +281,7 @@ impl RuntimeCall<'_> {
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall validated and exclusively owns this descriptor
         // for the duration of the semantic operation.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_make_closure(
             context,
@@ -295,7 +306,7 @@ impl RuntimeCall<'_> {
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns the validated published
         // descriptor for this semantic operation.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_make_function(context, &mut frame, function_id, dst, function_index)
     }
@@ -310,7 +321,7 @@ impl RuntimeCall<'_> {
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall construction validated and exclusively owns the
         // published descriptor; ActiveFrame stores no borrowed register slice.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_add(stack, context, &mut frame, dst, lhs, rhs)
     }
@@ -320,7 +331,7 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_neg(&mut frame, dst, src)
     }
@@ -337,7 +348,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_numeric_op(stack, context, &mut frame, dst, lhs, operation)
     }
@@ -354,7 +365,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_coerce_unary(stack, context, &mut frame, dst, src, operation)
     }
@@ -390,13 +401,9 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         // SAFETY: RuntimeCall retains the validated published native descriptor.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(self.frame.as_ptr()) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(self.frame.as_ptr()) }
             .map_err(|_| VmError::InvalidOperand)?;
-        let materialized = match self.identity {
-            RuntimeFrameIdentity::Materialized(index) => Some(index),
-            RuntimeFrameIdentity::StackOwned => None,
-        };
-        vm.jit_read_arguments(&self.context, stack, &mut frame, materialized, key)
+        vm.jit_read_arguments(&self.context, stack, &mut frame, key)
     }
 
     /// Build the activation's `arguments` object and commit it to `dst`.
@@ -410,13 +417,9 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
-        let materialized = match self.identity {
-            super::RuntimeFrameIdentity::Materialized(index) => Some(index),
-            super::RuntimeFrameIdentity::StackOwned => None,
-        };
-        vm.jit_runtime_collect_arguments(context, stack, &mut frame, materialized, dst)
+        vm.jit_runtime_collect_arguments(context, stack, &mut frame, dst)
     }
 
     /// Allocate the published `Op::NewObjectLiteral` object from boxed values
@@ -489,7 +492,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_create_context(context, &mut frame, dst, parent, scope_index)
     }
@@ -499,7 +502,7 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_copy_context(&mut frame, dst, src)
     }
@@ -536,7 +539,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         let stack = unsafe { &mut *self.stack.as_ptr() };
         vm.jit_runtime_load_global(stack, context, &mut frame, function_id, dst, name_index)
@@ -548,7 +551,7 @@ impl RuntimeCall<'_> {
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
-        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_load_regexp(context, &mut frame, dst, index)
     }
@@ -558,7 +561,7 @@ impl RuntimeCall<'_> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall construction validated the shared descriptor.
-        let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(frame) }
+        let frame = unsafe { crate::ActiveFrameRef::from_ptr(frame) }
             .map_err(|_| VmError::InvalidOperand)?;
         vm.jit_runtime_write_barrier(&frame, object, source)
     }
@@ -659,9 +662,8 @@ mod tests {
     };
 
     use crate::{
-        ActivationStack, ExecutionContext, Interpreter, JitElementFamily, Value, VmError,
-        VmRuntimeActivation,
-        native_abi::{NativeFrame, NativeFrameKind, VmFrameHeader},
+        ExecutionContext, Interpreter, JitElementFamily, Value, VmError, VmRuntimeActivation,
+        native_abi::{Frame, NativeFrameKind, VmFrameHeader},
         rooting::RootScopeExt,
     };
 
@@ -839,10 +841,10 @@ mod tests {
                 .expect("packed array fixture");
         let receiver = Value::array(array);
         let key = Value::number_i32(0);
-        let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [Value::undefined(); 3];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 1,
@@ -854,7 +856,6 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
 
         {
             // SAFETY: activation, native frame, and its register window remain
@@ -931,15 +932,15 @@ mod tests {
         vm.set_property(object, "y", Value::number_i32(22))
             .expect("y fixture");
         drop(setup_roots);
-        let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [
             Value::undefined(),
             receiver,
             Value::number_i32(33),
             Value::undefined(),
         ];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 1,
                 pc: 1,
@@ -951,7 +952,6 @@ mod tests {
             Value::function(1),
             Value::undefined(),
         );
-        frame.set_stack_registers();
 
         // SAFETY: activation, frame, and register window remain live and
         // exclusively owned for this boundary scope.
@@ -1016,7 +1016,7 @@ mod tests {
             .expect("install bytecode method");
         }
 
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let mut registers = [
             Value::undefined(),
             receiver,
@@ -1026,7 +1026,7 @@ mod tests {
             Value::number_i32(40),
             Value::number_i32(50),
         ];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 0,
@@ -1038,7 +1038,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         let packet = [
             registers[1],
             registers[2],
@@ -1049,7 +1049,7 @@ mod tests {
         ];
         vm.with_runtime_turn(&mut stack, |turn| {
             let (vm, stack) = turn.into_parts();
-            let mut activation = VmRuntimeActivation::new(vm, stack, &context, 0);
+            let mut activation = VmRuntimeActivation::new(vm, stack, &context);
             // SAFETY: activation/frame/register storage and the copied packet
             // remain live and exclusively owned for this boundary scope. The
             // exact activation stack is published by this runtime turn.
@@ -1147,10 +1147,10 @@ mod tests {
             "fresh peers must share the transition parent"
         );
 
-        let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [first, second, Value::undefined(), Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 2,
@@ -1162,7 +1162,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         // SAFETY: activation, frame, and both rooted locals remain live and
         // exclusively owned for the complete boundary scope.
         {
@@ -1197,11 +1197,11 @@ mod tests {
         let scalar_object = vm
             .allocate_array_literal_value([Value::number_i32(99)])
             .expect("scalar array field");
-        let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [Value::undefined(); 3];
         registers[0] = scalar_object;
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 1,
@@ -1213,7 +1213,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         let recipes = [
             VirtualObject {
                 id: VirtualObjectId(0),
@@ -1341,9 +1341,9 @@ mod tests {
             "Object.prototype must be the terminal direct prototype"
         );
 
-        let mut stack = ActivationStack::new();
+        let mut stack = crate::test_support::FrameChainFixture::new();
         let mut registers = [first, second, first_rhs, second_rhs];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 2,
@@ -1355,7 +1355,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         // SAFETY: `frame` and its register window remain stable and live until
         // the matching pop after the complete RuntimeCall scope.
         unsafe {
@@ -1363,7 +1363,7 @@ mod tests {
                 .expect("publish stack-owned test frame");
         }
         {
-            let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+            let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
             // SAFETY: the activation, published frame, and register array are
             // exclusively owned for both transition calls.
             let mut call = unsafe {
@@ -1441,10 +1441,10 @@ mod tests {
                 Some(prototype),
             );
         }
-        let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [prototype, first, second, Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 2,
@@ -1456,7 +1456,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         // SAFETY: activation/frame/register storage outlive the boundary.
         let mut call =
             unsafe { RuntimeCall::bind(NonNull::from(&mut activation), NonNull::from(&mut frame)) }
@@ -1482,15 +1482,15 @@ mod tests {
             vm.gc_heap_mut(),
         );
 
-        let mut stack = ActivationStack::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context, 0);
+        let mut stack = crate::test_support::FrameChainFixture::new();
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
         let mut registers = [
             receiver,
             Value::undefined(),
             Value::undefined(),
             Value::undefined(),
         ];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 2,
@@ -1502,7 +1502,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         // SAFETY: activation/frame/register storage outlive the boundary.
         {
             let mut call = unsafe {

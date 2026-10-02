@@ -112,106 +112,41 @@ pub(crate) extern "C" fn jit_store_property_stub(
     }
 }
 
-/// Complete the exact published `CallMethodValue` from boxed SSA values.
+/// Resolve the callable of the published `CallMethodValue` from `[receiver]`.
 ///
-/// `packet[0]` is the receiver and the remaining `count - 1` values are every
-/// actual argument. The packet is copied before binding the VM runtime call so
-/// no pointer into generated stack storage survives allocation or JavaScript
-/// reentry. The published frame supplies precise roots; its safepoint recipe
-/// selects the source call for an inlined descendant. That source's bytecode
-/// declares the method name and argument count.
-pub(crate) extern "C" fn jit_call_method_value_stub(
+/// The generated caller enters the call trampoline with the returned method;
+/// resolution may run getters but never calls the method.
+pub(crate) extern "C" fn jit_resolve_method_stub(
     ctx: *mut JitCtx,
     packet: *const Value,
     count: u32,
 ) -> NativeResultPair {
-    let copied = if count == 0
+    let receiver = if count != 1
         || packet.is_null()
         || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
     {
         Err(VmError::InvalidOperand)
     } else {
-        let count = count as usize;
-        // SAFETY: generated code passes one live, naturally aligned span of
-        // `count` initialized Value words. `u32 * size_of::<Value>()` fits the
-        // addressable-object bound on every supported 64-bit target. Copying
-        // ends the machine-memory borrow before any runtime operation begins.
-        let values = unsafe { std::slice::from_raw_parts(packet, count) };
-        Ok(smallvec::SmallVec::<[Value; 8]>::from_slice(values))
+        // SAFETY: generated code passes one live, aligned receiver word, read
+        // before any runtime operation begins.
+        Ok(unsafe { *packet })
     };
-
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = copied.and_then(|values| {
+    let result = receiver.and_then(|receiver| {
         ctx.runtime_call()
-            .and_then(|mut runtime| runtime.call_method_values(values.as_slice()))
+            .and_then(|mut runtime| runtime.resolve_method_values(&[receiver]))
     });
     committed_vm_result(ctx, result)
 }
 
-/// Complete the exact published explicit-receiver call from boxed SSA values.
-///
-/// `packet[0]` is the callee, `packet[1]` the receiver, and the remaining
-/// `count - 2` values are every actual argument; the packet is copied before
-/// the VM runtime call is bound, exactly like the method-value entry.
-pub(crate) extern "C" fn jit_call_with_this_value_stub(
-    ctx: *mut JitCtx,
-    packet: *const Value,
-    count: u32,
-) -> NativeResultPair {
-    let copied = if count < 2
-        || packet.is_null()
-        || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
-    {
-        Err(VmError::InvalidOperand)
-    } else {
-        let count = count as usize;
-        // SAFETY: generated code passes one live, naturally aligned span of
-        // `count` initialized Value words; copying ends the machine-memory
-        // borrow before any runtime operation begins.
-        let values = unsafe { std::slice::from_raw_parts(packet, count) };
-        Ok(smallvec::SmallVec::<[Value; 8]>::from_slice(values))
-    };
-
+/// Stage a dense spread array's elements as the pending request's actuals.
+pub(crate) extern "C" fn jit_stage_spread_stub(ctx: *mut JitCtx, array: u64) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = copied.and_then(|values| {
-        ctx.runtime_call()
-            .and_then(|mut runtime| runtime.call_with_this_values(values.as_slice()))
-    });
-    committed_vm_result(ctx, result)
-}
-
-/// Complete the exact published `New` from boxed SSA values.
-///
-/// `packet[0]` is the constructor and the remaining `count - 1` values are
-/// every actual argument; the packet is copied before the VM runtime call is
-/// bound, exactly like the method-value entry.
-pub(crate) extern "C" fn jit_construct_value_stub(
-    ctx: *mut JitCtx,
-    packet: *const Value,
-    count: u32,
-) -> NativeResultPair {
-    let copied = if count == 0
-        || packet.is_null()
-        || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
-    {
-        Err(VmError::InvalidOperand)
-    } else {
-        let count = count as usize;
-        // SAFETY: generated code passes one live, naturally aligned span of
-        // `count` initialized Value words; copying ends the machine-memory
-        // borrow before any runtime operation begins.
-        let values = unsafe { std::slice::from_raw_parts(packet, count) };
-        Ok(smallvec::SmallVec::<[Value; 8]>::from_slice(values))
-    };
-
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = copied.and_then(|values| {
-        ctx.runtime_call()
-            .and_then(|mut runtime| runtime.construct_values(values.as_slice()))
-    });
+    let result = ctx
+        .stage_spread_arguments(Value::from_bits(array))
+        .map(|()| Value::undefined());
     committed_vm_result(ctx, result)
 }
 
@@ -304,8 +239,7 @@ mod tests {
     use otter_vm::{
         VmError,
         native_abi::{
-            NativeFrame, NativeFrameKind, NativeResultDomain, NativeResultStatus, VmFrameHeader,
-            VmThread,
+            Frame, NativeFrameKind, NativeResultDomain, NativeResultStatus, VmFrameHeader, VmThread,
         },
     };
 
@@ -324,7 +258,7 @@ mod tests {
         ) -> NativeResultPair = jit_store_property_stub;
 
         let mut registers = [Value::undefined()];
-        let mut frame = NativeFrame::new(
+        let mut frame = Frame::new(
             VmFrameHeader {
                 function_id: 0,
                 pc: 0,
@@ -336,7 +270,7 @@ mod tests {
             Value::function(0),
             Value::undefined(),
         );
-        frame.set_stack_registers();
+
         let mut thread = VmThread::empty();
         let mut error = None;
         let mut ctx = JitCtx {
@@ -347,6 +281,10 @@ mod tests {
             global_this_offset: std::ptr::null(),
             native_stack_limit: 0,
             generated_feedback_clean: 1,
+            completion_destination: u32::MAX,
+            completion_generation: 0,
+            pending_call: otter_vm::native_abi::CallRequest::EMPTY,
+            completion: otter_vm::native_abi::NativeResultPair::success(otter_vm::Value::UNDEFINED),
             alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
             runtime_stats: std::ptr::null_mut(),
         };
@@ -374,54 +312,4 @@ mod tests {
         assert!(matches!(error, Some(VmError::InvalidOperand)));
     }
 
-    #[test]
-    fn method_call_entry_uses_owned_value_span_pair_abi() {
-        let _method_abi: extern "C" fn(*mut JitCtx, *const Value, u32) -> NativeResultPair =
-            jit_call_method_value_stub;
-
-        let mut registers = [Value::undefined()];
-        let mut frame = NativeFrame::new(
-            VmFrameHeader {
-                function_id: 0,
-                pc: 0,
-                register_count: 1,
-                kind: NativeFrameKind::Optimizing,
-                flags: Default::default(),
-            },
-            registers.as_mut_ptr() as u64,
-            Value::function(0),
-            Value::undefined(),
-        );
-        frame.set_stack_registers();
-        let mut thread = VmThread::empty();
-        let mut error = None;
-        let mut ctx = JitCtx {
-            thread: std::ptr::addr_of_mut!(thread),
-            native_frame: std::ptr::addr_of_mut!(frame),
-            error: std::ptr::addr_of_mut!(error),
-            generated_depth_limit: u64::MAX,
-            global_this_offset: std::ptr::null(),
-            native_stack_limit: 0,
-            generated_feedback_clean: 1,
-            alloc_window: otter_vm::jit::JitMachineAllocationWindow::disabled(),
-            runtime_stats: std::ptr::null_mut(),
-        };
-        unsafe { (*ctx.thread).frame_cell = std::ptr::addr_of_mut!(ctx.native_frame) as u64 };
-        let packet = [Value::number_i32(7), Value::number_i32(11)];
-
-        let result = jit_call_method_value_stub(&mut ctx, packet.as_ptr(), packet.len() as u32);
-        assert_eq!(
-            result.validate(NativeResultDomain::Committed),
-            Some(NativeResultStatus::Fatal)
-        );
-        assert!(matches!(error, Some(VmError::InvalidOperand)));
-
-        error = None;
-        let result = jit_call_method_value_stub(&mut ctx, std::ptr::null(), 0);
-        assert_eq!(
-            result.validate(NativeResultDomain::Committed),
-            Some(NativeResultStatus::Fatal)
-        );
-        assert!(matches!(error, Some(VmError::InvalidOperand)));
-    }
 }

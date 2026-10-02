@@ -131,25 +131,22 @@ impl Interpreter {
                 interp.module_init_closures.insert(module_url, closure);
                 closure
             };
-            let window = interp.alloc_reg_window(function.register_count as usize)?;
-            let frame =
-                Frame::for_code_block(function, None, self_value, Value::undefined(), window);
-            stack.push(frame);
+            let mut frame =
+                crate::PreparedCall::for_code_block(function, None, self_value, Value::undefined());
             let env_value = interp.escape_scoped(env);
             let import_meta_value = interp.escape_scoped(import_meta);
             let args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![env_value, import_meta_value, Value::boolean(hoist_phase)];
-            if let Err(error) =
-                interp.bind_bytecode_call_arguments(function, &mut stack[floor.depth()], args)
-            {
+            if let Err(error) = interp.bind_bytecode_call_arguments(function, &mut frame, args) {
                 interp.release_frames_above(stack, floor);
                 return Err(error);
             }
+            stack.push(frame);
             let init_promise = if function.is_async {
                 let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
                     .pending_stack_rooted(interp, stack, &[&env_value, &import_meta_value], &[])?;
-                let frame = stack.last_mut().expect("init frame was just pushed");
-                interp.frame_set_async_state(
+                let frame = stack.pending_mut().expect("init inputs were just queued");
+                interp.prepared_set_async_state(
                     frame,
                     AsyncFrameState {
                         result_promise: result,

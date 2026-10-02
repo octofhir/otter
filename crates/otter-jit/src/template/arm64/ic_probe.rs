@@ -124,12 +124,12 @@ pub(crate) fn emit_object_flags_guard(
     miss: DynamicLabel,
 ) {
     let scratch = if header == 14 { 11 } else { 14 };
-    dynasm!(ops ; .arch aarch64 ; ldrb W(scratch), [X(header), view.object_flags_byte]);
-    for bit in 0..8u32 {
-        if mask & (1 << bit) != 0 {
-            dynasm!(ops ; .arch aarch64 ; tbnz W(scratch), bit, =>miss);
-        }
-    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldrb W(scratch), [X(header), view.object_flags_byte]
+        ; tst W(scratch), u32::from(mask)
+        ; b.ne =>miss
+    );
 }
 
 /// Prove that one prototype-chain link still supports the missing-key proof a
@@ -165,7 +165,6 @@ fn emit_chain_link_state_guard(
 /// a caller may keep it only until its next safepoint.
 pub(crate) fn emit_load_header<R>(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     load_receiver: R,
     header: u8,
@@ -174,7 +173,7 @@ pub(crate) fn emit_load_header<R>(
 where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
-    emit_load_object_header(ops, relocations, view, load_receiver, header, miss)?;
+    emit_load_object_header(ops, load_receiver, header, miss)?;
     emit_ordinary_lookup_state_guard(ops, view, header, miss);
     Ok(())
 }
@@ -184,8 +183,6 @@ where
 /// each node reads only its declared alias class.
 pub(crate) fn emit_load_object_header<R>(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
     load_receiver: R,
     header: u8,
     miss: DynamicLabel,
@@ -195,20 +192,10 @@ where
 {
     load_receiver(ops, 9)?;
     super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, miss);
+    // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
-        ; mov w12, w9              // low-32 Gc offset (zero-ext)
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add X(header), x13, x12  // header = GcHeader ptr
+        ; mov X(header), x9
         ; ldrb w14, [X(header)]    // header type tag
         ; cmp w14, OBJECT_BODY_TYPE_TAG
         ; b.ne =>miss
@@ -367,7 +354,7 @@ where
         )
     });
     if !intrinsic {
-        emit_load_header(ops, relocations, view, &mut load_receiver, 13, miss)?;
+        emit_load_header(ops, view, &mut load_receiver, 13, miss)?;
     }
     let done = ops.new_dynamic_label();
     for program in programs {
@@ -378,7 +365,7 @@ where
         ) {
             load_receiver(ops, 9)?;
         } else if intrinsic {
-            emit_load_header(ops, relocations, view, &mut load_receiver, 13, next)?;
+            emit_load_header(ops, view, &mut load_receiver, 13, next)?;
         }
         let mut terminal = false;
         for op in program.ops.iter() {
@@ -523,8 +510,8 @@ where
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return Ok(());
     };
-    emit_load_header(ops, relocations, view, load_receiver, 13, miss)?;
-    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
+    emit_load_header(ops, view, load_receiver, 13, miss)?;
+    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tst w14, 0x10 ; b.ne =>miss);
     let matched = ops.new_dynamic_label();
     let existing = ops.new_dynamic_label();
     for program in programs {
@@ -648,7 +635,7 @@ where
                         ; b.hs =>next
                         ; =>storage_fits
                         ; ldrb w16, [x13, view.object_flags_byte]
-                        ; tbz w16, EXTENSIBLE_BIT, =>next
+                        ; tst w16, 1u32 << EXTENSIBLE_BIT ; b.eq =>next
                     );
                     // The program's receiver shape guard fixes the slot
                     // count at the appended index: the store is the exact
@@ -700,7 +687,7 @@ where
 
 /// Run the child-shape edge barrier after an add-transition value commit.
 ///
-/// `w16` is the child shape (`0` for an existing-slot store), `x12` the
+/// `w16` is the compressed child shape (`0` for an existing-slot store), `x12` the
 /// receiver header, and `x9` the already-stored value. The slow marking path is
 /// a native call, so preserve the parent/value pair needed by the following
 /// value barrier. There is deliberately no miss edge: structural publication
@@ -717,6 +704,16 @@ pub(crate) fn emit_property_transition_shape_barrier(
         ; cbz w16, =>done
         ; stp x12, x9, [sp, #-16]!
     );
+    // The barrier takes the child as a full cell address; decompress the
+    // shape handle.
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        15,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch aarch64 ; add x16, x15, x16);
     super::values::emit_write_barrier_with_context(ops, relocations, view, 12, 16, context);
     dynasm!(ops
         ; .arch aarch64
@@ -738,7 +735,6 @@ pub(crate) fn emit_property_transition_shape_barrier(
 /// `not_length` and the caller emits its ordinary property probe.
 pub(crate) fn emit_exotic_length_fast(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     have_length: DynamicLabel,
     not_length: DynamicLabel,
@@ -750,17 +746,10 @@ pub(crate) fn emit_exotic_length_fast(
     let try_string = ops.new_dynamic_label();
 
     emit_cell_test(ops, 9, 11, CellTest::IsNotCell, not_length);
-    dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
+    // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; mov x13, x9
         ; ldrb w14, [x13]
         ; cmp w14, array_tag
         ; b.ne =>try_string
@@ -795,17 +784,6 @@ pub(crate) fn emit_exotic_length_fast(
     dynasm!(ops ; .arch aarch64 ; b =>have_length);
 }
 
-/// Whether the index operand a site supplies still carries a `Value` tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DenseIndexForm {
-    /// A boxed `Value` whose int32 payload the guard must still prove.
-    Tagged,
-    /// A signed scalar index; reject its sign before unsigned bounds.
-    Int32,
-    /// An exact unsigned scalar index.
-    Uint32,
-}
-
 /// Whether a family is baked for the indexed-element program.
 ///
 /// The declaration is the whole gate: without a cage base the guard cannot
@@ -832,8 +810,6 @@ pub(crate) fn element_access_for(
 /// Clobbers `x9`, `x11`-`x16`.
 pub(crate) fn emit_dense_element_view<R>(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
     access: &JitElementAccess,
     load_receiver: R,
     miss: DynamicLabel,
@@ -846,17 +822,10 @@ where
     };
     load_receiver(ops, 9)?;
     emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
-    dynasm!(ops ; .arch aarch64 ; mov w12, w9); // low-32 Gc offset
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
+    // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; mov x13, x9
         ; ldrb w14, [x13]
         ; cmp w14, access.type_tag as u32
         ; b.ne =>miss
@@ -902,21 +871,14 @@ where
     R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
     if matches!(access.base, JitElementBase::InBody { .. }) {
-        return emit_dense_element_view(ops, relocations, view, access, load_receiver, miss);
+        return emit_dense_element_view(ops, access, load_receiver, miss);
     }
     load_receiver(ops, 9)?;
     emit_cell_test(ops, 9, 11, CellTest::IsNotCell, miss);
-    dynasm!(ops ; .arch aarch64 ; mov w12, w9);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
+    // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12
+        ; mov x13, x9
         ; ldrb w14, [x13]
         ; cmp w14, access.type_tag as u32
         ; b.ne =>miss
@@ -1070,34 +1032,30 @@ fn emit_through_local_buffer(
 /// Prove one index against an already validated in-body dense view.
 ///
 /// The caller supplies the raw base in `x16` and normalized length in `x14`.
-/// On success `x16` is advanced to the addressed element. The tagged form
-/// first proves the exact int32 number tag; the unsigned bounds comparison then
-/// rejects negative indices without a separate branch.
+/// On success `x16` is advanced to the addressed element. The tagged index
+/// must carry the exact int32 number tag; the sign test then rejects a
+/// negative index before the unsigned bounds comparison.
 ///
 /// Clobbers `x11`, `x12`, `x15`, and `x16`.
 pub(crate) fn emit_element_address_from_dense_view<I>(
     ops: &mut Assembler,
     access: &JitElementAccess,
     load_index: I,
-    index_form: DenseIndexForm,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
     load_index(ops, 15)?;
-    if index_form == DenseIndexForm::Tagged {
-        dynasm!(ops
-            ; .arch aarch64
-            ; lsr x11, x15, #48
-            ; movz x12, NUMBER_TAG_HI16
-            ; cmp x11, x12
-            ; b.ne =>miss
-        );
-    }
-    if matches!(index_form, DenseIndexForm::Tagged | DenseIndexForm::Int32) {
-        dynasm!(ops ; .arch aarch64 ; tbnz w15, #31, =>miss);
-    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; lsr x11, x15, #48
+        ; movz x12, NUMBER_TAG_HI16
+        ; cmp x11, x12
+        ; b.ne =>miss
+        ; tst w15, 0x80000000
+        ; b.ne =>miss
+    );
     match access.length_width {
         JitGuardWidth::Byte | JitGuardWidth::Word32 => dynasm!(ops
             ; .arch aarch64
@@ -1144,7 +1102,6 @@ pub(crate) fn emit_element_address<R, I>(
     access: &JitElementAccess,
     load_receiver: R,
     load_index: I,
-    index_form: DenseIndexForm,
     miss: DynamicLabel,
 ) -> Result<(), Unsupported>
 where
@@ -1153,7 +1110,7 @@ where
 {
     // The template tier keeps its runtime context in x20.
     emit_element_view(ops, relocations, view, access, 20, load_receiver, miss)?;
-    emit_element_address_from_dense_view(ops, access, load_index, index_form, miss)
+    emit_element_address_from_dense_view(ops, access, load_index, miss)
 }
 
 /// Read the element whose address [`emit_element_address`] left in `x16` into
@@ -1757,8 +1714,6 @@ fn emit_guarded_method_guard_impl(
             let shape_byte = view.object_shape_byte;
             emit_receiver_type_guard_impl(
                 ops,
-                relocations,
-                view,
                 receiver,
                 tagged_receiver,
                 OBJECT_BODY_TYPE_TAG,
@@ -1830,8 +1785,6 @@ fn emit_guarded_method_guard_impl(
         }) => {
             emit_receiver_type_guard_impl(
                 ops,
-                relocations,
-                view,
                 receiver,
                 tagged_receiver,
                 u32::from(type_tag),
@@ -1874,8 +1827,6 @@ fn emit_guarded_method_guard_impl(
 
 fn emit_receiver_type_guard_impl(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
     receiver: u16,
     tagged_receiver: Option<u8>,
     receiver_type_tag: u32,
@@ -1889,17 +1840,10 @@ fn emit_receiver_type_guard_impl(
     };
     let tag_scratch = if tagged == 11 { 10 } else { 11 };
     emit_cell_test(ops, tagged, tag_scratch, CellTest::IsNotCell, miss);
-    dynasm!(ops ; .arch aarch64 ; mov w12, W(tagged));
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        13,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
+    // A cell value is its header's full address.
     dynasm!(ops
         ; .arch aarch64
-        ; add x13, x13, x12
+        ; mov x13, X(tagged)
         ; ldrb w14, [x13]
         ; cmp w14, receiver_type_tag
         ; b.ne =>miss
@@ -1957,7 +1901,7 @@ pub(crate) fn emit_dictionary_layout_guard(
         ; ldr w14, [X(header), view.object_shape_byte]
         ; add x14, x12, x14
         ; ldrb w14, [x14, view.shape_kind_byte]
-        ; tbz w14, super::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
+        ; tst w14, 1u32 << super::values::SHAPE_KIND_DICTIONARY_BIT ; b.eq =>miss
         ; ldr w14, [X(header), view.object_exotic_handle_byte]
         ; cbz w14, =>miss
         ; add x14, x12, x14

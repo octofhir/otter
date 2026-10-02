@@ -1010,8 +1010,9 @@ fn select_with_loop_entries(
                     let exits = exit_specs[&point].clone();
                     let mut poll =
                         MachineInstruction::plain(MachineOpcode::BackedgePoll, Vec::new());
+                    // The poll's rare runtime call preserves the allocation
+                    // file itself.
                     attach_frame_state(hir, &values, state_index, exits, &mut poll);
-                    poll.clobbers = target_spec.clobbers(TargetClobberSet::ScalarCall).to_vec();
                     instructions.push(poll);
                 }
                 if loop_entries.entry_edges.contains(&(predecessor, edge)) {
@@ -1732,7 +1733,6 @@ fn select_with_loop_entries(
                     hir.element_sites.get(&node_value).copied(),
                     inputs,
                     element_values[&block_index],
-                    &mut representations,
                     &mut instructions,
                 )?;
                 let mut branch = MachineInstruction::plain(
@@ -12348,23 +12348,12 @@ mod tests {
         let allocation = sequence
             .allocate(&TargetSpec::aarch64())
             .expect("branch-phi Machine IR allocation");
-        assert!(
-            allocation
-                .metadata()
-                .iter()
-                .filter(|metadata| metadata.frame_state == Some(2))
-                .all(|metadata| match metadata.location {
-                    AllocatedLocation::Stack(_) => true,
-                    AllocatedLocation::Register(register) => {
-                        register.is_integer() && (20..=28).contains(&register.encoding())
-                    }
-                }),
-            "poll operands must survive the leaf call outside caller-saved registers"
-        );
+        // The poll preserves every allocatable register itself, so its
+        // frame-state values stay where the loop keeps them.
         assert!(allocation.metadata().iter().any(|metadata| {
             metadata.frame_state == Some(2)
                 && matches!(metadata.location, AllocatedLocation::Register(register)
-                    if register.is_integer() && (20..=28).contains(&register.encoding()))
+                    if register.is_integer())
         }));
         let layout = aarch64_test_frame(&allocation, 0).expect("branch-phi frame layout");
         let deopt_table = lower_deopt_table(

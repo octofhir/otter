@@ -125,7 +125,7 @@ pub(super) fn emit(
             ; movz w14, MAX_CHAIN
             ; =>step
             ; ldrb w9, [x13, view.object_flags_byte]
-            ; tbnz w9, CHAIN_LINK_OPAQUE_BIT, =>miss
+            ; tst w9, 1u32 << CHAIN_LINK_OPAQUE_BIT ; b.ne =>miss
         );
         crate::template::arm64::values::emit_load_prototype(ops, view, 9, 13, 11);
         dynasm!(ops ; .arch aarch64

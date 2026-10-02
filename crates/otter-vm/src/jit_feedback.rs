@@ -714,6 +714,17 @@ impl ArithFeedback {
         self.0 == ARITH_INT32
     }
 
+    /// `true` when an optimizing lowering may speculate `int32` operands: no
+    /// tier has observed any other representation. The interpreter records
+    /// every operand; baseline code records every representation its fast
+    /// paths and runtime completions handle except `int32`, so a site no tier
+    /// has recorded ran on `int32` operands only, or never ran. A wrong
+    /// speculation exits and widens the site.
+    #[must_use]
+    pub const fn speculates_int32(self) -> bool {
+        self.0 & !ARITH_INT32 == 0
+    }
+
     /// The cell after an optimized generation exited at this site.
     ///
     /// Operand observation cannot see an `int32` result that overflowed or a
@@ -891,6 +902,14 @@ impl InstructionFeedback {
             }
             _ => Family::Unseen,
         }
+    }
+
+    /// Address of the arithmetic observation byte. Template code ORs the
+    /// representations its own fast paths handle into it; the byte lives as
+    /// long as the owning CodeBlock.
+    #[must_use]
+    pub(crate) fn arith_cell_address(&self) -> u64 {
+        self.arith.as_ptr() as u64
     }
 
     /// Arithmetic bits consumed by a compile snapshot.

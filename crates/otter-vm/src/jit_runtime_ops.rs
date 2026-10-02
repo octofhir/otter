@@ -96,6 +96,7 @@ impl Interpreter {
             .rhs_register()
             .map(|register| frame.read(register))
             .transpose()?;
+        record_completed_arith(context, frame, lhs, rhs.unwrap_or(lhs));
         let result = self.numeric_runtime_value(stack, context, operation, lhs, rhs)?;
         frame.write(dst, result)
     }
@@ -113,6 +114,7 @@ impl Interpreter {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         let lhs = frame.read(lhs)?;
         let rhs = frame.read(rhs)?;
+        record_completed_arith(context, frame, lhs, rhs);
         let result = self.add_value(stack, context, lhs, rhs)?;
         frame.write(dst, result)
     }
@@ -333,6 +335,24 @@ impl Interpreter {
         let result = self.run_make_function_active_reg(&resolved, frame, dst, function_index);
         frame.set_pc(saved_pc);
         result
+    }
+}
+
+/// Record the operands of a compiled arithmetic site completed here. Baseline
+/// code reaches these completions with the representations its fast paths do
+/// not handle, so the site's feedback stays complete without the fast paths
+/// recording `int32`.
+fn record_completed_arith(
+    context: &ExecutionContext,
+    frame: &ActiveFrameMut<'_>,
+    lhs: crate::Value,
+    rhs: crate::Value,
+) {
+    if let Some(recorder) = context
+        .exec_function(frame.function_id())
+        .and_then(|function| function.feedback_recorder_at(frame.pc() as usize))
+    {
+        recorder.record_arith(lhs, rhs);
     }
 }
 

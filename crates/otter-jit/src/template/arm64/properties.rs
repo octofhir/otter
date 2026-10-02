@@ -68,7 +68,7 @@ pub(super) fn emit_load_property(
         let have_length = ops.new_dynamic_label();
         let not_length = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
-        ic_probe::emit_exotic_length_fast(ops, relocations, view, have_length, not_length);
+        ic_probe::emit_exotic_length_fast(ops, view, have_length, not_length);
         dynasm!(ops
             ; .arch aarch64
             ; =>have_length

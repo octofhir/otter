@@ -54,6 +54,7 @@ const TARGET_STRING_CONSTANT_CELL: u8 = 12;
 const TARGET_PROPERTY_LOOKUP_CACHE_TABLE: u8 = 13;
 const TARGET_STORE_TRANSITION_CACHE_TABLE: u8 = 14;
 const TARGET_CALLEE_IDENTITY_CELL: u8 = 16;
+const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
 /// Whether a property source-identity cell serves a load or a store site.
@@ -137,6 +138,12 @@ pub(crate) enum RelocationTarget {
     CalleeIdentityCell {
         function_id: u32,
         call_pc: u32,
+    },
+    /// Live arithmetic observation byte of one instruction, which baseline
+    /// code records into.
+    ArithFeedbackCell {
+        function_id: u32,
+        pc: u32,
     },
 }
 
@@ -1249,6 +1256,11 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             output.push(TARGET_CALLEE_IDENTITY_CELL);
             put_u32(output, *function_id);
             put_u32(output, *call_pc);
+        }
+        RelocationTarget::ArithFeedbackCell { function_id, pc } => {
+            output.push(TARGET_ARITH_FEEDBACK_CELL);
+            put_u32(output, *function_id);
+            put_u32(output, *pc);
         }
     }
     Ok(())

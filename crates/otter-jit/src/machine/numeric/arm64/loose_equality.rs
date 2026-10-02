@@ -16,8 +16,6 @@
 
 #![allow(clippy::useless_conversion)]
 
-use super::emit_load_symbolic_u64;
-use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
 use dynasmrt::aarch64::Assembler;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
@@ -25,7 +23,6 @@ use otter_vm::{JitCompileSnapshot, Value, value::tag};
 
 pub(super) fn emit(
     ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     inputs: [u8; 2],
     outputs: [u8; 2],
@@ -53,27 +50,15 @@ pub(super) fn emit(
     }
     emit_cell_test(ops, left, 16, CellTest::IsNotCell, miss);
     emit_cell_test(ops, right, 16, CellTest::IsNotCell, miss);
-    if view.cage_base == 0 {
-        dynasm!(ops ; .arch aarch64 ; b =>miss);
-    } else {
-        for source in [left, right] {
-            emit_load_symbolic_u64(
-                ops,
-                relocations,
-                16,
-                view.cage_base as u64,
-                RelocationTarget::GcCageBase,
-            );
-            dynasm!(ops ; .arch aarch64
-                ; mov w15, W(source) ; add x16, x16, x15 ; ldrb w15, [x16]
-            );
-            for primitive_tag in view.primitive_cell_type_tags {
-                dynasm!(ops ; .arch aarch64 ; cmp w15, u32::from(primitive_tag) ; b.eq =>miss);
-            }
+    for source in [left, right] {
+        // A cell value is its header's full address.
+        dynasm!(ops ; .arch aarch64 ; ldrb w15, [X(source)]);
+        for primitive_tag in view.primitive_cell_type_tags {
+            dynasm!(ops ; .arch aarch64 ; cmp w15, u32::from(primitive_tag) ; b.eq =>miss);
         }
-        // Both are non-primitive JS cells and their identities already differ.
-        dynasm!(ops ; .arch aarch64 ; b =>no);
     }
+    // Both are non-primitive JS cells and their identities already differ.
+    dynasm!(ops ; .arch aarch64 ; b =>no);
     dynasm!(ops ; .arch aarch64 ; =>integer);
     emit_load_u64(ops, 16, tag::NUMBER_TAG);
     dynasm!(ops ; .arch aarch64

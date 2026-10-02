@@ -487,6 +487,7 @@ fn compile_with_reach(
                     lhs,
                     rhs,
                     kind,
+                    arith::ArithSite::of(view, instr.pc),
                     &mut numeric_slow_paths,
                 )?;
             }
@@ -503,6 +504,7 @@ fn compile_with_reach(
                     lhs,
                     rhs,
                     kind,
+                    arith::ArithSite::of(view, instr.pc),
                     type_mismatch_exit,
                     &mut numeric_slow_paths,
                 )?;
@@ -550,10 +552,25 @@ fn compile_with_reach(
                 emit_unsigned_shift_right(&mut ops, dst, lhs, rhs, &mut numeric_slow_paths)?;
             }
             TemplateOp::Increment { dst, src, delta } => {
-                emit_increment(&mut ops, dst, src, delta, &mut numeric_slow_paths)?;
+                emit_increment(
+                    &mut ops,
+                    &mut relocations,
+                    dst,
+                    src,
+                    delta,
+                    arith::ArithSite::of(view, instr.pc),
+                    &mut numeric_slow_paths,
+                )?;
             }
             TemplateOp::Negate { dst, src } => {
-                emit_negate(&mut ops, dst, src, &mut numeric_slow_paths)?;
+                emit_negate(
+                    &mut ops,
+                    &mut relocations,
+                    dst,
+                    src,
+                    arith::ArithSite::of(view, instr.pc),
+                    &mut numeric_slow_paths,
+                )?;
             }
             TemplateOp::BitwiseNot { dst, src } => {
                 emit_bitwise_not(&mut ops, dst, src, &mut numeric_slow_paths)?;
@@ -578,6 +595,7 @@ fn compile_with_reach(
                     lhs,
                     rhs,
                     concat_safepoint,
+                    arith::ArithSite::of(view, instr.pc),
                     threw,
                     fatal,
                 )?;

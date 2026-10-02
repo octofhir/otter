@@ -87,6 +87,59 @@ fn numeric_slow_path(
     (entry, resume)
 }
 
+/// The live arithmetic observation byte of the instruction being emitted.
+///
+/// The interpreter records every operand representation. Baseline code
+/// records the representations it handles off its int32 fast path here, and
+/// its runtime completions record theirs, so the optimizing tier reads a site
+/// nothing recorded as int32-only or unexecuted.
+#[derive(Clone, Copy)]
+pub(super) struct ArithSite {
+    pub(super) cell: u64,
+    pub(super) function_id: u32,
+    pub(super) pc: u32,
+}
+
+impl ArithSite {
+    pub(super) fn of(view: &JitCompileSnapshot, pc: u32) -> Option<Self> {
+        let cell = view.instructions.get(pc as usize)?.arith_cell;
+        (cell != 0).then_some(Self {
+            cell,
+            function_id: view.code_block.id,
+            pc,
+        })
+    }
+}
+
+/// OR `bits` into the site's observation byte. Clobbers `x14` and `x16`.
+pub(super) fn emit_record_arith(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    site: Option<ArithSite>,
+    bits: u8,
+) {
+    let Some(site) = site else {
+        return;
+    };
+    let start = ops.offset().0;
+    emit_load_u64(ops, 16, site.cell);
+    relocations.record_mov_wide(
+        start,
+        ops.offset().0,
+        16,
+        crate::artifact::relocation::RelocationTarget::ArithFeedbackCell {
+            function_id: site.function_id,
+            pc: site.pc,
+        },
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldrb w14, [x16]
+        ; orr w14, w14, u32::from(bits)
+        ; strb w14, [x16]
+    );
+}
+
 /// Function-id immediate low tag as a 32-bit `dynasm` operand.
 const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
 use crate::template::{
@@ -103,6 +156,7 @@ use otter_bytecode::scalar_semantics::{Int32ResultPolicy, NegativeZeroCondition}
 /// integer quotients). `Rem` keeps the truncating int32 remainder inline and
 /// side-exits the cases int32 cannot represent (zero divisor → NaN, zero
 /// remainder of a negative dividend → `-0`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_binary_arith(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -110,6 +164,7 @@ pub(super) fn emit_binary_arith(
     lhs: u16,
     rhs: u16,
     kind: ArithKind,
+    site: Option<ArithSite>,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
     let semantics = kind.semantics();
@@ -119,6 +174,8 @@ pub(super) fn emit_binary_arith(
     emit_load_reg(ops, 10, rhs)?;
     match kind {
         ArithKind::Div => {
+            // Division always computes in doubles; its operands are recorded
+            // by the interpreter and the runtime completion.
             emit_num_to_double(ops, 9, 0, slow);
             emit_num_to_double(ops, 10, 1, slow);
             dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1);
@@ -226,6 +283,12 @@ pub(super) fn emit_binary_arith(
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+    emit_record_arith(
+        ops,
+        relocations,
+        site,
+        otter_vm::jit_feedback::ARITH_FLOAT64,
+    );
     emit_num_to_double(ops, 9, 0, slow);
     emit_num_to_double(ops, 10, 1, slow);
     match kind {
@@ -298,6 +361,7 @@ pub(super) fn emit_add_generic(
     lhs: u16,
     rhs: u16,
     concat_safepoint: otter_vm::native_abi::SafepointId,
+    site: Option<ArithSite>,
     threw: DynamicLabel,
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
@@ -322,12 +386,21 @@ pub(super) fn emit_add_generic(
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+    emit_record_arith(
+        ops,
+        relocations,
+        site,
+        otter_vm::jit_feedback::ARITH_FLOAT64,
+    );
     emit_num_to_double(ops, 9, 0, runtime_path);
     emit_num_to_double(ops, 10, 1, runtime_path);
     dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1);
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path);
+    // The inline concatenation handles two strings; any other operand reaches
+    // the delegate, whose completion records it.
+    emit_record_arith(ops, relocations, site, otter_vm::jit_feedback::ARITH_STRING);
     emit_string_concat_alloc_call(
         ops,
         relocations,
@@ -406,6 +479,7 @@ pub(super) fn emit_test_typeof(
     emit_store_reg(ops, 13, dst)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_compare(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -413,6 +487,7 @@ pub(super) fn emit_compare(
     lhs: u16,
     rhs: u16,
     kind: CompareKind,
+    site: Option<ArithSite>,
     bail: DynamicLabel,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
@@ -469,6 +544,14 @@ pub(super) fn emit_compare(
     );
     emit_cset(ops, kind, IntCondition);
     dynasm!(ops ; .arch aarch64 ; b =>have_bool ; =>float_path);
+    if !matches!(kind, CompareKind::Eq | CompareKind::Ne) {
+        emit_record_arith(
+            ops,
+            relocations,
+            site,
+            otter_vm::jit_feedback::ARITH_FLOAT64,
+        );
+    }
     if matches!(kind, CompareKind::Eq | CompareKind::Ne) {
         let lhs_non_number = ops.new_dynamic_label();
         let number_path = ops.new_dynamic_label();
@@ -680,7 +763,7 @@ pub(super) fn emit_loose_compare(
     dynasm!(ops ; .arch aarch64 ; fcmp d0, d1 ; cset w13, eq ; b =>have_bool);
 
     dynasm!(ops ; .arch aarch64 ; =>lhs_nullish);
-    emit_html_dda_candidate_exit(ops, relocations, view, 10, 11, 12, slow);
+    emit_html_dda_candidate_exit(ops, view, 10, 11, 12, slow);
     emit_load_u64(ops, 11, VALUE_NULL);
     dynasm!(ops ; .arch aarch64 ; cmp x10, x11 ; b.eq >both_nullish);
     emit_load_u64(ops, 11, VALUE_UNDEFINED);
@@ -694,7 +777,7 @@ pub(super) fn emit_loose_compare(
         ; b =>have_bool
         ; =>rhs_nullish
     );
-    emit_html_dda_candidate_exit(ops, relocations, view, 9, 11, 12, slow);
+    emit_html_dda_candidate_exit(ops, view, 9, 11, 12, slow);
     dynasm!(ops
         ; .arch aarch64
         ; movz w13, #0
@@ -799,9 +882,11 @@ pub(super) fn emit_unsigned_shift_right(
 /// side exit.
 pub(super) fn emit_increment(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     src: u16,
     delta: i32,
+    site: Option<ArithSite>,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
     let (slow, resume) = numeric_slow_path(
@@ -828,6 +913,12 @@ pub(super) fn emit_increment(
     emit_box_int32(ops, 13, 11);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+    emit_record_arith(
+        ops,
+        relocations,
+        site,
+        otter_vm::jit_feedback::ARITH_FLOAT64,
+    );
     emit_num_to_double(ops, 9, 0, slow);
     dynasm!(ops ; .arch aarch64 ; scvtf d1, w12 ; fadd d2, d0, d1);
     emit_box_double(ops, 2, 13);
@@ -841,8 +932,10 @@ pub(super) fn emit_increment(
 /// `-0` (from payload `0`) and `2147483648` (from `-i32::MIN`).
 pub(super) fn emit_negate(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     dst: u16,
     src: u16,
+    site: Option<ArithSite>,
     slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
     let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, src, 0, Op::Neg);
@@ -882,6 +975,15 @@ pub(super) fn emit_negate(
         ; .arch aarch64
         ; tst x9, x15
         ; b.eq =>slow                 // cell / immediate → VM numeric completion
+    );
+    emit_record_arith(
+        ops,
+        relocations,
+        site,
+        otter_vm::jit_feedback::ARITH_FLOAT64,
+    );
+    dynasm!(ops
+        ; .arch aarch64
         ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
         ; sub x14, x9, x14
         ; fmov d0, x14

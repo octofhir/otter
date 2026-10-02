@@ -55,6 +55,7 @@ pub(crate) use crate::GENERATED_POLL_BATCH;
 
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,
+    emit_method_shape_dispatch, emit_method_target,
 };
 pub(crate) use receiver_allocation::{
     emit_object_type_branch, emit_receiver_candidate_probe, emit_receiver_publication_effect,

@@ -42,7 +42,6 @@ pub(super) fn emit(
     // Consume the allocator's late receiver before initializing any scratch.
     emit_load_header(
         ops,
-        relocations,
         view,
         |ops, target| emit_load_allocated_tagged(ops, frame, locations[0], target, 0),
         13,
@@ -63,7 +62,7 @@ pub(super) fn emit(
         // A dictionary shape is shared by its lineage's dictionary objects
         // whatever their keys; no cache entry names one.
         ; ldrb w12, [x15, view.shape_kind_byte]
-        ; tbnz w12, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
+        ; tst w12, 1u32 << crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT ; b.ne =>miss
         ; ldr x11, [x15, cache.shape_id_byte]
     );
     emit_load_u64(ops, 15, cache.hash_shape_multiplier);
@@ -175,14 +174,13 @@ pub(super) fn emit_store(
     let final_miss = ops.new_dynamic_label();
     emit_load_header(
         ops,
-        relocations,
         view,
         |ops, target| emit_load_allocated_tagged(ops, frame, *receiver, target, 0),
         13,
         miss,
     )?;
     emit_ordinary_lookup_state_guard(ops, view, 13, miss);
-    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tbnz w14, 4, =>miss);
+    dynasm!(ops ; .arch aarch64 ; ldrb w14, [x13, view.object_flags_byte] ; tst w14, 0x10 ; b.ne =>miss);
     emit_load_symbolic_u64(
         ops,
         relocations,
@@ -197,7 +195,7 @@ pub(super) fn emit_store(
         // A dictionary shape is shared by its lineage's dictionary objects
         // whatever their keys; no cache entry names one.
         ; ldrb w12, [x15, view.shape_kind_byte]
-        ; tbnz w12, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
+        ; tst w12, 1u32 << crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT ; b.ne =>miss
         ; ldr x11, [x15, cache.shape_id_byte]
     );
     emit_load_u64(ops, 15, cache.hash_shape_multiplier);
@@ -321,7 +319,6 @@ fn emit_transition_store(
     let ready = ops.new_dynamic_label();
     emit_load_header(
         ops,
-        relocations,
         view,
         |ops, target| emit_load_allocated_tagged(ops, frame, receiver, target, 0),
         13,
@@ -341,7 +338,7 @@ fn emit_transition_store(
         ; ldr w14, [x13, view.object_shape_byte]
         ; add x14, x16, x14
         ; ldrb w15, [x14, view.shape_kind_byte]
-        ; tbnz w15, crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT, =>miss
+        ; tst w15, 1u32 << crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT ; b.ne =>miss
         ; ldr x11, [x14, cache.shape_id_byte]
         ; mov x15, xzr
     );
@@ -394,8 +391,8 @@ fn emit_transition_store(
         ; cbz w9, =>miss
         ; =>chain_done
         ; ldrb w10, [x12, view.object_flags_byte]
-        ; tbnz w10, 4, =>miss
-        ; tbz w10, crate::template::arm64::ic_probe::EXTENSIBLE_BIT, =>miss
+        ; tst w10, 0x10 ; b.ne =>miss
+        ; tst w10, 1u32 << crate::template::arm64::ic_probe::EXTENSIBLE_BIT ; b.eq =>miss
         // The matched receiver shape has exactly `slot` slots: the append
         // index is its property count.
         ; ldrh w9, [x17, cache.slot_byte]

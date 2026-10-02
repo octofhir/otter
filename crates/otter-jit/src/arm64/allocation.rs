@@ -152,7 +152,7 @@ pub(crate) fn emit_copy_context(
     dynasm!(ops
         ; .arch aarch64
         ; ldrh w14, [X(source), layout.scope_index_byte]
-        ; tbnz w14, JIT_CONTEXT_HAS_EXTENSION_BIT, =>slow
+        ; tst w14, 1u32 << JIT_CONTEXT_HAS_EXTENSION_BIT ; b.ne =>slow
         ; ldrh w15, [X(source), layout.slot_count_byte]
         ; cmp w15, JIT_INLINE_CONTEXT_MAX_WORDS as u32
         ; b.hi =>slow

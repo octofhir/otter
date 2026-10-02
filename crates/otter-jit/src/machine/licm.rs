@@ -116,10 +116,9 @@ struct ValueFacts {
     definitions: Vec<Option<usize>>,
     /// Values passed along a CFG edge.
     edge_values: Vec<bool>,
-    /// Values read by a non-input operand or by deopt reconstruction.
-    reconstruction_values: Vec<bool>,
-    /// Input-operand reads of each value across the whole function.
-    input_uses: Vec<u32>,
+    /// Reads of each value across the whole function, by every instruction
+    /// (see [`for_each_read`]) and by every frame state no instruction owns.
+    reads: Vec<u32>,
 }
 
 impl ValueFacts {
@@ -133,57 +132,82 @@ impl ValueFacts {
         {
             edge_values[value.0 as usize] = true;
         }
-        let mut reconstruction_values = vec![false; count];
-        let frame_values = sequence.frame_states.iter().flat_map(|state| {
-            state
-                .frames
-                .iter()
-                .flat_map(|frame| {
-                    frame
-                        .entry
-                        .iter()
-                        .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
-                        .chain(frame.slots.iter())
-                })
-                .chain(
-                    state
-                        .virtual_objects
-                        .iter()
-                        .flat_map(|object| object.fields.iter()),
-                )
-        });
-        for value in sequence
-            .instructions
-            .iter()
-            .flat_map(|instruction| instruction.operands.iter())
-            .filter(|operand| {
-                operand.role == OperandRole::Use && operand.purpose != OperandPurpose::Input
-            })
-            .map(|operand| operand.value)
-            .chain(frame_values.filter_map(|slot| match slot {
-                super::MachineFrameSlot::Value(value) => Some(*value),
-                super::MachineFrameSlot::TaggedLiteral(_)
-                | super::MachineFrameSlot::VirtualObject(_) => None,
-            }))
-        {
-            reconstruction_values[value.0 as usize] = true;
+        let mut reads = vec![0u32; count];
+        let mut owned_states = vec![false; sequence.frame_states.len()];
+        for instruction in &sequence.instructions {
+            if let Some(state) = instruction.frame_state {
+                owned_states[state as usize] = true;
+            }
+            for_each_read(sequence, instruction, |value| reads[value.0 as usize] += 1);
         }
-        let mut input_uses = vec![0u32; count];
-        for operand in sequence
-            .instructions
+        for (state, _) in owned_states
             .iter()
-            .flat_map(|instruction| instruction.operands.iter())
-            .filter(|operand| {
-                operand.role == OperandRole::Use && operand.purpose == OperandPurpose::Input
-            })
+            .enumerate()
+            .filter(|(_, owned)| !**owned)
         {
-            input_uses[operand.value.0 as usize] += 1;
+            for_each_frame_state_value(&sequence.frame_states[state], |value| {
+                reads[value.0 as usize] += 1;
+            });
         }
         Self {
             definitions: value_definition_blocks(sequence),
             edge_values,
-            reconstruction_values,
-            input_uses,
+            reads,
+        }
+    }
+}
+
+/// Call `read` for every value `instruction` reads: its use operands, the
+/// slots of the frame state it owns, and its inline activation recipes.
+fn for_each_read(
+    sequence: &InstructionSequence,
+    instruction: &MachineInstruction,
+    mut read: impl FnMut(MachineValue),
+) {
+    for operand in &instruction.operands {
+        if operand.role == OperandRole::Use {
+            read(operand.value);
+        }
+    }
+    if let Some(state) = instruction.frame_state {
+        for_each_frame_state_value(&sequence.frame_states[state as usize], &mut read);
+    }
+    for frame in &instruction.inline_frames {
+        for value in frame
+            .entry
+            .iter()
+            .flat_map(|entry| [entry.new_target, entry.this, entry.closure])
+            .chain(frame.slots.iter().copied())
+            .flatten()
+        {
+            read(value);
+        }
+    }
+}
+
+fn for_each_frame_state_value(
+    state: &super::MachineFrameState,
+    mut read: impl FnMut(MachineValue),
+) {
+    for slot in state
+        .frames
+        .iter()
+        .flat_map(|frame| {
+            frame
+                .entry
+                .iter()
+                .flat_map(|entry| [&entry.new_target, &entry.this, &entry.closure])
+                .chain(frame.slots.iter())
+        })
+        .chain(
+            state
+                .virtual_objects
+                .iter()
+                .flat_map(|object| object.fields.iter()),
+        )
+    {
+        if let super::MachineFrameSlot::Value(value) = slot {
+            read(*value);
         }
     }
 }
@@ -199,22 +223,19 @@ fn invariant_instructions(
         in_loop[block] = true;
     }
     // A value read outside the loop is read more often in the function than
-    // inside the loop; every non-input read already counts as reconstruction.
-    let mut loop_input_uses = rustc_hash::FxHashMap::<u32, u32>::default();
+    // inside it. Reads inside the loop, deopt reconstruction included, are
+    // redirected to the carried value when its definition moves.
+    let mut loop_reads = rustc_hash::FxHashMap::<u32, u32>::default();
     for &block in &natural_loop.blocks {
         let data = &sequence.blocks[block];
-        for operand in sequence.instructions[data.first.0 as usize..data.end.0 as usize]
-            .iter()
-            .flat_map(|instruction| instruction.operands.iter())
-            .filter(|operand| {
-                operand.role == OperandRole::Use && operand.purpose == OperandPurpose::Input
-            })
-        {
-            *loop_input_uses.entry(operand.value.0).or_default() += 1;
+        for instruction in &sequence.instructions[data.first.0 as usize..data.end.0 as usize] {
+            for_each_read(sequence, instruction, |value| {
+                *loop_reads.entry(value.0).or_default() += 1;
+            });
         }
     }
     let used_outside = |value: MachineValue| {
-        facts.input_uses[value.0 as usize] > loop_input_uses.get(&value.0).copied().unwrap_or(0)
+        facts.reads[value.0 as usize] > loop_reads.get(&value.0).copied().unwrap_or(0)
     };
     let mut writes = super::MachineAliasSet::NONE;
     let mut invalidating_boundary = false;
@@ -314,11 +335,10 @@ fn invariant_instructions(
                 if outputs.is_empty() {
                     continue;
                 }
-                if outputs.iter().any(|output| {
-                    facts.edge_values[output.0 as usize]
-                        || facts.reconstruction_values[output.0 as usize]
-                        || used_outside(*output)
-                }) {
+                if outputs
+                    .iter()
+                    .any(|output| facts.edge_values[output.0 as usize] || used_outside(*output))
+                {
                     continue;
                 }
                 // Tagged results move only for context-chain reads: their
@@ -520,9 +540,15 @@ fn split_preheader_and_hoist(
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
+    let mut rewritten_states = BTreeSet::new();
     for &block in &natural_loop.blocks {
         for instruction in &mut block_instructions[block] {
             rewrite_parameter_uses(instruction, &carried_outputs);
+            if let Some(state) = instruction.frame_state
+                && rewritten_states.insert(state)
+            {
+                rewrite_frame_state(&mut sequence.frame_states[state as usize], &carried_outputs);
+            }
         }
     }
     let header_body = std::mem::take(&mut block_instructions[header]);
@@ -574,6 +600,51 @@ fn rewrite_parameter_uses(
             && let Some(replacement) = replacements.get(&operand.value)
         {
             operand.value = *replacement;
+        }
+    }
+    for frame in &mut instruction.inline_frames {
+        for value in frame
+            .entry
+            .iter_mut()
+            .flat_map(|entry| [&mut entry.new_target, &mut entry.this, &mut entry.closure])
+            .chain(frame.slots.iter_mut())
+            .flatten()
+        {
+            if let Some(replacement) = replacements.get(value) {
+                *value = *replacement;
+            }
+        }
+    }
+}
+
+/// Redirect a frame state owned by a loop instruction to the carried values.
+/// The state is owned by loop instructions only: a value read outside the
+/// loop never moves.
+fn rewrite_frame_state(
+    state: &mut super::MachineFrameState,
+    replacements: &BTreeMap<MachineValue, MachineValue>,
+) {
+    for slot in state
+        .frames
+        .iter_mut()
+        .flat_map(|frame| {
+            frame
+                .entry
+                .iter_mut()
+                .flat_map(|entry| [&mut entry.new_target, &mut entry.this, &mut entry.closure])
+                .chain(frame.slots.iter_mut())
+        })
+        .chain(
+            state
+                .virtual_objects
+                .iter_mut()
+                .flat_map(|object| object.fields.iter_mut()),
+        )
+    {
+        if let super::MachineFrameSlot::Value(value) = slot
+            && let Some(replacement) = replacements.get(value)
+        {
+            *value = *replacement;
         }
     }
 }

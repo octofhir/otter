@@ -44,7 +44,7 @@ pub(crate) fn emit(ops: &mut Assembler, frame: u8, key: Option<u8>, miss: Dynami
     } else {
         dynasm!(ops
             ; .arch aarch64
-            ; tbnz w16, 31, =>miss
+            ; tst w16, 0x80000000 ; b.ne =>miss
             ; movz x17, NUMBER_TAG_HI16, lsl #48
             ; orr x16, x16, x17
         );

@@ -192,8 +192,7 @@ fn production_inline_full_gc_and_nested_abrupt_exit_stay_reusable() {
         "{stats:?}"
     );
     assert_eq!(
-        stats.jit_generated_template_entries,
-        stats.jit_generated_template_returns,
+        stats.jit_generated_template_entries, stats.jit_generated_template_returns,
         "{stats:?}"
     );
     // The first non-Number input exits the optimizing leaf before coercion

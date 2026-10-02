@@ -34,8 +34,8 @@ use crate::{Value, VmError};
 pub(crate) const TIER_COMPLETION_DESTINATION: u32 = u32::MAX - 1;
 
 /// Byte offset of a request's frame-flag byte.
-const REQUEST_FLAGS_OFFSET: usize = std::mem::offset_of!(CallRequest, header)
-    + std::mem::offset_of!(VmFrameHeader, flags);
+const REQUEST_FLAGS_OFFSET: usize =
+    std::mem::offset_of!(CallRequest, header) + std::mem::offset_of!(VmFrameHeader, flags);
 /// Byte offset of a request's frame-kind byte.
 const REQUEST_KIND_OFFSET: usize =
     std::mem::offset_of!(CallRequest, header) + std::mem::offset_of!(VmFrameHeader, kind);

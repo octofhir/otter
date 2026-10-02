@@ -29,8 +29,8 @@ use otter_bytecode::{
     opcode_schema::{RegisterAccess, RegisterSource, opcode_schema},
 };
 
-use crate::executable::CodeBlock;
 use crate::ExecutionContext;
+use crate::executable::CodeBlock;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SimpleConstructorInit {
@@ -258,9 +258,7 @@ mod tests {
         SourceKind,
     };
 
-    use super::{
-        match_constructor_shape_stores, match_simple_constructor_init,
-    };
+    use super::{match_constructor_shape_stores, match_simple_constructor_init};
     use crate::ExecutionContext;
 
     fn instr(pc: u32, op: Op, operands: impl AsRef<[Operand]>) -> Instruction {

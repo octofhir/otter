@@ -1827,8 +1827,10 @@ mod tests {
         let failed_ns = vm
             .optimizing_tier_policy
             .cumulative_compile_ns(0, crate::tier_policy::CostedTier::Template);
-        vm.jit_call_counts
-            .insert(0, template_entry_break_even_after(&context, 0, failed_ns) - 1);
+        vm.jit_call_counts.insert(
+            0,
+            template_entry_break_even_after(&context, 0, failed_ns) - 1,
+        );
         assert!(
             vm.resolve_jit_code_for_fid(&context, 0).is_some(),
             "new execution evidence repays the failure"

@@ -32,11 +32,9 @@ pub(crate) const PENDING_CALL_OFFSET: u32 = std::mem::offset_of!(JitCtx, pending
 pub(crate) const REQUEST_ENTRY_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::native_abi::CallRequest, entry) as u32;
 /// Request frame-flag byte, carrying `CONSTRUCT` for `[[Construct]]`.
-pub(crate) const REQUEST_FLAGS_OFFSET: u32 = (std::mem::offset_of!(
-    otter_vm::native_abi::CallRequest,
-    header
-) + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags))
-    as u32;
+pub(crate) const REQUEST_FLAGS_OFFSET: u32 =
+    (std::mem::offset_of!(otter_vm::native_abi::CallRequest, header)
+        + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, flags)) as u32;
 /// Request callee value.
 pub(crate) const REQUEST_CALLEE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::native_abi::CallRequest, callee) as u32;
@@ -131,9 +129,9 @@ pub(crate) const CODE_ENTRY_TIERING_ENABLED_OFFSET: u32 =
 /// Byte offsets of the callee-frame fields emitted nested-call sequences fill,
 /// re-exported from the VM-owned [`Frame`] layout.
 pub(crate) use otter_vm::native_abi::{
-    NATIVE_FRAME_CALL_SITE_OFFSET,
-    NATIVE_FRAME_MACHINE_ROOTS_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET,
-    NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+    NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_MACHINE_ROOTS_OFFSET,
+    NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
+    NATIVE_FRAME_THIS_OFFSET,
 };
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 = (std::mem::offset_of!(Frame, header)

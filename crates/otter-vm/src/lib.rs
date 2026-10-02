@@ -1885,6 +1885,11 @@ pub struct EvalCompileOptions {
     /// self-name binding (`typeof anonymous` inside the body is
     /// `"undefined"`).
     pub function_constructor: bool,
+    /// Host compile-cache identity of a byte-identical trusted source, such
+    /// as a builtin module body. The host may answer with a verified earlier
+    /// compile of the same source under this identity; `None` compiles
+    /// afresh.
+    pub cache_specifier: Option<String>,
 }
 
 /// Where an error's captured stack points, resolved against the source the
@@ -1942,12 +1947,32 @@ pub struct CallSiteInfo {
     pub source_lines_after: Vec<String>,
 }
 
+/// A module an [`EvalHook`] compiled or found already compiled.
+#[derive(Debug)]
+pub enum CompiledEvalSource {
+    /// Fresh compiler output; the VM verifies it when linking.
+    Fresh(BytecodeModule),
+    /// A module the host already verified, such as a compile-cache hit. The
+    /// VM links it without inspecting its wordcode again.
+    Verified(otter_bytecode::VerifiedBytecodeModule),
+}
+
+impl CompiledEvalSource {
+    /// The module DTO, giving up any verification proof.
+    #[must_use]
+    pub fn into_module(self) -> BytecodeModule {
+        match self {
+            Self::Fresh(module) => module,
+            Self::Verified(verified) => verified.into_module(),
+        }
+    }
+}
+
 /// Embedder-supplied parse + compile callback used by
-/// [`Op::Eval`] / [`Op::NewFunction`]. Returns a freshly linked
-/// [`BytecodeModule`] whose `<main>` completion value becomes the
-/// dispatch result.
+/// [`Op::Eval`] / [`Op::NewFunction`] and CommonJS wrappers. Returns the
+/// module whose `<main>` completion value becomes the dispatch result.
 pub type EvalHook = std::sync::Arc<
-    dyn Fn(&str, EvalCompileOptions) -> Result<BytecodeModule, String> + Send + Sync,
+    dyn Fn(&str, EvalCompileOptions) -> Result<CompiledEvalSource, String> + Send + Sync,
 >;
 
 struct StartupPhaseTimer {

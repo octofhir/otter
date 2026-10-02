@@ -1783,11 +1783,27 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
                 SourceKind::JavaScript,
                 "<evalScript>",
             )
+            .map(otter_vm::CompiledEvalSource::Fresh)
             .map_err(compile_error_message);
+        }
+        // A builtin module body is identical on every launch: serve its
+        // verified compile from the cache, and publish a fresh one there.
+        let cache = options.cache_specifier.as_deref().and_then(|specifier| {
+            compile_cache::CompileCache::user_default().map(|cache| {
+                (
+                    cache,
+                    compile_cache::cache_key(source, SourceKind::JavaScript, specifier),
+                )
+            })
+        });
+        if let Some((cache, key)) = &cache
+            && let Some(bytecode) = cache.load(key)
+        {
+            return Ok(otter_vm::CompiledEvalSource::Verified(bytecode));
         }
         // §19.2.1.3 — a direct eval compiles against its call site's
         // context chain; indirect eval and `Function` carry none.
-        otter_compiler::compile_eval_source(
+        let module = otter_compiler::compile_eval_source(
             source,
             SourceKind::JavaScript,
             "<eval>",
@@ -1800,7 +1816,11 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
             options.super_call_allowed,
             options.function_constructor,
         )
-        .map_err(compile_error_message)
+        .map_err(compile_error_message)?;
+        if let Some((cache, key)) = &cache {
+            cache.store(key, &module);
+        }
+        Ok(otter_vm::CompiledEvalSource::Fresh(module))
     })
 }
 
@@ -5303,16 +5323,31 @@ impl Runtime {
         self.run_linked_script_with_context_since(context, start)
     }
 
-    fn run_verified_script_with_context_since(
+    fn run_linked_script_with_context_since(
         &mut self,
-        module: otter_bytecode::VerifiedBytecodeModule,
+        context: ExecutionContext,
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let context = self.interp.link_verified_module(module)?;
-        self.run_linked_script_with_context_since(context, start)
+        let (result, context) = self.run_linked_script_outcome(context, start)?;
+        Ok((self.attach_execution_stats(result), context))
     }
 
-    fn run_linked_script_with_context_since(
+    /// Run one bootstrap module. Its result is never reported, so it carries
+    /// no execution statistics: gathering them walks every linked body.
+    fn run_bootstrap_module(
+        &mut self,
+        module: Result<otter_bytecode::VerifiedBytecodeModule, BytecodeModule>,
+        start: std::time::Instant,
+    ) -> Result<ExecutionResult, OtterError> {
+        let context = match module {
+            Ok(verified) => self.interp.link_verified_module(verified)?,
+            Err(module) => self.interp.link_module(module)?,
+        };
+        self.run_linked_script_outcome(context, start)
+            .map(|(result, _context)| result)
+    }
+
+    fn run_linked_script_outcome(
         &mut self,
         context: ExecutionContext,
         start: std::time::Instant,
@@ -5349,7 +5384,7 @@ impl Runtime {
             ) => {
                 release_root(&mut self.interp);
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                return Ok((self.attach_execution_stats(result), context));
+                return Ok((result, context));
             }
             (Err(script_err), _) => {
                 return Err(enrich_runtime_diagnostic_with_cause(
@@ -5375,7 +5410,6 @@ impl Runtime {
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp));
-        let result = self.attach_execution_stats(result);
         Ok((result, context))
     }
 
@@ -5690,17 +5724,13 @@ impl Runtime {
             )
         {
             self.source_maps.record_compiled_metadata(&metadata);
-            return self
-                .run_verified_script_with_context_since(bytecode, start)
-                .map(|(result, _context)| result);
+            return self.run_bootstrap_module(Ok(bytecode), start);
         }
         let compiled = self.compile_source(&source, &specifier)?;
         if let (Some(cache), Some(key)) = (&cache, &key) {
             cache.store(key, &compiled.bytecode);
         }
-        let bytecode = compiled.bytecode;
-        self.run_compiled_script_with_context_since(bytecode, start)
-            .map(|(result, _context)| result)
+        self.run_bootstrap_module(Err(compiled.bytecode), start)
     }
 
     fn compile_source(

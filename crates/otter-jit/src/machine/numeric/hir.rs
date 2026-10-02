@@ -502,7 +502,10 @@ pub(super) enum NumericNode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum NumericDirectCallArguments {
-    Fixed { start: u32, count: u32 },
+    Fixed {
+        start: u32,
+        count: u32,
+    },
     /// A dense spread array; `CallSpread` also carries its explicit receiver.
     Spread {
         receiver: Option<NumericValue>,

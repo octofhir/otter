@@ -171,7 +171,8 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     {
         resume_error = Some(error);
     }
-    if fresh_entry && resume_error.is_none() && !stack.has_prepared_call() && vm.jit_hook.is_some() {
+    if fresh_entry && resume_error.is_none() && !stack.has_prepared_call() && vm.jit_hook.is_some()
+    {
         match vm.prepare_compiled_entry(stack, context) {
             Ok(Some(entry)) => return tier_request(ctx, entry),
             Ok(None) => {}
@@ -179,13 +180,15 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         }
     }
     match vm.dispatch_current_activation(context, stack, floor, resume_error) {
-        Ok(DispatchOutcome::Call) => match stack.take_request().or_else(|| stack.pending_packet()) {
-            Some(packet) => {
-                ctx.pending_call = packet;
-                NativeResultPair::continue_execution()
+        Ok(DispatchOutcome::Call) => {
+            match stack.take_request().or_else(|| stack.pending_packet()) {
+                Some(packet) => {
+                    ctx.pending_call = packet;
+                    NativeResultPair::continue_execution()
+                }
+                None => NativeResultPair::fatal_internal(),
             }
-            None => NativeResultPair::fatal_internal(),
-        },
+        }
         Ok(DispatchOutcome::Tier(entry)) => tier_request(ctx, entry),
         Ok(DispatchOutcome::Returned(value)) => NativeResultPair::success(value),
         Err(VmError::Uncaught) => match vm.pending_uncaught_throw.take() {

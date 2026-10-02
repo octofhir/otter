@@ -51,6 +51,18 @@ where
     Source: FnMut(&mut Assembler, usize, u8, u32) -> Result<u8, Unsupported>,
 {
     let bytes = pushed_argument_bytes(count)?;
+    // A one- or two-word span is read before the reservation and stored
+    // with one pre-indexed store that also reserves it.
+    if bytes == 16 {
+        let first = source(ops, 0, 15, 0)?;
+        if count == 2 {
+            let second = source(ops, 1, 16, 0)?;
+            dynasm!(ops ; .arch aarch64 ; stp X(first), X(second), [sp, -16]!);
+        } else {
+            dynasm!(ops ; .arch aarch64 ; str X(first), [sp, -16]!);
+        }
+        return Ok(bytes);
+    }
     if bytes != 0 {
         dynasm!(ops ; .arch aarch64 ; sub sp, sp, bytes);
     }
@@ -101,11 +113,15 @@ pub(crate) fn emit_call(
     target: CallTarget,
 ) {
     debug_assert!(
-        [(callee, 1), (receiver.unwrap_or(2), 2), (new_target.unwrap_or(3), 3)]
-            .iter()
-            .all(|&(register, abi)| register == abi
-                || (abi == 3 && register == 1)
-                || (register > 4 && register != 8 && register != 16))
+        [
+            (callee, 1),
+            (receiver.unwrap_or(2), 2),
+            (new_target.unwrap_or(3), 3)
+        ]
+        .iter()
+        .all(|&(register, abi)| register == abi
+            || (abi == 3 && register == 1)
+            || (register > 4 && register != 8 && register != 16))
     );
     dynasm!(ops ; .arch aarch64 ; mov x0, X(context));
     if callee != 1 {
@@ -189,9 +205,15 @@ pub(crate) fn emit_staged_call(
     receiver: Option<u8>,
     new_target: Option<u8>,
 ) {
-    debug_assert!(![callee, receiver.unwrap_or(callee), new_target.unwrap_or(callee)]
+    debug_assert!(
+        ![
+            callee,
+            receiver.unwrap_or(callee),
+            new_target.unwrap_or(callee)
+        ]
         .iter()
-        .any(|register| (9..=11).contains(register) || *register == 0));
+        .any(|register| (9..=11).contains(register) || *register == 0)
+    );
     let flags = if new_target.is_some() {
         u32::from(abi::NativeFrameFlags::CONSTRUCT)
     } else {
@@ -208,7 +230,9 @@ pub(crate) fn emit_staged_call(
         ; movz x11, VALUE_UNDEFINED as u32
     );
     match receiver {
-        Some(receiver) => dynasm!(ops ; .arch aarch64 ; str X(receiver), [x9, REQUEST_RECEIVER_OFFSET]),
+        Some(receiver) => {
+            dynasm!(ops ; .arch aarch64 ; str X(receiver), [x9, REQUEST_RECEIVER_OFFSET])
+        }
         None => dynasm!(ops ; .arch aarch64 ; str x11, [x9, REQUEST_RECEIVER_OFFSET]),
     }
     match new_target {

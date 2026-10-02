@@ -159,6 +159,17 @@ impl VerifiedBytecodeModule {
         self.functions.get(index)
     }
 
+    /// Name the source the module was compiled from on the module and every
+    /// function. The URL is diagnostic metadata no proof depends on.
+    #[must_use]
+    pub fn with_module_url(mut self, url: &str) -> Self {
+        self.module.module = url.to_string();
+        for function in &mut self.module.functions {
+            function.module_url = url.to_string();
+        }
+        self
+    }
+
     /// Consume the proof and return the underlying module DTO.
     ///
     /// Once extracted, callers must verify the module again before executing it

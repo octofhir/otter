@@ -22,7 +22,9 @@
 //! - [`crate::x86_64::js_call`] — the shared call ABI emitters.
 
 use super::*;
-use crate::machine::{DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, MachineInstruction};
+use crate::machine::{
+    DirectCallArgumentMode, DirectCallCandidate, DirectCallKind, MachineInstruction,
+};
 use crate::x86_64::js_call::{
     CallTarget as JsCallTarget, emit_call, emit_enter_staged, emit_pop_arguments,
     emit_push_arguments, emit_staged_call,
@@ -272,7 +274,14 @@ pub(super) fn emit(
             let next = ops.new_dynamic_label();
             call.load_operand(ops, 0, 9, 0)?;
             emit_inline_method_guard(ops, relocations, call.view, guard, next)?;
-            emit_invoke(ops, relocations, call, form, Some(candidate.callee.plan), true)?;
+            emit_invoke(
+                ops,
+                relocations,
+                call,
+                form,
+                Some(candidate.callee.plan),
+                true,
+            )?;
             dynasm!(ops ; .arch x64 ; =>next);
         }
         let receiver = call
@@ -400,14 +409,7 @@ fn emit_invoke(
                 target,
             );
         }
-        None => emit_staged_call(
-            ops,
-            relocations,
-            call.transitions,
-            15,
-            receiver,
-            new_target,
-        ),
+        None => emit_staged_call(ops, relocations, call.transitions, 15, receiver, new_target),
     }
     call.emit_complete(ops, bytes)
 }

@@ -43,8 +43,7 @@ pub(crate) use lowering::finalize_assembler;
 pub(crate) use lowering::reg_offset;
 pub use lowering::{BackendFailure, Unsupported};
 pub(crate) use lowering::{
-    BaselinePlan, PACKED_REGISTER_LANES, pack_register_lanes,
-    unpack_register_lanes,
+    BaselinePlan, PACKED_REGISTER_LANES, pack_register_lanes, unpack_register_lanes,
 };
 use runtime_ops::*;
 pub(crate) use runtime_ops::{PropertySourceCell, jit_backedge_poll_stub};
@@ -214,7 +213,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         {
             let entry: extern "C" fn(*mut JitCtx) -> abi::NativeResultPair =
                 abi::prepare_activation;
-            binding(abi::STUB_JIT_PREPARE_ACTIVATION, entry as *const () as usize)
+            binding(
+                abi::STUB_JIT_PREPARE_ACTIVATION,
+                entry as *const () as usize,
+            )
         },
         {
             let entry: unsafe extern "C" fn(*mut JitCtx) -> abi::NativeResultPair =
@@ -224,7 +226,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         {
             let entry: extern "C" fn(*mut JitCtx, u64) -> abi::NativeResultPair =
                 abi::derived_construct_result;
-            binding(abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT, entry as *const () as usize)
+            binding(
+                abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+                entry as *const () as usize,
+            )
         },
         binding(
             abi::STUB_JIT_STAGE_SPREAD,
@@ -290,7 +295,6 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_LOAD_REGEXP,
             jit_load_regexp_stub as *const () as usize,
         ),
-
         binding(
             abi::STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
             jit_class_super_constructor_stub as *const () as usize,

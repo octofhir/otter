@@ -89,7 +89,8 @@ pub struct BoundFunctionBody {
 }
 
 /// Byte offset of the target callable in [`BoundFunctionBody`]'s payload.
-pub const BOUND_FUNCTION_BODY_TARGET_OFFSET: usize = std::mem::offset_of!(BoundFunctionBody, target);
+pub const BOUND_FUNCTION_BODY_TARGET_OFFSET: usize =
+    std::mem::offset_of!(BoundFunctionBody, target);
 /// Byte offset of the bound `this` in [`BoundFunctionBody`]'s payload.
 pub const BOUND_FUNCTION_BODY_THIS_OFFSET: usize =
     std::mem::offset_of!(BoundFunctionBody, bound_this);

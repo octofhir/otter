@@ -50,8 +50,14 @@ impl RuntimeCall<'_> {
     pub fn stage_forward_values(
         &mut self,
         values: &[crate::Value],
-    ) -> Result<(crate::Value, crate::Value, smallvec::SmallVec<[crate::Value; 8]>), crate::VmError>
-    {
+    ) -> Result<
+        (
+            crate::Value,
+            crate::Value,
+            smallvec::SmallVec<[crate::Value; 8]>,
+        ),
+        crate::VmError,
+    > {
         // SAFETY: the bound activation owns the context and published frame;
         // the checked source borrows no managed slice across reentrant work.
         let context = &self.context;

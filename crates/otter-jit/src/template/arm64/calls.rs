@@ -49,13 +49,11 @@ use super::ic_probe::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    emit_box_double, emit_box_int32, emit_box_number, emit_load_reg,
-    emit_load_u64, emit_num_to_double, emit_slab_base, emit_store_reg,
+    emit_box_double, emit_box_int32, emit_box_number, emit_load_reg, emit_load_u64,
+    emit_num_to_double, emit_slab_base, emit_store_reg,
 };
 use crate::arm64::{MethodGuardSite, emit_method_guard};
-use crate::artifact::relocation::{
-    RelocationCapture,
-};
+use crate::artifact::relocation::RelocationCapture;
 use crate::artifact::{
     CodeMapCapture, CodeRegion, InlineScratchEntryArtifact, InlineScratchLayoutArtifact,
     InlineSiteArtifact,
@@ -1117,7 +1115,11 @@ pub(super) fn emit_call_with_receiver(
         CallNewTarget::None,
         CallActuals::Fixed(argument_registers),
         direct_target
-            .filter(|_| view.direct_callees.get(&byte_pc).is_some_and(|targets| targets.len() == 1))
+            .filter(|_| {
+                view.direct_callees
+                    .get(&byte_pc)
+                    .is_some_and(|targets| targets.len() == 1)
+            })
             .map(|target| target.plan),
         dst,
         throw_value,
@@ -1215,8 +1217,7 @@ pub(super) fn emit_trampoline_call(
     // `[[Construct]]` enters a proven target directly only when it has the
     // internal method; classification throws otherwise.
     let known = known.filter(|plan| {
-        new_target == CallNewTarget::None
-            || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
+        new_target == CallNewTarget::None || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
     });
     if let (Some(plan), CallActuals::Fixed(arguments)) = (known, actuals) {
         let generic = ops.new_dynamic_label();
@@ -1247,7 +1248,8 @@ pub(super) fn emit_trampoline_call(
             Ok(register)
         })?;
         emit_trampoline_operands(ops, callee, receiver, new_target)?;
-        let count = u32::try_from(count).map_err(|_| Unsupported::OperandShape("call actual count"))?;
+        let count =
+            u32::try_from(count).map_err(|_| Unsupported::OperandShape("call actual count"))?;
         emit_call(
             ops,
             relocations,
@@ -1412,7 +1414,9 @@ pub(super) fn emit_construct(
             CallNewTarget::Callee
         },
         CallActuals::Fixed(argument_registers),
-        view.direct_constructs.get(&byte_pc).map(|target| target.plan),
+        view.direct_constructs
+            .get(&byte_pc)
+            .map(|target| target.plan),
         dst,
         throw_value,
         threw,

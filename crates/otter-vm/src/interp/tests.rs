@@ -1025,7 +1025,9 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
     let outer = module_with(Vec::new(), 4);
     let mut interp = Interpreter::new();
     let context = interp.link_module(outer).expect("valid bytecode fixture");
-    interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| Ok(compiled.clone()))));
+    interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| {
+        Ok(crate::CompiledEvalSource::Fresh(compiled.clone()))
+    })));
     let arg = Value::string(JsString::from_str("", interp.gc_heap_mut()).unwrap());
     let args = [arg];
     let mut stack = crate::test_support::FrameChainFixture::new();
@@ -1195,7 +1197,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_call_method_value(
+        let staged = interp.do_call_method_value(
             stack,
             &context,
             &[
@@ -1205,7 +1207,8 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
                 Operand::ConstIndex(1),
                 Operand::Register(1),
             ],
-        ); complete_staged(interp, stack, &context, staged) }
+        );
+        complete_staged(interp, stack, &context, staged)
     })
     .expect("array map");
 
@@ -1249,8 +1252,8 @@ fn call_method_on_nullish_receiver_reports_type_error() {
     frame.registers[0] = Value::undefined();
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1259,8 +1262,10 @@ fn call_method_on_nullish_receiver_reports_type_error() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("nullish method call should reject before intrinsic fallback");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("nullish method call should reject before intrinsic fallback");
 
     assert!(matches!(err, VmError::TypeError));
     assert_eq!(
@@ -1297,8 +1302,8 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
     frame.registers[0] = Value::number_i32(1);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1307,8 +1312,10 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("missing primitive method should reject as non-callable");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("missing primitive method should reject as non-callable");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1357,8 +1364,8 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = recv;
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1367,8 +1374,10 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable String.prototype.slice should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable String.prototype.slice should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1480,7 +1489,7 @@ fn call_char_code_at(
     frame.registers[1] = Value::number_i32(1);
     stack.push(frame);
     with_test_runtime_turn(interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_call_method_value(
+        let staged = interp.do_call_method_value(
             stack,
             &context,
             &[
@@ -1490,7 +1499,8 @@ fn call_char_code_at(
                 Operand::ConstIndex(1),
                 Operand::Register(1),
             ],
-        ); complete_staged(interp, stack, &context, staged) }
+        );
+        complete_staged(interp, stack, &context, staged)
     })?;
     Ok(stack)
 }
@@ -1533,8 +1543,8 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::number_i32(7);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1543,8 +1553,10 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Number.prototype.toString should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Number.prototype.toString should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1658,7 +1670,8 @@ fn call_number_to_string(
         ]
     };
     with_test_runtime_turn(interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_call_method_value(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
+        let staged = interp.do_call_method_value(stack, &context, &operands);
+        complete_staged(interp, stack, &context, staged)
     })?;
     Ok(stack)
 }
@@ -1701,8 +1714,8 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::boolean(true);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1711,8 +1724,10 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Boolean.prototype.valueOf should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Boolean.prototype.valueOf should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1757,8 +1772,8 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::big_int(bigint);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1767,8 +1782,10 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable BigInt.prototype.toString should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable BigInt.prototype.toString should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1812,8 +1829,8 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::symbol(symbol);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1822,8 +1839,10 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Symbol.prototype.valueOf should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Symbol.prototype.valueOf should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1871,8 +1890,8 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::weak_ref(weak_ref);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1881,8 +1900,10 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable WeakRef.prototype.deref should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable WeakRef.prototype.deref should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1933,8 +1954,8 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::finalization_registry(registry);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1943,8 +1964,10 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable FinalizationRegistry.prototype.unregister should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable FinalizationRegistry.prototype.unregister should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -1980,8 +2003,8 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
     frame.registers[0] = Value::promise(promise);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -1990,8 +2013,10 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own promise method should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own promise method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2035,8 +2060,8 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::promise(promise);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2045,8 +2070,10 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Promise.prototype.then should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Promise.prototype.then should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2083,8 +2110,8 @@ fn call_method_array_own_non_callable_shadows_builtin() {
     frame.registers[0] = Value::array(array);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2093,8 +2120,10 @@ fn call_method_array_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own array method should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own array method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2131,8 +2160,8 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
     frame.registers[0] = Value::regexp(regexp);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2141,8 +2170,10 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own regexp method should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own regexp method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2187,8 +2218,8 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::regexp(regexp);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2197,8 +2228,10 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable RegExp.prototype.exec should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable RegExp.prototype.exec should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2245,8 +2278,8 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::object(date);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2255,8 +2288,10 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Date.prototype.getTime should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Date.prototype.getTime should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2303,8 +2338,8 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::object(date);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2313,8 +2348,10 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Date.prototype.setTime should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Date.prototype.setTime should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2361,8 +2398,8 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
     frame.registers[0] = Value::typed_array(typed_array);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2371,8 +2408,10 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own typed array method should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own typed array method should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2426,8 +2465,8 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::typed_array(typed_array);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2436,8 +2475,10 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Int8Array.prototype.map should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Int8Array.prototype.map should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2491,8 +2532,8 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::typed_array(typed_array);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2501,8 +2542,10 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Int8Array.prototype.slice should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Int8Array.prototype.slice should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2554,8 +2597,8 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
         .expect("array iterator");
     stack[0].registers[0] = stack[0].registers[1];
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2564,8 +2607,10 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Iterator.prototype.toArray should shadow helper");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Iterator.prototype.toArray should shadow helper");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2609,8 +2654,8 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
     frame.registers[0] = Value::map(map);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2619,8 +2664,10 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Map.prototype.forEach should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Map.prototype.forEach should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2664,8 +2711,8 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
     frame.registers[0] = Value::set(set);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2674,8 +2721,10 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Set.prototype.forEach should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Set.prototype.forEach should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2719,8 +2768,8 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
     frame.registers[0] = Value::map(map);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2729,8 +2778,10 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Map.prototype.get should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Map.prototype.get should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2774,8 +2825,8 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
     frame.registers[0] = Value::set(set);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2784,8 +2835,10 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Set.prototype.add should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Set.prototype.add should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2829,8 +2882,8 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
     frame.registers[0] = Value::weak_map(weak_map);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2839,8 +2892,10 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable WeakMap.prototype.get should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable WeakMap.prototype.get should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2884,8 +2939,8 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
     frame.registers[0] = Value::weak_set(weak_set);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2894,8 +2949,10 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable WeakSet.prototype.add should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable WeakSet.prototype.add should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -2941,8 +2998,8 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::array_buffer(buffer);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -2951,8 +3008,10 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable ArrayBuffer.prototype.slice should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable ArrayBuffer.prototype.slice should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3000,8 +3059,8 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::data_view(view);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3010,8 +3069,10 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable DataView.prototype.getUint8 should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable DataView.prototype.getUint8 should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3055,8 +3116,8 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
     frame.registers[0] = Value::set(set);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3065,8 +3126,10 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Set.prototype.union should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Set.prototype.union should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3111,8 +3174,8 @@ fn call_method_function_own_non_callable_shadows_call() {
             .expect("function user property")
     );
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3121,8 +3184,10 @@ fn call_method_function_own_non_callable_shadows_call() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own function call should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own function call should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3167,8 +3232,8 @@ fn call_method_function_own_non_callable_shadows_object_method() {
             .expect("function user property")
     );
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3177,8 +3242,10 @@ fn call_method_function_own_non_callable_shadows_object_method() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own hasOwnProperty should shadow Object.prototype");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own hasOwnProperty should shadow Object.prototype");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3212,8 +3279,8 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
     frame.registers[0] = Value::object(obj);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3222,8 +3289,10 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("null-prototype object should not inherit Object.prototype methods");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("null-prototype object should not inherit Object.prototype methods");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3271,8 +3340,8 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = native;
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3281,8 +3350,10 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable Object.prototype.hasOwnProperty should shadow native intercept");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Object.prototype.hasOwnProperty should shadow native intercept");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3325,8 +3396,8 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
     frame.registers[0] = Value::number_i32(1);
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3335,10 +3406,10 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
                 Operand::ConstIndex(0),
                 Operand::ConstIndex(0),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err(
-            "non-callable Object.prototype.hasOwnProperty should shadow primitive intercept",
         );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable Object.prototype.hasOwnProperty should shadow primitive intercept");
 
     assert!(matches!(err, VmError::NotCallable));
 }
@@ -3409,8 +3480,8 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     frame.registers[2] = repl;
     stack.push(frame);
 
-    let err = { let staged = interp
-        .do_call_method_value(
+    let err = {
+        let staged = interp.do_call_method_value(
             &mut stack,
             &context,
             &[
@@ -3421,8 +3492,10 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
                 Operand::Register(1),
                 Operand::Register(2),
             ],
-        ); complete_staged(&mut interp, &mut stack, &context, staged) }
-        .expect_err("non-callable own String wrapper replace should shadow builtin");
+        );
+        complete_staged(&mut interp, &mut stack, &context, staged)
+    }
+    .expect_err("non-callable own String wrapper replace should shadow builtin");
 
     assert!(matches!(err, VmError::NotCallable));
     interp.pop_iteration_anchors_to(obj_anchor);
@@ -3915,8 +3988,8 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        { let staged = interp
-            .do_call_method_value(
+        {
+            let staged = interp.do_call_method_value(
                 stack,
                 &context,
                 &[
@@ -3925,8 +3998,10 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
                     Operand::ConstIndex(0),
                     Operand::ConstIndex(0),
                 ],
-            ); complete_staged(interp, stack, &context, staged) }
-            .expect("async generator next");
+            );
+            complete_staged(interp, stack, &context, staged)
+        }
+        .expect("async generator next");
     });
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -5029,7 +5104,8 @@ fn native_construct_context_walks_the_live_caller_stack() {
     ];
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_construct(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
+        let staged = interp.do_construct(stack, &context, &operands);
+        complete_staged(interp, stack, &context, staged)
     })
     .expect("native construct");
 
@@ -5084,7 +5160,8 @@ fn direct_native_call_uses_contiguous_argument_window() {
     ];
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_call(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
+        let staged = interp.do_call(stack, &context, &operands);
+        complete_staged(interp, stack, &context, staged)
     })
     .unwrap();
 
@@ -5133,7 +5210,8 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_call(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
+        let staged = interp.do_call(stack, &context, &operands);
+        complete_staged(interp, stack, &context, staged)
     })
     .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5221,7 +5299,8 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        { let staged = interp.do_construct(stack, &context, &operands); complete_staged(interp, stack, &context, staged) }
+        let staged = interp.do_construct(stack, &context, &operands);
+        complete_staged(interp, stack, &context, staged)
     })
     .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;

@@ -80,9 +80,9 @@ use crate::{
         ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
         ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_SELF_OFFSET,
-        NATIVE_FRAME_THIS_OFFSET,
-        NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL,
-        VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        NATIVE_FRAME_THIS_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, THREAD_OFFSET,
+        VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
@@ -91,7 +91,6 @@ const NUMBER_TAG: u64 = (NUMBER_TAG_HI16 as u64) << 48;
 const DOUBLE_OFFSET: u64 = (DOUBLE_OFFSET_HI16 as u64) << 48;
 const CANONICAL_NAN: u64 = (CANONICAL_NAN_HI16 as u64) << 48;
 const NOT_CELL_MASK: u64 = otter_vm::value::tag::NOT_CELL_MASK;
-
 
 pub(super) fn compile(
     view: &JitCompileSnapshot,
@@ -1661,8 +1660,6 @@ fn requires_pc_stamp(op: TemplateOp) -> bool {
             }
     )
 }
-
-
 
 fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
     dynasm!(ops ; .arch x64 ; mov DWORD [r14 + NATIVE_FRAME_PC_OFFSET as i32], pc as i32);
@@ -3330,13 +3327,10 @@ fn emit_collect_arguments(
     emit_status_word_result(ops, threw, fatal);
 }
 
-
 #[derive(Debug, Clone, Copy)]
 enum PacketWord {
     Register(u16),
 }
-
-
 
 fn emit_value_packet_transition(
     ops: &mut Assembler,

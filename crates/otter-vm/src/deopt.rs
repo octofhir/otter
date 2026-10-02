@@ -54,8 +54,8 @@
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
 use crate::Value;
-use crate::number::NumberValue;
 use crate::native_abi::{ExitAction, ExitReason, FrameStateId};
+use crate::number::NumberValue;
 
 /// Declared bounds used to verify one compiled function's deopt metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

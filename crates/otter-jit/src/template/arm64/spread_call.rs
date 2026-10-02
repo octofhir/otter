@@ -53,9 +53,21 @@ pub(super) fn emit_spread_call_op(
                 CallNewTarget::None,
             )
         } else if opcode == otter_bytecode::Op::NewSpread as u8 {
-            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Callee)
+            (
+                arg0 as u16,
+                arg1 as u16,
+                None,
+                arg2 as u16,
+                CallNewTarget::Callee,
+            )
         } else if opcode == otter_bytecode::Op::SuperConstructSpread as u8 {
-            (arg0 as u16, arg1 as u16, None, arg2 as u16, CallNewTarget::Super)
+            (
+                arg0 as u16,
+                arg1 as u16,
+                None,
+                arg2 as u16,
+                CallNewTarget::Super,
+            )
         } else {
             return Err(Unsupported::OperandShape("spread call opcode"));
         };

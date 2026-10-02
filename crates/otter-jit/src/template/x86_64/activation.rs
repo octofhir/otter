@@ -283,12 +283,22 @@ pub(super) fn emit_call_entry_cold(
             ; jne =>constructed
             ; mov rdi, r15
         );
-        emit_stub(ops, relocations, transitions, abi::STUB_JIT_PREPARE_ACTIVATION);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            abi::STUB_JIT_PREPARE_ACTIVATION,
+        );
         dynasm!(ops ; .arch x64 ; test rdx, rdx ; jnz =>exits.construct ; jmp =>constructed);
     }
     if let Some((prepare, prepared)) = cold.prepare {
         dynasm!(ops ; .arch x64 ; =>prepare ; mov rdi, r15);
-        emit_stub(ops, relocations, transitions, abi::STUB_JIT_PREPARE_ACTIVATION);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            abi::STUB_JIT_PREPARE_ACTIVATION,
+        );
         dynasm!(ops ; .arch x64 ; test rdx, rdx ; jnz =>exits.construct ; jmp =>prepared);
     }
     // Promotion compiles against the published record; this activation
@@ -333,7 +343,12 @@ pub(super) fn emit_exits(
     dynasm!(ops ; .arch x64 ; =>primitive);
     if derived {
         dynasm!(ops ; .arch x64 ; mov rsi, rax ; mov rdi, r15);
-        emit_stub(ops, relocations, transitions, abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        );
     } else {
         dynasm!(ops ; .arch x64 ; mov rax, [r14 + NATIVE_FRAME_THIS_OFFSET as i32]);
     }

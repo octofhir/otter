@@ -95,7 +95,10 @@ impl JitCtx {
         &mut self,
         arguments: impl IntoIterator<Item = Value>,
     ) -> Result<(), VmError> {
-        let activation = self.checked_activation().copied().ok_or(VmError::InvalidOperand)?;
+        let activation = self
+            .checked_activation()
+            .copied()
+            .ok_or(VmError::InvalidOperand)?;
         // SAFETY: the published activation retains its stack for this entry.
         let stack = unsafe { activation.stack.as_mut() }.ok_or(VmError::InvalidOperand)?;
         let (pointer, count) = stack
@@ -108,12 +111,17 @@ impl JitCtx {
 
     /// Stage a dense spread array's elements as the pending call's actuals.
     pub fn stage_spread_arguments(&mut self, array: Value) -> Result<(), VmError> {
-        let activation = self.checked_activation().copied().ok_or(VmError::InvalidOperand)?;
+        let activation = self
+            .checked_activation()
+            .copied()
+            .ok_or(VmError::InvalidOperand)?;
         // SAFETY: the published activation retains its VM for this entry.
         let vm = unsafe { activation.vm.as_ref() }.ok_or(VmError::InvalidOperand)?;
         let array = array.as_array().ok_or(VmError::TypeMismatch)?;
         let elements: smallvec::SmallVec<[Value; 8]> =
-            crate::array::with_elements(array, &vm.gc_heap, |values| values.iter().copied().collect());
+            crate::array::with_elements(array, &vm.gc_heap, |values| {
+                values.iter().copied().collect()
+            });
         self.stage_call_arguments(elements)
     }
 

@@ -165,7 +165,7 @@ pub fn run_builtin_cjs_shim<'scope>(
 ) -> Result<Local<'scope>, NativeError> {
     let exports = scope.get(module, "exports")?;
     let module_name = scope.string(name)?;
-    let wrapper = scope.commonjs_wrapper(name, source)?;
+    let wrapper = scope.builtin_commonjs_wrapper(name, source)?;
     scope.call(
         wrapper,
         exports,

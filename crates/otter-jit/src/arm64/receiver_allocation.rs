@@ -29,6 +29,8 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG, value::tag as value_tag};
 
+use crate::arm64::allocation::emit_count_allocation;
+use crate::template::arm64::values::{CellTest, emit_cell_test};
 use crate::{
     artifact::relocation::{RelocationCapture, RelocationTarget},
     entry::{
@@ -38,8 +40,6 @@ use crate::{
         RUNTIME_STATS_OFFSET, VALUE_UNDEFINED,
     },
 };
-use crate::arm64::allocation::emit_count_allocation;
-use crate::template::arm64::values::{CellTest, emit_cell_test};
 
 #[allow(clippy::too_many_arguments)]
 fn emit_receiver_candidate(

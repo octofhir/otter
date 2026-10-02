@@ -503,6 +503,24 @@ impl CodeSpace {
         verified: VerifiedBytecodeModule,
         account: &ResourceAccount,
     ) -> Result<ExecutionContext, BytecodeLinkError> {
+        self.link_verified_with_retention(verified, account, ChunkRetention::Pinned)
+    }
+
+    /// [`Self::link_evictable_module`] for a module already verified.
+    pub(crate) fn link_evictable_verified_module(
+        self: &Arc<Self>,
+        verified: VerifiedBytecodeModule,
+        account: &ResourceAccount,
+    ) -> Result<ExecutionContext, BytecodeLinkError> {
+        self.link_verified_with_retention(verified, account, ChunkRetention::Evictable)
+    }
+
+    fn link_verified_with_retention(
+        self: &Arc<Self>,
+        verified: VerifiedBytecodeModule,
+        account: &ResourceAccount,
+        retention: ChunkRetention,
+    ) -> Result<ExecutionContext, BytecodeLinkError> {
         let _link = self
             .link
             .lock()
@@ -518,7 +536,7 @@ impl CodeSpace {
             function_base,
             function_count,
             property_ic_base,
-            ChunkRetention::Pinned,
+            retention,
             account,
         )?;
         publish_chunk(self, Arc::clone(&chunk));

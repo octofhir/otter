@@ -244,7 +244,10 @@ extern "C" fn prepare_deopt_writeback(
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     // SAFETY: the published frame and activation context are live.
-    let Some(owner) = (unsafe { ctx.activation().owner_context((*ctx.native_frame).header.function_id) }) else {
+    let Some(owner) = (unsafe {
+        ctx.activation()
+            .owner_context((*ctx.native_frame).header.function_id)
+    }) else {
         return compiled_fatal(ctx, VmError::InvalidOperand);
     };
     let context = &owner;

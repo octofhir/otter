@@ -24,10 +24,10 @@
 
 pub(crate) mod activation;
 pub(crate) mod allocation;
-pub(crate) mod js_call;
-mod receiver_allocation;
 pub(crate) mod inline_guard;
+pub(crate) mod js_call;
 mod method_guard;
+mod receiver_allocation;
 
 /// Whether this CPU implements the ARMv8.3 JavaScript conversion
 /// (`FJCVTZS`), which computes ECMAScript ToInt32 of a double in one
@@ -53,11 +53,11 @@ pub(crate) fn emit_fjcvtzs(ops: &mut dynasmrt::aarch64::Assembler, source: u8, d
 /// countdown expires, keeping accounting and interrupt latency aligned.
 pub(crate) use crate::GENERATED_POLL_BATCH;
 
-pub(crate) use receiver_allocation::{
-    emit_object_type_branch, emit_receiver_candidate_probe, emit_receiver_publication_effect,
-};
 pub(crate) use method_guard::{
     MethodGuardSite, emit_method_guard, emit_method_guard_from_tagged_register,
+};
+pub(crate) use receiver_allocation::{
+    emit_object_type_branch, emit_receiver_candidate_probe, emit_receiver_publication_effect,
 };
 
 pub(crate) mod arguments;

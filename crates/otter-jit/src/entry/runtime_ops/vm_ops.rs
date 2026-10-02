@@ -311,5 +311,4 @@ mod tests {
         );
         assert!(matches!(error, Some(VmError::InvalidOperand)));
     }
-
 }

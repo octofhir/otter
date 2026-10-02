@@ -78,7 +78,11 @@ impl HostTurn<'_> {
     }
 
     fn register(&self, index: usize) -> Value {
-        self.frame().registers.get(index).copied().unwrap_or(Value::UNDEFINED)
+        self.frame()
+            .registers
+            .get(index)
+            .copied()
+            .unwrap_or(Value::UNDEFINED)
     }
 
     fn set_register(&mut self, index: usize, value: Value) {
@@ -101,7 +105,10 @@ impl HostTurn<'_> {
     }
 
     fn is_construct(&self) -> bool {
-        self.frame().header.flags.contains(NativeFrameFlags::CONSTRUCT)
+        self.frame()
+            .header
+            .flags
+            .contains(NativeFrameFlags::CONSTRUCT)
     }
 }
 
@@ -193,14 +200,16 @@ pub(crate) extern "C" fn host_call_entry(ctx: *mut JitCtx) -> NativeResultPair {
                 } else {
                     with_turn(ctx, |turn, _| {
                         Err(turn.vm.err_type(
-                            "Proxy construct trap returned non-object".to_string().into(),
+                            "Proxy construct trap returned non-object"
+                                .to_string()
+                                .into(),
                         ))
                     })
                 }
             }
-            Some(NativeResultStatus::Success | NativeResultStatus::Throw | NativeResultStatus::Fatal) => {
-                completion
-            }
+            Some(
+                NativeResultStatus::Success | NativeResultStatus::Throw | NativeResultStatus::Fatal,
+            ) => completion,
             _ => NativeResultPair::fatal_internal(),
         };
     }
@@ -227,9 +236,9 @@ pub(crate) extern "C" fn host_call_entry(ctx: *mut JitCtx) -> NativeResultPair {
                     .to_string()
                     .into(),
             )),
-            HostCallKind::NotConstructor => Err(turn.vm.err_type(
-                "function is not a constructor".to_string().into(),
-            )),
+            HostCallKind::NotConstructor => Err(turn
+                .vm
+                .err_type("function is not a constructor".to_string().into())),
         }
     })
 }
@@ -351,7 +360,9 @@ fn native_construct_with(
     };
     // The frame's receiver slot roots the prototype across the allocation.
     turn.frame_mut().this_value = proto;
-    let receiver = turn.vm.alloc_stack_rooted_object_with_extra_roots(turn.stack, &[])?;
+    let receiver = turn
+        .vm
+        .alloc_stack_rooted_object_with_extra_roots(turn.stack, &[])?;
     let proto = turn.frame().this_value;
     crate::object::set_prototype_value(receiver, &mut turn.vm.gc_heap, Some(proto));
     turn.frame_mut().this_value = Value::object(receiver);
@@ -423,7 +434,11 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Vm
         .as_proxy()
         .ok_or(VmError::InvalidOperand)?;
     let admitted = if construct {
-        crate::abstract_ops::is_constructor(&turn.frame().self_value, turn.context, &turn.vm.gc_heap)
+        crate::abstract_ops::is_constructor(
+            &turn.frame().self_value,
+            turn.context,
+            &turn.vm.gc_heap,
+        )
     } else {
         proxy.is_callable(&turn.vm.gc_heap)
     };
@@ -445,15 +460,24 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Vm
     turn.set_register(PROXY_TARGET_REGISTER, target);
     turn.set_register(PROXY_HANDLER_REGISTER, handler);
     let trap_key = crate::VmPropertyKey::String(if construct { "construct" } else { "apply" });
-    let trap = match turn
-        .vm
-        .ordinary_get_value(turn.stack, turn.context, handler, handler, &trap_key, 0)?
-    {
+    let trap = match turn.vm.ordinary_get_value(
+        turn.stack,
+        turn.context,
+        handler,
+        handler,
+        &trap_key,
+        0,
+    )? {
         crate::VmGetOutcome::Value(value) => value,
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let handler = turn.register(PROXY_HANDLER_REGISTER);
-            turn.vm
-                .run_callable_sync_rooted(turn.stack, turn.context, &getter, handler, SmallVec::new())?
+            turn.vm.run_callable_sync_rooted(
+                turn.stack,
+                turn.context,
+                &getter,
+                handler,
+                SmallVec::new(),
+            )?
         }
     };
     if trap.is_nullish() {
@@ -487,9 +511,12 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Vm
     turn.set_register(TRAP_ARGUMENTS_REGISTER + 1, receiver);
     turn.frame_mut().this_value = trap;
     let args = turn.actuals();
-    let argv = turn
-        .vm
-        .alloc_stack_rooted_array_from_values(turn.stack, args.iter().copied(), &[], &args)?;
+    let argv = turn.vm.alloc_stack_rooted_array_from_values(
+        turn.stack,
+        args.iter().copied(),
+        &[],
+        &args,
+    )?;
     let trap = turn.frame().this_value;
     let receiver = turn.register(TRAP_ARGUMENTS_REGISTER + 1);
     turn.frame_mut().this_value = receiver;
@@ -504,7 +531,12 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Vm
     turn.set_register(TRAP_ARGUMENTS_REGISTER + 1, second);
     turn.set_register(TRAP_ARGUMENTS_REGISTER + 2, third);
     // SAFETY: three contiguous initialized registers inside the host window.
-    let arguments = unsafe { turn.frame().registers.as_mut_ptr().add(TRAP_ARGUMENTS_REGISTER) };
+    let arguments = unsafe {
+        turn.frame()
+            .registers
+            .as_mut_ptr()
+            .add(TRAP_ARGUMENTS_REGISTER)
+    };
     request_child(
         ctx,
         turn,
@@ -579,9 +611,9 @@ pub unsafe extern "C" fn promote_entered_function(ctx: *mut JitCtx) -> NativeRes
         return NativeResultPair::success(Value::UNDEFINED);
     };
     // SAFETY: the activation's services are live for the whole entry.
-    let (Some(vm), Some(context)) =
-        (unsafe { activation.vm.as_mut() }, unsafe { activation.context.as_ref() })
-    else {
+    let (Some(vm), Some(context)) = (unsafe { activation.vm.as_mut() }, unsafe {
+        activation.context.as_ref()
+    }) else {
         return NativeResultPair::success(Value::UNDEFINED);
     };
     // SAFETY: the call entry published this frame before the call.

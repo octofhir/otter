@@ -26,7 +26,9 @@
 //! - [`crate::arm64::activation`] — pieces shared with the optimizing tier.
 //! - [`crate::call_linkage`] — the call contract.
 
-use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use dynasmrt::{
+    AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm,
+};
 use otter_vm::{JitCompileSnapshot, native_abi as abi};
 
 use super::transitions::TransitionTable;
@@ -302,12 +304,22 @@ pub(super) fn emit_call_entry_cold(
             ; b.ne =>created
             ; mov x0, x20
         );
-        emit_stub(ops, relocations, transitions, abi::STUB_JIT_PREPARE_ACTIVATION);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            abi::STUB_JIT_PREPARE_ACTIVATION,
+        );
         dynasm!(ops ; .arch aarch64 ; cbnz x1, =>exits.construct ; =>created ; b =>constructed);
     }
     if let Some((prepare, prepared)) = cold.prepare {
         dynasm!(ops ; .arch aarch64 ; =>prepare ; mov x0, x20);
-        emit_stub(ops, relocations, transitions, abi::STUB_JIT_PREPARE_ACTIVATION);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            abi::STUB_JIT_PREPARE_ACTIVATION,
+        );
         dynasm!(ops ; .arch aarch64 ; cbnz x1, =>exits.construct ; b =>prepared);
     }
     // Promotion compiles against the published record; this activation
@@ -373,7 +385,12 @@ pub(super) fn emit_exits(
     dynasm!(ops ; .arch aarch64 ; =>primitive);
     if derived {
         dynasm!(ops ; .arch aarch64 ; mov x1, x0 ; mov x0, x20);
-        emit_stub(ops, relocations, transitions, abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT);
+        emit_stub(
+            ops,
+            relocations,
+            transitions,
+            abi::STUB_JIT_DERIVED_CONSTRUCT_RESULT,
+        );
     } else {
         dynasm!(ops ; .arch aarch64 ; ldr x0, [x21, NATIVE_FRAME_THIS_OFFSET]);
     }

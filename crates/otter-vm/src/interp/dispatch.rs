@@ -471,8 +471,11 @@ impl Interpreter {
                             self.function_prototype_call_target(callee, receiver)
                         });
                     if let Some(target) = function_call_target {
-                        let transition =
-                            self.record_ordinary_call_feedback(function, instr.instruction_pc, target);
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
                         if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
                         }
@@ -787,7 +790,9 @@ impl Interpreter {
                     let result = self
                         .frame_cold(&stack[top_idx])
                         .and_then(|cold| cold.async_state.as_ref())
-                        .map_or(Value::undefined(), |state| Value::promise(state.result_promise));
+                        .map_or(Value::undefined(), |state| {
+                            Value::promise(state.result_promise)
+                        });
                     let anchor = self.push_iteration_anchor(result) - 1;
                     let awaited_result = self.do_await(stack, context, dst, awaited);
                     let result = self.iteration_anchor(anchor);

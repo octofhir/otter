@@ -270,6 +270,29 @@ impl Interpreter {
         Ok(context)
     }
 
+    /// [`Self::link_evictable_module`] for a module whose verification the
+    /// host already holds: its wordcode is not inspected again.
+    pub fn link_evictable_verified_module(
+        &mut self,
+        module: otter_bytecode::VerifiedBytecodeModule,
+    ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
+        let function_count = u32::try_from(module.module().functions.len()).map_err(|_| {
+            crate::BytecodeLinkError::FunctionIdCapacity {
+                base: 0,
+                function_count: module.module().functions.len(),
+            }
+        })?;
+        let context = self
+            .code_space
+            .link_evictable_verified_module(module, self.module_sources.account())?;
+        let context = self.finish_linked_module(context, function_count)?;
+        let retained = self.code_space.evictable_retained_bytes();
+        self.code_eviction_stats.retained_bytes = retained;
+        self.code_eviction_stats.peak_retained_bytes =
+            self.code_eviction_stats.peak_retained_bytes.max(retained);
+        Ok(context)
+    }
+
     /// Link a decoded or cached module while retaining its mandatory
     /// verification proof through code-space rebasing and executable building.
     ///
@@ -624,9 +647,12 @@ impl Interpreter {
         let this_value = *effective_this;
         let args = std::mem::take(effective_args);
         match self.run_callable_sync_rooted(stack, context, &callee, this_value, args) {
-            Ok(value) => {
-                self.settle_microtask_capability(context, stack, result_capability.take(), Ok(value))
-            }
+            Ok(value) => self.settle_microtask_capability(
+                context,
+                stack,
+                result_capability.take(),
+                Ok(value),
+            ),
             Err(error) => {
                 if result_capability.is_some() && !error.is_termination() {
                     // §27.2.1.3.2 step 1.f.iii: the rejection carries the

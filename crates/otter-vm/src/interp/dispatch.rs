@@ -1230,32 +1230,11 @@ impl Interpreter {
                     )?;
                     continue;
                 }
-                Op::StoreElementStrict => {
-                    let recv_reg = instr.reg(0);
-                    let idx_reg = instr.reg(1);
-                    let src_reg = instr.reg(2);
-                    let (function_id, receiver, key, value) = {
-                        let frame = ActiveFrameRef::from_frame(&stack[top_idx]);
-                        (
-                            frame.function_id(),
-                            frame.read(recv_reg)?,
-                            frame.read(idx_reg)?,
-                            frame.read(src_reg)?,
-                        )
-                    };
-                    self.store_element_values(
-                        stack,
-                        context,
-                        function_id,
-                        receiver,
-                        key,
-                        value,
-                        true,
-                    )?;
-                    stack[top_idx].advance_pc()?;
-                    continue;
-                }
-                Op::StoreElement => {
+                // §15.7.1 — `StoreElementStrict` keeps strict PutValue
+                // semantics inside a sloppy frame; both forms record the
+                // same feedback.
+                Op::StoreElement | Op::StoreElementStrict => {
+                    let strict = op == Op::StoreElementStrict;
                     let recv_reg = instr.reg(0);
                     let idx_reg = instr.reg(1);
                     let src_reg = instr.reg(2);
@@ -1291,7 +1270,7 @@ impl Interpreter {
                         receiver,
                         key,
                         value,
-                        false,
+                        strict,
                     )?;
                     // The synchronous helper completed the full effect (or
                     // threw), so publish exactly one resume increment.

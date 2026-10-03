@@ -1619,6 +1619,28 @@ pub struct JitElementAccess {
     pub base: JitElementBase,
     /// How one element is stored.
     pub element: JitElementRepr,
+    /// The side bitmap that marks holes in numeric storage, when the layout
+    /// has one. A set bit is an absent element whatever the payload word
+    /// holds.
+    pub holes: Option<JitHoleBitmap>,
+}
+
+/// Numeric dense storage that may have holes: either numeric storage kind
+/// applies, and a bitmap marks the holes, one bit per element, in `u64`
+/// words that start right after the storage's `capacity` element words. A
+/// packed prefix keeps every bit clear, so the one access serves both kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitHoleBitmap {
+    /// Signed byte offset, from the element base, of the storage's `u32`
+    /// element capacity.
+    pub capacity_byte: i32,
+    /// Byte offset, from the receiver's `GcHeader`, of its one-byte storage
+    /// kind.
+    pub kind_byte: u32,
+    /// The kind byte of hole-free numeric storage.
+    pub packed_kind: u8,
+    /// The kind byte of numeric storage with holes.
+    pub holey_kind: u8,
 }
 
 impl JitElementAccess {
@@ -1643,6 +1665,7 @@ impl JitElementAccess {
                 byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
             },
             element: JitElementRepr::Float64,
+            holes: None,
         }
     }
 
@@ -2063,6 +2086,9 @@ pub enum JitElementFamily {
     DenseTagged,
     /// Ordinary dense arrays whose complete live prefix contains raw `f64`s.
     DenseFloat64,
+    /// Ordinary dense arrays of raw `f64`s, some of them with holes selected
+    /// by a side bitmap. Covers [`Self::DenseFloat64`] receivers as well.
+    DenseHoleyFloat64,
     /// Fixed-length typed views of exactly this element kind. BigInt and
     /// Float16 views are recorded as [`Self::Generic`].
     Typed(crate::binary::TypedArrayKind),

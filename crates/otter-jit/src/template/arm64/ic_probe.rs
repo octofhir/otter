@@ -787,8 +787,9 @@ pub(crate) fn emit_exotic_length_fast(
 /// Whether a family is baked for the indexed-element program.
 ///
 /// The declaration is the whole gate: without a cage base the guard cannot
-/// reach a body at all, and a zero cell tag means no element-bearing family was
-/// described, so the site keeps the runtime path.
+/// reach a body at all, a zero cell tag means no element-bearing family was
+/// described, and a hole bitmap is a layout the baseline program does not
+/// read, so the site keeps the runtime path.
 pub(crate) fn element_access_for(
     view: &JitCompileSnapshot,
     byte_pc: u32,
@@ -796,7 +797,7 @@ pub(crate) fn element_access_for(
     (view.cage_base != 0)
         .then(|| view.element_accesses.get(&byte_pc))
         .flatten()
-        .filter(|access| access.type_tag != 0)
+        .filter(|access| access.type_tag != 0 && access.holes.is_none())
 }
 
 /// Prove the receiver and immutable body guards for one in-body dense view.

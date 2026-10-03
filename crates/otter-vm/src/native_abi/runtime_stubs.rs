@@ -1692,6 +1692,21 @@ pub const STUB_JIT_STAGE_TAIL_CALL: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// Barrier for one tagged element store generated code wrote into an
+/// ordinary array's slab: `(element base, index, value)`. Reached only for a
+/// heap-cell value while marking or when the value is young; marks the slot
+/// dirty and remembers the slab.
+pub const STUB_ELEMENT_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
+    94,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::MutatingLeafValue3,
+    3,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1789,6 +1804,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         91 => "jit_call_generic",
         92 => "jit_call_overflow",
         93 => "jit_stage_tail_call",
+        94 => "element_write_barrier",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1888,6 +1904,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CALL_GENERIC,
     STUB_JIT_CALL_OVERFLOW,
     STUB_JIT_STAGE_TAIL_CALL,
+    STUB_ELEMENT_WRITE_BARRIER,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

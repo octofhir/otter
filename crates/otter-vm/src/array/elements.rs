@@ -95,6 +95,12 @@ pub(crate) struct ElementSlabBody {
 }
 
 const _: () = assert!(std::mem::size_of::<ElementSlabBody>() == 24);
+
+/// Signed byte offset of a slab's `u32` capacity from its element base, as
+/// generated code locates the hole bitmap that follows the element words.
+pub(crate) const CAPACITY_FROM_DATA_BYTE: i32 = std::mem::offset_of!(ElementSlabBody, capacity)
+    as i32
+    - std::mem::size_of::<ElementSlabBody>() as i32;
 const _: () = assert!(std::mem::align_of::<ElementSlabBody>() == 8);
 
 impl ElementSlabBody {
@@ -448,6 +454,35 @@ pub(crate) fn body_of(slab: ElementSlabHandle) -> Option<*mut ElementSlabBody> {
             .add(std::mem::size_of::<otter_gc::GcHeader>())
             .cast::<ElementSlabBody>()
     })
+}
+
+/// Record one tagged element store generated code made directly: the slab
+/// whose data base is `data` marks slot `index` dirty and is remembered for
+/// `child`, exactly as [`ElementSlabBody::write`] and the array's barrier would
+/// have.
+///
+/// # Safety
+/// `data` is the data base of a live tagged slab and `index` is below its
+/// capacity.
+pub(crate) unsafe fn record_generated_write(
+    heap: &mut otter_gc::GcHeap,
+    data: *mut u8,
+    index: usize,
+    child: &Value,
+) {
+    // SAFETY: forwarded from the contract; the data base sits one fixed
+    // header past the slab payload, which sits one GC header past the cell.
+    unsafe {
+        let body = data
+            .sub(std::mem::size_of::<ElementSlabBody>())
+            .cast::<ElementSlabBody>();
+        (*body).mark_dirty_range(index, index + 1);
+        let header = body
+            .cast::<u8>()
+            .sub(std::mem::size_of::<otter_gc::GcHeader>())
+            .cast::<otter_gc::GcHeader>();
+        heap.record_write_at(header, child);
+    }
 }
 
 #[must_use]

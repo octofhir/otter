@@ -1083,8 +1083,11 @@ impl Interpreter {
             .iter()
             .filter_map(|instr| {
                 let op = instr.op(&view.code_block);
-                matches!(op, Op::LoadElement | Op::StoreElement)
-                    .then_some((instr.byte_pc, instr.instruction_pc(&view.code_block)))
+                matches!(
+                    op,
+                    Op::LoadElement | Op::StoreElement | Op::StoreElementStrict
+                )
+                .then_some((instr.byte_pc, instr.instruction_pc(&view.code_block)))
             })
             .collect();
         for (byte_pc, pc) in sites {
@@ -1107,6 +1110,7 @@ impl Interpreter {
                     jit::JitElementRepr::Float64,
                     crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE,
                 ),
+                jit::JitElementFamily::DenseHoleyFloat64 => Self::holey_double_element_access(),
                 jit::JitElementFamily::Unseen => {
                     view.unseen_element_sites.insert(byte_pc);
                     continue;
@@ -1125,7 +1129,9 @@ impl Interpreter {
         element: jit::JitElementRepr,
         dense_kind: u32,
     ) -> jit::JitElementAccess {
-        if element == jit::JitElementRepr::Float64 {
+        if element == jit::JitElementRepr::Float64
+            && dense_kind == crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE
+        {
             return jit::JitElementAccess::packed_double_array();
         }
         let header = otter_gc::header::HEADER_SIZE as u32;
@@ -1149,6 +1155,33 @@ impl Interpreter {
                 byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
             },
             element,
+            holes: None,
+        }
+    }
+
+    /// Numeric dense storage of either kind, read through the hole bitmap.
+    /// The exotic sidecar is guarded as for every dense family; the storage
+    /// kind is proved by the bitmap descriptor, which admits both numeric
+    /// kinds.
+    fn holey_double_element_access() -> jit::JitElementAccess {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let [exotic, _] = Self::dense_element_access(
+            jit::JitElementRepr::Float64,
+            crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE,
+        )
+        .guards;
+        jit::JitElementAccess {
+            guards: [exotic, None],
+            holes: Some(jit::JitHoleBitmap {
+                capacity_byte: crate::array::elements::CAPACITY_FROM_DATA_BYTE,
+                kind_byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
+                packed_kind: crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE as u8,
+                holey_kind: crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE as u8,
+            }),
+            ..Self::dense_element_access(
+                jit::JitElementRepr::Float64,
+                crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE,
+            )
         }
     }
 
@@ -1192,6 +1225,7 @@ impl Interpreter {
                 cached_data_byte: header + view::TYPED_ARRAY_BODY_DATA_OFFSET as u32,
             },
             element,
+            holes: None,
         }
     }
 
@@ -1896,6 +1930,18 @@ impl Interpreter {
         for &pc in snapshot.optimized_exit_reasons.keys() {
             if let Some(instruction) = snapshot.instructions.get_mut(pc as usize) {
                 instruction.note_optimized_exit();
+            }
+        }
+        // An element site that an earlier generation left to collect feedback
+        // has executed since; if it still records no family, its receivers
+        // have a layout no generated access describes, and it is no longer
+        // unseen.
+        for &(profile_fid, pc, reason) in self.jit_optimized_exit_profiles.keys() {
+            if profile_fid == fid
+                && reason == native_abi::ExitReason::InsufficientFeedback
+                && let Some(instruction) = snapshot.instructions.get(pc as usize)
+            {
+                snapshot.unseen_element_sites.remove(&instruction.byte_pc);
             }
         }
     }

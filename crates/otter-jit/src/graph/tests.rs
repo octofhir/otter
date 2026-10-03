@@ -44,7 +44,7 @@ fn seed(view: &mut JitCompileSnapshot, pcs: &[u32], bits: u8) {
 /// and the frame window afterwards.
 fn run(view: &JitCompileSnapshot, args: &[u64]) -> (NativeResultPair, Vec<u64>) {
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(view, 7001, &transitions, None).expect("graph compile");
+    let compiled = super::compile(view, 7001, &transitions, None, false).expect("graph compile");
     let entry: JitEntry = unsafe {
         std::mem::transmute(
             compiled
@@ -378,7 +378,7 @@ fn nested_loops() -> JitCompileSnapshot {
 fn nested_loops_carry_values_through_both_headers() {
     let view = nested_loops();
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(&view, 7001, &transitions, None).expect("graph compile");
+    let compiled = super::compile(&view, 7001, &transitions, None, false).expect("graph compile");
     let dump = compiled.built.graph.dump(&compiled.built.layout);
     let (result, _) = run(&view, &[int(10), int(1)]);
     assert_eq!(

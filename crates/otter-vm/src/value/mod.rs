@@ -335,14 +335,17 @@ impl Value {
         }
     }
 
-    /// Number from an `f64`. NaNs are purified to the canonical pattern
-    /// before the double offset is applied (so no boxed double aliases
-    /// the cell space); integer-valued finite doubles are *not*
-    /// automatically demoted to int32 — pass through
-    /// [`NumberValue::canonicalize`] first if you want that.
+    /// Number from an `f64`, in the one canonical encoding every tier
+    /// shares: an integral value in the int32 range other than `-0` is an
+    /// int32 word, and NaNs are purified to the canonical pattern before the
+    /// double offset is applied (so no boxed double aliases the cell space).
     #[inline]
     #[must_use]
     pub fn number_f64(d: f64) -> Self {
+        let int = d as i32;
+        if f64::from(int) == d && (int != 0 || d.is_sign_positive()) {
+            return Self::number_i32(int);
+        }
         let bits = if d.is_nan() {
             CANONICAL_NAN
         } else {

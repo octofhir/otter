@@ -84,12 +84,14 @@ pub(crate) struct Compiled {
     pub(crate) plan: crate::template::TemplatePlan,
 }
 
-/// Compile `view` to machine code.
+/// Compile `view` to machine code; `capture` keeps the relocation records an
+/// artifact renders.
 pub(crate) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
     osr_pc: Option<u32>,
+    capture: bool,
 ) -> Result<Compiled, Unsupported> {
     let analysis = bytecode::Analysis::build(view)
         .map_err(|_| Unsupported::OperandShape("graph bytecode analysis"))?;
@@ -97,7 +99,7 @@ pub(crate) fn compile(
     let baseline = BaselineSupport::of(&plan, view);
     let mut built = builder::build(view, &analysis, &baseline, osr_pc)
         .map_err(|_| Unsupported::OperandShape("graph construction"))?;
-    phi_repr::untag_phis(&mut built.graph, &built.layout);
+    phi_repr::untag_phis(&mut built.graph, &built.layout, &built.loop_headers);
     let allocation = regalloc::allocate(&built.graph, &built.layout);
     // The recipe's address is baked before its contents exist: the exits are
     // known only once the code is emitted, and the box never moves.
@@ -116,7 +118,7 @@ pub(crate) fn compile(
             deopt_address,
             &plan,
             slots,
-            false,
+            capture,
             far,
         )
     };
@@ -143,9 +145,13 @@ fn deopt_runtime(
     slots: arm64::SlotLayout,
     exits: &[arm64::ExitSite],
 ) -> DeoptRuntime {
-    let mut states = Vec::with_capacity(exits.len());
+    // Exits that rebuild the same frame share one recipe: several exits of
+    // one node, and nodes of one instruction whose values sit in the same
+    // locations.
+    let mut states = Vec::new();
+    let mut recipes: rustc_hash::FxHashMap<FrameState, u32> = rustc_hash::FxHashMap::default();
     let mut descriptors = Vec::with_capacity(exits.len());
-    for (index, site) in exits.iter().enumerate() {
+    for site in exits {
         let node = built.graph.node(site.node);
         let state_id = if site.lazy { node.lazy } else { node.eager }
             .expect("an exit site has its frame state");
@@ -156,7 +162,7 @@ fn deopt_runtime(
         } else {
             &node_allocation.eager
         };
-        states.push(FrameState {
+        let recipe = FrameState {
             frames: Box::new([DeoptFrame {
                 function_id: view.code_block.id,
                 byte_pc: state.byte_pc,
@@ -164,9 +170,13 @@ fn deopt_runtime(
                 slots: arm64::deopt_slots(&built.graph, slots, state, locations),
             }]),
             virtual_objects: Box::new([]),
+        };
+        let index = *recipes.entry(recipe).or_insert_with_key(|recipe| {
+            states.push(recipe.clone());
+            (states.len() - 1) as u32
         });
         descriptors.push(DeoptExitDescriptor {
-            state: index as u32,
+            state: index,
             reason: site.reason,
             action: site.action,
             resume_pcs: Box::new([state.pc]),
@@ -179,14 +189,22 @@ fn deopt_runtime(
     }
 }
 
-/// Compile `view` into an installable optimized code object.
+/// Compile `view` into an installable optimized code object, with its
+/// artifact bundle when one is requested.
 pub(crate) fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
     osr_pc: Option<u32>,
+    artifact_request: Option<crate::artifact::ArtifactRequest>,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
-    let compiled = compile(view, code_object_id, transitions, osr_pc)?;
+    let compiled = compile(
+        view,
+        code_object_id,
+        transitions,
+        osr_pc,
+        artifact_request.is_some(),
+    )?;
     let Compiled {
         emission,
         built,
@@ -208,6 +226,7 @@ pub(crate) fn compile_optimized(
         inline_frames: Box::new([]),
         call_pc: NO_CALL_PC,
     });
+    safepoints.extend(emission.site_records.iter().cloned());
     safepoints.sort_by_key(|record| record.id);
     let metadata = OptimizedMetadata {
         code_object_id,
@@ -223,6 +242,48 @@ pub(crate) fn compile_optimized(
         dynasmrt::AssemblyOffset(emission.tier_entry),
     );
     let node_count = built.graph.nodes.len() as u64;
+    let artifact = artifact_request.map(|request| {
+        let mut code_map = crate::artifact::CodeMapCapture::default();
+        let offsets = &emission.node_offsets;
+        for (index, &(start, node)) in offsets.iter().enumerate() {
+            let end = offsets
+                .get(index + 1)
+                .map_or(emission.body_end, |&(next, _)| next);
+            let data = built.graph.node(node);
+            let byte_pc = view
+                .instructions
+                .get(data.pc as usize)
+                .map_or(0, |metadata| metadata.byte_pc);
+            code_map.record(crate::artifact::CodeRegion::instruction(
+                start,
+                end,
+                data.block.map(|block| block.0),
+                None,
+                view.code_block.id,
+                data.pc,
+                byte_pc,
+                Some(node.0),
+                format!("v{} {:?}", node.0, data.kind),
+            ));
+        }
+        code_map.record(crate::artifact::CodeRegion::structural(
+            "out-of-line",
+            emission.body_end,
+            code.len(),
+        ));
+        crate::artifact::build_bundle(
+            request,
+            view,
+            code_object_id,
+            &code,
+            otter_vm::JitArtifactFileName::OptimizedIr,
+            built.graph.dump(&built.layout),
+            code_map,
+            emission.relocations,
+            Some(&deopt),
+            &safepoints,
+        )
+    });
     Ok(crate::artifact::NativeCompileOutput {
         code: OptimizedCode::new(
             code,
@@ -236,7 +297,7 @@ pub(crate) fn compile_optimized(
             plan.register_operands,
             metadata,
         ),
-        artifact: None,
+        artifact,
         diagnostics: Box::default(),
         ir_node_count: node_count,
     })

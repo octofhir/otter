@@ -79,6 +79,9 @@ pub(crate) struct NodeAllocation {
     /// Registers holding live tagged and untagged values across the node,
     /// for nodes whose slow path saves them itself.
     pub(crate) live_registers: SmallVec<[(Location, Repr); 8]>,
+    /// For a node that may collect (a call, a back-edge poll): the tagged
+    /// slots holding values live across it, which its safepoint roots.
+    pub(crate) gc_roots: Option<Vec<u32>>,
 }
 
 /// Moves on one control edge, resolved in parallel at the end of the
@@ -709,6 +712,8 @@ impl<'g> Allocator<'g> {
         self.out.nodes[node.0 as usize].inputs = inputs.clone();
         if properties.call {
             self.spill_all_live(at);
+            let roots = self.tagged_roots(at, node);
+            self.out.nodes[node.0 as usize].gc_roots = Some(roots);
         }
         // Temporaries.
         let mut gp_temps = SmallVec::new();
@@ -933,6 +938,10 @@ impl<'g> Allocator<'g> {
             }
         }
         self.out.nodes[control.0 as usize].live_registers = occupied;
+        if matches!(data.kind, Kind::JumpLoop(_)) {
+            let roots = self.tagged_roots(at, control);
+            self.out.nodes[control.0 as usize].gc_roots = Some(roots);
+        }
         // The edge reads every value live at its target, including values
         // whose last use is this jump (a back edge extends the loop's
         // live-through values to here): take the state before releasing.
@@ -981,6 +990,41 @@ impl<'g> Allocator<'g> {
             self.exit_states.insert(block, exit);
             self.out.edges.insert((block, target), edge);
         }
+    }
+
+    /// The tagged slots of values live after `at`, or read by `node`'s own
+    /// frame states, sorted.
+    fn tagged_roots(&self, at: u32, node: NodeId) -> Vec<u32> {
+        let data = self.graph.node(node);
+        let state_values: SmallVec<[NodeId; 16]> = data
+            .eager
+            .iter()
+            .chain(data.lazy.iter())
+            .flat_map(|&state| {
+                self.graph
+                    .frame_state(state)
+                    .registers
+                    .iter()
+                    .map(|&(_, v)| v)
+            })
+            .filter(|&value| value != node)
+            .collect();
+        let mut roots: Vec<u32> = self
+            .out
+            .spill
+            .iter()
+            .filter_map(|(&value, &location)| match location {
+                Location::TaggedSlot(index)
+                    if self.is_live_after(value, at) || state_values.contains(&value) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        roots
     }
 
     fn snapshot(&self) -> Vec<(NodeId, Location)> {

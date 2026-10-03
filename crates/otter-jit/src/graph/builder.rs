@@ -21,9 +21,16 @@
 //!   their inputs when they arrive.
 //! - Frame states carry exactly the registers live before (eager) or after
 //!   (lazy) the instruction; dead registers resume as `undefined`.
-//! - A fact in [`Known`] about a node never outlives the path it was proved
-//!   on: joins keep only facts every predecessor agrees on, loop headers drop
-//!   heap facts, and calls and stores drop shape facts.
+//! - A fact in [`Known`] never outlives the path it was proved on: joins keep
+//!   only facts every predecessor agrees on, calls drop every heap fact, and
+//!   a store forgets every known value at its offset. A loop header keeps the
+//!   heap facts of its entry only when every back edge arrives with them;
+//!   otherwise the graph is rebuilt with the facts a back edge lost forgotten
+//!   at that header, or all of them for a loop that calls out. Storage words
+//!   read from the heap never cross a back edge, whose interrupt poll may
+//!   move element storage; context parents never change and are always kept.
+//! - The finished graph has no trivial phi: one that merges a single value
+//!   (apart from itself) is replaced by that value everywhere.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -31,8 +38,10 @@
 
 use otter_bytecode::Op;
 use otter_bytecode::opcode_schema::ContextCoord;
+use otter_vm::jit::{JitElementAccess, JitElementBase, JitElementRepr};
+use otter_vm::native_abi::ExitReason;
 use otter_vm::{JitCompileSnapshot, value::tag};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::bytecode::{Analysis, Flow, Instruction, RegisterSet};
@@ -61,12 +70,69 @@ pub(crate) struct NodeInfo {
     pub(crate) number: bool,
     /// The shape proof also excludes prototype objects.
     pub(crate) writable: bool,
+    /// The value is proved an indexed receiver of this element layout.
+    pub(crate) elements: Option<JitElementAccess>,
+    /// The `Word` element count and element base of a proved indexed
+    /// receiver, already read on this path.
+    pub(crate) storage: Option<ElementStorage>,
+}
+
+/// The nodes that read a proved indexed receiver's storage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ElementStorage {
+    /// `Word` element count.
+    pub(crate) length: NodeId,
+    /// `Word` element base.
+    pub(crate) base: NodeId,
+}
+
+/// A heap word whose current value a path knows: a context slot or a named
+/// property slot of one object node, at a byte offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct FieldKey {
+    object: NodeId,
+    property: bool,
+    offset: i32,
+}
+
+/// What one heap fact is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum FactKey {
+    /// The layout facts of a node.
+    Node(NodeId),
+    /// The value of a heap word.
+    Field(FieldKey),
+}
+
+/// One heap fact a loop header assumes holds on every iteration.
+#[derive(Debug, Clone, PartialEq)]
+enum HeapFact {
+    Layout {
+        shapes: Option<SmallVec<[u32; 4]>>,
+        writable: bool,
+        elements: Option<JitElementAccess>,
+    },
+    Field(NodeId),
+}
+
+/// How a loop header treats the heap facts of its entry.
+#[derive(Debug, Clone, Default)]
+struct LoopPolicy {
+    /// The loop calls out: no heap fact survives an iteration.
+    clobber: bool,
+    /// Facts a back edge arrived without.
+    dropped: FxHashSet<FactKey>,
 }
 
 /// Facts along the current path.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Known {
     info: FxHashMap<NodeId, NodeInfo>,
+    /// Heap words whose current value is a node on this path.
+    fields: FxHashMap<FieldKey, NodeId>,
+    /// The parent of each context loaded on this path. Context chains never
+    /// change, so no heap write forgets these.
+    parents: FxHashMap<NodeId, NodeId>,
 }
 
 impl Known {
@@ -96,11 +162,21 @@ impl Known {
             if info.shapes != theirs.shapes {
                 info.shapes = None;
             }
+            if info.elements != theirs.elements {
+                info.elements = None;
+            }
+            if info.storage != theirs.storage {
+                info.storage = None;
+            }
             info.writable &= theirs.writable;
             info.heap_object &= theirs.heap_object;
             info.number &= theirs.number;
             *info != NodeInfo::default()
         });
+        self.fields
+            .retain(|key, value| other.fields.get(key) == Some(value));
+        self.parents
+            .retain(|context, parent| other.parents.get(context) == Some(parent));
     }
 
     /// Forget every fact a heap write may invalidate.
@@ -108,7 +184,99 @@ impl Known {
         for info in self.info.values_mut() {
             info.shapes = None;
             info.writable = false;
+            info.elements = None;
+            info.storage = None;
         }
+        self.fields.clear();
+    }
+
+    /// The value a store just wrote to `key`. A store through another node
+    /// may write the same word, so every other value at its offset is
+    /// forgotten.
+    fn store_field(&mut self, key: FieldKey, value: NodeId) {
+        self.fields
+            .retain(|other, _| other.property != key.property || other.offset != key.offset);
+        self.fields.insert(key, value);
+    }
+
+    /// Forget the heap facts `keys` name.
+    fn forget(&mut self, keys: &FxHashSet<FactKey>) {
+        for key in keys {
+            match *key {
+                FactKey::Node(node) => {
+                    if let Some(info) = self.info.get_mut(&node) {
+                        info.shapes = None;
+                        info.writable = false;
+                        info.elements = None;
+                        info.storage = None;
+                    }
+                }
+                FactKey::Field(field) => {
+                    self.fields.remove(&field);
+                }
+            }
+        }
+    }
+
+    /// Forget the storage words read on this path. A loop back edge polls
+    /// for interrupts, and a collection there may move element storage.
+    fn forget_storage(&mut self) {
+        for info in self.info.values_mut() {
+            info.storage = None;
+        }
+    }
+
+    /// The heap facts on this path.
+    fn heap_facts(&self) -> Vec<(FactKey, HeapFact)> {
+        let mut facts: Vec<(FactKey, HeapFact)> = self
+            .info
+            .iter()
+            .filter(|(_, info)| info.shapes.is_some() || info.elements.is_some())
+            .map(|(&node, info)| {
+                (
+                    FactKey::Node(node),
+                    HeapFact::Layout {
+                        shapes: info.shapes.clone(),
+                        writable: info.writable,
+                        elements: info.elements,
+                    },
+                )
+            })
+            .chain(
+                self.fields
+                    .iter()
+                    .map(|(&key, &value)| (FactKey::Field(key), HeapFact::Field(value))),
+            )
+            .collect();
+        facts.sort_by_key(|(key, _)| *key);
+        facts
+    }
+
+    /// The keys of `facts` that no longer hold on this path.
+    fn broken(&self, facts: &[(FactKey, HeapFact)]) -> impl Iterator<Item = FactKey> {
+        facts
+            .iter()
+            .filter(|(key, fact)| match (key, fact) {
+                (
+                    FactKey::Node(node),
+                    HeapFact::Layout {
+                        shapes,
+                        writable,
+                        elements,
+                    },
+                ) => !self.info.get(node).is_some_and(|info| {
+                    (shapes.is_none() || info.shapes == *shapes)
+                        && (!writable || info.writable)
+                        && (elements.is_none() || info.elements == *elements)
+                }),
+                (FactKey::Field(field), HeapFact::Field(value)) => {
+                    self.fields.get(field) != Some(value)
+                }
+                _ => true,
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
@@ -138,6 +306,23 @@ pub(crate) struct Built {
     /// The block an OSR entry jumps to; it reads every register live at the
     /// loop header from the interpreter's window.
     pub(crate) osr_entry: Option<BlockId>,
+    /// Every loop header with a back edge.
+    pub(crate) loop_headers: Vec<LoopHeader>,
+}
+
+/// One loop header, for representation selection of its phis.
+#[derive(Debug, Clone)]
+pub(crate) struct LoopHeader {
+    pub(crate) block: BlockId,
+    /// The header's interpreter state with its back edge's values. An entry
+    /// edge's state is this one with each phi register bound to that edge's
+    /// input instead.
+    pub(crate) state: FrameStateId,
+    /// The header's phis by interpreter register.
+    pub(crate) phis: Vec<(u16, NodeId)>,
+    /// Whether an entry value may be speculated to be an int32: no earlier
+    /// optimized code left at the header for a type mismatch.
+    pub(crate) speculate: bool,
 }
 
 struct Builder<'a> {
@@ -162,17 +347,73 @@ struct Builder<'a> {
     osr_entry: bool,
     /// Eager frame states already built, by PC.
     eager_states: FxHashMap<u32, FrameStateId>,
+    /// How each loop header treats the heap facts of its entry.
+    policies: &'a FxHashMap<usize, LoopPolicy>,
+    /// Heap facts each loop header assumes for its whole body.
+    assumptions: FxHashMap<usize, Vec<(FactKey, HeapFact)>>,
+    /// Loops whose body may write the heap through a call.
+    effectful: FxHashSet<usize>,
+    /// Per loop header, the assumed facts a back edge arrived without.
+    failed: FxHashMap<usize, FxHashSet<FactKey>>,
+    /// The loops each bytecode block lies in.
+    enclosing: Vec<SmallVec<[usize; 2]>>,
     pc: u32,
     undefined: NodeId,
 }
 
 /// Build the graph of `view`.
+///
+/// Loop headers keep the heap facts of their entry optimistically. A build
+/// in which a back edge arrives without one of them is redone with every
+/// loop that calls out, and every loop that failed, entered without heap
+/// facts.
 pub(crate) fn build(
     view: &JitCompileSnapshot,
     analysis: &Analysis,
     baseline: &'_ super::BaselineSupport,
     osr_pc: Option<u32>,
 ) -> Result<Built, BuildError> {
+    let mut policies: FxHashMap<usize, LoopPolicy> = FxHashMap::default();
+    loop {
+        let BuildPass {
+            built,
+            effectful,
+            failed,
+        } = build_once(view, analysis, baseline, osr_pc, &policies)?;
+        if failed.is_empty() {
+            return Ok(built);
+        }
+        for (header, keys) in failed {
+            let policy = policies.entry(header).or_default();
+            if effectful.contains(&header) {
+                policy.clobber = true;
+            } else {
+                debug_assert!(
+                    !keys.is_subset(&policy.dropped),
+                    "a dropped fact never fails"
+                );
+                policy.dropped.extend(keys);
+            }
+        }
+    }
+}
+
+/// One construction of the graph under a set of loop policies.
+struct BuildPass {
+    built: Built,
+    /// Loops whose body calls out.
+    effectful: FxHashSet<usize>,
+    /// Per loop header, the assumed facts a back edge arrived without.
+    failed: FxHashMap<usize, FxHashSet<FactKey>>,
+}
+
+fn build_once(
+    view: &JitCompileSnapshot,
+    analysis: &Analysis,
+    baseline: &'_ super::BaselineSupport,
+    osr_pc: Option<u32>,
+    policies: &FxHashMap<usize, LoopPolicy>,
+) -> Result<BuildPass, BuildError> {
     let code = view.code_block.as_ref();
     let register_count = code.register_count;
     let mut graph = Graph::default();
@@ -199,6 +440,19 @@ pub(crate) fn build(
         known: Known::default(),
         osr_entry: osr_pc.is_some(),
         eager_states: FxHashMap::default(),
+        policies,
+        assumptions: FxHashMap::default(),
+        effectful: FxHashSet::default(),
+        failed: FxHashMap::default(),
+        enclosing: {
+            let mut enclosing = vec![SmallVec::new(); block_count];
+            for (&header, info) in &analysis.loops {
+                for &block in &info.body {
+                    enclosing[block].push(header);
+                }
+            }
+            enclosing
+        },
         pc: 0,
         undefined,
     };
@@ -228,6 +482,7 @@ pub(crate) fn build(
         let range = analysis.blocks[block].start..analysis.blocks[block].end;
         for pc in range.clone() {
             builder.pc = pc;
+            builder.graph.position = pc;
             builder.visit(&analysis.instructions[pc as usize]);
             if builder.current.is_none() {
                 break;
@@ -245,11 +500,104 @@ pub(crate) fn build(
         layout.extend(builder.trailing[block].iter().copied());
     }
     builder.finish_loops();
-    Ok(Built {
-        graph: builder.graph,
-        layout,
-        osr_entry,
+    remove_trivial_phis(&mut builder.graph, &layout);
+    let loop_headers = builder.loop_headers();
+    Ok(BuildPass {
+        built: Built {
+            graph: builder.graph,
+            layout,
+            osr_entry,
+            loop_headers,
+        },
+        effectful: builder.effectful,
+        failed: builder.failed,
     })
+}
+
+/// Replace every phi that merges one value with that value.
+///
+/// A phi whose inputs, apart from references to itself, are all the same
+/// node `v` is `v`: the only value that reaches it is `v`, which therefore
+/// dominates it. Replacing one phi can make the phis that read it trivial in
+/// turn, so the pass runs to a fixpoint, then rewrites node inputs, phi
+/// inputs and frame states and drops the replaced phis.
+fn remove_trivial_phis(graph: &mut Graph, layout: &[BlockId]) {
+    fn resolve(replaced: &mut FxHashMap<NodeId, NodeId>, node: NodeId) -> NodeId {
+        let mut current = node;
+        while let Some(&next) = replaced.get(&current) {
+            current = next;
+        }
+        // Compress the chain behind `node`.
+        let mut walk = node;
+        while let Some(&next) = replaced.get(&walk) {
+            if next == current {
+                break;
+            }
+            replaced.insert(walk, current);
+            walk = next;
+        }
+        current
+    }
+    let phis: Vec<NodeId> = layout
+        .iter()
+        .flat_map(|&block| graph.block(block).phis.iter().copied())
+        .collect();
+    let mut replaced: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+    loop {
+        let mut changed = false;
+        for &phi in &phis {
+            if replaced.contains_key(&phi) {
+                continue;
+            }
+            let mut same = None;
+            let mut trivial = true;
+            for index in 0..graph.node(phi).inputs.len() {
+                let input = resolve(&mut replaced, graph.node(phi).inputs[index]);
+                if input == phi || Some(input) == same {
+                    continue;
+                }
+                if same.is_some() {
+                    trivial = false;
+                    break;
+                }
+                same = Some(input);
+            }
+            if trivial && let Some(value) = same {
+                replaced.insert(phi, value);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if replaced.is_empty() {
+        return;
+    }
+    let keys: Vec<NodeId> = replaced.keys().copied().collect();
+    for key in keys {
+        resolve(&mut replaced, key);
+    }
+    for node in &mut graph.nodes {
+        for input in &mut node.inputs {
+            if let Some(&value) = replaced.get(input) {
+                *input = value;
+            }
+        }
+    }
+    for state in &mut graph.frame_states {
+        for (_, value) in &mut state.registers {
+            if let Some(&value_after) = replaced.get(value) {
+                *value = value_after;
+            }
+        }
+    }
+    for &block in layout {
+        graph
+            .block_mut(block)
+            .phis
+            .retain(|phi| !replaced.contains_key(phi));
+    }
 }
 
 impl<'a> Builder<'a> {
@@ -313,7 +661,13 @@ impl<'a> Builder<'a> {
             known.intersect(&edge.known);
         }
         if is_loop {
-            known.clobber_heap();
+            known.forget_storage();
+            match self.policies.get(&block) {
+                Some(policy) if policy.clobber => known.clobber_heap(),
+                Some(policy) => known.forget(&policy.dropped),
+                None => {}
+            }
+            self.assumptions.insert(block, known.heap_facts());
         }
         let mut frame = incoming[0].frame.clone();
         let mut phis = Vec::new();
@@ -402,6 +756,12 @@ impl<'a> Builder<'a> {
         self.box_live_registers(&live);
         let target_block = self.block_map[target];
         if back_edge {
+            if let Some(assumed) = self.assumptions.get(&target) {
+                let broken: Vec<FactKey> = self.known.broken(assumed).collect();
+                if !broken.is_empty() {
+                    self.failed.entry(target).or_default().extend(broken);
+                }
+            }
             let phis = self.loop_phis[&target].clone();
             for (register, phi) in phis {
                 let value = self.tagged(self.frame[usize::from(register)]);
@@ -488,8 +848,7 @@ impl<'a> Builder<'a> {
         self.graph.block_mut(block).control = Some(node);
     }
 
-    /// Drop loop-header phis whose back edges never arrived, and phis whose
-    /// inputs are all the same value.
+    /// Clear the loop mark of headers whose back edges never arrived.
     fn finish_loops(&mut self) {
         for (&header, phis) in &self.loop_phis {
             let block = self.block_map[header];
@@ -518,6 +877,47 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The finished loop headers: those whose back edges arrived, with the
+    /// phis that survived trivial-phi removal.
+    fn loop_headers(&self) -> Vec<LoopHeader> {
+        let mut headers = Vec::new();
+        for (&header, phis) in &self.loop_phis {
+            let block = self.block_map[header];
+            let data = self.graph.block(block);
+            if !data.is_loop {
+                continue;
+            }
+            let Some(state) = data.predecessors.iter().find_map(|&predecessor| {
+                let control = self.graph.block(predecessor).control?;
+                let node = self.graph.node(control);
+                matches!(node.kind, Kind::JumpLoop(_))
+                    .then_some(node.eager)
+                    .flatten()
+            }) else {
+                continue;
+            };
+            let phis = phis
+                .iter()
+                .copied()
+                .filter(|(_, phi)| data.phis.contains(phi))
+                .collect();
+            let header_pc = self.analysis.blocks[header].start;
+            let speculate = !self
+                .view
+                .optimized_exit_reasons
+                .get(&header_pc)
+                .is_some_and(|reasons| reasons.contains(&ExitReason::TypeMismatch));
+            headers.push(LoopHeader {
+                block,
+                state,
+                phis,
+                speculate,
+            });
+        }
+        headers.sort_by_key(|header| header.block);
+        headers
+    }
+
     // ------------------------------------------------------------------
     // Nodes, frame states and representations
     // ------------------------------------------------------------------
@@ -535,9 +935,18 @@ impl<'a> Builder<'a> {
         // Only a call can change an object's shape or prototype state; a
         // slot store keeps every shape.
         if properties.call {
-            self.known.clobber_heap();
+            self.clobber_heap();
         }
         node
+    }
+
+    /// Forget heap facts after a call, which also makes every loop around
+    /// the current block one that writes the heap.
+    fn clobber_heap(&mut self) {
+        self.known.clobber_heap();
+        if let Some(loops) = self.enclosing.get(self.current_bytecode_block) {
+            self.effectful.extend(loops.iter().copied());
+        }
     }
 
     fn constant_tagged(&mut self, bits: u64) -> NodeId {
@@ -747,6 +1156,11 @@ impl<'a> Builder<'a> {
                 let value = self.add(Kind::LoadClosure, &[], Repr::Tagged);
                 self.write(instruction.writes[0], value);
             }
+            Op::LoadClosureContext => {
+                let closure = self.add(Kind::LoadClosure, &[], Repr::Tagged);
+                let value = self.add(Kind::LoadClosureContext, &[closure], Repr::Tagged);
+                self.write(instruction.writes[0], value);
+            }
             Op::LoadThis if !self.view.derived_constructor => {
                 let value = self.add(Kind::LoadThis, &[], Repr::Tagged);
                 self.write(instruction.writes[0], value);
@@ -795,13 +1209,48 @@ impl<'a> Builder<'a> {
             | Op::GreaterThan
             | Op::GreaterEq
             | Op::Equal
-            | Op::NotEqual => self.visit_compare(instruction, None),
+            | Op::NotEqual
+            | Op::LooseEqual
+            | Op::LooseNotEqual => self.visit_compare(instruction, None),
             Op::LessThanImm | Op::EqualImm | Op::NotEqualImm => {
                 let immediate = instruction.imm32(2).unwrap_or(0);
                 self.visit_compare(instruction, Some(immediate));
             }
             Op::LoadProperty => self.visit_load_property(instruction),
             Op::StoreProperty | Op::StorePropertyStrict => self.visit_store_property(instruction),
+            Op::Call => self.visit_call(instruction, false),
+            Op::New => self.visit_call(instruction, true),
+            Op::LogicalNot | Op::ToBoolean => {
+                let value = self.read(instruction.reads[0]);
+                let value = self.tagged(value);
+                let kind = if instruction.op == Op::LogicalNot {
+                    Kind::LogicalNot
+                } else {
+                    Kind::ToBoolean
+                };
+                let result =
+                    if kind == Kind::ToBoolean && self.graph.node(value).kind.produces_boolean() {
+                        value
+                    } else {
+                        self.add(kind, &[value], Repr::Tagged)
+                    };
+                self.write(instruction.writes[0], result);
+            }
+            Op::LoadString
+                if self
+                    .view
+                    .string_constant_cells
+                    .contains_key(&instruction.byte_pc) =>
+            {
+                let value = self.add(
+                    Kind::LoadStringConstant(instruction.byte_pc),
+                    &[],
+                    Repr::Tagged,
+                );
+                self.write(instruction.writes[0], value);
+            }
+            Op::LoadElement => self.visit_load_element(instruction),
+            Op::StoreElement | Op::StoreElementStrict => self.visit_store_element(instruction),
             Op::LoadContextSlot => self.visit_load_context_slot(instruction),
             Op::StoreContextSlot => self.visit_store_context_slot(instruction),
             _ => self.generic(instruction),
@@ -840,7 +1289,7 @@ impl<'a> Builder<'a> {
         );
         let lazy = self.lazy_state(None);
         self.graph.node_mut(node).lazy = Some(lazy);
-        self.known.clobber_heap();
+        self.clobber_heap();
         if instruction.flow == Flow::Exit {
             // The operation completes the frame; nothing follows it.
             self.deopt(DeoptReason::Unsupported);
@@ -858,6 +1307,14 @@ impl<'a> Builder<'a> {
 
     fn exited_before(&self) -> bool {
         self.view.optimized_exit_reasons.contains_key(&self.pc)
+    }
+
+    /// Whether optimized code left at this instruction for `reason`.
+    fn exited_for(&self, reason: ExitReason) -> bool {
+        self.view
+            .optimized_exit_reasons
+            .get(&self.pc)
+            .is_some_and(|reasons| reasons.contains(&reason))
     }
 
     fn visit_binary(&mut self, instruction: &Instruction, immediate: Option<i32>) {
@@ -1021,8 +1478,8 @@ impl<'a> Builder<'a> {
             Op::LessEq => Condition::LessEqual,
             Op::GreaterThan => Condition::Greater,
             Op::GreaterEq => Condition::GreaterEqual,
-            Op::Equal | Op::EqualImm => Condition::Equal,
-            Op::NotEqual | Op::NotEqualImm => Condition::NotEqual,
+            Op::Equal | Op::EqualImm | Op::LooseEqual => Condition::Equal,
+            Op::NotEqual | Op::NotEqualImm | Op::LooseNotEqual => Condition::NotEqual,
             _ => return None,
         })
     }
@@ -1034,16 +1491,26 @@ impl<'a> Builder<'a> {
         };
         let feedback = self.feedback();
         let int32 = feedback.speculates_int32() && !self.exited_before();
-        let numeric = feedback.is_numeric_only() || int32;
-        if !numeric {
-            self.generic(instruction);
-            return;
-        }
         let lhs = self.read(instruction.reads[0]);
         let rhs = match immediate {
             Some(value) => self.constant_int32(value),
             None => self.read(instruction.reads[1]),
         };
+        // Loose equality of two Numbers is their strict equality.
+        let proved_numbers = self.is_number(lhs) && self.is_number(rhs);
+        let numeric = feedback.is_numeric_only() || int32 || proved_numbers;
+        let strict = matches!(
+            instruction.op,
+            Op::Equal | Op::NotEqual | Op::EqualImm | Op::NotEqualImm
+        );
+        if !numeric {
+            if strict {
+                self.visit_strict_equal(instruction, lhs, rhs, condition);
+            } else {
+                self.generic(instruction);
+            }
+            return;
+        }
         let (branch, inputs) = if int32 {
             let a = self.int32(lhs);
             let b = self.int32(rhs);
@@ -1097,6 +1564,58 @@ impl<'a> Builder<'a> {
         self.write(destination, value);
     }
 
+    /// `===` / `!==` on values that are not all Numbers. An operand that is
+    /// an immediate other than a Number (`undefined`, `null`, a boolean) makes
+    /// identity exact; otherwise the full strict comparison runs inline.
+    fn visit_strict_equal(
+        &mut self,
+        instruction: &Instruction,
+        lhs: NodeId,
+        rhs: NodeId,
+        condition: Condition,
+    ) {
+        let a = self.tagged(lhs);
+        let b = self.tagged(rhs);
+        let negate = condition == Condition::NotEqual;
+        let oddball = |graph: &Graph, node: NodeId| match graph.node(node).kind {
+            Kind::ConstTagged(bits) => !tag::is_number_bits(bits),
+            _ => false,
+        };
+        let identity = oddball(&self.graph, a) || oddball(&self.graph, b);
+        let destination = instruction.writes[0];
+        let next_pc = self.pc + 1;
+        if identity
+            && let Some(next) = self.analysis.instructions.get(next_pc as usize)
+            && self.analysis.block_of[next_pc as usize] == self.current_bytecode_block
+            && matches!(next.op, Op::JumpIfTrue | Op::JumpIfFalse)
+            && next.reads.first() == Some(&destination)
+            && let Flow::Branch { target } = next.flow
+        {
+            let after = next_pc + 1;
+            let dead_after = (after as usize) >= self.analysis.instructions.len()
+                || !self.analysis.live_at(after).contains(destination)
+                    && !self.analysis.live_at(target).contains(destination);
+            if dead_after {
+                let value = self.add(Kind::StrictEqual { negate }, &[a, b], Repr::Tagged);
+                self.write(destination, value);
+                self.pc = next_pc;
+                let taken = self.analysis.block_of[target as usize];
+                let fallthrough = self.analysis.block_of[after as usize];
+                // The branch tests identity: its true edge is `===`.
+                let jumps_on_equal = (next.op == Op::JumpIfTrue) != negate;
+                let (if_true, if_false) = if jumps_on_equal {
+                    (taken, fallthrough)
+                } else {
+                    (fallthrough, taken)
+                };
+                self.branch(BranchKind::TaggedEqual, &[a, b], if_true, if_false);
+                return;
+            }
+        }
+        let value = self.add(Kind::StrictEqual { negate }, &[a, b], Repr::Tagged);
+        self.write(destination, value);
+    }
+
     fn visit_branch(&mut self, instruction: &Instruction) {
         let Flow::Branch { target } = instruction.flow else {
             unreachable!("a conditional jump has a target");
@@ -1125,8 +1644,18 @@ impl<'a> Builder<'a> {
         let object = self.read(instruction.reads[0]);
         let object = self.tagged(object);
         self.check_shapes(object, &access.shapes, false);
+        let key = FieldKey {
+            object,
+            property: true,
+            offset: access.offset,
+        };
+        if let Some(&value) = self.known.fields.get(&key) {
+            self.write(instruction.writes[0], value);
+            return;
+        }
         let base = self.add(Kind::LoadSlotBase, &[object], Repr::Word);
         let value = self.add(Kind::LoadTaggedField(access.offset), &[base], Repr::Tagged);
+        self.known.fields.insert(key, value);
         self.write(instruction.writes[0], value);
     }
 
@@ -1147,6 +1676,14 @@ impl<'a> Builder<'a> {
             Repr::None,
         );
         self.add(Kind::WriteBarrier, &[object, value], Repr::None);
+        self.known.store_field(
+            FieldKey {
+                object,
+                property: true,
+                offset: access.offset,
+            },
+            value,
+        );
         // A slot write keeps the object's shape.
         let info = self.known.entry(object);
         info.shapes = Some(access.shapes.clone());
@@ -1176,10 +1713,317 @@ impl<'a> Builder<'a> {
         info.heap_object = true;
     }
 
+    // ------------------------------------------------------------------
+    // Calls
+    // ------------------------------------------------------------------
+
+    /// `dst = callee(args...)`, or `dst = new callee(args...)` when
+    /// `construct`. A site that never ran leaves to collect its target; a
+    /// site with one proven target enters it directly.
+    fn visit_call(&mut self, instruction: &Instruction, construct: bool) {
+        let (Some(callee), Some(argc)) = (instruction.register(1), instruction.const_index(2))
+        else {
+            return self.generic(instruction);
+        };
+        let Ok(argc) = usize::try_from(argc) else {
+            return self.generic(instruction);
+        };
+        let arguments: Option<SmallVec<[u16; 8]>> = (0..argc)
+            .map(|index| instruction.register(3 + index))
+            .collect();
+        let Some(arguments) = arguments else {
+            return self.generic(instruction);
+        };
+        if !self.view.instructions[self.pc as usize].call_attempted {
+            return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        let plan = if construct {
+            // `[[Construct]]` enters a proven target directly only when it
+            // has the internal method; classification throws otherwise.
+            self.view
+                .direct_constructs
+                .get(&instruction.byte_pc)
+                .map(|target| target.plan)
+                .filter(|plan| {
+                    plan.call_flags & otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
+                })
+        } else {
+            self.view
+                .direct_callees
+                .get(&instruction.byte_pc)
+                .filter(|targets| targets.len() == 1)
+                .map(|targets| targets[0].plan)
+        };
+        let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
+        let callee = self.read(callee);
+        inputs.push(self.tagged(callee));
+        for register in arguments {
+            let value = self.read(register);
+            inputs.push(self.tagged(value));
+        }
+        let node = self.add(
+            Kind::CallJs {
+                pc: self.pc,
+                plan,
+                construct,
+            },
+            &inputs,
+            Repr::Tagged,
+        );
+        let destination = instruction.writes[0];
+        let lazy = self.lazy_state(Some((destination, node)));
+        self.graph.node_mut(node).lazy = Some(lazy);
+        self.write(destination, node);
+    }
+
+    // ------------------------------------------------------------------
+    // Indexed element access
+    // ------------------------------------------------------------------
+
+    /// The element layout this site speculates on, or why it has none:
+    /// `Err(true)` for a site that never ran, `Err(false)` for one whose
+    /// receivers have no single layout, or whose receiver, bounds or key
+    /// speculation already failed.
+    fn element_access(&self, instruction: &Instruction) -> Result<JitElementAccess, bool> {
+        let byte_pc = instruction.byte_pc;
+        if self.view.cage_base == 0 {
+            return Err(false);
+        }
+        if self.view.unseen_element_sites.contains(&byte_pc) {
+            return Err(true);
+        }
+        let Some(&access) = self.view.element_accesses.get(&byte_pc) else {
+            return Err(false);
+        };
+        if access.type_tag == 0
+            || matches!(access.base, JitElementBase::None)
+            || self.exited_for(ExitReason::ShapeGuard)
+            || self.exited_for(ExitReason::BoundsGuard)
+            || self.exited_for(ExitReason::InvalidElementIndex)
+        {
+            return Err(false);
+        }
+        Ok(access)
+    }
+
+    /// Prove `receiver` has `access`'s layout and read its storage, unless
+    /// this path already did. A typed view is proved to keep a cached
+    /// element base, which its storage then reads directly.
+    fn elements_of(&mut self, receiver: NodeId, access: JitElementAccess) -> ElementStorage {
+        let info = self.known.get(receiver);
+        let proved = info.and_then(|info| info.elements) == Some(access);
+        if proved && let Some(storage) = info.and_then(|info| info.storage) {
+            return storage;
+        }
+        let (base_byte, cached_base) = match access.base {
+            JitElementBase::InBody { byte } => (byte, None),
+            JitElementBase::ThroughLocalBuffer {
+                cached_data_byte, ..
+            } => (cached_data_byte, Some(cached_data_byte)),
+            JitElementBase::None => unreachable!("an element access names its base"),
+        };
+        if !proved {
+            self.add(
+                Kind::CheckElements {
+                    type_tag: access.type_tag,
+                    guards: access.guards,
+                    holes: access.holes,
+                    cached_base,
+                },
+                &[receiver],
+                Repr::None,
+            );
+        }
+        let length = self.add(
+            Kind::LoadElementsLength {
+                byte: access.length_byte,
+                width: access.length_width,
+            },
+            &[receiver],
+            Repr::Word,
+        );
+        let base = self.add(Kind::LoadElementsBase(base_byte), &[receiver], Repr::Word);
+        let storage = ElementStorage { length, base };
+        let info = self.known.entry(receiver);
+        info.elements = Some(access);
+        info.storage = Some(storage);
+        info.heap_object = true;
+        storage
+    }
+
+    /// The proved storage of tagged `receiver` and the in-bounds int32 form
+    /// of register `index`.
+    fn element_address(
+        &mut self,
+        receiver: NodeId,
+        index: u16,
+        access: JitElementAccess,
+    ) -> (ElementStorage, NodeId) {
+        let index = self.read(index);
+        let index = self.element_index(index);
+        let fact = self.elements_of(receiver, access);
+        self.add(Kind::CheckBounds, &[index, fact.length], Repr::None);
+        (fact, index)
+    }
+
+    /// The int32 form of an element key: any Number holding an integer in
+    /// the int32 range. Range and sign are the bounds check's.
+    fn element_index(&mut self, index: NodeId) -> NodeId {
+        let node = self.graph.node(index);
+        match (&node.kind, node.repr) {
+            (_, Repr::Int32) => return index,
+            (Kind::ConstTagged(bits), _) if bits & tag::NUMBER_TAG == tag::NUMBER_TAG => {
+                let int = *bits as u32 as i32;
+                return self.constant_int32(int);
+            }
+            _ => {}
+        }
+        if let Some(int) = self.known.get(index).and_then(|info| info.int32) {
+            return int;
+        }
+        // Not recorded as the value's int32 form: `-0` converts to `0`.
+        match self.graph.node(index).repr {
+            Repr::Float64 => self.add(Kind::CheckedFloat64ToIndex, &[index], Repr::Int32),
+            _ => self.add(Kind::CheckedTaggedToIndex, &[index], Repr::Int32),
+        }
+    }
+
+    fn visit_load_element(&mut self, instruction: &Instruction) {
+        let access = match self.element_access(instruction) {
+            Ok(access) => access,
+            Err(true) => return self.deopt(DeoptReason::InsufficientFeedback),
+            Err(false) => return self.generic(instruction),
+        };
+        let receiver = self.read(instruction.reads[0]);
+        let receiver = self.tagged(receiver);
+        let (fact, index) = self.element_address(receiver, instruction.reads[1], access);
+        let value = match access.element {
+            JitElementRepr::Float64 if let Some(holes) = access.holes => self.add(
+                Kind::LoadHoleyFloat64Element(holes),
+                &[fact.base, index],
+                Repr::Tagged,
+            ),
+            JitElementRepr::Boxed => self.add(
+                Kind::LoadElement(access.element),
+                &[fact.base, index],
+                Repr::Tagged,
+            ),
+            JitElementRepr::Float32 | JitElementRepr::Float64 => self.add(
+                Kind::LoadElement(access.element),
+                &[fact.base, index],
+                Repr::Float64,
+            ),
+            // A `Uint32` element that once left the int32 range is read as a
+            // double.
+            JitElementRepr::Uint32 if self.exited_for(ExitReason::TypeMismatch) => self.add(
+                Kind::LoadElementUint32ToFloat64,
+                &[fact.base, index],
+                Repr::Float64,
+            ),
+            element => self.add(Kind::LoadElement(element), &[fact.base, index], Repr::Int32),
+        };
+        self.write(instruction.writes[0], value);
+    }
+
+    fn visit_store_element(&mut self, instruction: &Instruction) {
+        let access = match self.element_access(instruction) {
+            Ok(access) => access,
+            Err(true) => return self.deopt(DeoptReason::InsufficientFeedback),
+            Err(false) => return self.generic(instruction),
+        };
+        let value = self.read(instruction.reads[2]);
+        let element = access.element;
+        // A numeric element stores Numbers only: a site that stored anything
+        // else keeps the runtime path.
+        let feedback = self.feedback();
+        if element != JitElementRepr::Boxed
+            && !feedback.is_unseen()
+            && !feedback.is_numeric_only()
+            && !self.is_number(value)
+        {
+            return self.generic(instruction);
+        }
+        // Convert the stored value before the receiver is proved, so the
+        // conversion's deopt resumes with nothing written.
+        let stored = match element {
+            JitElementRepr::Boxed => self.tagged(value),
+            JitElementRepr::Float32 | JitElementRepr::Float64 => self.float64(value),
+            JitElementRepr::Uint8Clamped => {
+                if self.graph.node(value).repr == Repr::Float64 || !self.int32_value(value) {
+                    self.float64(value)
+                } else {
+                    self.int32(value)
+                }
+            }
+            _ => {
+                if self.int32_value(value) {
+                    self.int32(value)
+                } else {
+                    let double = self.float64(value);
+                    self.add(Kind::TruncateFloat64ToInt32, &[double], Repr::Int32)
+                }
+            }
+        };
+        let receiver = self.read(instruction.reads[0]);
+        let receiver = self.tagged(receiver);
+        let (fact, index) = self.element_address(receiver, instruction.reads[1], access);
+        // An absent element would have to consult the prototype chain.
+        if element == JitElementRepr::Boxed {
+            self.add(Kind::CheckElementPresent, &[fact.base, index], Repr::None);
+        } else if let Some(holes) = access.holes {
+            self.add(
+                Kind::CheckHoleyElementPresent(holes),
+                &[fact.base, index],
+                Repr::None,
+            );
+        }
+        self.add(
+            Kind::StoreElement(element),
+            &[fact.base, index, stored],
+            Repr::None,
+        );
+        if element == JitElementRepr::Boxed {
+            self.add(
+                Kind::ElementWriteBarrier,
+                &[fact.base, index, stored],
+                Repr::None,
+            );
+        }
+    }
+
+    /// Whether `value` is, or is speculated by this site's value feedback to
+    /// be, an int32.
+    fn int32_value(&self, value: NodeId) -> bool {
+        let node = self.graph.node(value);
+        match (&node.kind, node.repr) {
+            (_, Repr::Int32) => return true,
+            (_, Repr::Float64) => return false,
+            (Kind::ConstTagged(bits), _) => {
+                return bits & tag::NUMBER_TAG == tag::NUMBER_TAG;
+            }
+            _ => {}
+        }
+        if self
+            .known
+            .get(value)
+            .is_some_and(|info| info.int32.is_some())
+        {
+            return true;
+        }
+        self.feedback().speculates_int32()
+    }
+
     fn context_at_depth(&mut self, context: NodeId, depth: u16) -> NodeId {
         let mut context = context;
         for _ in 0..depth {
-            context = self.add(Kind::LoadContextParent, &[context], Repr::Tagged);
+            context = match self.known.parents.get(&context) {
+                Some(&parent) => parent,
+                None => {
+                    let parent = self.add(Kind::LoadContextParent, &[context], Repr::Tagged);
+                    self.known.parents.insert(context, parent);
+                    parent
+                }
+            };
         }
         context
     }
@@ -1193,7 +2037,17 @@ impl<'a> Builder<'a> {
         let context = self.tagged(context);
         let context = self.context_at_depth(context, coord.depth);
         let offset = self.view.context_layout.slots_byte as i32 + i32::from(coord.slot) * 8;
+        let key = FieldKey {
+            object: context,
+            property: false,
+            offset,
+        };
+        if let Some(&value) = self.known.fields.get(&key) {
+            self.write(instruction.writes[0], value);
+            return;
+        }
         let value = self.add(Kind::LoadTaggedField(offset), &[context], Repr::Tagged);
+        self.known.fields.insert(key, value);
         self.write(instruction.writes[0], value);
     }
 
@@ -1214,5 +2068,13 @@ impl<'a> Builder<'a> {
             Repr::None,
         );
         self.add(Kind::WriteBarrier, &[context, value], Repr::None);
+        self.known.store_field(
+            FieldKey {
+                object: context,
+                property: false,
+                offset,
+            },
+            value,
+        );
     }
 }

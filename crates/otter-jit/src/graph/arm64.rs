@@ -36,7 +36,11 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptSlot};
-use otter_vm::native_abi::{self as abi, ExitAction, ExitReason, NativeResultStatus};
+use otter_vm::jit::{JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap};
+use otter_vm::native_abi::{
+    self as abi, ExitAction, ExitReason, NO_CALL_PC, NO_FRAME_STATE, NativeResultStatus,
+    SafepointRecord, TaggedLocation, TaggedLocationKind,
+};
 use otter_vm::value::tag;
 use rustc_hash::FxHashMap;
 
@@ -46,7 +50,7 @@ use super::regalloc::{Allocation, FP_REGISTERS, GP_REGISTERS, Location, Move};
 use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
-    NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET,
+    NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET, VALUE_HOLE,
     VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     VM_THREAD_MARKING_FLAG_CELL_OFFSET,
 };
@@ -60,6 +64,8 @@ const VALUE_UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 const VALUE_NULL: u64 = tag::VALUE_NULL;
 const DOUBLE_OFFSET: u64 = tag::DOUBLE_ENCODE_OFFSET;
 const NEW_TARGET_OFFSET: u32 = abi::NATIVE_FRAME_NEW_TARGET_OFFSET;
+const DETACH_PROTECTOR: u32 = crate::entry::VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET;
+const ARRAY_INDEX_PROTECTOR: u32 = crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET;
 
 /// Index of an allocatable register in the deopt dump and in deopt
 /// locations: general registers by number, then floating-point registers in
@@ -169,6 +175,11 @@ pub(crate) struct Emission {
     pub(crate) store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Code offset where each emitted node (and block) starts.
     pub(crate) node_offsets: Vec<(usize, NodeId)>,
+    /// Code offset where the body ends and the out-of-line code begins.
+    pub(crate) body_end: usize,
+    /// One safepoint record per distinct set of slots a point that may
+    /// collect roots.
+    pub(crate) site_records: Vec<SafepointRecord>,
 }
 
 fn exit_reason(reason: DeoptReason) -> (ExitReason, ExitAction) {
@@ -179,6 +190,7 @@ fn exit_reason(reason: DeoptReason) -> (ExitReason, ExitAction) {
         DeoptReason::Overflow => (ExitReason::Int32Overflow, ExitAction::Recompile),
         DeoptReason::MinusZero => (ExitReason::NegativeZero, ExitAction::Recompile),
         DeoptReason::OutOfBounds => (ExitReason::BoundsGuard, ExitAction::Recompile),
+        DeoptReason::InvalidIndex => (ExitReason::InvalidElementIndex, ExitAction::Recompile),
         DeoptReason::LostPrecision => (ExitReason::TypeMismatch, ExitAction::Recompile),
         DeoptReason::InsufficientFeedback => {
             (ExitReason::InsufficientFeedback, ExitAction::Recompile)
@@ -236,6 +248,10 @@ struct Codegen<'a> {
     island_base: usize,
     exits_flushed: usize,
     veneers: Vec<(DynamicLabel, DynamicLabel)>,
+    /// Safepoint records of the points that may collect, by their rooted
+    /// slot sets.
+    site_records: Vec<SafepointRecord>,
+    site_ids: FxHashMap<Vec<u32>, abi::SafepointId>,
 }
 
 /// Body bytes between islands: a segment plus its island stays well inside
@@ -326,6 +342,8 @@ pub(crate) fn emit(
         next_store_ic: 0,
         no_direct_call_events: None,
         no_code_map: None,
+        site_records: Vec::new(),
+        site_ids: FxHashMap::default(),
         node_offsets: Vec::new(),
         threw,
         committed_throw,
@@ -371,6 +389,7 @@ pub(crate) fn emit(
             .0;
     dynasm!(codegen.ops ; .arch aarch64 ; =>body);
     codegen.emit_body()?;
+    let body_end = codegen.ops.offset().0;
     codegen.flush_segment();
     codegen.emit_exit_stubs();
     crate::arm64::frame::emit_exits(
@@ -389,6 +408,7 @@ pub(crate) fn emit(
         load_ic_cells,
         store_ic_cells,
         node_offsets,
+        site_records,
         ..
     } = codegen;
     let buffer = crate::entry::finalize_assembler(ops)?;
@@ -401,6 +421,8 @@ pub(crate) fn emit(
         load_ic_cells,
         store_ic_cells,
         node_offsets,
+        body_end,
+        site_records,
     })
 }
 
@@ -782,6 +804,41 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("a result"));
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x21, NATIVE_FRAME_SELF_OFFSET]);
             }
+            Kind::LoadStringConstant(byte_pc) => {
+                let destination = Self::gp(result.expect("a result"));
+                let byte_pc = *byte_pc;
+                let cell = self
+                    .view
+                    .string_constant_cells
+                    .get(&byte_pc)
+                    .ok_or(Unsupported::OperandShape("graph LoadString cell"))?
+                    .cell_addr;
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    destination,
+                    cell as u64,
+                    RelocationTarget::StringConstantCell {
+                        function_id: self.view.code_block.id,
+                        byte_pc,
+                    },
+                );
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination)]);
+            }
+            Kind::ToBoolean | Kind::LogicalNot => {
+                let value = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let negate = data.kind == Kind::LogicalNot;
+                if self.graph.node(data.inputs[0]).kind.produces_boolean() {
+                    if negate {
+                        dynasm!(self.ops ; .arch aarch64 ; eor XSP(destination), X(value), 1);
+                    } else if destination != value {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(value));
+                    }
+                } else {
+                    self.emit_to_boolean(node, value, destination, negate);
+                }
+            }
             Kind::LoadNewTarget => {
                 let destination = Self::gp(result.expect("a result"));
                 dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x21, NEW_TARGET_OFFSET]);
@@ -952,6 +1009,30 @@ impl<'a> Codegen<'a> {
                     _ => dynasm!(self.ops ; .arch aarch64 ; fdiv D(destination), D(a), D(b)),
                 }
             }
+            Kind::Float64Mod => {
+                let (a, b) = (Self::fp(input(0)), Self::fp(input(1)));
+                let destination = Self::fp(result.expect("a result"));
+                // `fmod` through the VM's typed leaf, every live register
+                // saved around it: the leaf follows the platform ABI.
+                let live = self.allocation.node(node).live_registers.clone();
+                let saved = self.emit_save_registers(&live);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; fmov d31, D(b)
+                    ; fmov d0, D(a)
+                    ; fmov d1, d31
+                );
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    16,
+                    otter_vm::runtime_stubs::NUMBER_REM_F64_LEAF.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_NUMBER_REM_F64_LEAF),
+                );
+                dynasm!(self.ops ; .arch aarch64 ; blr x16 ; fmov d31, d0);
+                self.emit_restore_registers(&live, saved);
+                dynasm!(self.ops ; .arch aarch64 ; fmov D(destination), d31);
+            }
             Kind::Float64Negate => {
                 let a = Self::fp(input(0));
                 let destination = Self::fp(result.expect("a result"));
@@ -1049,11 +1130,75 @@ impl<'a> Codegen<'a> {
                     ; mov W(destination), w16
                 );
             }
+            Kind::CheckedTaggedToIndex => {
+                let a = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let double = allocation.fp_temps[0];
+                let exit = self.eager_exit(node, DeoptReason::InvalidIndex);
+                let int = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                self.load_immediate(16, NUMBER_TAG);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp X(a), x16
+                    ; b.hs =>int
+                    ; tst X(a), x16
+                    ; b.eq =>exit
+                );
+                self.load_immediate(17, DOUBLE_OFFSET);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; sub x17, X(a), x17
+                    ; fmov D(double), x17
+                    ; fcvtzs w16, D(double)
+                    ; scvtf d31, w16
+                    ; fcmp D(double), d31
+                    ; b.ne =>exit
+                    ; mov W(destination), w16
+                    ; b =>done
+                    ; =>int
+                    ; mov W(destination), W(a)
+                    ; =>done
+                );
+            }
+            Kind::CheckedFloat64ToIndex => {
+                let a = Self::fp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::InvalidIndex);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; fcvtzs w16, D(a)
+                    ; scvtf d31, w16
+                    ; fcmp D(a), d31
+                    ; b.ne =>exit
+                    ; mov W(destination), w16
+                );
+            }
             Kind::TaggedEqual => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
                 dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
                 self.emit_cset_bool(destination, Condition::Equal, false);
+            }
+            Kind::StrictEqual { negate } => {
+                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let condition = if *negate {
+                    Condition::NotEqual
+                } else {
+                    Condition::Equal
+                };
+                let oddball = |input: NodeId| match self.graph.node(input).kind {
+                    Kind::ConstTagged(bits) => !tag::is_number_bits(bits),
+                    _ => false,
+                };
+                if oddball(data.inputs[0]) || oddball(data.inputs[1]) {
+                    dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
+                    self.emit_cset_bool(destination, condition, false);
+                } else {
+                    let double = allocation.fp_temps[0];
+                    self.emit_strict_equal(node, [a, b], double, destination, condition);
+                }
             }
             Kind::CheckHeapObject => {
                 let a = Self::gp(input(0));
@@ -1080,9 +1225,124 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; cmp X(a), x16 ; b.ne =>exit);
             }
             Kind::CheckBounds => {
-                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let (index, length) = (Self::gp(input(0)), Self::gp(input(1)));
                 let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
-                dynasm!(self.ops ; .arch aarch64 ; cmp W(a), W(b) ; b.hs =>exit);
+                // Sign-extended, a negative index is above every length.
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp XSP(length), W(index), sxtw
+                    ; b.ls =>exit
+                );
+            }
+            Kind::CheckElements {
+                type_tag,
+                guards,
+                holes,
+                cached_base,
+            } => {
+                let receiver = Self::gp(input(0));
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                let (type_tag, guards, holes, cached_base) =
+                    (*type_tag, *guards, *holes, *cached_base);
+                self.load_immediate(16, NOT_CELL_MASK);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; tst X(receiver), x16
+                    ; b.ne =>exit
+                    ; ldrb w17, [X(receiver)]
+                    ; cmp w17, u32::from(type_tag)
+                    ; b.ne =>exit
+                );
+                for guard in guards.iter().flatten() {
+                    self.emit_body_guard(receiver, *guard, exit);
+                }
+                if let Some(cached) = cached_base {
+                    // The cached base stands for the buffer's liveness and
+                    // extent only while no buffer was ever detached.
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr x16, [X(receiver), cached]
+                        ; cbz x16, =>exit
+                        ; ldr x17, [x20, THREAD_OFFSET]
+                        ; ldr x17, [x17, DETACH_PROTECTOR]
+                        ; cbz x17, =>exit
+                        ; ldrb w17, [x17]
+                        ; cbnz w17, =>exit
+                    );
+                }
+                if let Some(holes) = holes {
+                    let kind = holes.kind_byte;
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldrb w17, [X(receiver), kind]
+                        ; cmp w17, u32::from(holes.packed_kind)
+                        ; ccmp w17, u32::from(holes.holey_kind), 4, ne
+                        ; b.ne =>exit
+                    );
+                }
+            }
+            Kind::CheckElementPresent => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [X(base), W(index), uxtw #3]);
+                self.load_immediate(17, VALUE_HOLE);
+                dynasm!(self.ops ; .arch aarch64 ; cmp x16, x17 ; b.eq =>exit);
+            }
+            Kind::LoadElementsLength { byte, width } => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let byte = *byte;
+                match width {
+                    JitGuardWidth::Byte => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldrb W(destination), [X(receiver), byte])
+                    }
+                    JitGuardWidth::Word32 => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr W(destination), [X(receiver), byte])
+                    }
+                    JitGuardWidth::Word64 => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(receiver), byte])
+                    }
+                }
+            }
+            Kind::LoadElementsBase(byte) => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let byte = *byte;
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(receiver), byte]);
+            }
+            Kind::LoadElement(element) => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let element = *element;
+                let result = result.expect("a result");
+                self.emit_load_element(node, element, base, index, result);
+            }
+            Kind::LoadHoleyFloat64Element(holes) => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let double = allocation.fp_temps[0];
+                let holes = *holes;
+                self.emit_load_holey_float64(node, holes, [base, index], double, destination);
+            }
+            Kind::CheckHoleyElementPresent(holes) => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                let holes = *holes;
+                self.emit_hole_bit(holes, base, index);
+                dynasm!(self.ops ; .arch aarch64 ; b.ne =>exit);
+            }
+            Kind::LoadElementUint32ToFloat64 => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::fp(result.expect("a result"));
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr w16, [X(base), W(index), uxtw #2]
+                    ; ucvtf D(destination), w16
+                );
+            }
+            Kind::StoreElement(element) => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let element = *element;
+                self.emit_store_element(element, base, index, input(2))?;
             }
             Kind::LoadSlotBase => {
                 let object = Self::gp(input(0));
@@ -1128,6 +1388,27 @@ impl<'a> Codegen<'a> {
                 self.load_immediate(16, u64::from(*shape));
                 dynasm!(self.ops ; .arch aarch64 ; str w16, [X(object), byte]);
             }
+            Kind::LoadClosureContext => {
+                let closure = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let context = self.view.closure_call_layout.context_byte;
+                let bare = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                self.load_immediate(16, NOT_CELL_MASK);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; tst X(closure), x16
+                    ; b.ne =>bare
+                    ; ldrb w16, [X(closure)]
+                    ; cmp w16, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as u32
+                    ; b.ne =>bare
+                    ; ldr X(destination), [X(closure), context]
+                    ; b =>done
+                    ; =>bare
+                );
+                self.load_immediate(destination, VALUE_UNDEFINED);
+                dynasm!(self.ops ; .arch aarch64 ; =>done);
+            }
             Kind::LoadContextParent => {
                 let context = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -1138,15 +1419,167 @@ impl<'a> Codegen<'a> {
                 let (object, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 self.emit_write_barrier(node, object, value);
             }
+            Kind::ElementWriteBarrier => {
+                let (base, index, value) =
+                    (Self::gp(input(0)), Self::gp(input(1)), Self::gp(input(2)));
+                self.emit_element_write_barrier(node, base, index, value);
+            }
             Kind::Generic { pc, registers } => {
                 let (pc, registers) = (*pc, registers.clone());
                 self.emit_generic(node, pc, &registers)?;
+            }
+            Kind::CallJs {
+                pc,
+                plan,
+                construct,
+            } => {
+                let (pc, plan, construct) = (*pc, *plan, *construct);
+                self.emit_call_js(node, pc, plan, construct)?;
             }
             other => {
                 return Err(Unsupported::OperandShape(node_name(other)));
             }
         }
         Ok(())
+    }
+
+    /// `X(destination)` = the tagged boolean of `X(a) === X(b)` under
+    /// `condition` (`Equal` for `===`, `NotEqual` for `!==`). Numbers compare
+    /// by value, identical words are equal, two cells of one string or BigInt
+    /// type compare by content through the leaf probe, and anything else
+    /// differs. Reads both inputs before it writes the result.
+    fn emit_strict_equal(
+        &mut self,
+        node: NodeId,
+        [a, b]: [u8; 2],
+        double: u8,
+        destination: u8,
+        condition: Condition,
+    ) {
+        let lhs_non_number = self.ops.new_dynamic_label();
+        let a_int = self.ops.new_dynamic_label();
+        let a_done = self.ops.new_dynamic_label();
+        let b_int = self.ops.new_dynamic_label();
+        let b_done = self.ops.new_dynamic_label();
+        let cells = self.ops.new_dynamic_label();
+        let leaf = self.ops.new_dynamic_label();
+        let equal = self.ops.new_dynamic_label();
+        let differ = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.load_immediate(16, NUMBER_TAG);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(a), x16
+            ; b.eq =>lhs_non_number
+            ; tst X(b), x16
+            ; b.eq =>differ
+            // Two Numbers: compare their values; NaN is unordered.
+            ; cmp X(a), x16
+            ; b.hs =>a_int
+        );
+        self.load_immediate(17, DOUBLE_OFFSET);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub x17, X(a), x17
+            ; fmov d31, x17
+            ; b =>a_done
+            ; =>a_int
+            ; scvtf d31, W(a)
+            ; =>a_done
+            ; cmp X(b), x16
+            ; b.hs =>b_int
+        );
+        self.load_immediate(17, DOUBLE_OFFSET);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub x17, X(b), x17
+            ; fmov D(double), x17
+            ; b =>b_done
+            ; =>b_int
+            ; scvtf D(double), W(b)
+            ; =>b_done
+            ; fcmp d31, D(double)
+        );
+        self.emit_cset_bool(destination, condition, true);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b =>done
+            ; =>lhs_non_number
+            ; tst X(b), x16
+            ; b.ne =>differ
+        );
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(a), x16
+            ; b.eq =>cells
+            ; tst X(b), x16
+            ; b.eq =>cells
+            // Two immediates: identity.
+            ; cmp X(a), X(b)
+            ; b.eq =>equal
+            ; b =>differ
+            ; =>cells
+            ; cmp X(a), X(b)
+            ; b.eq =>equal
+            // A cell differs from an immediate, and two cells of different
+            // types, or of a type compared by identity, differ.
+            ; tst X(a), x16
+            ; b.ne =>differ
+            ; tst X(b), x16
+            ; b.ne =>differ
+            ; ldrb w16, [X(a)]
+            ; ldrb w17, [X(b)]
+            ; cmp w16, w17
+            ; b.ne =>differ
+            ; cmp w16, u32::from(otter_vm::string::JS_STRING_BODY_TYPE_TAG)
+            ; b.eq =>leaf
+            ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
+            ; b.eq =>leaf
+            ; =>differ
+        );
+        let (when_equal, when_differ) = if condition == Condition::Equal {
+            (VALUE_TRUE, VALUE_FALSE)
+        } else {
+            (VALUE_FALSE, VALUE_TRUE)
+        };
+        self.load_immediate(destination, when_differ);
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>equal);
+        self.load_immediate(destination, when_equal);
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        let live = self.allocation.node(node).live_registers.clone();
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>leaf);
+                let saved = codegen.emit_save_registers(&live);
+                // The probe reads two string or BigInt bodies and allocates
+                // nothing; its only miss is a null heap, which generated
+                // code never passes.
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x16, X(a)
+                    ; mov x17, X(b)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    ; mov x1, x16
+                    ; mov x2, x17
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_STRICT_EQ_LEAF),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; cmp x16, VALUE_TRUE as u32
+                    ; b.eq =>equal
+                    ; b =>differ
+                );
+            }));
     }
 
     /// `X(destination)` = the tagged boolean of the flags under `condition`.
@@ -1258,6 +1691,286 @@ impl<'a> Codegen<'a> {
 
     /// The generational barrier for storing `X(value)` into `X(object)`. The
     /// slow path preserves every live register itself.
+    /// Branch to `exit` unless the body word `guard` names holds its
+    /// expected value.
+    fn emit_body_guard(&mut self, receiver: u8, guard: JitBodyGuard, exit: DynamicLabel) {
+        let byte = guard.byte;
+        match guard.width {
+            JitGuardWidth::Byte => {
+                dynasm!(self.ops ; .arch aarch64 ; ldrb w17, [X(receiver), byte])
+            }
+            JitGuardWidth::Word32 => {
+                dynasm!(self.ops ; .arch aarch64 ; ldr w17, [X(receiver), byte])
+            }
+            JitGuardWidth::Word64 => {
+                dynasm!(self.ops ; .arch aarch64 ; ldr x17, [X(receiver), byte])
+            }
+        }
+        if guard.expect == 0 {
+            dynasm!(self.ops ; .arch aarch64 ; cmp x17, #0 ; b.ne =>exit);
+        } else if guard.expect < 4096 {
+            dynasm!(self.ops ; .arch aarch64 ; cmp x17, guard.expect ; b.ne =>exit);
+        } else {
+            self.load_immediate(16, u64::from(guard.expect));
+            dynasm!(self.ops ; .arch aarch64 ; cmp x17, x16 ; b.ne =>exit);
+        }
+    }
+
+    /// Set the flags `ne` exactly when the hole bitmap of the numeric storage
+    /// at `X(base)` marks `W(index)`. Clobbers `x16`, `x17`.
+    fn emit_hole_bit(&mut self, holes: JitHoleBitmap, base: u8, index: u8) {
+        let capacity = holes.capacity_byte;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldur w16, [X(base), capacity]
+            ; add x16, X(base), x16, lsl #3
+            ; lsr w17, W(index), #6
+            ; ldr x16, [x16, x17, lsl #3]
+            // The shift reads the index's low six bits: its bit in the word.
+            ; lsr x16, x16, X(index)
+            ; tst x16, #1
+        );
+    }
+
+    /// The double element at `[X(base) + W(index) << 3]` boxed into
+    /// `X(destination)`, or `undefined` for a hole while the array-index
+    /// protector holds.
+    fn emit_load_holey_float64(
+        &mut self,
+        node: NodeId,
+        holes: JitHoleBitmap,
+        [base, index]: [u8; 2],
+        double: u8,
+        destination: u8,
+    ) {
+        let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+        let hole = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.emit_hole_bit(holes, base, index);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b.ne =>hole
+            ; ldr D(double), [X(base), W(index), uxtw #3]
+        );
+        self.emit_box_float64(double, destination);
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; =>hole
+                    ; ldr x16, [x20, THREAD_OFFSET]
+                    ; ldr x16, [x16, ARRAY_INDEX_PROTECTOR]
+                    ; ldrb w16, [x16]
+                    ; cbnz w16, =>exit
+                );
+                codegen.load_immediate(destination, VALUE_UNDEFINED);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
+    }
+
+    /// The element at `[X(base) + W(index) << stride]` into `result`.
+    fn emit_load_element(
+        &mut self,
+        node: NodeId,
+        element: JitElementRepr,
+        base: u8,
+        index: u8,
+        result: Location,
+    ) {
+        use JitElementRepr as E;
+        match element {
+            E::Boxed => {
+                let destination = Self::gp(result);
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                let hole = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [X(base), W(index), uxtw #3]);
+                self.load_immediate(17, VALUE_HOLE);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp x16, x17
+                    ; b.eq =>hole
+                    ; mov X(destination), x16
+                    ; =>done
+                );
+                // A hole of a plain array reads `undefined` while no indexed
+                // property exists on the realm's element prototypes and no
+                // indexed accessor exists anywhere.
+                self.deferred
+                    .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                        dynasm!(codegen.ops
+                            ; .arch aarch64
+                            ; =>hole
+                            ; ldr x16, [x20, THREAD_OFFSET]
+                            ; ldr x16, [x16, ARRAY_INDEX_PROTECTOR]
+                            ; ldrb w16, [x16]
+                            ; cbnz w16, =>exit
+                        );
+                        codegen.load_immediate(destination, VALUE_UNDEFINED);
+                        dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+                    }));
+            }
+            E::Int8 => {
+                let destination = Self::gp(result);
+                dynasm!(self.ops ; .arch aarch64 ; ldrsb W(destination), [X(base), W(index), uxtw]);
+            }
+            E::Uint8 | E::Uint8Clamped => {
+                let destination = Self::gp(result);
+                dynasm!(self.ops ; .arch aarch64 ; ldrb W(destination), [X(base), W(index), uxtw]);
+            }
+            E::Int16 => {
+                let destination = Self::gp(result);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldrsh W(destination), [X(base), W(index), uxtw #1]
+                );
+            }
+            E::Uint16 => {
+                let destination = Self::gp(result);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldrh W(destination), [X(base), W(index), uxtw #1]
+                );
+            }
+            E::Int32 => {
+                let destination = Self::gp(result);
+                dynasm!(self.ops ; .arch aarch64 ; ldr W(destination), [X(base), W(index), uxtw #2]);
+            }
+            E::Uint32 => {
+                let destination = Self::gp(result);
+                let exit = self.eager_exit(node, DeoptReason::LostPrecision);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr w16, [X(base), W(index), uxtw #2]
+                    ; cmp w16, #0
+                    ; b.lt =>exit
+                    ; mov W(destination), w16
+                );
+            }
+            E::Float32 => {
+                let destination = Self::fp(result);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr s31, [X(base), W(index), uxtw #2]
+                    ; fcvt D(destination), s31
+                );
+            }
+            E::Float64 => {
+                let destination = Self::fp(result);
+                dynasm!(self.ops ; .arch aarch64 ; ldr D(destination), [X(base), W(index), uxtw #3]);
+            }
+        }
+    }
+
+    /// Store `value` at `[X(base) + W(index) << stride]`; the builder already
+    /// converted it to the element's representation.
+    fn emit_store_element(
+        &mut self,
+        element: JitElementRepr,
+        base: u8,
+        index: u8,
+        value: Location,
+    ) -> Result<(), Unsupported> {
+        use JitElementRepr as E;
+        match (element, value) {
+            (E::Boxed, Location::Gp(value)) => {
+                dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(base), W(index), uxtw #3]);
+            }
+            (E::Int8 | E::Uint8, Location::Gp(value)) => {
+                dynasm!(self.ops ; .arch aarch64 ; strb W(value), [X(base), W(index), uxtw]);
+            }
+            (E::Int16 | E::Uint16, Location::Gp(value)) => {
+                dynasm!(self.ops ; .arch aarch64 ; strh W(value), [X(base), W(index), uxtw #1]);
+            }
+            (E::Int32 | E::Uint32, Location::Gp(value)) => {
+                dynasm!(self.ops ; .arch aarch64 ; str W(value), [X(base), W(index), uxtw #2]);
+            }
+            (E::Uint8Clamped, Location::Gp(value)) => dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp WSP(value), #0
+                ; csel w16, wzr, W(value), lt
+                ; mov w17, #255
+                ; cmp w16, w17
+                ; csel w16, w17, w16, gt
+                ; strb w16, [X(base), W(index), uxtw]
+            ),
+            // §7.1.12 ToUint8Clamp of a double: round half to even, NaN and
+            // negatives to 0, saturated to 255.
+            (E::Uint8Clamped, Location::Fp(value)) => dynasm!(self.ops
+                ; .arch aarch64
+                ; fcvtnu w16, D(value)
+                ; mov w17, #255
+                ; cmp w16, w17
+                ; csel w16, w17, w16, hi
+                ; strb w16, [X(base), W(index), uxtw]
+            ),
+            (E::Float32, Location::Fp(value)) => dynasm!(self.ops
+                ; .arch aarch64
+                ; fcvt s31, D(value)
+                ; str s31, [X(base), W(index), uxtw #2]
+            ),
+            (E::Float64, Location::Fp(value)) => {
+                dynasm!(self.ops ; .arch aarch64 ; str D(value), [X(base), W(index), uxtw #3]);
+            }
+            _ => return Err(Unsupported::OperandShape("graph element store operand")),
+        }
+        Ok(())
+    }
+
+    /// The barrier after a tagged element store: a non-cell needs nothing;
+    /// a cell while marking, or a young cell, reaches the slab barrier, which
+    /// marks the slot dirty and remembers the slab.
+    fn emit_element_write_barrier(&mut self, node: NodeId, base: u8, index: u8, value: u8) {
+        let flags_byte = self.view.gc_barrier.header_flags_byte;
+        let young = self.view.gc_barrier.young_flag;
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(value), x16
+            ; b.ne =>done
+            ; ldr x16, [x20, THREAD_OFFSET]
+            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+            ; ldrb w16, [x16]
+            ; cbnz w16, =>slow
+            ; ldrb w16, [X(value), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne =>slow
+            ; =>done
+        );
+        let live = self.allocation.node(node).live_registers.clone();
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                // The operands may sit in any argument register: park them
+                // before the arguments are written.
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; stp X(base), X(index), [sp, #-16]!
+                    ; mov x17, X(value)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    ; ldp x1, x2, [sp], #16
+                    ; mov w2, w2
+                    ; mov x3, x17
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::ELEMENT_WRITE_BARRIER_MUTATING.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_ELEMENT_WRITE_BARRIER),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
+    }
+
     fn emit_write_barrier(&mut self, node: NodeId, object: u8, value: u8) {
         let flags_byte = self.view.gc_barrier.header_flags_byte;
         let young = self.view.gc_barrier.young_flag;
@@ -1366,34 +2079,183 @@ impl<'a> Codegen<'a> {
     /// Run the baseline operation of the instruction at `pc` on the frame
     /// window. Every allocatable register is free here (a generic node is a
     /// call); its inputs are stored into their window registers first.
-    fn emit_generic(
+    /// Name, in the frame record, the safepoint that roots `slots` while the
+    /// next call runs: the collector traces exactly those tagged slots.
+    fn stamp_safepoint(&mut self, slots: Vec<u32>) {
+        let id = match self.site_ids.get(&slots) {
+            Some(&id) => id,
+            None => {
+                let id = SLOT_SAFEPOINT - 1 - self.site_records.len() as abi::SafepointId;
+                self.site_records.push(SafepointRecord {
+                    id,
+                    frame_state: NO_FRAME_STATE,
+                    tagged_locations: slots
+                        .iter()
+                        .map(|&index| TaggedLocation {
+                            kind: TaggedLocationKind::SpillSlot,
+                            index: index as u16,
+                        })
+                        .collect(),
+                    inline_frames: Box::new([]),
+                    call_pc: NO_CALL_PC,
+                });
+                self.site_ids.insert(slots, id);
+                id
+            }
+        };
+        self.load_immediate(16, u64::from(id));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; str w16, [x21, abi::NATIVE_FRAME_CALL_SITE_OFFSET]
+        );
+    }
+
+    /// Stamp the safepoint of a call node: the tagged slots of every value
+    /// live across it.
+    fn stamp_node_safepoint(&mut self, node: NodeId) {
+        let slots = self
+            .allocation
+            .node(node)
+            .gc_roots
+            .clone()
+            .expect("a call node has its roots");
+        self.stamp_safepoint(slots);
+    }
+
+    /// `[[Call]]` of the callee in `x1` (its `[[Construct]]` with itself as
+    /// `new.target` when `construct`), the node's other inputs its
+    /// arguments, with the result in `x0`. The actual span is pushed first,
+    /// so the identity proof's scratch cannot overwrite an argument; a callee
+    /// the proof refuses takes the generic entry with the same span. A callee
+    /// that retired itself for a tail call it staged returns `Continue`, and
+    /// the staged call is entered in its place.
+    fn emit_call_js(
         &mut self,
         node: NodeId,
         pc: u32,
-        registers: &[u16],
+        plan: Option<otter_vm::jit::JitDirectCallPlan>,
+        construct: bool,
     ) -> Result<(), Unsupported> {
+        // `new.target` is the callee itself, already in `x1`.
+        let new_target = construct.then_some(1);
+        use crate::arm64::js_call::{CallTarget, emit_call, emit_enter_staged};
+        self.stamp_node_safepoint(node);
         self.load_immediate(16, u64::from(pc));
         dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
         let inputs = self.allocation.node(node).inputs.clone();
-        for (&register, &location) in registers.iter().zip(&inputs) {
-            let offset = u32::from(register) * 8;
-            let source = match location {
-                Location::Gp(source) => source,
-                other => {
-                    self.emit_move(other, Location::Gp(16));
-                    16
-                }
-            };
-            if offset <= 32760 {
-                dynasm!(self.ops ; .arch aarch64 ; str X(source), [x19, offset]);
-            } else {
-                self.load_immediate(17, u64::from(offset));
-                dynasm!(self.ops ; .arch aarch64 ; str X(source), [x19, x17]);
-            }
+        let arguments = &inputs[1..];
+        let count = u32::try_from(arguments.len())
+            .map_err(|_| Unsupported::OperandShape("call actual count"))?;
+        let pushed = plan.map_or(arguments.len(), |plan| {
+            arguments.len().max(usize::from(plan.param_count))
+        });
+        let bytes = self.emit_push_actuals(arguments, pushed)?;
+        let generic = self.ops.new_dynamic_label();
+        let returned = self.ops.new_dynamic_label();
+        if let Some(plan) = plan {
+            dynasm!(self.ops ; .arch aarch64 ; mov x9, x1);
+            crate::arm64::inline_guard::emit_cached_identity(
+                &mut self.ops,
+                &mut self.relocations,
+                self.view,
+                plan,
+                pc,
+                generic,
+            );
+            emit_call(
+                &mut self.ops,
+                &mut self.relocations,
+                self.transitions,
+                20,
+                1,
+                None,
+                new_target,
+                count,
+                CallTarget::Known {
+                    entry_cell: plan.entry_cell,
+                    function_id: plan.function_id,
+                },
+            );
+            dynasm!(self.ops ; .arch aarch64 ; b =>returned);
         }
-        // A throw the frame may catch rebuilds the interpreter frame first;
-        // the interpreter then enters the handler.
-        let (threw, committed_throw) = if self.in_exception_region(pc) {
+        dynasm!(self.ops ; .arch aarch64 ; =>generic);
+        emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.transitions,
+            20,
+            1,
+            None,
+            new_target,
+            count,
+            CallTarget::Generic,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; =>returned);
+        self.emit_pop_actuals(bytes);
+        let (threw, committed_throw) = self.throw_targets(node, pc);
+        let threw = self.cond_target(threw);
+        let committed_throw = self.cond_target(committed_throw);
+        let completion = self.ops.new_dynamic_label();
+        let error = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>completion
+            ; cbz x1, =>done
+            ; cmp x1, abi::NativeResultStatus::Continue as u32
+            ; b.ne =>error
+        );
+        emit_enter_staged(&mut self.ops, &mut self.relocations, self.transitions, 20);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b =>completion
+            ; =>error
+            ; cmp x1, abi::NativeResultStatus::Throw as u32
+            ; b.eq =>committed_throw
+            ; b =>threw
+            ; =>done
+        );
+        Ok(())
+    }
+
+    /// Reserve an actual span of `pushed` words below `sp` and fill it from
+    /// `arguments`, padding with `undefined`. Returns the reserved bytes.
+    fn emit_push_actuals(
+        &mut self,
+        arguments: &[Location],
+        pushed: usize,
+    ) -> Result<u32, Unsupported> {
+        let bytes = crate::call_linkage::pushed_argument_bytes(pushed)?;
+        if bytes == 0 {
+            return Ok(0);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; sub sp, sp, bytes);
+        self.sp_delta += bytes;
+        for index in 0..pushed {
+            match arguments.get(index) {
+                Some(&location) => self.emit_move(location, Location::Gp(16)),
+                None => self.load_immediate(16, VALUE_UNDEFINED),
+            }
+            let offset = (index * 8) as u32;
+            dynasm!(self.ops ; .arch aarch64 ; str x16, [sp, offset]);
+        }
+        Ok(bytes)
+    }
+
+    /// Release a span [`Self::emit_push_actuals`] reserved.
+    fn emit_pop_actuals(&mut self, bytes: u32) {
+        if bytes != 0 {
+            dynasm!(self.ops ; .arch aarch64 ; add sp, sp, bytes);
+            self.sp_delta -= bytes;
+        }
+    }
+
+    /// Where a throw at `node` goes: the shared throw paths, or, inside a
+    /// region the frame may catch, paths that first rebuild the interpreter
+    /// frame so the interpreter enters the handler. The first label takes a
+    /// parked error, the second an exception in `x0`.
+    fn throw_targets(&mut self, node: NodeId, pc: u32) -> (DynamicLabel, DynamicLabel) {
+        if self.in_exception_region(pc) {
             let index = self.exit_index(node, ExitReason::RuntimeTransition, ExitAction::Resume);
             let threw = self.ops.new_dynamic_label();
             let committed_throw = self.ops.new_dynamic_label();
@@ -1419,7 +2281,36 @@ impl<'a> Codegen<'a> {
             (threw, committed_throw)
         } else {
             (self.threw, self.committed_throw)
-        };
+        }
+    }
+
+    fn emit_generic(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        registers: &[u16],
+    ) -> Result<(), Unsupported> {
+        self.stamp_node_safepoint(node);
+        self.load_immediate(16, u64::from(pc));
+        dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
+        let inputs = self.allocation.node(node).inputs.clone();
+        for (&register, &location) in registers.iter().zip(&inputs) {
+            let offset = u32::from(register) * 8;
+            let source = match location {
+                Location::Gp(source) => source,
+                other => {
+                    self.emit_move(other, Location::Gp(16));
+                    16
+                }
+            };
+            if offset <= 32760 {
+                dynasm!(self.ops ; .arch aarch64 ; str X(source), [x19, offset]);
+            } else {
+                self.load_immediate(17, u64::from(offset));
+                dynasm!(self.ops ; .arch aarch64 ; str X(source), [x19, x17]);
+            }
+        }
+        let (threw, committed_throw) = self.throw_targets(node, pc);
         let exit = |codegen: &mut Self, reason: ExitReason, action: ExitAction| {
             codegen.typed_exit(node, reason, action)
         };
@@ -1611,6 +2502,16 @@ impl<'a> Codegen<'a> {
                             ; b.eq =>true_target
                         );
                     }
+                    BranchKind::Truthy
+                        if self.graph.node(data.inputs[0]).kind.produces_boolean() =>
+                    {
+                        let a = Self::gp(allocation.inputs[0]);
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp XSP(a), VALUE_TRUE as u32
+                            ; b.eq =>true_target
+                        );
+                    }
                     BranchKind::Truthy => {
                         let a = Self::gp(allocation.inputs[0]);
                         self.emit_truthy_branch(control, a, true_label, false_label);
@@ -1644,6 +2545,76 @@ impl<'a> Codegen<'a> {
             (Condition::Greater, _) => dynasm!(self.ops ; .arch aarch64 ; b.gt =>target),
             (Condition::GreaterEqual, _) => dynasm!(self.ops ; .arch aarch64 ; b.ge =>target),
         }
+    }
+
+    /// `X(destination)` = the tagged boolean `ToBoolean(X(value))`, negated
+    /// for `!`: immediates and int32 inline, every other value through the
+    /// VM's leaf predicate with live registers saved.
+    fn emit_to_boolean(&mut self, node: NodeId, value: u8, destination: u8, negate: bool) {
+        let truthy = self.ops.new_dynamic_label();
+        let falsy = self.ops.new_dynamic_label();
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let not_int = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp XSP(value), VALUE_TRUE as u32
+            ; b.eq =>truthy
+            ; cmp XSP(value), VALUE_FALSE as u32
+            ; b.eq =>falsy
+            ; cmp XSP(value), VALUE_UNDEFINED as u32
+            ; b.eq =>falsy
+            ; cmp XSP(value), VALUE_NULL as u32
+            ; b.eq =>falsy
+        );
+        self.load_immediate(16, NUMBER_TAG);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp X(value), x16
+            ; b.lo =>not_int
+            ; cmp WSP(value), #0
+            ; b.eq =>falsy
+            ; b =>truthy
+            ; =>not_int
+            ; b =>slow
+        );
+        let (when_truthy, when_falsy) = if negate {
+            (VALUE_FALSE, VALUE_TRUE)
+        } else {
+            (VALUE_TRUE, VALUE_FALSE)
+        };
+        dynasm!(self.ops ; .arch aarch64 ; =>truthy);
+        self.load_immediate(destination, when_truthy);
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>falsy);
+        self.load_immediate(destination, when_falsy);
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        let live = self.allocation.node(node).live_registers.clone();
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x1, X(value)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_TO_BOOLEAN_LEAF),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; cmp x16, VALUE_TRUE as u32
+                    ; b.eq =>truthy
+                    ; b =>falsy
+                );
+            }));
     }
 
     /// Branch on `ToBoolean(X(value))`: immediates and int32 inline, every
@@ -1766,10 +2737,22 @@ impl<'a> Codegen<'a> {
                 let restore_exit = codegen.ops.new_dynamic_label();
                 let restore_threw = codegen.ops.new_dynamic_label();
                 dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let mut roots = codegen
+                    .allocation
+                    .node(control)
+                    .gc_roots
+                    .clone()
+                    .expect("a back edge has its roots");
                 for &(location, repr) in &live {
                     let slot = codegen.slots.snapshot_slot(location, repr);
                     codegen.emit_move(location, slot);
+                    if let Location::TaggedSlot(index) = slot {
+                        roots.push(index);
+                    }
                 }
+                roots.sort_unstable();
+                roots.dedup();
+                codegen.stamp_safepoint(roots);
                 codegen.load_immediate(16, u64::from(header_pc));
                 dynasm!(codegen.ops
                     ; .arch aarch64
@@ -2026,10 +3009,7 @@ pub(crate) fn deopt_slots(
 
 fn node_name(kind: &Kind) -> &'static str {
     match kind {
-        Kind::CallJs { .. } => "graph CallJs",
         Kind::Generic { .. } => "graph Generic",
-        Kind::Float64Mod => "graph Float64Mod",
-        Kind::ToBoolean | Kind::LogicalNot => "graph ToBoolean",
         _ => "graph node",
     }
 }

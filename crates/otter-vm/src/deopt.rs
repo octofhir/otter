@@ -186,7 +186,7 @@ impl std::error::Error for DeoptVerifyError {}
 /// general register, a double in an FP register); the deopt record names the
 /// representation so the exit re-tags it into the boxed `Value` the
 /// interpreter frame expects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeoptRepr {
     /// Already a full 8-byte tagged `Value`; the raw bits are the value.
     Tagged,
@@ -220,7 +220,7 @@ impl DeoptRepr {
 }
 
 /// Where a value lives at a deopt point, relative to the optimized frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeoptLocation {
     /// A machine register, by the optimizing tier's register id.
     Register(u16),
@@ -238,7 +238,7 @@ pub enum DeoptLocation {
 pub struct VirtualObjectId(pub u32);
 
 /// Allocation semantics retained for one scalar-replaced object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VirtualObjectKind {
     /// Ordinary extensible object with `%Object.prototype%` and no own fields.
@@ -248,7 +248,7 @@ pub enum VirtualObjectKind {
 }
 
 /// One virtual allocation embedded in the authoritative frame state.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualObject<Slot> {
     /// Dense materialization identity and order.
@@ -273,7 +273,7 @@ pub enum VirtualMaterializationValue {
 /// A [`DeoptLocation::VirtualObject`] names a recipe in the same
 /// [`FrameState`]; no separate materialization table or emitter-owned state
 /// exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeoptSlot {
     /// Where the value lives or which virtual recipe materializes it.
     pub location: DeoptLocation,
@@ -315,7 +315,7 @@ impl DeoptSlot {
 /// interpreter a complete set of frames rather than re-running the caller's
 /// call instruction, so the binding a call would have established has to be
 /// described here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeoptFrameEntry<Slot = DeoptSlot> {
     /// Caller register the frame's return value is written to.
@@ -333,7 +333,7 @@ pub struct DeoptFrameEntry<Slot = DeoptSlot> {
 /// Rebuilding it means materializing each [`DeoptSlot`] (read the raw bits at
 /// its location, [`DeoptRepr::reconstitute`]) into the interpreter register of
 /// the same index, and resuming that frame at `byte_pc`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeoptFrame<Slot = DeoptSlot> {
     /// VM function id whose body this frame runs.
@@ -359,7 +359,7 @@ pub struct DeoptFrame<Slot = DeoptSlot> {
 /// stands it on the call instruction until the callee returns, and the
 /// register the call writes is left to the ordinary return protocol rather
 /// than restored here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FrameState<Slot = DeoptSlot> {
     /// Frames to rebuild, outermost first and innermost last. Never empty.
     pub frames: Box<[DeoptFrame<Slot>]>,

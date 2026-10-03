@@ -29,6 +29,7 @@
 //! - [`super::builder`] — builds the graph from bytecode and feedback.
 //! - [`super::regalloc`] — assigns locations from [`Constraints`].
 
+use otter_vm::jit::{JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap};
 use smallvec::SmallVec;
 
 /// Dense node index.
@@ -104,6 +105,8 @@ pub(crate) enum DeoptReason {
     MinusZero,
     /// An index was outside the speculated bounds.
     OutOfBounds,
+    /// An element key was not an integral Number in the int32 range.
+    InvalidIndex,
     /// A double did not convert exactly to int32.
     LostPrecision,
     /// The site had never executed when this code was compiled.
@@ -146,6 +149,9 @@ pub(crate) enum Kind {
     LoadThis,
     /// The callee (SELF) from the record.
     LoadClosure,
+    /// The primitive string constant of the `LoadString` at this byte PC,
+    /// read from its isolate-owned cell.
+    LoadStringConstant(u32),
     /// `new.target` from the record.
     LoadNewTarget,
     /// Read a window-resident register.
@@ -207,8 +213,20 @@ pub(crate) enum Kind {
     TruncateFloat64ToInt32,
     /// Exact double to int32; eager deopt when not exact or -0.
     CheckedFloat64ToInt32,
+    /// An element index from a tagged Number: an int32, or a double holding
+    /// an integer in the int32 range (`-0` is `0`). Eager deopt otherwise.
+    CheckedTaggedToIndex,
+    /// An element index from a double holding an integer in the int32 range
+    /// (`-0` is `0`). Eager deopt otherwise.
+    CheckedFloat64ToIndex,
     /// Strict equality of two tagged words producing a tagged boolean.
     TaggedEqual,
+    /// `input0 === input1` (or `!==` when `negate`) on any two tagged values,
+    /// producing a tagged boolean: numbers by value, strings and BigInts by
+    /// content through a leaf probe, everything else by identity.
+    StrictEqual {
+        negate: bool,
+    },
     /// `ToBoolean` producing a tagged boolean.
     ToBoolean,
     /// `!ToBoolean` producing a tagged boolean.
@@ -229,8 +247,27 @@ pub(crate) enum Kind {
     },
     /// Eager deopt unless input0 is exactly this tagged word.
     CheckValue(u64),
-    /// Eager deopt unless `0 <= input0 < input1` (both int32/word).
+    /// Eager deopt unless the int32 index input0 lies in `0..input1`, where
+    /// input1 is a `Word` element count.
     CheckBounds,
+    /// Eager deopt unless input0 is a heap cell of this body type whose
+    /// instance guards hold, whose storage kind is one of the two numeric
+    /// kinds for numeric storage that may have holes, and whose cached
+    /// element base is valid for a typed view: the indexed storage then has
+    /// the access's layout.
+    CheckElements {
+        type_tag: u8,
+        guards: [Option<JitBodyGuard>; 2],
+        holes: Option<JitHoleBitmap>,
+        /// For a typed view: the byte offset of its cached element base,
+        /// which must be non-null while no buffer was ever detached.
+        cached_base: Option<u32>,
+    },
+    /// Eager deopt if the boxed element at `input0 + input1 * 8` is a hole.
+    CheckElementPresent,
+    /// Eager deopt if the hole bitmap of numeric storage with element base
+    /// input0 marks index input1.
+    CheckHoleyElementPresent(JitHoleBitmap),
 
     // ---- Memory ----
     /// The base address of input0's named slots: in-object or slab.
@@ -244,14 +281,51 @@ pub(crate) enum Kind {
     StoreShape(u32),
     /// Generational write barrier for storing input1 into object input0.
     WriteBarrier,
+    /// Barrier for the tagged value input2 just stored at index input1 of the
+    /// ordinary-array element base input0: a young or marking-visible cell
+    /// marks the slot dirty and remembers the slab.
+    ElementWriteBarrier,
     /// Parent context of context input0.
     LoadContextParent,
+    /// The context closure input0 closes over, or `undefined` for a bare
+    /// function value.
+    LoadClosureContext,
+    /// The live element count of a proved indexed receiver input0, as a
+    /// `Word`.
+    LoadElementsLength {
+        byte: u32,
+        width: JitGuardWidth,
+    },
+    /// The element base of a proved receiver input0, a word at this byte
+    /// offset of its body.
+    LoadElementsBase(u32),
+    /// The element at `input0 + input1 << stride` in the element's
+    /// representation: a tagged value (eager deopt on a hole), an int32, or a
+    /// double. A `Uint32` element deopts eagerly above `i32::MAX`.
+    LoadElement(JitElementRepr),
+    /// A `Uint32` element as a double.
+    LoadElementUint32ToFloat64,
+    /// A double element of holey numeric storage, tagged: a hole reads
+    /// `undefined` while the array-index protector holds and deopts
+    /// otherwise.
+    LoadHoleyFloat64Element(JitHoleBitmap),
+    /// Store input2 at `input0 + input1 << stride`: tagged into a boxed
+    /// element, an int32's low bits into an integer element (clamped for
+    /// `Uint8Clamped`, which also takes a double), a double into a floating
+    /// element.
+    StoreElement(JitElementRepr),
 
     // ---- Calls ----
-    /// The JavaScript call ABI: inputs `callee, receiver, new.target,
-    /// args...`. Lazy deopt, may throw.
+    /// `[[Call]]` of input0 with `undefined` as receiver and the remaining
+    /// inputs as arguments, through the JavaScript call ABI, or with
+    /// `construct` its `[[Construct]]` with input0 as `new.target`. With a
+    /// `plan`, a callee proved to be the plan's function is entered through
+    /// its current generation; any other callee through the generic entry.
+    /// The bytecode instruction at `pc` is published while the callee runs.
     CallJs {
-        argc: u16,
+        pc: u32,
+        plan: Option<otter_vm::jit::JitDirectCallPlan>,
+        construct: bool,
     },
     /// The baseline operation for the bytecode instruction at `pc`, run on
     /// the frame window: input `i` is stored to window register
@@ -322,6 +396,19 @@ pub(crate) struct Constraints {
 }
 
 impl Kind {
+    /// Whether the node's tagged result is always `true` or `false`.
+    pub(crate) fn produces_boolean(&self) -> bool {
+        matches!(
+            self,
+            Self::Int32Compare(_)
+                | Self::Float64Compare(_)
+                | Self::TaggedEqual
+                | Self::StrictEqual { .. }
+                | Self::ToBoolean
+                | Self::LogicalNot
+        )
+    }
+
     pub(crate) fn is_constant(&self) -> bool {
         matches!(
             self,
@@ -349,6 +436,7 @@ impl Kind {
             | Self::InitialRegister(_)
             | Self::LoadThis
             | Self::LoadClosure
+            | Self::LoadStringConstant(_)
             | Self::LoadNewTarget
             | Self::LoadWindow(_)
             | Self::Phi
@@ -371,11 +459,23 @@ impl Kind {
             | Self::Int32ToFloat64
             | Self::TruncateFloat64ToInt32
             | Self::TaggedEqual
+            | Self::StrictEqual { .. }
             | Self::ToBoolean
             | Self::LogicalNot
             | Self::LoadSlotBase
             | Self::LoadTaggedField(_)
-            | Self::LoadContextParent => pure,
+            | Self::LoadContextParent
+            | Self::LoadClosureContext
+            | Self::LoadElementsLength { .. }
+            | Self::LoadElementsBase(_)
+            | Self::LoadElementUint32ToFloat64 => pure,
+            Self::LoadElement(element) => {
+                if matches!(element, JitElementRepr::Boxed | JitElementRepr::Uint32) {
+                    eager
+                } else {
+                    pure
+                }
+            }
             Self::Float64Mod => pure,
             Self::Int32Add
             | Self::Int32Sub
@@ -387,15 +487,23 @@ impl Kind {
             | Self::CheckedTaggedToInt32
             | Self::CheckedTaggedToFloat64
             | Self::CheckedFloat64ToInt32
+            | Self::CheckedTaggedToIndex
+            | Self::CheckedFloat64ToIndex
             | Self::CheckHeapObject
             | Self::CheckNumber
             | Self::CheckShapes { .. }
             | Self::CheckValue(_)
-            | Self::CheckBounds => eager,
+            | Self::CheckBounds
+            | Self::CheckElements { .. }
+            | Self::CheckElementPresent
+            | Self::CheckHoleyElementPresent(_)
+            | Self::LoadHoleyFloat64Element(_) => eager,
             Self::StoreWindow(_)
             | Self::StoreTaggedField(_)
             | Self::StoreShape(_)
-            | Self::WriteBarrier => Properties {
+            | Self::StoreElement(_)
+            | Self::WriteBarrier
+            | Self::ElementWriteBarrier => Properties {
                 writes: true,
                 effectful: true,
                 ..Properties::default()
@@ -443,6 +551,7 @@ impl Kind {
             Self::InitialRegister(_)
             | Self::LoadThis
             | Self::LoadClosure
+            | Self::LoadStringConstant(_)
             | Self::LoadNewTarget
             | Self::LoadWindow(_) => simple(0, ResultPolicy::Register),
             Self::StoreWindow(_) => simple(1, ResultPolicy::None),
@@ -463,12 +572,29 @@ impl Kind {
             | Self::Float64Div
             | Self::Float64Compare(_)
             | Self::TaggedEqual
-            | Self::CheckBounds => simple(2, ResultPolicy::Register),
+            | Self::LoadElement(_)
+            | Self::LoadElementUint32ToFloat64 => simple(2, ResultPolicy::Register),
+            Self::LoadHoleyFloat64Element(_) => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 1,
+            },
+            Self::CheckBounds | Self::CheckElementPresent | Self::CheckHoleyElementPresent(_) => {
+                simple(2, ResultPolicy::None)
+            }
+            Self::StoreElement(_) | Self::ElementWriteBarrier => simple(3, ResultPolicy::None),
             Self::Int32Div | Self::Int32Mod => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 1,
                 fp_temps: 0,
+            },
+            Self::StrictEqual { .. } => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 1,
             },
             Self::Float64Mod => Constraints {
                 inputs: registers(2),
@@ -484,27 +610,32 @@ impl Kind {
             | Self::Int32ToFloat64
             | Self::TruncateFloat64ToInt32
             | Self::CheckedFloat64ToInt32
+            | Self::CheckedFloat64ToIndex
             | Self::LoadSlotBase
             | Self::LoadTaggedField(_)
-            | Self::LoadContextParent => simple(1, ResultPolicy::Register),
-            Self::CheckedTaggedToFloat64 | Self::Float64ToTagged => Constraints {
-                inputs: registers(1),
-                result: ResultPolicy::Register,
-                gp_temps: 0,
-                fp_temps: 1,
-            },
+            | Self::LoadContextParent
+            | Self::LoadClosureContext
+            | Self::LoadElementsLength { .. }
+            | Self::LoadElementsBase(_) => simple(1, ResultPolicy::Register),
+            Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {
+                Constraints {
+                    inputs: registers(1),
+                    result: ResultPolicy::Register,
+                    gp_temps: 0,
+                    fp_temps: 1,
+                }
+            }
             Self::ToBoolean | Self::LogicalNot => simple(1, ResultPolicy::Register),
             Self::CheckHeapObject | Self::CheckNumber | Self::CheckValue(_) => {
                 simple(1, ResultPolicy::None)
             }
-            Self::CheckShapes { .. } => simple(1, ResultPolicy::None),
+            Self::CheckShapes { .. } | Self::CheckElements { .. } => simple(1, ResultPolicy::None),
             Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
             Self::StoreShape(_) => simple(1, ResultPolicy::None),
             Self::WriteBarrier => simple(2, ResultPolicy::None),
             Self::CallJs { .. } => {
-                let mut inputs: SmallVec<[InputPolicy; 4]> =
-                    smallvec::smallvec![FixedGp(1), FixedGp(2), FixedGp(3)];
-                inputs.extend((3..input_count).map(|_| Any));
+                let mut inputs: SmallVec<[InputPolicy; 4]> = smallvec::smallvec![FixedGp(1)];
+                inputs.extend((1..input_count).map(|_| Any));
                 Constraints {
                     inputs,
                     result: ResultPolicy::FixedGp(0),
@@ -542,6 +673,8 @@ pub(crate) struct Node {
     pub(crate) lazy: Option<FrameStateId>,
     /// Owning block; `None` for constants.
     pub(crate) block: Option<BlockId>,
+    /// The bytecode instruction this node was built for.
+    pub(crate) pc: u32,
 }
 
 /// One basic block.
@@ -578,6 +711,8 @@ pub(crate) struct Graph {
     pub(crate) blocks: Vec<Block>,
     pub(crate) frame_states: Vec<FrameState>,
     constants: rustc_hash::FxHashMap<(u8, u64), NodeId>,
+    /// The instruction new nodes are built for.
+    pub(crate) position: u32,
 }
 
 impl Graph {
@@ -623,6 +758,7 @@ impl Graph {
             eager: None,
             lazy: None,
             block: None,
+            pc: self.position,
         });
         id
     }

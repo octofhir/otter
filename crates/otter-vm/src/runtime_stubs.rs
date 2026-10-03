@@ -561,6 +561,12 @@ pub const WRITE_BARRIER_MUTATING: MutatingLeafStub2 = MutatingLeafStub2 {
     entry: write_barrier_mutating,
 };
 
+/// Callable ABI entry for the generated tagged element-store barrier.
+pub const ELEMENT_WRITE_BARRIER_MUTATING: MutatingLeafStub3 = MutatingLeafStub3 {
+    descriptor: crate::native_abi::STUB_ELEMENT_WRITE_BARRIER,
+    entry: element_write_barrier_mutating,
+};
+
 /// Callable ABI entry for in-place `Map.prototype.set`.
 pub const COLLECTION_MAP_SET_MUTATING: MutatingLeafStub3 = MutatingLeafStub3 {
     descriptor: STUB_COLLECTION_MAP_SET_MUTATING,
@@ -848,6 +854,9 @@ pub const fn mutating_leaf_stub2_by_id(id: RuntimeStubId) -> Option<MutatingLeaf
 pub const fn mutating_leaf_stub3_by_id(id: RuntimeStubId) -> Option<MutatingLeafStub3> {
     if id == STUB_COLLECTION_MAP_SET_MUTATING.id {
         return Some(COLLECTION_MAP_SET_MUTATING);
+    }
+    if id == crate::native_abi::STUB_ELEMENT_WRITE_BARRIER.id {
+        return Some(ELEMENT_WRITE_BARRIER_MUTATING);
     }
     None
 }
@@ -1818,6 +1827,32 @@ pub extern "C" fn write_barrier_mutating(
     // storing into, under the same guard that proved the receiver's class.
     unsafe {
         heap.record_write_at(parent_header as *mut otter_gc::header::GcHeader, &child);
+    }
+    NativeResultPair::success(Value::undefined())
+}
+
+/// Barrier for a tagged element store generated code made into an ordinary
+/// array's slab: `data` is the slab's element base, `index` the written slot.
+pub extern "C" fn element_write_barrier_mutating(
+    heap: *mut otter_gc::GcHeap,
+    data: u64,
+    index: u64,
+    child_bits: u64,
+) -> NativeResultPair {
+    let Some(heap) = heap_mut(heap) else {
+        return NativeResultPair::miss();
+    };
+    let child = Value::from_abi_bits(child_bits);
+    // SAFETY: the emitted store proved the receiver an ordinary array with a
+    // tagged dense prefix and `index` below its length, and read `data` from
+    // its cached element base with no allocation in between.
+    unsafe {
+        crate::array::elements::record_generated_write(
+            heap,
+            data as *mut u8,
+            index as usize,
+            &child,
+        );
     }
     NativeResultPair::success(Value::undefined())
 }
@@ -2823,7 +2858,7 @@ mod tests {
         }
 
         for value in [
-            Value::number_f64(7.0),
+            Value::number_f64(7.5),
             Value::undefined(),
             Value::boolean(true),
         ] {
@@ -3224,12 +3259,7 @@ mod tests {
         let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 26);
         let before = interp.gc_heap().stats();
 
-        for invalid in [
-            n(-1),
-            Value::number_f64(7.0),
-            Value::number_f64(1.5),
-            Value::undefined(),
-        ] {
+        for invalid in [n(-1), Value::number_f64(1.5), Value::undefined()] {
             let pair = ARRAY_CONSTRUCT_ALLOC
                 .invoke_raw(&mut ctx, 26, invalid.to_abi_bits(), slots[1], slots[2])
                 .expect("entry");

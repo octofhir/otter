@@ -172,6 +172,8 @@ pub(crate) struct Block {
 pub(crate) struct LoopInfo {
     /// Registers written anywhere inside the loop body.
     pub(crate) assigned: RegisterSet,
+    /// Every block of the loop body, the header included.
+    pub(crate) body: Vec<usize>,
 }
 
 /// Whole-function analysis.
@@ -447,6 +449,7 @@ impl Analysis {
                     blocks[successor].back_predecessors += 1;
                     loops.entry(successor).or_insert_with(|| LoopInfo {
                         assigned: RegisterSet::new(usize::from(register_count)),
+                        body: Vec::new(),
                     });
                 } else {
                     irreducible.insert(successor);
@@ -474,6 +477,7 @@ impl Analysis {
                 if !inside {
                     continue;
                 }
+                info.body.push(block);
                 for pc in blocks[block].start..blocks[block].end {
                     for &register in &instructions[pc as usize].writes {
                         info.assigned.insert(register);

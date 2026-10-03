@@ -79,6 +79,7 @@ const ELEMENT_GENERIC: u8 = 3;
 /// `ELEMENT_TYPED_BASE + kind` for the nine converted typed-array kinds
 /// (`Int8` = 0 … `Float64` = 8).
 const ELEMENT_TYPED_BASE: u8 = 4;
+const ELEMENT_DENSE_HOLEY_FLOAT64: u8 = 13;
 const ELEMENT_MASK: u8 = 0b0000_1111;
 
 const CALL_ATTEMPTED_SEEN: u8 = 1 << 4;
@@ -843,7 +844,8 @@ impl InstructionFeedback {
     }
 
     /// Record the receiver family observed at one `LoadElement` instruction.
-    /// A site that sees two families becomes permanently generic. Returns
+    /// Packed and holey numeric arrays merge into the holey family; a site
+    /// that sees any other two families becomes permanently generic. Returns
     /// `true` when the bounded family changes.
     pub fn record_element_family(&self, observed: crate::jit::JitElementFamily) -> bool {
         use crate::jit::JitElementFamily as Family;
@@ -857,6 +859,7 @@ impl InstructionFeedback {
             Family::Unseen => None,
             Family::DenseTagged => Some(ELEMENT_DENSE_TAGGED),
             Family::DenseFloat64 => Some(ELEMENT_DENSE_FLOAT64),
+            Family::DenseHoleyFloat64 => Some(ELEMENT_DENSE_HOLEY_FLOAT64),
             Family::Typed(kind) => Some(match crate::jit::JitElementRepr::for_typed_kind(kind) {
                 Some(_) => ELEMENT_TYPED_BASE + kind as u8,
                 None => ELEMENT_GENERIC,
@@ -871,6 +874,11 @@ impl InstructionFeedback {
                 (ELEMENT_UNSEEN, Some(observed)) => observed,
                 (_, None) => ELEMENT_GENERIC,
                 (value, Some(observed)) if value == observed => value,
+                // Numeric storage with holes generalizes the packed kind.
+                (ELEMENT_DENSE_FLOAT64, Some(ELEMENT_DENSE_HOLEY_FLOAT64))
+                | (ELEMENT_DENSE_HOLEY_FLOAT64, Some(ELEMENT_DENSE_FLOAT64)) => {
+                    ELEMENT_DENSE_HOLEY_FLOAT64
+                }
                 _ => ELEMENT_GENERIC,
             };
             if next_family == current {
@@ -896,6 +904,7 @@ impl InstructionFeedback {
         match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
             ELEMENT_DENSE_TAGGED => Family::DenseTagged,
             ELEMENT_DENSE_FLOAT64 => Family::DenseFloat64,
+            ELEMENT_DENSE_HOLEY_FLOAT64 => Family::DenseHoleyFloat64,
             ELEMENT_GENERIC => Family::Generic,
             code if (ELEMENT_TYPED_BASE..=ELEMENT_TYPED_BASE + 8).contains(&code) => {
                 crate::binary::TypedArrayKind::from_u32(u32::from(code - ELEMENT_TYPED_BASE))

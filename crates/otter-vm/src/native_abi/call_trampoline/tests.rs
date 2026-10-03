@@ -595,7 +595,12 @@ fn resumption_uses_the_published_frame_at_the_depth_limit() {
 }
 
 #[test]
-fn tail_call_after_resumption_replaces_the_logical_activation() {
+fn tail_call_from_a_resumed_record_returns_the_request_to_its_owner() {
+    // A tier request resumes a record whose native frame belongs to a
+    // generated caller; the resumed code then tail-calls. The trampoline must
+    // not replace a record it does not own: it hands the staged request back
+    // as `Continue`, so the owner retires the record and its caller enters
+    // the request.
     let mut registers = [Value::number_i32(10_000), Value::number_i32(41)];
     let mut frame = Frame::new(
         VmFrameHeader::interpreter(7, 2),
@@ -621,11 +626,16 @@ fn tail_call_after_resumption_replaces_the_logical_activation() {
         super::super::NativeFrameFlags::from_bits(super::super::NativeFrameFlags::TIER_ENTRY);
     assert_eq!(
         unsafe { call_trampoline(&mut ctx) },
-        NativeResultPair::success(registers[1])
+        NativeResultPair::continue_execution()
     );
     assert_eq!(ctx.native_frame, pointer);
-    assert_eq!(harness.entries, 10001);
-    assert_eq!(harness.max_js, 1);
+    assert!(
+        ctx.pending_call
+            .header
+            .flags
+            .contains(super::super::NativeFrameFlags::TAIL_CALL)
+    );
+    assert_eq!(harness.entries, 1);
     assert_eq!(harness.max_rust, 1);
     assert!(error.is_none());
 }

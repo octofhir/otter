@@ -55,7 +55,7 @@ impl Interpreter {
         };
         if !matches!(
             code_block.op(instruction),
-            Op::LoadElement | Op::StoreElement
+            Op::LoadElement | Op::StoreElement | Op::StoreElementStrict
         ) {
             return false;
         }

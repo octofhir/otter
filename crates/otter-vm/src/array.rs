@@ -340,6 +340,8 @@ pub(crate) const DENSE_ELEMENT_KIND_TAGGED: u32 = DenseElementKind::Tagged as u3
 
 /// Native guard literal for a hole-free unboxed-double dense prefix.
 pub(crate) const DENSE_ELEMENT_KIND_PACKED_DOUBLE: u32 = DenseElementKind::PackedDouble as u32;
+/// JIT-visible discriminant of numeric dense storage with holes.
+pub(crate) const DENSE_ELEMENT_KIND_HOLEY_DOUBLE: u32 = DenseElementKind::HoleyDouble as u32;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ArrayExoticSlots`].
 pub const ARRAY_EXOTIC_SLOTS_TYPE_TAG: u8 = 0x38;

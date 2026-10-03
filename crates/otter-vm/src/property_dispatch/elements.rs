@@ -28,12 +28,10 @@ impl Interpreter {
             return match crate::array::dense_element_kind(array, &self.gc_heap) {
                 crate::array::DenseElementKind::PackedDouble => Family::DenseFloat64,
                 crate::array::DenseElementKind::Tagged => Family::DenseTagged,
-                // Empty and holey numeric storage are transient layouts that
-                // no generated packed hit may consume. The feedback cell
-                // deliberately ignores Unseen until a complete packed prefix
-                // has been published.
-                crate::array::DenseElementKind::Empty
-                | crate::array::DenseElementKind::HoleyDouble => Family::Unseen,
+                crate::array::DenseElementKind::HoleyDouble => Family::DenseHoleyFloat64,
+                // An empty array is a transient construction layout. The
+                // feedback cell ignores Unseen until storage is published.
+                crate::array::DenseElementKind::Empty => Family::Unseen,
             };
         }
         match recv.as_typed_array(&self.gc_heap).map(|view| view.kind()) {

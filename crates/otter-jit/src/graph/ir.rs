@@ -175,6 +175,9 @@ pub(crate) enum Kind {
     Int32ShiftRight,
     /// Logical shift right whose result must fit int32; deopts otherwise.
     Int32ShiftRightLogical,
+    /// Logical shift right of int32 operands as a Float64: the unsigned
+    /// result needs no check.
+    Uint32ShiftRightToFloat64,
     /// Int32 compare producing a tagged boolean.
     Int32Compare(Condition),
 
@@ -355,6 +358,7 @@ impl Kind {
             | Self::Int32BitNot
             | Self::Int32ShiftLeft
             | Self::Int32ShiftRight
+            | Self::Uint32ShiftRightToFloat64
             | Self::Int32Compare(_)
             | Self::Float64Add
             | Self::Float64Sub
@@ -451,6 +455,7 @@ impl Kind {
             | Self::Int32ShiftLeft
             | Self::Int32ShiftRight
             | Self::Int32ShiftRightLogical
+            | Self::Uint32ShiftRightToFloat64
             | Self::Int32Compare(_)
             | Self::Float64Add
             | Self::Float64Sub

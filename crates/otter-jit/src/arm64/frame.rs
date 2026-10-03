@@ -126,6 +126,10 @@ pub(crate) struct ActivationExits {
 }
 
 /// Cold continuations of the call entry, each a `(cold, back)` pair.
+///
+/// The labels exist before either half is emitted: the continuations go
+/// ahead of the call entry, next to it, so its conditional branches reach
+/// them however large the body behind it grows.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CallEntryCold {
     overflow: DynamicLabel,
@@ -133,6 +137,24 @@ pub(crate) struct CallEntryCold {
     promote: (DynamicLabel, DynamicLabel),
     construct: Option<(DynamicLabel, DynamicLabel)>,
     prepare: Option<(DynamicLabel, DynamicLabel)>,
+}
+
+impl CallEntryCold {
+    /// The labels of the call entry of a function of `shape`.
+    pub(crate) fn new(ops: &mut Assembler, shape: EntryShape) -> Self {
+        let mut pair = || (ops.new_dynamic_label(), ops.new_dynamic_label());
+        let break_even = pair();
+        let promote = pair();
+        let construct = shape.base_constructor().then(&mut pair);
+        let prepare = shape.sloppy_receiver().then(&mut pair);
+        Self {
+            overflow: ops.new_dynamic_label(),
+            break_even,
+            promote,
+            construct,
+            prepare,
+        }
+    }
 }
 
 /// Save the frame registers and establish `x29`.
@@ -208,16 +230,23 @@ fn reservation(shape: EntryShape, spill: SpillArea) -> u32 {
 }
 
 /// Emit the call-ABI entry. It falls through into the body; its cold
-/// continuations are emitted by [`emit_call_entry_cold`].
+/// continuations, named by `cold`, are emitted by [`emit_call_entry_cold`]
+/// just before it.
 pub(crate) fn emit_call_entry(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     shape: EntryShape,
     spill: SpillArea,
-) -> (AssemblyOffset, CallEntryCold) {
+    cold: CallEntryCold,
+) -> AssemblyOffset {
     let start = ops.offset();
-    let overflow = ops.new_dynamic_label();
-    let break_even = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    let CallEntryCold {
+        overflow,
+        break_even,
+        promote,
+        construct,
+        prepare,
+    } = cold;
     let bytes = reservation(shape, spill);
     let window = u32::from(shape.register_count) * 8;
     emit_save(ops);
@@ -329,31 +358,17 @@ pub(crate) fn emit_call_entry(
     );
     emit_fill_window(ops, shape);
     dynasm!(ops ; .arch aarch64 ; str x21, [x20, NATIVE_FRAME_OFFSET]);
-    let construct = shape.base_constructor().then(|| {
-        let (cold, back) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    if let Some((cold, _)) = construct {
         dynasm!(ops ; .arch aarch64 ; cmp x3, VALUE_UNDEFINED as u32 ; b.ne =>cold);
-        (cold, back)
-    });
-    let prepare = shape.sloppy_receiver().then(|| {
-        let (cold, back) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    }
+    if let Some((cold, back)) = prepare {
         dynasm!(ops ; .arch aarch64 ; cbnz x5, =>cold ; =>back);
-        (cold, back)
-    });
+    }
     if let Some((_, back)) = construct {
         dynasm!(ops ; .arch aarch64 ; =>back);
     }
-    let promote = (ops.new_dynamic_label(), ops.new_dynamic_label());
     dynasm!(ops ; .arch aarch64 ; cbnz x6, =>promote.0 ; =>promote.1);
-    (
-        start,
-        CallEntryCold {
-            overflow,
-            break_even,
-            promote,
-            construct,
-            prepare,
-        },
-    )
+    start
 }
 
 /// Seed the window `x19` from the padded span `[x29 + 48]`: formals, then
@@ -400,7 +415,8 @@ fn emit_fill_window(ops: &mut Assembler, shape: EntryShape) {
     }
 }
 
-/// Emit the cold continuations of the call entry.
+/// Emit the cold continuations of the call entry, ahead of the entry itself
+/// so its conditional branches stay in reach.
 pub(crate) fn emit_call_entry_cold(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -442,7 +458,14 @@ pub(crate) fn emit_call_entry_cold(
             transitions,
             abi::STUB_JIT_PREPARE_ACTIVATION,
         );
-        dynasm!(ops ; .arch aarch64 ; cbnz x1, =>exits.construct ; =>created ; b =>constructed);
+        // The epilogue follows the body: `b` reaches it at any size.
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz x1, =>created
+            ; b =>exits.construct
+            ; =>created
+            ; b =>constructed
+        );
     }
     if let Some((prepare, prepared)) = cold.prepare {
         dynasm!(ops ; .arch aarch64 ; =>prepare ; mov x0, x20);
@@ -452,7 +475,11 @@ pub(crate) fn emit_call_entry_cold(
             transitions,
             abi::STUB_JIT_PREPARE_ACTIVATION,
         );
-        dynasm!(ops ; .arch aarch64 ; cbnz x1, =>exits.construct ; b =>prepared);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cbz x1, =>prepared
+            ; b =>exits.construct
+        );
     }
     // Promotion compiles against the published record; this activation
     // keeps its generation and later entries take the new one.

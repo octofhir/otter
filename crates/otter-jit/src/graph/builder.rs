@@ -883,6 +883,13 @@ impl<'a> Builder<'a> {
         if bitwise && numeric {
             let a = self.truncated_int32(lhs, int32);
             let b = self.truncated_int32(rhs, int32);
+            // `>>>` is unsigned: once a result left the int32 range here, it
+            // is computed as a double instead of checked again.
+            if op == Op::Ushr && !int32 {
+                let result = self.add(Kind::Uint32ShiftRightToFloat64, &[a, b], Repr::Float64);
+                self.write(instruction.writes[0], result);
+                return;
+            }
             let kind = match op {
                 Op::BitwiseAnd | Op::BitwiseAndImm => Kind::Int32BitAnd,
                 Op::BitwiseOr => Kind::Int32BitOr,

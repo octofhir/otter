@@ -228,7 +228,19 @@ struct Codegen<'a> {
     /// Subroutine rebuilding the interpreter frame of the exit in `w17`
     /// without leaving; returns through `x30`.
     materialize: DynamicLabel,
+    /// A body past conditional-branch reach is emitted in segments: each
+    /// conditional branch to a block or a shared label leaves through a
+    /// veneer of its segment, and an island after the segment holds the
+    /// segment's slow paths, exit stubs and veneers.
+    far: bool,
+    island_base: usize,
+    exits_flushed: usize,
+    veneers: Vec<(DynamicLabel, DynamicLabel)>,
 }
+
+/// Body bytes between islands: a segment plus its island stays well inside
+/// the ±1 MiB a conditional branch reaches.
+const ISLAND_INTERVAL: usize = 256 * 1024;
 
 /// The safepoint every graph code object publishes: it roots all tagged
 /// spill slots.
@@ -245,6 +257,7 @@ pub(crate) fn emit(
     plan: &crate::template::TemplatePlan,
     slots: SlotLayout,
     capture_relocations: bool,
+    far: bool,
 ) -> Result<Emission, Unsupported> {
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
@@ -318,6 +331,10 @@ pub(crate) fn emit(
         committed_throw,
         propagate,
         materialize,
+        far,
+        island_base: 0,
+        exits_flushed: 0,
+        veneers: Vec::new(),
     };
     let tier_entry = codegen.ops.offset().0;
     let body = codegen.ops.new_dynamic_label();
@@ -341,14 +358,20 @@ pub(crate) fn emit(
     } else {
         dynasm!(codegen.ops ; .arch aarch64 ; b =>body);
     }
-    let (call_entry, call_entry_cold) =
-        crate::arm64::frame::emit_call_entry(&mut codegen.ops, view, shape, spill);
-    let call_entry = call_entry.0;
+    let call_entry_cold = crate::arm64::frame::CallEntryCold::new(&mut codegen.ops, shape);
+    crate::arm64::frame::emit_call_entry_cold(
+        &mut codegen.ops,
+        &mut codegen.relocations,
+        transitions,
+        activation,
+        call_entry_cold,
+    );
+    let call_entry =
+        crate::arm64::frame::emit_call_entry(&mut codegen.ops, view, shape, spill, call_entry_cold)
+            .0;
     dynasm!(codegen.ops ; .arch aarch64 ; =>body);
     codegen.emit_body()?;
-    while let Some(deferred) = codegen.deferred.pop() {
-        deferred(&mut codegen);
-    }
+    codegen.flush_segment();
     codegen.emit_exit_stubs();
     crate::arm64::frame::emit_exits(
         &mut codegen.ops,
@@ -358,13 +381,6 @@ pub(crate) fn emit(
         shape.derived,
         activation,
         spill,
-    );
-    crate::arm64::frame::emit_call_entry_cold(
-        &mut codegen.ops,
-        &mut codegen.relocations,
-        transitions,
-        activation,
-        call_entry_cold,
     );
     let Codegen {
         ops,
@@ -503,53 +519,105 @@ impl<'a> Codegen<'a> {
     }
 
     /// Run `moves` as one parallel assignment.
-    fn emit_parallel_moves(&mut self, mut moves: Vec<Move>) {
-        moves.retain(|m| m.from != m.to);
-        // Repeatedly emit a move whose destination no pending move reads.
-        while !moves.is_empty() {
-            let ready = moves
-                .iter()
-                .position(|candidate| !moves.iter().any(|other| other.from == candidate.to));
-            if let Some(index) = ready {
-                let m = moves.remove(index);
-                self.emit_move(m.from, m.to);
-                continue;
-            }
-            // Every destination is still read: break a cycle through a
-            // scratch register of the right class.
-            let m = moves.remove(0);
-            let scratch = match m.from {
-                Location::Fp(_) => Location::Fp(31),
-                _ => Location::Gp(16),
-            };
-            match (m.from, scratch) {
-                (Location::Gp(_) | Location::Fp(_), _) => self.emit_move(m.from, scratch),
-                (slot, Location::Gp(_)) => {
-                    // A slot source in a cycle: hold it in x17 so x16 stays
-                    // free for slot-to-slot moves.
-                    self.emit_move(slot, Location::Gp(17));
-                    for other in &mut moves {
-                        if other.from == m.from {
-                            other.from = Location::Gp(17);
-                        }
+    ///
+    /// A move is emitted once no pending move still reads its destination;
+    /// read counts per location make that a linear worklist. What remains
+    /// then is cycles: one source of a cycle is parked on the stack, which
+    /// frees its location, and the move that read it is replayed from the
+    /// stack when its own destination is free. Parking on the stack keeps
+    /// every scratch register available to the slot and constant moves of
+    /// the same assignment.
+    fn emit_parallel_moves(&mut self, moves: Vec<Move>) {
+        let moves: Vec<Move> = moves.into_iter().filter(|m| m.from != m.to).collect();
+        if moves.is_empty() {
+            return;
+        }
+        let mut readers: FxHashMap<Location, u32> = FxHashMap::default();
+        let mut writer: FxHashMap<Location, usize> = FxHashMap::default();
+        for (index, m) in moves.iter().enumerate() {
+            *readers.entry(m.from).or_default() += 1;
+            writer.insert(m.to, index);
+        }
+        let mut done = vec![false; moves.len()];
+        let mut parked: Option<usize> = None;
+        let mut ready: Vec<usize> = (0..moves.len())
+            .filter(|&index| !readers.contains_key(&moves[index].to))
+            .collect();
+        let mut remaining = moves.len();
+        while remaining != 0 {
+            while let Some(index) = ready.pop() {
+                let m = moves[index];
+                if parked == Some(index) {
+                    self.emit_unpark(m.to);
+                    parked = None;
+                } else {
+                    self.emit_move(m.from, m.to);
+                    let count = readers.get_mut(&m.from).expect("a read source");
+                    *count -= 1;
+                    if *count == 0
+                        && let Some(&next) = writer.get(&m.from)
+                        && !done[next]
+                    {
+                        ready.push(next);
                     }
-                    moves.push(Move {
-                        from: Location::Gp(17),
-                        to: m.to,
-                    });
-                    continue;
                 }
-                _ => unreachable!("fp slot cycles go through d31"),
+                done[index] = true;
+                remaining -= 1;
             }
-            for other in &mut moves {
-                if other.from == m.from {
-                    other.from = scratch;
-                }
+            if remaining == 0 {
+                break;
             }
-            moves.push(Move {
-                from: scratch,
-                to: m.to,
-            });
+            // Only cycles are left: park one source.
+            let index = (0..moves.len())
+                .find(|&index| !done[index])
+                .expect("a pending move");
+            let source = moves[index].from;
+            self.emit_park(source);
+            parked = Some(index);
+            let count = readers.get_mut(&source).expect("a read source");
+            *count -= 1;
+            if *count == 0
+                && let Some(&next) = writer.get(&source)
+                && !done[next]
+            {
+                ready.push(next);
+            }
+        }
+    }
+
+    /// Push `source` below the stack pointer, keeping slot offsets exact.
+    fn emit_park(&mut self, source: Location) {
+        match source {
+            Location::Gp(register) => {
+                dynasm!(self.ops ; .arch aarch64 ; str X(register), [sp, #-16]!);
+            }
+            Location::Fp(register) => {
+                dynasm!(self.ops ; .arch aarch64 ; str D(register), [sp, #-16]!);
+            }
+            slot @ (Location::TaggedSlot(_) | Location::UntaggedSlot(_)) => {
+                self.load_slot_gp(16, slot);
+                dynasm!(self.ops ; .arch aarch64 ; str x16, [sp, #-16]!);
+            }
+            Location::Constant(_) => unreachable!("a constant is never a move destination"),
+        }
+        self.sp_delta += 16;
+    }
+
+    /// Pop the parked value into `to`.
+    fn emit_unpark(&mut self, to: Location) {
+        self.sp_delta -= 16;
+        match to {
+            Location::Gp(register) => {
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(register), [sp], #16);
+            }
+            Location::Fp(register) => {
+                dynasm!(self.ops ; .arch aarch64 ; ldr D(register), [sp], #16);
+            }
+            slot @ (Location::TaggedSlot(_) | Location::UntaggedSlot(_)) => {
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [sp], #16);
+                self.store_slot_gp(16, slot);
+            }
+            Location::Constant(_) => unreachable!("a constant is never a move destination"),
         }
     }
 
@@ -602,6 +670,48 @@ impl<'a> Codegen<'a> {
     // Body
     // ------------------------------------------------------------------
 
+    /// The label a conditional branch to `target` names: `target` itself,
+    /// or in a far body the veneer of the current segment that jumps there.
+    fn cond_target(&mut self, target: DynamicLabel) -> DynamicLabel {
+        if !self.far {
+            return target;
+        }
+        if let Some(&(_, veneer)) = self.veneers.iter().find(|(known, _)| *known == target) {
+            return veneer;
+        }
+        let veneer = self.ops.new_dynamic_label();
+        self.veneers.push((target, veneer));
+        veneer
+    }
+
+    /// Close the current segment with an island once it is long enough.
+    fn maybe_island(&mut self) {
+        if !self.far || self.ops.offset().0 - self.island_base < ISLAND_INTERVAL {
+            return;
+        }
+        let skip = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch aarch64 ; b =>skip);
+        self.flush_segment();
+        dynasm!(self.ops ; .arch aarch64 ; =>skip);
+        self.island_base = self.ops.offset().0;
+    }
+
+    /// The slow paths, exit stubs and veneers the segment so far named.
+    fn flush_segment(&mut self) {
+        while let Some(deferred) = self.deferred.pop() {
+            deferred(self);
+        }
+        let deopt = self.deopt;
+        for index in self.exits_flushed..self.exits.len() {
+            let label = self.exits[index].label;
+            dynasm!(self.ops ; .arch aarch64 ; =>label ; movz w17, index as u32 ; b =>deopt);
+        }
+        self.exits_flushed = self.exits.len();
+        for (target, veneer) in std::mem::take(&mut self.veneers) {
+            dynasm!(self.ops ; .arch aarch64 ; =>veneer ; b =>target);
+        }
+    }
+
     fn emit_body(&mut self) -> Result<(), Unsupported> {
         for (position, &block) in self.layout.iter().enumerate() {
             let label = self.labels[&block];
@@ -624,6 +734,7 @@ impl<'a> Codegen<'a> {
                 if allocation.skipped {
                     continue;
                 }
+                self.maybe_island();
                 self.node_offsets.push((self.ops.offset().0, node));
                 for m in allocation.moves.clone() {
                     self.emit_move(m.from, m.to);
@@ -803,6 +914,15 @@ impl<'a> Codegen<'a> {
                     ; cmp w16, #0
                     ; b.lt =>exit
                     ; mov W(destination), w16
+                );
+            }
+            Kind::Uint32ShiftRightToFloat64 => {
+                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::fp(result.expect("a result"));
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; lsr w16, W(a), W(b)
+                    ; ucvtf D(destination), w16
                 );
             }
             Kind::Int32BitNot => {
@@ -1168,12 +1288,16 @@ impl<'a> Codegen<'a> {
             .push(Box::new(move |codegen: &mut Codegen<'a>| {
                 dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
                 let saved = codegen.emit_save_registers(&live);
+                // The operands may sit in any argument register: park them
+                // in the scratch pair before the arguments are written.
                 dynasm!(codegen.ops
                     ; .arch aarch64
-                    ; mov x1, X(object)
-                    ; mov x2, X(value)
+                    ; mov x16, X(object)
+                    ; mov x17, X(value)
                     ; ldr x0, [x20, THREAD_OFFSET]
                     ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    ; mov x1, x16
+                    ; mov x2, x17
                 );
                 emit_load_symbol_u64(
                     &mut codegen.ops,
@@ -1300,6 +1424,13 @@ impl<'a> Codegen<'a> {
             codegen.typed_exit(node, reason, action)
         };
         let runtime_transition = exit(self, ExitReason::RuntimeTransition, ExitAction::Resume);
+        // The baseline operation branches to these conditionally.
+        let threw = self.cond_target(threw);
+        let committed_throw = self.cond_target(committed_throw);
+        let (returned, propagate, fatal) = (self.returned, self.propagate, self.fatal);
+        let returned = self.cond_target(returned);
+        let propagate = self.cond_target(propagate);
+        let fatal = self.cond_target(fatal);
         let exits = crate::template::arm64::OperationExits {
             type_mismatch_exit: exit(self, ExitReason::TypeMismatch, ExitAction::Recompile),
             identity_guard_exit: exit(self, ExitReason::IdentityGuard, ExitAction::Recompile),
@@ -1312,11 +1443,11 @@ impl<'a> Codegen<'a> {
             runtime_transition_exit: runtime_transition,
             backedge_relink_exit: exit(self, ExitReason::Interrupt, ExitAction::Resume),
             bail: runtime_transition,
-            returned: self.returned,
+            returned,
             committed_throw,
             threw,
-            propagate_throw: self.propagate,
-            fatal: self.fatal,
+            propagate_throw: propagate,
+            fatal,
         };
         let positions = self.plan_index.get(&pc).cloned().unwrap_or_default();
         let labels = std::collections::BTreeMap::new();
@@ -1349,7 +1480,7 @@ impl<'a> Codegen<'a> {
             )?;
         }
         if !numeric_slow_paths.is_empty() || !coercion_slow_paths.is_empty() {
-            let fatal = self.fatal;
+            let fatal = self.cond_target(self.fatal);
             let transitions = self.transitions;
             self.deferred
                 .push(Box::new(move |codegen: &mut Codegen<'a>| {
@@ -1443,8 +1574,9 @@ impl<'a> Codegen<'a> {
                 if_true,
                 if_false,
             } => {
-                let true_label = self.labels[&if_true];
                 let false_label = self.labels[&if_false];
+                let true_label = self.labels[&if_true];
+                let true_target = self.cond_target(true_label);
                 match kind {
                     BranchKind::Int32(condition) => {
                         let (a, b) = (
@@ -1452,7 +1584,7 @@ impl<'a> Codegen<'a> {
                             Self::gp(allocation.inputs[1]),
                         );
                         dynasm!(self.ops ; .arch aarch64 ; cmp W(a), W(b));
-                        self.emit_branch_condition(condition, false, true_label);
+                        self.emit_branch_condition(condition, false, true_target);
                     }
                     BranchKind::Float64(condition) => {
                         let (a, b) = (
@@ -1460,23 +1592,23 @@ impl<'a> Codegen<'a> {
                             Self::fp(allocation.inputs[1]),
                         );
                         dynasm!(self.ops ; .arch aarch64 ; fcmp D(a), D(b));
-                        self.emit_branch_condition(condition, true, true_label);
+                        self.emit_branch_condition(condition, true, true_target);
                     }
                     BranchKind::TaggedEqual => {
                         let (a, b) = (
                             Self::gp(allocation.inputs[0]),
                             Self::gp(allocation.inputs[1]),
                         );
-                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b) ; b.eq =>true_label);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b) ; b.eq =>true_target);
                     }
                     BranchKind::Nullish => {
                         let a = Self::gp(allocation.inputs[0]);
                         dynasm!(self.ops
                             ; .arch aarch64
                             ; cmp XSP(a), VALUE_NULL as u32
-                            ; b.eq =>true_label
+                            ; b.eq =>true_target
                             ; cmp XSP(a), VALUE_UNDEFINED as u32
-                            ; b.eq =>true_label
+                            ; b.eq =>true_target
                         );
                     }
                     BranchKind::Truthy => {
@@ -1525,16 +1657,18 @@ impl<'a> Codegen<'a> {
     ) {
         let not_int = self.ops.new_dynamic_label();
         let slow = self.ops.new_dynamic_label();
+        let true_target = self.cond_target(if_true);
+        let false_target = self.cond_target(if_false);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp XSP(value), VALUE_TRUE as u32
-            ; b.eq =>if_true
+            ; b.eq =>true_target
             ; cmp XSP(value), VALUE_FALSE as u32
-            ; b.eq =>if_false
+            ; b.eq =>false_target
             ; cmp XSP(value), VALUE_UNDEFINED as u32
-            ; b.eq =>if_false
+            ; b.eq =>false_target
             ; cmp XSP(value), VALUE_NULL as u32
-            ; b.eq =>if_false
+            ; b.eq =>false_target
         );
         self.load_immediate(16, NUMBER_TAG);
         dynasm!(self.ops
@@ -1542,7 +1676,7 @@ impl<'a> Codegen<'a> {
             ; cmp X(value), x16
             ; b.lo =>not_int
             ; cmp WSP(value), #0
-            ; b.eq =>if_false
+            ; b.eq =>false_target
             ; b =>if_true
             ; =>not_int
             ; b =>slow
@@ -1567,10 +1701,11 @@ impl<'a> Codegen<'a> {
                 );
                 dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
                 codegen.emit_restore_registers(&live, saved);
+                let true_target = codegen.cond_target(if_true);
                 dynasm!(codegen.ops
                     ; .arch aarch64
                     ; cmp x16, VALUE_TRUE as u32
-                    ; b.eq =>if_true
+                    ; b.eq =>true_target
                     ; b =>if_false
                 );
             }));
@@ -1697,15 +1832,8 @@ impl<'a> Codegen<'a> {
         crate::arm64::frame::emit_epilogue(&mut self.ops, activation, spill);
         self.emit_throw_handlers();
         self.emit_materialize();
-        let deopt = self.deopt;
-        for (index, site) in self.exits.clone().into_iter().enumerate() {
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; =>site.label
-                ; movz w17, index as u32
-                ; b =>deopt
-            );
-        }
+        // The handlers above may name exits of their own.
+        self.flush_segment();
         self.emit_deopt_handler();
     }
 

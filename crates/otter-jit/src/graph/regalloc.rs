@@ -166,7 +166,9 @@ struct Allocator<'g> {
     /// Released slots with the position their last value died at.
     free_tagged: Vec<(u32, u32)>,
     free_untagged: Vec<(u32, u32)>,
-    released: rustc_hash::FxHashSet<NodeId>,
+    /// Spilled values by the position of their last use, earliest first:
+    /// each slot is released once, when the walk passes that use.
+    expiries: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>,
     entry_states: FxHashMap<BlockId, Vec<(NodeId, Location)>>,
     exit_states: FxHashMap<BlockId, Vec<(NodeId, Location)>>,
     current: NodeId,
@@ -190,7 +192,7 @@ pub(crate) fn allocate(graph: &Graph, layout: &[BlockId]) -> Allocation {
         },
         free_tagged: Vec::new(),
         free_untagged: Vec::new(),
-        released: rustc_hash::FxHashSet::default(),
+        expiries: std::collections::BinaryHeap::new(),
         entry_states: FxHashMap::default(),
         exit_states: FxHashMap::default(),
         current: NodeId(0),
@@ -292,22 +294,28 @@ impl<'g> Allocator<'g> {
                 loops.push((start, end));
             }
         }
+        for state in self.values.values_mut() {
+            state.uses.sort_unstable();
+            state.uses.dedup();
+        }
         let definitions: Vec<(NodeId, u32)> = self
             .values
             .keys()
             .map(|&value| (value, self.pos(value)))
             .collect();
+        // Uses stay sorted: an extension only ever appends a new last use.
         loop {
             let mut changed = false;
             for &(start, end) in &loops {
                 for &(value, defined) in &definitions {
-                    let state = self.values.get_mut(&value).expect("a used value");
                     let defined_before = defined == NO_POSITION || defined < start;
                     if !defined_before {
                         continue;
                     }
-                    let used_inside = state.uses.iter().any(|&at| at >= start && at <= end);
-                    let last = state.uses.iter().copied().max().unwrap_or(0);
+                    let state = self.values.get_mut(&value).expect("a used value");
+                    let first_inside = state.uses.partition_point(|&at| at < start);
+                    let used_inside = state.uses.get(first_inside).is_some_and(|&at| at <= end);
+                    let last = state.uses.last().copied().unwrap_or(0);
                     if used_inside && last < end {
                         state.uses.push(end);
                         changed = true;
@@ -317,10 +325,6 @@ impl<'g> Allocator<'g> {
             if !changed {
                 break;
             }
-        }
-        for state in self.values.values_mut() {
-            state.uses.sort_unstable();
-            state.uses.dedup();
         }
     }
 
@@ -439,6 +443,8 @@ impl<'g> Allocator<'g> {
             Location::UntaggedSlot(index)
         };
         self.out.spill.insert(value, slot);
+        self.expiries
+            .push(std::cmp::Reverse((self.last_use(value), value.0)));
         slot
     }
 
@@ -565,16 +571,13 @@ impl<'g> Allocator<'g> {
                 }
             }
         }
-        let dead: Vec<(NodeId, Location)> = self
-            .out
-            .spill
-            .iter()
-            .filter(|(value, _)| !self.released.contains(*value) && self.last_use(**value) <= at)
-            .map(|(&value, &slot)| (value, slot))
-            .collect();
-        for (value, slot) in dead {
+        while let Some(&std::cmp::Reverse((last, value))) = self.expiries.peek() {
+            if last > at {
+                break;
+            }
+            self.expiries.pop();
+            let slot = self.out.spill[&NodeId(value)];
             // A slot lives as long as its value, then is recycled.
-            self.released.insert(value);
             match slot {
                 Location::TaggedSlot(index) => self.free_tagged.push((index, at)),
                 Location::UntaggedSlot(index) => self.free_untagged.push((index, at)),

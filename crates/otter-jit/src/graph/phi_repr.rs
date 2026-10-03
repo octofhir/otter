@@ -187,6 +187,7 @@ fn node_reads_int32(graph: &Graph, kind: &Kind, node: NodeId, index: usize) -> b
         | Kind::Int32ShiftLeft
         | Kind::Int32ShiftRight
         | Kind::Int32ShiftRightLogical
+        | Kind::Uint32ShiftRightToFloat64
         | Kind::Int32Compare(_)
         | Kind::Int32ToTagged
         | Kind::Int32ToFloat64

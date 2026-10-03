@@ -103,17 +103,27 @@ pub(crate) fn compile(
     // known only once the code is emitted, and the box never moves.
     let mut deopt = Box::new(DeoptRuntime::default());
     let slots = arm64::SlotLayout::of(&allocation);
-    let emission = arm64::emit(
-        view,
-        &built,
-        &allocation,
-        transitions,
-        code_object_id,
-        std::ptr::from_ref::<DeoptRuntime>(&deopt),
-        &plan,
-        slots,
-        false,
-    )?;
+    // Near branches are one instruction; only a body whose own control flow
+    // spans more than a conditional branch reaches pays for the far form.
+    let deopt_address = std::ptr::from_ref::<DeoptRuntime>(&deopt);
+    let emit = |far| {
+        arm64::emit(
+            view,
+            &built,
+            &allocation,
+            transitions,
+            code_object_id,
+            deopt_address,
+            &plan,
+            slots,
+            false,
+            far,
+        )
+    };
+    let emission = match emit(false) {
+        Err(Unsupported::Backend(crate::BackendFailure::Relocation)) => emit(true),
+        result => result,
+    }?;
     *deopt = deopt_runtime(view, &built, &allocation, slots, &emission.exits);
     Ok(Compiled {
         emission,

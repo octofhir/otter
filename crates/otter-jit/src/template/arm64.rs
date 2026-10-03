@@ -258,11 +258,20 @@ fn compile_with_reach(
     crate::arm64::frame::emit_tier_prologue(&mut ops, crate::arm64::frame::SpillArea::NONE);
     dynasm!(ops ; .arch aarch64 ; b =>body);
     let call_entry = (!plan.osr_only).then(|| {
+        let cold = crate::arm64::frame::CallEntryCold::new(&mut ops, shape);
+        crate::arm64::frame::emit_call_entry_cold(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            activation_exits,
+            cold,
+        );
         crate::arm64::frame::emit_call_entry(
             &mut ops,
             view,
             shape,
             crate::arm64::frame::SpillArea::NONE,
+            cold,
         )
     });
     dynasm!(ops ; .arch aarch64 ; =>body);
@@ -643,15 +652,6 @@ fn compile_with_reach(
         activation_exits,
         crate::arm64::frame::SpillArea::NONE,
     );
-    if let Some((_, cold)) = call_entry {
-        crate::arm64::frame::emit_call_entry_cold(
-            &mut ops,
-            &mut relocations,
-            transitions,
-            activation_exits,
-            cold,
-        );
-    }
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "throwEpilogue",
@@ -719,7 +719,7 @@ fn compile_with_reach(
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
         osr_entries,
-        call_entry.map(|(offset, _)| offset.0),
+        call_entry.map(|offset| offset.0),
         osr_only,
     );
     Ok(NativeCompileOutput {

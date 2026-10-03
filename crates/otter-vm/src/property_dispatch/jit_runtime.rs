@@ -28,11 +28,15 @@ use otter_bytecode::Op;
 /// Decode one fixed named-property operation from its explicit source
 /// identity, independently of the published native activation. The immutable
 /// CodeBlock remains the authority for property spelling and feedback site.
+///
+/// A load site is a `LoadProperty` or the method lookup of a
+/// `CallMethodValue`, which shares the load table; a store site is a
+/// `StoreProperty`.
 fn named_property_site<'a>(
     context: &'a ExecutionContext,
     function_id: u32,
     instruction_pc: u32,
-    expected_op: Op,
+    kind: PropertyIcKind,
 ) -> Result<
     (
         AtomizedPropertyKey<'a>,
@@ -46,12 +50,12 @@ fn named_property_site<'a>(
     let instruction = function
         .instr_at_index(instruction_pc as usize)
         .ok_or(VmError::InvalidOperand)?;
-    if instruction.instruction_pc != instruction_pc || function.op(instruction) != expected_op {
+    if instruction.instruction_pc != instruction_pc {
         return Err(VmError::InvalidOperand);
     }
-    let name_operand = match expected_op {
-        Op::LoadProperty => 2,
-        Op::StoreProperty => 1,
+    let name_operand = match (kind, function.op(instruction)) {
+        (PropertyIcKind::Load, Op::LoadProperty | Op::CallMethodValue) => 2,
+        (PropertyIcKind::Store, Op::StoreProperty) => 1,
         _ => return Err(VmError::InvalidOperand),
     };
     let name_index = function
@@ -60,11 +64,6 @@ fn named_property_site<'a>(
     let key = context
         .property_atom_for_function(function_id, name_index)
         .ok_or(VmError::InvalidOperand)?;
-    let kind = match expected_op {
-        Op::LoadProperty => PropertyIcKind::Load,
-        Op::StoreProperty => PropertyIcKind::Store,
-        _ => return Err(VmError::InvalidOperand),
-    };
     let slot = function
         .property_feedback_at(instruction_pc as usize, kind)
         .ok_or(VmError::InvalidOperand)?;
@@ -89,7 +88,7 @@ impl Interpreter {
         mut receiver: Value,
     ) -> Result<Value, VmError> {
         let (atomized_key, slot) =
-            named_property_site(context, function_id, instruction_pc, Op::LoadProperty)?;
+            named_property_site(context, function_id, instruction_pc, PropertyIcKind::Load)?;
         self.record_jit_runtime_property_stub();
         let scope_frame = crate::handles::HandleScopeFrame::enter(self);
         let scope = scope_frame.token();
@@ -206,7 +205,7 @@ impl Interpreter {
         fill_megamorphic_cache: bool,
     ) -> Result<(), VmError> {
         let (atomized_key, slot) =
-            named_property_site(context, function_id, instruction_pc, Op::StoreProperty)?;
+            named_property_site(context, function_id, instruction_pc, PropertyIcKind::Store)?;
         self.record_jit_runtime_property_stub();
         let strict = context.function_is_strict(function_id);
         use crate::jit_debug::JitPropertyStorePath as Path;

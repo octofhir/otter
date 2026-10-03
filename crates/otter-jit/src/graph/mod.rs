@@ -37,10 +37,7 @@ pub(crate) mod phi_repr;
 pub(crate) mod regalloc;
 
 use otter_vm::JitCompileSnapshot;
-use otter_vm::deopt::{DeoptExitDescriptor, DeoptFrame, DeoptRuntime, DeoptTable, FrameState};
-use otter_vm::native_abi::{
-    NO_CALL_PC, NO_FRAME_STATE, SafepointRecord, TaggedLocation, TaggedLocationKind,
-};
+use otter_vm::deopt::{DeoptExitDescriptor, DeoptRuntime, DeoptTable, FrameState};
 
 use crate::optimizing::{OptimizedCode, OptimizedMetadata};
 use crate::{CompiledCode, Unsupported};
@@ -93,8 +90,10 @@ pub(crate) fn compile(
     osr_pc: Option<u32>,
     capture: bool,
 ) -> Result<Compiled, Unsupported> {
-    let analysis = bytecode::Analysis::build(view)
-        .map_err(|_| Unsupported::OperandShape("graph bytecode analysis"))?;
+    let analysis = std::rc::Rc::new(
+        bytecode::Analysis::build(view)
+            .map_err(|_| Unsupported::OperandShape("graph bytecode analysis"))?,
+    );
     let plan = crate::template::TemplatePlan::build_unfused(view)?;
     let baseline = BaselineSupport::of(&plan, view);
     let mut built = builder::build(view, &analysis, &baseline, osr_pc)
@@ -126,7 +125,7 @@ pub(crate) fn compile(
         Err(Unsupported::Backend(crate::BackendFailure::Relocation)) => emit(true),
         result => result,
     }?;
-    *deopt = deopt_runtime(view, &built, &allocation, slots, &emission.exits);
+    *deopt = deopt_runtime(&built, &allocation, slots, &emission.exits);
     Ok(Compiled {
         emission,
         built,
@@ -139,7 +138,6 @@ pub(crate) fn compile(
 
 /// One frame-state recipe per exit site, in exit order.
 fn deopt_runtime(
-    view: &JitCompileSnapshot,
     built: &builder::Built,
     allocation: &regalloc::Allocation,
     slots: arm64::SlotLayout,
@@ -155,20 +153,14 @@ fn deopt_runtime(
         let node = built.graph.node(site.node);
         let state_id = if site.lazy { node.lazy } else { node.eager }
             .expect("an exit site has its frame state");
-        let state = built.graph.frame_state(state_id);
         let node_allocation = allocation.node(site.node);
-        let locations = if site.lazy {
-            &node_allocation.lazy
-        } else {
-            &node_allocation.eager
+        let locations: &[regalloc::Location] = match &site.locations {
+            Some(locations) => locations,
+            None if site.lazy => &node_allocation.lazy,
+            None => &node_allocation.eager,
         };
         let recipe = FrameState {
-            frames: Box::new([DeoptFrame {
-                function_id: view.code_block.id,
-                byte_pc: state.byte_pc,
-                entry: None,
-                slots: arm64::deopt_slots(&built.graph, slots, state, locations),
-            }]),
+            frames: arm64::deopt_frames(&built.graph, slots, state_id, locations),
             virtual_objects: Box::new([]),
         };
         let index = *recipes.entry(recipe).or_insert_with_key(|recipe| {
@@ -179,7 +171,12 @@ fn deopt_runtime(
             state: index,
             reason: site.reason,
             action: site.action,
-            resume_pcs: Box::new([state.pc]),
+            resume_pcs: built
+                .graph
+                .state_chain(state_id)
+                .iter()
+                .map(|&state| built.graph.frame_state(state).pc)
+                .collect(),
         });
     }
     DeoptRuntime {
@@ -210,22 +207,10 @@ pub(crate) fn compile_optimized(
         built,
         allocation,
         deopt,
-        slots,
         plan,
+        ..
     } = compiled;
     let mut safepoints = plan.safepoint_records.clone();
-    safepoints.push(SafepointRecord {
-        id: arm64::SLOT_SAFEPOINT,
-        frame_state: NO_FRAME_STATE,
-        tagged_locations: (0..slots.tagged)
-            .map(|index| TaggedLocation {
-                kind: TaggedLocationKind::SpillSlot,
-                index: index as u16,
-            })
-            .collect(),
-        inline_frames: Box::new([]),
-        call_pc: NO_CALL_PC,
-    });
     safepoints.extend(emission.site_records.iter().cloned());
     safepoints.sort_by_key(|record| record.id);
     let metadata = OptimizedMetadata {

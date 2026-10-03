@@ -16,8 +16,10 @@
 //!   `x17` and `d31`; no node writes an allocatable register other than its
 //!   result and declared temporaries.
 //! - Spill slots live at `sp`: tagged slot `k` at `sp + 8k`, untagged slots
-//!   after every tagged one. One safepoint record per code object roots every
-//!   tagged slot; entries publish it on the frame record once.
+//!   after every tagged one. Each point that may collect names its own
+//!   safepoint on the frame record before the runtime runs, rooting exactly
+//!   the tagged slots live across it, all written by then; entries publish
+//!   none and leave slots unwritten.
 //! - A value is stored to its slot right after it is defined (a phi at its
 //!   block's start), never at a later spill point.
 //! - A deopt exit is `movz w17, index ; b deopt`: the shared handler dumps
@@ -35,7 +37,7 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
-use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptSlot};
+use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot};
 use otter_vm::jit::{JitBodyGuard, JitElementRepr, JitGuardWidth, JitHoleBitmap};
 use otter_vm::native_abi::{
     self as abi, ExitAction, ExitReason, NO_CALL_PC, NO_FRAME_STATE, NativeResultStatus,
@@ -45,7 +47,9 @@ use otter_vm::value::tag;
 use rustc_hash::FxHashMap;
 
 use super::builder::Built;
-use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, NodeId, Repr};
+use super::ir::{
+    BlockId, BranchKind, Condition, DeoptReason, FrameStateId, Graph, Kind, NodeId, Repr,
+};
 use super::regalloc::{Allocation, FP_REGISTERS, GP_REGISTERS, Location, Move};
 use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
@@ -157,6 +161,9 @@ pub(crate) struct ExitSite {
     pub(crate) lazy: bool,
     pub(crate) reason: ExitReason,
     pub(crate) action: ExitAction,
+    /// Where the state's values are at this exit when that is not where the
+    /// allocator put them for the node.
+    pub(crate) locations: Option<Box<[Location]>>,
 }
 
 /// A slow path emitted after the body.
@@ -203,6 +210,8 @@ struct Codegen<'a> {
     ops: Assembler,
     relocations: RelocationCapture,
     view: &'a JitCompileSnapshot,
+    /// The snapshot of each inlined body, by origin minus one.
+    inline_views: &'a [std::sync::Arc<JitCompileSnapshot>],
     graph: &'a Graph,
     allocation: &'a Allocation,
     layout: &'a [BlockId],
@@ -258,9 +267,38 @@ struct Codegen<'a> {
 /// the ±1 MiB a conditional branch reaches.
 const ISLAND_INTERVAL: usize = 256 * 1024;
 
-/// The safepoint every graph code object publishes: it roots all tagged
-/// spill slots.
-pub(crate) const SLOT_SAFEPOINT: abi::SafepointId = abi::NO_SAFEPOINT - 1;
+/// Prototype links an inline `instanceof` follows before the runtime
+/// completes the walk.
+const INSTANCEOF_CHAIN_BOUND: u32 = 32;
+
+/// The first id of a code object's own safepoints; each point that may
+/// collect names the next one down.
+const FIRST_SITE_SAFEPOINT: abi::SafepointId = abi::NO_SAFEPOINT - 1;
+
+/// The property source cells the code object's runtime completions name:
+/// one per shared-table access node, and one per baseline property operation
+/// a generic node runs. Nodes no block emits only leave a cell unused.
+fn property_cell_counts(built: &Built, plan: &crate::template::TemplatePlan) -> (usize, usize) {
+    use crate::template::TemplateOp;
+    let (mut loads, mut stores) = (0, 0);
+    for node in &built.graph.nodes {
+        match node.kind {
+            Kind::LoadPropertyCached { .. } => loads += 1,
+            Kind::StorePropertyCached { .. } => stores += 1,
+            Kind::Generic { pc, .. } => {
+                for instruction in plan.instructions.iter().filter(|op| op.pc == pc) {
+                    match instruction.op {
+                        TemplateOp::LoadProperty { .. } => loads += 1,
+                        TemplateOp::StoreProperty { .. } => stores += 1,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (loads, stores)
+}
 
 /// Emit the code object for `built` allocated by `allocation`.
 pub(crate) fn emit(
@@ -277,6 +315,7 @@ pub(crate) fn emit(
 ) -> Result<Emission, Unsupported> {
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
+    let (load_cells, store_cells) = property_cell_counts(built, plan);
     let labels = built
         .layout
         .iter()
@@ -293,21 +332,34 @@ pub(crate) fn emit(
     let committed_throw = ops.new_dynamic_label();
     let propagate = ops.new_dynamic_label();
     let materialize = ops.new_dynamic_label();
+    // No slot is rooted before a point that may collect names its own
+    // safepoint, which lists only slots already written: the entries
+    // publish no safepoint and leave the slots unwritten.
     let spill = crate::arm64::frame::SpillArea {
         bytes: slots.bytes(),
-        tagged_slots: slots.tagged,
-        safepoint: SLOT_SAFEPOINT,
+        tagged_slots: 0,
+        safepoint: abi::NO_SAFEPOINT,
     };
+    // A body that never runs a baseline operation on the window leaves it
+    // to the exits that rebuild the interpreter frame.
+    let lazy_window = !built.graph.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            Kind::Generic { .. } | Kind::LoadWindow(_) | Kind::StoreWindow(_)
+        )
+    });
     let shape = crate::arm64::frame::EntryShape::of(
         view,
         code_object_id,
         abi::NativeFrameKind::Optimizing,
         true,
-    )?;
+    )?
+    .with_lazy_window(lazy_window);
     let mut codegen = Codegen {
         ops,
         relocations: RelocationCapture::new(capture_relocations),
         view,
+        inline_views: &built.inline_views,
         graph: &built.graph,
         allocation,
         layout: &built.layout,
@@ -331,14 +383,11 @@ pub(crate) fn emit(
             }
             index
         },
-        load_ic_cells: vec![crate::entry::PropertySourceCell::default(); plan.load_property_count]
+        load_ic_cells: vec![crate::entry::PropertySourceCell::default(); load_cells]
             .into_boxed_slice(),
         next_load_ic: 0,
-        store_ic_cells: vec![
-            crate::entry::PropertySourceCell::default();
-            plan.store_property_count
-        ]
-        .into_boxed_slice(),
+        store_ic_cells: vec![crate::entry::PropertySourceCell::default(); store_cells]
+            .into_boxed_slice(),
         next_store_ic: 0,
         no_direct_call_events: None,
         no_code_map: None,
@@ -670,11 +719,9 @@ impl<'a> Codegen<'a> {
     /// A label that leaves through `node`'s eager deopt with this reason and
     /// action.
     fn typed_exit(&mut self, node: NodeId, reason: ExitReason, action: ExitAction) -> DynamicLabel {
-        if let Some(site) = self
-            .exits
-            .iter()
-            .find(|site| site.node == node && !site.lazy && site.reason == reason)
-        {
+        if let Some(site) = self.exits.iter().find(|site| {
+            site.node == node && !site.lazy && site.reason == reason && site.locations.is_none()
+        }) {
             return site.label;
         }
         let label = self.ops.new_dynamic_label();
@@ -684,6 +731,7 @@ impl<'a> Codegen<'a> {
             lazy: false,
             reason,
             action,
+            locations: None,
         });
         label
     }
@@ -808,18 +856,19 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("a result"));
                 let byte_pc = *byte_pc;
                 let cell = self
-                    .view
+                    .view_of(node)
                     .string_constant_cells
                     .get(&byte_pc)
                     .ok_or(Unsupported::OperandShape("graph LoadString cell"))?
                     .cell_addr;
+                let function_id = self.view_of(node).code_block.id;
                 emit_load_symbol_u64(
                     &mut self.ops,
                     &mut self.relocations,
                     destination,
                     cell as u64,
                     RelocationTarget::StringConstantCell {
-                        function_id: self.view.code_block.id,
+                        function_id,
                         byte_pc,
                     },
                 );
@@ -1409,6 +1458,53 @@ impl<'a> Codegen<'a> {
                 self.load_immediate(destination, VALUE_UNDEFINED);
                 dynasm!(self.ops ; .arch aarch64 ; =>done);
             }
+            Kind::LoadNamedProperty(byte_pc) => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
+                let byte_pc = *byte_pc;
+                self.emit_load_named_property(
+                    node,
+                    byte_pc,
+                    receiver,
+                    [holder, scratch],
+                    destination,
+                )?;
+            }
+            Kind::StoreNamedProperty(byte_pc) => {
+                let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
+                let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
+                let byte_pc = *byte_pc;
+                self.emit_store_named_property(
+                    node,
+                    byte_pc,
+                    [receiver, value],
+                    [holder, scratch],
+                )?;
+            }
+            Kind::LoadPropertyCached { pc, atom } => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                    allocation.gp_temps[3],
+                ];
+                let (pc, atom) = (*pc, *atom);
+                self.emit_load_property_cached(node, pc, atom, receiver, temps, destination)?;
+            }
+            Kind::StorePropertyCached { pc, atom } => {
+                let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                    allocation.gp_temps[3],
+                ];
+                let (pc, atom) = (*pc, *atom);
+                self.emit_store_property_cached(node, pc, atom, [receiver, value], temps)?;
+            }
             Kind::LoadContextParent => {
                 let context = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -1432,9 +1528,75 @@ impl<'a> Codegen<'a> {
                 pc,
                 plan,
                 construct,
+                receiver,
+                allocation,
             } => {
-                let (pc, plan, construct) = (*pc, *plan, *construct);
-                self.emit_call_js(node, pc, plan, construct)?;
+                let (pc, plan, construct, receiver, allocation) =
+                    (*pc, *plan, *construct, *receiver, *allocation);
+                self.emit_call_js(node, pc, plan, construct, receiver, allocation)?;
+            }
+            Kind::CheckFunction { function_id, cell } => {
+                let value = Self::gp(input(0));
+                let (function_id, cell) = (*function_id, *cell);
+                self.emit_check_function(node, function_id, cell, value);
+            }
+            Kind::Instanceof => {
+                let (value, target) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                    allocation.gp_temps[3],
+                    allocation.gp_temps[4],
+                ];
+                self.emit_instanceof(node, [value, target], temps, destination);
+            }
+            Kind::CheckNotHole => {
+                let value = Self::gp(input(0));
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                self.load_immediate(16, tag::VALUE_HOLE);
+                dynasm!(self.ops ; .arch aarch64 ; cmp X(value), x16 ; b.eq =>exit);
+            }
+            Kind::CheckFunctionPrototypeCall(byte_pc) => {
+                let value = Self::gp(input(0));
+                let temp = allocation.gp_temps[0];
+                let byte_pc = *byte_pc;
+                self.emit_check_function_prototype_call(node, byte_pc, value, temp)?;
+            }
+            Kind::LoadGuardedMethod {
+                byte_pc,
+                target,
+                receiver_proved,
+            } => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let holder = allocation.gp_temps[0];
+                let (byte_pc, target, receiver_proved) = (*byte_pc, *target, *receiver_proved);
+                self.emit_load_guarded_method(
+                    node,
+                    (byte_pc, target),
+                    receiver_proved,
+                    receiver,
+                    holder,
+                    destination,
+                )?;
+            }
+            Kind::LoadReceiverShape => {
+                let receiver = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let other = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                self.emit_ordinary_receiver(receiver, 0, other);
+                let shape_byte = self.view.object_shape_byte;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr W(destination), [X(receiver), shape_byte]
+                    ; b =>done
+                    ; =>other
+                    ; mov X(destination), xzr
+                    ; =>done
+                );
             }
             other => {
                 return Err(Unsupported::OperandShape(node_name(other)));
@@ -1691,6 +1853,1401 @@ impl<'a> Codegen<'a> {
 
     /// The generational barrier for storing `X(value)` into `X(object)`. The
     /// slow path preserves every live register itself.
+    /// Branch to `miss` unless `X(value)` is a native function whose
+    /// external reference is `native_ref`.
+    fn emit_native_identity(&mut self, value: u8, native_ref: u32, miss: DynamicLabel) {
+        let native_type_tag = u32::from(self.view.collection_layout.native_function_type_tag);
+        let identity_byte = self.view.native_call_layout.identity_byte;
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(value), x16
+            ; b.ne =>miss
+            ; cbz X(value), =>miss
+            ; ldrb w16, [X(value)]
+            ; cmp w16, native_type_tag
+            ; b.ne =>miss
+            ; ldr w16, [X(value), identity_byte]
+        );
+        self.load_immediate(17, u64::from(native_ref));
+        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
+    }
+
+    /// Prove the callee of the `f.call` site at `byte_pc` is
+    /// `%Function.prototype.call%`: `X(value)` itself, or the `call` slot
+    /// the closure receiver `X(value)` reads through the pinned
+    /// `%Function.prototype%`.
+    fn emit_check_function_prototype_call(
+        &mut self,
+        node: NodeId,
+        byte_pc: u32,
+        value: u8,
+        temp: u8,
+    ) -> Result<(), Unsupported> {
+        let site = self
+            .view_of(node)
+            .function_prototype_calls
+            .get(&byte_pc)
+            .ok_or(Unsupported::OperandShape("graph f.call site"))?;
+        let native_ref = site.proof.call_native_ref;
+        let lookup = site.proof.lookup;
+        let exit = self.eager_exit(node, DeoptReason::WrongValue);
+        let Some(lookup) = lookup else {
+            self.emit_native_identity(value, native_ref, exit);
+            return Ok(());
+        };
+        let target = lookup.receiver;
+        let view = self.view;
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(value), x16
+            ; b.ne =>exit
+            ; cbz X(value), =>exit
+            ; ldrb w16, [X(value)]
+            ; cmp w16, u32::from(target.type_tag)
+            ; b.ne =>exit
+        );
+        if let Some(guard) = target.guard {
+            self.emit_body_guard(value, guard, exit);
+        }
+        if let Some(realm) = target.active_realm {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x16, [x20, THREAD_OFFSET]
+                ; ldr x16, [x16, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+                ; cbz x16, =>exit
+                ; ldr w16, [x16]
+            );
+            self.load_immediate(17, u64::from(realm));
+            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+        }
+        // `%Function.prototype%`, its shape, and the native in its `call`
+        // slot.
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            temp,
+            u64::from(target.proto_offset),
+            RelocationTarget::GuardedHeapReference {
+                component: crate::artifact::relocation::GuardedHeapComponent::Prototype,
+                byte_pc,
+                runtime_stub_id: abi::STUB_JIT_RESOLVE_METHOD.id,
+            },
+        );
+        let ordinary_mask = u32::from(otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and x16, X(value), #0xffff_ffff_0000_0000
+            ; add X(temp), X(temp), x16
+            ; ldrb w16, [X(temp), view.object_flags_byte]
+            ; tst w16, ordinary_mask
+            ; b.ne =>exit
+            ; ldr w16, [X(temp), view.object_shape_byte]
+        );
+        self.load_immediate(17, u64::from(lookup.holder_shape));
+        let slab = view.object_slab_handle_byte;
+        let words = view.object_slab_words_byte;
+        let inline = view.object_inline_values_byte;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w16, w17
+            ; b.ne =>exit
+            ; ldr w16, [X(temp), slab]
+            ; and x17, X(temp), #0xffff_ffff_0000_0000
+            ; orr x17, x17, x16
+            ; add x17, x17, words
+            ; cmp w16, #0
+            ; add x16, XSP(temp), inline
+            ; csel x16, x16, x17, eq
+            ; ldr X(temp), [x16, lookup.call_value_byte]
+        );
+        self.emit_native_identity(temp, native_ref, exit);
+        Ok(())
+    }
+
+    /// The method of the guarded method call at `byte_pc` into
+    /// `X(destination)`: the receiver `X(receiver)` has the guarded shape,
+    /// the prototype chain proof holds, and the method is the holder's slot.
+    /// Eager deopt unless `X(value)` is the function `function_id`: its
+    /// function-id immediate, or a closure of it that needs no runtime
+    /// setup.
+    fn emit_check_function(&mut self, node: NodeId, function_id: u32, cell: u64, value: u8) {
+        let exit = self.eager_exit(node, DeoptReason::WrongValue);
+        let proved = self.ops.new_dynamic_label();
+        let layout = self.view.closure_call_layout;
+        let cell_target = RelocationTarget::CalleeIdentityCell {
+            function_id,
+            call_pc: self.graph.node(node).pc,
+        };
+        if cell != 0 {
+            let start = self.ops.offset().0;
+            self.load_immediate(16, cell);
+            self.relocations
+                .record_mov_wide(start, self.ops.offset().0, 16, cell_target.clone());
+            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x16] ; cmp X(value), x16 ; b.eq =>proved);
+        }
+        self.load_immediate(16, tag::box_function_id(function_id));
+        dynasm!(self.ops ; .arch aarch64 ; cmp X(value), x16 ; b.eq =>proved);
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(value), x16
+            ; b.ne =>exit
+            ; cbz X(value), =>exit
+            ; ldrb w16, [X(value)]
+            ; cmp w16, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as u32
+            ; b.ne =>exit
+        );
+        if layout.runtime_setup_flags != 0 {
+            dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(value), layout.flags_byte]);
+            self.load_immediate(17, u64::from(layout.runtime_setup_flags));
+            dynasm!(self.ops ; .arch aarch64 ; tst w16, w17 ; b.ne =>exit);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(value), layout.function_id_byte]);
+        self.load_immediate(17, u64::from(function_id));
+        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+        if cell != 0 {
+            // The proved value is the one the next check compares first.
+            let start = self.ops.offset().0;
+            self.load_immediate(16, cell);
+            self.relocations
+                .record_mov_wide(start, self.ops.offset().0, 16, cell_target);
+            dynasm!(self.ops ; .arch aarch64 ; str X(value), [x16]);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>proved);
+    }
+
+    fn emit_load_guarded_method(
+        &mut self,
+        node: NodeId,
+        (byte_pc, target): (u32, u8),
+        receiver_proved: bool,
+        receiver: u8,
+        holder: u8,
+        destination: u8,
+    ) -> Result<(), Unsupported> {
+        let guard = self
+            .view_of(node)
+            .direct_methods
+            .get(&byte_pc)
+            .and_then(|methods| methods.get(usize::from(target)))
+            .map(|method| method.guard.clone())
+            .ok_or(Unsupported::OperandShape("graph guarded method"))?;
+        let exit = self.eager_exit(node, DeoptReason::WrongShape);
+        let view = self.view;
+        if !receiver_proved {
+            self.emit_ordinary_receiver(receiver, 0, exit);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr w16, [X(receiver), view.object_shape_byte]
+            );
+            self.load_immediate(17, u64::from(guard.recv_shape));
+            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+        }
+        if let Some(validity) = guard.prototype_validity {
+            crate::template::arm64::values::emit_prototype_validity_guard(
+                &mut self.ops,
+                &mut self.relocations,
+                validity,
+                holder,
+                exit,
+            );
+        }
+        if guard.holder_root == 0 {
+            dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
+        } else {
+            self.load_immediate(17, u64::from(guard.holder_root));
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; and x16, X(receiver), #0xffff_ffff_0000_0000
+                ; add x17, x16, x17
+                ; ldr W(holder), [x17, view.shape_prototype_byte]
+                ; add X(holder), x16, X(holder)
+            );
+        }
+        let slab = view.object_slab_handle_byte;
+        let words = view.object_slab_words_byte;
+        let inline = view.object_inline_values_byte;
+        let value_byte = guard.method_value_byte;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr w16, [X(holder), slab]
+            ; and x17, X(holder), #0xffff_ffff_0000_0000
+            ; orr x17, x17, x16
+            ; add x17, x17, words
+            ; cmp w16, #0
+            ; add x16, XSP(holder), inline
+            ; csel x16, x16, x17, eq
+        );
+        if value_byte <= 32760 && value_byte % 8 == 0 {
+            dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, value_byte]);
+        } else {
+            self.load_immediate(17, u64::from(value_byte));
+            dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, x17]);
+        }
+        Ok(())
+    }
+
+    /// The named store at `byte_pc` through its feedback programs. The
+    /// receiver in `X(receiver)` must be an ordinary object that no chain
+    /// proof subscribes to; each program then proves its shape and chain and
+    /// writes `X(value)` into an existing slot, or appends the slot within
+    /// the receiver's storage and publishes the child shape. No program
+    /// matching leaves through the eager deopt before any effect.
+    fn emit_store_named_property(
+        &mut self,
+        node: NodeId,
+        byte_pc: u32,
+        [receiver, value]: [u8; 2],
+        [holder, scratch]: [u8; 2],
+    ) -> Result<(), Unsupported> {
+        use otter_vm::JitCacheIrOp as Op;
+        let programs = self
+            .view_of(node)
+            .property_programs
+            .get(&byte_pc)
+            .ok_or(Unsupported::OperandShape("graph named store programs"))?
+            .clone();
+        let exit = self.eager_exit(node, DeoptReason::WrongShape);
+        let done = self.ops.new_dynamic_label();
+        let view = self.view;
+        let ordinary_mask = u32::from(otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK);
+        let link_mask = u32::from(otter_vm::jit::JIT_OBJECT_SHAPE_STATE_MASK);
+        let used_as_prototype = u32::from(otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE);
+        let extensible = u32::from(otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE);
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(receiver), x16
+            ; b.ne =>exit
+            ; ldrb w16, [X(receiver)]
+            ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+            ; b.ne =>exit
+            ; ldrb w16, [X(receiver), view.object_flags_byte]
+            ; tst w16, ordinary_mask | used_as_prototype
+            ; b.ne =>exit
+        );
+        for program in programs.iter() {
+            let next = self.ops.new_dynamic_label();
+            let transition = program
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::PublishShape { .. }));
+            let mut stored_byte = None;
+            for op in program.ops.iter() {
+                let object = |operand: u8| if operand == 0 { receiver } else { holder };
+                match *op {
+                    Op::LoadPrototypeHolder { root, .. } => {
+                        self.load_immediate(17, u64::from(root));
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; and x16, X(receiver), #0xffff_ffff_0000_0000
+                            ; add x17, x16, x17
+                            ; ldr W(holder), [x17, view.shape_prototype_byte]
+                            ; add X(holder), x16, X(holder)
+                        );
+                    }
+                    Op::GuardPrototypeValidity { validity } => {
+                        crate::template::arm64::values::emit_prototype_validity_guard(
+                            &mut self.ops,
+                            &mut self.relocations,
+                            validity,
+                            scratch,
+                            next,
+                        );
+                    }
+                    Op::GuardShape {
+                        object: operand,
+                        shape,
+                    } => {
+                        let header = object(operand);
+                        // A transition's chain link only has to keep its
+                        // shape authoritative for the keys it owns.
+                        let mask = if operand == 1 && transition {
+                            link_mask
+                        } else {
+                            ordinary_mask
+                        };
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; ldrb w16, [X(header), view.object_flags_byte]
+                            ; tst w16, mask
+                            ; b.ne =>next
+                            ; ldr w16, [X(header), view.object_shape_byte]
+                            ; cbz w16, =>next
+                        );
+                        self.load_immediate(17, u64::from(shape));
+                        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>next);
+                    }
+                    Op::GuardPrototypeNull { object: operand } => {
+                        let header = object(operand);
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; and x17, X(header), #0xffff_ffff_0000_0000
+                            ; ldr w16, [X(header), view.object_shape_byte]
+                            ; add x16, x17, x16
+                            ; ldr w16, [x16, view.shape_prototype_byte]
+                            ; cbnz w16, =>next
+                        );
+                    }
+                    Op::GuardAtomSlot { .. } => {
+                        // The receiver's shape guard proves the immutable
+                        // atom/slot mapping and the live override state.
+                    }
+                    Op::GuardExtensible { value_byte, .. } => {
+                        // The appended slot fits the storage the receiver
+                        // already has, and the receiver may still grow.
+                        let slot = value_byte / 8;
+                        let inline_storage = self.ops.new_dynamic_label();
+                        let fits = self.ops.new_dynamic_label();
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; ldr w16, [X(receiver), view.object_slab_handle_byte]
+                            ; cbz w16, =>inline_storage
+                            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+                            ; add x16, x17, x16
+                            ; ldr w16, [x16, view.object_slab_capacity_byte]
+                        );
+                        self.load_immediate(17, u64::from(slot));
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp w17, w16
+                            ; b.hs =>next
+                            ; b =>fits
+                            ; =>inline_storage
+                            ; ldrb w16, [X(receiver), view.object_inline_capacity_byte]
+                        );
+                        self.load_immediate(17, u64::from(slot));
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp w17, w16
+                            ; b.hs =>next
+                            ; =>fits
+                            ; ldrb w16, [X(receiver), view.object_flags_byte]
+                            ; tst w16, extensible
+                            ; b.eq =>next
+                        );
+                    }
+                    Op::StoreField { value_byte, .. } => {
+                        // Every guard has passed: the slot base, then the
+                        // value word.
+                        let slab = view.object_slab_handle_byte;
+                        let words = view.object_slab_words_byte;
+                        let inline = view.object_inline_values_byte;
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; ldr w16, [X(receiver), slab]
+                            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+                            ; orr x17, x17, x16
+                            ; add x17, x17, words
+                            ; cmp w16, #0
+                            ; add x16, XSP(receiver), inline
+                            ; csel X(scratch), x16, x17, eq
+                        );
+                        if value_byte <= 32760 {
+                            dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(scratch), value_byte]);
+                        } else {
+                            self.load_immediate(17, u64::from(value_byte));
+                            dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(scratch), x17]);
+                        }
+                        stored_byte = Some(value_byte);
+                    }
+                    Op::PublishShape { shape, .. } => {
+                        self.load_immediate(16, u64::from(shape));
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; str w16, [X(receiver), view.object_shape_byte]
+                        );
+                        self.emit_shape_child_barrier(node, receiver, shape, scratch);
+                    }
+                    _ => return Err(Unsupported::OperandShape("graph named store operation")),
+                }
+            }
+            if stored_byte.is_none() {
+                return Err(Unsupported::OperandShape(
+                    "graph named store without a store",
+                ));
+            }
+            dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
+        Ok(())
+    }
+
+    /// Leave `X(shape_address)` the decompressed hidden class of the
+    /// ordinary object in `X(receiver)` and `X(shape_id)` its table identity,
+    /// branching to `miss` for anything else or for a dictionary shape, which
+    /// no shared table entry names. `X(receiver)` must already be a proved
+    /// ordinary object.
+    fn emit_shape_identity(
+        &mut self,
+        receiver: u8,
+        [shape_address, shape_id]: [u8; 2],
+        shape_id_byte: u32,
+        miss: DynamicLabel,
+    ) {
+        let view = self.view;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and x16, X(receiver), #0xffff_ffff_0000_0000
+            ; ldr W(shape_address), [X(receiver), view.object_shape_byte]
+            ; add X(shape_address), x16, X(shape_address)
+            ; ldrb w17, [X(shape_address), view.shape_kind_byte]
+            ; tst w17, 1u32 << crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT
+            ; b.ne =>miss
+            ; ldr X(shape_id), [X(shape_address), shape_id_byte]
+        );
+    }
+
+    /// Branch to `miss` unless `X(receiver)` is an ordinary object whose
+    /// named lookup its shape fully describes.
+    fn emit_ordinary_receiver(&mut self, receiver: u8, extra_flags: u32, miss: DynamicLabel) {
+        let view = self.view;
+        let mask = u32::from(otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK) | extra_flags;
+        self.load_immediate(16, NOT_CELL_MASK);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(receiver), x16
+            ; b.ne =>miss
+            ; ldrb w16, [X(receiver)]
+            ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+            ; b.ne =>miss
+            ; ldrb w16, [X(receiver), view.object_flags_byte]
+            ; tst w16, mask
+            ; b.ne =>miss
+        );
+    }
+
+    /// `X(entry)` = the address of the shared-table bucket for the shape
+    /// identity in `X(shape_id)` and `atom`: `((id * Ms) ^ (atom * Ma)) >>
+    /// shift & mask`, scaled by `bucket_bytes`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_table_bucket(
+        &mut self,
+        shape_id: u8,
+        atom: u32,
+        [shape_multiplier, atom_multiplier]: [u64; 2],
+        hash_shift: u8,
+        index_mask: u32,
+        bucket_bytes: u64,
+        table: (usize, RelocationTarget),
+        entry: u8,
+    ) {
+        self.load_immediate(17, shape_multiplier);
+        dynasm!(self.ops ; .arch aarch64 ; mul X(entry), X(shape_id), x17);
+        self.load_immediate(17, u64::from(atom).wrapping_mul(atom_multiplier));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; eor X(entry), X(entry), x17
+            ; lsr X(entry), X(entry), u32::from(hash_shift)
+        );
+        self.load_immediate(17, u64::from(index_mask));
+        dynasm!(self.ops ; .arch aarch64 ; and X(entry), X(entry), x17);
+        self.load_immediate(17, bucket_bytes);
+        dynasm!(self.ops ; .arch aarch64 ; mul X(entry), X(entry), x17);
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            17,
+            table.0 as u64,
+            table.1,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; add X(entry), X(entry), x17);
+    }
+
+    /// `X(base)` = the slot storage of the ordinary object in `X(holder)`
+    /// when slot `X(slot)` lies inside it; `miss` otherwise.
+    fn emit_slot_storage(&mut self, holder: u8, slot: u8, base: u8, miss: DynamicLabel) {
+        let view = self.view;
+        let inline = self.ops.new_dynamic_label();
+        let ready = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr W(base), [X(holder), view.object_slab_handle_byte]
+            ; cbz W(base), =>inline
+            ; and x16, X(holder), #0xffff_ffff_0000_0000
+            ; add X(base), x16, X(base)
+            ; ldr w16, [X(base), view.object_slab_capacity_byte]
+            ; cmp W(slot), w16
+            ; b.hs =>miss
+            ; add XSP(base), XSP(base), view.object_slab_words_byte
+            ; b =>ready
+            ; =>inline
+            ; ldrb w16, [X(holder), view.object_inline_capacity_byte]
+            ; cmp W(slot), w16
+            ; b.hs =>miss
+            ; add XSP(base), XSP(holder), view.object_inline_values_byte
+            ; =>ready
+        );
+    }
+
+    /// `[[Get]]` of the load site at `pc` from `X(receiver)` into
+    /// `X(destination)`: an own or chain-proved inherited data slot the
+    /// isolate's shared lookup table names for `atom`, else the runtime.
+    fn emit_load_property_cached(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        atom: Option<u32>,
+        receiver: u8,
+        [shape_address, shape_id, entry, base]: [u8; 4],
+        destination: u8,
+    ) -> Result<(), Unsupported> {
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let cache = self.view.property_lookup_cache.filter(|cache| {
+            cache.table_addr != 0 && cache.entry_bytes != 0 && cache.hash_shift < 64
+        });
+        if let (Some(atom), Some(cache)) = (atom, cache) {
+            let holder_ready = self.ops.new_dynamic_label();
+            self.emit_ordinary_receiver(receiver, 0, slow);
+            self.emit_shape_identity(
+                receiver,
+                [shape_address, shape_id],
+                cache.shape_id_byte,
+                slow,
+            );
+            self.emit_table_bucket(
+                shape_id,
+                atom,
+                [cache.hash_shape_multiplier, cache.hash_atom_multiplier],
+                cache.hash_shift,
+                cache.index_mask,
+                u64::from(cache.entry_bytes),
+                (cache.table_addr, RelocationTarget::PropertyLookupCacheTable),
+                entry,
+            );
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x16, [X(entry), cache.receiver_shape_id_byte]
+                ; cmp x16, X(shape_id)
+                ; b.ne =>slow
+                ; ldr w16, [X(entry), cache.atom_byte]
+            );
+            self.load_immediate(17, u64::from(atom));
+            let view = self.view;
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w16, w17
+                ; b.ne =>slow
+                ; ldrb w16, [X(entry), cache.is_data_byte]
+                ; cmp w16, #1
+                ; b.ne =>slow
+                ; ldrb w16, [X(entry), cache.hops_byte]
+                ; cmp w16, #1
+                ; b.hi =>slow
+                ; mov X(shape_address), X(receiver)
+                ; cbz w16, =>holder_ready
+                // One hop: the chain proof, then the holder its pinned
+                // instance-root shape names.
+                ; ldr x16, [X(entry), cache.validity_byte]
+                ; cbz x16, =>slow
+                ; ldar w16, [x16]
+                ; cbz w16, =>slow
+                ; and x17, X(receiver), #0xffff_ffff_0000_0000
+                ; ldr w16, [X(entry), cache.holder_root_byte]
+                ; add x16, x17, x16
+                ; ldr W(shape_address), [x16, view.shape_prototype_byte]
+                ; add X(shape_address), x17, X(shape_address)
+                ; =>holder_ready
+                ; ldrh W(shape_id), [X(entry), cache.slot_byte]
+            );
+            self.emit_slot_storage(shape_address, shape_id, base, slow);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr X(destination), [X(base), X(shape_id), lsl #3]
+                ; b =>done
+            );
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b =>slow);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>slow);
+        self.emit_property_runtime(
+            node,
+            pc,
+            crate::artifact::relocation::PropertySourceAccess::Load,
+            [receiver, receiver],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    /// `[[Set]]` of `X(value)` at the store site at `pc` on `X(receiver)`:
+    /// an existing writable own slot the shared lookup table names for
+    /// `atom`, or an add transition the shared transition table names, else
+    /// the runtime.
+    fn emit_store_property_cached(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        atom: Option<u32>,
+        [receiver, value]: [u8; 2],
+        [shape_address, shape_id, entry, base]: [u8; 4],
+    ) -> Result<(), Unsupported> {
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let used_as_prototype = u32::from(otter_vm::jit::JIT_OBJECT_FLAG_USED_AS_PROTOTYPE);
+        let lookup = self.view.property_lookup_cache.filter(|cache| {
+            cache.table_addr != 0 && cache.entry_bytes != 0 && cache.hash_shift < 64
+        });
+        let transitions = self.view.store_transition_cache.filter(|cache| {
+            cache.table_addr != 0
+                && cache.entry_bytes != 0
+                && cache.entry_bytes < 4096
+                && cache.ways != 0
+                && cache.ways <= u32::from(u16::MAX)
+                && cache.hash_shift < 64
+        });
+        let view = self.view;
+        if let (Some(atom), Some(cache)) = (atom, lookup) {
+            let transition = self.ops.new_dynamic_label();
+            self.emit_ordinary_receiver(receiver, used_as_prototype, slow);
+            self.emit_shape_identity(
+                receiver,
+                [shape_address, shape_id],
+                cache.shape_id_byte,
+                slow,
+            );
+            self.emit_table_bucket(
+                shape_id,
+                atom,
+                [cache.hash_shape_multiplier, cache.hash_atom_multiplier],
+                cache.hash_shift,
+                cache.index_mask,
+                u64::from(cache.entry_bytes),
+                (cache.table_addr, RelocationTarget::PropertyLookupCacheTable),
+                entry,
+            );
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x16, [X(entry), cache.receiver_shape_id_byte]
+                ; cmp x16, X(shape_id)
+                ; b.ne =>transition
+                ; ldr w16, [X(entry), cache.atom_byte]
+            );
+            self.load_immediate(17, u64::from(atom));
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w16, w17
+                ; b.ne =>transition
+                ; ldrb w16, [X(entry), cache.hops_byte]
+                ; cbnz w16, =>transition
+                ; ldrb w16, [X(entry), cache.is_data_byte]
+                ; cmp w16, #1
+                ; b.ne =>transition
+                ; ldrb w16, [X(entry), cache.is_writable_byte]
+                ; cmp w16, #1
+                ; b.ne =>transition
+                // The entry's holder shape is the receiver's own.
+                ; ldr w16, [X(entry), cache.holder_shape_byte]
+                ; cbz w16, =>transition
+                ; ldr w17, [X(receiver), view.object_shape_byte]
+                ; cmp w16, w17
+                ; b.ne =>transition
+                ; ldrh W(shape_id), [X(entry), cache.slot_byte]
+            );
+            self.emit_slot_storage(receiver, shape_id, base, transition);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; str X(value), [X(base), X(shape_id), lsl #3]
+                ; b =>done
+                ; =>transition
+            );
+            if let Some(cache) = transitions {
+                // The receiver is a proved ordinary non-prototype object.
+                let way = self.ops.new_dynamic_label();
+                let next_way = self.ops.new_dynamic_label();
+                let found = self.ops.new_dynamic_label();
+                let chain_done = self.ops.new_dynamic_label();
+                self.emit_shape_identity(
+                    receiver,
+                    [shape_address, shape_id],
+                    cache.shape_id_byte,
+                    slow,
+                );
+                self.emit_table_bucket(
+                    shape_id,
+                    atom,
+                    [cache.hash_shape_multiplier, cache.hash_atom_multiplier],
+                    cache.hash_shift,
+                    cache.index_mask,
+                    u64::from(cache.entry_bytes) * u64::from(cache.ways),
+                    (
+                        cache.table_addr,
+                        RelocationTarget::StoreTransitionCacheTable,
+                    ),
+                    entry,
+                );
+                // Probe the set's ways in recording order; `X(entry)` ends on
+                // the match.
+                self.load_immediate(17, u64::from(atom));
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; movz W(base), cache.ways
+                    ; =>way
+                    ; ldr x16, [X(entry), cache.receiver_shape_byte]
+                    ; cmp x16, X(shape_id)
+                    ; b.ne =>next_way
+                    ; ldr w16, [X(entry), cache.atom_byte]
+                    ; cmp w16, w17
+                    ; b.eq =>found
+                    ; =>next_way
+                    ; add XSP(entry), XSP(entry), cache.entry_bytes
+                    ; subs W(base), WSP(base), #1
+                    ; b.ne =>way
+                    ; b =>slow
+                    ; =>found
+                    ; ldr w16, [X(entry), cache.target_shape_byte]
+                    ; cbz w16, =>slow
+                    ; ldr x16, [X(entry), cache.validity_byte]
+                    ; cbz x16, =>chain_done
+                    ; ldar w16, [x16]
+                    ; cbz w16, =>slow
+                    ; =>chain_done
+                    ; ldrb w16, [X(receiver), view.object_flags_byte]
+                    ; tst w16, u32::from(otter_vm::jit::JIT_OBJECT_FLAG_EXTENSIBLE)
+                    ; b.eq =>slow
+                    // The matched receiver shape has exactly `slot` slots:
+                    // the append index is its property count.
+                    ; ldrh W(shape_id), [X(entry), cache.slot_byte]
+                );
+                self.emit_slot_storage(receiver, shape_id, base, slow);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; str X(value), [X(base), X(shape_id), lsl #3]
+                    ; ldr W(shape_id), [X(entry), cache.target_shape_byte]
+                    ; str W(shape_id), [X(receiver), view.object_shape_byte]
+                );
+                self.emit_dynamic_shape_child_barrier(node, receiver, shape_id, shape_address);
+                dynasm!(self.ops ; .arch aarch64 ; b =>done);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; b =>slow);
+            }
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b =>slow);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>slow);
+        self.emit_property_runtime(
+            node,
+            pc,
+            crate::artifact::relocation::PropertySourceAccess::Store,
+            [receiver, value],
+            None,
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    /// The full property operation at `pc` in the runtime, with every live
+    /// register saved in a rooted snapshot slot around the call: the load
+    /// stub from `X(receiver)` into `X(destination)`, or the store stub of
+    /// `X(value)`. A throw leaves through the node's throw routing.
+    fn emit_property_runtime(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        access: crate::artifact::relocation::PropertySourceAccess,
+        [receiver, value]: [u8; 2],
+        destination: Option<u8>,
+    ) -> Result<(), Unsupported> {
+        use crate::artifact::relocation::PropertySourceAccess;
+        let function_id = self.view_of(node).code_block.id;
+        let (cell_address, ordinal, stub) = match access {
+            PropertySourceAccess::Load => {
+                let ordinal = self.next_load_ic;
+                let cell = self
+                    .load_ic_cells
+                    .get_mut(ordinal)
+                    .ok_or(Unsupported::OperandShape("graph load property cell"))?;
+                cell.set_source(function_id, pc);
+                self.next_load_ic += 1;
+                (
+                    cell as *mut crate::entry::PropertySourceCell as u64,
+                    ordinal,
+                    abi::STUB_JIT_LOAD_PROPERTY,
+                )
+            }
+            PropertySourceAccess::Store => {
+                let ordinal = self.next_store_ic;
+                let cell = self
+                    .store_ic_cells
+                    .get_mut(ordinal)
+                    .ok_or(Unsupported::OperandShape("graph store property cell"))?;
+                cell.set_source(function_id, pc);
+                self.next_store_ic += 1;
+                (
+                    cell as *mut crate::entry::PropertySourceCell as u64,
+                    ordinal,
+                    abi::STUB_JIT_STORE_PROPERTY,
+                )
+            }
+        };
+        let values: &[u8] = match access {
+            PropertySourceAccess::Load => &[receiver],
+            PropertySourceAccess::Store => &[receiver, value],
+        };
+        self.emit_committed_call(
+            node,
+            stub,
+            values,
+            Some((
+                cell_address,
+                RelocationTarget::PropertySourceCell {
+                    access,
+                    ordinal: ordinal as u32,
+                },
+            )),
+            destination,
+        );
+        Ok(())
+    }
+
+    /// Call the committed runtime entry `stub` with the context, the values
+    /// in `values` and then `immediate`, with every live register saved in a
+    /// rooted snapshot slot around the call and the node's own safepoint and
+    /// position published. The result goes to `X(destination)`; a thrown
+    /// exception leaves through the node's throw routing, any other abrupt
+    /// completion is an engine failure.
+    fn emit_committed_call(
+        &mut self,
+        node: NodeId,
+        stub: abi::RuntimeStubDescriptor,
+        values: &[u8],
+        immediate: Option<(u64, RelocationTarget)>,
+        destination: Option<u8>,
+    ) {
+        debug_assert!(values.len() <= 2, "two values pass through x16/x17");
+        let live = self.allocation.node(node).live_registers.clone();
+        let mut roots = self
+            .allocation
+            .node(node)
+            .gc_roots
+            .clone()
+            .expect("a collecting node has its roots");
+        for &(location, repr) in &live {
+            let slot = self.slots.snapshot_slot(location, repr);
+            self.emit_move(location, slot);
+            if let Location::TaggedSlot(index) = slot {
+                roots.push(index);
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        self.stamp_safepoint(node, roots);
+        let outer_pc = self.graph.outer_pc(node);
+        self.load_immediate(16, u64::from(outer_pc));
+        dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
+        // The values may sit in the argument registers they move between.
+        for (index, &value) in values.iter().enumerate() {
+            dynasm!(self.ops ; .arch aarch64 ; mov X(16 + index as u8), X(value));
+        }
+        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+        for index in 0..values.len() {
+            dynasm!(self.ops ; .arch aarch64 ; mov X(1 + index as u8), X(16 + index as u8));
+        }
+        if let Some((bits, target)) = immediate {
+            let register = 1 + values.len() as u8;
+            let start = self.ops.offset().0;
+            self.load_immediate(register, bits);
+            self.relocations
+                .record_mov_wide(start, self.ops.offset().0, register, target);
+        }
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            self.transitions.entry(stub),
+            RelocationTarget::runtime_stub(stub),
+        );
+        // An abrupt completion leaves while the live values are still in
+        // their snapshot slots, which its frame rebuild reads them from.
+        let snapshot_locations: Box<[Location]> = {
+            let state_values = self
+                .graph
+                .node(node)
+                .eager
+                .map(|state| self.graph.state_values(state))
+                .unwrap_or_default();
+            self.allocation
+                .node(node)
+                .eager
+                .iter()
+                .zip(state_values)
+                .map(|(&location, value)| match location {
+                    Location::Gp(_) | Location::Fp(_) => self
+                        .slots
+                        .snapshot_slot(location, self.graph.node(value).repr),
+                    other => other,
+                })
+                .collect()
+        };
+        let (_, committed_throw) = self.throw_targets_at(node, Some(snapshot_locations));
+        let committed_throw = self.cond_target(committed_throw);
+        let fatal = self.cond_target(self.fatal);
+        let error = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; cbnz x1, =>error);
+        // The result waits on the stack while the live registers come back
+        // from their snapshot slots.
+        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, #-16]!);
+        self.sp_delta += 16;
+        for &(location, repr) in &live {
+            let slot = self.slots.snapshot_slot(location, repr);
+            self.emit_move(slot, location);
+        }
+        match destination {
+            Some(destination) => {
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [sp], #16);
+            }
+            None => dynasm!(self.ops ; .arch aarch64 ; add sp, sp, #16),
+        }
+        self.sp_delta -= 16;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b =>done
+            ; =>error
+            ; cmp x1, NativeResultStatus::Throw as u32
+            ; b.ne =>fatal
+            ; b =>committed_throw
+            ; =>done
+        );
+    }
+
+    /// `X(destination)` = `X(value) instanceof X(target)`. A target that is
+    /// an ordinary closure without symbol-keyed own properties uses the
+    /// default `@@hasInstance`, OrdinaryHasInstance: its `prototype` (an
+    /// ordinary object) is searched on the value's prototype chain, a
+    /// primitive answers false. Every other case, an opaque chain link and a
+    /// chain longer than the walk bound complete in the runtime.
+    fn emit_instanceof(
+        &mut self,
+        node: NodeId,
+        [value, target]: [u8; 2],
+        [cage, rare, prototype, cursor, budget]: [u8; 5],
+        destination: u8,
+    ) {
+        use crate::template::arm64::values::{CellTest, emit_cell_test};
+        let view = self.view;
+        let layout = view.closure_call_layout;
+        let yes = self.ops.new_dynamic_label();
+        let no = self.ops.new_dynamic_label();
+        let miss = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let walk = self.ops.new_dynamic_label();
+        let step = self.ops.new_dynamic_label();
+        let symbols_absent = self.ops.new_dynamic_label();
+        if view.cage_base == 0 || layout.prototype_byte == 0 {
+            dynasm!(self.ops ; .arch aarch64 ; b =>miss);
+        } else {
+            let named_lookup = otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE;
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                cage,
+                view.cage_base as u64,
+                RelocationTarget::GcCageBase,
+            );
+            // Target: an ordinary closure whose own properties hold no
+            // `@@hasInstance` override.
+            emit_cell_test(&mut self.ops, target, 16, CellTest::IsNotCell, miss);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbz X(target), =>miss
+                ; mov w16, W(target)
+                ; add X(rare), X(cage), x16
+                ; ldrb w16, [X(rare)]
+                ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
+                ; b.ne =>miss
+                ; ldrb w16, [X(rare), named_lookup]
+                ; and w16, w16, !u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
+                ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
+                ; b.ne =>miss
+                // `prototype` lives in the rare record; without one, or
+                // while it holds the hole, the runtime allocates it.
+                ; ldr W(rare), [X(rare), layout.rare_byte]
+                ; cbz W(rare), =>miss
+                ; add X(rare), X(cage), X(rare)
+                ; ldr w16, [X(rare), layout.own_props_byte]
+                ; cbz w16, =>symbols_absent
+                ; add x16, X(cage), x16
+                ; ldr w16, [x16, view.object_exotic_handle_byte]
+                ; cbz w16, =>symbols_absent
+                ; add x16, X(cage), x16
+                ; ldr w16, [x16, otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE]
+                ; cbnz w16, =>miss
+                ; =>symbols_absent
+                ; ldr X(prototype), [X(rare), layout.prototype_byte]
+            );
+            // The prototype must be an ordinary object; anything else throws.
+            emit_cell_test(&mut self.ops, prototype, 16, CellTest::IsNotCell, miss);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbz X(prototype), =>miss
+                ; mov w16, W(prototype)
+                ; add X(prototype), X(cage), x16
+                ; ldrb w16, [X(prototype)]
+                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+                ; b.ne =>miss
+            );
+            // Value: a non-cell answers false, a primitive cell answers
+            // false, an ordinary object is walked, any other cell misses.
+            emit_cell_test(&mut self.ops, value, 16, CellTest::IsNotCell, no);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbz X(value), =>miss
+                ; mov w16, W(value)
+                ; add X(cursor), X(cage), x16
+                ; ldrb w16, [X(cursor)]
+                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+                ; b.eq =>walk
+            );
+            for primitive_tag in view.primitive_cell_type_tags {
+                dynasm!(self.ops ; .arch aarch64 ; cmp w16, u32::from(primitive_tag) ; b.eq =>no);
+            }
+            let opaque = otter_vm::jit::JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE.trailing_zeros();
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; b =>miss
+                ; =>walk
+                ; movz W(budget), INSTANCEOF_CHAIN_BOUND
+                ; =>step
+                ; ldrb w16, [X(cursor), view.object_flags_byte]
+                ; tst w16, 1u32 << opaque
+                ; b.ne =>miss
+            );
+            crate::template::arm64::values::emit_load_prototype(
+                &mut self.ops,
+                view,
+                16,
+                cursor,
+                cage,
+            );
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbz w16, =>no
+                ; add X(cursor), X(cage), x16
+                ; cmp X(cursor), X(prototype)
+                ; b.eq =>yes
+                ; ldrb w16, [X(cursor)]
+                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+                ; b.ne =>miss
+                ; subs W(budget), WSP(budget), #1
+                ; b.ne =>step
+                ; b =>miss
+            );
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>yes);
+        self.load_immediate(destination, otter_vm::Value::boolean(true).to_bits());
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>no);
+        self.load_immediate(destination, otter_vm::Value::boolean(false).to_bits());
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>miss);
+        self.emit_committed_call(
+            node,
+            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+            &[value, target],
+            None,
+            Some(destination),
+        );
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+    }
+
+    /// [`Self::emit_shape_child_barrier`] for a child shape whose compressed
+    /// handle is in `W(shape)`; `X(child)` is clobbered.
+    fn emit_dynamic_shape_child_barrier(
+        &mut self,
+        node: NodeId,
+        receiver: u8,
+        shape: u8,
+        child: u8,
+    ) {
+        let flags_byte = self.view.gc_barrier.header_flags_byte;
+        let young = self.view.gc_barrier.young_flag;
+        let settled = young | self.view.gc_barrier.remembered_flag;
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and XSP(child), X(receiver), #0xffff_ffff_0000_0000
+            ; add X(child), X(child), X(shape)
+            ; ldr x16, [x20, THREAD_OFFSET]
+            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+            ; ldrb w16, [x16]
+            ; cbnz w16, =>slow
+            ; ldrb w16, [X(receiver), flags_byte]
+            ; movz w17, u32::from(settled)
+            ; tst w16, w17
+            ; b.ne =>done
+            ; ldrb w16, [X(child), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne =>slow
+            ; =>done
+        );
+        let live = self.allocation.node(node).live_registers.clone();
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x16, X(receiver)
+                    ; mov x17, X(child)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    ; mov x1, x16
+                    ; mov x2, x17
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
+    }
+
+    /// The generational and marking barrier for the edge from the receiver
+    /// to the child shape a transition just published.
+    fn emit_shape_child_barrier(&mut self, node: NodeId, receiver: u8, shape: u32, child: u8) {
+        let flags_byte = self.view.gc_barrier.header_flags_byte;
+        let young = self.view.gc_barrier.young_flag;
+        let settled = young | self.view.gc_barrier.remembered_flag;
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.load_immediate(17, u64::from(shape));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and XSP(child), X(receiver), #0xffff_ffff_0000_0000
+            ; add X(child), X(child), x17
+            ; ldr x16, [x20, THREAD_OFFSET]
+            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+            ; ldrb w16, [x16]
+            ; cbnz w16, =>slow
+            ; ldrb w16, [X(receiver), flags_byte]
+            ; movz w17, u32::from(settled)
+            ; tst w16, w17
+            ; b.ne =>done
+            ; ldrb w16, [X(child), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne =>slow
+            ; =>done
+        );
+        let live = self.allocation.node(node).live_registers.clone();
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x16, X(receiver)
+                    ; mov x17, X(child)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                    ; mov x1, x16
+                    ; mov x2, x17
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
+    }
+
+    /// The named load at `byte_pc` through its feedback programs: each
+    /// proves the receiver in `X(receiver)` and reads one data slot of it or
+    /// of its holder; the first program that matches delivers the value to
+    /// `X(destination)`, and none matching leaves through the eager deopt.
+    fn emit_load_named_property(
+        &mut self,
+        node: NodeId,
+        byte_pc: u32,
+        receiver: u8,
+        [holder, scratch]: [u8; 2],
+        destination: u8,
+    ) -> Result<(), Unsupported> {
+        use otter_vm::JitCacheIrOp as Op;
+        let programs = self
+            .view_of(node)
+            .property_programs
+            .get(&byte_pc)
+            .ok_or(Unsupported::OperandShape("graph named load programs"))?
+            .clone();
+        let exit = self.eager_exit(node, DeoptReason::WrongShape);
+        let done = self.ops.new_dynamic_label();
+        let ordinary_mask = u32::from(otter_vm::jit::JIT_OBJECT_ORDINARY_LOOKUP_MASK);
+        for program in programs.iter() {
+            let next = self.ops.new_dynamic_label();
+            for op in program.ops.iter() {
+                let object = |operand: u8| if operand == 0 { receiver } else { holder };
+                match *op {
+                    Op::LoadIntrinsicPrototype { target, .. } => {
+                        self.load_immediate(16, NOT_CELL_MASK);
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; tst X(receiver), x16
+                            ; b.ne =>next
+                            ; cbz X(receiver), =>next
+                            ; ldrb w16, [X(receiver)]
+                            ; cmp w16, u32::from(target.type_tag)
+                            ; b.ne =>next
+                        );
+                        if let Some(guard) = target.guard {
+                            self.emit_body_guard(receiver, guard, next);
+                        }
+                        if let Some(realm) = target.active_realm {
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; ldr x16, [x20, THREAD_OFFSET]
+                                ; ldr x16, [x16, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+                                ; cbz x16, =>next
+                                ; ldr w16, [x16]
+                            );
+                            self.load_immediate(17, u64::from(realm));
+                            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>next);
+                        }
+                        // The pinned prototype: cage base plus its offset.
+                        emit_load_symbol_u64(
+                            &mut self.ops,
+                            &mut self.relocations,
+                            holder,
+                            u64::from(target.proto_offset),
+                            RelocationTarget::GuardedHeapReference {
+                                component:
+                                    crate::artifact::relocation::GuardedHeapComponent::Prototype,
+                                byte_pc,
+                                runtime_stub_id: abi::STUB_JIT_LOAD_PROPERTY.id,
+                            },
+                        );
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; and x16, X(receiver), #0xffff_ffff_0000_0000
+                            ; add X(holder), X(holder), x16
+                        );
+                    }
+                    Op::LoadPrototypeHolder { root, .. } => {
+                        // The holder the pinned instance-root shape names.
+                        self.load_immediate(17, u64::from(root));
+                        let prototype = self.view.shape_prototype_byte;
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; and x16, X(receiver), #0xffff_ffff_0000_0000
+                            ; add x17, x16, x17
+                            ; ldr W(holder), [x17, prototype]
+                            ; add X(holder), x16, X(holder)
+                        );
+                    }
+                    Op::GuardPrototypeValidity { validity } => {
+                        crate::template::arm64::values::emit_prototype_validity_guard(
+                            &mut self.ops,
+                            &mut self.relocations,
+                            validity,
+                            scratch,
+                            next,
+                        );
+                    }
+                    Op::GuardShape {
+                        object: operand,
+                        shape,
+                    } => {
+                        let header = object(operand);
+                        if operand == 0 {
+                            self.load_immediate(16, NOT_CELL_MASK);
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; tst X(header), x16
+                                ; b.ne =>next
+                                ; ldrb w16, [X(header)]
+                                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+                                ; b.ne =>next
+                            );
+                        }
+                        let flags = self.view.object_flags_byte;
+                        let shape_byte = self.view.object_shape_byte;
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; ldrb w16, [X(header), flags]
+                            ; tst w16, ordinary_mask
+                            ; b.ne =>next
+                            ; ldr w16, [X(header), shape_byte]
+                            ; cbz w16, =>next
+                        );
+                        self.load_immediate(17, u64::from(shape));
+                        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>next);
+                    }
+                    Op::GuardDictionaryLayout { layout, .. } => {
+                        let shape_byte = self.view.object_shape_byte;
+                        let kind_byte = self.view.shape_kind_byte;
+                        let exotic_byte = self.view.object_exotic_handle_byte;
+                        let layout_byte = self.view.exotic_dictionary_layout_byte;
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; and x17, X(holder), #0xffff_ffff_0000_0000
+                            ; ldr w16, [X(holder), shape_byte]
+                            ; add x16, x17, x16
+                            ; ldrb w16, [x16, kind_byte]
+                            ; tst w16, 1u32 << crate::template::arm64::values::SHAPE_KIND_DICTIONARY_BIT
+                            ; b.eq =>next
+                            ; ldr w16, [X(holder), exotic_byte]
+                            ; cbz w16, =>next
+                            ; add x16, x17, x16
+                            ; ldr w16, [x16, layout_byte]
+                        );
+                        self.load_immediate(17, layout);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>next);
+                    }
+                    Op::GuardAtomSlot { .. } => {
+                        // The shape guard before it already proved no
+                        // object-local state overrides the slot; the atom's
+                        // slot is immutable in that shape.
+                    }
+                    Op::LoadField {
+                        object: operand,
+                        value_byte,
+                    } => {
+                        let header = object(operand);
+                        let slab = self.view.object_slab_handle_byte;
+                        let words = self.view.object_slab_words_byte;
+                        let inline = self.view.object_inline_values_byte;
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; ldr w16, [X(header), slab]
+                            ; and x17, X(header), #0xffff_ffff_0000_0000
+                            ; orr x17, x17, x16
+                            ; add x17, x17, words
+                            ; cmp w16, #0
+                            ; add x16, XSP(header), inline
+                            ; csel x16, x16, x17, eq
+                        );
+                        if value_byte <= 32760 && value_byte % 8 == 0 {
+                            dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, value_byte]);
+                        } else {
+                            self.load_immediate(17, u64::from(value_byte));
+                            dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, x17]);
+                        }
+                        dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                    }
+                    _ => return Err(Unsupported::OperandShape("graph named load operation")),
+                }
+            }
+            dynasm!(self.ops ; .arch aarch64 ; =>next);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
+        Ok(())
+    }
+
     /// Branch to `exit` unless the body word `guard` names holds its
     /// expected value.
     fn emit_body_guard(&mut self, receiver: u8, guard: JitBodyGuard, exit: DynamicLabel) {
@@ -2081,11 +3638,23 @@ impl<'a> Codegen<'a> {
     /// call); its inputs are stored into their window registers first.
     /// Name, in the frame record, the safepoint that roots `slots` while the
     /// next call runs: the collector traces exactly those tagged slots.
-    fn stamp_safepoint(&mut self, slots: Vec<u32>) {
-        let id = match self.site_ids.get(&slots) {
-            Some(&id) => id,
+    fn stamp_safepoint(&mut self, node: NodeId, slots: Vec<u32>) {
+        // A point inside an inlined body names the frames it runs in, so
+        // stack walks and runtime operations see the callee's position.
+        let inline_frames = self.inline_frames(node);
+        let call_pc = if inline_frames.is_empty() {
+            NO_CALL_PC
+        } else {
+            self.graph.outer_pc(node)
+        };
+        let shared = inline_frames
+            .is_empty()
+            .then(|| self.site_ids.get(&slots).copied())
+            .flatten();
+        let id = match shared {
+            Some(id) => id,
             None => {
-                let id = SLOT_SAFEPOINT - 1 - self.site_records.len() as abi::SafepointId;
+                let id = FIRST_SITE_SAFEPOINT - self.site_records.len() as abi::SafepointId;
                 self.site_records.push(SafepointRecord {
                     id,
                     frame_state: NO_FRAME_STATE,
@@ -2096,10 +3665,12 @@ impl<'a> Codegen<'a> {
                             index: index as u16,
                         })
                         .collect(),
-                    inline_frames: Box::new([]),
-                    call_pc: NO_CALL_PC,
+                    call_pc,
+                    inline_frames,
                 });
-                self.site_ids.insert(slots, id);
+                if call_pc == NO_CALL_PC {
+                    self.site_ids.insert(slots, id);
+                }
                 id
             }
         };
@@ -2119,7 +3690,42 @@ impl<'a> Codegen<'a> {
             .gc_roots
             .clone()
             .expect("a call node has its roots");
-        self.stamp_safepoint(slots);
+        self.stamp_safepoint(node, slots);
+    }
+
+    /// The inlined frames `node` runs in, outermost first: each body's
+    /// function standing on its call into the next, the innermost at the
+    /// node's own instruction. Empty for a node of the compiled function.
+    fn inline_frames(&self, node: NodeId) -> Box<[DeoptFrame<Option<u16>>]> {
+        let data = self.graph.node(node);
+        let mut frames = Vec::new();
+        let mut origin = data.origin;
+        let mut byte_pc = self
+            .view_of(node)
+            .instructions
+            .get(data.pc as usize)
+            .map_or(0, |instruction| instruction.byte_pc);
+        while origin != 0 {
+            let body = self.graph.inlined[usize::from(origin) - 1];
+            frames.push(DeoptFrame {
+                function_id: body.function_id,
+                byte_pc,
+                entry: None,
+                slots: Box::new([]),
+            });
+            byte_pc = body.call_byte_pc;
+            origin = body.parent;
+        }
+        frames.reverse();
+        frames.into_boxed_slice()
+    }
+
+    /// The snapshot of the body `node` belongs to.
+    fn view_of(&self, node: NodeId) -> &'a JitCompileSnapshot {
+        match self.graph.node(node).origin {
+            0 => self.view,
+            origin => &self.inline_views[usize::from(origin) - 1],
+        }
     }
 
     /// `[[Call]]` of the callee in `x1` (its `[[Construct]]` with itself as
@@ -2135,15 +3741,21 @@ impl<'a> Codegen<'a> {
         pc: u32,
         plan: Option<otter_vm::jit::JitDirectCallPlan>,
         construct: bool,
+        receiver: bool,
+        allocation: Option<otter_vm::jit::JitReceiverAllocationPlan>,
     ) -> Result<(), Unsupported> {
-        // `new.target` is the callee itself, already in `x1`.
+        // `new.target` is the callee itself, already in `x1`; an explicit
+        // receiver is in `x2`.
         let new_target = construct.then_some(1);
+        let receiver_register = receiver.then_some(2);
+        let first_argument = if receiver { 2 } else { 1 };
         use crate::arm64::js_call::{CallTarget, emit_call, emit_enter_staged};
         self.stamp_node_safepoint(node);
-        self.load_immediate(16, u64::from(pc));
+        let outer_pc = self.graph.outer_pc(node);
+        self.load_immediate(16, u64::from(outer_pc));
         dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
         let inputs = self.allocation.node(node).inputs.clone();
-        let arguments = &inputs[1..];
+        let arguments = &inputs[first_argument..];
         let count = u32::try_from(arguments.len())
             .map_err(|_| Unsupported::OperandShape("call actual count"))?;
         let pushed = plan.map_or(arguments.len(), |plan| {
@@ -2162,13 +3774,42 @@ impl<'a> Codegen<'a> {
                 pc,
                 generic,
             );
+            // The proven constructor's receiver, allocated before it is
+            // entered; a probe miss leaves it to the constructor. The callee
+            // stays in `x9`, which the probe does not touch, and nothing
+            // between allocation and the call can collect.
+            let known_receiver = if let Some(allocation) = allocation {
+                let missed = self.ops.new_dynamic_label();
+                let allocated = self.ops.new_dynamic_label();
+                dynasm!(self.ops ; .arch aarch64 ; mov x2, x9);
+                crate::arm64::emit_receiver_candidate_probe(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    self.view,
+                    allocation,
+                    20,
+                );
+                dynasm!(self.ops ; .arch aarch64 ; cbz x1, =>missed);
+                crate::arm64::emit_receiver_publication_effect(&mut self.ops, self.view, 20);
+                dynasm!(self.ops ; .arch aarch64 ; b =>allocated ; =>missed);
+                self.load_immediate(0, VALUE_UNDEFINED);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; =>allocated
+                    ; mov x2, x0
+                    ; mov x1, x9
+                );
+                Some(2)
+            } else {
+                receiver_register
+            };
             emit_call(
                 &mut self.ops,
                 &mut self.relocations,
                 self.transitions,
                 20,
                 1,
-                None,
+                known_receiver,
                 new_target,
                 count,
                 CallTarget::Known {
@@ -2185,14 +3826,14 @@ impl<'a> Codegen<'a> {
             self.transitions,
             20,
             1,
-            None,
+            receiver_register,
             new_target,
             count,
             CallTarget::Generic,
         );
         dynasm!(self.ops ; .arch aarch64 ; =>returned);
         self.emit_pop_actuals(bytes);
-        let (threw, committed_throw) = self.throw_targets(node, pc);
+        let (threw, committed_throw) = self.throw_targets(node);
         let threw = self.cond_target(threw);
         let committed_throw = self.cond_target(committed_throw);
         let completion = self.ops.new_dynamic_label();
@@ -2254,9 +3895,20 @@ impl<'a> Codegen<'a> {
     /// region the frame may catch, paths that first rebuild the interpreter
     /// frame so the interpreter enters the handler. The first label takes a
     /// parked error, the second an exception in `x0`.
-    fn throw_targets(&mut self, node: NodeId, pc: u32) -> (DynamicLabel, DynamicLabel) {
-        if self.in_exception_region(pc) {
+    fn throw_targets(&mut self, node: NodeId) -> (DynamicLabel, DynamicLabel) {
+        self.throw_targets_at(node, None)
+    }
+
+    /// [`Self::throw_targets`] for a point where the node's eager values
+    /// are at `locations` rather than where the allocator put them.
+    fn throw_targets_at(
+        &mut self,
+        node: NodeId,
+        locations: Option<Box<[Location]>>,
+    ) -> (DynamicLabel, DynamicLabel) {
+        if self.in_exception_region(self.graph.outer_pc(node)) {
             let index = self.exit_index(node, ExitReason::RuntimeTransition, ExitAction::Resume);
+            self.exits[index as usize].locations = locations;
             let threw = self.ops.new_dynamic_label();
             let committed_throw = self.ops.new_dynamic_label();
             let shared_threw = self.threw;
@@ -2310,7 +3962,7 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; str X(source), [x19, x17]);
             }
         }
-        let (threw, committed_throw) = self.throw_targets(node, pc);
+        let (threw, committed_throw) = self.throw_targets(node);
         let exit = |codegen: &mut Self, reason: ExitReason, action: ExitAction| {
             codegen.typed_exit(node, reason, action)
         };
@@ -2406,6 +4058,7 @@ impl<'a> Codegen<'a> {
             lazy: false,
             reason,
             action,
+            locations: None,
         });
         (self.exits.len() - 1) as u32
     }
@@ -2491,6 +4144,11 @@ impl<'a> Codegen<'a> {
                             Self::gp(allocation.inputs[1]),
                         );
                         dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b) ; b.eq =>true_target);
+                    }
+                    BranchKind::WordEqual(constant) => {
+                        let a = Self::gp(allocation.inputs[0]);
+                        self.load_immediate(16, u64::from(constant));
+                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), x16 ; b.eq =>true_target);
                     }
                     BranchKind::Nullish => {
                         let a = Self::gp(allocation.inputs[0]);
@@ -2752,7 +4410,7 @@ impl<'a> Codegen<'a> {
                 }
                 roots.sort_unstable();
                 roots.dedup();
-                codegen.stamp_safepoint(roots);
+                codegen.stamp_safepoint(control, roots);
                 codegen.load_immediate(16, u64::from(header_pc));
                 dynasm!(codegen.ops
                     ; .arch aarch64
@@ -2877,9 +4535,13 @@ impl<'a> Codegen<'a> {
             ; =>materialize
             ; str x30, [sp, #-16]!
             ; sub sp, sp, dump_bytes
-            ; mov x0, x20
             ; mov w1, w17
         );
+        crate::arm64::frame::emit_publish_lazy_window(
+            &mut self.ops,
+            self.view.code_block.register_count,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
         emit_load_symbol_u64(
             &mut self.ops,
             &mut self.relocations,
@@ -2932,11 +4594,12 @@ impl<'a> Codegen<'a> {
             let offset = dump_index(Location::Fp(register)).expect("a dump slot") as u32 * 8;
             dynasm!(self.ops ; .arch aarch64 ; str D(register), [sp, offset]);
         }
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; mov x0, x20
-            ; mov w1, w17
+        dynasm!(self.ops ; .arch aarch64 ; mov w1, w17);
+        crate::arm64::frame::emit_publish_lazy_window(
+            &mut self.ops,
+            self.view.code_block.register_count,
         );
+        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
         emit_load_symbol_u64(
             &mut self.ops,
             &mut self.relocations,
@@ -2973,38 +4636,70 @@ impl<'a> Codegen<'a> {
     }
 }
 
-/// Lower one frame state to the VM's deopt slot recipe.
-pub(crate) fn deopt_slots(
+/// Lower the frame states of `state`'s inline chain to the VM's frames,
+/// outermost first. `locations` holds the chain's values in
+/// [`Graph::state_values`] order.
+pub(crate) fn deopt_frames(
     graph: &Graph,
     slots: SlotLayout,
-    state: &super::ir::FrameState,
+    state: FrameStateId,
     locations: &[Location],
-) -> Box<[DeoptSlot]> {
-    let mut recipe: Vec<DeoptSlot> = (0..state.register_count)
-        .map(|_| DeoptSlot::physical(DeoptLocation::Literal(VALUE_UNDEFINED), DeoptRepr::Tagged))
-        .collect();
-    for (&(register, value), &location) in state.registers.iter().zip(locations) {
-        let repr = match graph.node(value).repr {
-            Repr::Int32 => DeoptRepr::Int32,
-            Repr::Float64 => DeoptRepr::Float64,
-            _ => DeoptRepr::Tagged,
-        };
-        let deopt_location = match location {
-            Location::Gp(_) | Location::Fp(_) => {
-                DeoptLocation::Register(dump_index(location).expect("an allocatable register"))
+) -> Box<[DeoptFrame]> {
+    let mut locations = locations.iter().copied();
+    let mut slot = |value: NodeId| {
+        let location = locations.next().expect("a location per state value");
+        deopt_slot(graph, slots, value, location)
+    };
+    graph
+        .state_chain(state)
+        .into_iter()
+        .map(|state| {
+            let data = graph.frame_state(state);
+            let entry = data.caller.map(|caller| DeoptFrameEntry {
+                return_register: caller.return_register,
+                this: slot(caller.this),
+                closure: slot(caller.closure),
+                new_target: slot(caller.new_target),
+            });
+            let mut registers: Vec<DeoptSlot> = (0..data.register_count)
+                .map(|_| {
+                    DeoptSlot::physical(DeoptLocation::Literal(VALUE_UNDEFINED), DeoptRepr::Tagged)
+                })
+                .collect();
+            for &(register, value) in &data.registers {
+                registers[usize::from(register)] = slot(value);
             }
-            Location::TaggedSlot(_) | Location::UntaggedSlot(_) => {
-                DeoptLocation::StackSlot(slots.offset(location) as i32)
+            DeoptFrame {
+                function_id: data.function_id,
+                byte_pc: data.byte_pc,
+                entry,
+                slots: registers.into_boxed_slice(),
             }
-            Location::Constant(node) => match graph.node(node).kind {
-                Kind::ConstTagged(bits) | Kind::ConstFloat64(bits) => DeoptLocation::Literal(bits),
-                Kind::ConstInt32(int) => DeoptLocation::Literal(u64::from(int as u32)),
-                _ => unreachable!("a constant"),
-            },
-        };
-        recipe[usize::from(register)] = DeoptSlot::physical(deopt_location, repr);
-    }
-    recipe.into_boxed_slice()
+        })
+        .collect()
+}
+
+/// The VM's slot for `value` at `location`.
+fn deopt_slot(graph: &Graph, slots: SlotLayout, value: NodeId, location: Location) -> DeoptSlot {
+    let repr = match graph.node(value).repr {
+        Repr::Int32 => DeoptRepr::Int32,
+        Repr::Float64 => DeoptRepr::Float64,
+        _ => DeoptRepr::Tagged,
+    };
+    let deopt_location = match location {
+        Location::Gp(_) | Location::Fp(_) => {
+            DeoptLocation::Register(dump_index(location).expect("an allocatable register"))
+        }
+        Location::TaggedSlot(_) | Location::UntaggedSlot(_) => {
+            DeoptLocation::StackSlot(slots.offset(location) as i32)
+        }
+        Location::Constant(node) => match graph.node(node).kind {
+            Kind::ConstTagged(bits) | Kind::ConstFloat64(bits) => DeoptLocation::Literal(bits),
+            Kind::ConstInt32(int) => DeoptLocation::Literal(u64::from(int as u32)),
+            _ => unreachable!("a constant"),
+        },
+    };
+    DeoptSlot::physical(deopt_location, repr)
 }
 
 fn node_name(kind: &Kind) -> &'static str {

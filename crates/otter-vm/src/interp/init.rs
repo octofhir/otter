@@ -207,6 +207,7 @@ impl Interpreter {
             realm_context: None,
             shape_runtime,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
+            simple_constructor_absence: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             object_literal_layouts: rustc_hash::FxHashMap::default(),
             constructor_field_transition_cache: rustc_hash::FxHashMap::default(),

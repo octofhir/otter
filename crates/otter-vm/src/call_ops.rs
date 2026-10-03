@@ -450,13 +450,27 @@ impl Interpreter {
         let Some(proto_obj) = prototype.as_object() else {
             return Ok(None);
         };
-        if init.fields.iter().any(|field| {
-            !matches!(
-                crate::object::lookup(proto_obj, &self.gc_heap, &field.name),
-                crate::object::PropertyLookup::Absent
-            )
-        }) {
-            return Ok(None);
+        // The field names stay absent from the chain while the chain's
+        // current proof is the one they were found absent under.
+        let proof = crate::object::prototype_validity::chain_validity(proto_obj, &self.gc_heap);
+        let proven = proof.as_ref().is_some_and(|proof| {
+            self.simple_constructor_absence
+                .get(&function_id)
+                .is_some_and(|known| std::sync::Arc::ptr_eq(known, proof) && known.is_valid())
+        });
+        if !proven {
+            if init.fields.iter().any(|field| {
+                !matches!(
+                    crate::object::lookup(proto_obj, &self.gc_heap, &field.name),
+                    crate::object::PropertyLookup::Absent
+                )
+            }) {
+                self.simple_constructor_absence.remove(&function_id);
+                return Ok(None);
+            }
+            if let Some(proof) = proof {
+                self.simple_constructor_absence.insert(function_id, proof);
+            }
         }
         let field_count = init.fields.len();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {

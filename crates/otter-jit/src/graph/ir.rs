@@ -7,6 +7,8 @@
 //! - [`Repr`] — the machine representation of a node's result.
 //! - [`Kind`] — every node operation, value and control alike.
 //! - [`Node`], [`Block`], [`FrameState`], [`Graph`] — the arena.
+//! - [`InlineCaller`] / [`InlinedBody`] — how an inlined body's frames and
+//!   nodes name the call they run for.
 //! - [`Properties`] / [`Kind::properties`] — what a node may do (call,
 //!   deopt eagerly or lazily, throw, read or write the heap).
 //! - [`Constraints`] / [`Kind::constraints`] — where the register allocator
@@ -24,6 +26,8 @@
 //!   it, with the node itself bound to the instruction's result register.
 //! - A call ([`Properties::call`]) clobbers every allocatable register; the
 //!   allocator spills every live value before it.
+//! - A frame state of an inlined body links to its caller's state after the
+//!   call; the values of the whole chain stay live wherever it is read.
 //!
 //! # See also
 //! - [`super::builder`] — builds the graph from bytecode and feedback.
@@ -129,6 +133,8 @@ pub(crate) enum BranchKind {
     TaggedEqual,
     /// `input0` is `undefined` or `null`.
     Nullish,
+    /// The word `input0` equals this constant.
+    WordEqual(u32),
 }
 
 /// Every graph operation.
@@ -272,6 +278,32 @@ pub(crate) enum Kind {
     // ---- Memory ----
     /// The base address of input0's named slots: in-object or slab.
     LoadSlotBase,
+    /// The named property of receiver input0 the load site at this byte PC
+    /// reads through its feedback programs: one of their receivers, then one
+    /// data slot of the receiver or of its guarded holder. Eager deopt when no
+    /// program matches.
+    LoadNamedProperty(u32),
+    /// Store input1 into the named property of receiver input0 through the
+    /// feedback programs of the store site at this byte PC: an existing
+    /// writable slot, or an appended slot with the child shape published and
+    /// its edge barriered. Eager deopt when no program matches; the value's
+    /// own barrier is a separate node.
+    StoreNamedProperty(u32),
+    /// `[[Get]]` of the named property at the load site `pc` from receiver
+    /// input0: an own or prototype data slot found in the isolate's shared
+    /// lookup table for `atom`, else the full operation in the runtime.
+    LoadPropertyCached {
+        pc: u32,
+        atom: Option<u32>,
+    },
+    /// `[[Set]]` of input1 as the named property of receiver input0 at the
+    /// store site `pc`: an existing writable own slot found in the shared
+    /// lookup table, or an add transition found in the shared transition
+    /// table, for `atom`; else the full operation in the runtime.
+    StorePropertyCached {
+        pc: u32,
+        atom: Option<u32>,
+    },
     /// Tagged word at `[input0 + offset]` (input0 a `Word` base or a tagged
     /// cell address).
     LoadTaggedField(i32),
@@ -326,7 +358,46 @@ pub(crate) enum Kind {
         pc: u32,
         plan: Option<otter_vm::jit::JitDirectCallPlan>,
         construct: bool,
+        /// Input1 is the receiver; otherwise the receiver is `undefined`.
+        receiver: bool,
+        /// For a construct of a proven base constructor: how the receiver
+        /// is allocated before the constructor is entered, so its prologue
+        /// does not prepare one in the runtime.
+        allocation: Option<otter_vm::jit::JitReceiverAllocationPlan>,
     },
+    /// Eager deopt unless the callee of the call site at this byte PC is
+    /// `%Function.prototype.call%`: input0 itself for an explicit-receiver
+    /// call, or the `call` a method call reads from its closure receiver
+    /// input0 through the pinned `%Function.prototype%`.
+    CheckFunctionPrototypeCall(u32),
+    /// Eager deopt unless input0 is the function `function_id`: its
+    /// function-id immediate, or a closure of it that needs no runtime setup.
+    /// `cell`, when not zero, holds the last value proved here, which a
+    /// repeated callee matches with one compare.
+    CheckFunction {
+        function_id: u32,
+        cell: u64,
+    },
+    /// Eager deopt when input0 is the hole of a binding still in its
+    /// temporal dead zone.
+    CheckNotHole,
+    /// `input0 instanceof input1`: the prototype chain walk of the default
+    /// `@@hasInstance` inline, every other case in the runtime.
+    Instanceof,
+    /// The method the guarded method call at this byte PC reads from
+    /// receiver input0: its proved shape, prototype chain and holder slot.
+    /// Eager deopt when the receiver does not match.
+    LoadGuardedMethod {
+        byte_pc: u32,
+        /// The site's method target whose guard and slot this load uses.
+        target: u8,
+        /// The receiver is already proved an ordinary object of the
+        /// target's shape.
+        receiver_proved: bool,
+    },
+    /// The compressed shape of input0 when it is an ordinary object that
+    /// looks its properties up through its shape; zero otherwise.
+    LoadReceiverShape,
     /// The baseline operation for the bytecode instruction at `pc`, run on
     /// the frame window: input `i` is stored to window register
     /// `registers[i]` first, and the instruction's written registers are read
@@ -363,6 +434,10 @@ pub(crate) struct Properties {
     pub(crate) writes: bool,
     /// Must stay even when its value is unused.
     pub(crate) effectful: bool,
+    /// Not a call, but its slow path enters the runtime, which may collect
+    /// or run JavaScript: live registers are saved in rooted snapshot slots
+    /// around it and its safepoint roots every live tagged slot.
+    pub(crate) may_collect: bool,
 }
 
 /// Where the allocator must put one input.
@@ -468,6 +543,7 @@ impl Kind {
             | Self::LoadClosureContext
             | Self::LoadElementsLength { .. }
             | Self::LoadElementsBase(_)
+            | Self::LoadReceiverShape
             | Self::LoadElementUint32ToFloat64 => pure,
             Self::LoadElement(element) => {
                 if matches!(element, JitElementRepr::Boxed | JitElementRepr::Uint32) {
@@ -494,10 +570,31 @@ impl Kind {
             | Self::CheckShapes { .. }
             | Self::CheckValue(_)
             | Self::CheckBounds
+            | Self::CheckFunctionPrototypeCall(_)
+            | Self::CheckFunction { .. }
+            | Self::CheckNotHole
+            | Self::LoadGuardedMethod { .. }
+            | Self::LoadNamedProperty(_)
             | Self::CheckElements { .. }
             | Self::CheckElementPresent
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_) => eager,
+            Self::StoreNamedProperty(_) => Properties {
+                eager_deopt: true,
+                writes: true,
+                effectful: true,
+                ..Properties::default()
+            },
+            Self::LoadPropertyCached { .. }
+            | Self::StorePropertyCached { .. }
+            | Self::Instanceof => Properties {
+                eager_deopt: true,
+                can_throw: true,
+                writes: true,
+                effectful: true,
+                may_collect: true,
+                ..Properties::default()
+            },
             Self::StoreWindow(_)
             | Self::StoreTaggedField(_)
             | Self::StoreShape(_)
@@ -515,6 +612,7 @@ impl Kind {
                 can_throw: true,
                 writes: true,
                 effectful: true,
+                may_collect: false,
             },
             Self::Jump(_) | Self::JumpLoop(_) | Self::Branch { .. } | Self::Return => Properties {
                 effectful: true,
@@ -584,6 +682,49 @@ impl Kind {
                 simple(2, ResultPolicy::None)
             }
             Self::StoreElement(_) | Self::ElementWriteBarrier => simple(3, ResultPolicy::None),
+            Self::CheckFunctionPrototypeCall(_) => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::None,
+                gp_temps: 1,
+                fp_temps: 0,
+            },
+            Self::CheckFunction { .. } | Self::CheckNotHole => simple(1, ResultPolicy::None),
+            Self::LoadGuardedMethod { .. } => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::Register,
+                gp_temps: 1,
+                fp_temps: 0,
+            },
+            Self::LoadNamedProperty(_) => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::Register,
+                gp_temps: 2,
+                fp_temps: 0,
+            },
+            Self::StoreNamedProperty(_) => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::None,
+                gp_temps: 2,
+                fp_temps: 0,
+            },
+            Self::Instanceof => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::Register,
+                gp_temps: 5,
+                fp_temps: 0,
+            },
+            Self::LoadPropertyCached { .. } => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::Register,
+                gp_temps: 4,
+                fp_temps: 0,
+            },
+            Self::StorePropertyCached { .. } => Constraints {
+                inputs: registers(2),
+                result: ResultPolicy::None,
+                gp_temps: 4,
+                fp_temps: 0,
+            },
             Self::Int32Div | Self::Int32Mod => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
@@ -616,7 +757,8 @@ impl Kind {
             | Self::LoadContextParent
             | Self::LoadClosureContext
             | Self::LoadElementsLength { .. }
-            | Self::LoadElementsBase(_) => simple(1, ResultPolicy::Register),
+            | Self::LoadElementsBase(_)
+            | Self::LoadReceiverShape => simple(1, ResultPolicy::Register),
             Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {
                 Constraints {
                     inputs: registers(1),
@@ -633,9 +775,12 @@ impl Kind {
             Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),
             Self::StoreShape(_) => simple(1, ResultPolicy::None),
             Self::WriteBarrier => simple(2, ResultPolicy::None),
-            Self::CallJs { .. } => {
+            Self::CallJs { receiver, .. } => {
                 let mut inputs: SmallVec<[InputPolicy; 4]> = smallvec::smallvec![FixedGp(1)];
-                inputs.extend((1..input_count).map(|_| Any));
+                if *receiver {
+                    inputs.push(FixedGp(2));
+                }
+                inputs.extend((inputs.len()..input_count).map(|_| Any));
                 Constraints {
                     inputs,
                     result: ResultPolicy::FixedGp(0),
@@ -673,8 +818,11 @@ pub(crate) struct Node {
     pub(crate) lazy: Option<FrameStateId>,
     /// Owning block; `None` for constants.
     pub(crate) block: Option<BlockId>,
-    /// The bytecode instruction this node was built for.
+    /// The bytecode instruction this node was built for, in its own body.
     pub(crate) pc: u32,
+    /// The function body the node belongs to: `0` for the compiled
+    /// function, `i` for [`Graph::inlined`]`[i - 1]`.
+    pub(crate) origin: u16,
 }
 
 /// One basic block.
@@ -702,6 +850,63 @@ pub(crate) struct FrameState {
     /// Live registers and their values; every other register resumes as
     /// `undefined`.
     pub(crate) registers: Vec<(u16, NodeId)>,
+    /// How the frame was entered when it runs an inlined call; `None` for
+    /// the compiled function's own frame.
+    pub(crate) caller: Option<InlineCaller>,
+}
+
+impl FrameState {
+    /// Apply `f` to every value this frame itself reads: its entry bindings,
+    /// then its live registers.
+    pub(crate) fn for_each_value_mut(&mut self, mut f: impl FnMut(&mut NodeId)) {
+        if let Some(caller) = &mut self.caller {
+            f(&mut caller.this);
+            f(&mut caller.closure);
+            f(&mut caller.new_target);
+        }
+        for (_, value) in &mut self.registers {
+            f(value);
+        }
+    }
+}
+
+/// The call an inlined frame runs for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlineCaller {
+    /// The calling frame's state. It resumes after the call and stands on
+    /// the call until this frame returns.
+    pub(crate) state: FrameStateId,
+    /// The calling frame's register the call writes.
+    pub(crate) return_register: u16,
+    /// The frame's `this` binding.
+    pub(crate) this: NodeId,
+    /// The exact callable the frame runs.
+    pub(crate) closure: NodeId,
+    /// The frame's `new.target`.
+    pub(crate) new_target: NodeId,
+}
+
+/// A point graph construction can return to; see [`Graph::checkpoint`].
+#[derive(Debug)]
+pub(crate) struct Checkpoint {
+    nodes: usize,
+    blocks: usize,
+    frame_states: usize,
+    inlined: usize,
+    constants: rustc_hash::FxHashMap<(u8, u64), NodeId>,
+    pub(crate) block: BlockId,
+    body: usize,
+}
+
+/// One function body inlined into the graph.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlinedBody {
+    pub(crate) function_id: u32,
+    /// The origin of the body that calls it.
+    pub(crate) parent: u16,
+    /// The call instruction in the calling body: logical and byte PC.
+    pub(crate) call_pc: u32,
+    pub(crate) call_byte_pc: u32,
 }
 
 /// The whole graph of one compilation.
@@ -713,6 +918,10 @@ pub(crate) struct Graph {
     constants: rustc_hash::FxHashMap<(u8, u64), NodeId>,
     /// The instruction new nodes are built for.
     pub(crate) position: u32,
+    /// The body new nodes are built for.
+    pub(crate) origin: u16,
+    /// Inlined bodies; origin `i > 0` names `inlined[i - 1]`.
+    pub(crate) inlined: Vec<InlinedBody>,
 }
 
 impl Graph {
@@ -759,8 +968,80 @@ impl Graph {
             lazy: None,
             block: None,
             pc: self.position,
+            origin: self.origin,
         });
         id
+    }
+
+    /// The frame states of `id`'s inline chain, outermost first.
+    pub(crate) fn state_chain(&self, id: FrameStateId) -> SmallVec<[FrameStateId; 4]> {
+        let mut chain = SmallVec::new();
+        let mut cursor = Some(id);
+        while let Some(state) = cursor {
+            chain.push(state);
+            cursor = self.frame_state(state).caller.map(|caller| caller.state);
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Every value the frame states of `id`'s chain read, outermost frame
+    /// first: an inlined frame's entry bindings (`this`, closure,
+    /// `new.target`), then each frame's live registers.
+    pub(crate) fn state_values(&self, id: FrameStateId) -> SmallVec<[NodeId; 16]> {
+        let mut values = SmallVec::new();
+        for state in self.state_chain(id) {
+            let data = self.frame_state(state);
+            if let Some(caller) = data.caller {
+                values.extend([caller.this, caller.closure, caller.new_target]);
+            }
+            values.extend(data.registers.iter().map(|&(_, value)| value));
+        }
+        values
+    }
+
+    /// The instruction of the compiled function itself that `node` runs
+    /// under: its own for a node of that function, the outermost inlined
+    /// call for a node of an inlined body.
+    pub(crate) fn outer_pc(&self, node: NodeId) -> u32 {
+        let data = self.node(node);
+        self.outer_pc_at(data.origin, data.pc)
+    }
+
+    /// [`Self::outer_pc`] of instruction `pc` of the body `origin`.
+    pub(crate) fn outer_pc_at(&self, mut origin: u16, mut pc: u32) -> u32 {
+        while origin != 0 {
+            let body = self.inlined[usize::from(origin) - 1];
+            (origin, pc) = (body.parent, body.call_pc);
+        }
+        pc
+    }
+
+    /// The state [`Self::rollback`] returns the graph to, with `block`
+    /// the open block construction continues in.
+    pub(crate) fn checkpoint(&self, block: BlockId) -> Checkpoint {
+        let data = self.block(block);
+        Checkpoint {
+            nodes: self.nodes.len(),
+            blocks: self.blocks.len(),
+            frame_states: self.frame_states.len(),
+            inlined: self.inlined.len(),
+            constants: self.constants.clone(),
+            block,
+            body: data.body.len(),
+        }
+    }
+
+    /// Drop everything built since `checkpoint` and reopen its block.
+    pub(crate) fn rollback(&mut self, checkpoint: Checkpoint) {
+        self.nodes.truncate(checkpoint.nodes);
+        self.blocks.truncate(checkpoint.blocks);
+        self.frame_states.truncate(checkpoint.frame_states);
+        self.inlined.truncate(checkpoint.inlined);
+        self.constants = checkpoint.constants;
+        let block = self.block_mut(checkpoint.block);
+        block.body.truncate(checkpoint.body);
+        block.control = None;
     }
 
     /// The canonical constant node for `kind`.
@@ -819,10 +1100,14 @@ impl Graph {
                     n.repr,
                     n.eager.map_or(String::new(), |s| format!(
                         " eager={:?}",
-                        self.frame_state(s)
-                            .registers
+                        self.state_chain(s)
                             .iter()
-                            .map(|(r, v)| (*r, v.0))
+                            .map(|&state| self
+                                .frame_state(state)
+                                .registers
+                                .iter()
+                                .map(|(r, v)| (*r, v.0))
+                                .collect::<Vec<_>>())
                             .collect::<Vec<_>>()
                     ))
                 );

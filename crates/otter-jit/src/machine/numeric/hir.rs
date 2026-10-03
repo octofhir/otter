@@ -5152,6 +5152,7 @@ mod tests {
                 method_value_byte: 32 + target_index * 8,
             },
             callee: direct_callee(function_id),
+            body: None,
         }
     }
 

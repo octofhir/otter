@@ -80,6 +80,11 @@ pub(crate) struct EntryShape {
     pub(crate) derived: bool,
     pub(crate) lexical_this: bool,
     pub(crate) converts_receiver: bool,
+    /// The entry leaves the register window unpublished and its body reads
+    /// the formals from the actual span; an exit that rebuilds the
+    /// interpreter frame publishes the window first.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) lazy_window: bool,
 }
 
 impl EntryShape {
@@ -103,7 +108,24 @@ impl EntryShape {
             derived: flags & FUNCTION_CALL_DERIVED_CONSTRUCTOR != 0,
             lexical_this: flags & FUNCTION_CALL_LEXICAL_THIS != 0,
             converts_receiver: flags & FUNCTION_CALL_NO_RECEIVER_CONVERSION == 0,
+            lazy_window: false,
         })
+    }
+
+    /// The same shape with the window published only by an exit.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn with_lazy_window(self, lazy_window: bool) -> Self {
+        Self {
+            lazy_window,
+            ..self
+        }
+    }
+
+    /// Whether the entry counts toward promotion: only a baseline generation
+    /// tiers up.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn counts_entries(self) -> bool {
+        self.kind == NativeFrameKind::Baseline
     }
 
     /// A base constructor creates its receiver when constructed.

@@ -229,11 +229,11 @@ pub(crate) fn untag_phis(graph: &mut Graph, layout: &[BlockId], loop_headers: &[
         graph.node_mut(phi).inputs = rewired;
     }
     for state in &mut graph.frame_states {
-        for (_, value) in &mut state.registers {
+        state.for_each_value_mut(|value| {
             if let Some(&replacement) = replaced.get(value) {
                 *value = replacement;
             }
-        }
+        });
     }
 }
 
@@ -265,7 +265,9 @@ fn entry_check(
         registers,
         ..back_edge
     });
+    // Loop headers belong to the compiled function itself.
     graph.position = back_edge.pc;
+    graph.origin = 0;
     let check = graph.add_node(Kind::CheckedTaggedToInt32, &[input], Repr::Int32);
     let node = graph.node_mut(check);
     node.block = Some(predecessor);

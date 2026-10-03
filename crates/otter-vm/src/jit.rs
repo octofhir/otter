@@ -547,14 +547,15 @@ pub struct JitCompileSnapshot {
     /// Complete CodeBlock-owned CacheIR programs, copied at the compilation
     /// boundary and keyed by source byte PC. Every installed program must be
     /// representable or the site is absent and uses its committed cold edge.
+    /// A `CallMethodValue` site's programs describe its method lookup.
     pub property_programs: rustc_hash::FxHashMap<u32, Vec<JitCacheIrProgram>>,
     /// Stable layout of this isolate's existing shared property lookup table.
     /// Generated load probes read its live entries without a runtime call.
     pub property_lookup_cache: Option<JitPropertyLookupCache>,
     /// Fixed shared add-property transition table read by megamorphic stores.
     pub store_transition_cache: Option<JitStoreTransitionCache>,
-    /// Terminal megamorphic named accesses: source byte PC to isolate-global
-    /// atom. Generated stores admit only an own writable data-slot proof;
+    /// Terminal megamorphic named accesses, method lookups included: source
+    /// byte PC to isolate-global atom. Generated stores admit only an own writable data-slot proof;
     /// negative and unsupported table results keep the committed cold operation.
     pub property_megamorphic_accesses: rustc_hash::FxHashMap<u32, u32>,
     /// Direct physical hit proofs for schema-owned binding sites, keyed by
@@ -578,6 +579,11 @@ pub struct JitCompileSnapshot {
     /// ([`JitInstructionMetadata::note_optimized_exit`]).
     pub optimized_exit_reasons:
         std::collections::BTreeMap<u32, std::collections::BTreeSet<crate::native_abi::ExitReason>>,
+    /// Logical PCs at which an earlier optimized generation left to collect
+    /// feedback. A site listed here has executed since; if its feedback is
+    /// still empty, nothing the site meets is something a speculation could
+    /// describe, and leaving again would only repeat the exit.
+    pub feedback_exits: std::collections::BTreeSet<u32>,
     /// Widest value each parameter was seen to hold when an optimized entry's
     /// parameter guards failed, indexed by parameter; empty when none did.
     /// Entry representations are capped by it, as JSC's argument value
@@ -1462,6 +1468,10 @@ pub struct JitDirectMethod {
     pub guard: JitMethodGuard,
     /// Exact entry generation and callee frame shape.
     pub callee: JitDirectCallee,
+    /// The method's fully baked body, for an optimizing caller that builds
+    /// it in place of the call; absent when the method needs an activation
+    /// of its own or the inline budget is spent.
+    pub body: Option<Arc<JitCompileSnapshot>>,
 }
 
 /// Current static offsets needed by native Array guards.
@@ -1935,6 +1945,7 @@ impl JitCompileSnapshot {
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
+            feedback_exits: std::collections::BTreeSet::new(),
             parameter_widening: Box::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }

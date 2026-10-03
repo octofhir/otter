@@ -269,7 +269,7 @@ impl<'g> Allocator<'g> {
                     self.add_use(input, at);
                 }
                 for state in data.eager.iter().chain(data.lazy.iter()) {
-                    for &(_, value) in &graph.frame_state(*state).registers {
+                    for value in graph.state_values(*state) {
                         if value != node {
                             self.add_use(value, at);
                         }
@@ -714,6 +714,11 @@ impl<'g> Allocator<'g> {
             self.spill_all_live(at);
             let roots = self.tagged_roots(at, node);
             self.out.nodes[node.0 as usize].gc_roots = Some(roots);
+        } else if properties.may_collect {
+            // The slow path saves live registers in snapshot slots and roots
+            // them with the live spill slots.
+            let roots = self.tagged_roots(at, node);
+            self.out.nodes[node.0 as usize].gc_roots = Some(roots);
         }
         // Temporaries.
         let mut gp_temps = SmallVec::new();
@@ -735,7 +740,7 @@ impl<'g> Allocator<'g> {
         let eager_values: SmallVec<[NodeId; 8]> = data
             .eager
             .iter()
-            .flat_map(|&state| graph.frame_state(state).registers.iter().map(|&(_, v)| v))
+            .flat_map(|&state| graph.state_values(state))
             .collect();
         for &input in &data.inputs {
             if !self.is_live_after(input, at) && !eager_values.contains(&input) {
@@ -755,8 +760,12 @@ impl<'g> Allocator<'g> {
             let mut live = SmallVec::new();
             for float in [false, true] {
                 for register in 0..32u8 {
+                    // A slow path that may collect also keeps what this
+                    // node's own exits read: a throw rebuilds the frame
+                    // from those locations after the runtime returns.
                     if let Some(value) = self.file(float).holder(register)
-                        && self.is_live_after(value, at)
+                        && (self.is_live_after(value, at)
+                            || (properties.may_collect && eager_values.contains(&value)))
                     {
                         live.push((
                             Self::register_location(float, register),
@@ -793,19 +802,17 @@ impl<'g> Allocator<'g> {
         // Deopt locations.
         if let Some(state) = data.eager {
             let locations = graph
-                .frame_state(state)
-                .registers
-                .iter()
-                .map(|&(_, value)| self.location_of(value).expect("a deopt value is live"))
+                .state_values(state)
+                .into_iter()
+                .map(|value| self.location_of(value).expect("a deopt value is live"))
                 .collect();
             self.out.nodes[node.0 as usize].eager = locations;
         }
         if let Some(state) = data.lazy {
             let locations = graph
-                .frame_state(state)
-                .registers
-                .iter()
-                .map(|&(_, value)| {
+                .state_values(state)
+                .into_iter()
+                .map(|value| {
                     if value == node {
                         self.out.nodes[node.0 as usize].result.expect("a result")
                     } else {
@@ -847,13 +854,7 @@ impl<'g> Allocator<'g> {
             .eager
             .iter()
             .chain(current.lazy.iter())
-            .flat_map(|&state| {
-                self.graph
-                    .frame_state(state)
-                    .registers
-                    .iter()
-                    .map(|&(_, v)| v)
-            })
+            .flat_map(|&state| self.graph.state_values(state))
             .collect();
         for value in state_values {
             if value != self.current && !self.graph.node(value).kind.is_constant() {
@@ -887,10 +888,9 @@ impl<'g> Allocator<'g> {
         self.out.nodes[control.0 as usize].inputs = inputs;
         if let Some(state) = data.eager {
             let locations = graph
-                .frame_state(state)
-                .registers
-                .iter()
-                .map(|&(_, value)| self.location_of(value).expect("a deopt value is live"))
+                .state_values(state)
+                .into_iter()
+                .map(|value| self.location_of(value).expect("a deopt value is live"))
                 .collect();
             self.out.nodes[control.0 as usize].eager = locations;
         }
@@ -1000,13 +1000,7 @@ impl<'g> Allocator<'g> {
             .eager
             .iter()
             .chain(data.lazy.iter())
-            .flat_map(|&state| {
-                self.graph
-                    .frame_state(state)
-                    .registers
-                    .iter()
-                    .map(|&(_, v)| v)
-            })
+            .flat_map(|&state| self.graph.state_values(state))
             .filter(|&value| value != node)
             .collect();
         let mut roots: Vec<u32> = self

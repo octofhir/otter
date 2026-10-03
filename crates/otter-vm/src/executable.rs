@@ -518,6 +518,7 @@ impl CodeBlock {
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
+            feedback_exits: std::collections::BTreeSet::new(),
             parameter_widening: Box::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
@@ -716,6 +717,19 @@ impl CodeBlock {
     #[must_use]
     pub const fn bytecode_byte_len(&self) -> u32 {
         self.bytecode_byte_len
+    }
+
+    /// `true` when this function is an arrow function.
+    #[must_use]
+    pub const fn is_arrow(&self) -> bool {
+        self.is_arrow
+    }
+
+    /// Whether an activation's `this` binding is observable: the body reads
+    /// it, creates a closure or holds a direct eval.
+    #[must_use]
+    pub const fn observes_this(&self) -> bool {
+        self.observes_this
     }
 
     /// Source module URL carried by this function.

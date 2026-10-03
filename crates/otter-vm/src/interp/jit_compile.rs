@@ -984,7 +984,7 @@ impl Interpreter {
             .filter(|instr| {
                 matches!(
                     instr.op(&view.code_block),
-                    Op::LoadProperty | Op::StoreProperty
+                    Op::LoadProperty | Op::StoreProperty | Op::CallMethodValue
                 )
             })
             .map(|instr| {
@@ -993,7 +993,9 @@ impl Interpreter {
                     instr.instruction_pc(&view.code_block),
                     instr.op(&view.code_block),
                     match instr.op(&view.code_block) {
-                        Op::LoadProperty => instr.const_index(&view.code_block, 2),
+                        Op::LoadProperty | Op::CallMethodValue => {
+                            instr.const_index(&view.code_block, 2)
+                        }
                         Op::StoreProperty => instr.const_index(&view.code_block, 1),
                         _ => None,
                     },
@@ -1001,10 +1003,11 @@ impl Interpreter {
             })
             .collect();
         for (byte_pc, instruction_pc, op, name_index) in sites {
-            let kind = if op == Op::LoadProperty {
-                crate::property_ic::PropertyIcKind::Load
-            } else {
+            // A method call's lookup shares the load table.
+            let kind = if op == Op::StoreProperty {
                 crate::property_ic::PropertyIcKind::Store
+            } else {
+                crate::property_ic::PropertyIcKind::Load
             };
             let Some(slot) = view
                 .code_block
@@ -1027,7 +1030,7 @@ impl Interpreter {
                     |cell| self.bake_prototype_validity(cell),
                 )
                 .unwrap_or_default();
-            if op == Op::LoadProperty
+            if op != Op::StoreProperty
                 && let Some(key) = name_index.and_then(|name_index| {
                     context.property_atom_for_function(view.code_block.id, name_index)
                 })
@@ -1932,16 +1935,15 @@ impl Interpreter {
                 instruction.note_optimized_exit();
             }
         }
-        // An element site that an earlier generation left to collect feedback
-        // has executed since; if it still records no family, its receivers
-        // have a layout no generated access describes, and it is no longer
-        // unseen.
+        // A site that an earlier generation left to collect feedback has
+        // executed since. An element site that still records no family meets
+        // receivers no generated access describes, and is no longer unseen.
         for &(profile_fid, pc, reason) in self.jit_optimized_exit_profiles.keys() {
-            if profile_fid == fid
-                && reason == native_abi::ExitReason::InsufficientFeedback
-                && let Some(instruction) = snapshot.instructions.get(pc as usize)
-            {
-                snapshot.unseen_element_sites.remove(&instruction.byte_pc);
+            if profile_fid == fid && reason == native_abi::ExitReason::InsufficientFeedback {
+                snapshot.feedback_exits.insert(pc);
+                if let Some(instruction) = snapshot.instructions.get(pc as usize) {
+                    snapshot.unseen_element_sites.remove(&instruction.byte_pc);
+                }
             }
         }
     }
@@ -2343,6 +2345,8 @@ impl Interpreter {
                     target,
                     u32::try_from(target_index).unwrap_or(u32::MAX),
                     target_count,
+                    tier,
+                    budget,
                 ) {
                     Ok(method) => {
                         let plan = method.callee.plan;
@@ -2389,7 +2393,20 @@ impl Interpreter {
             }
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
-                if let Some(method) = self.bake_one_inline_method(context, target, tier, budget) {
+                // A body already baked for the direct call serves the leaf
+                // inliner too.
+                let body = view
+                    .direct_methods
+                    .get(&snap.call_byte_pc)
+                    .and_then(|methods| {
+                        methods
+                            .iter()
+                            .find(|method| method.guard.method_fid == target.method_fid)
+                    })
+                    .and_then(|method| method.body.clone());
+                if let Some(method) =
+                    self.bake_one_inline_method(context, target, body, tier, budget)
+                {
                     baked.push(method);
                 }
             }
@@ -2446,6 +2463,8 @@ impl Interpreter {
         target: &PolyMethodTarget,
         target_index: u32,
         target_count: u32,
+        tier: jit_debug::JitDebugTier,
+        budget: &mut InlineSnapshotBudget,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
         let method_context = context
             .for_function(target.method_fid)
@@ -2464,6 +2483,12 @@ impl Interpreter {
             .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
         debug_assert_eq!(plan.function_id, target.method_fid);
         plan.callee_cell = self.bake_callee_identity_cell();
+        // An optimizing caller may build the method in place of the call;
+        // one that reads its actual arguments needs a frame of its own.
+        let body = (tier == jit_debug::JitDebugTier::Optimizing
+            && !method.requires_argument_frame())
+        .then(|| self.bake_inline_body(&method_context, target.method_fid, tier, budget))
+        .flatten();
         Ok(jit::JitDirectMethod {
             target_index,
             target_count,
@@ -2472,6 +2497,7 @@ impl Interpreter {
                 plan,
                 receiver_allocation: None,
             },
+            body,
         })
     }
 
@@ -2573,6 +2599,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         target: &PolyMethodTarget,
+        body: Option<std::sync::Arc<jit::JitCompileSnapshot>>,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
     ) -> Option<jit::JitInlineMethod> {
@@ -2590,7 +2617,10 @@ impl Interpreter {
         {
             return None;
         }
-        let method_view = self.bake_inline_body(context, target.method_fid, tier, budget)?;
+        let method_view = match body {
+            Some(body) => body,
+            None => self.bake_inline_body(context, target.method_fid, tier, budget)?,
+        };
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
         // byte offset; bail out if any property is absent, an accessor, or spills
         // past the inline value capacity. A receiver property resolves against

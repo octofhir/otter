@@ -44,10 +44,13 @@ use otter_vm::{JitCompileSnapshot, value::tag};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use std::rc::Rc;
+use std::sync::Arc;
+
 use super::bytecode::{Analysis, Flow, Instruction, RegisterSet};
 use super::ir::{
-    BlockId, BranchKind, Condition, DeoptReason, FrameState, FrameStateId, Graph, Kind, NodeId,
-    Repr,
+    BlockId, BranchKind, Condition, DeoptReason, FrameState, FrameStateId, Graph, InlineCaller,
+    InlinedBody, Kind, NodeId, Repr,
 };
 
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
@@ -199,6 +202,22 @@ impl Known {
         self.fields.insert(key, value);
     }
 
+    /// Forget every node's shape proof: a published transition changes the
+    /// shape of an object any node may name.
+    fn forget_shapes(&mut self) {
+        for info in self.info.values_mut() {
+            info.shapes = None;
+            info.writable = false;
+        }
+    }
+
+    /// Forget every known value at `offset`: a store through any node may
+    /// write it.
+    fn forget_field_offset(&mut self, property: bool, offset: i32) {
+        self.fields
+            .retain(|key, _| key.property != property || key.offset != offset);
+    }
+
     /// Forget the heap facts `keys` name.
     fn forget(&mut self, keys: &FxHashSet<FactKey>) {
         for key in keys {
@@ -308,6 +327,8 @@ pub(crate) struct Built {
     pub(crate) osr_entry: Option<BlockId>,
     /// Every loop header with a back edge.
     pub(crate) loop_headers: Vec<LoopHeader>,
+    /// The snapshot of each inlined body, by origin minus one.
+    pub(crate) inline_views: Vec<Arc<JitCompileSnapshot>>,
 }
 
 /// One loop header, for representation selection of its phis.
@@ -326,8 +347,11 @@ pub(crate) struct LoopHeader {
 }
 
 struct Builder<'a> {
+    /// The compiled function's own snapshot.
+    root: &'a JitCompileSnapshot,
+    /// The snapshot of the body being visited.
     view: &'a JitCompileSnapshot,
-    analysis: &'a Analysis,
+    analysis: Rc<Analysis>,
     baseline: &'a super::BaselineSupport,
     graph: Graph,
     function_id: u32,
@@ -359,6 +383,55 @@ struct Builder<'a> {
     enclosing: Vec<SmallVec<[usize; 2]>>,
     pc: u32,
     undefined: NodeId,
+    /// The inlined call the body being visited runs for; `None` in the
+    /// compiled function's own body.
+    inline: Option<Box<InlineFrame>>,
+    /// Bytecode bytes of every body inlined so far.
+    inlined_bytes: u32,
+    /// The snapshot of each inlined body, by origin minus one.
+    inline_views: Vec<Arc<JitCompileSnapshot>>,
+}
+
+/// The longest body inlined at one call, in bytecode bytes.
+const MAX_INLINED_BYTECODE_SIZE: u32 = 460;
+/// The most bytecode bytes inlined into one compilation.
+const MAX_INLINED_BYTECODE_CUMULATIVE: u32 = 920;
+/// The deepest chain of inlined calls.
+const MAX_INLINE_DEPTH: u8 = 3;
+
+/// The call an inlined body runs for.
+struct InlineFrame {
+    /// The caller state and entry bindings every frame state of the body
+    /// links to.
+    caller: InlineCaller,
+    depth: u8,
+    /// Loops of the compiled function around the outermost inlined call.
+    loops: SmallVec<[usize; 2]>,
+    /// The caller's block the body's returns jump to.
+    continuation: BlockId,
+    /// Each return: its block, its value and the facts that hold there.
+    returns: Vec<(BlockId, NodeId, Known)>,
+    /// The body needs something only an activation of its own provides.
+    abandoned: bool,
+}
+
+/// The half of the builder that describes the body being visited. Inlining
+/// swaps in the callee's, and the caller's back once the callee is built.
+struct Scope<'a> {
+    view: &'a JitCompileSnapshot,
+    analysis: Rc<Analysis>,
+    function_id: u32,
+    register_count: u16,
+    block_map: Vec<BlockId>,
+    trailing: Vec<Vec<BlockId>>,
+    incoming: Vec<Vec<Incoming>>,
+    loop_phis: FxHashMap<usize, Vec<(u16, NodeId)>>,
+    current_bytecode_block: usize,
+    frame: Vec<NodeId>,
+    eager_states: FxHashMap<u32, FrameStateId>,
+    enclosing: Vec<SmallVec<[usize; 2]>>,
+    pc: u32,
+    inline: Option<Box<InlineFrame>>,
 }
 
 /// Build the graph of `view`.
@@ -369,7 +442,7 @@ struct Builder<'a> {
 /// facts.
 pub(crate) fn build(
     view: &JitCompileSnapshot,
-    analysis: &Analysis,
+    analysis: &Rc<Analysis>,
     baseline: &'_ super::BaselineSupport,
     osr_pc: Option<u32>,
 ) -> Result<Built, BuildError> {
@@ -409,7 +482,7 @@ struct BuildPass {
 
 fn build_once(
     view: &JitCompileSnapshot,
-    analysis: &Analysis,
+    analysis: &Rc<Analysis>,
     baseline: &'_ super::BaselineSupport,
     osr_pc: Option<u32>,
     policies: &FxHashMap<usize, LoopPolicy>,
@@ -424,8 +497,9 @@ fn build_once(
         block_map[block] = graph.new_block();
     }
     let mut builder = Builder {
+        root: view,
         view,
-        analysis,
+        analysis: analysis.clone(),
         baseline,
         graph,
         function_id: code.id,
@@ -455,6 +529,9 @@ fn build_once(
         },
         pc: 0,
         undefined,
+        inline: None,
+        inlined_bytes: 0,
+        inline_views: Vec::new(),
     };
     let entry = builder.graph.new_block();
     builder.start_entry(entry);
@@ -473,32 +550,7 @@ fn build_once(
         layout.push(block);
         osr_entry = Some(block);
     }
-    let order = analysis.order.clone();
-    for block in order {
-        if !builder.start_block(block) {
-            continue;
-        }
-        layout.push(builder.block_map[block]);
-        let range = analysis.blocks[block].start..analysis.blocks[block].end;
-        for pc in range.clone() {
-            builder.pc = pc;
-            builder.graph.position = pc;
-            builder.visit(&analysis.instructions[pc as usize]);
-            if builder.current.is_none() {
-                break;
-            }
-        }
-        if builder.current.is_some() {
-            // Fell off the end of the block into its single successor.
-            let last = &analysis.instructions[range.end as usize - 1];
-            builder.pc = last.pc;
-            match analysis.blocks[block].successors.first() {
-                Some(&successor) => builder.goto(successor),
-                None => builder.deopt(DeoptReason::Unsupported),
-            }
-        }
-        layout.extend(builder.trailing[block].iter().copied());
-    }
+    layout.extend(builder.build_body());
     builder.finish_loops();
     remove_trivial_phis(&mut builder.graph, &layout);
     let loop_headers = builder.loop_headers();
@@ -508,6 +560,7 @@ fn build_once(
             layout,
             osr_entry,
             loop_headers,
+            inline_views: builder.inline_views,
         },
         effectful: builder.effectful,
         failed: builder.failed,
@@ -586,11 +639,11 @@ fn remove_trivial_phis(graph: &mut Graph, layout: &[BlockId]) {
         }
     }
     for state in &mut graph.frame_states {
-        for (_, value) in &mut state.registers {
+        state.for_each_value_mut(|value| {
             if let Some(&value_after) = replaced.get(value) {
                 *value = value_after;
             }
-        }
+        });
     }
     for &block in layout {
         graph
@@ -601,6 +654,293 @@ fn remove_trivial_phis(graph: &mut Graph, layout: &[BlockId]) {
 }
 
 impl<'a> Builder<'a> {
+    /// Visit every reachable block of the current body in reverse
+    /// post-order. Returns the body's blocks in emission order.
+    fn build_body(&mut self) -> Vec<BlockId> {
+        let analysis = self.analysis.clone();
+        let mut layout = Vec::new();
+        for &block in &analysis.order {
+            if self.inline.as_ref().is_some_and(|inline| inline.abandoned) {
+                break;
+            }
+            if !self.start_block(block) {
+                continue;
+            }
+            layout.push(self.block_map[block]);
+            let range = analysis.blocks[block].start..analysis.blocks[block].end;
+            for pc in range.clone() {
+                self.pc = pc;
+                self.graph.position = pc;
+                self.visit(&analysis.instructions[pc as usize]);
+                if self.current.is_none() {
+                    break;
+                }
+            }
+            if self.current.is_some() {
+                // Fell off the end of the block into its single successor.
+                let last = &analysis.instructions[range.end as usize - 1];
+                self.pc = last.pc;
+                match analysis.blocks[block].successors.first() {
+                    Some(&successor) => self.goto(successor),
+                    None => self.deopt(DeoptReason::Unsupported),
+                }
+            }
+            layout.extend(self.trailing[block].iter().copied());
+        }
+        layout
+    }
+
+    fn swap_scope(&mut self, scope: &mut Scope<'a>) {
+        use std::mem::swap;
+        swap(&mut self.view, &mut scope.view);
+        swap(&mut self.analysis, &mut scope.analysis);
+        swap(&mut self.function_id, &mut scope.function_id);
+        swap(&mut self.register_count, &mut scope.register_count);
+        swap(&mut self.block_map, &mut scope.block_map);
+        swap(&mut self.trailing, &mut scope.trailing);
+        swap(&mut self.incoming, &mut scope.incoming);
+        swap(&mut self.loop_phis, &mut scope.loop_phis);
+        swap(
+            &mut self.current_bytecode_block,
+            &mut scope.current_bytecode_block,
+        );
+        swap(&mut self.frame, &mut scope.frame);
+        swap(&mut self.eager_states, &mut scope.eager_states);
+        swap(&mut self.enclosing, &mut scope.enclosing);
+        swap(&mut self.pc, &mut scope.pc);
+        swap(&mut self.inline, &mut scope.inline);
+    }
+
+    /// Whether `body` may be built in place of a call from the current
+    /// body: a loop-free function without handlers, within the size, depth
+    /// and cumulative budgets, called from outside any exception region of
+    /// the compiled function.
+    fn inlinable(&self, body: &JitCompileSnapshot) -> bool {
+        let code = body.code_block.as_ref();
+        let bytes = code.bytecode_byte_len();
+        let depth = self.inline.as_ref().map_or(0, |inline| inline.depth);
+        let outer_pc = self.graph.outer_pc_at(self.graph.origin, self.pc);
+        depth < MAX_INLINE_DEPTH
+            && bytes <= MAX_INLINED_BYTECODE_SIZE
+            && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_CUMULATIVE
+            && code.loop_headers().is_empty()
+            && code.control_flow().handlers().is_empty()
+            && self.graph.inlined.len() < usize::from(u16::MAX)
+            && self.root_handler_at(outer_pc).is_none()
+    }
+
+    /// The exception handler of the compiled function covering `pc`.
+    fn root_handler_at(&self, pc: u32) -> Option<otter_bytecode::ExceptionHandler> {
+        self.root.code_block.control_flow().handler_at(pc)
+    }
+
+    /// Build `body` in place of the call at the current instruction, whose
+    /// callee is proved to be `closure` and whose activation would bind
+    /// `this` and receive `arguments`. The callee's returns meet in a fresh
+    /// block that continues the caller with the returned value in the
+    /// call's register. Returns `false`, with the graph as it was, when the
+    /// body needs an activation of its own.
+    fn inline_call(
+        &mut self,
+        instruction: &Instruction,
+        body: &'a Arc<JitCompileSnapshot>,
+        plan: otter_vm::jit::JitDirectCallPlan,
+        closure: NodeId,
+        this: NodeId,
+        arguments: &[NodeId],
+    ) -> bool {
+        let cell = plan.callee_cell;
+        let Some(block) = self.current else {
+            return false;
+        };
+        if !self.inlinable(body) {
+            return false;
+        }
+        let Ok(analysis) = Analysis::build(body) else {
+            return false;
+        };
+        let code = body.code_block.as_ref();
+        let bytes = code.bytecode_byte_len();
+        let checkpoint = self.graph.checkpoint(block);
+        let frame_states = self.graph.frame_states.len();
+        let views = self.inline_views.len();
+        let known = self.known.clone();
+        // The callee runs only as the function the body is.
+        self.add(
+            Kind::CheckFunction {
+                function_id: code.id,
+                cell,
+            },
+            &[closure],
+            Repr::None,
+        );
+        let destination = instruction.writes[0];
+        // The caller resumes after the call; the call's register is written
+        // by the return, so its old value is never restored.
+        let caller_state = self.lazy_state(Some((destination, self.undefined)));
+        let caller_origin = self.graph.origin;
+        self.graph.inlined.push(InlinedBody {
+            function_id: code.id,
+            parent: caller_origin,
+            call_pc: self.pc,
+            call_byte_pc: instruction.byte_pc,
+        });
+        self.inline_views.push(body.clone());
+        let origin = self.graph.inlined.len() as u16;
+        let continuation = self.graph.new_block();
+        let loops = match &self.inline {
+            Some(inline) => inline.loops.clone(),
+            None => self
+                .enclosing
+                .get(self.current_bytecode_block)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let depth = self.inline.as_ref().map_or(0, |inline| inline.depth) + 1;
+        let block_count = analysis.blocks.len();
+        let mut block_map = vec![BlockId(u32::MAX); block_count];
+        for &callee_block in &analysis.order {
+            block_map[callee_block] = self.graph.new_block();
+        }
+        let register_count = code.register_count;
+        let mut frame = vec![self.undefined; usize::from(register_count)];
+        let params = usize::from(code.param_count.min(register_count));
+        for (slot, &argument) in frame.iter_mut().zip(arguments).take(params) {
+            *slot = argument;
+        }
+        let mut scope = Scope {
+            view: body,
+            analysis: Rc::new(analysis),
+            function_id: code.id,
+            register_count,
+            block_map,
+            trailing: vec![Vec::new(); block_count],
+            incoming: vec![Vec::new(); block_count],
+            loop_phis: FxHashMap::default(),
+            current_bytecode_block: usize::MAX,
+            frame,
+            eager_states: FxHashMap::default(),
+            enclosing: vec![SmallVec::new(); block_count],
+            pc: 0,
+            inline: Some(Box::new(InlineFrame {
+                caller: InlineCaller {
+                    state: caller_state,
+                    return_register: destination,
+                    this,
+                    closure,
+                    new_target: self.undefined,
+                },
+                depth,
+                loops,
+                continuation,
+                returns: Vec::new(),
+                abandoned: false,
+            })),
+        };
+        let caller_position = self.graph.position;
+        self.swap_scope(&mut scope);
+        self.graph.origin = origin;
+        self.graph.position = 0;
+        self.inlined_bytes += bytes;
+        // The caller's block jumps to the callee's first block.
+        self.goto(0);
+        let layout = self.build_body();
+        self.swap_scope(&mut scope);
+        self.graph.origin = caller_origin;
+        self.graph.position = caller_position;
+        let frame = scope.inline.take().expect("the callee's inline frame");
+        if frame.abandoned {
+            self.inlined_bytes -= bytes;
+            self.graph.rollback(checkpoint);
+            self.inline_views.truncate(views);
+            // States built since the checkpoint are gone; their ids return.
+            self.eager_states
+                .retain(|_, state| (state.0 as usize) < frame_states);
+            self.known = known;
+            self.current = Some(block);
+            return false;
+        }
+        let owner = self.current_bytecode_block;
+        self.trailing[owner].extend(layout);
+        let mut returns = frame.returns;
+        if returns.is_empty() {
+            // Every path through the body leaves optimized code.
+            self.current = None;
+            return true;
+        }
+        self.trailing[owner].push(continuation);
+        self.graph.block_mut(continuation).predecessors =
+            returns.iter().map(|&(block, _, _)| block).collect();
+        let mut known = returns[0].2.clone();
+        for (_, _, edge) in &returns[1..] {
+            known.intersect(edge);
+        }
+        self.current = Some(continuation);
+        let value = if returns.len() == 1 {
+            returns[0].1
+        } else {
+            let inputs: SmallVec<[NodeId; 4]> = returns
+                .iter_mut()
+                .map(|(block, value, edge)| self.tagged_at_end(*block, *value, edge))
+                .collect();
+            let phi = self.graph.add_node(Kind::Phi, &inputs, Repr::Tagged);
+            self.graph.node_mut(phi).block = Some(continuation);
+            self.graph.block_mut(continuation).phis.push(phi);
+            phi
+        };
+        self.known = known;
+        self.write(destination, value);
+        true
+    }
+
+    /// The tagged form of `value` at the end of `block`, before its control
+    /// node, as the facts `known` of that block provide or a box placed
+    /// there.
+    fn tagged_at_end(&mut self, block: BlockId, value: NodeId, known: &mut Known) -> NodeId {
+        let node = self.graph.node(value);
+        if node.repr == Repr::Tagged {
+            return value;
+        }
+        if let Some(tagged) = known.get(value).and_then(|info| info.tagged) {
+            return tagged;
+        }
+        let constant = match node.kind {
+            Kind::ConstInt32(int) => Some(tag::NUMBER_TAG | u64::from(int as u32)),
+            Kind::ConstFloat64(bits) => Some(
+                otter_vm::Value::number(otter_vm::number::NumberValue::from_f64(f64::from_bits(
+                    bits,
+                )))
+                .to_bits(),
+            ),
+            _ => None,
+        };
+        if let Some(bits) = constant {
+            return self.constant_tagged(bits);
+        }
+        let kind = match node.repr {
+            Repr::Int32 => Kind::Int32ToTagged,
+            Repr::Float64 => Kind::Float64ToTagged,
+            Repr::Tagged | Repr::None | Repr::Word => unreachable!("not a boxable value"),
+        };
+        let boxed = self.graph.add_node(kind, &[value], Repr::Tagged);
+        self.graph.node_mut(boxed).block = Some(block);
+        self.graph.block_mut(block).body.push(boxed);
+        known.entry(value).tagged = Some(boxed);
+        boxed
+    }
+
+    /// Leave an inlined body with `value` as the call's result.
+    fn inline_return(&mut self, value: NodeId) {
+        let Some(block) = self.current else {
+            return;
+        };
+        let known = self.known.clone();
+        let inline = self.inline.as_mut().expect("an inlined body");
+        inline.returns.push((block, value, known));
+        let continuation = inline.continuation;
+        self.terminate(Kind::Jump(continuation), &[]);
+    }
+
     // ------------------------------------------------------------------
     // Blocks, edges and merges
     // ------------------------------------------------------------------
@@ -932,9 +1272,9 @@ impl<'a> Builder<'a> {
             let state = self.eager_state();
             self.graph.node_mut(node).eager = Some(state);
         }
-        // Only a call can change an object's shape or prototype state; a
-        // slot store keeps every shape.
-        if properties.call {
+        // Only a call, or a slow path that runs JavaScript, can change an
+        // object's shape or prototype state; a slot store keeps every shape.
+        if properties.call || properties.may_collect {
             self.clobber_heap();
         }
         node
@@ -944,7 +1284,11 @@ impl<'a> Builder<'a> {
     /// the current block one that writes the heap.
     fn clobber_heap(&mut self) {
         self.known.clobber_heap();
-        if let Some(loops) = self.enclosing.get(self.current_bytecode_block) {
+        let loops = match &self.inline {
+            Some(inline) => Some(&inline.loops),
+            None => self.enclosing.get(self.current_bytecode_block),
+        };
+        if let Some(loops) = loops {
             self.effectful.extend(loops.iter().copied());
         }
     }
@@ -1022,6 +1366,7 @@ impl<'a> Builder<'a> {
             function_id: self.function_id,
             register_count: self.register_count,
             registers,
+            caller: self.inline.as_ref().map(|inline| inline.caller),
         })
     }
 
@@ -1153,16 +1498,19 @@ impl<'a> Builder<'a> {
                 self.write(instruction.writes[0], value);
             }
             Op::LoadSelf => {
-                let value = self.add(Kind::LoadClosure, &[], Repr::Tagged);
+                let value = self.closure();
                 self.write(instruction.writes[0], value);
             }
             Op::LoadClosureContext => {
-                let closure = self.add(Kind::LoadClosure, &[], Repr::Tagged);
+                let closure = self.closure();
                 let value = self.add(Kind::LoadClosureContext, &[closure], Repr::Tagged);
                 self.write(instruction.writes[0], value);
             }
             Op::LoadThis if !self.view.derived_constructor => {
-                let value = self.add(Kind::LoadThis, &[], Repr::Tagged);
+                let value = match &self.inline {
+                    Some(inline) => inline.caller.this,
+                    None => self.add(Kind::LoadThis, &[], Repr::Tagged),
+                };
                 self.write(instruction.writes[0], value);
             }
             Op::Jump => {
@@ -1176,11 +1524,17 @@ impl<'a> Builder<'a> {
             }
             Op::Return | Op::ReturnValue => {
                 let value = self.read(instruction.reads[0]);
+                if self.inline.is_some() {
+                    return self.inline_return(value);
+                }
                 let value = self.tagged(value);
                 self.terminate(Kind::Return, &[value]);
             }
             Op::ReturnUndefined => {
                 let value = self.undefined;
+                if self.inline.is_some() {
+                    return self.inline_return(value);
+                }
                 self.terminate(Kind::Return, &[value]);
             }
             Op::Add
@@ -1220,6 +1574,8 @@ impl<'a> Builder<'a> {
             Op::StoreProperty | Op::StorePropertyStrict => self.visit_store_property(instruction),
             Op::Call => self.visit_call(instruction, false),
             Op::New => self.visit_call(instruction, true),
+            Op::CallWithThis => self.visit_call_with_this(instruction),
+            Op::CallMethodValue => self.visit_call_method(instruction),
             Op::LogicalNot | Op::ToBoolean => {
                 let value = self.read(instruction.reads[0]);
                 let value = self.tagged(value);
@@ -1249,11 +1605,53 @@ impl<'a> Builder<'a> {
                 );
                 self.write(instruction.writes[0], value);
             }
+            Op::Instanceof => {
+                let value = self.read(instruction.reads[0]);
+                let value = self.tagged(value);
+                let target = self.read(instruction.reads[1]);
+                let target = self.tagged(target);
+                let result = self.add(Kind::Instanceof, &[value, target], Repr::Tagged);
+                self.write(instruction.writes[0], result);
+            }
             Op::LoadElement => self.visit_load_element(instruction),
             Op::StoreElement | Op::StoreElementStrict => self.visit_store_element(instruction),
-            Op::LoadContextSlot => self.visit_load_context_slot(instruction),
+            Op::LoadContextSlot => self.visit_load_context_slot(instruction, false),
+            Op::LoadContextSlotChecked if !self.exited_for(ExitReason::IdentityGuard) => {
+                self.visit_load_context_slot(instruction, true);
+            }
             Op::StoreContextSlot => self.visit_store_context_slot(instruction),
             _ => self.generic(instruction),
+        }
+    }
+
+    /// The body baked for the plain call at `byte_pc` when it calls
+    /// `function_id` and no earlier code left the site on a wrong callee.
+    fn inline_body(&self, byte_pc: u32, function_id: u32) -> Option<&'a Arc<JitCompileSnapshot>> {
+        let view: &'a JitCompileSnapshot = self.view;
+        if self.exited_for(ExitReason::IdentityGuard) {
+            return None;
+        }
+        view.inline_callees
+            .get(&byte_pc)
+            .filter(|callee| callee.function_id() == function_id)
+            .map(|callee| &callee.body)
+    }
+
+    /// Whether a call of `plan`'s target binds the `this` value the caller
+    /// passes unchanged, so an inlined `body` needs no binding of its own:
+    /// the body never observes `this`, or is a strict non-arrow function.
+    fn binds_this_as_is(body: &JitCompileSnapshot, plan: otter_vm::jit::JitDirectCallPlan) -> bool {
+        let code = body.code_block.as_ref();
+        !code.observes_this()
+            || (plan.this_mode == otter_vm::jit::JitDirectCallThisMode::StrictOrLexical
+                && !code.is_arrow())
+    }
+
+    /// The callable the body being visited runs as.
+    fn closure(&mut self) -> NodeId {
+        match &self.inline {
+            Some(inline) => inline.caller.closure,
+            None => self.add(Kind::LoadClosure, &[], Repr::Tagged),
         }
     }
 
@@ -1265,6 +1663,13 @@ impl<'a> Builder<'a> {
     /// The instruction through its baseline operation on the frame window,
     /// or an unconditional deopt when it has none.
     fn generic(&mut self, instruction: &Instruction) {
+        // A baseline operation runs on its own function's window, which an
+        // inlined body does not have.
+        if let Some(inline) = self.inline.as_mut() {
+            inline.abandoned = true;
+            self.deopt(DeoptReason::Unsupported);
+            return;
+        }
         if !self.baseline.has_operation(self.pc) {
             self.deopt(DeoptReason::Unsupported);
             return;
@@ -1524,8 +1929,9 @@ impl<'a> Builder<'a> {
         // Fuse with an immediately following conditional jump on the result
         // when nothing else reads it.
         let next_pc = self.pc + 1;
-        if let Some(next) = self.analysis.instructions.get(next_pc as usize)
-            && self.analysis.block_of[next_pc as usize] == self.current_bytecode_block
+        let analysis = Rc::clone(&self.analysis);
+        if let Some(next) = analysis.instructions.get(next_pc as usize)
+            && analysis.block_of[next_pc as usize] == self.current_bytecode_block
             && matches!(next.op, Op::JumpIfTrue | Op::JumpIfFalse)
             && next.reads.first() == Some(&destination)
             && let Flow::Branch { target } = next.flow
@@ -1584,9 +1990,10 @@ impl<'a> Builder<'a> {
         let identity = oddball(&self.graph, a) || oddball(&self.graph, b);
         let destination = instruction.writes[0];
         let next_pc = self.pc + 1;
+        let analysis = Rc::clone(&self.analysis);
         if identity
-            && let Some(next) = self.analysis.instructions.get(next_pc as usize)
-            && self.analysis.block_of[next_pc as usize] == self.current_bytecode_block
+            && let Some(next) = analysis.instructions.get(next_pc as usize)
+            && analysis.block_of[next_pc as usize] == self.current_bytecode_block
             && matches!(next.op, Op::JumpIfTrue | Op::JumpIfFalse)
             && next.reads.first() == Some(&destination)
             && let Flow::Branch { target } = next.flow
@@ -1638,8 +2045,7 @@ impl<'a> Builder<'a> {
     fn visit_load_property(&mut self, instruction: &Instruction) {
         let byte_pc = instruction.byte_pc;
         let Some(access) = super::feedback::own_data_load(self.view, byte_pc) else {
-            self.generic(instruction);
-            return;
+            return self.visit_named_load(instruction);
         };
         let object = self.read(instruction.reads[0]);
         let object = self.tagged(object);
@@ -1659,10 +2065,75 @@ impl<'a> Builder<'a> {
         self.write(instruction.writes[0], value);
     }
 
+    /// A named load that is not one own data slot: a load through its
+    /// feedback programs, a deopt for a site that never ran, or the
+    /// baseline operation.
+    fn visit_named_load(&mut self, instruction: &Instruction) {
+        let byte_pc = instruction.byte_pc;
+        let programs = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| super::feedback::named_load_programs(self.view, byte_pc))
+            .flatten()
+            .is_some();
+        if !programs {
+            let atom = self.view.property_megamorphic_accesses.get(&byte_pc);
+            if self.view.instructions[self.pc as usize].load_array_length {
+                return self.generic(instruction);
+            }
+            if atom.is_none()
+                && !self.view.property_programs.contains_key(&byte_pc)
+                && !self.view.feedback_exits.contains(&self.pc)
+            {
+                return self.deopt(DeoptReason::InsufficientFeedback);
+            }
+        }
+        let object = self.read(instruction.reads[0]);
+        let object = self.tagged(object);
+        let value = self.named_lookup(byte_pc, object);
+        self.write(instruction.writes[0], value);
+    }
+
+    /// `[[Get]]` of the named site at `byte_pc` on `object`: the site's
+    /// feedback programs inline, or, for a megamorphic site or one whose
+    /// receivers no program describes, a probe of the shared lookup table
+    /// that completes in the runtime on a miss.
+    fn named_lookup(&mut self, byte_pc: u32, object: NodeId) -> NodeId {
+        if !self.exited_for(ExitReason::ShapeGuard)
+            && let Some(programs) = super::feedback::named_load_programs(self.view, byte_pc)
+        {
+            let receiver_shapes: Option<SmallVec<[u32; 4]>> = programs
+                .iter()
+                .map(|program| match program.ops.first() {
+                    Some(otter_vm::JitCacheIrOp::GuardShape { object: 0, shape }) => Some(*shape),
+                    _ => None,
+                })
+                .collect();
+            let value = self.add(Kind::LoadNamedProperty(byte_pc), &[object], Repr::Tagged);
+            // Every program proved an ordinary receiver of one of its shapes.
+            if let Some(shapes) = receiver_shapes {
+                let info = self.known.entry(object);
+                if info.shapes.is_none() {
+                    info.shapes = Some(shapes);
+                    info.writable = false;
+                }
+                info.heap_object = true;
+            }
+            return value;
+        }
+        let atom = self
+            .view
+            .property_megamorphic_accesses
+            .get(&byte_pc)
+            .copied();
+        self.add(
+            Kind::LoadPropertyCached { pc: self.pc, atom },
+            &[object],
+            Repr::Tagged,
+        )
+    }
+
     fn visit_store_property(&mut self, instruction: &Instruction) {
         let Some(access) = super::feedback::own_data_store(self.view, instruction.byte_pc) else {
-            self.generic(instruction);
-            return;
+            return self.visit_named_store(instruction);
         };
         let object = self.read(instruction.reads[0]);
         let object = self.tagged(object);
@@ -1688,6 +2159,104 @@ impl<'a> Builder<'a> {
         let info = self.known.entry(object);
         info.shapes = Some(access.shapes.clone());
         info.writable = true;
+    }
+
+    /// A named store that is not one existing own slot: a store through its
+    /// feedback programs, a deopt for a site that never ran, or the baseline
+    /// operation.
+    fn visit_named_store(&mut self, instruction: &Instruction) {
+        let byte_pc = instruction.byte_pc;
+        if !self.exited_for(ExitReason::ShapeGuard)
+            && let Some(programs) = super::feedback::named_store_programs(self.view, byte_pc)
+        {
+            use otter_vm::JitCacheIrOp as Op;
+            let object = self.read(instruction.reads[0]);
+            let object = self.tagged(object);
+            let value = self.read(instruction.reads[1]);
+            let value = self.tagged(value);
+            self.add(
+                Kind::StoreNamedProperty(byte_pc),
+                &[object, value],
+                Repr::None,
+            );
+            self.add(Kind::WriteBarrier, &[object, value], Repr::None);
+            // The receiver now has the shape each matching program leaves it
+            // with; a published transition may leave any other node's shape
+            // fact describing the old shape.
+            let mut shapes: SmallVec<[u32; 4]> = SmallVec::new();
+            let mut offsets: SmallVec<[i32; 4]> = SmallVec::new();
+            let mut transition = false;
+            for program in programs {
+                let mut shape = None;
+                for op in program.ops.iter() {
+                    match *op {
+                        Op::GuardShape {
+                            object: 0,
+                            shape: guarded,
+                        } => shape = Some(guarded),
+                        Op::PublishShape { shape: child, .. } => {
+                            shape = Some(child);
+                            transition = true;
+                        }
+                        Op::StoreField { value_byte, .. } => {
+                            offsets.push(value_byte as i32);
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(shape) = shape
+                    && !shapes.contains(&shape)
+                {
+                    shapes.push(shape);
+                }
+            }
+            if transition {
+                self.known.forget_shapes();
+            }
+            for &offset in &offsets {
+                self.known.forget_field_offset(true, offset);
+            }
+            if let [offset] = offsets.as_slice() {
+                let key = FieldKey {
+                    object,
+                    property: true,
+                    offset: *offset,
+                };
+                self.known.fields.insert(key, value);
+            }
+            let info = self.known.entry(object);
+            info.shapes = Some(shapes);
+            info.writable = true;
+            info.heap_object = true;
+            return;
+        }
+        let atom = self
+            .view
+            .property_megamorphic_accesses
+            .get(&byte_pc)
+            .copied();
+        if atom.is_none()
+            && !self.view.property_programs.contains_key(&byte_pc)
+            && !self.view.feedback_exits.contains(&self.pc)
+        {
+            return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        // A megamorphic site, or one whose receivers no program describes.
+        // The runtime completion serves the sloppy-or-function-strict form
+        // only.
+        if instruction.op != Op::StoreProperty {
+            return self.generic(instruction);
+        }
+        let object = self.read(instruction.reads[0]);
+        let object = self.tagged(object);
+        let value = self.read(instruction.reads[1]);
+        let value = self.tagged(value);
+        self.add(
+            Kind::StorePropertyCached { pc: self.pc, atom },
+            &[object, value],
+            Repr::None,
+        );
+        self.add(Kind::WriteBarrier, &[object, value], Repr::None);
     }
 
     /// Prove `object` has one of `shapes`, unless already proved.
@@ -1737,16 +2306,34 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
+        // A native leaf target is entered by the baseline operation without
+        // a frame.
+        if !construct
+            && self
+                .view
+                .static_native_calls
+                .contains_key(&instruction.byte_pc)
+        {
+            return self.generic(instruction);
+        }
+        // `[[Construct]]` enters a proven target directly only when it has
+        // the internal method; classification throws otherwise.
+        let construct_target = construct
+            .then(|| self.view.direct_constructs.get(&instruction.byte_pc))
+            .flatten()
+            .filter(|target| {
+                target.plan.call_flags & otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
+            });
+        // A base constructor's receiver is allocated in generated code when
+        // the target's allocation plan names it as new.target.
+        let allocation = construct_target.and_then(|target| {
+            target.receiver_allocation.filter(|allocation| {
+                allocation.new_target_function_id == target.plan.function_id
+                    && !target.plan.is_derived_constructor
+            })
+        });
         let plan = if construct {
-            // `[[Construct]]` enters a proven target directly only when it
-            // has the internal method; classification throws otherwise.
-            self.view
-                .direct_constructs
-                .get(&instruction.byte_pc)
-                .map(|target| target.plan)
-                .filter(|plan| {
-                    plan.call_flags & otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
-                })
+            construct_target.map(|target| target.plan)
         } else {
             self.view
                 .direct_callees
@@ -1754,9 +2341,25 @@ impl<'a> Builder<'a> {
                 .filter(|targets| targets.len() == 1)
                 .map(|targets| targets[0].plan)
         };
-        let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
         let callee = self.read(callee);
-        inputs.push(self.tagged(callee));
+        let callee = self.tagged(callee);
+        if !construct
+            && let Some(plan) = plan
+            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
+        {
+            let values: SmallVec<[NodeId; 8]> = arguments
+                .iter()
+                .map(|&register| self.read(register))
+                .collect();
+            let undefined = self.undefined;
+            if Self::binds_this_as_is(body, plan)
+                && self.inline_call(instruction, body, plan, callee, undefined, &values)
+            {
+                return;
+            }
+        }
+        let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
+        inputs.push(callee);
         for register in arguments {
             let value = self.read(register);
             inputs.push(self.tagged(value));
@@ -1766,6 +2369,8 @@ impl<'a> Builder<'a> {
                 pc: self.pc,
                 plan,
                 construct,
+                receiver: false,
+                allocation,
             },
             &inputs,
             Repr::Tagged,
@@ -1774,6 +2379,332 @@ impl<'a> Builder<'a> {
         let lazy = self.lazy_state(Some((destination, node)));
         self.graph.node_mut(node).lazy = Some(lazy);
         self.write(destination, node);
+    }
+
+    /// The argument registers of a call whose count is the constant operand
+    /// at `count_operand`, followed by the registers themselves.
+    fn call_arguments(
+        instruction: &Instruction,
+        count_operand: usize,
+    ) -> Option<SmallVec<[u16; 8]>> {
+        let argc = usize::try_from(instruction.const_index(count_operand)?).ok()?;
+        (0..argc)
+            .map(|index| instruction.register(count_operand + 1 + index))
+            .collect()
+    }
+
+    /// A call with an explicit receiver, entering `plan`'s target directly
+    /// when the callee is proved to be it.
+    fn emit_call_with_receiver(
+        &mut self,
+        instruction: &Instruction,
+        callee: NodeId,
+        receiver: NodeId,
+        arguments: &[NodeId],
+        plan: Option<otter_vm::jit::JitDirectCallPlan>,
+    ) {
+        // A strict non-arrow callee binds the explicit receiver as it is.
+        if let Some(plan) = plan
+            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
+            && Self::binds_this_as_is(body, plan)
+            && self.inline_call(instruction, body, plan, callee, receiver, arguments)
+        {
+            return;
+        }
+        let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
+        inputs.push(callee);
+        inputs.push(receiver);
+        inputs.extend(arguments.iter().copied());
+        let node = self.add(
+            Kind::CallJs {
+                pc: self.pc,
+                plan,
+                construct: false,
+                receiver: true,
+                allocation: None,
+            },
+            &inputs,
+            Repr::Tagged,
+        );
+        let destination = instruction.writes[0];
+        let lazy = self.lazy_state(Some((destination, node)));
+        self.graph.node_mut(node).lazy = Some(lazy);
+        self.write(destination, node);
+    }
+
+    /// `f.call(thisArg, ...args)` once `%Function.prototype.call%` is proved:
+    /// the call of `f` with `thisArg` as receiver.
+    fn emit_function_prototype_call(
+        &mut self,
+        instruction: &Instruction,
+        function: NodeId,
+        arguments: &[NodeId],
+        plan: otter_vm::jit::JitDirectCallPlan,
+    ) {
+        let (this, rest) = match arguments.split_first() {
+            Some((&this, rest)) => (this, rest),
+            None => (self.undefined, &[][..]),
+        };
+        let rest: SmallVec<[NodeId; 8]> = rest.iter().copied().collect();
+        self.emit_call_with_receiver(instruction, function, this, &rest, Some(plan));
+    }
+
+    /// `dst = callee.call(this, args...)` as the bytecode spells a call with
+    /// an explicit receiver.
+    fn visit_call_with_this(&mut self, instruction: &Instruction) {
+        let (Some(callee), Some(this), Some(arguments)) = (
+            instruction.register(1),
+            instruction.register(2),
+            Self::call_arguments(instruction, 3),
+        ) else {
+            return self.generic(instruction);
+        };
+        if !self.view.instructions[self.pc as usize].call_attempted {
+            return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        // A native leaf target is entered by the baseline operation without
+        // a frame.
+        if self
+            .view
+            .static_native_calls
+            .contains_key(&instruction.byte_pc)
+        {
+            return self.generic(instruction);
+        }
+        let callee = self.read(callee);
+        let callee = self.tagged(callee);
+        let this = self.read(this);
+        let this = self.tagged(this);
+        let arguments: SmallVec<[NodeId; 8]> = arguments
+            .iter()
+            .map(|&register| {
+                let value = self.read(register);
+                self.tagged(value)
+            })
+            .collect();
+        // A loaded `f.call` called with `f` as receiver calls `f`.
+        if !self.exited_for(ExitReason::IdentityGuard)
+            && let Some(site) = self.view.function_prototype_calls.get(&instruction.byte_pc)
+            && site.proof.lookup.is_none()
+        {
+            let plan = site.callee.plan;
+            self.add(
+                Kind::CheckFunctionPrototypeCall(instruction.byte_pc),
+                &[callee],
+                Repr::None,
+            );
+            return self.emit_function_prototype_call(instruction, this, &arguments, plan);
+        }
+        let plan = self
+            .view
+            .direct_callees
+            .get(&instruction.byte_pc)
+            .filter(|targets| targets.len() == 1)
+            .map(|targets| targets[0].plan);
+        self.emit_call_with_receiver(instruction, callee, this, &arguments, plan);
+    }
+
+    /// `dst = receiver.name(args...)`: `f.call` on a closure receiver, a
+    /// guarded method of a proved receiver, a method read like a named load
+    /// and called through the generic entry, or the baseline operation.
+    fn visit_call_method(&mut self, instruction: &Instruction) {
+        let (Some(receiver), Some(arguments)) = (
+            instruction.register(1),
+            Self::call_arguments(instruction, 3),
+        ) else {
+            return self.generic(instruction);
+        };
+        if !self.view.instructions[self.pc as usize].call_attempted {
+            return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        let byte_pc = instruction.byte_pc;
+        let fold = (!self.exited_for(ExitReason::IdentityGuard))
+            .then(|| self.view.function_prototype_calls.get(&byte_pc))
+            .flatten()
+            .filter(|site| {
+                site.proof
+                    .lookup
+                    .is_some_and(|lookup| lookup.receiver.is_generated_receiver())
+            })
+            .map(|site| site.callee.plan);
+        let method = (!self.exited_for(ExitReason::ShapeGuard)
+            && !self.exited_for(ExitReason::IdentityGuard))
+        .then(|| self.view.direct_methods.get(&byte_pc))
+        .flatten()
+        .filter(|methods| methods.len() == 1)
+        .map(|methods| methods[0].callee.plan);
+        let view: &'a JitCompileSnapshot = self.view;
+        let polymorphic = (!self.exited_for(ExitReason::ShapeGuard)
+            && !self.exited_for(ExitReason::IdentityGuard))
+        .then(|| view.direct_methods.get(&byte_pc))
+        .flatten()
+        .filter(|methods| methods.len() >= 2);
+        // Any other method is read like a named load when the site's lookup
+        // feedback describes it, then called through the generic entry.
+        let lookup = self.view.property_programs.contains_key(&byte_pc)
+            || self
+                .view
+                .property_megamorphic_accesses
+                .contains_key(&byte_pc);
+        // A native leaf method is entered by the baseline operation without
+        // a frame.
+        if (fold.is_none() && method.is_none() && polymorphic.is_none() && !lookup)
+            || self.view.static_native_calls.contains_key(&byte_pc)
+            || self.view.guarded_method_calls.contains_key(&byte_pc)
+        {
+            return self.generic(instruction);
+        }
+        let receiver = self.read(receiver);
+        let receiver = self.tagged(receiver);
+        let arguments: SmallVec<[NodeId; 8]> = arguments
+            .iter()
+            .map(|&register| {
+                let value = self.read(register);
+                self.tagged(value)
+            })
+            .collect();
+        if let Some(plan) = fold {
+            self.add(
+                Kind::CheckFunctionPrototypeCall(byte_pc),
+                &[receiver],
+                Repr::None,
+            );
+            return self.emit_function_prototype_call(instruction, receiver, &arguments, plan);
+        }
+        if let Some(plan) = method {
+            let callee = self.add(
+                Kind::LoadGuardedMethod {
+                    byte_pc,
+                    target: 0,
+                    receiver_proved: false,
+                },
+                &[receiver],
+                Repr::Tagged,
+            );
+            let view: &'a JitCompileSnapshot = self.view;
+            let body = view
+                .direct_methods
+                .get(&byte_pc)
+                .and_then(|methods| methods[0].body.as_ref());
+            // The guard proved an object receiver, which a non-arrow method
+            // binds as `this`.
+            if let Some(body) = body
+                && (!body.code_block.observes_this() || !body.code_block.is_arrow())
+                && self.inline_call(instruction, body, plan, callee, receiver, &arguments)
+            {
+                return;
+            }
+            return self.emit_call_with_receiver(
+                instruction,
+                callee,
+                receiver,
+                &arguments,
+                Some(plan),
+            );
+        }
+        if let Some(methods) = polymorphic {
+            return self.emit_polymorphic_method_call(instruction, receiver, &arguments, methods);
+        }
+        let callee = self.named_lookup(byte_pc, receiver);
+        self.emit_call_with_receiver(instruction, callee, receiver, &arguments, None);
+    }
+
+    /// A method call whose receivers had several observed shapes: the
+    /// receiver's shape selects one arm per target, which reads that
+    /// target's guarded method and runs it inline or calls it directly; a
+    /// receiver of no listed shape reads the method like a named load and
+    /// calls it through the generic entry. The arms meet with the call's
+    /// result in its register.
+    fn emit_polymorphic_method_call(
+        &mut self,
+        instruction: &Instruction,
+        receiver: NodeId,
+        arguments: &[NodeId],
+        methods: &'a [otter_vm::jit::JitDirectMethod],
+    ) {
+        let byte_pc = instruction.byte_pc;
+        let destination = instruction.writes[0];
+        let before = self.frame[usize::from(destination)];
+        let owner = self.current_bytecode_block;
+        let shape = self.add(Kind::LoadReceiverShape, &[receiver], Repr::Word);
+        let join = self.graph.new_block();
+        let entry_known = self.known.clone();
+        let mut arms: Vec<(BlockId, NodeId, Known)> = Vec::new();
+        let finish_arm = |builder: &mut Self, arms: &mut Vec<(BlockId, NodeId, Known)>| {
+            if let Some(end) = builder.current {
+                let value = builder.frame[usize::from(destination)];
+                arms.push((end, value, builder.known.clone()));
+                builder.terminate(Kind::Jump(join), &[]);
+            }
+        };
+        for (index, method) in methods.iter().enumerate() {
+            let Some(current) = self.current else {
+                break;
+            };
+            let matched = self.graph.new_block();
+            let next = self.graph.new_block();
+            self.terminate(
+                Kind::Branch {
+                    kind: BranchKind::WordEqual(method.guard.recv_shape),
+                    if_true: matched,
+                    if_false: next,
+                },
+                &[shape],
+            );
+            self.graph.block_mut(matched).predecessors.push(current);
+            self.graph.block_mut(next).predecessors.push(current);
+            self.trailing[owner].push(matched);
+            self.current = Some(matched);
+            self.known = entry_known.clone();
+            self.frame[usize::from(destination)] = before;
+            let callee = self.add(
+                Kind::LoadGuardedMethod {
+                    byte_pc,
+                    target: index as u8,
+                    receiver_proved: true,
+                },
+                &[receiver],
+                Repr::Tagged,
+            );
+            let plan = method.callee.plan;
+            let inlined = method.body.as_ref().is_some_and(|body| {
+                (!body.code_block.observes_this() || !body.code_block.is_arrow())
+                    && self.inline_call(instruction, body, plan, callee, receiver, arguments)
+            });
+            if !inlined {
+                self.emit_call_with_receiver(
+                    instruction,
+                    callee,
+                    receiver,
+                    arguments,
+                    Some(method.callee.plan),
+                );
+            }
+            finish_arm(self, &mut arms);
+            self.trailing[owner].push(next);
+            self.current = Some(next);
+        }
+        self.known = entry_known;
+        self.frame[usize::from(destination)] = before;
+        let callee = self.named_lookup(byte_pc, receiver);
+        self.emit_call_with_receiver(instruction, callee, receiver, arguments, None);
+        finish_arm(self, &mut arms);
+        self.trailing[owner].push(join);
+        self.graph.block_mut(join).predecessors = arms.iter().map(|&(block, _, _)| block).collect();
+        let mut known = arms[0].2.clone();
+        for (_, _, edge) in &arms[1..] {
+            known.intersect(edge);
+        }
+        self.current = Some(join);
+        let inputs: SmallVec<[NodeId; 4]> = arms
+            .iter_mut()
+            .map(|(block, value, edge)| self.tagged_at_end(*block, *value, edge))
+            .collect();
+        let phi = self.graph.add_node(Kind::Phi, &inputs, Repr::Tagged);
+        self.graph.node_mut(phi).block = Some(join);
+        self.graph.block_mut(join).phis.push(phi);
+        self.known = known;
+        self.write(destination, phi);
     }
 
     // ------------------------------------------------------------------
@@ -2028,7 +2959,11 @@ impl<'a> Builder<'a> {
         context
     }
 
-    fn visit_load_context_slot(&mut self, instruction: &Instruction) {
+    /// A context slot read; a `checked` read of a binding in its temporal
+    /// dead zone leaves for the interpreter, which throws. A value already
+    /// read or stored at the slot is that value, proved initialized unless
+    /// it is the hole itself.
+    fn visit_load_context_slot(&mut self, instruction: &Instruction, checked: bool) {
         let Some(coord) = instruction.imm32(2).and_then(ContextCoord::from_imm32) else {
             self.generic(instruction);
             return;
@@ -2043,10 +2978,18 @@ impl<'a> Builder<'a> {
             offset,
         };
         if let Some(&value) = self.known.fields.get(&key) {
+            if checked
+                && matches!(self.graph.node(value).kind, Kind::ConstTagged(bits) if bits == tag::VALUE_HOLE)
+            {
+                self.add(Kind::CheckNotHole, &[value], Repr::None);
+            }
             self.write(instruction.writes[0], value);
             return;
         }
         let value = self.add(Kind::LoadTaggedField(offset), &[context], Repr::Tagged);
+        if checked {
+            self.add(Kind::CheckNotHole, &[value], Repr::None);
+        }
         self.known.fields.insert(key, value);
         self.write(instruction.writes[0], value);
     }

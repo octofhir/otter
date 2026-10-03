@@ -7,6 +7,8 @@
 //! - [`emit_call_entry`] — the JavaScript call ABI entry: frame record and
 //!   register window built in the callee prologue, entry accounting,
 //!   receiver binding and publication.
+//! - [`emit_publish_lazy_window`] — the window of a record whose entry left
+//!   it unpublished, published by the exit that rebuilds the frame.
 //! - [`emit_tier_prologue`] — the entry over an already published
 //!   interpreter frame (function-entry tier transfer and loop OSR).
 //! - [`emit_epilogue`] / [`emit_exits`] — constructor completion,
@@ -26,7 +28,11 @@
 //! - A call entry reserves the spill area, the window and the record below
 //!   `x29` (spill area lowest, at `sp`) and publishes the record after every
 //!   field and register is initialized. Nothing allocates or reenters
-//!   before publication.
+//!   before publication. A lazy-window entry publishes a record without a
+//!   window and points `x19` at its actual span, whose first words are the
+//!   formals; only an exit that rebuilds the interpreter frame publishes
+//!   the reserved window.
+//! - Only a baseline generation counts its entries toward promotion.
 //! - With a spill area, the record names the area's safepoint and its base
 //!   for the body's whole extent; a tier entry saves the interpreter
 //!   record's previous words in the area's top 16 bytes and every exit of a
@@ -133,8 +139,8 @@ pub(crate) struct ActivationExits {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CallEntryCold {
     overflow: DynamicLabel,
-    break_even: (DynamicLabel, DynamicLabel),
-    promote: (DynamicLabel, DynamicLabel),
+    break_even: Option<(DynamicLabel, DynamicLabel)>,
+    promote: Option<(DynamicLabel, DynamicLabel)>,
     construct: Option<(DynamicLabel, DynamicLabel)>,
     prepare: Option<(DynamicLabel, DynamicLabel)>,
 }
@@ -143,8 +149,8 @@ impl CallEntryCold {
     /// The labels of the call entry of a function of `shape`.
     pub(crate) fn new(ops: &mut Assembler, shape: EntryShape) -> Self {
         let mut pair = || (ops.new_dynamic_label(), ops.new_dynamic_label());
-        let break_even = pair();
-        let promote = pair();
+        let break_even = shape.counts_entries().then(&mut pair);
+        let promote = shape.counts_entries().then(&mut pair);
         let construct = shape.base_constructor().then(&mut pair);
         let prepare = shape.sloppy_receiver().then(&mut pair);
         Self {
@@ -284,20 +290,22 @@ pub(crate) fn emit_call_entry(
         emit_zero_tagged_slots(ops, spill);
     }
     emit_load_u64(ops, 21, u64::from(window));
-    dynasm!(ops
-        ; .arch aarch64
-        ; add x21, x19, x21
+    dynasm!(ops ; .arch aarch64 ; add x21, x19, x21);
+    if let Some((check, back)) = break_even {
         // Entry accounting; past break-even the record asks for promotion.
-        ; mov x6, xzr
-        ; ldr x9, [x8, CODE_ENTRY_GENERATED_ENTRIES_OFFSET]
-        ; add x9, x9, 1
-        ; str x9, [x8, CODE_ENTRY_GENERATED_ENTRIES_OFFSET]
-        ; str xzr, [x20, GENERATED_FEEDBACK_CLEAN_OFFSET]
-        ; ldr x10, [x8, CODE_ENTRY_TIERING_BREAK_EVEN_OFFSET]
-        ; cmp x9, x10
-        ; b.hs =>break_even.0
-        ; =>break_even.1
-    );
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x6, xzr
+            ; ldr x9, [x8, CODE_ENTRY_GENERATED_ENTRIES_OFFSET]
+            ; add x9, x9, 1
+            ; str x9, [x8, CODE_ENTRY_GENERATED_ENTRIES_OFFSET]
+            ; str xzr, [x20, GENERATED_FEEDBACK_CLEAN_OFFSET]
+            ; ldr x10, [x8, CODE_ENTRY_TIERING_BREAK_EVEN_OFFSET]
+            ; cmp x9, x10
+            ; b.hs =>check
+            ; =>back
+        );
+    }
     if shape.sloppy_receiver() {
         emit_object_receiver_test(ops, view);
     }
@@ -324,13 +332,28 @@ pub(crate) fn emit_call_entry(
     } else {
         dynasm!(ops ; .arch aarch64 ; str x10, [x29, RETURN_FRAME]);
     }
+    let window_slots = if shape.lazy_window {
+        0
+    } else {
+        shape.register_count
+    };
     emit_load_u64(ops, 13, u64::from(shape.function_id));
-    emit_load_u64(ops, 14, shape.header_word(shape.register_count));
+    emit_load_u64(ops, 14, shape.header_word(window_slots));
     dynasm!(ops ; .arch aarch64 ; stp x13, x14, [x21]);
-    emit_load_u64(ops, 14, u64::from(shape.register_count));
+    if shape.lazy_window {
+        dynasm!(ops
+            ; .arch aarch64
+            ; stp xzr, xzr, [x21, (NATIVE_FRAME_REGISTER_BASE_OFFSET) as i32]
+        );
+    } else {
+        emit_load_u64(ops, 14, u64::from(shape.register_count));
+        dynasm!(ops
+            ; .arch aarch64
+            ; stp x19, x14, [x21, (NATIVE_FRAME_REGISTER_BASE_OFFSET) as i32]
+        );
+    }
     dynasm!(ops
         ; .arch aarch64
-        ; stp x19, x14, [x21, (NATIVE_FRAME_REGISTER_BASE_OFFSET) as i32]
         ; stp x2, x3, [x21, (NATIVE_FRAME_THIS_OFFSET) as i32]
         ; stp x1, x4, [x21, (NATIVE_FRAME_SELF_OFFSET) as i32]
         ; add x15, x29, 48
@@ -356,7 +379,12 @@ pub(crate) fn emit_call_entry(
         ; movn w16, 0
         ; str x16, [x21, abi::NATIVE_FRAME_CONTINUATION_OFFSET]
     );
-    emit_fill_window(ops, shape);
+    if shape.lazy_window {
+        // The body reads its formals where the caller pushed them.
+        dynasm!(ops ; .arch aarch64 ; add x19, x29, 48);
+    } else {
+        emit_fill_window(ops, shape);
+    }
     dynasm!(ops ; .arch aarch64 ; str x21, [x20, NATIVE_FRAME_OFFSET]);
     if let Some((cold, _)) = construct {
         dynasm!(ops ; .arch aarch64 ; cmp x3, VALUE_UNDEFINED as u32 ; b.ne =>cold);
@@ -367,8 +395,43 @@ pub(crate) fn emit_call_entry(
     if let Some((_, back)) = construct {
         dynasm!(ops ; .arch aarch64 ; =>back);
     }
-    dynasm!(ops ; .arch aarch64 ; cbnz x6, =>promote.0 ; =>promote.1);
+    if let Some((promote, promoted)) = promote {
+        dynasm!(ops ; .arch aarch64 ; cbnz x6, =>promote ; =>promoted);
+    }
     start
+}
+
+/// Publish the register window of a record whose entry left it
+/// unpublished: the slots reserved just below the record, all `undefined`,
+/// become the record's window in `x19`. A record with a window keeps it.
+/// Runs where no live value is in a register; clobbers `x16` and `x17`.
+pub(crate) fn emit_publish_lazy_window(ops: &mut Assembler, register_count: u16) {
+    let published = ops.new_dynamic_label();
+    let window = u32::from(register_count) * 8;
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x16, [x21, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; cbnz x16, =>published
+    );
+    emit_load_u64(ops, 16, u64::from(window));
+    dynasm!(ops ; .arch aarch64 ; sub x19, x21, x16);
+    emit_load_u64(ops, 16, VALUE_UNDEFINED);
+    for index in 0..u32::from(register_count) {
+        let offset = index * 8;
+        if offset <= 32760 {
+            dynasm!(ops ; .arch aarch64 ; str x16, [x19, offset]);
+        } else {
+            emit_load_u64(ops, 17, u64::from(offset));
+            dynasm!(ops ; .arch aarch64 ; str x16, [x19, x17]);
+        }
+    }
+    emit_load_u64(ops, 16, u64::from(register_count));
+    dynasm!(ops
+        ; .arch aarch64
+        ; stp x19, x16, [x21, (NATIVE_FRAME_REGISTER_BASE_OFFSET) as i32]
+        ; strh w16, [x21, abi::NATIVE_FRAME_REGISTER_COUNT_OFFSET]
+        ; =>published
+    );
 }
 
 /// Seed the window `x19` from the padded span `[x29 + 48]`: formals, then
@@ -425,15 +488,16 @@ pub(crate) fn emit_call_entry_cold(
     cold: CallEntryCold,
 ) {
     // Promotion is requested only while this generation may still tier up.
-    let (check, back) = cold.break_even;
-    dynasm!(ops
-        ; .arch aarch64
-        ; =>check
-        ; ldr w10, [x8, CODE_ENTRY_TIERING_ENABLED_OFFSET]
-        ; cbz w10, =>back
-        ; movz x6, 1
-        ; b =>back
-    );
+    if let Some((check, back)) = cold.break_even {
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>check
+            ; ldr w10, [x8, CODE_ENTRY_TIERING_ENABLED_OFFSET]
+            ; cbz w10, =>back
+            ; movz x6, 1
+            ; b =>back
+        );
+    }
     // [[Construct]] of a base constructor: owe constructor completion and
     // create the receiver unless the caller allocated it. Receiver
     // conversion does not apply to the created receiver.
@@ -483,10 +547,11 @@ pub(crate) fn emit_call_entry_cold(
     }
     // Promotion compiles against the published record; this activation
     // keeps its generation and later entries take the new one.
-    let (promote, promoted) = cold.promote;
-    dynasm!(ops ; .arch aarch64 ; =>promote ; mov x0, x20);
-    emit_stub(ops, relocations, transitions, abi::STUB_JIT_PROMOTE_ENTERED);
-    dynasm!(ops ; .arch aarch64 ; b =>promoted);
+    if let Some((promote, promoted)) = cold.promote {
+        dynasm!(ops ; .arch aarch64 ; =>promote ; mov x0, x20);
+        emit_stub(ops, relocations, transitions, abi::STUB_JIT_PROMOTE_ENTERED);
+        dynasm!(ops ; .arch aarch64 ; b =>promoted);
+    }
     // Nothing is published: return the overflow.
     dynasm!(ops ; .arch aarch64 ; =>cold.overflow ; mov x0, x20);
     emit_stub(ops, relocations, transitions, abi::STUB_JIT_CALL_OVERFLOW);

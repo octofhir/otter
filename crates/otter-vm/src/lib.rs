@@ -942,6 +942,14 @@ pub struct Interpreter {
     /// source descriptors only; GC shape handles stay in `shape_runtime`.
     simple_constructor_init_cache:
         rustc_hash::FxHashMap<u32, Option<constructor_fast_path::SimpleConstructorInit>>,
+    /// Per simple constructor, the prototype-chain proof under which its
+    /// field names were last found absent from its receivers' prototypes:
+    /// while the cell stays valid and is the prototype's current proof, a
+    /// new receiver needs no lookup.
+    simple_constructor_absence: rustc_hash::FxHashMap<
+        u32,
+        std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
+    >,
     /// Final hidden class reached by a cached simple constructor initializer.
     /// These handles are traced explicitly because a moving GC must rewrite the
     /// cache slot, not only the owning `shape_runtime` transition table.

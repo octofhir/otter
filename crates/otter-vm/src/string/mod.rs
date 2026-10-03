@@ -136,7 +136,9 @@ fn latin1_bytes_from_str(s: &str) -> Option<Vec<u8>> {
 }
 
 impl JsString {
-    fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
+    /// Wrap an existing string body, such as a hidden class's key, without
+    /// allocating.
+    pub(crate) fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
         let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
         Self {
             handle,

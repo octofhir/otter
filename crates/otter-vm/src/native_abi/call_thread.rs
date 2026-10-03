@@ -139,6 +139,21 @@ impl JitCtx {
         self.stage_call_arguments(arguments)
     }
 
+    /// Write a §15.10.3 tail call's request with staged actuals. The
+    /// generated activation that stages it retires its record and returns
+    /// `Continue`; whoever called that activation enters the request in its
+    /// place.
+    pub fn stage_tail_call_request(
+        &mut self,
+        callee: Value,
+        arguments: impl IntoIterator<Item = Value>,
+    ) -> Result<(), VmError> {
+        self.stage_call_request(callee, Value::undefined(), arguments)?;
+        self.pending_call.header.flags =
+            super::NativeFrameFlags::from_bits(super::NativeFrameFlags::TAIL_CALL);
+        Ok(())
+    }
+
     /// Try the typed boundary for pure-code fixture entries that deliberately
     /// publish no runtime context.
     pub fn try_runtime_call(&mut self) -> Result<Option<RuntimeCall<'_>>, VmError> {

@@ -150,6 +150,32 @@ pub(crate) extern "C" fn jit_stage_spread_stub(ctx: *mut JitCtx, array: u64) -> 
     committed_vm_result(ctx, result)
 }
 
+/// Stage a §15.10.3 tail call from `[callee, arguments…]`: the generated
+/// activation then retires its record and returns `Continue`, and its
+/// caller enters the request in its place.
+pub(crate) extern "C" fn jit_stage_tail_call_stub(
+    ctx: *mut JitCtx,
+    packet: *const Value,
+    count: u32,
+) -> NativeResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = if count == 0
+        || packet.is_null()
+        || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
+    {
+        Err(otter_vm::VmError::InvalidOperand)
+    } else {
+        // SAFETY: generated code passes `count` initialized, aligned words,
+        // copied before the request is staged.
+        let values = unsafe { std::slice::from_raw_parts(packet, count as usize) };
+        let values = smallvec::SmallVec::<[Value; 8]>::from_slice(values);
+        ctx.stage_tail_call_request(values[0], values[1..].iter().copied())
+    }
+    .map(|()| Value::undefined());
+    committed_vm_result(ctx, result)
+}
+
 /// Complete computed `[[Get]]` from fixed boxed-value operands.
 ///
 /// The active native frame supplies the exact function/PC feedback identity

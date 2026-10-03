@@ -800,7 +800,13 @@ mod tests {
         let main = module.main();
         assert_eq!(main.handlers.len(), 1, "{:?}", main.handlers);
         let handler = main.handlers[0];
-        assert!(main.code.iter().skip(handler.start as usize).take((handler.end - handler.start) as usize).any(|i| i.op == Op::Throw));
+        assert!(
+            main.code
+                .iter()
+                .skip(handler.start as usize)
+                .take((handler.end - handler.start) as usize)
+                .any(|i| i.op == Op::Throw)
+        );
         assert!(handler.target >= handler.end);
     }
 
@@ -838,8 +844,9 @@ mod tests {
         ];
         for source in sources {
             let module = compile_script_src(source);
-            otter_bytecode::verify_module(&module)
-                .unwrap_or_else(|error| panic!("compiler emitted invalid bytecode for {source}: {error}"));
+            otter_bytecode::verify_module(&module).unwrap_or_else(|error| {
+                panic!("compiler emitted invalid bytecode for {source}: {error}")
+            });
         }
     }
 

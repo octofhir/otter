@@ -99,7 +99,8 @@ fn run(selection: JitSelection) -> (String, u64) {
 #[test]
 fn optimizing_map_intrinsics_match_oracle_and_preserve_fallbacks() {
     let (oracle, _) = run(JitSelection::InterpreterOnly);
-    let (compiled, optimized_entries) = run(JitSelection::ProductionTiered);
+    // Only the AArch64 optimizing tier enters these Map callers.
+    let (compiled, _optimized_entries) = run(JitSelection::ProductionTiered);
 
     assert_eq!(compiled, oracle);
     assert_eq!(
@@ -108,7 +109,7 @@ fn optimizing_map_intrinsics_match_oracle_and_preserve_fallbacks() {
     );
     #[cfg(target_arch = "aarch64")]
     assert!(
-        optimized_entries > 0,
+        _optimized_entries > 0,
         "fixture must enter optimized Map callers before fallback cases"
     );
 }

@@ -99,7 +99,7 @@ impl RuntimeCall<'_> {
             .ok_or(VmError::InvalidOperand)?;
         let count_operand = match function.op(instruction) {
             otter_bytecode::Op::CallWithThis => 3,
-            otter_bytecode::Op::Call => 2,
+            otter_bytecode::Op::Call | otter_bytecode::Op::TailCall => 2,
             _ => return Err(VmError::InvalidOperand),
         };
         if instruction.instruction_pc != call_pc {

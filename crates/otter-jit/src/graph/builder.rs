@@ -278,7 +278,10 @@ impl<'a> Builder<'a> {
         self.current = Some(block);
         self.current_bytecode_block = usize::MAX;
         self.known = Known::default();
-        let live = self.analysis.live_at(self.analysis.blocks[header].start).clone();
+        let live = self
+            .analysis
+            .live_at(self.analysis.blocks[header].start)
+            .clone();
         for register in 0..self.register_count {
             self.frame[usize::from(register)] = if live.contains(register) {
                 self.add(Kind::InitialRegister(register), &[], Repr::Tagged)
@@ -325,14 +328,15 @@ impl<'a> Builder<'a> {
             // only: there every live register is a merge, not just the ones
             // the body assigns.
             let assigned = is_loop
-                && (self.osr_entry
-                    || self.analysis.loops[&block].assigned.contains(register));
+                && (self.osr_entry || self.analysis.loops[&block].assigned.contains(register));
             let differs = incoming.iter().any(|edge| edge.frame[index] != first);
             if !assigned && !differs {
                 continue;
             }
-            let inputs: SmallVec<[NodeId; 4]> =
-                incoming.iter().map(|edge| self.tagged_for_phi(edge, index)).collect();
+            let inputs: SmallVec<[NodeId; 4]> = incoming
+                .iter()
+                .map(|edge| self.tagged_for_phi(edge, index))
+                .collect();
             let phi = self.graph.add_node(Kind::Phi, &inputs, Repr::Tagged);
             self.graph.node_mut(phi).block = Some(graph_block);
             self.graph.block_mut(graph_block).phis.push(phi);
@@ -600,7 +604,9 @@ impl<'a> Builder<'a> {
             .view
             .instructions
             .get(pc as usize)
-            .map_or(self.view.code_block.bytecode_byte_len(), |metadata| metadata.byte_pc);
+            .map_or(self.view.code_block.bytecode_byte_len(), |metadata| {
+                metadata.byte_pc
+            });
         self.graph.add_frame_state(FrameState {
             pc,
             byte_pc,
@@ -864,7 +870,12 @@ impl<'a> Builder<'a> {
         };
         let bitwise = matches!(
             op,
-            Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr
+            Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
                 | Op::BitwiseAndImm
         );
         let int32 = feedback.speculates_int32() && !self.exited_before();
@@ -951,9 +962,9 @@ impl<'a> Builder<'a> {
             (Kind::ConstTagged(bits), _) => return tag::is_number_bits(*bits),
             _ => {}
         }
-        self.known.get(value).is_some_and(|info| {
-            info.number || info.int32.is_some() || info.float64.is_some()
-        })
+        self.known
+            .get(value)
+            .is_some_and(|info| info.number || info.int32.is_some() || info.float64.is_some())
     }
 
     /// `ToNumeric` / `ToNumber` of a Number is the value itself; anything
@@ -1123,7 +1134,11 @@ impl<'a> Builder<'a> {
         let value = self.tagged(value);
         self.check_shapes(object, &access.shapes, true);
         let base = self.add(Kind::LoadSlotBase, &[object], Repr::Word);
-        self.add(Kind::StoreTaggedField(access.offset), &[base, value], Repr::None);
+        self.add(
+            Kind::StoreTaggedField(access.offset),
+            &[base, value],
+            Repr::None,
+        );
         self.add(Kind::WriteBarrier, &[object, value], Repr::None);
         // A slot write keeps the object's shape.
         let info = self.known.entry(object);
@@ -1186,7 +1201,11 @@ impl<'a> Builder<'a> {
         let context = self.tagged(context);
         let context = self.context_at_depth(context, coord.depth);
         let offset = self.view.context_layout.slots_byte as i32 + i32::from(coord.slot) * 8;
-        self.add(Kind::StoreTaggedField(offset), &[context, value], Repr::None);
+        self.add(
+            Kind::StoreTaggedField(offset),
+            &[context, value],
+            Repr::None,
+        );
         self.add(Kind::WriteBarrier, &[context, value], Repr::None);
     }
 }

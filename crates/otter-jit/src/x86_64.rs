@@ -12,6 +12,11 @@
 //! # See also
 //! - `crate::arm64` — peer target implementation.
 
+// dynasm 5 normalizes dynamic x86-64 register operands through `Into<u8>`;
+// register ids in shared emitters are already `u8`, so the macro-generated
+// conversion is intentionally redundant.
+#![allow(clippy::useless_conversion)]
+
 pub(crate) mod activation;
 pub(crate) mod allocation;
 pub(crate) mod js_call;

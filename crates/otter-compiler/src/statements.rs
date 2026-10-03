@@ -772,7 +772,7 @@ fn compile_statement_body(
                 // §15.10.3 — a strict-mode `return <call>` with nothing to
                 // run after it is a proper tail call.
                 Some(arg)
-                    if cx.is_strict && cx.return_leaves_directly() && !cx.is_async_generator =>
+                    if cx.is_strict && cx.return_leaves_directly() && cx.proper_tail_calls =>
                 {
                     compile_tail_return(cx, arg, span)?;
                 }
@@ -1271,7 +1271,9 @@ pub(crate) fn compile_for_init_decl(
                     // §14.3.1.2 — NamedEvaluation; a register binding takes
                     // the value directly.
                     (Some(init), BindingStorage::Register { reg }) => {
-                        crate::expr::compile_expr_into_with_inferred_name(cx, init, &name, reg, span)?
+                        crate::expr::compile_expr_into_with_inferred_name(
+                            cx, init, &name, reg, span,
+                        )?
                     }
                     (Some(init), BindingStorage::Slot { .. }) => {
                         crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?

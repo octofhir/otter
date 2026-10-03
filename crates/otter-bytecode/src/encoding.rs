@@ -42,12 +42,11 @@
 //!     Imm32:       i32 little-endian
 //! ```
 
-
 use crate::{
     ExceptionHandler, FunctionCode, Instruction, Op, Operand, SpanEntry,
     opcode_schema::{
-        OperandKind, OperandShapeError, RelativeTargetBase, SuccessorSpec,
-        decode_operand_word, opcode_schema, operand_kind_at, verify_operand_shape,
+        OperandKind, OperandShapeError, RelativeTargetBase, SuccessorSpec, decode_operand_word,
+        opcode_schema, operand_kind_at, verify_operand_shape,
     },
     wordcode::{INLINE_OPERAND_WORDS, Instruction as WordInstruction},
 };
@@ -435,7 +434,10 @@ fn verify_reachable_end(
         }
     }
     while let Some(index) = worklist.pop() {
-        for successor in opcode_schema(instructions[index].op).successor_shape.exact() {
+        for successor in opcode_schema(instructions[index].op)
+            .successor_shape
+            .exact()
+        {
             let target = match successor {
                 SuccessorSpec::Fallthrough => index + 1,
                 SuccessorSpec::RelativeTarget { operand_index, .. } => {

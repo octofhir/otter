@@ -130,15 +130,20 @@ impl CallSite<'_> {
     }
 
     /// Release `bytes` of pushed actuals after a call returned `(x0, x1)`,
-    /// reload roots and route the completion.
+    /// reload roots and route the completion. A callee that retired itself
+    /// for a tail call it staged returns `Continue`; that call is entered in
+    /// its place under the same call-site roots.
     fn emit_complete(
         &self,
         ops: &mut dynasmrt::aarch64::Assembler,
+        relocations: &mut RelocationCapture,
         bytes: u32,
     ) -> Result<(), Unsupported> {
+        let completion = ops.new_dynamic_label();
         let abrupt = ops.new_dynamic_label();
+        let error = ops.new_dynamic_label();
         emit_pop_arguments(ops, bytes);
-        dynasm!(ops ; .arch aarch64 ; cbnz x1, =>abrupt);
+        dynasm!(ops ; .arch aarch64 ; =>completion ; cbnz x1, =>abrupt);
         // Root reloads touch only root registers and x16, so the result
         // stays in x0.
         emit_reload_safepoint_roots(ops, self.frame, self.site)?;
@@ -151,6 +156,14 @@ impl CallSite<'_> {
             ; .arch aarch64
             ; b =>self.done
             ; =>abrupt
+            ; cmp x1, NativeResultStatus::Continue as u32
+            ; b.ne =>error
+        );
+        crate::arm64::js_call::emit_enter_staged(ops, relocations, self.transitions, 19);
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>completion
+            ; =>error
             ; mov x17, x0
             ; mov x15, x1
         );
@@ -173,7 +186,7 @@ impl CallSite<'_> {
         relocations: &mut RelocationCapture,
     ) -> Result<(), Unsupported> {
         crate::arm64::js_call::emit_enter_staged(ops, relocations, self.transitions, 19);
-        self.emit_complete(ops, 0)
+        self.emit_complete(ops, relocations, 0)
     }
 }
 
@@ -462,5 +475,5 @@ fn emit_invoke(
             new_target,
         ),
     }
-    call.emit_complete(ops, bytes)
+    call.emit_complete(ops, relocations, bytes)
 }

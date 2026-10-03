@@ -146,8 +146,8 @@ use crate::{
         VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     template::arm64::ic_probe::{
-        emit_check_shape_identity, emit_exotic_length_fast, emit_load_header, emit_load_object_header,
-        emit_ordinary_lookup_state_guard, emit_shape_state_guard,
+        emit_check_shape_identity, emit_exotic_length_fast, emit_load_header,
+        emit_load_object_header, emit_ordinary_lookup_state_guard, emit_shape_state_guard,
     },
     template::arm64::values::{
         CellTest, emit_cell_test, emit_html_dda_candidate_exit, emit_slab_base,
@@ -177,8 +177,7 @@ fn element_index(
     locations: &[AllocatedLocation],
     operand: usize,
 ) -> Result<element::Index, Unsupported> {
-    let representation =
-        sequence.representations()[instruction.operands[operand].value.0 as usize];
+    let representation = sequence.representations()[instruction.operands[operand].value.0 as usize];
     let register = if representation == MachineRepresentation::Float64 {
         float_register(locations[operand])?
     } else {
@@ -197,8 +196,7 @@ fn element_value(
     locations: &[AllocatedLocation],
     operand: usize,
 ) -> Result<element::Element, Unsupported> {
-    let representation =
-        sequence.representations()[instruction.operands[operand].value.0 as usize];
+    let representation = sequence.representations()[instruction.operands[operand].value.0 as usize];
     let register = if representation == MachineRepresentation::Float64 {
         float_register(locations[operand])?
     } else {
@@ -3376,7 +3374,12 @@ fn emit_with_reach(
                     element::Base::Raw(base)
                 };
                 let result = if load {
-                    element::CheckedResult::Load(element_value(sequence, instruction, locations, 4)?)
+                    element::CheckedResult::Load(element_value(
+                        sequence,
+                        instruction,
+                        locations,
+                        4,
+                    )?)
                 } else {
                     element::CheckedResult::Address {
                         stored: element_value(sequence, instruction, locations, 4)?,

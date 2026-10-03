@@ -42,13 +42,13 @@ use rustc_hash::FxHashMap;
 
 use super::builder::Built;
 use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, NodeId, Repr};
-use super::regalloc::{Allocation, Location, Move, FP_REGISTERS, GP_REGISTERS};
+use super::regalloc::{Allocation, FP_REGISTERS, GP_REGISTERS, Location, Move};
 use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET,
-    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
-    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET,
+    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+    VM_THREAD_MARKING_FLAG_CELL_OFFSET,
 };
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 
@@ -455,8 +455,12 @@ impl<'a> Codegen<'a> {
             return;
         }
         match (from, to) {
-            (Location::Gp(a), Location::Gp(b)) => dynasm!(self.ops ; .arch aarch64 ; mov X(b), X(a)),
-            (Location::Fp(a), Location::Fp(b)) => dynasm!(self.ops ; .arch aarch64 ; fmov D(b), D(a)),
+            (Location::Gp(a), Location::Gp(b)) => {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(b), X(a))
+            }
+            (Location::Fp(a), Location::Fp(b)) => {
+                dynasm!(self.ops ; .arch aarch64 ; fmov D(b), D(a))
+            }
             (Location::Gp(a), slot @ (Location::TaggedSlot(_) | Location::UntaggedSlot(_))) => {
                 self.store_slot_gp(a, slot);
             }
@@ -774,10 +778,18 @@ impl<'a> Codegen<'a> {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
                 match data.kind {
-                    Kind::Int32BitAnd => dynasm!(self.ops ; .arch aarch64 ; and W(destination), W(a), W(b)),
-                    Kind::Int32BitOr => dynasm!(self.ops ; .arch aarch64 ; orr W(destination), W(a), W(b)),
-                    Kind::Int32BitXor => dynasm!(self.ops ; .arch aarch64 ; eor W(destination), W(a), W(b)),
-                    Kind::Int32ShiftLeft => dynasm!(self.ops ; .arch aarch64 ; lsl W(destination), W(a), W(b)),
+                    Kind::Int32BitAnd => {
+                        dynasm!(self.ops ; .arch aarch64 ; and W(destination), W(a), W(b))
+                    }
+                    Kind::Int32BitOr => {
+                        dynasm!(self.ops ; .arch aarch64 ; orr W(destination), W(a), W(b))
+                    }
+                    Kind::Int32BitXor => {
+                        dynasm!(self.ops ; .arch aarch64 ; eor W(destination), W(a), W(b))
+                    }
+                    Kind::Int32ShiftLeft => {
+                        dynasm!(self.ops ; .arch aarch64 ; lsl W(destination), W(a), W(b))
+                    }
                     _ => dynasm!(self.ops ; .arch aarch64 ; asr W(destination), W(a), W(b)),
                 }
             }
@@ -808,9 +820,15 @@ impl<'a> Codegen<'a> {
                 let (a, b) = (Self::fp(input(0)), Self::fp(input(1)));
                 let destination = Self::fp(result.expect("a result"));
                 match data.kind {
-                    Kind::Float64Add => dynasm!(self.ops ; .arch aarch64 ; fadd D(destination), D(a), D(b)),
-                    Kind::Float64Sub => dynasm!(self.ops ; .arch aarch64 ; fsub D(destination), D(a), D(b)),
-                    Kind::Float64Mul => dynasm!(self.ops ; .arch aarch64 ; fmul D(destination), D(a), D(b)),
+                    Kind::Float64Add => {
+                        dynasm!(self.ops ; .arch aarch64 ; fadd D(destination), D(a), D(b))
+                    }
+                    Kind::Float64Sub => {
+                        dynasm!(self.ops ; .arch aarch64 ; fsub D(destination), D(a), D(b))
+                    }
+                    Kind::Float64Mul => {
+                        dynasm!(self.ops ; .arch aarch64 ; fmul D(destination), D(a), D(b))
+                    }
                     _ => dynasm!(self.ops ; .arch aarch64 ; fdiv D(destination), D(a), D(b)),
                 }
             }
@@ -1018,10 +1036,16 @@ impl<'a> Codegen<'a> {
             (Condition::NotEqual, _) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ne),
             (Condition::Less, false) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), lt),
             (Condition::Less, true) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), mi),
-            (Condition::LessEqual, false) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), le),
-            (Condition::LessEqual, true) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ls),
+            (Condition::LessEqual, false) => {
+                dynasm!(self.ops ; .arch aarch64 ; cset W(destination), le)
+            }
+            (Condition::LessEqual, true) => {
+                dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ls)
+            }
             (Condition::Greater, _) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), gt),
-            (Condition::GreaterEqual, _) => dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ge),
+            (Condition::GreaterEqual, _) => {
+                dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ge)
+            }
         }
         dynasm!(self.ops ; .arch aarch64 ; orr XSP(destination), X(destination), VALUE_FALSE);
     }
@@ -1067,7 +1091,13 @@ impl<'a> Codegen<'a> {
 
     /// Exit unless `X(object)` is an ordinary object with one of `shapes`
     /// and no object-local state overriding its shape's slots.
-    fn emit_check_shapes(&mut self, object: u8, shapes: &[u32], writable: bool, exit: DynamicLabel) {
+    fn emit_check_shapes(
+        &mut self,
+        object: u8,
+        shapes: &[u32],
+        writable: bool,
+        exit: DynamicLabel,
+    ) {
         let matched = self.ops.new_dynamic_label();
         let shape_byte = self.view.object_shape_byte;
         let flags_byte = self.view.object_flags_byte;
@@ -1134,27 +1164,28 @@ impl<'a> Codegen<'a> {
             ; =>done
         );
         let live = self.allocation.node(node).live_registers.clone();
-        self.deferred.push(Box::new(move |codegen: &mut Codegen<'a>| {
-            dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-            let saved = codegen.emit_save_registers(&live);
-            dynasm!(codegen.ops
-                ; .arch aarch64
-                ; mov x1, X(object)
-                ; mov x2, X(value)
-                ; ldr x0, [x20, THREAD_OFFSET]
-                ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-            );
-            emit_load_symbol_u64(
-                &mut codegen.ops,
-                &mut codegen.relocations,
-                16,
-                otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
-                RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
-            );
-            dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
-            codegen.emit_restore_registers(&live, saved);
-            dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
-        }));
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x1, X(object)
+                    ; mov x2, X(value)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+            }));
     }
 
     /// Push every live caller-saved register; returns the bytes pushed.
@@ -1168,8 +1199,12 @@ impl<'a> Codegen<'a> {
         for (index, (location, _)) in live.iter().enumerate() {
             let offset = index as u32 * 8;
             match *location {
-                Location::Gp(register) => dynasm!(self.ops ; .arch aarch64 ; str X(register), [sp, offset]),
-                Location::Fp(register) => dynasm!(self.ops ; .arch aarch64 ; str D(register), [sp, offset]),
+                Location::Gp(register) => {
+                    dynasm!(self.ops ; .arch aarch64 ; str X(register), [sp, offset])
+                }
+                Location::Fp(register) => {
+                    dynasm!(self.ops ; .arch aarch64 ; str D(register), [sp, offset])
+                }
                 _ => {}
             }
         }
@@ -1183,8 +1218,12 @@ impl<'a> Codegen<'a> {
         for (index, (location, _)) in live.iter().enumerate() {
             let offset = index as u32 * 8;
             match *location {
-                Location::Gp(register) => dynasm!(self.ops ; .arch aarch64 ; ldr X(register), [sp, offset]),
-                Location::Fp(register) => dynasm!(self.ops ; .arch aarch64 ; ldr D(register), [sp, offset]),
+                Location::Gp(register) => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldr X(register), [sp, offset])
+                }
+                Location::Fp(register) => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldr D(register), [sp, offset])
+                }
                 _ => {}
             }
         }
@@ -1203,7 +1242,12 @@ impl<'a> Codegen<'a> {
     /// Run the baseline operation of the instruction at `pc` on the frame
     /// window. Every allocatable register is free here (a generic node is a
     /// call); its inputs are stored into their window registers first.
-    fn emit_generic(&mut self, node: NodeId, pc: u32, registers: &[u16]) -> Result<(), Unsupported> {
+    fn emit_generic(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        registers: &[u16],
+    ) -> Result<(), Unsupported> {
         self.load_immediate(16, u64::from(pc));
         dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
         let inputs = self.allocation.node(node).inputs.clone();
@@ -1233,20 +1277,21 @@ impl<'a> Codegen<'a> {
             let shared_committed = self.committed_throw;
             let materialize = self.materialize;
             let scratch = self.slots.exception_scratch();
-            self.deferred.push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; =>threw
-                    ; movz w17, index
-                    ; bl =>materialize
-                    ; b =>shared_threw
-                    ; =>committed_throw
-                );
-                codegen.store_slot_gp(0, scratch);
-                dynasm!(codegen.ops ; .arch aarch64 ; movz w17, index ; bl =>materialize);
-                codegen.load_slot_gp(0, scratch);
-                dynasm!(codegen.ops ; .arch aarch64 ; b =>shared_committed);
-            }));
+            self.deferred
+                .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                    dynasm!(codegen.ops
+                        ; .arch aarch64
+                        ; =>threw
+                        ; movz w17, index
+                        ; bl =>materialize
+                        ; b =>shared_threw
+                        ; =>committed_throw
+                    );
+                    codegen.store_slot_gp(0, scratch);
+                    dynasm!(codegen.ops ; .arch aarch64 ; movz w17, index ; bl =>materialize);
+                    codegen.load_slot_gp(0, scratch);
+                    dynasm!(codegen.ops ; .arch aarch64 ; b =>shared_committed);
+                }));
             (threw, committed_throw)
         } else {
             (self.threw, self.committed_throw)
@@ -1259,7 +1304,11 @@ impl<'a> Codegen<'a> {
             type_mismatch_exit: exit(self, ExitReason::TypeMismatch, ExitAction::Recompile),
             identity_guard_exit: exit(self, ExitReason::IdentityGuard, ExitAction::Recompile),
             allocation_miss_exit: exit(self, ExitReason::AllocationMiss, ExitAction::Resume),
-            unsupported_exit: exit(self, ExitReason::UnsupportedOperation, ExitAction::Recompile),
+            unsupported_exit: exit(
+                self,
+                ExitReason::UnsupportedOperation,
+                ExitAction::Recompile,
+            ),
             runtime_transition_exit: runtime_transition,
             backedge_relink_exit: exit(self, ExitReason::Interrupt, ExitAction::Resume),
             bail: runtime_transition,
@@ -1302,24 +1351,25 @@ impl<'a> Codegen<'a> {
         if !numeric_slow_paths.is_empty() || !coercion_slow_paths.is_empty() {
             let fatal = self.fatal;
             let transitions = self.transitions;
-            self.deferred.push(Box::new(move |codegen: &mut Codegen<'a>| {
-                crate::template::arm64::arith::emit_numeric_slow_paths(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    transitions,
-                    numeric_slow_paths,
-                    threw,
-                    fatal,
-                );
-                crate::template::arm64::arith::emit_coercion_slow_paths(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    transitions,
-                    coercion_slow_paths,
-                    threw,
-                    fatal,
-                );
-            }));
+            self.deferred
+                .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                    crate::template::arm64::arith::emit_numeric_slow_paths(
+                        &mut codegen.ops,
+                        &mut codegen.relocations,
+                        transitions,
+                        numeric_slow_paths,
+                        threw,
+                        fatal,
+                    );
+                    crate::template::arm64::arith::emit_coercion_slow_paths(
+                        &mut codegen.ops,
+                        &mut codegen.relocations,
+                        transitions,
+                        coercion_slow_paths,
+                        threw,
+                        fatal,
+                    );
+                }));
         }
         Ok(())
     }
@@ -1397,17 +1447,26 @@ impl<'a> Codegen<'a> {
                 let false_label = self.labels[&if_false];
                 match kind {
                     BranchKind::Int32(condition) => {
-                        let (a, b) = (Self::gp(allocation.inputs[0]), Self::gp(allocation.inputs[1]));
+                        let (a, b) = (
+                            Self::gp(allocation.inputs[0]),
+                            Self::gp(allocation.inputs[1]),
+                        );
                         dynasm!(self.ops ; .arch aarch64 ; cmp W(a), W(b));
                         self.emit_branch_condition(condition, false, true_label);
                     }
                     BranchKind::Float64(condition) => {
-                        let (a, b) = (Self::fp(allocation.inputs[0]), Self::fp(allocation.inputs[1]));
+                        let (a, b) = (
+                            Self::fp(allocation.inputs[0]),
+                            Self::fp(allocation.inputs[1]),
+                        );
                         dynasm!(self.ops ; .arch aarch64 ; fcmp D(a), D(b));
                         self.emit_branch_condition(condition, true, true_label);
                     }
                     BranchKind::TaggedEqual => {
-                        let (a, b) = (Self::gp(allocation.inputs[0]), Self::gp(allocation.inputs[1]));
+                        let (a, b) = (
+                            Self::gp(allocation.inputs[0]),
+                            Self::gp(allocation.inputs[1]),
+                        );
                         dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b) ; b.eq =>true_label);
                     }
                     BranchKind::Nullish => {
@@ -1489,31 +1548,32 @@ impl<'a> Codegen<'a> {
             ; b =>slow
         );
         let live = self.allocation.node(node).live_registers.clone();
-        self.deferred.push(Box::new(move |codegen: &mut Codegen<'a>| {
-            dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-            let saved = codegen.emit_save_registers(&live);
-            dynasm!(codegen.ops
-                ; .arch aarch64
-                ; mov x1, X(value)
-                ; ldr x0, [x20, THREAD_OFFSET]
-                ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-            );
-            emit_load_symbol_u64(
-                &mut codegen.ops,
-                &mut codegen.relocations,
-                16,
-                otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-                RelocationTarget::runtime_stub(abi::STUB_TO_BOOLEAN_LEAF),
-            );
-            dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
-            codegen.emit_restore_registers(&live, saved);
-            dynasm!(codegen.ops
-                ; .arch aarch64
-                ; cmp x16, VALUE_TRUE as u32
-                ; b.eq =>if_true
-                ; b =>if_false
-            );
-        }));
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
+                let saved = codegen.emit_save_registers(&live);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; mov x1, X(value)
+                    ; ldr x0, [x20, THREAD_OFFSET]
+                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+                    RelocationTarget::runtime_stub(abi::STUB_TO_BOOLEAN_LEAF),
+                );
+                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
+                codegen.emit_restore_registers(&live, saved);
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; cmp x16, VALUE_TRUE as u32
+                    ; b.eq =>if_true
+                    ; b =>if_false
+                );
+            }));
     }
 
     /// The interrupt and work-budget poll of a loop back edge, before the
@@ -1549,69 +1609,71 @@ impl<'a> Codegen<'a> {
             let threw = self.ops.new_dynamic_label();
             let shared = self.threw;
             let materialize = self.materialize;
-            self.deferred.push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; =>threw
-                    ; movz w17, index
-                    ; bl =>materialize
-                    ; b =>shared
-                );
-            }));
+            self.deferred
+                .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                    dynasm!(codegen.ops
+                        ; .arch aarch64
+                        ; =>threw
+                        ; movz w17, index
+                        ; bl =>materialize
+                        ; b =>shared
+                    );
+                }));
             threw
         } else {
             self.threw
         };
         let fatal = self.fatal;
         let poll = self.transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
-        self.deferred.push(Box::new(move |codegen: &mut Codegen<'a>| {
-            let restore_resume = codegen.ops.new_dynamic_label();
-            let restore_exit = codegen.ops.new_dynamic_label();
-            let restore_threw = codegen.ops.new_dynamic_label();
-            dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-            for &(location, repr) in &live {
-                let slot = codegen.slots.snapshot_slot(location, repr);
-                codegen.emit_move(location, slot);
-            }
-            codegen.load_immediate(16, u64::from(header_pc));
-            dynasm!(codegen.ops
-                ; .arch aarch64
-                ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]
-                ; mov x0, x20
-            );
-            emit_load_symbol_u64(
-                &mut codegen.ops,
-                &mut codegen.relocations,
-                16,
-                poll,
-                RelocationTarget::runtime_stub(abi::STUB_JIT_BACKEDGE_POLL),
-            );
-            dynasm!(codegen.ops
-                ; .arch aarch64
-                ; blr x16
-                ; cmp x0, NativeResultStatus::Success as u32
-                ; b.eq =>restore_resume
-                ; cmp x0, NativeResultStatus::Yield as u32
-                ; b.eq =>restore_resume
-                ; cmp x0, NativeResultStatus::Throw as u32
-                ; b.eq =>restore_threw
-                ; cmp x0, NativeResultStatus::SideExit as u32
-                ; b.eq =>restore_exit
-                ; b =>fatal
-            );
-            for (label, target) in [
-                (restore_resume, resume),
-                (restore_exit, exit),
-                (restore_threw, threw),
-            ] {
-                dynasm!(codegen.ops ; .arch aarch64 ; =>label);
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                let restore_resume = codegen.ops.new_dynamic_label();
+                let restore_exit = codegen.ops.new_dynamic_label();
+                let restore_threw = codegen.ops.new_dynamic_label();
+                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
                 for &(location, repr) in &live {
                     let slot = codegen.slots.snapshot_slot(location, repr);
-                    codegen.emit_move(slot, location);
+                    codegen.emit_move(location, slot);
                 }
-                dynasm!(codegen.ops ; .arch aarch64 ; b =>target);
-            }
-        }));
+                codegen.load_immediate(16, u64::from(header_pc));
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]
+                    ; mov x0, x20
+                );
+                emit_load_symbol_u64(
+                    &mut codegen.ops,
+                    &mut codegen.relocations,
+                    16,
+                    poll,
+                    RelocationTarget::runtime_stub(abi::STUB_JIT_BACKEDGE_POLL),
+                );
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, NativeResultStatus::Success as u32
+                    ; b.eq =>restore_resume
+                    ; cmp x0, NativeResultStatus::Yield as u32
+                    ; b.eq =>restore_resume
+                    ; cmp x0, NativeResultStatus::Throw as u32
+                    ; b.eq =>restore_threw
+                    ; cmp x0, NativeResultStatus::SideExit as u32
+                    ; b.eq =>restore_exit
+                    ; b =>fatal
+                );
+                for (label, target) in [
+                    (restore_resume, resume),
+                    (restore_exit, exit),
+                    (restore_threw, threw),
+                ] {
+                    dynasm!(codegen.ops ; .arch aarch64 ; =>label);
+                    for &(location, repr) in &live {
+                        let slot = codegen.slots.snapshot_slot(location, repr);
+                        codegen.emit_move(slot, location);
+                    }
+                    dynasm!(codegen.ops ; .arch aarch64 ; b =>target);
+                }
+            }));
     }
 
     // ------------------------------------------------------------------
@@ -1724,7 +1786,8 @@ impl<'a> Codegen<'a> {
             &mut self.ops,
             &mut self.relocations,
             16,
-            self.transitions.variadic_entry(abi::STUB_JIT_DEOPT_WRITEBACK),
+            self.transitions
+                .variadic_entry(abi::STUB_JIT_DEOPT_WRITEBACK),
             RelocationTarget::runtime_stub(abi::STUB_JIT_DEOPT_WRITEBACK),
         );
         dynasm!(self.ops
@@ -1780,7 +1843,8 @@ impl<'a> Codegen<'a> {
             &mut self.ops,
             &mut self.relocations,
             16,
-            self.transitions.variadic_entry(abi::STUB_JIT_DEOPT_WRITEBACK),
+            self.transitions
+                .variadic_entry(abi::STUB_JIT_DEOPT_WRITEBACK),
             RelocationTarget::runtime_stub(abi::STUB_JIT_DEOPT_WRITEBACK),
         );
         let side_exit = self.activation.side_exit;

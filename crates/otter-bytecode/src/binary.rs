@@ -40,9 +40,9 @@
 use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
-    ExceptionHandler, Function,
-    MappedArgumentBinding, ModuleInit, ModuleResolution, ScopeDescriptor, ScopeFlags, ScopeKind,
-    SlotDescriptor, SlotKind, SourceKind, SpanEntry, TemplateSite,
+    ExceptionHandler, Function, MappedArgumentBinding, ModuleInit, ModuleResolution,
+    ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanEntry,
+    TemplateSite,
     encoding::{op_from_byte, op_to_byte},
     verifier::{BytecodeVerifyError, VerifiedBytecodeModule},
 };

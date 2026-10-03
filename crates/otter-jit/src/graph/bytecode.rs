@@ -221,8 +221,8 @@ impl Analysis {
             let mut reads = SmallVec::new();
             let mut writes = SmallVec::new();
             for (position, operand) in operands.iter().enumerate() {
-                let spec = operand_spec_at(op, position)
-                    .ok_or(AnalysisError::MalformedOperand { pc })?;
+                let spec =
+                    operand_spec_at(op, position).ok_or(AnalysisError::MalformedOperand { pc })?;
                 if OperandKind::of(operand) != spec.kind {
                     return Err(AnalysisError::MalformedOperand { pc });
                 }

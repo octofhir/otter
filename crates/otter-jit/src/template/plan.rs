@@ -364,6 +364,20 @@ pub(crate) enum TemplateOp {
         /// Serialized byte PC used to resolve the immutable call-site link.
         byte_pc: u32,
     },
+    /// `return r<callee>(args…)` from a strict tail position (§15.10.3): the
+    /// callee takes this activation's place and returns to its caller. A
+    /// constructing activation calls like [`Self::Call`] into `dst`, and the
+    /// following return completes; a tier-entered activation, or a callee
+    /// whose actuals outgrow the span this activation was called with,
+    /// leaves exactly for the interpreter, which owns its frame replacement.
+    TailCall {
+        dst: u16,
+        callee: u16,
+        argc: u16,
+        packed_args: u64,
+        /// Serialized byte PC used to resolve the immutable call-site link.
+        byte_pc: u32,
+    },
     /// `r<dst> = r<callee>.call(r<this_value>, args…)` — the same generated
     /// linkage as [`Self::Call`] with an explicit receiver instead of the
     /// canonical `undefined`. Lowered for `obj[k](…)`, a private method
@@ -562,9 +576,6 @@ pub(crate) enum TemplateOp {
     },
     /// Complete spread calls/constructions through the shared synchronous VM
     /// transition.
-    /// `TailCall` is intentionally excluded — its interpreter completion
-    /// discards the caller frame for true tail-call stack reuse, which the
-    /// compiled call helper cannot reproduce, so it stays an exact side exit.
     SpreadCallOp {
         opcode: u8,
         arg0: u64,
@@ -738,6 +749,7 @@ impl TemplatePlan {
 
     /// The plan with one operation sequence per instruction: no fused
     /// numeric chains span several instructions.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn build_unfused(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
         Self::build_with_fusion(view, false)
     }
@@ -1151,6 +1163,17 @@ impl TemplatePlan {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
                     TemplateOp::Call {
+                        dst: operands.dst,
+                        callee: operands.callee,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
+                        byte_pc: meta.byte_pc,
+                    }
+                }
+                Op::TailCall => {
+                    let operands = lowered.call_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    TemplateOp::TailCall {
                         dst: operands.dst,
                         callee: operands.callee,
                         argc: arguments.len() as u16,

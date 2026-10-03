@@ -429,6 +429,8 @@ mod tests {
         assert_ne!(before, after);
     }
 
+    // The check is a debug-build invariant of the dispatch hot path.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "no interpreter has linked or adopted")]
     fn unresolved_table_refuses_to_hand_out_an_atom() {

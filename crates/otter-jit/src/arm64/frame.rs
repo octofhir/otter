@@ -11,6 +11,11 @@
 //!   interpreter frame (function-entry tier transfer and loop OSR).
 //! - [`emit_epilogue`] / [`emit_exits`] — constructor completion,
 //!   unpublication, and side exits that resume the interpreter in place.
+//! - [`emit_tail_admission`], [`emit_tail_span_check`],
+//!   [`emit_tail_transfer`] and [`emit_tail_return`] — a proper tail call
+//!   (§15.10.3): the callee takes the place of this called record, in place
+//!   when its actuals fit the record's span and through the caller
+//!   otherwise.
 //!
 //! # Invariants
 //! - Body registers: `x19` register window, `x20` context, `x21` published
@@ -29,6 +34,10 @@
 //! - A side exit of a called record continues in the interpreter on the same
 //!   record and window and returns its completion; a tier-entered frame
 //!   returns the exit to its interpreter.
+//! - A called record's actuals start at `[x29 + 48]`, in the span its caller
+//!   pushed: `max(actual count, formal count)` words rounded up to an even
+//!   count. A tail callee's span starts at the same address, so the caller
+//!   releases exactly the span it pushed when the callee returns to it.
 //!
 //! # See also
 //! - [`crate::arm64::activation`] — receiver and object tests used here.
@@ -39,9 +48,9 @@ use dynasmrt::{
 };
 use otter_vm::{JitCompileSnapshot, native_abi as abi};
 
+pub(crate) use crate::arm64::activation::EntryShape;
 use crate::entry::TransitionTable;
 use crate::template::arm64::values::{emit_load_runtime_stub, emit_load_u64};
-pub(crate) use crate::arm64::activation::EntryShape;
 use crate::{
     arm64::activation::{emit_lexical_this, emit_object_receiver_test, emit_object_test},
     artifact::relocation::RelocationCapture,
@@ -49,7 +58,8 @@ use crate::{
         CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_TIERING_BREAK_EVEN_OFFSET,
         CODE_ENTRY_TIERING_ENABLED_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_STACK_LIMIT_OFFSET, VALUE_HOLE, VALUE_UNDEFINED,
+        NATIVE_STACK_LIMIT_OFFSET, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
 };
 
@@ -557,4 +567,128 @@ pub(crate) fn emit_exits(
         ; str x9, [x20, NATIVE_FRAME_OFFSET]
     );
     emit_restore(ops);
+}
+
+/// Branch to `leave` unless this body may hand its record to a tail callee,
+/// and to `ordinary` when the record owes constructor completion.
+///
+/// Only a called record is replaced: a tier-entered frame belongs to its
+/// interpreter, which performs the replacement itself, and so does a
+/// pending interrupt, since an unbounded tail-call chain has no back-edge
+/// to poll at. A constructing record calls ordinarily and completes on the
+/// return that follows. Clobbers `x9`, `x10` and `x17`.
+pub(crate) fn emit_tail_admission(
+    ops: &mut Assembler,
+    leave: DynamicLabel,
+    ordinary: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x29, RETURN_FRAME]
+        ; cmp x9, x21
+        ; b.eq =>leave
+        ; tbnz x9, 0, =>ordinary
+        ; ldr x17, [x20, THREAD_OFFSET]
+        ; ldr x10, [x17, VM_THREAD_INTERRUPT_CELL_OFFSET]
+        ; ldrb w10, [x10]
+        ; cbnz w10, =>leave
+    );
+}
+
+/// Branch to `outgrown` unless a tail callee's span of `words` (an even
+/// count) fits the span this record was called with. `params` is this
+/// function's formal count. Clobbers `x9` and `x10`.
+pub(crate) fn emit_tail_span_check(
+    ops: &mut Assembler,
+    params: u16,
+    words: u32,
+    outgrown: DynamicLabel,
+) {
+    // The incoming span holds `max(actuals, params)` rounded up to even.
+    if u32::from(params).next_multiple_of(2) >= words {
+        return;
+    }
+    emit_load_u64(ops, 10, u64::from(words - 1));
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w9, [x21, abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+        ; cmp w9, w10
+        ; b.lo =>outgrown
+    );
+}
+
+/// Retire this called record and return `Continue`: the context holds the
+/// tail call it staged, and the caller enters that request in its place.
+/// [`emit_tail_admission`] passed, so the record owes no constructor
+/// completion.
+pub(crate) fn emit_tail_return(ops: &mut Assembler) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x0, VALUE_UNDEFINED as u32
+        ; movz x1, abi::NativeResultStatus::Continue as u32
+        ; ldr x9, [x29, RETURN_FRAME]
+        ; str x9, [x20, NATIVE_FRAME_OFFSET]
+    );
+    emit_restore(ops);
+}
+
+/// Retire this called record and enter the callee in `x13` in its place.
+///
+/// The callee's `count` actuals occupy the `bytes` just pushed at `sp`, and
+/// [`emit_tail_admission`] and [`emit_tail_span_check`] passed. The record
+/// is unpublished, the saved registers and the return address are
+/// restored, the span moves up to `[x29 + 48]` where this record's own
+/// actuals began, and control branches to `target` with the call ABI
+/// registers set; the callee returns straight to this record's caller.
+/// Nothing allocates between the unpublication and the callee's entry.
+pub(crate) fn emit_tail_transfer(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &TransitionTable,
+    bytes: u32,
+    count: u32,
+    target: crate::arm64::js_call::CallTarget,
+) {
+    emit_load_u64(ops, 4, u64::from(count));
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x0, x20
+        ; mov x1, x13
+        ; movz x2, VALUE_UNDEFINED as u32
+        ; movz x3, VALUE_UNDEFINED as u32
+        ; ldr x9, [x29, RETURN_FRAME]
+        ; str x9, [x20, NATIVE_FRAME_OFFSET]
+        ; add x10, x29, 48
+        ; ldr x21, [x29, #32]
+        ; ldp x19, x20, [x29, #16]
+        ; ldp x29, x30, [x29]
+    );
+    // The destination lies above the pushed span: copying from the top
+    // down reads every word before a store can reach it.
+    if bytes <= 512 {
+        let mut offset = bytes;
+        while offset > 0 {
+            offset -= 16;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldp x11, x12, [sp, offset as i32]
+                ; stp x11, x12, [x10, offset as i32]
+            );
+        }
+    } else {
+        let copy = ops.new_dynamic_label();
+        emit_load_u64(ops, 14, u64::from(bytes));
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>copy
+            ; sub x14, x14, 16
+            ; add x15, sp, x14
+            ; ldp x11, x12, [x15]
+            ; add x16, x10, x14
+            ; stp x11, x12, [x16]
+            ; cbnz x14, =>copy
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; mov sp, x10);
+    crate::arm64::js_call::emit_tail_branch(ops, relocations, transitions, target);
 }

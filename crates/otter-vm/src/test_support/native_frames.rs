@@ -108,7 +108,6 @@ impl From<Frame> for FrameFixture {
     }
 }
 
-
 impl std::ops::Deref for FrameFixture {
     type Target = Frame;
     fn deref(&self) -> &Frame {

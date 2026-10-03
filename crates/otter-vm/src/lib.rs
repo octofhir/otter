@@ -250,6 +250,7 @@ pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef};
 pub use arithmetic_dispatch::NumericRuntimeOp;
 pub use code_space::BytecodeLinkError;
 pub use cpu_profile::CpuProfile;
+pub use eval_ops::commonjs_wrapper_source;
 pub use execution_context::{CallFeedbackStats, ExecutionContext};
 pub use frame_state::{
     AsyncFrameState, PendingBindFunction, PendingBindStage, PendingGetIterator,
@@ -259,8 +260,8 @@ pub use jit_exception_ops::JitExceptionOutcome;
 pub use jit_runtime_ops::{UnaryCoercionOp, UnaryPrimitiveHint};
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
-    DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
-    RunError, StackFrameSnapshot, VmError,
+    DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag, RunError,
+    StackFrameSnapshot, VmError,
 };
 pub use runtime_activation::{
     BackedgePollOutcome, BinaryOperator, ClassRuntimeOp, CommittedValueError,

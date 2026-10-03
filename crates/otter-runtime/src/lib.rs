@@ -1769,6 +1769,17 @@ fn compile_error_message(error: otter_compiler::CompileError) -> String {
     }
 }
 
+/// How a file that is not an explicit module runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommonJsRouting {
+    /// Inside the CommonJS module wrapper.
+    CommonJs,
+    /// As an ES module: the source parses as one.
+    Module,
+    /// As a classic script.
+    Script,
+}
+
 /// The one eval/`new Function` compile path every isolate shares.
 /// The closure is reusable across calls; each invocation builds a
 /// fresh `BytecodeModule`.
@@ -1801,27 +1812,34 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
         {
             return Ok(otter_vm::CompiledEvalSource::Verified(bytecode));
         }
-        // §19.2.1.3 — a direct eval compiles against its call site's
-        // context chain; indirect eval and `Function` carry none.
-        let module = otter_compiler::compile_eval_source(
-            source,
-            SourceKind::JavaScript,
-            "<eval>",
-            options.force_strict,
-            options.forbid_var_arguments,
-            options.caller_chain.as_ref(),
-            options.new_target_allowed,
-            options.in_class_field_initializer,
-            options.super_property_allowed,
-            options.super_call_allowed,
-            options.function_constructor,
-        )
-        .map_err(compile_error_message)?;
+        let module = compile_eval_with_options(source, &options).map_err(compile_error_message)?;
         if let Some((cache, key)) = &cache {
             cache.store(key, &module);
         }
         Ok(otter_vm::CompiledEvalSource::Fresh(module))
     })
+}
+
+/// Compile eval-goal `source` the way the VM's compile requests ask for it.
+/// §19.2.1.3 — a direct eval compiles against its call site's context chain;
+/// indirect eval, `Function`, and the CommonJS wrapper carry none.
+fn compile_eval_with_options(
+    source: &str,
+    options: &EvalCompileOptions,
+) -> Result<otter_bytecode::BytecodeModule, otter_compiler::CompileError> {
+    otter_compiler::compile_eval_source(
+        source,
+        SourceKind::JavaScript,
+        "<eval>",
+        options.force_strict,
+        options.forbid_var_arguments,
+        options.caller_chain.as_ref(),
+        options.new_target_allowed,
+        options.in_class_field_initializer,
+        options.super_property_allowed,
+        options.super_call_allowed,
+        options.function_constructor,
+    )
 }
 
 /// One reading of an isolate's complete budget.
@@ -6242,39 +6260,10 @@ impl Runtime {
             return self.run_module_with_context(path);
         }
         let specifier = path.to_string_lossy().to_string();
-        // The CommonJS wrapper compiles its body as JavaScript (through the
-        // eval/`new Function` path), so only route JavaScript-kind sources here.
-        // TypeScript CommonJS (`.cts`) needs type-stripping in the wrapper and
-        // is handled by the existing path until that lands.
-        let commonjs_kind = matches!(
-            source.kind,
-            SourceKind::JavaScript | SourceKind::JavaScriptJsx
-        );
-        if self.config.commonjs_enabled && commonjs_kind {
-            // CommonJS handles every script-shaped source. Only explicit ESM
-            // (module extension / package type, handled above) or an ambiguous
-            // source that actually parses as a module takes the ESM path.
-            if package_type == Some(module_loader::LoaderPackageType::CommonJs)
-                || source_path_has_script_extension(path)
-            {
-                return self.run_commonjs_file(path, source);
-            }
-            // Only a source that parses as a module is one. A source that does
-            // not parse under the module grammar is CommonJS: its body runs
-            // inside the wrapper function, where constructs the module grammar
-            // rejects — a top-level `return`, chiefly — are legal. Routing it
-            // to the wrapper is also what reports a genuine syntax error, since
-            // the wrapper compiles the same text.
-            let looks_module = match with_program(&source.text, source.kind, |program| {
-                Ok::<bool, OtterError>(program_looks_like_module(program))
-            }) {
-                Ok(looks_module) => looks_module?,
-                Err(_) => false,
-            };
-            if looks_module {
-                return self.run_module_with_context(path);
-            }
-            return self.run_commonjs_file(path, source);
+        match self.commonjs_routing(path, &source, package_type)? {
+            CommonJsRouting::CommonJs => return self.run_commonjs_file(path, source),
+            CommonJsRouting::Module => return self.run_module_with_context(path),
+            CommonJsRouting::Script => {}
         }
         if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
             return self.run_script_with_context(source, &specifier);
@@ -6530,6 +6519,48 @@ impl Runtime {
         let source = SourceInput::from_javascript(include_str!("eval_scope.js"));
         self.run_commonjs_file(&cwd.join("[eval]"), source)
             .map(|_| ())
+    }
+
+    /// How [`Self::run_file`] runs a source that is not an explicit module.
+    ///
+    /// The CommonJS wrapper compiles its body as JavaScript (through the
+    /// eval/`new Function` path), so only JavaScript-kind sources route
+    /// there; TypeScript CommonJS (`.cts`) runs as a script. CommonJS handles
+    /// every script-shaped source: only a source that actually parses as a
+    /// module takes the ESM path. A source that does not parse under the
+    /// module grammar is CommonJS, since its body runs inside the wrapper
+    /// function where constructs the module grammar rejects — a top-level
+    /// `return`, chiefly — are legal, and compiling the same text there is
+    /// also what reports a genuine syntax error.
+    pub(crate) fn commonjs_routing(
+        &self,
+        path: &Path,
+        source: &SourceInput,
+        package_type: Option<module_loader::LoaderPackageType>,
+    ) -> Result<CommonJsRouting, OtterError> {
+        let commonjs_kind = matches!(
+            source.kind,
+            SourceKind::JavaScript | SourceKind::JavaScriptJsx
+        );
+        if !(self.config.commonjs_enabled && commonjs_kind) {
+            return Ok(CommonJsRouting::Script);
+        }
+        if package_type == Some(module_loader::LoaderPackageType::CommonJs)
+            || source_path_has_script_extension(path)
+        {
+            return Ok(CommonJsRouting::CommonJs);
+        }
+        let looks_module = match with_program(&source.text, source.kind, |program| {
+            Ok::<bool, OtterError>(program_looks_like_module(program))
+        }) {
+            Ok(looks_module) => looks_module?,
+            Err(_) => false,
+        };
+        Ok(if looks_module {
+            CommonJsRouting::Module
+        } else {
+            CommonJsRouting::CommonJs
+        })
     }
 
     pub(crate) fn run_commonjs_file(

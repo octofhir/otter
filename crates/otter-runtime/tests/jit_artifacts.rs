@@ -77,6 +77,7 @@ function sumAbsoluteOffsets(limit) {
 String(sumAbsoluteOffsets(96));
 "#;
 
+#[cfg(target_arch = "aarch64")]
 const TEMPLATE_INLINE_METHOD: &str = r#"
 function apply(value) {
   return value + this.bias;
@@ -286,6 +287,7 @@ fn bundle_relocation_target_kinds(bundle: &JitArtifactBundle) -> BTreeSet<String
         .collect()
 }
 
+#[cfg(target_arch = "aarch64")]
 fn relocation_target_kinds(batch: &JitArtifactBatch) -> BTreeSet<String> {
     batch
         .bundles()

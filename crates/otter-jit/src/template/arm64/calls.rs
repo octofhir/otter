@@ -1127,22 +1127,200 @@ pub(super) fn emit_call_with_receiver(
     )
 }
 
-/// Deliver a trampoline completion in `x0`/`x1`: success to `dst`, a throw
-/// to `throw_value`, a parked error to `threw`.
+/// Emit `return callee(args…)` from a strict tail position (§15.10.3).
+///
+/// A called record whose span holds the callee's actuals pushes them like a
+/// call's and hands its place to the callee (see
+/// [`crate::arm64::frame::emit_tail_transfer`]): a chain of tail calls runs
+/// in constant native stack and every callee returns straight to the
+/// chain's caller. A site with one proven bytecode target enters its current
+/// generation behind the identity guard; any other callee goes through the
+/// generic entry. Actuals that outgrow the record's span are staged as the
+/// context's request, and the record retires with `Continue`; its caller
+/// enters the request in its place. A constructing record calls like
+/// [`emit_call`] into `dst`, and the return that follows completes it. A
+/// tier-entered frame and a pending interrupt reach `leave`, an exact exit
+/// at this instruction: the interpreter performs the replacement there.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_tail_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    code_map: Option<&mut CodeMapCapture>,
+    dst: u16,
+    callee: u16,
+    argc: u16,
+    argument_registers: &[u16],
+    logical_pc: u32,
+    byte_pc: u32,
+    leave: DynamicLabel,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    throw_value: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    use crate::arm64::js_call::CallTarget;
+    let start = ops.offset().0;
+    let ordinary = ops.new_dynamic_label();
+    let outgrown = ops.new_dynamic_label();
+    let params = view.code_block.param_count;
+    crate::arm64::frame::emit_tail_admission(ops, leave, ordinary);
+    let count = usize::from(argc);
+    let known = view
+        .direct_callees
+        .get(&byte_pc)
+        .filter(|targets| targets.len() == 1)
+        .and_then(|targets| targets.first())
+        .map(|target| target.plan);
+    if let Some(plan) = known {
+        let generic = ops.new_dynamic_label();
+        emit_load_reg(ops, 9, callee)?;
+        crate::arm64::inline_guard::emit_cached_identity(
+            ops,
+            relocations,
+            view,
+            plan,
+            logical_pc,
+            generic,
+        );
+        emit_tail_path(
+            ops,
+            relocations,
+            table,
+            params,
+            callee,
+            argument_registers,
+            count.max(usize::from(plan.param_count)),
+            CallTarget::Known {
+                entry_cell: plan.entry_cell,
+                function_id: plan.function_id,
+            },
+            outgrown,
+        )?;
+        dynasm!(ops ; .arch aarch64 ; =>generic);
+    }
+    emit_tail_path(
+        ops,
+        relocations,
+        table,
+        params,
+        callee,
+        argument_registers,
+        count,
+        CallTarget::Generic,
+        outgrown,
+    )?;
+    dynasm!(ops ; .arch aarch64 ; =>outgrown);
+    let mut words = vec![PacketWord::Register(callee)];
+    words.extend(argument_registers.iter().copied().map(PacketWord::Register));
+    emit_value_packet_transition(
+        ops,
+        relocations,
+        table,
+        abi::STUB_JIT_STAGE_TAIL_CALL,
+        &words,
+        None,
+        throw_value,
+        fatal,
+    )?;
+    crate::arm64::frame::emit_tail_return(ops);
+    if let Some(code_map) = code_map {
+        code_map.record(CodeRegion::call_structural(
+            "tailCall",
+            start,
+            ops.offset().0,
+            view.code_block.id,
+            logical_pc,
+            byte_pc,
+            known.map(|plan| plan.function_id),
+        ));
+    }
+    dynasm!(ops ; .arch aarch64 ; =>ordinary);
+    emit_call(
+        ops,
+        relocations,
+        table,
+        view,
+        direct_call_events,
+        None,
+        dst,
+        callee,
+        argc,
+        argument_registers,
+        logical_pc,
+        byte_pc,
+        bail,
+        threw,
+        throw_value,
+    )
+}
+
+/// One target of [`emit_tail_call`]: check that `pushed` actuals fit the
+/// record's span, push them (`undefined` past the call's own), and hand the
+/// record to `target`; actuals that outgrow the span reach `outgrown`.
+/// `params` is this function's formal count.
+#[allow(clippy::too_many_arguments)]
+fn emit_tail_path(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    params: u16,
+    callee: u16,
+    argument_registers: &[u16],
+    pushed: usize,
+    target: crate::arm64::js_call::CallTarget,
+    outgrown: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let bytes = crate::call_linkage::pushed_argument_bytes(pushed)?;
+    crate::arm64::frame::emit_tail_span_check(ops, params, bytes / 8, outgrown);
+    crate::arm64::js_call::emit_push_arguments(ops, pushed, |ops, index, register, _| {
+        match argument_registers.get(index) {
+            Some(&source) => emit_load_reg(ops, register, source)?,
+            None => emit_load_u64(ops, register, VALUE_UNDEFINED),
+        }
+        Ok(register)
+    })?;
+    emit_load_reg(ops, 13, callee)?;
+    let count = u32::try_from(argument_registers.len())
+        .map_err(|_| Unsupported::OperandShape("tail call actual count"))?;
+    crate::arm64::frame::emit_tail_transfer(ops, relocations, table, bytes, count, target);
+    Ok(())
+}
+
+/// Deliver a call completion in `x0`/`x1`: success to `dst`, a throw to
+/// `throw_value`, a parked error to `threw`. A callee that retired itself
+/// for a tail call it staged returns `Continue`; that call is entered in its
+/// place and its completion delivered the same way.
 pub(super) fn emit_call_completion(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
+    let completion = ops.new_dynamic_label();
     let abrupt = ops.new_dynamic_label();
+    let error = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; cbnz x1, =>abrupt);
+    dynasm!(ops ; .arch aarch64 ; =>completion ; cbnz x1, =>abrupt);
     emit_store_reg(ops, 0, dst)?;
     dynasm!(ops
         ; .arch aarch64
         ; b =>done
         ; =>abrupt
+        ; cmp x1, abi::NativeResultStatus::Continue as u32
+        ; b.ne =>error
+    );
+    // The callee retired itself for a tail call it staged: enter that call
+    // in its place.
+    crate::arm64::js_call::emit_enter_staged(ops, relocations, table, 20);
+    dynasm!(ops
+        ; .arch aarch64
+        ; b =>completion
+        ; =>error
         ; cmp x1, abi::NativeResultStatus::Throw as u32
         ; b.eq =>throw_value
         ; b =>threw
@@ -1265,7 +1443,7 @@ pub(super) fn emit_trampoline_call(
             },
         );
         emit_pop_arguments(ops, bytes);
-        emit_call_completion(ops, dst, throw_value, threw)?;
+        emit_call_completion(ops, relocations, table, dst, throw_value, threw)?;
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>generic);
     }
     // The method callable survives the span push: it clobbers only x15/x16.
@@ -1309,7 +1487,7 @@ pub(super) fn emit_trampoline_call(
             );
         }
     }
-    emit_call_completion(ops, dst, throw_value, threw)?;
+    emit_call_completion(ops, relocations, table, dst, throw_value, threw)?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::call_structural(

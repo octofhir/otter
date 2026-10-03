@@ -521,7 +521,9 @@ impl Interpreter {
             Ok(PoppedCompletion::Value(value)) => Ok(Some(value)),
             // An async activation's completion is its promise, which only a
             // caller at the region floor still needs.
-            Ok(PoppedCompletion::Promise(promise)) => Ok(stack.is_at_floor(floor).then_some(promise)),
+            Ok(PoppedCompletion::Promise(promise)) => {
+                Ok(stack.is_at_floor(floor).then_some(promise))
+            }
             Err(error) => Err(error),
         }
     }

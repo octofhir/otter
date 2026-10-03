@@ -811,11 +811,9 @@ impl BaselinePlan {
                         src: reg(operands, 0)?,
                     })
                 }
-                Op::TdzError => {
-                    LoweredOperands::Immediate(ImmediateOperands {
-                        value: imm32(operands, 0)?,
-                    })
-                }
+                Op::TdzError => LoweredOperands::Immediate(ImmediateOperands {
+                    value: imm32(operands, 0)?,
+                }),
                 Op::NewObject
                 | Op::LoadThis
                 | Op::LoadClosureContext
@@ -968,7 +966,7 @@ impl BaselinePlan {
                     index: reg(operands, 1)?,
                     value: reg(operands, 2)?,
                 }),
-                Op::Call | Op::New | Op::SuperConstruct => {
+                Op::Call | Op::TailCall | Op::New | Op::SuperConstruct => {
                     let count = const_index(operands, 2)? as usize;
                     let arguments = append_register_tail(
                         &mut register_operands,

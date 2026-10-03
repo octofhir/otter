@@ -438,6 +438,7 @@ impl TypedFeedbackSlot {
                 Box::default(),
             ),
             Op::Call
+            | Op::TailCall
             | Op::CallWithThis
             | Op::CallForwardArguments
             | Op::CallSpread

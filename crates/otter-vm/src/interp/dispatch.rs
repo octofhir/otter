@@ -411,7 +411,25 @@ impl Interpreter {
                     if self.interrupt.is_set() {
                         return Err(VmError::Interrupted);
                     }
+                    if jit_installed {
+                        self.record_call_attempt_feedback(
+                            function,
+                            instr.instruction_pc,
+                            function_id,
+                        );
+                    }
                     self.do_tail_call_exec(stack, function, instr)?;
+                    if jit_installed && let Some(function_id) = self.staged_bytecode_target(stack) {
+                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(function_id);
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                    }
                     continue;
                 }
                 Op::CallForwardArguments => {
@@ -766,14 +784,13 @@ impl Interpreter {
                         self.pending_uncaught_frames =
                             Some(self.snapshot_active_frames(context, usize::MAX));
                     }
-                    let unwind =
-                        self.unwind_throw_above(
-                            context,
-                            stack,
-                            floor,
-                            value,
-                            crate::activation_stack::ThrowSite::Instruction,
-                        );
+                    let unwind = self.unwind_throw_above(
+                        context,
+                        stack,
+                        floor,
+                        value,
+                        crate::activation_stack::ThrowSite::Instruction,
+                    );
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
                     } else {

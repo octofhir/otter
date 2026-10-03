@@ -8,6 +8,7 @@
 //!   then the call.
 //! - [`emit_spread_call_op`] / [`emit_forward_call`] — calls whose span, or
 //!   whole request, a runtime staging entry writes.
+//! - [`emit_tail_call`] — a proper tail call.
 //!
 //! # Invariants
 //! - `r15` holds the context, `r14` the published frame and `r13` its
@@ -46,13 +47,33 @@ pub(super) enum CallNewTarget {
 }
 
 /// Deliver a completion in `rax`/`rdx`: success to `dst`, a throw to
-/// `throw_value`, a parked error to `threw`.
-fn emit_completion(ops: &mut Assembler, dst: u16, throw_value: DynamicLabel, threw: DynamicLabel) {
+/// `throw_value`, a parked error to `threw`. A callee that retired itself
+/// for a tail call it staged returns `Continue`; that call is entered in its
+/// place and its completion delivered the same way.
+fn emit_completion(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    dst: u16,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+) {
+    let completion = ops.new_dynamic_label();
+    let error = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
+        ; =>completion
         ; test rdx, rdx
         ; jz =>done
+        ; cmp edx, abi::NativeResultStatus::Continue as i32
+        ; jne =>error
+    );
+    emit_enter_staged(ops, relocations, table, 15);
+    dynasm!(ops
+        ; .arch x64
+        ; jmp =>completion
+        ; =>error
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>throw_value
         ; jmp =>threw
@@ -200,11 +221,135 @@ pub(super) fn emit_call(
             target,
         );
         emit_pop_arguments(ops, bytes);
-        emit_completion(ops, dst, throw_value, threw);
+        emit_completion(ops, relocations, table, dst, throw_value, threw);
         dynasm!(ops ; .arch x64 ; jmp =>done ; =>next);
     }
     dynasm!(ops ; .arch x64 ; =>done);
     Ok(())
+}
+
+/// Emit `return callee(args…)` from a strict tail position (§15.10.3); see
+/// the AArch64 emitter for the protocol. A called record whose span holds
+/// the callee's actuals hands its place to the callee in place; actuals that
+/// outgrow the span are staged and the record retires with `Continue`; a
+/// constructing record calls ordinarily into `dst`; a tier-entered frame
+/// and a pending interrupt reach `leave`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_tail_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    view: &JitCompileSnapshot,
+    callee: u16,
+    arguments: &[u16],
+    known: Option<otter_vm::jit::JitDirectCallPlan>,
+    call_pc: u32,
+    dst: u16,
+    leave: DynamicLabel,
+    throw_value: DynamicLabel,
+    threw: DynamicLabel,
+    fatal: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let ordinary = ops.new_dynamic_label();
+    let outgrown = ops.new_dynamic_label();
+    let params = view.code_block.param_count;
+    let count = u32::try_from(arguments.len())
+        .map_err(|_| Unsupported::OperandShape("x86-64 tail call actual count"))?;
+    super::activation::emit_tail_admission(ops, leave, ordinary);
+    emit_load_reg(ops, 9, callee);
+    let targets = known
+        .map(|plan| {
+            (
+                Some(plan),
+                CallTarget::Known {
+                    entry_cell: plan.entry_cell,
+                    function_id: plan.function_id,
+                },
+            )
+        })
+        .into_iter()
+        .chain([(None, CallTarget::Generic)]);
+    for (plan, target) in targets {
+        let next = ops.new_dynamic_label();
+        let pushed = match plan {
+            Some(plan) => {
+                crate::x86_64::js_call::emit_cached_identity(
+                    ops,
+                    relocations,
+                    plan,
+                    call_pc,
+                    next,
+                    |ops, bail| emit_identity_guard(ops, view, plan.function_id, bail),
+                );
+                arguments.len().max(usize::from(plan.param_count))
+            }
+            None => arguments.len(),
+        };
+        let bytes = crate::call_linkage::pushed_argument_bytes(pushed)?;
+        super::activation::emit_tail_span_check(ops, params, bytes / 8, outgrown);
+        emit_push_arguments(ops, pushed, 0, |ops, index, register, _| {
+            match arguments.get(index) {
+                Some(&source) => emit_load_reg(ops, register, source),
+                None => dynasm!(ops ; .arch x64 ; mov Rd(register), VALUE_UNDEFINED as i32),
+            }
+            Ok(())
+        })?;
+        dynasm!(ops ; .arch x64 ; mov rsi, r9);
+        super::activation::emit_tail_transfer(ops, relocations, table, bytes, count, target);
+        dynasm!(ops ; .arch x64 ; =>next);
+    }
+    // The generic target's span check fell through only when it fits, so
+    // control never reaches here from a transfer.
+    let words = std::iter::once(callee)
+        .chain(arguments.iter().copied())
+        .collect::<Vec<_>>();
+    let bytes = crate::call_linkage::pushed_argument_bytes(words.len())?;
+    let staged = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; =>outgrown ; sub rsp, bytes as i32);
+    for (index, &word) in words.iter().enumerate() {
+        emit_load_reg(ops, 0, word);
+        dynasm!(ops ; .arch x64 ; mov [rsp + (index * 8) as i32], rax);
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov rsi, rsp
+        ; mov edx, words.len() as i32
+    );
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        table.entry(abi::STUB_JIT_STAGE_TAIL_CALL),
+        abi::STUB_JIT_STAGE_TAIL_CALL,
+    );
+    dynasm!(ops
+        ; .arch x64
+        ; call r11
+        ; add rsp, bytes as i32
+        ; test rdx, rdx
+        ; jz =>staged
+        ; cmp edx, abi::NativeResultStatus::Throw as i32
+        ; je =>throw_value
+        ; jmp =>fatal
+        ; =>staged
+    );
+    super::activation::emit_tail_return(ops);
+    dynasm!(ops ; .arch x64 ; =>ordinary);
+    emit_call(
+        ops,
+        relocations,
+        table,
+        view,
+        Some(callee),
+        None,
+        CallNewTarget::None,
+        arguments,
+        known,
+        call_pc,
+        dst,
+        throw_value,
+        threw,
+    )
 }
 
 /// Resolve the method of `receiver` through the shared caches, then call it
@@ -341,7 +486,7 @@ pub(super) fn emit_spread_call_op(
         receiver.is_some(),
         new_target != CallNewTarget::None,
     );
-    emit_completion(ops, dst, throw_value, threw);
+    emit_completion(ops, relocations, table, dst, throw_value, threw);
     Ok(())
 }
 
@@ -398,6 +543,6 @@ pub(super) fn emit_forward_call(
         ; =>staged
     );
     emit_enter_staged(ops, relocations, table, 15);
-    emit_completion(ops, dst, throw_value, threw);
+    emit_completion(ops, relocations, table, dst, throw_value, threw);
     Ok(())
 }

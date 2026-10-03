@@ -1017,8 +1017,8 @@ impl Interpreter {
         delta: i32,
     ) -> Result<Value, VmError> {
         let numeric = crate::coerce::to_numeric_or_throw(self, stack, context, &value)?;
-        let kind = abstract_ops::to_numeric_kind(&numeric, &self.gc_heap)
-            .ok_or(VmError::TypeMismatch)?;
+        let kind =
+            abstract_ops::to_numeric_kind(&numeric, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         match kind {
             abstract_ops::NumericKind::Num(number_value) => Ok(Value::number(
                 NumberValue::from_f64(number_value.as_f64() + f64::from(delta)),

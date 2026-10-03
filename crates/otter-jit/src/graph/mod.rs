@@ -37,9 +37,7 @@ pub(crate) mod phi_repr;
 pub(crate) mod regalloc;
 
 use otter_vm::JitCompileSnapshot;
-use otter_vm::deopt::{
-    DeoptExitDescriptor, DeoptFrame, DeoptRuntime, DeoptTable, FrameState,
-};
+use otter_vm::deopt::{DeoptExitDescriptor, DeoptFrame, DeoptRuntime, DeoptTable, FrameState};
 use otter_vm::native_abi::{
     NO_CALL_PC, NO_FRAME_STATE, SafepointRecord, TaggedLocation, TaggedLocationKind,
 };
@@ -206,8 +204,7 @@ pub(crate) fn compile_optimized(
         function_id: view.code_block.id,
         param_count: view.code_block.param_count,
         register_count: view.code_block.register_count,
-        machine_register_count: (regalloc::GP_REGISTERS.len() + regalloc::FP_REGISTERS.len())
-            as u8,
+        machine_register_count: (regalloc::GP_REGISTERS.len() + regalloc::FP_REGISTERS.len()) as u8,
         allocator_spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
         spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
     };

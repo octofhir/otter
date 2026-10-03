@@ -77,7 +77,7 @@ pub(super) fn emit_forward_call(
         fatal,
     )?;
     crate::arm64::js_call::emit_enter_staged(ops, relocations, table, 20);
-    calls::emit_call_completion(ops, dst, throw_value, threw)?;
+    calls::emit_call_completion(ops, relocations, table, dst, throw_value, threw)?;
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::call_structural(
             "callTrampoline",

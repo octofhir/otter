@@ -356,20 +356,18 @@ pub enum Op {
     /// (`super()` called twice); otherwise stores `value` with the write
     /// barrier. A register-held derived `this` uses [`Op::BindThisValue`].
     BindThisContextSlot,
-    /// Variadic call. Operands: `dst, callee, argc, args...`. The
-    /// callee must be a function value at this slice. The callee
-    /// receives `this = undefined` (foundation default).
+    /// Variadic call. Operands: `dst, callee, argc, args...`. The callee
+    /// receives `this = undefined`; a non-callable callee throws
+    /// `TypeError`.
     Call,
-    /// Proper-tail call (§15.10.3). Same operand layout as
-    /// [`Op::Call`] (`dst, callee, argc, args...`) and the same
-    /// `this = undefined` default. Emitted by the compiler only for a
-    /// call in a strict-mode tail position that is not enclosed by a
-    /// `try`/`finally`. The dispatcher **replaces** the current frame
-    /// with the callee's frame instead of pushing a new one, so a
-    /// self-recursive tail call runs in O(1) native stack. When the
-    /// caller frame can't be discarded safely (constructor, async, or
-    /// an active handler), the dispatcher falls back to ordinary
-    /// [`Op::Call`] semantics using `dst`.
+    /// Proper tail call (§15.10.3). Same operands and receiver as
+    /// [`Op::Call`]. Emitted only for a call in tail position of a strict
+    /// body that is neither a generator nor async, with no construct
+    /// between it and the return, and always followed by
+    /// `ReturnValue dst`. The callee **replaces** the current activation,
+    /// so a chain of tail calls runs in constant native stack. A
+    /// constructing activation calls ordinarily into `dst`, and the
+    /// following return completes it.
     TailCall,
     /// Variadic call with an explicit receiver. Operands:
     /// `dst, callee, this, argc, args...`. Used by

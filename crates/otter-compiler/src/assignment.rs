@@ -370,9 +370,7 @@ pub(crate) fn compile_assignment_with(
     {
         match compound_op {
             None => {
-                crate::expr::compile_expr_into_with_inferred_name(
-                    cx, &a.right, &name, reg, span,
-                )?;
+                crate::expr::compile_expr_into_with_inferred_name(cx, &a.right, &name, reg, span)?;
             }
             Some(op) => {
                 let rhs = compile_expr(cx, &a.right, span)?;

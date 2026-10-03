@@ -49,7 +49,11 @@ pub(crate) fn compile_effect(
             unary::compile_update(cx, u, enclosing_span, unary::UpdateUse::Discarded)?;
         }
         Expression::AssignmentExpression(a) => {
-            crate::assignment::compile_assignment_with(cx, a, crate::assignment::AssignUse::Discarded)?;
+            crate::assignment::compile_assignment_with(
+                cx,
+                a,
+                crate::assignment::AssignUse::Discarded,
+            )?;
         }
         Expression::SequenceExpression(s) => {
             let span = (s.span.start, s.span.end);

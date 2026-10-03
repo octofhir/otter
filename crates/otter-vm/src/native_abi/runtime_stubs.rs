@@ -1677,6 +1677,21 @@ pub const STUB_JIT_CALL_OVERFLOW: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Execution,
 );
 
+/// Stage a §15.10.3 tail call from one boxed-value span — the callee, then
+/// its actual arguments — as the context's pending request. The staging
+/// activation then retires its record and returns `Continue`; its caller
+/// enters the request in its place. Reads only.
+pub const STUB_JIT_STAGE_TAIL_CALL: RuntimeStubDescriptor = descriptor(
+    93,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::ReentrantValueSpan,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Human-readable symbol for a runtime-stub id in the current contract.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1773,6 +1788,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         90 => "jit_resolve_method",
         91 => "jit_call_generic",
         92 => "jit_call_overflow",
+        93 => "jit_stage_tail_call",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1871,6 +1887,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_RESOLVE_METHOD,
     STUB_JIT_CALL_GENERIC,
     STUB_JIT_CALL_OVERFLOW,
+    STUB_JIT_STAGE_TAIL_CALL,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

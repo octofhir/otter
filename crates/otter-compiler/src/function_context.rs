@@ -132,6 +132,10 @@ pub(crate) struct FunctionContext {
     /// Canonical source URL inherited by nested functions.
     pub(crate) module_url: String,
     pub(crate) is_async_generator: bool,
+    /// §15.10.2 — a call in tail position of this body replaces its
+    /// activation: the body is neither a generator nor an async body.
+    /// Strictness is checked separately.
+    pub(crate) proper_tail_calls: bool,
     /// Stack of enclosing loops; the innermost is on top.
     pub(crate) loops: Vec<LoopFrame>,
     /// Constructs an abrupt completion from the current point passes,
@@ -215,6 +219,7 @@ impl FunctionContext {
             dot_arguments_observed: false,
             module_url: String::new(),
             is_async_generator: false,
+            proper_tail_calls: false,
             loops: Vec::new(),
             control: Vec::new(),
             handlers: Vec::new(),

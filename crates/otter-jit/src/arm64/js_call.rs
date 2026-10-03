@@ -8,6 +8,7 @@
 //!   or the generic entry that classifies any other callee.
 //! - [`emit_staged_call`] / [`emit_enter_staged`] — a call whose span, or
 //!   whole request, a runtime staging entry wrote.
+//! - [`emit_tail_branch`] — the entry branch of a proper tail call.
 //!
 //! # Invariants
 //! - The span is pushed before the call ABI registers are set and popped
@@ -168,6 +169,49 @@ pub(crate) fn emit_call(
                 RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
             );
             dynasm!(ops ; .arch aarch64 ; blr x16);
+        }
+    }
+}
+
+/// Branch to `target` with the call ABI registers already set: the tail of
+/// a proper tail call, whose callee returns to the retired record's caller.
+/// Clobbers `x8` and `x16`.
+pub(crate) fn emit_tail_branch(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    target: CallTarget,
+) {
+    match target {
+        CallTarget::Known {
+            entry_cell,
+            function_id,
+        } => {
+            let start = ops.offset().0;
+            emit_load_u64(ops, 8, entry_cell);
+            relocations.record_mov_wide(
+                start,
+                ops.offset().0,
+                8,
+                RelocationTarget::FunctionEntryCell { function_id },
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x8, [x8]
+                ; ldr x16, [x8]
+                ; br x16
+            );
+        }
+        CallTarget::Generic => {
+            let start = ops.offset().0;
+            emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_GENERIC));
+            relocations.record_mov_wide(
+                start,
+                ops.offset().0,
+                16,
+                RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
+            );
+            dynasm!(ops ; .arch aarch64 ; br x16);
         }
     }
 }

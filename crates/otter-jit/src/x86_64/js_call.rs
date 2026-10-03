@@ -8,6 +8,7 @@
 //!   or the generic entry that classifies any other callee.
 //! - [`emit_staged_call`] / [`emit_enter_staged`] — a call whose span, or
 //!   whole request, a runtime staging entry wrote.
+//! - [`emit_tail_branch`] — the entry jump of a proper tail call.
 //! - [`emit_cached_identity`] — a call site's identity proof behind its cache
 //!   of the last callee it proved.
 //!
@@ -163,6 +164,48 @@ pub(crate) fn emit_call(
                 RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
             );
             dynasm!(ops ; .arch x64 ; call r11);
+        }
+    }
+}
+
+/// Jump to `target` with the call ABI registers already set and `rsp` on
+/// the return address: the tail of a proper tail call, whose callee returns
+/// to the retired record's caller. Clobbers `r9` and `r11`.
+pub(crate) fn emit_tail_branch(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    table: &TransitionTable,
+    target: CallTarget,
+) {
+    match target {
+        CallTarget::Known {
+            entry_cell,
+            function_id,
+        } => {
+            let start = ops.offset().0;
+            dynasm!(ops ; .arch x64 ; mov r11, QWORD entry_cell as i64);
+            relocations.record_x86_imm64(
+                start,
+                ops.offset().0,
+                11,
+                RelocationTarget::FunctionEntryCell { function_id },
+            );
+            dynasm!(ops
+                ; .arch x64
+                ; mov r9, [r11]
+                ; jmp QWORD [r9]
+            );
+        }
+        CallTarget::Generic => {
+            let start = ops.offset().0;
+            dynasm!(ops ; .arch x64 ; mov r11, QWORD table.entry(abi::STUB_JIT_CALL_GENERIC) as i64);
+            relocations.record_x86_imm64(
+                start,
+                ops.offset().0,
+                11,
+                RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
+            );
+            dynasm!(ops ; .arch x64 ; jmp r11);
         }
     }
 }

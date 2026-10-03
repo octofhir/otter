@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::module_graph::LinkedProgram;
 use crate::{
-    OtterError, Runtime, SourceInput, module_loader, program_looks_like_module,
+    CommonJsRouting, OtterError, Runtime, SourceInput, module_loader, program_looks_like_module,
     source_path_has_module_extension, source_path_has_script_extension, source_path_package_type,
 };
 
@@ -65,8 +65,9 @@ impl CompiledProgram {
 }
 
 impl Runtime {
-    /// Compile-and-dump a file through the same script/module routing used by
-    /// [`Self::run_file`](crate::Runtime::run_file).
+    /// Compile-and-dump a file through the same script/module/CommonJS
+    /// routing used by [`Self::run_file`](crate::Runtime::run_file): a
+    /// CommonJS file dumps the module wrapper function a run executes.
     ///
     /// Module-shaped inputs use the runtime module loader and package graph,
     /// then return the linked bytecode plus per-source compiler metadata.
@@ -91,6 +92,11 @@ impl Runtime {
             return self.dump_module(path);
         }
         let specifier = path.to_string_lossy().to_string();
+        match self.commonjs_routing(path, &source, package_type)? {
+            CommonJsRouting::CommonJs => return self.dump_commonjs(&source, &specifier),
+            CommonJsRouting::Module => return self.dump_module(path),
+            CommonJsRouting::Script => {}
+        }
         if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
             return self
                 .dump(source, &specifier)
@@ -105,6 +111,25 @@ impl Runtime {
         }
         self.dump(source, &specifier)
             .map(CompiledProgram::from_compiled_module)
+    }
+
+    /// The CommonJS wrapper function exactly as a run compiles it.
+    fn dump_commonjs(
+        &self,
+        source: &SourceInput,
+        specifier: &str,
+    ) -> Result<CompiledProgram, OtterError> {
+        let wrapped = otter_vm::commonjs_wrapper_source(&source.text);
+        let mut module =
+            crate::compile_eval_with_options(&wrapped, &otter_vm::EvalCompileOptions::default())
+                .map_err(|err| crate::map_compile_error(err, specifier))?;
+        module.module = specifier.to_string();
+        for function in &mut module.functions {
+            function.module_url = specifier.to_string();
+        }
+        CompiledModule::from_bytecode(module)
+            .map(CompiledProgram::from_compiled_module)
+            .map_err(|err| crate::map_compile_error(err, specifier))
     }
 
     fn dump_module(&mut self, entry_path: &std::path::Path) -> Result<CompiledProgram, OtterError> {

@@ -247,12 +247,17 @@ pub(crate) enum Kind {
     // ---- Calls ----
     /// The JavaScript call ABI: inputs `callee, receiver, new.target,
     /// args...`. Lazy deopt, may throw.
-    CallJs { argc: u16 },
+    CallJs {
+        argc: u16,
+    },
     /// The baseline operation for the bytecode instruction at `pc`, run on
     /// the frame window: input `i` is stored to window register
     /// `registers[i]` first, and the instruction's written registers are read
     /// back by `LoadWindow` nodes after it.
-    Generic { pc: u32, registers: Box<[u16]> },
+    Generic {
+        pc: u32,
+        registers: Box<[u16]>,
+    },
 
     // ---- Control ----
     Jump(BlockId),
@@ -324,11 +329,7 @@ impl Kind {
     pub(crate) fn is_control(&self) -> bool {
         matches!(
             self,
-            Self::Jump(_)
-                | Self::JumpLoop(_)
-                | Self::Branch { .. }
-                | Self::Return
-                | Self::Deopt(_)
+            Self::Jump(_) | Self::JumpLoop(_) | Self::Branch { .. } | Self::Return | Self::Deopt(_)
         )
     }
 
@@ -403,10 +404,7 @@ impl Kind {
                 writes: true,
                 effectful: true,
             },
-            Self::Jump(_)
-            | Self::JumpLoop(_)
-            | Self::Branch { .. }
-            | Self::Return => Properties {
+            Self::Jump(_) | Self::JumpLoop(_) | Self::Branch { .. } | Self::Return => Properties {
                 effectful: true,
                 ..Properties::default()
             },
@@ -421,9 +419,8 @@ impl Kind {
     /// The allocation contract for a node with `input_count` inputs.
     pub(crate) fn constraints(&self, input_count: usize) -> Constraints {
         use InputPolicy::{Any, FixedGp, Register};
-        let registers = |count: usize| -> SmallVec<[InputPolicy; 4]> {
-            (0..count).map(|_| Register).collect()
-        };
+        let registers =
+            |count: usize| -> SmallVec<[InputPolicy; 4]> { (0..count).map(|_| Register).collect() };
         let simple = |inputs: usize, result: ResultPolicy| Constraints {
             inputs: registers(inputs),
             result,
@@ -431,15 +428,14 @@ impl Kind {
             fp_temps: 0,
         };
         match self {
-            Self::ConstTagged(_)
-            | Self::ConstInt32(_)
-            | Self::ConstFloat64(_)
-            | Self::Phi => Constraints {
-                inputs: (0..input_count).map(|_| Any).collect(),
-                result: ResultPolicy::Register,
-                gp_temps: 0,
-                fp_temps: 0,
-            },
+            Self::ConstTagged(_) | Self::ConstInt32(_) | Self::ConstFloat64(_) | Self::Phi => {
+                Constraints {
+                    inputs: (0..input_count).map(|_| Any).collect(),
+                    result: ResultPolicy::Register,
+                    gp_temps: 0,
+                    fp_temps: 0,
+                }
+            }
             Self::InitialRegister(_)
             | Self::LoadThis
             | Self::LoadClosure
@@ -666,7 +662,12 @@ impl Graph {
                 if data.is_loop { " loop" } else { "" },
                 data.predecessors.iter().map(|b| b.0).collect::<Vec<_>>()
             );
-            for &node in data.phis.iter().chain(&data.body).chain(data.control.iter()) {
+            for &node in data
+                .phis
+                .iter()
+                .chain(&data.body)
+                .chain(data.control.iter())
+            {
                 let n = self.node(node);
                 let _ = writeln!(
                     out,
@@ -675,7 +676,14 @@ impl Graph {
                     n.kind,
                     n.inputs.iter().map(|i| i.0).collect::<Vec<_>>(),
                     n.repr,
-                    n.eager.map_or(String::new(), |s| format!(" eager={:?}", self.frame_state(s).registers.iter().map(|(r, v)| (*r, v.0)).collect::<Vec<_>>()))
+                    n.eager.map_or(String::new(), |s| format!(
+                        " eager={:?}",
+                        self.frame_state(s)
+                            .registers
+                            .iter()
+                            .map(|(r, v)| (*r, v.0))
+                            .collect::<Vec<_>>()
+                    ))
                 );
             }
         }

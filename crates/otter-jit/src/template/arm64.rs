@@ -257,7 +257,14 @@ fn compile_with_reach(
     let body = ops.new_dynamic_label();
     crate::arm64::frame::emit_tier_prologue(&mut ops, crate::arm64::frame::SpillArea::NONE);
     dynasm!(ops ; .arch aarch64 ; b =>body);
-    let call_entry = (!plan.osr_only).then(|| crate::arm64::frame::emit_call_entry(&mut ops, view, shape, crate::arm64::frame::SpillArea::NONE));
+    let call_entry = (!plan.osr_only).then(|| {
+        crate::arm64::frame::emit_call_entry(
+            &mut ops,
+            view,
+            shape,
+            crate::arm64::frame::SpillArea::NONE,
+        )
+    });
     dynasm!(ops ; .arch aarch64 ; =>body);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
@@ -479,7 +486,11 @@ fn compile_with_reach(
         ; =>returned
         ; movz x1, abi::NativeResultStatus::Success as u32
     );
-    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::arm64::frame::SpillArea::NONE);
+    crate::arm64::frame::emit_epilogue(
+        &mut ops,
+        activation_exits,
+        crate::arm64::frame::SpillArea::NONE,
+    );
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "returnEpilogue",
@@ -600,14 +611,22 @@ fn compile_with_reach(
         ; =>propagate_throw
         ; movz x1, abi::NativeResultStatus::Throw as u32
     );
-    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::arm64::frame::SpillArea::NONE);
+    crate::arm64::frame::emit_epilogue(
+        &mut ops,
+        activation_exits,
+        crate::arm64::frame::SpillArea::NONE,
+    );
     dynasm!(ops
         ; .arch aarch64
         ; =>fatal
     );
     emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; movz x1, abi::NativeResultStatus::Fatal as u32);
-    crate::arm64::frame::emit_epilogue(&mut ops, activation_exits, crate::arm64::frame::SpillArea::NONE);
+    crate::arm64::frame::emit_epilogue(
+        &mut ops,
+        activation_exits,
+        crate::arm64::frame::SpillArea::NONE,
+    );
     crate::arm64::frame::emit_exits(
         &mut ops,
         &mut relocations,
@@ -705,7 +724,6 @@ fn compile_with_reach(
             .unwrap_or_default(),
     })
 }
-
 
 /// Exit labels one template operation branches to.
 #[derive(Debug, Clone, Copy)]
@@ -948,15 +966,7 @@ pub(crate) fn emit_operation(
             )?;
         }
         TemplateOp::TestTypeOf { dst, src, test } => {
-            arith::emit_test_typeof(
-                ops,
-                relocations,
-                view,
-                dst,
-                src,
-                test,
-                type_mismatch_exit,
-            )?;
+            arith::emit_test_typeof(ops, relocations, view, dst, src, test, type_mismatch_exit)?;
         }
         TemplateOp::LooseCompare {
             dst,
@@ -1069,15 +1079,7 @@ pub(crate) fn emit_operation(
             depth,
             slot,
         } => {
-            context::emit_store_context_slot(
-                ops,
-                relocations,
-                view,
-                src,
-                context,
-                depth,
-                slot,
-            )?;
+            context::emit_store_context_slot(ops, relocations, view, src, context, depth, slot)?;
         }
         TemplateOp::CreateContext {
             dst,
@@ -1245,14 +1247,7 @@ pub(crate) fn emit_operation(
             )?;
         }
         TemplateOp::CollectArguments { dst } => {
-            transitions::emit_collect_arguments(
-                ops,
-                relocations,
-                transitions,
-                dst,
-                threw,
-                fatal,
-            );
+            transitions::emit_collect_arguments(ops, relocations, transitions, dst, threw, fatal);
         }
         TemplateOp::CallForwardArguments {
             dst,
@@ -1446,6 +1441,34 @@ pub(crate) fn emit_operation(
                 identity_guard_exit,
                 threw,
                 committed_throw,
+            )?;
+        }
+        TemplateOp::TailCall {
+            dst,
+            callee,
+            argc,
+            packed_args,
+            byte_pc,
+        } => {
+            let argument_registers = plan.call_argument_registers(argc, packed_args);
+            calls::emit_tail_call(
+                ops,
+                relocations,
+                transitions,
+                view,
+                direct_call_events.as_mut(),
+                code_map.as_mut(),
+                dst,
+                callee,
+                argc,
+                &argument_registers,
+                instr.pc,
+                byte_pc,
+                bail,
+                identity_guard_exit,
+                threw,
+                committed_throw,
+                fatal,
             )?;
         }
         TemplateOp::CallWithThis {

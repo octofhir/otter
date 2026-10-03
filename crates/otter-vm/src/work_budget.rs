@@ -388,6 +388,7 @@ impl RuntimeHeapSnapshot {
 pub(crate) const fn opcode_work_units(op: Op) -> u8 {
     match op {
         Op::Call
+        | Op::TailCall
         | Op::CallWithThis
         | Op::CallForwardArguments
         | Op::CallMethodValue

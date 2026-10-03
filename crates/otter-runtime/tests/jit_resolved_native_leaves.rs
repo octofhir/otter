@@ -99,9 +99,10 @@ fn completion(runtime: &mut Runtime, source: &str) -> String {
 /// Whether this tier lowers explicit-receiver leaves on this target. The
 /// x86-64 Template tier keeps its general call for explicit receivers.
 fn generates_hit(selection: JitSelection) -> bool {
+    const TEMPLATE_LOWERS_RECEIVER_LEAVES: bool = cfg!(target_arch = "aarch64");
     match selection {
         JitSelection::InterpreterOnly => false,
-        JitSelection::Template => cfg!(target_arch = "aarch64"),
+        JitSelection::Template => TEMPLATE_LOWERS_RECEIVER_LEAVES,
         _ => true,
     }
 }

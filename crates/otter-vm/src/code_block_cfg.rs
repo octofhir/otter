@@ -89,7 +89,10 @@ impl CodeBlockControlFlow {
 
     /// Build tables from wordcode and a handler table that have already
     /// passed verification.
-    pub(crate) fn from_verified_wordcode(code: &FunctionCode, handlers: &[ExceptionHandler]) -> Self {
+    pub(crate) fn from_verified_wordcode(
+        code: &FunctionCode,
+        handlers: &[ExceptionHandler],
+    ) -> Self {
         let mut block_starts = BTreeSet::new();
         let mut loop_latches = BTreeMap::<u32, u32>::new();
         let instruction_count = code.len() as u32;

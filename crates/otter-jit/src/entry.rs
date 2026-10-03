@@ -240,6 +240,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_stage_forward_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_STAGE_TAIL_CALL,
+            jit_stage_tail_call_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_RESOLVE_METHOD,
             jit_resolve_method_stub as *const () as usize,
         ),

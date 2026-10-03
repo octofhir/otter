@@ -111,9 +111,7 @@ impl Allocation {
 }
 
 /// Allocatable general registers.
-pub(crate) const GP_REGISTERS: &[u8] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-];
+pub(crate) const GP_REGISTERS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 /// Allocatable floating-point registers.
 pub(crate) const FP_REGISTERS: &[u8] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
@@ -476,7 +474,9 @@ impl<'g> Allocator<'g> {
             let Some(value) = file.values[register as usize] else {
                 continue;
             };
-            let distance = self.next_use_after(value, at.saturating_sub(1)).unwrap_or(u32::MAX);
+            let distance = self
+                .next_use_after(value, at.saturating_sub(1))
+                .unwrap_or(u32::MAX);
             if best.is_none_or(|(_, best_distance)| distance > best_distance) {
                 best = Some((register, distance));
             }
@@ -507,7 +507,9 @@ impl<'g> Allocator<'g> {
             self.block_register(float, register);
             return register;
         }
-        let from = self.location_of(value).expect("a live value has a location");
+        let from = self
+            .location_of(value)
+            .expect("a live value has a location");
         let register = self.take_register(float);
         self.bind(value, register);
         self.block_register(float, register);
@@ -522,7 +524,9 @@ impl<'g> Allocator<'g> {
             self.block_register(float, register);
             return;
         }
-        let from = self.location_of(value).expect("a live value has a location");
+        let from = self
+            .location_of(value)
+            .expect("a live value has a location");
         if self.file(float).holder(register).is_some() {
             // Move the occupant aside when it stays live.
             let occupant = self.file(float).holder(register).expect("an occupant");
@@ -776,8 +780,7 @@ impl<'g> Allocator<'g> {
                 self.bind(node, register);
             }
             self.block_register(float, register);
-            self.out.nodes[node.0 as usize].result =
-                Some(Self::register_location(float, register));
+            self.out.nodes[node.0 as usize].result = Some(Self::register_location(float, register));
         }
         // Deopt locations.
         if let Some(state) = data.eager {
@@ -836,7 +839,13 @@ impl<'g> Allocator<'g> {
             .eager
             .iter()
             .chain(current.lazy.iter())
-            .flat_map(|&state| self.graph.frame_state(state).registers.iter().map(|&(_, v)| v))
+            .flat_map(|&state| {
+                self.graph
+                    .frame_state(state)
+                    .registers
+                    .iter()
+                    .map(|&(_, v)| v)
+            })
             .collect();
         for value in state_values {
             if value != self.current && !self.graph.node(value).kind.is_constant() {
@@ -901,7 +910,10 @@ impl<'g> Allocator<'g> {
                 if let Some(&input) = graph.node(phi).inputs.get(index)
                     && let Some(location) = self.location_of(input)
                 {
-                    phi_inputs.entry(target).or_default().push((phi, input, location));
+                    phi_inputs
+                        .entry(target)
+                        .or_default()
+                        .push((phi, input, location));
                 }
             }
         }

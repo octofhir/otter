@@ -116,11 +116,20 @@ impl CallSite<'_> {
     }
 
     /// Release `bytes` of pushed actuals after a call returned `rax`/`rdx`,
-    /// reload roots and route the completion.
-    fn emit_complete(&self, ops: &mut Assembler, bytes: u32) -> Result<(), Unsupported> {
+    /// reload roots and route the completion. A callee that retired itself
+    /// for a tail call it staged returns `Continue`; that call is entered in
+    /// its place under the same call-site roots.
+    fn emit_complete(
+        &self,
+        ops: &mut Assembler,
+        relocations: &mut RelocationCapture,
+        bytes: u32,
+    ) -> Result<(), Unsupported> {
+        let completion = ops.new_dynamic_label();
         let abrupt = ops.new_dynamic_label();
+        let error = ops.new_dynamic_label();
         emit_pop_arguments(ops, bytes);
-        dynasm!(ops ; .arch x64 ; test rdx, rdx ; jnz =>abrupt);
+        dynasm!(ops ; .arch x64 ; =>completion ; test rdx, rdx ; jnz =>abrupt);
         // Root reloads use only root registers and `r11`, so the result stays
         // in `rax`.
         reload_roots(ops, self.frame, self.site)?;
@@ -133,6 +142,16 @@ impl CallSite<'_> {
             ; .arch x64
             ; jmp =>self.done
             ; =>abrupt
+            ; cmp edx, NativeResultStatus::Continue as i32
+            ; jne =>error
+        );
+        // The callee retired itself for a tail call it staged: enter that
+        // call in its place under the same call-site roots.
+        emit_enter_staged(ops, relocations, self.transitions, 15);
+        dynasm!(ops
+            ; .arch x64
+            ; jmp =>completion
+            ; =>error
             ; mov [rsp - 8], rax
             ; mov [rsp - 16], rdx
         );
@@ -232,7 +251,7 @@ pub(super) fn emit(
     if kind == DirectCallKind::Forward {
         emit_forward_stage(ops, relocations, call)?;
         emit_enter_staged(ops, relocations, call.transitions, 15);
-        return call.emit_complete(ops, 0);
+        return call.emit_complete(ops, relocations, 0);
     }
     let explicit_receiver = matches!(
         kind,
@@ -411,7 +430,7 @@ fn emit_invoke(
         }
         None => emit_staged_call(ops, relocations, call.transitions, 15, receiver, new_target),
     }
-    call.emit_complete(ops, bytes)
+    call.emit_complete(ops, relocations, bytes)
 }
 
 /// Admit the forwarding source, then stage the forwarded call's complete

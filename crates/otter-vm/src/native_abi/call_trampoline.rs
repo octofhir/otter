@@ -14,7 +14,10 @@
 //! before allocating and return only statuses in the execution domain. Stack
 //! checks precede reservation; both the frame and stack pointer are aligned.
 //! No Rust unwind may cross an entry. The caller's frame is restored before
-//! the trampoline returns, including on abrupt completion.
+//! the trampoline returns, including on abrupt completion. A callee that
+//! returns `Continue` with a `TAIL_CALL` request has retired its own frame:
+//! the request takes its place, so a chain of tail calls through one
+//! trampoline runs in constant native stack.
 //!
 //! # See also
 //! - [`super::JitCtx`] for the shared context and continuation mailbox.
@@ -539,7 +542,12 @@ macro_rules! arm64_call_trampoline {
             "mov x4, x21",
             "mov x8, x24",
             "blr x22",
-            "b 99f",
+            "cmp x1, #{continue_status}",
+            "b.ne 99f",
+            // The callee retired its record for a tail call it staged:
+            // classify that request in its place.
+            "mov sp, x29",
+            "b 10b",
             // Interpreter destination: bind the receiver for this frame.
             "71:",
             "tbnz w15, #{construct_bit}, 75f",
@@ -855,10 +863,19 @@ macro_rules! arm64_call_trampoline {
             "mov x0, #{undefined}",
             "mov x1, #0",
             "b 40b",
+            // A tail call replaces the frame in place, unless this entry
+            // only resumed a record whose native frame belongs to a
+            // generated caller: that owner retires it and its own caller
+            // enters the request.
             "46:",
+            "cbnz x25, 49f",
             "str x21, [x19, #{frame_cell}]",
             "mov sp, x29",
             "b 10b",
+            "49:",
+            "mov x0, #{undefined}",
+            "mov x1, #{continue_status}",
+            "b 50f",
             "89:",
             "mov x0, #{undefined}",
             "mov x1, #{fatal_status}",
@@ -1281,7 +1298,12 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "mov r8, r13",
         "mov r9, [rbp - 120]",
         "call r15",
-        "jmp 99f",
+        "cmp rdx, {continue_status}",
+        "jne 99f",
+        // The callee retired its record for a tail call it staged:
+        // classify that request in its place.
+        "lea rsp, [rbp - 128]",
+        "jmp 10b",
         // Interpreter destination: bind the receiver for this frame.
         "71:",
         "test r9d, {construct_flag}",
@@ -1663,10 +1685,19 @@ pub unsafe extern "C" fn call_trampoline(_ctx: *mut JitCtx) -> NativeResultPair 
         "mov rax, {undefined}",
         "xor edx, edx",
         "jmp 40b",
+        // A tail call replaces the frame in place, unless this entry only
+        // resumed a record whose native frame belongs to a generated caller:
+        // that owner retires it and its own caller enters the request.
         "46:",
+        "cmp qword ptr [rbp - 72], 0",
+        "jne 49f",
         "mov [r12 + {frame_cell}], r13",
         "lea rsp, [rbp - 128]",
         "jmp 10b",
+        "49:",
+        "mov rax, {undefined}",
+        "mov edx, {continue_status}",
+        "jmp 50f",
         "89:",
         "mov rax, {undefined}",
         "mov edx, {fatal_status}",

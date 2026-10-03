@@ -273,6 +273,7 @@ pub(crate) fn compile_function_impl(
     child.dot_arguments_observed = parent.dot_arguments_observed;
     child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
+    child.proper_tail_calls = !is_async && !is_generator;
     let formal_names: Vec<String> = formal_parameter_bound_names(params);
     let mut self_name_referenced = false;
     if let Some(b) = body {
@@ -603,8 +604,13 @@ fn compile_function_scopes(
             });
         };
         let inner_span = (es.span.start, es.span.end);
-        let reg = compile_expr(parent, &es.expression, inner_span)?;
-        parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
+        // §15.10.2 — a strict non-async concise body is in tail position.
+        if parent.is_strict && parent.proper_tail_calls {
+            crate::statements::compile_tail_return(parent, &es.expression, inner_span)?;
+        } else {
+            let reg = compile_expr(parent, &es.expression, inner_span)?;
+            parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
+        }
         return Ok(mapped_argument_bindings);
     }
 

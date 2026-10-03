@@ -5011,9 +5011,7 @@ fn unwind_throw_lands_in_catch_handler() {
         target: 2,
         exception: 1,
     }];
-    let context = interp
-        .link_module(module)
-        .expect("valid bytecode fixture");
+    let context = interp.link_module(module).expect("valid bytecode fixture");
     interp
         .unwind_throw(
             &context,

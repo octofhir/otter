@@ -9,6 +9,11 @@
 //!   interpreter frame (function-entry tier transfer and loop OSR).
 //! - [`emit_epilogue`] / [`emit_exits`] — constructor completion,
 //!   unpublication, and side exits that resume the interpreter in place.
+//! - [`emit_tail_admission`], [`emit_tail_span_check`],
+//!   [`emit_tail_transfer`] and [`emit_tail_return`] — a proper tail call
+//!   (§15.10.3): the callee takes the place of this called record, in place
+//!   when its actuals fit the record's span and through the caller
+//!   otherwise.
 //!
 //! # Invariants
 //! - Body registers: `r15` context, `r14` published frame, `r13` register
@@ -19,6 +24,11 @@
 //! - A call entry reserves the window and the record below the saved
 //!   registers and publishes the record after every field and register is
 //!   initialized. Nothing allocates or reenters before publication.
+//! - A called record's actuals start at `[rbp + 16]`, above the return
+//!   address, in the span its caller pushed: `max(actual count, formal
+//!   count)` words rounded up to an even count. A tail callee's span starts
+//!   at the same address, so the caller releases exactly the span it pushed
+//!   when the callee returns to it.
 //!
 //! # See also
 //! - [`crate::x86_64::activation`] — pieces shared with the optimizing tier.
@@ -34,7 +44,8 @@ use crate::{
         CODE_ENTRY_GENERATED_ENTRIES_OFFSET, CODE_ENTRY_TIERING_BREAK_EVEN_OFFSET,
         CODE_ENTRY_TIERING_ENABLED_OFFSET, GENERATED_FEEDBACK_CLEAN_OFFSET, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-        NATIVE_STACK_LIMIT_OFFSET, TransitionTable, VALUE_UNDEFINED,
+        NATIVE_STACK_LIMIT_OFFSET, THREAD_OFFSET, TransitionTable, VALUE_UNDEFINED,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     x86_64::activation::{emit_lexical_this, emit_object_receiver_test, emit_object_test},
 };
@@ -379,6 +390,132 @@ pub(super) fn emit_exits(
         ; .arch x64
         ; =>tier
         ; mov edx, abi::NativeResultStatus::SideExit as i32
+        ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r11
+    );
+    emit_restore(ops);
+}
+
+/// Branch to `leave` unless this body may hand its record to a tail callee,
+/// and to `ordinary` when the record owes constructor completion.
+///
+/// Only a called record is replaced: a tier-entered frame belongs to its
+/// interpreter, which performs the replacement itself, and so does a
+/// pending interrupt, since an unbounded tail-call chain has no back-edge
+/// to poll at. A constructing record calls ordinarily and completes on the
+/// return that follows. Clobbers `rax` and `r11`.
+pub(super) fn emit_tail_admission(
+    ops: &mut Assembler,
+    leave: DynamicLabel,
+    ordinary: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov r11, [rbp + RETURN_FRAME]
+        ; cmp r11, r14
+        ; je =>leave
+        ; test r11b, 1
+        ; jnz =>ordinary
+        ; mov rax, [r15 + THREAD_OFFSET as i32]
+        ; mov rax, [rax + VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
+        ; cmp BYTE [rax], 0
+        ; jne =>leave
+    );
+}
+
+/// Branch to `outgrown` unless a tail callee's span of `words` (an even
+/// count) fits the span this record was called with. `params` is this
+/// function's formal count. Clobbers `rax`.
+pub(super) fn emit_tail_span_check(
+    ops: &mut Assembler,
+    params: u16,
+    words: u32,
+    outgrown: DynamicLabel,
+) {
+    // The incoming span holds `max(actuals, params)` rounded up to even.
+    if u32::from(params).next_multiple_of(2) >= words {
+        return;
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; mov eax, [r14 + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+        ; cmp eax, (words - 1) as i32
+        ; jb =>outgrown
+    );
+}
+
+/// Retire this called record and enter the callee in `rsi` in its place.
+///
+/// The callee's `count` actuals occupy the `bytes` just pushed at `rsp`, and
+/// [`emit_tail_admission`] and [`emit_tail_span_check`] passed. The record
+/// is unpublished, the span moves up to `[rbp + 16]` where this record's own
+/// actuals began, the saved registers are restored with `rsp` on the return
+/// address this record was called with, and control jumps to `target` with
+/// the call ABI registers set; the callee returns straight to this record's
+/// caller. Nothing allocates between the unpublication and the callee's
+/// entry.
+pub(super) fn emit_tail_transfer(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &TransitionTable,
+    bytes: u32,
+    count: u32,
+    target: crate::x86_64::js_call::CallTarget,
+) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov rdi, r15
+        ; mov edx, VALUE_UNDEFINED as i32
+        ; mov ecx, VALUE_UNDEFINED as i32
+        ; mov r8d, count as i32
+        ; mov r11, [rbp + RETURN_FRAME]
+        ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r11
+    );
+    // The destination lies above the pushed span: copying from the top
+    // down reads every word before a store can reach it.
+    if bytes <= 512 {
+        let mut offset = bytes as i32;
+        while offset > 0 {
+            offset -= 8;
+            dynasm!(ops
+                ; .arch x64
+                ; mov rax, [rsp + offset]
+                ; mov [rbp + 16 + offset], rax
+            );
+        }
+    } else {
+        let copy = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch x64
+            ; mov r10d, bytes as i32
+            ; =>copy
+            ; sub r10, 8
+            ; mov rax, [rsp + r10]
+            ; mov [rbp + r10 + 16], rax
+            ; jnz =>copy
+        );
+    }
+    dynasm!(ops
+        ; .arch x64
+        ; mov r12, [rbp - 8]
+        ; mov r13, [rbp - 16]
+        ; mov r14, [rbp - 24]
+        ; mov r15, [rbp - 32]
+        ; lea rsp, [rbp + 8]
+        ; mov rbp, [rbp]
+    );
+    crate::x86_64::js_call::emit_tail_branch(ops, relocations, transitions, target);
+}
+
+/// Retire this called record and return `Continue`: the context holds the
+/// tail call it staged, and the caller enters that request in its place.
+/// [`emit_tail_admission`] passed, so the record owes no constructor
+/// completion.
+pub(super) fn emit_tail_return(ops: &mut Assembler) {
+    dynasm!(ops
+        ; .arch x64
+        ; mov eax, VALUE_UNDEFINED as i32
+        ; mov edx, abi::NativeResultStatus::Continue as i32
+        ; mov r11, [rbp + RETURN_FRAME]
         ; mov [r15 + NATIVE_FRAME_OFFSET as i32], r11
     );
     emit_restore(ops);

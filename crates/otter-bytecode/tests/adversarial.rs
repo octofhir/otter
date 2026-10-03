@@ -28,8 +28,7 @@ use otter_bytecode::wordcode::FunctionCodeBuilder;
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BindingStoreFallback, BytecodeModule,
     ClassHintSite, Constant, ContextCoord, ExceptionHandler, Function, LookupGlobalMode,
-    LookupRefTarget,
-    MappedArgumentBinding, ModuleInit, ModuleResolution, Op, Operand,
+    LookupRefTarget, MappedArgumentBinding, ModuleInit, ModuleResolution, Op, Operand,
     ScopeDescriptor, ScopeFlags, ScopeKind, SlotDescriptor, SlotKind, SourceKind, SpanEntry,
     StoreRefMode, TemplateSite,
 };

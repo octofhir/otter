@@ -46,9 +46,12 @@ fn run(view: &JitCompileSnapshot, args: &[u64]) -> (NativeResultPair, Vec<u64>) 
     let transitions = TransitionTable::resolve();
     let compiled = super::compile(view, 7001, &transitions, None).expect("graph compile");
     let entry: JitEntry = unsafe {
-        std::mem::transmute(compiled.emission.buffer.ptr(dynasmrt::AssemblyOffset(
-            compiled.emission.tier_entry,
-        )))
+        std::mem::transmute(
+            compiled
+                .emission
+                .buffer
+                .ptr(dynasmrt::AssemblyOffset(compiled.emission.tier_entry)),
+        )
     };
     let register_count = view.code_block.register_count;
     let mut window = vec![Value::undefined().to_bits(); usize::from(register_count)];
@@ -114,7 +117,11 @@ fn int32_add_returns_boxed_sum() {
         vec![
             (
                 Op::Add,
-                vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)],
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
             ),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ],
@@ -132,7 +139,11 @@ fn float64_mul_boxes_canonically() {
         vec![
             (
                 Op::Mul,
-                vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)],
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
             ),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ],
@@ -140,12 +151,18 @@ fn float64_mul_boxes_canonically() {
     seed(&mut view, &[0], ARITH_INT32 | ARITH_FLOAT64);
     let (result, _) = run(
         &view,
-        &[Value::number_f64(1.5).to_bits(), Value::number_f64(3.0).to_bits()],
+        &[
+            Value::number_f64(1.5).to_bits(),
+            Value::number_f64(3.0).to_bits(),
+        ],
     );
     assert_eq!(returned(result), Value::number_f64(4.5).to_bits());
     let (result, _) = run(
         &view,
-        &[Value::number_f64(2.0).to_bits(), Value::number_f64(3.0).to_bits()],
+        &[
+            Value::number_f64(2.0).to_bits(),
+            Value::number_f64(3.0).to_bits(),
+        ],
     );
     assert_eq!(returned(result), int(6), "integral results box as int32");
 }
@@ -160,16 +177,31 @@ fn sum_loop() -> JitCompileSnapshot {
             (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
             (
                 Op::LessThan,
-                vec![Operand::Register(3), Operand::Register(2), Operand::Register(0)],
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(0),
+                ],
             ),
-            (Op::JumpIfFalse, vec![Operand::Imm32(3), Operand::Register(3)]),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(3), Operand::Register(3)],
+            ),
             (
                 Op::Add,
-                vec![Operand::Register(1), Operand::Register(1), Operand::Register(2)],
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
             ),
             (
                 Op::AddImm,
-                vec![Operand::Register(2), Operand::Register(2), Operand::Imm32(1)],
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(2),
+                    Operand::Imm32(1),
+                ],
             ),
             (Op::Jump, vec![Operand::Imm32(-5)]),
             (Op::ReturnValue, vec![Operand::Register(1)]),
@@ -197,15 +229,26 @@ fn branches_merge_through_phis() {
         vec![
             (
                 Op::LessThan,
-                vec![Operand::Register(3), Operand::Register(0), Operand::Register(1)],
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
             ),
-            (Op::JumpIfFalse, vec![Operand::Imm32(2), Operand::Register(3)]),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(2), Operand::Register(3)],
+            ),
             (Op::LoadLocal, vec![Operand::Register(2), Operand::Imm32(0)]),
             (Op::Jump, vec![Operand::Imm32(1)]),
             (Op::LoadLocal, vec![Operand::Register(2), Operand::Imm32(1)]),
             (
                 Op::AddImm,
-                vec![Operand::Register(2), Operand::Register(2), Operand::Imm32(1)],
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(2),
+                    Operand::Imm32(1),
+                ],
             ),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ],
@@ -225,7 +268,11 @@ fn int32_overflow_deopts_before_the_add() {
         vec![
             (
                 Op::Add,
-                vec![Operand::Register(2), Operand::Register(0), Operand::Register(1)],
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
             ),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ],
@@ -238,7 +285,11 @@ fn int32_overflow_deopts_before_the_add() {
         Some(NativeResultStatus::SideExit),
         "overflow leaves through the eager deopt, got {result:?}"
     );
-    assert_eq!(&window[..2], &args, "the operands are rebuilt in the window");
+    assert_eq!(
+        &window[..2],
+        &args,
+        "the operands are rebuilt in the window"
+    );
 }
 
 #[test]
@@ -267,27 +318,53 @@ fn nested_loops() -> JitCompileSnapshot {
             (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
             (
                 Op::LessThan,
-                vec![Operand::Register(4), Operand::Register(3), Operand::Register(0)],
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(3),
+                    Operand::Register(0),
+                ],
             ),
-            (Op::JumpIfFalse, vec![Operand::Imm32(8), Operand::Register(4)]),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(8), Operand::Register(4)],
+            ),
             (Op::LoadInt32, vec![Operand::Register(5), Operand::Imm32(0)]),
             (
                 Op::LessThanImm,
-                vec![Operand::Register(4), Operand::Register(5), Operand::Imm32(4)],
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(5),
+                    Operand::Imm32(4),
+                ],
             ),
-            (Op::JumpIfFalse, vec![Operand::Imm32(3), Operand::Register(4)]),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(3), Operand::Register(4)],
+            ),
             (
                 Op::Add,
-                vec![Operand::Register(2), Operand::Register(2), Operand::Register(1)],
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                ],
             ),
             (
                 Op::AddImm,
-                vec![Operand::Register(5), Operand::Register(5), Operand::Imm32(1)],
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(5),
+                    Operand::Imm32(1),
+                ],
             ),
             (Op::Jump, vec![Operand::Imm32(-5)]),
             (
                 Op::AddImm,
-                vec![Operand::Register(3), Operand::Register(3), Operand::Imm32(1)],
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(3),
+                    Operand::Imm32(1),
+                ],
             ),
             (Op::Jump, vec![Operand::Imm32(-10)]),
             (Op::ReturnValue, vec![Operand::Register(2)]),
@@ -304,5 +381,10 @@ fn nested_loops_carry_values_through_both_headers() {
     let compiled = super::compile(&view, 7001, &transitions, None).expect("graph compile");
     let dump = compiled.built.graph.dump(&compiled.built.layout);
     let (result, _) = run(&view, &[int(10), int(1)]);
-    assert_eq!(returned(result), int(40), "{dump}\n{:#?}", compiled.allocation.edges);
+    assert_eq!(
+        returned(result),
+        int(40),
+        "{dump}\n{:#?}",
+        compiled.allocation.edges
+    );
 }

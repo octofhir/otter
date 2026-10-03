@@ -241,11 +241,12 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) 
 #[test]
 fn loop_proof_invalidation_preserves_semantics() {
     let (oracle, _, _, _) = run(JitSelection::InterpreterOnly, false);
-    let (compiled, optimized_entries, _, _) = run(JitSelection::ProductionTiered, false);
+    // Only the AArch64 optimizing tier enters this loop.
+    let (compiled, _optimized_entries, _, _) = run(JitSelection::ProductionTiered, false);
     assert_eq!(compiled, oracle);
     assert_eq!(oracle, "[125696,8,352,1,420,420,2816,272,684,64]");
     #[cfg(target_arch = "aarch64")]
-    assert!(optimized_entries > 0, "fixture must enter optimizing code");
+    assert!(_optimized_entries > 0, "fixture must enter optimizing code");
 }
 
 #[cfg(target_arch = "aarch64")]

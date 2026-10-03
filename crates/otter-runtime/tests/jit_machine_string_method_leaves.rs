@@ -116,9 +116,10 @@ fn warmed(selection: JitSelection) -> Runtime {
 /// Whether this tier generates the guarded leaf hit on this target. The x86-64
 /// Template tier keeps its general method call for every guarded builtin.
 fn generates_hit(selection: JitSelection) -> bool {
+    const TEMPLATE_GENERATES_HIT: bool = cfg!(target_arch = "aarch64");
     match selection {
         JitSelection::InterpreterOnly => false,
-        JitSelection::Template => cfg!(target_arch = "aarch64"),
+        JitSelection::Template => TEMPLATE_GENERATES_HIT,
         _ => true,
     }
 }

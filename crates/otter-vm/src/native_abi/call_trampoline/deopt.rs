@@ -68,6 +68,60 @@ pub unsafe extern "C" fn deopt_call_entry(_ctx: *mut JitCtx, _exit: u64) -> Nati
     );
 }
 
+/// Resume the published callee using the x86 platform aggregate-return ABI.
+///
+/// # Safety
+/// The publication, lifetime and side-exit requirements match the ARM64 entry.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn deopt_call_entry(_ctx: *mut JitCtx, _exit: u64) -> NativeResultPair {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "push rbx",
+        ".if {windows}",
+        "push r12",
+        "sub rsp, 48",
+        "mov r12, rcx",
+        "mov rbx, rdx",
+        "call {prepare}",
+        "cmp qword ptr [r12 + 8], {continue_status}",
+        "jne 20f",
+        "mov rcx, r12",
+        "mov rdx, rbx",
+        "add rsp, 48",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "jmp {trampoline}",
+        "20:",
+        "mov rax, r12",
+        "add rsp, 48",
+        "pop r12",
+        ".else",
+        "sub rsp, 8",
+        "mov rbx, rdi",
+        "call {prepare}",
+        "cmp rdx, {continue_status}",
+        "jne 20f",
+        "mov rdi, rbx",
+        "add rsp, 8",
+        "pop rbx",
+        "pop rbp",
+        "jmp {trampoline}",
+        "20:",
+        "add rsp, 8",
+        ".endif",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        windows = const cfg!(target_os = "windows") as u8,
+        prepare = sym prepare_call_resume,
+        trampoline = sym super::call_trampoline,
+        continue_status = const NativeResultStatus::Continue as u64,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,58 +183,4 @@ mod tests {
             ));
         }
     }
-}
-
-/// Resume the published callee using the x86 platform aggregate-return ABI.
-///
-/// # Safety
-/// The publication, lifetime and side-exit requirements match the ARM64 entry.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-pub unsafe extern "C" fn deopt_call_entry(_ctx: *mut JitCtx, _exit: u64) -> NativeResultPair {
-    core::arch::naked_asm!(
-        "push rbp",
-        "mov rbp, rsp",
-        "push rbx",
-        ".if {windows}",
-        "push r12",
-        "sub rsp, 48",
-        "mov r12, rcx",
-        "mov rbx, rdx",
-        "call {prepare}",
-        "cmp qword ptr [r12 + 8], {continue_status}",
-        "jne 20f",
-        "mov rcx, r12",
-        "mov rdx, rbx",
-        "add rsp, 48",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
-        "jmp {trampoline}",
-        "20:",
-        "mov rax, r12",
-        "add rsp, 48",
-        "pop r12",
-        ".else",
-        "sub rsp, 8",
-        "mov rbx, rdi",
-        "call {prepare}",
-        "cmp rdx, {continue_status}",
-        "jne 20f",
-        "mov rdi, rbx",
-        "add rsp, 8",
-        "pop rbx",
-        "pop rbp",
-        "jmp {trampoline}",
-        "20:",
-        "add rsp, 8",
-        ".endif",
-        "pop rbx",
-        "pop rbp",
-        "ret",
-        windows = const cfg!(target_os = "windows") as u8,
-        prepare = sym prepare_call_resume,
-        trampoline = sym super::call_trampoline,
-        continue_status = const NativeResultStatus::Continue as u64,
-    );
 }

@@ -31,7 +31,9 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
-use otter_vm::jit::{JitBodyGuard, JitElementAccess, JitElementBase, JitElementRepr, JitGuardWidth};
+use otter_vm::jit::{
+    JitBodyGuard, JitElementAccess, JitElementBase, JitElementRepr, JitGuardWidth,
+};
 
 use super::super::super::MachineRepresentation;
 use super::NUMBER_TAG;
@@ -341,11 +343,19 @@ fn emit_read(
     match result.representation {
         MachineRepresentation::Int32 | MachineRepresentation::Uint32 => match element {
             E::Int8 => dynasm!(ops ; .arch aarch64 ; ldrsb W(out), [X(base), x17]),
-            E::Uint8 | E::Uint8Clamped => dynasm!(ops ; .arch aarch64 ; ldrb W(out), [X(base), x17]),
+            E::Uint8 | E::Uint8Clamped => {
+                dynasm!(ops ; .arch aarch64 ; ldrb W(out), [X(base), x17])
+            }
             E::Int16 => dynasm!(ops ; .arch aarch64 ; ldrsh W(out), [X(base), x17, lsl #1]),
             E::Uint16 => dynasm!(ops ; .arch aarch64 ; ldrh W(out), [X(base), x17, lsl #1]),
-            E::Int32 | E::Uint32 => dynasm!(ops ; .arch aarch64 ; ldr W(out), [X(base), x17, lsl #2]),
-            _ => return Err(Unsupported::OperandShape("scalar element load representation")),
+            E::Int32 | E::Uint32 => {
+                dynasm!(ops ; .arch aarch64 ; ldr W(out), [X(base), x17, lsl #2])
+            }
+            _ => {
+                return Err(Unsupported::OperandShape(
+                    "scalar element load representation",
+                ));
+            }
         },
         MachineRepresentation::Float64 => match element {
             E::Float32 => dynasm!(ops
@@ -354,7 +364,11 @@ fn emit_read(
                 ; fcvt D(out), s31
             ),
             E::Float64 => dynasm!(ops ; .arch aarch64 ; ldr D(out), [X(base), x17, lsl #3]),
-            _ => return Err(Unsupported::OperandShape("floating element load representation")),
+            _ => {
+                return Err(Unsupported::OperandShape(
+                    "floating element load representation",
+                ));
+            }
         },
         MachineRepresentation::Tagged => match element {
             E::Boxed => {
@@ -416,7 +430,12 @@ fn emit_read(
 /// `element`: a value already in the element's representation stores
 /// exactly, and a boxed element takes any non-cell (a cell owes the
 /// generational barrier only the runtime runs). Clobbers `x17`.
-fn emit_write_guard(ops: &mut Assembler, element: JitElementRepr, stored: Element, miss: DynamicLabel) {
+fn emit_write_guard(
+    ops: &mut Assembler,
+    element: JitElementRepr,
+    stored: Element,
+    miss: DynamicLabel,
+) {
     if stored.representation != MachineRepresentation::Tagged {
         return;
     }
@@ -599,15 +618,21 @@ pub(super) fn emit_value_store(
         }
         (
             E::Int8 | E::Uint8,
-            MachineRepresentation::Tagged | MachineRepresentation::Int32 | MachineRepresentation::Uint32,
+            MachineRepresentation::Tagged
+            | MachineRepresentation::Int32
+            | MachineRepresentation::Uint32,
         ) => dynasm!(ops ; .arch aarch64 ; strb W(source), [X(address)]),
         (
             E::Int16 | E::Uint16,
-            MachineRepresentation::Tagged | MachineRepresentation::Int32 | MachineRepresentation::Uint32,
+            MachineRepresentation::Tagged
+            | MachineRepresentation::Int32
+            | MachineRepresentation::Uint32,
         ) => dynasm!(ops ; .arch aarch64 ; strh W(source), [X(address)]),
         (
             E::Int32 | E::Uint32,
-            MachineRepresentation::Tagged | MachineRepresentation::Int32 | MachineRepresentation::Uint32,
+            MachineRepresentation::Tagged
+            | MachineRepresentation::Int32
+            | MachineRepresentation::Uint32,
         ) => dynasm!(ops ; .arch aarch64 ; str W(source), [X(address)]),
         (E::Uint8Clamped, MachineRepresentation::Tagged | MachineRepresentation::Int32) => {
             dynasm!(ops

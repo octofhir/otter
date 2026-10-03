@@ -7,6 +7,7 @@
 //! # Contents
 //! - Indirect eval execution and writeback.
 //! - `Function` constructor argument coercion and body synthesis.
+//! - [`commonjs_wrapper_source`] — the one CommonJS module wrapper text.
 //!
 //! # Invariants
 //! - Helpers advance the current frame PC exactly once on success.
@@ -413,12 +414,7 @@ impl Interpreter {
         body: &str,
         builtin: bool,
     ) -> Result<Value, VmError> {
-        // Node-style wrapper with the entire prologue on line 1, so a
-        // source line `N` maps to wrapped line `N`: stack-trace line
-        // numbers match the original file (only line-1 columns carry the
-        // prologue offset — the same quirk Node has).
-        let source =
-            format!("(function (exports, require, module, __filename, __dirname) {{ {body}\n}})");
+        let source = commonjs_wrapper_source(body);
         // A builtin body is identical on every launch, so the host may
         // reuse its verified compile.
         let options = EvalCompileOptions {
@@ -597,6 +593,17 @@ impl Interpreter {
         })?;
         hook(source, options).map_err(|message| self.err_syntax(message.into()))
     }
+}
+
+/// The function a CommonJS module body runs in:
+/// `(function (exports, require, module, __filename, __dirname) { <body> })`.
+///
+/// The whole prologue sits on line 1, so a source line `N` maps to wrapped
+/// line `N`: stack-trace line numbers match the original file (only line-1
+/// columns carry the prologue offset — the same quirk Node has).
+#[must_use]
+pub fn commonjs_wrapper_source(body: &str) -> String {
+    format!("(function (exports, require, module, __filename, __dirname) {{ {body}\n}})")
 }
 
 fn is_v8_native_eval_hint(source: &str) -> bool {

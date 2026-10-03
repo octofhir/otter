@@ -1352,6 +1352,35 @@ pub(super) fn compile(
                     ; jmp =>returned
                 );
             }
+            TemplateOp::TailCall {
+                dst,
+                callee,
+                argc,
+                packed_args,
+                byte_pc,
+            } => {
+                let arguments = plan.call_argument_registers(argc, packed_args);
+                let known = view
+                    .direct_callees
+                    .get(&byte_pc)
+                    .filter(|targets| targets.len() == 1)
+                    .map(|targets| targets[0].plan);
+                calls::emit_tail_call(
+                    &mut ops,
+                    &mut relocations,
+                    transitions,
+                    view,
+                    callee,
+                    &arguments,
+                    known,
+                    instruction.pc,
+                    dst,
+                    runtime_transition,
+                    committed_throw,
+                    threw,
+                    fatal,
+                )?;
+            }
             TemplateOp::UnsupportedBail => dynasm!(ops ; .arch x64 ; jmp =>unsupported),
         }
         if let Some(code_map) = code_map.as_mut() {

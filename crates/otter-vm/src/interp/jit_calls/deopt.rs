@@ -141,7 +141,9 @@ impl Interpreter {
         let waiting = |index: usize| index + 1 < frames.len();
         let standing_pc = |index: usize| -> Result<u32, VmError> {
             if waiting(index) {
-                resume_pcs[index].checked_sub(1).ok_or(VmError::InvalidOperand)
+                resume_pcs[index]
+                    .checked_sub(1)
+                    .ok_or(VmError::InvalidOperand)
             } else {
                 Ok(resume_pcs[index])
             }
@@ -149,7 +151,10 @@ impl Interpreter {
         native.registers.copy_from_slice(&outermost.slots);
         native.header.pc = standing_pc(0)?;
         if waiting(0) {
-            native.header.flags = native.header.flags.with(NativeFrameFlags::ADVANCE_ON_RESUME);
+            native.header.flags = native
+                .header
+                .flags
+                .with(NativeFrameFlags::ADVANCE_ON_RESUME);
         }
         if !native.enter_interpreter() {
             return Err(VmError::InvalidOperand);

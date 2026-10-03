@@ -7207,6 +7207,62 @@ fn order_string_key_entries(entries: Vec<(String, usize)>) -> Vec<(String, usize
     ordered
 }
 
+/// The string keys of a shaped object as the hidden class's own key
+/// strings, in ordinary own-key order: array indices ascending, then every
+/// other key in insertion order. Nothing is allocated on the heap, so the
+/// values need no rooting while the caller collects them. `None` for a
+/// dictionary-mode object, whose keys are not string cells.
+pub(crate) fn shaped_string_key_values(obj: JsObject, heap: &GcHeap) -> Option<Vec<Value>> {
+    heap.read_payload(obj, |body| {
+        if body.is_dictionary() {
+            return None;
+        }
+        let keys = shape_body::shape_keys_ordered(heap, body.shape);
+        let mut indices = Vec::new();
+        let mut names = Vec::with_capacity(keys.len());
+        for (key, _) in keys {
+            let index = crate::string::gc_body::with_latin1(
+                heap,
+                key,
+                key_order::array_index_property_bytes,
+            )
+            .unwrap_or_else(|| {
+                // A wide key holds a non-digit; a rope is read in full.
+                let units = to_utf16_vec(heap, key);
+                let bytes: Option<Vec<u8>> =
+                    units.iter().map(|&unit| u8::try_from(unit).ok()).collect();
+                bytes.and_then(|bytes| key_order::array_index_property_bytes(&bytes))
+            });
+            match index {
+                Some(index) => indices.push((index, key)),
+                None => names.push(key),
+            }
+        }
+        indices.sort_by_key(|&(index, _)| index);
+        Some(
+            indices
+                .into_iter()
+                .map(|(_, key)| key)
+                .chain(names)
+                .map(|key| Value::string(JsString::from_handle(key, heap)))
+                .collect(),
+        )
+    })
+}
+
+/// The symbol keys of `obj`'s own properties, Private Names excluded, in
+/// insertion order.
+pub(crate) fn own_symbol_key_values(obj: JsObject, heap: &GcHeap) -> Vec<Value> {
+    heap.read_payload(obj, |body| {
+        body.symbol_props()
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| !key.is_private_name())
+            .map(Value::symbol)
+            .collect()
+    })
+}
+
 /// Run `f` with a [`Properties`] snapshot of `obj`'s string-keyed
 /// and symbol-keyed own properties. The view does not escape the
 /// closure scope.

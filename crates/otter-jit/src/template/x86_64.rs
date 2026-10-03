@@ -1413,11 +1413,14 @@ pub(super) fn compile(
         transitions.entry(abi::STUB_JIT_ROUTE_THROW),
         abi::STUB_JIT_ROUTE_THROW,
     );
+    // A handler of this function landed the throw: its exception register
+    // holds the value and the record names the handler's PC.
+    let caught = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch x64
         ; call r11
         ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>activation_exits.side_exit
+        ; je =>caught
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>pair_exit
         ; cmp edx, abi::NativeResultStatus::Fatal as i32
@@ -1483,12 +1486,16 @@ pub(super) fn compile(
         ; .arch x64
         ; call r11
         ; cmp edx, abi::NativeResultStatus::SideExit as i32
-        ; je =>activation_exits.side_exit
+        ; je =>caught
         ; cmp edx, abi::NativeResultStatus::Throw as i32
         ; je =>pair_exit
         ; cmp edx, abi::NativeResultStatus::Fatal as i32
         ; je =>pair_exit
         ; jmp =>fatal
+    );
+    emit_handler_dispatch(&mut ops, view, &labels, caught, activation_exits.side_exit);
+    dynasm!(ops
+        ; .arch x64
         ; =>fatal
     );
     emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
@@ -1607,6 +1614,38 @@ fn requires_pc_stamp(op: TemplateOp) -> bool {
 
 fn emit_stamp_pc(ops: &mut Assembler, pc: u32) {
     dynasm!(ops ; .arch x64 ; mov DWORD [r14 + NATIVE_FRAME_PC_OFFSET as i32], pc as i32);
+}
+
+/// Continue at the handler a routed throw landed in. The router wrote the
+/// exception into the handler's register and the handler's PC into the
+/// published record; this body has a label at every handler target, so the
+/// throw never leaves compiled code. A PC without a label leaves through
+/// `resume` with the router's exit in `rax`.
+fn emit_handler_dispatch(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    labels: &BTreeMap<u32, DynamicLabel>,
+    caught: DynamicLabel,
+    resume: DynamicLabel,
+) {
+    let targets: BTreeSet<u32> = view
+        .code_block
+        .control_flow()
+        .handlers()
+        .iter()
+        .map(|handler| handler.target)
+        .collect();
+    dynasm!(ops
+        ; .arch x64
+        ; =>caught
+        ; mov r11d, DWORD [r14 + NATIVE_FRAME_PC_OFFSET as i32]
+    );
+    for target in targets {
+        if let Some(&label) = labels.get(&target) {
+            dynasm!(ops ; .arch x64 ; cmp r11d, target as i32 ; je =>label);
+        }
+    }
+    dynasm!(ops ; .arch x64 ; jmp =>resume);
 }
 
 fn emit_side_exit(
@@ -1879,9 +1918,13 @@ fn emit_remainder(ops: &mut Assembler, dst: u16, lhs: u16, rhs: u16, bail: Dynam
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     emit_guard_int32_pair(ops, 0, 8, slow);
+    // A zero divisor yields NaN, and `idiv` traps on `INT32_MIN / -1`; a
+    // `-1` divisor's result is the dividend's signed zero anyway.
     dynasm!(ops
         ; .arch x64
         ; test r8d, r8d
+        ; je =>slow
+        ; cmp r8d, -1
         ; je =>slow
         ; mov r10d, eax
         ; cdq

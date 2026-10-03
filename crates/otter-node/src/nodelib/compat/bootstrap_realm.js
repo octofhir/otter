@@ -11,12 +11,9 @@
 // pattern (Safe* containers, %TypedArray%, uncurryThis itself).
 
 const ReflectApply = Reflect.apply;
-
-function uncurryThis(fn) {
-  return function (thisArg, ...args) {
-    return ReflectApply(fn, thisArg, args);
-  };
-}
+// `uncurryThis(fn)(thisArg, ...args)` is `fn.call(thisArg, ...args)`: a
+// bound `call`, with no argument list built per call.
+const uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
 
 const constructors = {
   Array, ArrayBuffer, BigInt, Boolean, DataView, Date, Error, EvalError,
@@ -93,6 +90,13 @@ const explicit = {
   },
   SafePromiseRace: (v) => Promise.race(v),
   SafePromisePrototypeFinally: (promise, onFinally) => promise.finally(onFinally),
+  // The match index of `regexp` in `string`, searched from the start
+  // whatever `lastIndex` held.
+  SafeStringPrototypeSearch: (string, regexp) => {
+    regexp.lastIndex = 0;
+    const match = RegExp.prototype.exec.call(regexp, string);
+    return match ? match.index : -1;
+  },
   PromisePrototypeCatch: (promise, onRejected) => promise.catch(onRejected),
   // Pin the pattern's own `Symbol.match`/`replace`/`search`/`split` and its
   // `constructor` to the originals, so a pattern the runtime uses internally
@@ -114,6 +118,8 @@ const explicit = {
   },
   // `queueMicrotask` rides along for files that pull it from primordials.
   queueMicrotask: globalThis.queueMicrotask,
+  // The global functions Node's realm copies under their own names.
+  decodeURI, decodeURIComponent, encodeURI, encodeURIComponent, escape, unescape,
 };
 
 // Symbol wells: SymbolIterator, SymbolAsyncIterator, SymbolDispose, ...

@@ -568,11 +568,14 @@ fn compile_with_reach(
         transitions.entry(abi::STUB_JIT_ROUTE_THROW),
         abi::STUB_JIT_ROUTE_THROW,
     );
+    // A handler of this function landed the throw: its exception register
+    // holds the value and the record names the handler's PC.
+    let caught = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
         ; cmp x1, abi::NativeResultStatus::SideExit as u32
-        ; b.eq =>bail
+        ; b.eq =>caught
         ; cmp x1, abi::NativeResultStatus::Throw as u32
         ; b.eq =>propagate_throw
         ; b =>fatal
@@ -604,10 +607,14 @@ fn compile_with_reach(
         ; .arch aarch64
         ; blr x16
         ; cmp x1, abi::NativeResultStatus::SideExit as u32
-        ; b.eq =>bail
+        ; b.eq =>caught
         ; cmp x1, abi::NativeResultStatus::Throw as u32
         ; b.eq =>propagate_throw
         ; b =>fatal
+    );
+    emit_handler_dispatch(&mut ops, view, &labels, caught, bail);
+    dynasm!(ops
+        ; .arch aarch64
         ; =>propagate_throw
         ; movz x1, abi::NativeResultStatus::Throw as u32
     );
@@ -2003,6 +2010,43 @@ pub(crate) fn emit_operation(
         }
     }
     Ok(())
+}
+
+/// Continue at the handler a routed throw landed in. The router wrote the
+/// exception into the handler's register and the handler's PC into the
+/// published record; this body has a label at every handler target, so the
+/// throw never leaves compiled code. A PC without a label leaves through
+/// `resume`, which continues the interpreter there.
+fn emit_handler_dispatch(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    labels: &BTreeMap<u32, DynamicLabel>,
+    caught: DynamicLabel,
+    resume: DynamicLabel,
+) {
+    let targets: BTreeSet<u32> = view
+        .code_block
+        .control_flow()
+        .handlers()
+        .iter()
+        .map(|handler| handler.target)
+        .collect();
+    dynasm!(ops ; .arch aarch64 ; =>caught ; ldr w9, [x21, NATIVE_FRAME_PC_OFFSET]);
+    for target in targets {
+        let Some(&label) = labels.get(&target) else {
+            continue;
+        };
+        let next = ops.new_dynamic_label();
+        if target <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; cmp w9, target);
+        } else {
+            emit_load_u64(ops, 10, u64::from(target));
+            dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
+        }
+        // Handlers sit anywhere in the body: `b` reaches every label.
+        dynasm!(ops ; .arch aarch64 ; b.ne =>next ; b =>label ; =>next);
+    }
+    dynasm!(ops ; .arch aarch64 ; b =>resume);
 }
 
 /// Whether an operation can leave native code and therefore needs an exact

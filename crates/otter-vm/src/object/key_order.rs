@@ -14,27 +14,32 @@
 //! - <https://tc39.es/ecma262/#sec-ordinaryownpropertykeys>
 //! - <https://tc39.es/ecma262/#array-index>
 
+/// The array index `key` names (§6.1.7), or `None` for any other string.
 pub(crate) fn array_index_property_name(key: &str) -> Option<u32> {
-    if key.is_empty() {
+    array_index_property_bytes(key.as_bytes())
+}
+
+/// [`array_index_property_name`] over Latin-1 code units: the canonical
+/// decimal spelling of an integer below `2^32 - 1`. Allocation-free, so key
+/// enumeration can classify a shape's own key strings in place.
+pub(crate) fn array_index_property_bytes(key: &[u8]) -> Option<u32> {
+    let (&first, rest) = key.split_first()?;
+    if !first.is_ascii_digit() || (first == b'0' && !rest.is_empty()) || key.len() > 10 {
         return None;
     }
-    if key.len() > 1 && key.as_bytes().first() == Some(&b'0') {
-        return None;
+    let mut value = u64::from(first - b'0');
+    for &unit in rest {
+        if !unit.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + u64::from(unit - b'0');
     }
-    let value = key.parse::<u32>().ok()?;
-    if value == u32::MAX {
-        return None;
-    }
-    if value.to_string() == key {
-        Some(value)
-    } else {
-        None
-    }
+    u32::try_from(value).ok().filter(|&index| index != u32::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::array_index_property_name;
+    use super::{array_index_property_bytes, array_index_property_name};
 
     #[test]
     fn recognises_array_index_property_names() {
@@ -47,5 +52,8 @@ mod tests {
         assert_eq!(array_index_property_name("-1"), None);
         assert_eq!(array_index_property_name("1.0"), None);
         assert_eq!(array_index_property_name("4294967295"), None);
+        assert_eq!(array_index_property_name("+1"), None);
+        assert_eq!(array_index_property_name("99999999999"), None);
+        assert_eq!(array_index_property_bytes(b"42"), Some(42));
     }
 }

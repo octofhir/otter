@@ -471,6 +471,14 @@ impl Interpreter {
             return Ok(keys);
         }
         if let Some(obj) = target.as_object() {
+            // A shaped ordinary object hands out its hidden class's own key
+            // strings: nothing allocates, so nothing needs rooting.
+            if object::string_data(obj, &self.gc_heap).is_none()
+                && let Some(mut keys) = object::shaped_string_key_values(obj, &self.gc_heap)
+            {
+                keys.extend(object::own_symbol_key_values(obj, &self.gc_heap));
+                return Ok(keys);
+            }
             let mut keys: Vec<Value> = Vec::new();
             let string_data = object::string_data(obj, &self.gc_heap);
             if let Some(value) = &string_data {

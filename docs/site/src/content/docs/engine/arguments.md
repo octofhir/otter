@@ -21,11 +21,9 @@ Mapped parameter functions and captured aliases also retain the ordinary object.
 Admission is independent of function names. The bytecode verifier checks the
 required function metadata before execution.
 
-The interpreter and both JIT tiers read length and exact in-range Int32 indices
-from the actual argument list. Machine IR contains an explicit
-`ArgumentsReadProbe`, its committed cold call, Success/Throw/Fatal edges and the
-result join before register allocation. Artifact code maps identify the probe
-as `machineArgumentsReadProbe` at the source byte PC.
+The interpreter and the Template tier read length and exact in-range Int32
+indices from the actual argument list. The optimizing tier runs these reads as
+their baseline operations.
 
 ## Observable materialization
 

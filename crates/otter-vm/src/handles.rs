@@ -40,14 +40,15 @@
 //!   leaves every outer slot in place.
 //! - A `Local` never caches a payload; it is only an arena index. Reads go
 //!   through [`HandleArena::get`], which the collector keeps live.
-//! - A scoped write may box a wide number inside the callee (`object::set` and
-//!   its symbol/define variants), and that box allocation traces only the
-//!   receiver it is handed. When the interpreter's runtime-root source is not
+//! - Descriptor preparation roots its actual receiver, key and pending values.
+//!   When the interpreter's runtime-root source is not
 //!   registered, a scope installs that exact source for its lifetime (see
 //!   [`Interpreter::scope_runtime_roots_guard`]) — an unrelated native-call
 //!   provider is not accepted as a substitute. The arena is then traced by any
 //!   collection the box drives, while the dispatch hot path pays nothing
 //!   because its matching source is already present.
+//! - Bulk layout construction allocates the final shape's immutable inline
+//!   capacity and publishes all its initial slots in the same allocation.
 //!
 //! # See also
 //!
@@ -329,7 +330,7 @@ impl Drop for HandleScopeFrame {
 /// ```compile_fail
 /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx};
 ///
-/// let mut interp = Interpreter::new();
+/// let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 /// let escaped = NativeCtx::with_host_context(
 ///     &mut interp,
 ///     NativeCallInfo::default_call(),
@@ -346,7 +347,7 @@ impl Drop for HandleScopeFrame {
 /// ```compile_fail
 /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx};
 ///
-/// let mut interp = Interpreter::new();
+/// let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 /// let mut leaked = None;
 /// NativeCtx::with_host_context(
 ///     &mut interp,
@@ -416,7 +417,7 @@ impl Interpreter {
     /// handle arena) as an extra-roots provider for a scope's lifetime, but only
     /// when no provider is already installed.
     ///
-    /// A scoped write can box a wide number inside `object::set` (and the
+    /// A scoped write can box a wide number inside `object::ordinary_set_data_property` (and the
     /// symbol/define variants); that box allocation traces only the receiver it
     /// is handed. On the dispatch path the loop already installs a provider over
     /// [`crate::runtime_state::RuntimeState::trace_roots`], so a collection
@@ -452,7 +453,11 @@ impl Interpreter {
     /// caller that builds many objects of one shape should keep the answer.
     pub(crate) fn object_layout(&mut self, keys: &[&str]) -> Result<ObjectLayout, VmError> {
         let prototype = self.object_prototype_object_opt();
-        let mut shape = self.object_root(prototype)?;
+        let mut shape = self.object_root(
+            prototype,
+            crate::object::inline_capacity_for(keys.len()),
+            crate::object::ShapeState::ORDINARY,
+        )?;
         for key in keys {
             shape = self.layout_shape_child(shape, key)?;
         }
@@ -481,7 +486,11 @@ impl Interpreter {
         // A layout's shape fixes the realm's `%Object.prototype%`, so the
         // realm's root partitions the cache.
         let prototype = self.object_prototype_object_opt();
-        let root = self.object_root(prototype)?;
+        let root = self.object_root(
+            prototype,
+            crate::object::inline_capacity_for(keys.len()),
+            crate::object::ShapeState::ORDINARY,
+        )?;
         let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
         if let Some(layout) = self.object_layout_cache.get(root_id, tag, keys) {
             return Ok(layout);
@@ -509,9 +518,12 @@ impl Interpreter {
         ) {
             return Ok(child);
         }
-        // Shape transitions allocate without collecting; see
-        // `Interpreter::shape_child_rooting_object_value`.
-        let _no_collection = self.gc_heap.always_allocate_scope();
+        let _runtime_roots = self.scope_runtime_roots_guard();
+        let mut parent = parent;
+        let mut pending = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the current parent slot survives the entire collecting
+        // transition preparation; the runtime source also traces the arena.
+        unsafe { pending.add_raw_slot(std::ptr::addr_of_mut!(parent).cast::<RawGc>()) };
         let mut external_visit = |_: &mut dyn FnMut(*mut RawGc)| {};
         self.shape_runtime
             .child_with_roots(
@@ -539,26 +551,22 @@ impl Interpreter {
         scope: &'s HandleScope,
         layout: ObjectLayout,
     ) -> Result<Local<'s>, VmError> {
-        let shape = self
+        let mut shape = self
             .shape_runtime
             .handle_for_id(layout.shape)
             .ok_or(VmError::TypeMismatch)?;
-        // The layout's shape fixes the prototype.
-        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
-        let handle = self.scoped_value(scope, Value::object(object));
         let count = layout.len as usize;
-        // The slab is grown once, then the shape and its `undefined` slots go
-        // on together, so no handle can go stale between them.
-        let object = self.scoped_object_handle(handle)?;
-        let slots = smallvec::SmallVec::<[Value; 8]>::from_elem(Value::undefined(), count);
-        crate::object::install_fresh_shape_with_slots(
-            object,
+        let mut slots = smallvec::SmallVec::<[Value; 8]>::from_elem(Value::undefined(), count);
+        let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| visitor(shape_slot);
+        let object = crate::object::alloc_object_with_shape_and_values_roots(
             &mut self.gc_heap,
             shape,
-            slots.as_slice(),
-            count,
-        );
-        Ok(handle)
+            &mut slots,
+            &mut roots,
+        )
+        .map_err(VmError::from)?;
+        Ok(self.scoped_value(scope, Value::object(object)))
     }
 
     /// Build an object whose layout slots contain `values` from its first
@@ -794,7 +802,7 @@ impl Interpreter {
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let array = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(VmError::from)?;
-        self.register_array_prototype_override(array);
+        let array = self.register_array_prototype_override(array)?;
         // Park before growing so the handle survives any allocation the length
         // reservation drives; then resolve the (possibly relocated) handle from
         // the arena to set the length.
@@ -925,7 +933,8 @@ impl Interpreter {
             call,
             &mut external_visit,
         )?;
-        Ok(self.scoped_value(scope, Value::native_function(function)))
+        let value = self.stamp_native_creation_realm(Value::native_function(function));
+        Ok(self.scoped_value(scope, value))
     }
 
     /// Read property `key` from the object handle `obj`, resolving `obj`
@@ -946,15 +955,13 @@ impl Interpreter {
         Ok(self.scoped_value(scope, value))
     }
 
-    /// Write `value` to property `key` on the object handle `obj`, resolving
-    /// both handles through the arena at call time.
+    /// Assign the data half of an ordinary own property write after resolving
+    /// receiver and value through their current arena slots.
     ///
-    /// `object::set` never reassigns the `JsObject` handle it is given; the only
-    /// way the object relocates is a moving collection driven by the write's own
-    /// allocation, and that collection rewrites the arena slot in place. The
-    /// slot is therefore authoritative on return — parking the (now-stale) local
-    /// back would clobber the collector's fix-up, so the write intentionally
-    /// does not re-park.
+    /// Read-only data, accessor and non-extensible rejections surface as
+    /// [`VmError::TypeMismatch`]. Real allocation failures retain their cause.
+    /// The descriptor owner traces its actual receiver/value preparation slots;
+    /// collection independently rewrites the authoritative arena aliases.
     pub(crate) fn scoped_set(
         &mut self,
         _scope: &HandleScope,
@@ -965,28 +972,27 @@ impl Interpreter {
         let receiver = self.handle_arena.get(obj.index());
         let stored = self.handle_arena.get(value.index());
         if let Some(mut object) = receiver.as_object() {
-            // The raw store, not `Interpreter::set_property`. Routing this
-            // through the shaped path was measured and rejected: appending a
-            // key that way costs a presence lookup, a shape-count read, a
-            // transition-cache probe keyed by the name, and then the store's
-            // own offset lookup, against one lookup and one owned key here.
-            // Building an object a `set` at a time therefore got 2x slower.
-            // The win a hidden class buys is real but belongs to a builder
-            // that knows an object's whole key list before it starts, and so
-            // pays for one shape rather than one per property.
-            crate::object::set(&mut object, &mut self.gc_heap, key, stored);
-            return Ok(());
+            return if crate::object::ordinary_set_data_property(
+                &mut object,
+                &mut self.gc_heap,
+                key,
+                stored,
+            )? {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
         }
         if let Some(array) = receiver.as_array() {
-            // NativeScope exposes indexed writes separately. Restrict this
-            // path to named own properties so it cannot enter dense growth or
-            // ArraySetLength while holding an unrefreshable raw array copy.
+            // Indexed writes and ArraySetLength have their own scoped owners.
             if key == "length" || crate::object::array_index_property_name(key).is_some() {
                 return Err(VmError::TypeMismatch);
             }
-            crate::array::set_named_property(array, &mut self.gc_heap, key, stored)
-                .map_err(|_| VmError::TypeMismatch)?;
-            return Ok(());
+            return if crate::array::set_named_property(array, &mut self.gc_heap, key, stored)? {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
         }
         Err(VmError::TypeMismatch)
     }
@@ -999,29 +1005,7 @@ impl Interpreter {
         atom: &crate::HostAtom,
         value: Local<'_>,
     ) -> Result<(), VmError> {
-        let names = std::sync::Arc::clone(&self.names);
-        let atom_id = self.object_layout_cache.atom_id(&names, atom);
-        let key = crate::property_atom::AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(atom_id),
-            atom.as_str(),
-        );
-        let receiver = self.handle_arena.get(obj.index());
-        let stored = self.handle_arena.get(value.index());
-        if let Some(mut object) = receiver.as_object() {
-            crate::object::set_atomized(&mut object, &mut self.gc_heap, key, stored);
-            return Ok(());
-        }
-        if let Some(array) = receiver.as_array() {
-            if key.name() == "length"
-                || crate::object::array_index_property_name(key.name()).is_some()
-            {
-                return Err(VmError::TypeMismatch);
-            }
-            crate::array::set_named_property(array, &mut self.gc_heap, key.name(), stored)
-                .map_err(|_| VmError::TypeMismatch)?;
-            return Ok(());
-        }
-        Err(VmError::TypeMismatch)
+        self.scoped_set(_scope, obj, atom.as_str(), value)
     }
 
     /// Write `value` to the symbol-keyed property `key` on the object handle
@@ -1037,16 +1021,29 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
         let stored = self.handle_arena.get(value.index());
-        if let Some(object) = receiver.as_object() {
-            return if crate::object::set_symbol(object, &mut self.gc_heap, key, stored) {
+        if let Some(mut object) = receiver.as_object() {
+            return if crate::object::ordinary_set_symbol_data_property(
+                &mut object,
+                &mut self.gc_heap,
+                key,
+                stored,
+            )? {
                 Ok(())
             } else {
                 Err(VmError::TypeMismatch)
             };
         }
-        if let Some(array) = receiver.as_array() {
-            crate::array::set_symbol_property(array, &mut self.gc_heap, key, stored);
-            return Ok(());
+        if let Some(mut array) = receiver.as_array() {
+            return if crate::array::ordinary_set_symbol_data_property(
+                &mut array,
+                &mut self.gc_heap,
+                key,
+                stored,
+            )? {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
         }
         Err(VmError::TypeMismatch)
     }
@@ -1098,7 +1095,7 @@ impl Interpreter {
             kind: crate::object::DescriptorKind::Data { value: stored },
             flags,
         };
-        if crate::object::define_own_symbol_property(object, &mut self.gc_heap, symbol, descriptor)
+        if crate::object::define_own_symbol_property(object, &mut self.gc_heap, symbol, descriptor)?
         {
             Ok(())
         } else {
@@ -1133,19 +1130,55 @@ impl Interpreter {
         let result = self.scoped_object(scope)?;
         match &desc.kind {
             DescriptorKind::Data { .. } => {
-                self.scoped_set(scope, result, "value", value_h.expect("data value parked"))?;
+                self.scoped_define_data(
+                    scope,
+                    result,
+                    "value",
+                    value_h.expect("data value parked"),
+                    crate::object::PropertyFlags::data_default(),
+                )?;
                 let writable = self.scoped_boolean(scope, desc.writable());
-                self.scoped_set(scope, result, "writable", writable)?;
+                self.scoped_define_data(
+                    scope,
+                    result,
+                    "writable",
+                    writable,
+                    crate::object::PropertyFlags::data_default(),
+                )?;
             }
             DescriptorKind::Accessor { .. } => {
-                self.scoped_set(scope, result, "get", get_h.expect("accessor getter parked"))?;
-                self.scoped_set(scope, result, "set", set_h.expect("accessor setter parked"))?;
+                self.scoped_define_data(
+                    scope,
+                    result,
+                    "get",
+                    get_h.expect("accessor getter parked"),
+                    crate::object::PropertyFlags::data_default(),
+                )?;
+                self.scoped_define_data(
+                    scope,
+                    result,
+                    "set",
+                    set_h.expect("accessor setter parked"),
+                    crate::object::PropertyFlags::data_default(),
+                )?;
             }
         }
         let enumerable = self.scoped_boolean(scope, desc.enumerable());
-        self.scoped_set(scope, result, "enumerable", enumerable)?;
+        self.scoped_define_data(
+            scope,
+            result,
+            "enumerable",
+            enumerable,
+            crate::object::PropertyFlags::data_default(),
+        )?;
         let configurable = self.scoped_boolean(scope, desc.configurable());
-        self.scoped_set(scope, result, "configurable", configurable)?;
+        self.scoped_define_data(
+            scope,
+            result,
+            "configurable",
+            configurable,
+            crate::object::PropertyFlags::data_default(),
+        )?;
         Ok(result)
     }
 
@@ -1168,7 +1201,7 @@ impl Interpreter {
                 kind: crate::object::DescriptorKind::Data { value: stored },
                 flags,
             };
-            return if native.define_own_property(&mut self.gc_heap, key, descriptor) {
+            return if native.define_own_property(&mut self.gc_heap, key, descriptor)? {
                 Ok(())
             } else {
                 Err(VmError::TypeMismatch)
@@ -1189,7 +1222,7 @@ impl Interpreter {
             kind: crate::object::DescriptorKind::Data { value: stored },
             flags,
         };
-        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
+        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor)? {
             Ok(())
         } else {
             Err(VmError::TypeMismatch)
@@ -1221,7 +1254,7 @@ impl Interpreter {
             },
             flags,
         };
-        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
+        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor)? {
             Ok(())
         } else {
             Err(VmError::TypeMismatch)
@@ -1365,7 +1398,7 @@ impl Interpreter {
     }
 
     /// Force a minor collection that roots *only* `receiver`, exactly as
-    /// `object::set`'s internal box allocation does (it hands `compress` a
+    /// `object::ordinary_set_data_property`'s internal box allocation does (it hands `compress` a
     /// visitor over the receiver alone). Any sibling that survives does so only
     /// through a registered extra-roots provider — the handle arena — which the
     /// host-side scope is responsible for installing. Used to prove the
@@ -1390,6 +1423,92 @@ mod tests {
 
     fn imm(i: i32) -> Value {
         Value::number_i32(i)
+    }
+
+    #[test]
+    fn native_layout_allocates_exact_capacity_and_keeps_children_through_gc() {
+        for count in [0, 1, 3, 4, 64, 65] {
+            let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+            // Explicit collection must move the fresh receiver and children.
+            interp.gc_heap_mut().set_gc_stress(0, false);
+            crate::NativeCtx::with_host_context(
+                &mut interp,
+                crate::NativeCallInfo::default_call(),
+                None,
+                |ctx| {
+                    ctx.scope(|mut scope| {
+                        let names = (0..count)
+                            .map(|index| format!("p{index}"))
+                            .collect::<Vec<_>>();
+                        let keys = names.iter().map(String::as_str).collect::<Vec<_>>();
+                        let layout = scope.object_layout(&keys).expect("layout");
+                        let object = scope
+                            .object_of_layout(layout)
+                            .expect("exact layout receiver");
+                        for index in 0..count {
+                            let initial = scope.slot(object, index).expect("initialized slot");
+                            assert!(scope.is_undefined(initial));
+                        }
+                        let before = scope.raw(object).as_raw_gc().unwrap().0;
+                        let mut child_offsets = Vec::new();
+                        for index in (0..count).filter(|&index| index == 0 || index + 1 == count) {
+                            // The receiver's fields are the only remaining
+                            // roots of these children when this range closes.
+                            let offset = scope.scope(|mut child_scope| {
+                                let child = child_scope.object().expect("young child");
+                                let marker = child_scope.number(index as f64 + 719.0);
+                                child_scope
+                                    .set(child, "marker", marker)
+                                    .expect("child marker");
+                                child_scope
+                                    .set_slot(object, index, child)
+                                    .expect("banked child");
+                                child_scope.raw(child).as_raw_gc().unwrap().0
+                            });
+                            child_offsets.push((index, offset));
+                        }
+                        scope.with_turn_parts(|interp, _| {
+                            interp.collect_minor_tracing_runtime_roots();
+                        });
+                        let raw = scope.raw(object);
+                        assert_ne!(raw.as_raw_gc().unwrap().0, before, "actual receiver move");
+                        scope.with_turn_parts(|interp, _| {
+                            let object = raw.as_object().unwrap();
+                            assert_eq!(
+                                crate::object::shape_id(object, interp.gc_heap()),
+                                layout.shape
+                            );
+                            assert_eq!(
+                                interp.gc_heap().read_payload(
+                                    object,
+                                    crate::object::ObjectBody::inline_capacity
+                                ),
+                                count.min(crate::object::MAX_INLINE_CAPACITY),
+                                "capacity follows the layout before any shape install"
+                            );
+                        });
+                        for (index, offset) in &child_offsets {
+                            let child = scope.slot(object, *index).expect("rewritten child");
+                            assert_ne!(
+                                scope.raw(child).as_raw_gc().unwrap().0,
+                                *offset,
+                                "actual field child move"
+                            );
+                            let marker = scope.get(child, "marker").expect("live marker");
+                            assert_eq!(scope.number_value(marker).unwrap(), *index as f64 + 719.0);
+                        }
+                        scope.with_turn_parts(|interp, _| {
+                            interp.collect_full_tracing_runtime_roots();
+                        });
+                        for (index, _) in child_offsets {
+                            let child = scope.slot(object, index).expect("full-GC child");
+                            let marker = scope.get(child, "marker").expect("full-GC marker");
+                            assert_eq!(scope.number_value(marker).unwrap(), index as f64 + 719.0);
+                        }
+                    });
+                },
+            );
+        }
     }
 
     #[test]
@@ -1433,7 +1552,7 @@ mod tests {
 
     #[test]
     fn scope_truncates_on_return() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let base = interp.handle_arena_len_for_test();
         let out = interp.with_handle_scope(|interp, s| {
             let v = interp.scoped_value(s, imm(7));
@@ -1446,7 +1565,7 @@ mod tests {
 
     #[test]
     fn scope_truncates_and_unwinds_roots_on_panic() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let base = interp.handle_arena_len_for_test();
         assert!(!interp.gc_heap().has_extra_roots());
 
@@ -1464,7 +1583,7 @@ mod tests {
 
     #[test]
     fn scoped_object_survives_and_moves_under_minor_gc() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let (moved, content) = interp.with_handle_scope(|interp, s| {
             // Objects are young-space, so a minor scavenge relocates a survivor
             // — the case that turns a raw held offset stale. Park a string
@@ -1522,7 +1641,7 @@ mod tests {
 
     #[test]
     fn scoped_prototype_accepts_array_and_proxy_values() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         interp.with_handle_scope(|interp, scope| {
             let object = interp.scoped_object_bare(scope).expect("receiver");
             let array = interp.scoped_array(scope, 0).expect("array prototype");
@@ -1560,7 +1679,7 @@ mod tests {
 
     #[test]
     fn scoped_string_survives_full_gc() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         // String bodies live in old space (mark-sweep, non-moving), so the
         // relocation proof uses an object above. Here a full GC would sweep any
         // unreachable old-space body; surviving one proves the arena roots the
@@ -1579,7 +1698,7 @@ mod tests {
 
     #[test]
     fn inner_scope_truncation_leaves_outer_handle_valid() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let content = interp.with_handle_scope(|interp, outer| {
             let outer_str = interp.scoped_string(outer, "outer").unwrap();
 
@@ -1601,7 +1720,7 @@ mod tests {
 
     #[test]
     fn unrelated_extra_roots_do_not_suppress_handle_arena_provider() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let unrelated = crate::NativeCallInfo::default_call();
         let unrelated_roots = otter_gc::ExtraRoots::new(&unrelated);
         let unrelated_guard = interp.gc_heap.register_extra_roots(unrelated_roots);
@@ -1647,7 +1766,7 @@ mod tests {
         // property write must still trace every sibling parked in the handle
         // arena. `with_handle_scope` installs the runtime-root provider for the
         // scope, so slot-growth collections cannot strand those siblings.
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         // No dispatch loop is running, so the scope must install the provider
         // itself — the exact condition the fix targets.
         assert!(
@@ -1718,7 +1837,7 @@ mod tests {
 
     #[test]
     fn stress_scoped_creation_with_interleaved_scavenges() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         interp.with_handle_scope(|interp, s| {
             for i in 0..1000 {
                 interp.with_handle_scope(|interp, inner| {

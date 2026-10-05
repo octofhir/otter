@@ -20,6 +20,8 @@
 //!   the VM consumes.
 //! - [`VerifiedBytecodeModule`] — immutable admission proof carried by caches
 //!   into the VM.
+//! - [`commonjs`] — the CommonJS module wrapper text shared by the build-time
+//!   builtin producer and the VM.
 //! - [`disasm`] — text disassembler for CLI/debug output.
 //! - [`dump`] — JSON dump for tooling and tests.
 //! - [`opcode_schema`] — declarative opcode identity, wire-format, conservative
@@ -47,6 +49,7 @@
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 pub mod binary;
+pub mod commonjs;
 pub mod disasm;
 pub mod dump;
 pub mod encoding;
@@ -2340,8 +2343,9 @@ impl ScopeDescriptor {
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         self.slots.iter().fold(
-            std::mem::size_of_val::<[SlotDescriptor]>(&self.slots) as u64,
-            |total, slot| total.saturating_add(slot.name.len() as u64),
+            (self.slots.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<SlotDescriptor>() as u64),
+            |total, slot| total.saturating_add(slot.name.capacity() as u64),
         )
     }
 }
@@ -2568,55 +2572,73 @@ impl BytecodeModule {
 
     /// Heap bytes this module retains for its owner's lifetime: every
     /// function body, the constant pool, the shared source snapshot, and the
-    /// linker tables. Excludes `size_of::<Self>()`, which the owning
+    /// linker tables, including unused Vec/String capacity and exception handlers.
+    /// Excludes `size_of::<Self>()`, which the owning
     /// allocation accounts for. Saturating, so a saturated total still
     /// exceeds any real budget and fails admission closed.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
-        let mut total = self.module.len() as u64;
-        total = total
-            .saturating_add(std::mem::size_of_val::<[TemplateSite]>(&self.template_sites) as u64);
+        let mut total = self.module.capacity() as u64;
+        total = total.saturating_add(
+            (self.template_sites.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<TemplateSite>() as u64),
+        );
         for site in &self.template_sites {
             total = total
-                .saturating_add(std::mem::size_of_val::<[Option<String>]>(&site.cooked) as u64)
-                .saturating_add(std::mem::size_of_val::<[String]>(&site.raw) as u64);
+                .saturating_add(
+                    (site.cooked.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<Option<String>>() as u64),
+                )
+                .saturating_add(
+                    (site.raw.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<String>() as u64),
+                );
             for cooked in site.cooked.iter().flatten() {
-                total = total.saturating_add(cooked.len() as u64);
+                total = total.saturating_add(cooked.capacity() as u64);
             }
             for raw in &site.raw {
-                total = total.saturating_add(raw.len() as u64);
+                total = total.saturating_add(raw.capacity() as u64);
             }
         }
-        total = total.saturating_add(std::mem::size_of_val::<[Function]>(&self.functions) as u64);
+        total = total.saturating_add(
+            (self.functions.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Function>() as u64),
+        );
         for function in &self.functions {
             total = total.saturating_add(function.retained_bytes());
         }
         if let Some(source) = &self.function_source {
-            total = total.saturating_add(source.len() as u64);
+            total = total.saturating_add(source.capacity() as u64);
         }
-        total = total.saturating_add(std::mem::size_of_val::<[Constant]>(&self.constants) as u64);
+        total = total.saturating_add(
+            (self.constants.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Constant>() as u64),
+        );
         for constant in &self.constants {
             total = total.saturating_add(constant.retained_bytes());
         }
-        total = total.saturating_add(std::mem::size_of_val::<[ModuleResolution]>(
-            &self.module_resolutions,
-        ) as u64);
+        total = total.saturating_add(
+            (self.module_resolutions.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ModuleResolution>() as u64),
+        );
         for resolution in &self.module_resolutions {
             total = total
-                .saturating_add(resolution.referrer.len() as u64)
-                .saturating_add(resolution.specifier.len() as u64)
+                .saturating_add(resolution.referrer.capacity() as u64)
+                .saturating_add(resolution.specifier.capacity() as u64)
                 .saturating_add(
                     resolution
                         .attr_type
                         .as_ref()
-                        .map_or(0, |attr| attr.len() as u64),
+                        .map_or(0, |attr| attr.capacity() as u64),
                 )
-                .saturating_add(resolution.target.len() as u64);
+                .saturating_add(resolution.target.capacity() as u64);
         }
-        total =
-            total.saturating_add(std::mem::size_of_val::<[ModuleInit]>(&self.module_inits) as u64);
+        total = total.saturating_add(
+            (self.module_inits.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ModuleInit>() as u64),
+        );
         for init in &self.module_inits {
-            total = total.saturating_add(init.url.len() as u64);
+            total = total.saturating_add(init.url.capacity() as u64);
         }
         total
     }
@@ -2624,28 +2646,45 @@ impl BytecodeModule {
 
 impl Function {
     /// Heap bytes this compiled function retains: name, wordcode body, span
-    /// table, scope descriptors, mapped-arguments table, and annotation-hint
-    /// tables. Excludes `size_of::<Self>()`, which the owning function table
+    /// table, exception handlers, scope descriptors, mapped-arguments table,
+    /// and annotation-hint tables, including retained Vec/String capacity. Excludes `size_of::<Self>()`, which the owning function table
     /// accounts for.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
-        let mut total = (self.name.len() as u64).saturating_add(self.module_url.len() as u64);
-        total = total.saturating_add(std::mem::size_of_val::<[MappedArgumentBinding]>(
-            &self.mapped_argument_bindings,
-        ) as u64);
+        let mut total =
+            (self.name.capacity() as u64).saturating_add(self.module_url.capacity() as u64);
+        total = total.saturating_add(
+            (self.mapped_argument_bindings.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<MappedArgumentBinding>() as u64),
+        );
         for binding in &self.mapped_argument_bindings {
-            total = total.saturating_add(binding.formal_name.len() as u64);
+            total = total.saturating_add(binding.formal_name.capacity() as u64);
         }
-        total =
-            total.saturating_add(std::mem::size_of_val::<[ScopeDescriptor]>(&self.scopes) as u64);
+        total = total.saturating_add(
+            (self.scopes.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<ScopeDescriptor>() as u64),
+        );
         for scope in &self.scopes {
             total = total.saturating_add(scope.retained_bytes());
         }
         total
             .saturating_add(self.code.retained_bytes())
-            .saturating_add(std::mem::size_of_val::<[SpanEntry]>(&self.spans) as u64)
-            .saturating_add(std::mem::size_of_val::<[u32]>(&self.number_hint_sites) as u64)
-            .saturating_add(std::mem::size_of_val::<[ClassHintSite]>(&self.class_hint_sites) as u64)
+            .saturating_add(
+                (self.handlers.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<ExceptionHandler>() as u64),
+            )
+            .saturating_add(
+                (self.spans.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<SpanEntry>() as u64),
+            )
+            .saturating_add(
+                (self.number_hint_sites.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<u32>() as u64),
+            )
+            .saturating_add(
+                (self.class_hint_sites.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<ClassHintSite>() as u64),
+            )
     }
 }
 
@@ -2654,14 +2693,17 @@ impl Constant {
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         match self {
-            Self::String { utf16 } => std::mem::size_of_val::<[u16]>(utf16) as u64,
+            Self::String { utf16 } => {
+                (utf16.capacity() as u64).saturating_mul(std::mem::size_of::<u16>() as u64)
+            }
             Self::Number { .. } | Self::FunctionId { .. } => 0,
-            Self::BigInt { decimal } => decimal.len() as u64,
+            Self::BigInt { decimal } => decimal.capacity() as u64,
             Self::RegExp {
                 pattern_utf16,
                 flags,
-            } => (std::mem::size_of_val::<[u16]>(pattern_utf16) as u64)
-                .saturating_add(flags.len() as u64),
+            } => ((pattern_utf16.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<u16>() as u64))
+            .saturating_add(flags.capacity() as u64),
         }
     }
 }
@@ -2775,3 +2817,7 @@ impl TypeOfTest {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "retained_bytes_tests.rs"]
+mod retained_bytes_tests;

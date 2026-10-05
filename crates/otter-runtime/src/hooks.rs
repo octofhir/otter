@@ -315,6 +315,12 @@ impl RuntimeHooks {
         self.compile.as_deref()
     }
 
+    /// Share the compile hook with host machinery that outlives this borrow,
+    /// such as the isolate's dynamic-code compile callback.
+    pub(crate) fn shared_compile_hook(&self) -> Option<Arc<dyn RuntimeCompileHook>> {
+        self.compile.clone()
+    }
+
     /// Return the job enqueue hook, when installed.
     #[must_use]
     pub fn job_hook(&self) -> Option<&dyn RuntimeJobHook> {

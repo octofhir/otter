@@ -90,57 +90,6 @@ fn emit_ctx_arg(ops: &mut Assembler) {
     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
 }
 
-pub(super) fn emit_make_function(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    dst: u16,
-    constant: u32,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
-    emit_load_u64(ops, 2, u64::from(constant));
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_MAKE_FN),
-        abi::STUB_JIT_MAKE_FN,
-        threw,
-        fatal,
-    );
-}
-
-/// `MakeClosure dst, fn, ctx`: `x1` the compiling function id, `x2` the
-/// destination, `x3` the function constant, `x4` the context register.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_make_closure(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    table: &TransitionTable,
-    code_block_id: u32,
-    dst: u16,
-    function: u32,
-    context: u16,
-    threw: DynamicLabel,
-    fatal: DynamicLabel,
-) {
-    emit_ctx_arg(ops);
-    emit_load_u64(ops, 1, u64::from(code_block_id));
-    dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
-    emit_load_u64(ops, 3, u64::from(function));
-    dynasm!(ops ; .arch aarch64 ; movz x4, context as u32);
-    emit_transition_call(
-        ops,
-        relocations,
-        table.variadic_entry(abi::STUB_JIT_MAKE_CLOSURE),
-        abi::STUB_JIT_MAKE_CLOSURE,
-        threw,
-        fatal,
-    );
-}
-
 pub(super) fn emit_load_regexp(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,

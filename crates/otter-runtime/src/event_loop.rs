@@ -18,6 +18,9 @@
 //!   results; JS callback dispatch stays on the isolate runner.
 //! - Timer tokens stay within JavaScript's exact integer range and are unique
 //!   among currently armed timers on a shared host.
+//! - Event-loop clones and their default remote providers share one HTTP pool.
+//!   A fetch initializes the client when it starts its request, so local-only
+//!   work and custom remote providers do not initialize it.
 //! - The timer drain task owns only its private driver state. Dropping the last
 //!   host/event-loop owner closes that state and wakes the task so it can exit.
 //! - Cancelled timer heap entries are compacted relative to the live registry;
@@ -31,7 +34,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -155,7 +158,7 @@ pub(crate) struct TokioEventLoop {
     // wakes the drain task, allowing runtime shutdown to join it promptly.
     timers: Arc<TimerDriverOwner>,
     owned: Option<Arc<tokio::runtime::Runtime>>,
-    http_client: reqwest::Client,
+    http_client: Arc<OnceLock<reqwest::Client>>,
 }
 
 impl std::fmt::Debug for TokioEventLoop {
@@ -175,7 +178,7 @@ impl TokioEventLoop {
             handle,
             timers,
             owned: None,
-            http_client: remote_http_client(),
+            http_client: Arc::new(OnceLock::new()),
         }
     }
 
@@ -192,7 +195,7 @@ impl TokioEventLoop {
             handle,
             timers,
             owned: Some(runtime),
-            http_client: remote_http_client(),
+            http_client: Arc::new(OnceLock::new()),
         })
     }
 
@@ -218,6 +221,9 @@ impl TokioEventLoop {
     }
 
     /// Async provider used by the remote graph fetch/prefetch phase.
+    ///
+    /// Creating the provider retains the shared client slot; only polling a
+    /// fetch can initialize the pooled client.
     pub(crate) fn remote_module_provider(
         &self,
     ) -> Arc<dyn crate::module_loader::RemoteModuleProvider> {
@@ -510,7 +516,7 @@ impl TimerDriverInner {
 
 #[derive(Debug)]
 struct TokioRemoteModuleProvider {
-    client: reqwest::Client,
+    client: Arc<OnceLock<reqwest::Client>>,
 }
 
 fn remote_http_client() -> reqwest::Client {
@@ -596,19 +602,12 @@ async fn fetch_remote_module_hop(
         })?;
         let Some(chunk) = chunk else { break };
         builder.push_bytes(&chunk).map_err(|error| {
-            crate::module_loader::RemoteModuleError::Fetch {
-                url: current.to_string(),
-                message: format!("bounded body read failed: {error}"),
-            }
+            crate::module_loader::RemoteModuleError::source_error(current.as_str(), error)
         })?;
     }
-    let source =
-        builder
-            .finish_utf8()
-            .map_err(|error| crate::module_loader::RemoteModuleError::Fetch {
-                url: current.to_string(),
-                message: format!("HTTP body is not valid UTF-8 source: {error}"),
-            })?;
+    let source = builder.finish_utf8().map_err(|error| {
+        crate::module_loader::RemoteModuleError::source_error(current.as_str(), error)
+    })?;
     Ok(crate::module_loader::RemoteModuleResponse::Source {
         source,
         content_type,
@@ -627,7 +626,10 @@ impl crate::module_loader::RemoteModuleProvider for TokioRemoteModuleProvider {
                 () = cancellation.cancelled() => {
                     Err(crate::module_loader::RemoteModuleError::Cancelled)
                 }
-                result = fetch_remote_module_hop(client, request) => result,
+                result = async {
+                    let client = client.get_or_init(remote_http_client).clone();
+                    fetch_remote_module_hop(client, request).await
+                } => result,
             }
         })
     }

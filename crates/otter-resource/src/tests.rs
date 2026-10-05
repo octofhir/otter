@@ -76,6 +76,17 @@ fn shared_source_charges_once_across_all_clones() {
 }
 
 #[test]
+fn static_shared_source_borrows_program_image_text_without_charge() {
+    static TEXT: &str = "module.exports = 1;\n";
+    let source = SharedSource::from_static(TEXT);
+    assert_eq!(source.as_ptr(), TEXT.as_ptr());
+    assert_eq!(source.len(), TEXT.len());
+    let line = source.slice(0..6).expect("ASCII boundary");
+    assert_eq!(&*line, "module");
+    assert_eq!(line.as_ptr(), TEXT.as_ptr());
+}
+
+#[test]
 fn shared_source_exact_admission_rejects_without_retained_charge() {
     let account = account_with_limit(ResourceClass::SourceModuleBytes, 2);
     let error = SharedSource::admit(&account, "three".to_owned()).unwrap_err();
@@ -710,7 +721,7 @@ fn overflow_is_typed_and_does_not_change_usage() {
     );
     assert_eq!(error.class(), ResourceClass::GeneratedCodeBytes);
     assert_eq!(error.requested(), 1);
-    assert_eq!(error.in_use(), u64::MAX);
+    assert_eq!(error.in_use(), Some(u64::MAX));
     assert_eq!(error.limit(), None);
     assert_eq!(
         account
@@ -819,4 +830,137 @@ fn exact_many_recovers_a_poisoned_mutex_and_releases_as_one_set() {
     let snapshot = account.snapshot();
     assert_eq!(snapshot.get(ResourceClass::QueuedMessages).current(), 0);
     assert_eq!(snapshot.get(ResourceClass::QueuedMessageBytes).current(), 0);
+}
+
+#[test]
+fn shared_utf8_slices_retain_one_full_charge_and_view_identity() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    fn hash(source: &SharedSource) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        hasher.finish()
+    }
+    let account = account_with_limit(ResourceClass::SourceModuleBytes, 18);
+    let source = SharedSource::admit(&account, "head\né𝄞z\r\nlast".to_owned()).unwrap();
+    assert_eq!(source.len(), 18);
+    let line = source.slice(5..12).unwrap();
+    let scalar = line.slice(2..6).unwrap();
+    let empty = line.slice(7..7).unwrap();
+    assert_eq!(line.as_ref(), "é𝄞z");
+    assert_eq!(scalar.as_ref(), "𝄞");
+    assert_eq!(line.len(), 7);
+    assert_eq!(scalar.len(), 4);
+    assert!(empty.is_empty());
+    assert_eq!(line.as_ptr(), source.as_ptr().wrapping_add(5));
+    assert_eq!(scalar.as_ptr(), source.as_ptr().wrapping_add(7));
+    assert!(line.slice(1..2).is_none());
+    assert!(line.slice(3..6).is_none());
+    assert!(line.slice(0..8).is_none());
+    assert!(line.slice(5..2).is_none());
+    let separate_account = ResourceAccount::default();
+    let equal = SharedSource::admit(&separate_account, "𝄞".to_owned()).unwrap();
+    assert_eq!(scalar, equal);
+    assert_eq!(hash(&scalar), hash(&equal));
+    drop(source);
+    drop(line);
+    drop(scalar);
+    assert_eq!(
+        account
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current(),
+        18
+    );
+    drop(empty);
+    assert_eq!(
+        account
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current(),
+        0
+    );
+    assert_eq!(
+        account
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .peak(),
+        18
+    );
+}
+
+#[test]
+fn allocator_failure_keeps_actual_cause_and_is_distinct_from_quota_refusal() {
+    use std::error::Error;
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ResourceError>();
+    let mut buffer = Vec::<u8>::new();
+    let cause = buffer.try_reserve_exact(usize::MAX).unwrap_err();
+    let error = ResourceError::Allocation {
+        class: ResourceClass::SourceModuleBytes,
+        capacity: usize::MAX,
+        requested: usize::MAX as u64,
+        cause: cause.clone(),
+    };
+    assert_eq!(error.class(), ResourceClass::SourceModuleBytes);
+    assert_eq!(error.requested(), usize::MAX as u64);
+    assert_eq!(error.in_use(), None);
+    assert_eq!(error.limit(), None);
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::collections::TryReserveError>(),
+        Some(&cause)
+    );
+    assert_eq!(error.clone(), error);
+    let account = account_with_limit(ResourceClass::SourceModuleBytes, 7);
+    assert_eq!(
+        account
+            .reserve_exact(ResourceClass::SourceModuleBytes, 8)
+            .unwrap_err(),
+        ResourceError::Exhausted {
+            class: ResourceClass::SourceModuleBytes,
+            requested: 8,
+            in_use: 0,
+            limit: 7
+        }
+    );
+    assert!(buffer.is_empty());
+    assert_eq!(buffer.capacity(), 0);
+}
+
+#[test]
+fn lease_identity_queries_the_single_shared_account() {
+    let first = ResourceAccount::default();
+    let alias = first.clone();
+    let other = ResourceAccount::default();
+    let lease = first
+        .reserve_exact(ResourceClass::SourceModuleBytes, 17)
+        .unwrap();
+    assert!(lease.belongs_to(&first));
+    assert!(lease.belongs_to(&alias));
+    assert!(!lease.belongs_to(&other));
+    assert_eq!(
+        first
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current(),
+        17
+    );
+    assert_eq!(
+        other
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current(),
+        0
+    );
+    drop(lease);
+    assert_eq!(
+        alias
+            .snapshot()
+            .get(ResourceClass::SourceModuleBytes)
+            .current(),
+        0
+    );
 }

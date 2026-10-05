@@ -1,13 +1,14 @@
 //! `node:fs` native core.
 //!
-//! Provides the capability-gated synchronous primitives that the `fs.js` shim
-//! builds the full Node `fs` surface on top of. Raw file bytes cross the
-//! native/JS boundary as latin1 strings (each byte maps 1:1 to a code unit), so
-//! the JS layer can wrap them in a `Buffer` and apply any encoding.
+//! Provides capability-gated synchronous primitives on the hidden `__fsnative`
+//! row (the full `fs` surface is vendored Node over `internalBinding('fs')`).
+//! Raw file bytes cross the native/JS boundary as latin1 strings (each byte
+//! maps 1:1 to a code unit), so the JS layer can wrap them in a `Buffer` and
+//! apply any encoding.
 //!
 //! # Contents
 //! - [`install_fs_module`] - the legacy ESM namespace (text sync helpers).
-//! - [`fs_native_value`] - the raw sync core consumed by `fs.js`.
+//! - [`fs_native_value`] - the raw sync core behind `__fsnative`.
 //!
 //! # Invariants
 //! - Every operation checks `read`/`write` capabilities at the Rust boundary
@@ -122,37 +123,6 @@ pub fn install_fs_module<'scope>(
     )?;
     scope.set(namespace, "mkdirSync", mkdir_sync)?;
     Ok(namespace)
-}
-
-const FS_SHIM: &str = include_str!("fs.js");
-const FS_PROMISES_SHIM: &str = "'use strict';\nmodule.exports = require('fs').promises;\n";
-
-/// CommonJS export: the full `fs` namespace, built by `fs.js` on the native core.
-pub fn fs_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:fs", FS_SHIM, module, require)
-}
-
-/// CommonJS export: `fs/promises` (= `require('fs').promises`).
-pub fn fs_promises_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:fs/promises",
-        FS_PROMISES_SHIM,
-        module,
-        require,
-    )
 }
 
 /// Hidden CommonJS row that supplies the capability-gated native `fs` core.

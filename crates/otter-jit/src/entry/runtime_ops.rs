@@ -24,7 +24,10 @@
 //! - `crate::template::code` for metadata ownership.
 //! - `otter_vm::jit_runtime_ops` for the safe typed VM operations.
 
-use otter_vm::{VmError, native_abi::NativeResultStatus};
+use otter_vm::{
+    VmError,
+    native_abi::{CommittedValueError, NativeResultStatus},
+};
 
 use super::JitCtx;
 
@@ -39,12 +42,16 @@ pub(crate) use literals::*;
 pub(crate) use reentry::*;
 pub(crate) use vm_ops::*;
 
-fn park_result(ctx: &mut JitCtx, result: Result<(), VmError>) -> u64 {
+fn park_result(ctx: &mut JitCtx, result: Result<(), CommittedValueError>) -> u64 {
     match result {
         Ok(()) => NativeResultStatus::Success as u64,
-        Err(err) => {
-            park_jit_error(ctx, err);
+        Err(CommittedValueError::JavaScript(error)) => {
+            park_jit_error(ctx, error);
             NativeResultStatus::Throw as u64
+        }
+        Err(CommittedValueError::Fatal(error)) => {
+            park_jit_error(ctx, error);
+            NativeResultStatus::Fatal as u64
         }
     }
 }
@@ -54,8 +61,10 @@ pub(super) fn decode_register(raw: u64) -> Result<u16, VmError> {
     u16::try_from(raw).map_err(|_| VmError::InvalidOperand)
 }
 
-fn complete_add(ctx: &mut JitCtx, dst: u16, lhs: u16, rhs: u16) -> Result<(), VmError> {
-    ctx.runtime_call()?.add(dst, lhs, rhs)
+fn complete_add(ctx: &mut JitCtx, dst: u16, lhs: u16, rhs: u16) -> Result<(), CommittedValueError> {
+    ctx.runtime_call()
+        .map_err(CommittedValueError::Fatal)?
+        .add(dst, lhs, rhs)
 }
 
 pub(super) extern "C" fn jit_add_stub(ctx: *mut JitCtx, dst: u64, lhs: u64, rhs: u64) -> u64 {
@@ -64,9 +73,9 @@ pub(super) extern "C" fn jit_add_stub(ctx: *mut JitCtx, dst: u64, lhs: u64, rhs:
     let result = (|| {
         complete_add(
             ctx,
-            decode_register(dst)?,
-            decode_register(lhs)?,
-            decode_register(rhs)?,
+            decode_register(dst).map_err(CommittedValueError::Fatal)?,
+            decode_register(lhs).map_err(CommittedValueError::Fatal)?,
+            decode_register(rhs).map_err(CommittedValueError::Fatal)?,
         )
     })();
     park_result(ctx, result)
@@ -81,7 +90,8 @@ pub(super) extern "C" fn jit_define_data_property_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        ctx.runtime_call()?
+        ctx.runtime_call()
+            .map_err(CommittedValueError::Fatal)?
             .define_data_property(object as u16, key as u16, value as u16)
     })();
     park_result(ctx, result)
@@ -95,8 +105,10 @@ pub(super) extern "C" fn jit_load_builtin_error_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        ctx.runtime_call()?
+        ctx.runtime_call()
+            .map_err(CommittedValueError::Fatal)?
             .load_builtin_error(dst as u16, kind_index as u32)
+            .map_err(CommittedValueError::JavaScript)
     })();
     park_result(ctx, result)
 }
@@ -110,32 +122,9 @@ pub(super) extern "C" fn jit_define_own_property_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        ctx.runtime_call()?
+        ctx.runtime_call()
+            .map_err(CommittedValueError::Fatal)?
             .define_own_property(target as u16, key as u16, descriptor as u16)
-    })();
-    park_result(ctx, result)
-}
-
-/// `MakeClosure dst, fn, ctx`: allocate the site's closure over the context
-/// held in register `context`.
-pub(super) extern "C" fn jit_make_closure_stub(
-    ctx: *mut JitCtx,
-    function_id: u64,
-    dst: u64,
-    function_index: u64,
-    context: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let result = (|| {
-        let function_id = u32::try_from(function_id).map_err(|_| VmError::InvalidOperand)?;
-        let function_index = u32::try_from(function_index).map_err(|_| VmError::InvalidOperand)?;
-        ctx.runtime_call()?.make_closure(
-            function_id,
-            decode_register(dst)?,
-            function_index,
-            decode_register(context)?,
-        )
     })();
     park_result(ctx, result)
 }

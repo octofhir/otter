@@ -385,9 +385,7 @@ pub(crate) fn plural_rules_select(
             crate::coerce::to_number_or_throw(interp, stack, &exec, &value)
         });
         number
-            .map_err(|error| {
-                crate::native_function::vm_to_native_error(ctx.interp_mut(), error, "select")
-            })?
+            .map_err(|error| error.into_native(ctx.interp_mut(), "select"))?
             .as_f64()
     } else {
         f64::NAN
@@ -429,26 +427,14 @@ pub(crate) fn plural_rules_select_range(
             crate::coerce::to_number_or_throw(interp, stack, &exec, &start_value)
         });
         let x = start_number
-            .map_err(|error| {
-                crate::native_function::vm_to_native_error(
-                    scope.context().interp_mut(),
-                    error,
-                    "selectRange",
-                )
-            })?
+            .map_err(|error| error.into_native(scope.context().interp_mut(), "selectRange"))?
             .as_f64();
         let end_value = scope.raw(end);
         let end_number = scope.with_turn_parts(|interp, stack| {
             crate::coerce::to_number_or_throw(interp, stack, &exec, &end_value)
         });
         let y = end_number
-            .map_err(|error| {
-                crate::native_function::vm_to_native_error(
-                    scope.context().interp_mut(),
-                    error,
-                    "selectRange",
-                )
-            })?
+            .map_err(|error| error.into_native(scope.context().interp_mut(), "selectRange"))?
             .as_f64();
         Ok::<_, NativeError>((x, y))
     })?;

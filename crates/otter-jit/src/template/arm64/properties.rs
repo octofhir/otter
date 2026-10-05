@@ -1,10 +1,11 @@
 //! AArch64 named-property IC probes for the template compiler.
 //!
 //! # Contents
-//! - Inline guarded own-data loads/stores from immutable CacheIR snapshots
-//!   cells, with the Array exotic `length` fast path.
-//! - Fixed-value misses that resolve full load/`[[Set]]` semantics and
-//!   self-patch cacheable sites.
+//! - One immutable monomorphic CacheIR program inline, then a `bl` to the code
+//!   object's shared property subroutine ([`super::shared_property`]): the
+//!   live shared property-action probe and the committed runtime miss.
+//! - Exotic length reads and existing shape/value barriers after committed stores.
+//! - Source-owned cold entries complete full load/`[[Set]]` semantics once.
 //!
 //! # Invariants
 //! - Inline sequences neither allocate nor call, so they carry no safepoint;
@@ -18,8 +19,12 @@
 //! - The active frame already publishes and traces the complete register
 //!   window. Misses pass boxed values directly, so setters, proxies,
 //!   exceptions, reentry, and moving GC complete without replay.
-//! - Cage bases, IC cells, and transition entries carry semantic relocation
-//!   identities; IC ordinals are assigned before emission in ownership order.
+//! - A failed PIC reloads inputs from the rooted window before the shared
+//!   probe. Independent read/store facts select their own holder and slot.
+//! - Every miss precedes effects. Published stores have only barrier/completion
+//!   edges; their child shape and value are each barriered by the existing owner.
+//! - Cache tables and source cells carry semantic relocation identities;
+//!   source ordinals are assigned before emission in ownership order.
 //!
 //! # See also
 //! - [`super::values`] — slot compression/decompression primitives.
@@ -31,20 +36,41 @@ use otter_vm::JitCompileSnapshot;
 use otter_vm::native_abi as abi;
 
 use super::ic_probe;
-use super::transitions::TransitionTable;
 use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_runtime_stub, emit_load_symbol_u64,
     emit_store_reg, emit_write_barrier,
 };
 use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget};
+use crate::entry::TransitionTable;
 use crate::entry::{Unsupported, reg_offset};
 
-/// Emit `dst = obj.name` from transpiled CacheIR and one committed cold edge.
+/// Route the shared subroutine's `NativeResultPair` status in `x1`.
+fn emit_shared_status(ops: &mut Assembler, throw_value: DynamicLabel, fatal: DynamicLabel) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz x1, >completed
+        ; cmp x1, abi::NativeResultStatus::Throw as u32
+        ; b.eq =>throw_value
+        ; b =>fatal
+        ; completed:
+    );
+}
+
+/// Only a monomorphic site keeps its CacheIR program inline; every other
+/// receiver is served by the shared action probe.
+fn inline_programs(
+    programs: Option<&[otter_vm::JitCacheIrProgram]>,
+) -> Option<&[otter_vm::JitCacheIrProgram]> {
+    programs.filter(|programs| programs.len() == 1)
+}
+
+/// Emit `dst = obj.name` from CacheIR, the shared table and one committed miss.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_load_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    shared_probes: &mut super::shared_property::SharedPropertyProbes,
     view: &JitCompileSnapshot,
     dst: u16,
     object: u16,
@@ -59,6 +85,7 @@ pub(super) fn emit_load_property(
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
+    let shared = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
 
@@ -78,10 +105,8 @@ pub(super) fn emit_load_property(
         );
     }
 
-    // Inline guarded own-data load through the self-patching cell: guard tag
-    // + GC type tag + cell shape, then read the value slab slot at the cell's
-    // byte offset. Shape `0` is the empty-cell sentinel, so live shape-0
-    // receivers deliberately miss to the transition.
+    // Immutable CacheIR proves the exact receiver/holder before the live
+    // slot read. A miss remains pre-effect and reaches the shared probe.
     if cage_base != 0 {
         let obj_off = reg_offset(object)?;
         let dst_off = reg_offset(dst)?;
@@ -89,7 +114,7 @@ pub(super) fn emit_load_property(
             ops,
             relocations,
             view,
-            programs,
+            inline_programs(programs),
             byte_pc,
             |ops, register| {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
@@ -97,7 +122,7 @@ pub(super) fn emit_load_property(
             },
             cell_addr,
             cell_ordinal,
-            miss,
+            shared,
         )?;
         dynasm!(ops
             ; .arch aarch64
@@ -106,9 +131,30 @@ pub(super) fn emit_load_property(
         );
     }
 
-    // Miss / no cage base: pass the boxed receiver directly. The published
-    // native frame supplies function/PC/name/site identity, and the stable IC
-    // pointer lets the canonical completion patch this code object's probe.
+    // The immutable PIC may miss for a peer shape recorded after this
+    // generation was installed. Reload the actual receiver and call the
+    // shared probe of the same current table the optimizing tier and VM use.
+    dynasm!(ops ; .arch aarch64 ; =>shared);
+    let access = view
+        .property_accesses
+        .get(&byte_pc)
+        .filter(|_| cage_base != 0);
+    if let Some(access) = access {
+        use super::shared_property::{LOAD_ATOM, LOAD_ORDINAL, LOAD_RECEIVER};
+        let subroutine = shared_probes.label(ops, false);
+        emit_load_reg(ops, LOAD_RECEIVER, object)?;
+        super::values::emit_load_u64(ops, LOAD_ATOM, u64::from(access.atom));
+        super::values::emit_load_u64(ops, LOAD_ORDINAL, u64::from(cell_ordinal));
+        dynasm!(ops ; .arch aarch64 ; bl =>subroutine);
+        emit_shared_status(ops, throw_value, fatal);
+        emit_store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
+    }
+
+    // No key / no cage base: pass the boxed receiver directly. The published
+    // native frame and retained source cell supply function/PC/name/site
+    // identity. Canonical completion publishes actions for subsequent probes.
     dynasm!(ops
         ; .arch aarch64
         ; =>miss
@@ -147,16 +193,18 @@ pub(super) fn emit_load_property(
     Ok(())
 }
 
-/// Emit `obj.name = value` from transpiled CacheIR and one committed cold edge.
+/// Emit `obj.name = value` from CacheIR, the shared table and one committed miss.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_store_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    shared_probes: &mut super::shared_property::SharedPropertyProbes,
     view: &JitCompileSnapshot,
     object: u16,
     _name: u32,
     value: u16,
+    byte_pc: u32,
     _site: u64,
     cell_addr: usize,
     cell_ordinal: u32,
@@ -165,11 +213,12 @@ pub(super) fn emit_store_property(
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
+    let shared = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
 
-    // Inline guarded existing-own-data store through the self-patching cell,
-    // then a value-tag-gated write barrier (primitive stores skip it).
+    // Immutable CacheIR resolves a guarded own slot or append and commits
+    // through the existing child/value barrier owners.
     if cage_base != 0 {
         let obj_off = reg_offset(object)?;
         let src_off = reg_offset(value)?;
@@ -177,14 +226,14 @@ pub(super) fn emit_store_property(
             ops,
             relocations,
             view,
-            programs,
+            inline_programs(programs),
             |ops, register| {
                 dynasm!(ops ; .arch aarch64 ; ldr X(register), [x19, obj_off]);
                 Ok(())
             },
             cell_addr,
             cell_ordinal,
-            miss,
+            shared,
         )?;
         let store_prim = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, src_off]);
@@ -205,7 +254,28 @@ pub(super) fn emit_store_property(
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }
 
-    // Miss / no cage base: receiver and value are read from the published,
+    // The PIC miss is still pre-effect. Its scratch can be discarded;
+    // the published window supplies collector-current inputs to the shared
+    // action probe. It preserves x12/x9 and returns the child in w11.
+    dynasm!(ops ; .arch aarch64 ; =>shared);
+    let access = view
+        .property_accesses
+        .get(&byte_pc)
+        .filter(|_| cage_base != 0);
+    if let Some(access) = access {
+        use super::shared_property::{STORE_ATOM, STORE_ORDINAL, STORE_RECEIVER, STORE_VALUE};
+        let subroutine = shared_probes.label(ops, true);
+        emit_load_reg(ops, STORE_RECEIVER, object)?;
+        emit_load_reg(ops, STORE_VALUE, value)?;
+        super::values::emit_load_u64(ops, STORE_ATOM, u64::from(access.atom));
+        super::values::emit_load_u64(ops, STORE_ORDINAL, u64::from(cell_ordinal));
+        dynasm!(ops ; .arch aarch64 ; bl =>subroutine);
+        emit_shared_status(ops, throw_value, fatal);
+        dynasm!(ops ; .arch aarch64 ; =>done);
+        return Ok(());
+    }
+
+    // No key / no cage base: receiver and value are read from the published,
     // traced window immediately before the fixed-value call.
     dynasm!(ops
         ; .arch aarch64

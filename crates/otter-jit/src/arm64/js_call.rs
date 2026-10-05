@@ -5,37 +5,73 @@
 //!   the caller's stack.
 //! - [`emit_call`] — the call ABI registers and the call itself: the current
 //!   generation of a proven bytecode target through its `FunctionEntryCell`,
-//!   or the generic entry that classifies any other callee.
+//!   a proved NativeFunction through its selected Host convention, or the
+//!   generic entry that classifies any other callee.
 //! - [`emit_staged_call`] / [`emit_enter_staged`] — a call whose span, or
 //!   whole request, a runtime staging entry wrote.
 //! - [`emit_tail_branch`] — the entry branch of a proper tail call.
+//! - [`emit_push_forwarded`] / [`emit_pop_forwarded`] — the span of a
+//!   forwarded call: the activation's own actual arguments, its mapped
+//!   formals read from where they live now.
 //!
 //! # Invariants
 //! - The span is pushed before the call ABI registers are set and popped
-//!   after the completion returns; a proven target's span is padded with
-//!   `undefined` to its formal count.
+//!   after the completion returns. It contains only actual arguments;
+//!   the callee owns every missing formal's `undefined` value.
 //! - Callee activation, receiver binding, constructor completion and callee
 //!   deoptimization belong to the callee. A caller consumes only `Success`,
 //!   `Throw` (exception in `x0`) or `Fatal` (error parked in the context).
+//! - Emitters return the exact offset immediately after BLR, before any cleanup.
 //! - Emitters clobber `x0`–`x17` and preserve every callee-saved register.
 //!
 //! # See also
 //! - [`crate::call_linkage`] — the architecture-neutral call contract.
 //! - [`super::activation`] — the callee side of the same ABI.
 
-use dynasmrt::{DynasmApi, aarch64::Assembler, dynasm};
+use dynasmrt::{
+    AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm,
+};
 use otter_vm::native_abi as abi;
 
 use crate::{
     artifact::relocation::{RelocationCapture, RelocationTarget},
     call_linkage::pushed_argument_bytes,
     entry::{
-        PENDING_CALL_OFFSET, REQUEST_CALLEE_OFFSET, REQUEST_ENTRY_OFFSET, REQUEST_FLAGS_OFFSET,
-        REQUEST_NEW_TARGET_OFFSET, REQUEST_RECEIVER_OFFSET, REQUEST_REGISTER_SEED_OFFSET,
-        TransitionTable, Unsupported, VALUE_UNDEFINED,
+        NATIVE_STACK_LIMIT_OFFSET, PENDING_CALL_OFFSET, REQUEST_CALLEE_OFFSET,
+        REQUEST_ENTRY_OFFSET, REQUEST_FLAGS_OFFSET, REQUEST_NEW_TARGET_OFFSET,
+        REQUEST_RECEIVER_OFFSET, REQUEST_REGISTER_SEED_OFFSET, TransitionTable, Unsupported,
+        VALUE_UNDEFINED,
     },
     template::arm64::values::emit_load_u64,
 };
+
+/// Prove a full tagged NativeFunction cell before reading its header.
+/// Only x16 and flags are clobbered; the callee excludes reserved scratch.
+/// x17 retains the original guarded-method callable on the Generic miss path.
+pub(crate) fn emit_native_kind_guard(ops: &mut Assembler, value: u8, miss: DynamicLabel) {
+    assert!(
+        value != 16 && value != 17,
+        "native callee cannot alias guard scratch"
+    );
+    emit_load_u64(ops, 16, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch aarch64
+        ; tst X(value), x16 ; b.ne =>miss ; cbz X(value), =>miss
+        ; ldrb w16, [X(value)]
+        ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
+        ; b.ne =>miss
+    );
+}
+
+/// Clear the sole canonical incoming construction ticket. Only x17 is
+/// scratch; no call operand or the x16 target is touched.
+pub(crate) fn emit_clear_construct_ticket(ops: &mut Assembler, context: u8) {
+    dynasm!(ops ; .arch aarch64
+        ; str xzr, [X(context), PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]
+        ; str wzr, [X(context), PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_LAYOUT_OFFSET]
+        ; movz x17, VALUE_UNDEFINED as u32
+        ; str x17, [X(context), PENDING_CALL_OFFSET + abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
+    );
+}
 
 /// Reserve and fill a fixed actual span below `sp`.
 ///
@@ -91,12 +127,131 @@ pub(crate) fn emit_pop_arguments(ops: &mut Assembler, bytes: u32) {
     }
 }
 
+/// `x16` = the bytes of the frame's actual span, rounded up to 16 bytes.
+fn emit_forwarded_bytes(ops: &mut Assembler, frame: u8) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w16, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; add w16, w16, 1
+        ; and w16, w16, 0xffff_fffe
+        ; lsl x16, x16, 3
+    );
+}
+
+/// Reserve and fill the span of a forwarded call below `sp`: the actual
+/// arguments of the activation whose record is in `frame`, each
+/// `(argument index, binding)` actual
+/// below the argument count replaced by the binding's current value; then
+/// `x4` holds the argument count. A span past the stack limit branches to
+/// `overflow` before `sp` moves. `old_sp` keeps the stack pointer the span
+/// moved, `source` is clobbered, and so are `x16`/`x17`.
+pub(crate) fn emit_push_forwarded(
+    ops: &mut Assembler,
+    frame: u8,
+    [old_sp, source]: [u8; 2],
+    overflow: DynamicLabel,
+    bindings: &[(u16, ForwardedBinding)],
+) {
+    emit_forwarded_bytes(ops, frame);
+    let probe = ops.new_dynamic_label();
+    let probed = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x17, sp
+        ; mov X(old_sp), x17
+        ; sub x16, X(old_sp), x16
+        ; ldr x17, [x20, NATIVE_STACK_LIMIT_OFFSET]
+        ; cmp x16, x17
+        ; b.lo =>overflow
+        // Touch each page from the old stack pointer down before `sp`
+        // passes it.
+        ; mov x17, X(old_sp)
+        ; =>probe
+        ; sub x17, x17, 1, lsl 12
+        ; cmp x17, x16
+        ; b.ls =>probed
+        ; str xzr, [x17]
+        ; b =>probe
+        ; =>probed
+        ; mov sp, x16
+    );
+    let copy = ops.new_dynamic_label();
+    let copied = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr X(source), [X(frame), abi::NATIVE_FRAME_ACTUALS_OFFSET]
+        ; ldr w17, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+        ; =>copy
+        ; cbz w17, =>copied
+        ; sub w17, w17, 1
+        ; ldr x16, [X(source), x17, lsl #3]
+        ; str x16, [sp, x17, lsl #3]
+        ; b =>copy
+        ; =>copied
+    );
+    for &(index, binding) in bindings {
+        let skip = ops.new_dynamic_label();
+        emit_load_u64(ops, 16, u64::from(index));
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr w17, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+            ; cmp w17, w16
+            ; b.ls =>skip
+        );
+        let value = match binding {
+            ForwardedBinding::Register(register) => register,
+            ForwardedBinding::Load { base, offset } => {
+                emit_load_u64(ops, 17, u64::from(offset));
+                dynasm!(ops ; .arch aarch64 ; ldr x16, [X(base), x17]);
+                16
+            }
+            ForwardedBinding::ContextSlot {
+                base,
+                offset,
+                slot_byte,
+            } => {
+                emit_load_u64(ops, 17, u64::from(offset));
+                dynasm!(ops ; .arch aarch64 ; ldr x16, [X(base), x17]);
+                emit_load_u64(ops, 17, u64::from(slot_byte));
+                dynasm!(ops ; .arch aarch64 ; ldr x16, [x16, x17]);
+                16
+            }
+            ForwardedBinding::Immediate(bits) => {
+                emit_load_u64(ops, 16, bits);
+                16
+            }
+        };
+        emit_load_u64(ops, 17, u64::from(index));
+        dynasm!(ops
+            ; .arch aarch64
+            ; str X(value), [sp, x17, lsl #3]
+            ; =>skip
+        );
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w4, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+    );
+}
+
+/// Release a span [`emit_push_forwarded`] reserved, sized again from the
+/// unchanged argument count of `frame`. Clobbers `x16`/`x17`.
+pub(crate) fn emit_pop_forwarded(ops: &mut Assembler, frame: u8) {
+    emit_forwarded_bytes(ops, frame);
+    dynasm!(ops ; .arch aarch64 ; add sp, sp, x16);
+}
+
 pub(crate) use crate::call_linkage::CallTarget;
+use crate::call_linkage::ForwardedBinding;
 
 /// Set the call ABI registers from `callee`, `receiver` (`undefined` when
 /// absent) and `new_target` (present exactly for `[[Construct]]`), then call
-/// `target` with `count` actuals at `sp`. Returns with the completion in
-/// `x0`/`x1`.
+/// `target` with `count` actuals at `sp`, or with the count the caller
+/// already put in `x4` when `count` is `None`. Returns with the completion
+/// in `x0`/`x1`.
 ///
 /// Each value register is either its own ABI register (`x1` callee, `x2`
 /// receiver, `x3` `new.target`) or lies outside `x0`–`x4`, `x8` and `x16`;
@@ -110,9 +265,9 @@ pub(crate) fn emit_call(
     callee: u8,
     receiver: Option<u8>,
     new_target: Option<u8>,
-    count: u32,
+    count: Option<u32>,
     target: CallTarget,
-) {
+) -> AssemblyOffset {
     debug_assert!(
         [
             (callee, 1),
@@ -136,9 +291,14 @@ pub(crate) fn emit_call(
     match new_target {
         Some(3) => {}
         Some(new_target) => dynasm!(ops ; .arch aarch64 ; mov x3, X(new_target)),
-        None => dynasm!(ops ; .arch aarch64 ; movz x3, VALUE_UNDEFINED as u32),
+        None => {
+            emit_clear_construct_ticket(ops, context);
+            dynasm!(ops ; .arch aarch64 ; movz x3, VALUE_UNDEFINED as u32);
+        }
     }
-    emit_load_u64(ops, 4, u64::from(count));
+    if let Some(count) = count {
+        emit_load_u64(ops, 4, u64::from(count));
+    }
     match target {
         CallTarget::Known {
             entry_cell,
@@ -159,18 +319,23 @@ pub(crate) fn emit_call(
                 ; blr x16
             );
         }
-        CallTarget::Generic => {
+        CallTarget::Generic | CallTarget::Native => {
+            let stub = match target {
+                CallTarget::Native => abi::STUB_JIT_CALL_NATIVE,
+                _ => abi::STUB_JIT_CALL_GENERIC,
+            };
             let start = ops.offset().0;
-            emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_GENERIC));
+            emit_load_u64(ops, 16, table.entry(stub));
             relocations.record_mov_wide(
                 start,
                 ops.offset().0,
                 16,
-                RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
+                RelocationTarget::runtime_stub(stub),
             );
             dynasm!(ops ; .arch aarch64 ; blr x16);
         }
     }
+    ops.offset()
 }
 
 /// Branch to `target` with the call ABI registers already set: the tail of
@@ -202,29 +367,57 @@ pub(crate) fn emit_tail_branch(
                 ; br x16
             );
         }
-        CallTarget::Generic => {
+        CallTarget::Generic | CallTarget::Native => {
+            let stub = match target {
+                CallTarget::Native => abi::STUB_JIT_CALL_NATIVE,
+                _ => abi::STUB_JIT_CALL_GENERIC,
+            };
             let start = ops.offset().0;
-            emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_GENERIC));
+            emit_load_u64(ops, 16, table.entry(stub));
             relocations.record_mov_wide(
                 start,
                 ops.offset().0,
                 16,
-                RelocationTarget::runtime_stub(abi::STUB_JIT_CALL_GENERIC),
+                RelocationTarget::runtime_stub(stub),
             );
             dynasm!(ops ; .arch aarch64 ; br x16);
         }
     }
 }
 
-/// Enter the trampoline with the complete request a staging entry wrote.
+/// Publish the generated caller's genuine return coordinate and enter the
+/// trampoline with the complete staged request. Existing nonzero, tier-transfer
+/// and tail-call associations remain owned by their original source extent.
 /// Returns the completion in `x0`/`x1`.
 pub(crate) fn emit_enter_staged(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     context: u8,
-) {
-    dynasm!(ops ; .arch aarch64 ; mov x0, X(context));
+) -> AssemblyOffset {
+    let return_to_caller = ops.new_dynamic_label();
+    let origin_ready = ops.new_dynamic_label();
+    let no_generated_caller = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; mov x0, X(context)
+        ; add x16, x0, PENDING_CALL_OFFSET
+        ; ldr x17, [x16, abi::REQUEST_CALLER_RETURN_PC_OFFSET]
+        ; cbnz x17, =>origin_ready
+        ; ldrb w17, [x16, REQUEST_FLAGS_OFFSET]
+        ; tst w17, u32::from(abi::NativeFrameFlags::TIER_ENTRY | abi::NativeFrameFlags::TAIL_CALL)
+        ; b.ne =>origin_ready
+        ; ldr x17, [x0, crate::entry::NATIVE_FRAME_OFFSET]
+        ; str x17, [x16, abi::REQUEST_CALLER_OFFSET]
+        ; cbz x17, =>no_generated_caller
+        ; ldr w17, [x17, abi::NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
+        ; cbz w17, =>no_generated_caller
+        ; adr x17, =>return_to_caller
+        ; str x17, [x16, abi::REQUEST_CALLER_RETURN_PC_OFFSET]
+        ; b =>origin_ready
+        ; =>no_generated_caller
+        ; str xzr, [x16, abi::REQUEST_CALLER_RETURN_PC_OFFSET]
+        ; =>origin_ready
+    );
     let start = ops.offset().0;
     emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL));
     relocations.record_mov_wide(
@@ -233,7 +426,8 @@ pub(crate) fn emit_enter_staged(
         16,
         RelocationTarget::runtime_stub(abi::STUB_JIT_CALL),
     );
-    dynasm!(ops ; .arch aarch64 ; blr x16);
+    dynasm!(ops ; .arch aarch64 ; blr x16 ; =>return_to_caller);
+    ops.offset()
 }
 
 /// Write the context's request around a span a staging entry already wrote,
@@ -248,7 +442,8 @@ pub(crate) fn emit_staged_call(
     callee: u8,
     receiver: Option<u8>,
     new_target: Option<u8>,
-) {
+) -> AssemblyOffset {
+    emit_clear_construct_ticket(ops, context);
     debug_assert!(
         ![
             callee,
@@ -292,5 +487,5 @@ pub(crate) fn emit_staged_call(
         ; str x10, [x9, REQUEST_REGISTER_SEED_OFFSET]
         ; str xzr, [x9, REQUEST_REGISTER_SEED_OFFSET + 8]
     );
-    emit_enter_staged(ops, relocations, table, context);
+    emit_enter_staged(ops, relocations, table, context)
 }

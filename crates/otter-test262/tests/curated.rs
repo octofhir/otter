@@ -1,9 +1,16 @@
-//! Curated bring-up subset for the per-test driver (slice 103).
+//! Curated synthetic tests for the per-test conformance driver.
 //!
 //! Synthetic fixtures that exercise every [`Outcome`] variant on
 //! the in-process driver. CI uses these to detect regressions in
 //! the runner itself before it touches the full corpus.
 //!
+//! # Contents
+//! Positive/negative execution, diagnostics and each typed policy skip.
+//!
+//! # Invariants
+//! Fixtures exercise the actual runner without a vendored corpus dependency.
+//!
+//! # See also
 //! Spec: <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
 
 use std::path::Path;
@@ -11,7 +18,8 @@ use std::time::Duration;
 
 use otter_test262::config::Test262Config;
 use otter_test262::harness::HarnessCache;
-use otter_test262::runner::{CorpusPaths, ExecConfig, Outcome, run_one};
+use otter_test262::results::{Outcome, SkipReason};
+use otter_test262::runner::{CorpusPaths, ExecConfig, run_one};
 
 /// Build a synthetic [`CorpusPaths`] rooted at `tmp` with a
 /// minimal `harness/` containing `assert.js` + `sta.js`.
@@ -304,7 +312,12 @@ fn skipped_outcome_for_skip_feature() {
     };
     let result = run_one(&path, &corpus, &mut harness, &cfg);
     match result.outcome {
-        Outcome::Skipped { feature } => assert_eq!(feature, "Atomics"),
+        Outcome::Skipped { reason } => assert_eq!(
+            reason,
+            SkipReason::Feature {
+                feature: "Atomics".to_owned()
+            }
+        ),
         other => panic!("expected Skipped(Atomics), got {other:?}"),
     }
 }
@@ -332,7 +345,12 @@ fn skipped_outcome_for_no_strict_only_test() {
     };
     let result = run_one(&path, &corpus, &mut harness, &cfg);
     match result.outcome {
-        Outcome::Skipped { feature } => assert_eq!(feature, "flag:noStrict"),
+        Outcome::Skipped { reason } => assert_eq!(
+            reason,
+            SkipReason::Flag {
+                flag: "noStrict".to_owned()
+            }
+        ),
         other => panic!("expected flag:noStrict skip, got {other:?}"),
     }
 }
@@ -360,7 +378,12 @@ fn skipped_outcome_for_known_panic() {
     };
     let result = run_one(&path, &corpus, &mut harness, &cfg);
     match result.outcome {
-        Outcome::Skipped { feature } => assert_eq!(feature, "known panic"),
+        Outcome::Skipped { reason } => assert_eq!(
+            reason,
+            SkipReason::KnownPanic {
+                pattern: "panics/foo".to_owned()
+            }
+        ),
         other => panic!("expected known panic skip, got {other:?}"),
     }
 }
@@ -388,7 +411,12 @@ fn skipped_outcome_for_ignored_path() {
     };
     let result = run_one(&path, &corpus, &mut harness, &cfg);
     match result.outcome {
-        Outcome::Skipped { feature } => assert_eq!(feature, "ignored by config"),
+        Outcome::Skipped { reason } => assert_eq!(
+            reason,
+            SkipReason::Ignored {
+                pattern: "skip/ignored-here".to_owned()
+            }
+        ),
         other => panic!("expected ignored skip, got {other:?}"),
     }
 }
@@ -439,7 +467,41 @@ fn missing_frontmatter_records_skip() {
     let corpus = synth_corpus(&tmp);
     let path = write_test(&corpus, "no-fm/foo.js", "1 + 1;\n");
     match drive(&corpus, &path) {
-        Outcome::Skipped { feature } => assert_eq!(feature, "no frontmatter"),
+        Outcome::Skipped { reason } => assert_eq!(reason, SkipReason::MissingFrontmatter),
         other => panic!("expected Skipped, got {other:?}"),
     }
+}
+
+#[test]
+fn skipped_source_too_large_records_actual_size_and_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let source = "x".repeat(2 * 1024 * 1024 + 1);
+    let path = write_test(&corpus, "skip/too-large.js", &source);
+    assert_eq!(
+        drive(&corpus, &path),
+        Outcome::Skipped {
+            reason: SkipReason::SourceTooLarge {
+                bytes: source.len() as u64,
+                limit: 2 * 1024 * 1024
+            }
+        }
+    );
+}
+
+#[test]
+fn skipped_conflicting_strictness_flags_record_no_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "skip/conflicting-strictness.js",
+        "/*---\ndescription: no executable variant\nflags: [noStrict, onlyStrict]\n---*/\n1;\n",
+    );
+    assert_eq!(
+        drive(&corpus, &path),
+        Outcome::Skipped {
+            reason: SkipReason::NoStrictnessVariant
+        }
+    );
 }

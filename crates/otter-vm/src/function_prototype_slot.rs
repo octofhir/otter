@@ -163,7 +163,11 @@ impl Interpreter {
                             .and_then(|v| v.as_object())
                     })
             }) {
-                object::set_prototype(proto_now(interp), &mut interp.gc_heap, Some(object_proto));
+                let mut prototype = proto_now(interp);
+                if !object::set_prototype(&mut prototype, &mut interp.gc_heap, Some(object_proto))?
+                {
+                    return Err(VmError::TypeError);
+                }
             }
             let is_generator = context
                 .function(function_id)
@@ -176,7 +180,10 @@ impl Interpreter {
                     // §27.5.1 / §27.6.1 — generator-function `.prototype`
                     // objects inherit from the one shared
                     // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
-                    object::set_prototype(proto_now(interp), &mut interp.gc_heap, Some(shared));
+                    let mut prototype = proto_now(interp);
+                    if !object::set_prototype(&mut prototype, &mut interp.gc_heap, Some(shared))? {
+                        return Err(VmError::TypeError);
+                    }
                 } else {
                     let parent = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
                     let proto = proto_now(interp);

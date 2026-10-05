@@ -15,6 +15,7 @@
 //! - `jit_spread_call_ops` owns canonical arguments materialization.
 //! - `otter-compiler/src/arguments_elision.rs` proves the identity cannot escape.
 
+use crate::native_abi::CommittedValueError;
 use crate::rooting::RootScopeExt;
 use crate::{
     ActivationStack, ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError,
@@ -50,7 +51,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         object: Value,
         key: Option<Value>,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         match key {
             None => self.get_property_value_for_call(stack, context, object, "length"),
             Some(key) => self.load_element_values(stack, context, object, key),
@@ -63,9 +64,10 @@ impl Interpreter {
         stack: &mut ActivationStack,
         index: usize,
         key: Option<Value>,
-    ) -> Result<Value, VmError> {
-        if let Some(value) =
-            self.unmaterialized_argument_read(&ActiveFrameRef::from_frame(&stack[index]), key)?
+    ) -> Result<Value, CommittedValueError> {
+        if let Some(value) = self
+            .unmaterialized_argument_read(&ActiveFrameRef::from_frame(&stack[index]), key)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         {
             return Ok(value);
         }
@@ -75,7 +77,9 @@ impl Interpreter {
         unsafe {
             roots.add_value(&mut rooted_key);
         }
-        let object = self.materialize_frame_arguments_object(context, stack, index)?;
+        let object = self
+            .materialize_frame_arguments_object(context, stack, index)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         self.materialized_argument_read(context, stack, object, key.map(|_| rooted_key))
     }
 
@@ -85,8 +89,11 @@ impl Interpreter {
         stack: &mut ActivationStack,
         frame: &mut ActiveFrameMut<'_>,
         key: Option<Value>,
-    ) -> Result<Value, VmError> {
-        if let Some(value) = self.unmaterialized_argument_read(&frame.as_ref(), key)? {
+    ) -> Result<Value, CommittedValueError> {
+        if let Some(value) = self
+            .unmaterialized_argument_read(&frame.as_ref(), key)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
             return Ok(value);
         }
         let mut rooted_key = key.unwrap_or_else(Value::undefined);
@@ -95,7 +102,9 @@ impl Interpreter {
         unsafe {
             roots.add_value(&mut rooted_key);
         }
-        let object = self.jit_materialize_arguments(context, stack, frame)?;
+        let object = self
+            .jit_materialize_arguments(context, stack, frame)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         self.materialized_argument_read(context, stack, object, key.map(|_| rooted_key))
     }
 }

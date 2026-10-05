@@ -4,15 +4,16 @@
 //! graph. Native host classes (URL, Blob) are static specs installed through
 //! the runtime builder path; the Fetch classes (Headers, Request, Response)
 //! and the wider pure-JS surface (Event, TextEncoder/Decoder, streams, …) are
-//! JS shims evaluated lazily on first global touch (see [`globals`]).
+//! JS shims compiled by this crate's build script and installed eagerly after
+//! native globals (see [`globals`]).
 //!
 //! # Contents
 //! - [`url`] - URL parsing and mutation.
 //! - [`blob`] - owned byte blobs.
 //! - [`crypto`] - native CSPRNG + digest backing for the `crypto` global.
-//! - [`globals`] - function globals plus the lazy JS shim surface
+//! - [`globals`] - function globals plus the static JS bootstrap surface
 //!   (`web_bootstrap.js`, `web_streams.js`, `web_fetch.js`).
-//! - [`WEB_API_CLASSES`] - static class specs.
+//! - [`web_api_classes`] - static class specs.
 //!
 //! # Invariants
 //! - Web API state is owned Rust data and contains no VM contexts or handles.
@@ -55,34 +56,7 @@ otter_macros::romp! {
         wasm::WasmExceptionIntrinsic,
         wasm::WebAssemblyIntrinsic,
     ],
-    js = [
-        (include_str!("web_bootstrap.js"), defines = [
-            "AbortController", "AbortSignal", "BroadcastChannel", "CloseEvent",
-            "CustomEvent", "DOMException", "ErrorEvent", "Event",
-            "EventTarget", "FormData", "MessageChannel", "MessageEvent",
-            "MessagePort", "Navigator", "performance", "Performance",
-            "ProgressEvent", "PromiseRejectionEvent", "reportError",
-            "TextDecoder", "TextEncoder", "URLSearchParams",
-        ]),
-        // Streams precede fetch: the fetch body getter wraps buffered
-        // bodies in a ReadableStream.
-        (include_str!("web_streams.js"), defines = [
-            "ByteLengthQueuingStrategy", "CompressionStream",
-            "CountQueuingStrategy", "DecompressionStream", "ReadableStream",
-            "ReadableByteStreamController", "ReadableStreamBYOBReader",
-            "ReadableStreamBYOBRequest", "ReadableStreamDefaultController",
-            "ReadableStreamDefaultReader",
-            "TextDecoderStream", "TextEncoderStream", "TransformStream",
-            "TransformStreamDefaultController", "WritableStream",
-            "WritableStreamDefaultController", "WritableStreamDefaultWriter",
-        ]),
-        (include_str!("web_fetch.js"), defines = ["fetch", "Headers", "Request", "Response"]),
-        // URLPattern needs URL (a native class) + RegExp; both exist eagerly.
-        (include_str!("web_urlpattern.js"), defines = ["URLPattern"]),
-        // Console extras sit on top of the engine's write path, so they load
-        // after every other global is in place.
-        (include_str!("web_console.js"), defines = ["Console"]),
-    ],
+    js = Some(include!(concat!(env!("OUT_DIR"), "/web-bootstrap.rs"))),
 }
 
 /// Return active Web API class specs (declaration order).
@@ -109,7 +83,7 @@ pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
 
 /// Ergonomic extension trait for enabling Web APIs on builders.
 pub trait WebApiBuilderExt: Sized {
-    /// Register the Web platform globals (URL, Blob, the lazy JS shim
+    /// Register the Web platform globals (URL, Blob, the eagerly installed JS shim
     /// surface including Headers/Request/Response, and function globals).
     #[must_use]
     fn with_web_apis(self) -> Self;
@@ -126,3 +100,7 @@ impl WebApiBuilderExt for OtterBuilder {
         with_web_apis_for_otter(self)
     }
 }
+
+#[cfg(test)]
+#[path = "../build/bootstrap.rs"]
+mod bootstrap_build_tests;

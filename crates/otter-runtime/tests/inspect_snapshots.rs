@@ -80,7 +80,7 @@ fn ic_snapshot_reports_polymorphic_and_megamorphic_states() {
             IcSiteState::Megamorphic => {
                 saw_megamorphic = true;
             }
-            IcSiteState::Empty => {}
+            IcSiteState::Empty | IcSiteState::Uncacheable => {}
         }
     }
     assert!(

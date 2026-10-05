@@ -78,7 +78,7 @@ fn to_index_or_throw(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, Na
         .ok_or_else(|| bad("missing execution context"))?;
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+            .map_err(|e| e.into_native(interp, NAME))
     })?;
     let n = number.as_f64();
     let integer = if n.is_nan() { 0.0 } else { n.trunc() };
@@ -105,13 +105,13 @@ fn convert_set_value(
     if is_bigint {
         let big = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_big_int_or_throw(interp, stack, &exec, value)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+                .map_err(|e| e.into_native(interp, NAME))
         })?;
         Ok(Value::big_int(big))
     } else {
         let number = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, NAME))
+                .map_err(|e| e.into_native(interp, NAME))
         })?;
         Ok(number_value(number.as_f64()))
     }

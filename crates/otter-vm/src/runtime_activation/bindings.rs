@@ -18,6 +18,8 @@
 //! - Both boxed inputs and the result are rooted for the complete allocating or
 //!   reentrant operation; allocating kernels re-read contexts from those roots.
 //! - Source and immutable operands are resolved before exclusive VM access.
+//!   GlobalThis and global binding operations use that source FID's linked
+//!   realm even when the published caller currently runs in another realm.
 //! - No operation advances the PC or writes a destination register.
 //!
 //! # See also
@@ -32,18 +34,6 @@ use otter_bytecode::opcode_schema::{
 use crate::{Value, VmError, rooting::RootScopeExt};
 
 use super::{CommittedValueError, RuntimeCall};
-
-fn semantic_error(error: VmError) -> CommittedValueError {
-    match error {
-        VmError::MissingReturn
-        | VmError::InvalidOperand
-        | VmError::OutOfMemory { .. }
-        | VmError::Interrupted
-        | VmError::BudgetExceeded
-        | VmError::Exit { .. } => CommittedValueError::Fatal(error),
-        _ => CommittedValueError::JavaScript(error),
-    }
-}
 
 fn flag(value: i32) -> Result<bool, CommittedValueError> {
     match value {
@@ -103,9 +93,10 @@ impl RuntimeCall<'_> {
         }
 
         result = match operation {
-            BindingSemantics::Read(BindingRead::GlobalThis { .. }) => {
-                Ok(Value::object(vm.global_this))
-            }
+            BindingSemantics::Read(BindingRead::GlobalThis { .. }) => vm
+                .global_this_for_function(function_id)
+                .map(Value::object)
+                .map_err(CommittedValueError::Fatal),
             BindingSemantics::Read(BindingRead::Global { name, missing, .. }) => {
                 let name_idx = const_index(name)?;
                 match missing {
@@ -124,11 +115,13 @@ impl RuntimeCall<'_> {
             BindingSemantics::Read(BindingRead::ContextSlot { coord, .. }) => {
                 let coord = imm32(coord)?;
                 vm.load_context_slot_value(context, value0, coord, true)
+                    .map_err(CommittedValueError::JavaScript)
             }
             BindingSemantics::Read(BindingRead::LookupSlot { name, coord, .. }) => {
                 let name_idx = const_index(name)?;
                 let coord = imm32(coord)?;
                 vm.load_lookup_slot_value(context, function_id, value0, name_idx, coord)
+                    .map_err(CommittedValueError::JavaScript)
             }
             BindingSemantics::Read(BindingRead::LookupGlobal {
                 name,
@@ -152,6 +145,7 @@ impl RuntimeCall<'_> {
                 let name_idx = const_index(name)?;
                 let target = imm32(target)?;
                 vm.resolve_lookup_ref_value(context, function_id, value0, name_idx, target)
+                    .map_err(CommittedValueError::JavaScript)
             }
             BindingSemantics::Write(BindingWrite::Global { name, strict, .. }) => {
                 let name_idx = const_index(name)?;
@@ -177,11 +171,13 @@ impl RuntimeCall<'_> {
             BindingSemantics::Write(BindingWrite::ContextSlot { coord, .. }) => {
                 let coord = imm32(coord)?;
                 vm.store_context_slot_value(context, value1, coord, value0, true)
+                    .map_err(CommittedValueError::JavaScript)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::BindThis { coord, .. }) => {
                 let coord = imm32(coord)?;
                 vm.bind_this_context_slot_value(value1, coord, value0)
+                    .map_err(CommittedValueError::JavaScript)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::LookupSlot {
@@ -202,6 +198,7 @@ impl RuntimeCall<'_> {
                     fallback,
                     value0,
                 )
+                .map_err(CommittedValueError::JavaScript)
                 .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::LookupGlobal { name, mode, .. }) => {
@@ -230,6 +227,7 @@ impl RuntimeCall<'_> {
                 let name_idx = const_index(name)?;
                 let var_depth = imm32(var_depth)?;
                 vm.declare_eval_var_value(context, function_id, value0, name_idx, var_depth)
+                    .map_err(CommittedValueError::JavaScript)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Write(BindingWrite::VarScope {
@@ -238,20 +236,22 @@ impl RuntimeCall<'_> {
                 let name_idx = const_index(name)?;
                 let var_depth = imm32(var_depth)?;
                 vm.store_var_scope_value(context, function_id, value1, name_idx, var_depth, value0)
+                    .map_err(CommittedValueError::JavaScript)
                     .map(|()| Value::undefined())
             }
             BindingSemantics::Delete(BindingDelete::LookupSlot { name, depth, .. }) => {
                 let name_idx = const_index(name)?;
                 let depth = imm32(depth)?;
                 vm.delete_lookup_slot_value(context, function_id, value0, name_idx, depth)
+                    .map_err(CommittedValueError::JavaScript)
             }
             BindingSemantics::Delete(BindingDelete::LookupGlobal { name, depth, .. }) => {
                 let name_idx = const_index(name)?;
                 let depth = imm32(depth)?;
                 vm.delete_lookup_global_value(context, function_id, value0, name_idx, depth)
+                    .map_err(CommittedValueError::JavaScript)
             }
-        }
-        .map_err(semantic_error)?;
+        }?;
         Ok(result)
     }
 
@@ -291,6 +291,9 @@ impl RuntimeCall<'_> {
         // Source and immutable operands are resolved before exclusive VM access.
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        // SAFETY: RuntimeCall holds exclusive ownership of this current
+        // activation stack for the complete committed operation.
+        let stack = unsafe { &mut *self.stack.as_ptr() };
 
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);
@@ -306,11 +309,13 @@ impl RuntimeCall<'_> {
                 let name_idx = const_index(name)?;
                 let configurable = flag(imm32(configurable)?)?;
                 vm.declare_global_var_value(context, function_id, name_idx, configurable)
+                    .map_err(CommittedValueError::JavaScript)
             }
             GlobalDeclarationSemantics::DeclareLexical { name, is_const } => {
                 let name_idx = const_index(name)?;
                 let is_const = flag(imm32(is_const)?)?;
                 vm.declare_global_lex_value(context, function_id, name_idx, is_const)
+                    .map_err(CommittedValueError::JavaScript)
             }
             GlobalDeclarationSemantics::Validate {
                 name,
@@ -322,10 +327,11 @@ impl RuntimeCall<'_> {
                     return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
                 }
                 vm.validate_global_decl_value(context, function_id, name_idx, kind)
+                    .map_err(CommittedValueError::JavaScript)
             }
             GlobalDeclarationSemantics::DefineVar { name, .. } => {
                 let name_idx = const_index(name)?;
-                vm.define_global_var_value(context, function_id, name_idx, value0)
+                vm.define_global_var_value(context, stack, function_id, name_idx, value0)
             }
             GlobalDeclarationSemantics::DefineFunction {
                 name, deletable, ..
@@ -333,13 +339,15 @@ impl RuntimeCall<'_> {
                 let name_idx = const_index(name)?;
                 let deletable = flag(imm32(deletable)?)?;
                 vm.define_global_function_value(context, function_id, name_idx, value0, deletable)
+                    .map_err(CommittedValueError::JavaScript)
             }
             GlobalDeclarationSemantics::InitializeLexical { name, .. } => {
                 let name_idx = const_index(name)?;
                 vm.init_global_lex_value(context, function_id, name_idx, value0)
+                    .map_err(CommittedValueError::JavaScript)
             }
         };
-        semantic.map_err(semantic_error)?;
+        semantic?;
         Ok(result)
     }
 }

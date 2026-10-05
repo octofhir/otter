@@ -5,7 +5,7 @@
 //!   symbolic-address capture.
 //! - Number guards, int32/double boxing, and NaN-purifying double encode.
 //! - Full-semantics `ToInt32`/`ToUint32` fast paths for bitwise operators.
-//! - Object shape reads: the prototype a shape fixes and its dictionary kind.
+//! - Object shape reads: the prototype and immutable state the shape fixes.
 //!
 //! # Invariants
 //! - Every helper documents its scratch registers; nothing survives a call.
@@ -245,7 +245,7 @@ pub(crate) fn emit_box_number(ops: &mut Assembler, src_d: u8, dst_x: u8) {
 /// Box a canonical Number with a caller-selected non-allocatable FP scratch.
 ///
 /// This is the same representation contract as [`emit_box_number`]. The
-/// separate scratch parameter lets a Machine operation keep every declared
+/// separate scratch parameter lets an optimizing node keep every declared
 /// floating-point clobber outside its allocatable register file.
 pub(crate) fn emit_box_number_with_scratch(
     ops: &mut Assembler,
@@ -368,53 +368,60 @@ pub(crate) fn emit_load_prototype(
     );
 }
 
-/// Bit index of [`otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY`] in a shape's kind
-/// byte.
-pub(crate) const SHAPE_KIND_DICTIONARY_BIT: u32 =
-    otter_vm::jit::JIT_SHAPE_KIND_DICTIONARY.trailing_zeros();
+/// Load the sole immutable state byte of the object's current shape.
+///
+/// `header` is the full object header address. `state` and `cage` are distinct
+/// caller-selected scratch registers; this helper preserves `header` and owns
+/// the symbolic cage relocation. The result is zero-extended in `W(state)`.
+/// Published object cells always carry a non-null shape; pending allocation
+/// shells must not reach this helper before their shape is installed.
+pub(crate) fn emit_load_shape_state(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    header: u8,
+    state: u8,
+    cage: u8,
+) {
+    assert!(header != state && header != cage && state != cage);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        cage,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; ldr W(state), [X(header), view.object_shape_byte]
+        ; add X(state), X(cage), X(state)
+        ; ldrb W(state), [X(state), view.shape_state_byte]
+    );
+}
 
-/// Compute the slot base for a shape-matched object into `X(reg)`, which holds
-/// the decompressed `GcHeader` pointer on entry (`X(scratch)` is clobbered).
-/// While the out-of-line slab handle is null the slots are in-object, so the
-/// base is `header + object_inline_values_byte`, derived from the object's
-/// header every access. A spilled object's base is its slab's word array: the
-/// cage base plus the compressed handle plus the slab's fixed word offset.
-pub(crate) fn emit_slab_base(
+/// Select the shape-proven field bank without a per-object storage branch.
+pub(crate) fn emit_field_base(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     reg: u8,
     scratch: u8,
+    field: otter_vm::object::FieldLocation,
 ) {
-    assert_ne!(reg, scratch, "slab base needs a distinct scratch register");
-    let spilled = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    // Branch on the out-of-line slab HANDLE, not on `slab_len`: the
-    // capacity model can move a small object's slots out of line early (an
-    // existing-slot slow store reserves ahead), and a spilled slab that
-    // shrinks back stays out of line — a length compare reads the stale
-    // in-object words in both cases.
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr W(scratch), [X(reg), view.object_slab_handle_byte]
-        ; cbnz W(scratch), =>spilled
-        ; add XSP(reg), XSP(reg), view.object_inline_values_byte
-        ; b =>done
-        ; =>spilled
-    );
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        reg,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; add X(reg), X(reg), X(scratch)
-        ; add XSP(reg), XSP(reg), view.object_slab_words_byte
-        ; =>done
-    );
+    assert_ne!(reg, scratch);
+    if field.is_inline() {
+        dynasm!(ops ; .arch aarch64 ; add XSP(reg), XSP(reg), view.field_layout.inline_values_byte);
+    } else {
+        dynasm!(ops ; .arch aarch64 ; ldr W(scratch), [X(reg), view.field_layout.slab_handle_byte]);
+        emit_load_symbol_u64(
+            ops,
+            relocations,
+            reg,
+            view.cage_base as u64,
+            RelocationTarget::GcCageBase,
+        );
+        dynasm!(ops ; .arch aarch64 ; add X(reg), X(reg), X(scratch)
+            ; add XSP(reg), XSP(reg), view.field_layout.slab_words_byte);
+    }
 }
 
 /// Classify `X(value)` into its `typeof` kind code
@@ -569,7 +576,7 @@ pub(crate) fn emit_write_barrier(
     emit_write_barrier_with_context(ops, relocations, view, parent, child, 20);
 }
 
-/// Context-register-parametric form used by the Machine IR backend, whose
+/// Context-register-parametric form used by the optimizing tier, whose
 /// generated-function ABI keeps the [`JitCtx`](otter_vm::JitCtx) in `x19`.
 pub(crate) fn emit_write_barrier_with_context(
     ops: &mut Assembler,

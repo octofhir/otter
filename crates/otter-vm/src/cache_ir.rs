@@ -102,8 +102,9 @@ impl CacheStub {
     ///
     /// `resolve_shape` is the VM's compile-boundary validation: it maps an
     /// interned semantic shape id to its current stable compressed token. If
-    /// any referenced fact cannot be validated, or any CacheIR op has no
-    /// native representation yet, the whole program is rejected.
+    /// any referenced fact cannot be validated, or any
+    /// CacheIR op has no native representation, the whole program is rejected.
+    /// Runtime IC execution and feedback remain independent of static baking.
     pub(crate) fn snapshot_for_jit(
         &self,
         mut resolve_shape: impl FnMut(ShapeId) -> Option<u32>,
@@ -128,29 +129,34 @@ impl CacheStub {
                     ops.push(JitCacheIrOp::GuardPrototypeValidity {
                         validity: resolve_validity(self.validity.as_ref()?)?,
                     });
-                    ops.push(JitCacheIrOp::LoadPrototypeHolder {
-                        root: resolve_shape(self.holder_root_id)?,
-                        result: 1,
-                    });
+                    let root = resolve_shape(self.holder_root_id)?;
+                    if root == 0 {
+                        return None;
+                    }
+                    ops.push(JitCacheIrOp::LoadPrototypeHolder { root, result: 1 });
                 }
                 CacheOp::LoadDataSlotResult { obj, hit } => {
                     let hit = *self.hits.get(hit as usize)?;
+                    // The holder's layout is also static compile metadata.
+                    // Validate it before deriving a field even when validity
+                    // already authorizes the inherited semantic load; the sole
+                    // resolver validates it.
+                    let shape = resolve_shape(hit.shape_id)?;
+                    if shape == 0 {
+                        return None;
+                    }
                     if obj == 0 {
-                        let shape = resolve_shape(hit.shape_id)?;
-                        if shape == 0 {
-                            return None;
-                        }
                         ops.push(JitCacheIrOp::GuardShape { object: obj, shape });
                         ops.push(JitCacheIrOp::GuardAtomSlot {
                             object: obj,
                             atom: hit.atom_id.raw(),
-                            value_byte: slot_value_byte(hit.slot),
+                            field: crate::object::field_location(hit.shape, u32::from(hit.slot)),
                             writable: false,
                         });
                     }
                     ops.push(JitCacheIrOp::LoadField {
                         object: obj,
-                        value_byte: slot_value_byte(hit.slot),
+                        field: crate::object::field_location(hit.shape, u32::from(hit.slot)),
                     });
                 }
                 CacheOp::StoreDataSlot { obj, hit } => {
@@ -163,12 +169,12 @@ impl CacheStub {
                     ops.push(JitCacheIrOp::GuardAtomSlot {
                         object: obj,
                         atom: hit.atom_id.raw(),
-                        value_byte: slot_value_byte(hit.slot),
+                        field: crate::object::field_location(hit.shape, u32::from(hit.slot)),
                         writable: true,
                     });
                     ops.push(JitCacheIrOp::StoreField {
                         object: obj,
-                        value_byte: slot_value_byte(hit.slot),
+                        field: crate::object::field_location(hit.shape, u32::from(hit.slot)),
                     });
                 }
                 CacheOp::StoreAddTransition { transition } => {
@@ -195,15 +201,12 @@ impl CacheStub {
                             });
                         }
                     }
-                    let value_byte = slot_value_byte(transition.slot);
-                    ops.push(JitCacheIrOp::GuardExtensible {
-                        object: 0,
-                        value_byte,
-                    });
-                    ops.push(JitCacheIrOp::StoreField {
-                        object: 0,
-                        value_byte,
-                    });
+                    let field = crate::object::field_location(
+                        transition.to_shape.get(),
+                        u32::from(transition.slot),
+                    );
+                    ops.push(JitCacheIrOp::GuardExtensible { object: 0, field });
+                    ops.push(JitCacheIrOp::StoreField { object: 0, field });
                     ops.push(JitCacheIrOp::PublishShape {
                         object: 0,
                         shape: to_shape,
@@ -269,8 +272,7 @@ impl CacheStub {
                     }
                 }
                 CacheOp::LoadPrototypeHolder => {
-                    if !self.validity.as_ref()?.is_valid()
-                        || heap.read_payload(recv, |body| body.chain_link_opaque())
+                    if !self.validity.as_ref()?.is_valid() || object::state(recv, heap).is_opaque()
                     {
                         return None;
                     }
@@ -298,6 +300,12 @@ impl CacheStub {
         heap: &otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<Value> {
+        // Installation and replay share the ordinary lookup contract. The
+        // atom-slot helper below also supports guarded exotic/dictionary
+        // reads, so its shape/atom match alone cannot authorize this IC.
+        if !object::supports_fast_property_ic(recv, heap) {
+            return None;
+        }
         // Fast path for the common monomorphic own-data stub: the receiver owns
         // the slot, so skip the operand file and run the single load terminal
         // directly (its own shape/atom guard validates the hit).
@@ -419,7 +427,12 @@ impl CacheStub {
                 recv,
                 heap,
                 key,
-                &self.transitions[transition as usize],
+                self.transitions[transition as usize].from_shape_id,
+                self.transitions[transition as usize].atom_id,
+                self.transitions[transition as usize].to_shape_id,
+                || self.transitions[transition as usize].to_shape.get(),
+                &self.transitions[transition as usize].kind,
+                self.transitions[transition as usize].slot,
                 value,
             ),
             _ => Ok(None),
@@ -518,7 +531,7 @@ pub(crate) fn resolve_atom_data_slot(
             is_writable: flags.writable(),
         });
     }
-    if own.hit.is_some() || heap.read_payload(obj, |body| body.chain_link_opaque()) {
+    if own.hit.is_some() || object::state(obj, heap).is_opaque() {
         return None;
     }
     let first = object::prototype(obj, heap)?;
@@ -548,9 +561,4 @@ pub(crate) fn resolve_atom_data_slot(
         }
     }
     None
-}
-
-/// Byte offset of a string-keyed own slot inside the object's value slab.
-fn slot_value_byte(slot: u16) -> u32 {
-    u32::from(slot) * std::mem::size_of::<crate::Value>() as u32
 }

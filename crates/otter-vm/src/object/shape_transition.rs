@@ -225,19 +225,26 @@ pub(crate) fn capture_store_property_transition_with_shape(
 /// Returns `Ok(Some(()))` only after the property was added. Any shape/key,
 /// prototype, extensibility, or dictionary-mode mismatch falls back to ordinary
 /// `[[Set]]`. Allocation failure after a matched guard propagates to the VM
-/// without probing another recipe or replaying the operation.
+/// without probing another recipe or replaying the operation. The child reader
+/// names its actual traced owner; no copied child word is reused after GC.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_store_property_transition(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
-    transition: &StorePropertyTransition,
+    from_shape_id: ShapeId,
+    atom_id: AtomId,
+    target_shape_id: ShapeId,
+    read_target: impl Fn() -> ShapeHandle,
+    kind: &StorePropertyTransitionKind,
+    slot: u16,
     value: &Value,
 ) -> Result<Option<()>, otter_gc::OutOfMemory> {
-    if !transition_kind_matches(obj, heap, transition) {
+    if !transition_kind_matches(obj, heap, kind) {
         return Ok(None);
     }
     let current_shape_id = super::shape_id(obj, heap);
-    let to_shape = transition.to_shape.get();
+    let to_shape = read_target();
     let to_shape_id = if to_shape.is_null() {
         None
     } else {
@@ -256,9 +263,9 @@ pub(crate) fn replay_store_property_transition(
     let current_count = heap.read_payload(obj, |body| super::body_property_count(heap, body));
     let guard_matches = heap.read_payload(obj, |body| {
         if !is_fast_shape_body(body)
-            || current_shape_id != transition.from_shape_id
-            || key.atom().id() != transition.atom_id
-            || !transition_kind_matches_receiver_body(body, &transition.kind)
+            || current_shape_id != from_shape_id
+            || key.atom().id() != atom_id
+            || !transition_kind_matches_receiver_body(body, kind)
             || !body.extensible()
         {
             return false;
@@ -268,7 +275,7 @@ pub(crate) fn replay_store_property_transition(
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             current_count,
-            usize::from(transition.slot),
+            usize::from(slot),
             "replay count diverged from slot offset"
         );
         true
@@ -298,7 +305,7 @@ pub(crate) fn replay_store_property_transition(
             &mut obj,
             heap,
             &slot_metas,
-            usize::from(transition.slot) + 1,
+            usize::from(slot) + 1,
             std::slice::from_mut(&mut stored),
         )?;
         let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, None);
@@ -315,14 +322,16 @@ pub(crate) fn replay_store_property_transition(
     super::reserve_slot_capacity(
         &mut obj,
         heap,
-        usize::from(transition.slot) + 1,
+        usize::from(slot) + 1,
         std::slice::from_mut(&mut stored),
     )?;
+    // Read the actual retained child word after every collecting reservation.
+    let to_shape = read_target();
     heap.with_payload(obj, |body| {
-        let offset = usize::from(transition.slot);
+        let offset = usize::from(slot);
         if to_shape.is_null() {
             let advance_layout = !body.is_dictionary();
-            body.enter_dictionary_mode_as(transition.to_shape_id, advance_layout);
+            body.enter_dictionary_mode_as(target_shape_id, advance_layout);
             if let Some(table) = dict_table {
                 body.exotic_mut().dictionary_keys = table;
             }
@@ -331,7 +340,7 @@ pub(crate) fn replay_store_property_transition(
             }
             super::dict_push_key(body, key.name().to_owned());
         } else {
-            debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
+            debug_assert_eq!(to_shape_id, Some(target_shape_id));
             body.invalidate_prototype_proofs();
             body.shape = to_shape;
         }
@@ -384,12 +393,12 @@ fn transition_kind(
 fn transition_kind_matches(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
-    transition: &StorePropertyTransition,
+    kind: &StorePropertyTransitionKind,
 ) -> bool {
     heap.read_payload(obj, |body| {
         is_fast_shape_body(body)
-            && transition_kind_matches_receiver_body(body, &transition.kind)
-            && match &transition.kind {
+            && transition_kind_matches_receiver_body(body, kind)
+            && match kind {
                 StorePropertyTransitionKind::OwnAdd => true,
                 StorePropertyTransitionKind::PrototypeChainMissing { validity }
                 | StorePropertyTransitionKind::DirectPrototypeWritableData { validity } => {
@@ -425,7 +434,8 @@ mod tests {
 
     #[test]
     fn matched_transition_allocation_failure_is_not_a_cache_miss() {
-        let mut interp = crate::Interpreter::with_string_heap_cap(4 * 1024 * 1024);
+        let mut interp = crate::Interpreter::with_string_heap_cap(4 * 1024 * 1024)
+            .expect("fixture interpreter bootstrap");
         let owner = otter_gc::ExtraRoots::new(&interp);
         let _owner = interp.gc_heap_mut().register_extra_roots(owner);
         let mut first = interp

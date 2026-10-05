@@ -44,9 +44,23 @@ unsafe fn trace_value_vec(slot: *mut (), visitor: &mut dyn FnMut(*mut RawGc)) {
     }
 }
 
+unsafe fn trace_pelt_slot<T: crate::pelt::PeltField>(
+    slot: *mut (),
+    visitor: &mut dyn FnMut(*mut RawGc),
+) {
+    // SAFETY: add_pelt registers only an actual stationary T slot.
+    unsafe { (&mut *slot.cast::<T>()).pelt_trace(visitor) };
+}
+
 /// Typed rooting entry points for VM locals.
 #[doc(hidden)]
 pub trait RootScopeExt {
+    /// Root an engine-owned descriptor or payload slot in place.
+    ///
+    /// # Safety
+    /// The actual slot must remain stationary and outlive the scope.
+    unsafe fn add_pelt<T: crate::pelt::PeltField>(&mut self, slot: &mut T);
+
     /// Root a `Value` local.
     ///
     /// # Safety
@@ -76,6 +90,11 @@ pub trait RootScopeExt {
 }
 
 impl RootScopeExt for RootScope {
+    unsafe fn add_pelt<T: crate::pelt::PeltField>(&mut self, slot: &mut T) {
+        // SAFETY: contract forwarded to the caller; no copy is registered.
+        unsafe { self.add_erased((slot as *mut T).cast::<()>(), trace_pelt_slot::<T>) }
+    }
+
     unsafe fn add_value(&mut self, slot: &mut Value) {
         // SAFETY: contract forwarded to the caller.
         unsafe { self.add_erased((slot as *mut Value).cast::<()>(), trace_value_slot) }

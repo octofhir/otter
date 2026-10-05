@@ -1,14 +1,16 @@
 //! `otter-test262` CLI entry point.
 //!
-//! Slices shipped end-to-end:
-//! - 101: corpus traversal, `--dry-run`, refusal-to-launch.
-//! - 102: frontmatter parser + `parse <path>` subcommand.
-//! - 103: per-test driver with watchdog + heap cap + `catch_unwind`.
-//! - 104: sharding, JSON+Markdown writers, `diff`, `merge`,
-//!   cursor persistence, Ctrl-C partial dump.
+//! # Contents
+//! - Corpus selection, isolated worker supervision and exact row admission.
+//! - Canonical reports, strict full-corpus merge/publication and before/after diff.
 //!
-//! Spec links:
-//! - <https://tc39.es/ecma262/>
+//! # Invariants
+//! Every selected path receives one explicit result. Workers use one frozen skip
+//! policy and actual executable; malformed or mismatched worker rows are fatal.
+//! Publication requires exact pinned full-corpus coverage and runner identity.
+//!
+//! # See also
+//! - `otter_test262::report` and `otter_test262::provenance`.
 //! - <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
 
 #![forbid(unsafe_code)]
@@ -25,7 +27,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::{Deserialize, Serialize};
+mod worker_results;
+use otter_test262::provenance::{RunConfig, RunnerProvenance};
+use otter_test262::results::{Outcome, TestResult};
+use worker_results::WorkerLine;
 
 use otter_test262::config::Test262Config;
 use otter_test262::diff::{self, DiffReport};
@@ -33,8 +38,7 @@ use otter_test262::harness::HarnessCache;
 use otter_test262::metadata::Frontmatter;
 use otter_test262::report::{Baseline, ReportError};
 use otter_test262::runner::{
-    CorpusError, CorpusPaths, ExecConfig, Outcome, TestResult, ensure_corpus_present, list_tests,
-    run_one,
+    CorpusError, CorpusPaths, ExecConfig, ensure_corpus_present, list_tests, run_one,
 };
 use otter_test262::shard::ShardSpec;
 
@@ -318,9 +322,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Worker(args) => worker(&repo_root, args),
         Command::Parse(args) => parse(args),
         Command::Diff(args) => diff_cmd(&repo_root, args),
-        Command::Merge(args) => merge_cmd(args),
-        Command::Site(args) => site_cmd(args),
-        Command::Conformance(args) => conformance_cmd(args),
+        Command::Merge(args) => merge_cmd(&repo_root, args),
+        Command::Site(args) => site_cmd(&repo_root, args),
+        Command::Conformance(args) => conformance_cmd(&repo_root, args),
     }
 }
 
@@ -338,7 +342,24 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         Err(other) => return Err(other).context("failed to locate test262 corpus"),
     };
 
-    let config = Test262Config::load_or_default(args.config.as_deref());
+    let config_path = args
+        .config
+        .as_ref()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                repo_root.join(path)
+            }
+        })
+        .unwrap_or_else(|| repo_root.join("test262_config.toml"));
+    let config = if config_path.exists() {
+        Test262Config::load(&config_path).map_err(anyhow::Error::msg)?
+    } else if args.config.is_some() {
+        anyhow::bail!("missing explicit config {}", config_path.display());
+    } else {
+        Test262Config::default()
+    };
 
     // Precedence: CLI flag, then env var, then `test262_config.toml`, then the
     // built-in default.
@@ -371,7 +392,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
 
-    let all_tests = list_tests(&paths, args.filter.as_deref());
+    let all_tests = list_tests(&paths, args.filter.as_deref())?;
 
     let shard = match args.shard.as_deref() {
         Some(spec) => match ShardSpec::parse(spec) {
@@ -417,7 +438,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         repo_root,
         &paths,
         &tests,
-        args.config.as_deref(),
+        &config,
         timeout_ms,
         max_heap_bytes,
         args.output.as_deref(),
@@ -465,12 +486,6 @@ fn init_test262_cage(jobs: usize, max_heap_bytes: u64) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct WorkerLine {
-    idx: usize,
-    result: TestResult,
-}
-
 struct ProgressState {
     done: AtomicUsize,
     completed: Mutex<Vec<bool>>,
@@ -512,7 +527,7 @@ fn execute_process_isolated(
     repo_root: &Path,
     paths: &CorpusPaths,
     tests: &[PathBuf],
-    config_path: Option<&Path>,
+    config: &Test262Config,
     timeout_ms: u64,
     max_heap_bytes: u64,
     output: Option<&Path>,
@@ -538,14 +553,25 @@ fn execute_process_isolated(
         std::fs::write(&paths_file, out).context("failed to write worker path list")?;
     }
 
-    let config_path = config_path.map(|path| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            repo_root.join(path)
-        }
-    });
+    let config_path = temp.path().join("effective-config.toml");
+    std::fs::write(&config_path, toml::to_string(config)?)?;
+    let config_path = Some(config_path);
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let runner = RunnerProvenance::capture(
+        &exe,
+        RunConfig {
+            timeout_ms,
+            max_heap_bytes,
+            jit_tier: jit_tier.as_arg().to_owned(),
+            snapshot_isolates,
+            skip_features: config.skip_features.clone(),
+            skip_flags: config.skip_flags.clone(),
+            ignored_tests: config.ignored_tests.clone(),
+            known_panics: config.known_panics.clone(),
+            engine_environment: otter_test262::provenance::engine_environment(),
+        },
+    )
+    .context("cannot establish actual worker executable provenance")?;
     let queue: Arc<Mutex<VecDeque<(usize, usize)>>> = Arc::new(Mutex::new(
         (0..tests.len())
             .step_by(chunk_size)
@@ -555,6 +581,12 @@ fn execute_process_isolated(
     let slots: Arc<Vec<Mutex<Option<TestResult>>>> =
         Arc::new((0..tests.len()).map(|_| Mutex::new(None)).collect());
     let tests = Arc::new(tests.to_vec());
+    let expected = Arc::new(
+        tests
+            .iter()
+            .map(|path| relative_to(&paths.test_dir, path))
+            .collect::<Vec<_>>(),
+    );
     let paths = Arc::new(paths.clone());
     let progress = Arc::new(ProgressState::new(tests.len(), cursor, resume_offset));
 
@@ -567,6 +599,7 @@ fn execute_process_isolated(
     );
     pb.set_message("process");
 
+    let worker_errors = Arc::new(Mutex::new(Vec::<String>::new()));
     let interrupted = Arc::new(AtomicBool::new(false));
     let _ = ctrlc_install(Arc::clone(&interrupted));
     let start = Instant::now();
@@ -582,9 +615,11 @@ fn execute_process_isolated(
             let queue = Arc::clone(&queue);
             let slots = Arc::clone(&slots);
             let tests = Arc::clone(&tests);
+            let expected = Arc::clone(&expected);
             let paths = Arc::clone(&paths);
             let progress = Arc::clone(&progress);
             let interrupted = Arc::clone(&interrupted);
+            let worker_errors = Arc::clone(&worker_errors);
             let pb = pb.clone();
             let exe = exe.clone();
             let repo_root = repo_root.to_path_buf();
@@ -597,9 +632,11 @@ fn execute_process_isolated(
                     &queue,
                     &slots,
                     &tests,
+                    &expected,
                     &paths,
                     &progress,
                     &interrupted,
+                    &worker_errors,
                     &pb,
                     &exe,
                     &repo_root,
@@ -619,6 +656,11 @@ fn execute_process_isolated(
         let _ = handle.join();
     }
     pb.finish_and_clear();
+    let errors = worker_errors.lock().expect("worker error state poisoned");
+    if !errors.is_empty() {
+        anyhow::bail!("invalid process-worker output: {}", errors.join("; "));
+    }
+    drop(errors);
 
     let mut results = Vec::with_capacity(tests.len());
     for (idx, path) in tests.iter().enumerate() {
@@ -641,14 +683,18 @@ fn execute_process_isolated(
 
     write_timings_if_requested(&results);
 
+    if RunnerProvenance::capture(&exe, runner.semantic_config.clone())? != runner {
+        anyhow::bail!("worker executable changed during the run");
+    }
     let elapsed = start.elapsed();
-    let baseline = build_baseline(&paths, &results);
+    let baseline = build_baseline(&paths, runner, results)?;
+    baseline.validate_coverage(expected.iter().map(String::as_str))?;
     print_summary(&baseline, elapsed);
     if let Some(json_path) = output {
         write_baseline(json_path, &baseline)?;
     }
     if interrupted.load(Ordering::Relaxed) {
-        write_partial_baseline(output, &paths, &results);
+        write_partial_baseline(output, &baseline);
         return Ok(ExitCode::from(130));
     }
     if baseline.totals.crashed > 0 {
@@ -663,9 +709,11 @@ fn process_parent_worker_loop(
     queue: &Mutex<VecDeque<(usize, usize)>>,
     slots: &[Mutex<Option<TestResult>>],
     tests: &[PathBuf],
+    expected: &[String],
     paths: &CorpusPaths,
     progress: &ProgressState,
     interrupted: &AtomicBool,
+    worker_errors: &Mutex<Vec<String>>,
     pb: &ProgressBar,
     exe: &Path,
     repo_root: &Path,
@@ -705,13 +753,36 @@ fn process_parent_worker_loop(
             snapshot_isolates,
         );
 
-        let recorded = read_worker_lines(&out_file, slots, pb, progress);
+        let recorded = match read_worker_lines(
+            &out_file,
+            slots,
+            expected,
+            lo..hi,
+            !worker_status.timed_out
+                && worker_status
+                    .status
+                    .as_ref()
+                    .is_some_and(ExitStatus::success),
+            pb,
+            progress,
+        ) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                worker_errors
+                    .lock()
+                    .expect("worker error state poisoned")
+                    .push(format!("{error}: {}", worker_status.failure_reason()));
+                interrupted.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
         let _ = std::fs::remove_file(&out_file);
         let _ = std::fs::remove_file(&stdout_file);
         let _ = std::fs::remove_file(&stderr_file);
         if let Some(first_missing) = (lo..hi).find(|idx| !recorded.contains(idx)) {
             if !worker_status.timed_out
                 && matches!(&worker_status.status, Some(status) if status.success())
+                && !recorded.is_empty()
             {
                 eprintln!(
                     "worker {worker_id}: retired after {} result(s); requeueing [{first_missing}, {hi})",
@@ -762,10 +833,14 @@ struct WorkerRunStatus {
 
 impl WorkerRunStatus {
     fn failure_reason(&self) -> String {
-        let mut reason = self.status.map_or_else(
-            || "worker spawn failed".to_string(),
-            |status| format!("worker exited before reporting this test ({status})"),
-        );
+        let mut reason = if self.timed_out {
+            "process-worker supervisor watchdog expired".to_owned()
+        } else {
+            self.status.map_or_else(
+                || "worker spawn failed".to_string(),
+                |status| format!("worker exited before reporting this test ({status})"),
+            )
+        };
         if !self.stderr_tail.is_empty() {
             reason.push_str("; stderr: ");
             reason.push_str(&self.stderr_tail);
@@ -893,21 +968,24 @@ fn run_worker_child(
 fn read_worker_lines(
     out_file: &Path,
     slots: &[Mutex<Option<TestResult>>],
+    expected: &[String],
+    assigned: std::ops::Range<usize>,
+    successful: bool,
     pb: &ProgressBar,
     progress: &ProgressState,
-) -> HashSet<usize> {
+) -> Result<HashSet<usize>, String> {
+    let rows = worker_results::read_rows(out_file, expected, assigned, successful)?;
     let mut recorded = HashSet::new();
-    let Ok(text) = std::fs::read_to_string(out_file) else {
-        return recorded;
-    };
-    for line in text.lines() {
-        let Ok(row) = serde_json::from_str::<WorkerLine>(line) else {
-            continue;
-        };
+    for row in rows {
+        if !store_worker_result(slots, row.idx, row.result, pb, progress) {
+            return Err(format!(
+                "duplicate process-worker result at index {}",
+                row.idx
+            ));
+        }
         recorded.insert(row.idx);
-        store_worker_result(slots, row.idx, row.result, pb, progress);
     }
-    recorded
+    Ok(recorded)
 }
 
 fn store_worker_result(
@@ -943,7 +1021,17 @@ fn synthetic_result(paths: &CorpusPaths, path: &Path, outcome: Outcome) -> TestR
 
 fn worker(repo_root: &Path, args: WorkerArgs) -> Result<ExitCode> {
     let paths = ensure_corpus_present(repo_root).context("failed to locate test262 corpus")?;
-    let config = Test262Config::load_or_default(args.config.as_deref());
+    let config = match args.config.as_deref() {
+        Some(path) => Test262Config::load(path).map_err(anyhow::Error::msg)?,
+        None => {
+            let path = repo_root.join("test262_config.toml");
+            if path.exists() {
+                Test262Config::load(&path).map_err(anyhow::Error::msg)?
+            } else {
+                Test262Config::default()
+            }
+        }
+    };
     init_test262_cage(1, args.max_heap_bytes)?;
     let mut harness = HarnessCache::new(&paths.harness_dir);
     if let Err(err) = harness.prewarm() {
@@ -1048,12 +1136,11 @@ fn write_timings_if_requested(results: &[TestResult]) {
     }
 }
 
-fn write_partial_baseline(output: Option<&Path>, paths: &CorpusPaths, results: &[TestResult]) {
+fn write_partial_baseline(output: Option<&Path>, baseline: &Baseline) {
     let stem = format!("partial-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
     let dir = output
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new("."));
-    let baseline = build_baseline(paths, results);
     if let Ok((json, _)) = baseline.write_pair(dir, &stem) {
         eprintln!("partial baseline at {}", json.display());
     }
@@ -1089,11 +1176,15 @@ fn record_progress(pb: &ProgressBar, outcome: &Outcome) {
     pb.set_message(label);
 }
 
-fn build_baseline(paths: &CorpusPaths, results: &[TestResult]) -> Baseline {
+fn build_baseline(
+    paths: &CorpusPaths,
+    runner: RunnerProvenance,
+    results: Vec<TestResult>,
+) -> Result<Baseline, ReportError> {
     let test262_commit = git_head(&paths.root).unwrap_or_else(|| "unknown".to_string());
     let engine_commit = git_head(Path::new(".")).unwrap_or_else(|| "unknown".to_string());
     let ran_at = chrono::Utc::now().to_rfc3339();
-    Baseline::from_results(results, test262_commit, engine_commit, ran_at)
+    Baseline::from_results(results, runner, test262_commit, engine_commit, ran_at)
 }
 
 fn write_baseline(json_path: &Path, baseline: &Baseline) -> Result<()> {
@@ -1174,9 +1265,10 @@ fn git_head(repo: &Path) -> Option<String> {
     Some(head.to_string())
 }
 
-fn conformance_cmd(args: ConformanceArgs) -> Result<ExitCode> {
+fn conformance_cmd(repo_root: &Path, args: ConformanceArgs) -> Result<ExitCode> {
     let baseline = Baseline::from_path(&args.input)
         .with_context(|| format!("failed to read baseline {}", args.input.display()))?;
+    validate_full_corpus(repo_root, &baseline)?;
     std::fs::write(&args.output, baseline.to_markdown())
         .with_context(|| format!("failed to write {}", args.output.display()))?;
     println!(
@@ -1214,24 +1306,25 @@ fn diff_cmd(repo_root: &Path, args: DiffArgs) -> Result<ExitCode> {
         .unwrap_or_else(|| repo_root.join(BASELINE_DIR).join("main.json"));
     let current = Baseline::from_path(&current_path)
         .with_context(|| format!("failed to read current baseline {}", current_path.display()))?;
-    let report: DiffReport = diff::compute(&previous, &current);
+    let report: DiffReport = diff::compute(&previous, &current)?;
     print!("{}", report.to_text(&args.previous.display().to_string()));
     Ok(ExitCode::from(report.exit_code() as u8))
 }
 
-fn merge_cmd(args: MergeArgs) -> Result<ExitCode> {
+fn merge_cmd(repo_root: &Path, args: MergeArgs) -> Result<ExitCode> {
     if args.inputs.is_empty() {
         eprintln!("error: merge requires at least one input baseline");
         return Ok(ExitCode::from(2));
     }
-    let mut shards: Vec<Baseline> = Vec::with_capacity(args.inputs.len());
+    let mut shards = Vec::with_capacity(args.inputs.len());
     for path in &args.inputs {
         let baseline = Baseline::from_path(path)
             .with_context(|| format!("failed to read shard {}", path.display()))?;
-        shards.push(baseline);
+        shards.push((path.display().to_string(), baseline));
     }
 
-    let merged = merge_baselines(&shards, &args.inputs).map_err(anyhow::Error::from)?;
+    let merged = Baseline::merge(shards, chrono::Utc::now().to_rfc3339())?;
+    validate_full_corpus(repo_root, &merged)?;
     let parent = args.output.parent().unwrap_or_else(|| Path::new("."));
     let stem = args
         .output
@@ -1252,10 +1345,11 @@ fn merge_cmd(args: MergeArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn site_cmd(args: SiteArgs) -> Result<ExitCode> {
+fn site_cmd(repo_root: &Path, args: SiteArgs) -> Result<ExitCode> {
     let baseline = Baseline::from_path(&args.input)
         .with_context(|| format!("failed to read baseline {}", args.input.display()))?;
-    let html = otter_test262::site::render_html(&baseline);
+    validate_full_corpus(repo_root, &baseline)?;
+    let html = otter_test262::site::render_html(&baseline)?;
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1266,59 +1360,25 @@ fn site_cmd(args: SiteArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Combine per-shard baselines by union; flags collisions via
-/// [`ReportError::MergeCollision`].
-fn merge_baselines(shards: &[Baseline], inputs: &[PathBuf]) -> Result<Baseline, ReportError> {
-    let mut totals = otter_test262::report::Totals::default();
-    let mut by_section: otter_test262::report::BySection = std::collections::BTreeMap::new();
-    let mut failing_tests: Vec<otter_test262::report::FailingTest> = Vec::new();
-    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
-    for (shard, path) in shards.iter().zip(inputs.iter()) {
-        // Sum totals.
-        totals.total += shard.totals.total;
-        totals.passed += shard.totals.passed;
-        totals.failed += shard.totals.failed;
-        totals.skipped += shard.totals.skipped;
-        totals.crashed += shard.totals.crashed;
-        totals.timed_out += shard.totals.timed_out;
-        totals.oom += shard.totals.oom;
-
-        // Sum per-section totals.
-        for (section, t) in &shard.by_section {
-            let entry = by_section.entry(section.clone()).or_default();
-            entry.total += t.total;
-            entry.passed += t.passed;
-            entry.failed += t.failed;
-            entry.skipped += t.skipped;
-            entry.crashed += t.crashed;
-            entry.timed_out += t.timed_out;
-            entry.oom += t.oom;
-        }
-
-        // Append failing rows; flag collisions.
-        for row in &shard.failing_tests {
-            if let Some(existing) = seen.get(&row.path) {
-                return Err(ReportError::MergeCollision {
-                    path: row.path.clone(),
-                    first: existing.clone(),
-                    second: path.display().to_string(),
-                });
-            }
-            seen.insert(row.path.clone(), path.display().to_string());
-            failing_tests.push(row.clone());
-        }
+/// Publishing conformance data requires the exact pinned full corpus.
+fn validate_full_corpus(repo_root: &Path, baseline: &Baseline) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let publisher = RunnerProvenance::capture(&exe, baseline.runner.semantic_config.clone())?;
+    if publisher != baseline.runner {
+        anyhow::bail!("report runner identity differs from actual publishing executable");
     }
-
-    // Inherit `test262_commit` / `engine_commit` from the first
-    // shard — every shard runs against the same checkout in CI.
-    let head = shards.first().expect("non-empty inputs validated above");
-    Ok(Baseline {
-        test262_commit: head.test262_commit.clone(),
-        engine_commit: head.engine_commit.clone(),
-        ran_at: chrono::Utc::now().to_rfc3339(),
-        totals,
-        by_section,
-        failing_tests,
-    })
+    let paths = ensure_corpus_present(repo_root)?;
+    let commit = git_head(&paths.root).context("cannot establish pinned Test262 commit")?;
+    if baseline.test262_commit != commit {
+        anyhow::bail!(
+            "report corpus {} differs from pinned corpus {commit}",
+            baseline.test262_commit
+        );
+    }
+    let expected: Vec<_> = list_tests(&paths, None)?
+        .iter()
+        .map(|path| relative_to(&paths.test_dir, path))
+        .collect();
+    baseline.validate_coverage(expected.iter().map(String::as_str))?;
+    Ok(())
 }

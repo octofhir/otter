@@ -9,12 +9,15 @@
 //! file only owns the descriptor / integrity ladder.
 //!
 //! # Contents
-//! - [`call`] — single entry point used by the dispatch loop.
+//! - `native_call` — context-aware JS builtin entry.
+//! - `call` — private heap-only descriptor/integrity dispatch.
 //! - [`coerce_to_descriptor`] — implements §6.2.5.5
 //!   `ToPropertyDescriptor` against a JS-side descriptor object.
 //!
 //! # Invariants
 //! - All names match ECMA-262 spelling exactly.
+//! - Object.assign enters the sole full [[Get]]/[[Set]] owner with the actual
+//!   execution context; the heap dispatcher rejects a missing context.
 //! - Reads of the descriptor object's `value / writable / enumerable
 //!   / configurable / get / set` slots use direct own-data reads
 //!   ([`crate::object::lookup_own`]). User-installed accessors / inherited
@@ -27,6 +30,9 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
 //! - <https://tc39.es/ecma262/#sec-topropertydescriptor>
 //! - <https://tc39.es/ecma262/#sec-setintegritylevel>
+
+use crate::native_abi::CommittedValueError;
+use crate::rooting::RootScopeExt;
 
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::native_function::NativeCall;
@@ -153,21 +159,18 @@ fn native_call(
                 let create_result = ctx.with_turn_parts(|interp, stack| {
                     interp.do_object_create_with_descriptors(context, stack, args)
                 });
-                return create_result
-                    .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
+                return create_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()));
             }
             M::DefineProperties => {
                 let define_result = ctx.with_turn_parts(|interp, stack| {
                     interp.do_object_define_properties(context, stack, args)
                 });
-                return define_result
-                    .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
+                return define_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()));
             }
             M::Assign => {
                 let assign_result = ctx
                     .with_turn_parts(|interp, stack| interp.do_object_assign(context, stack, args));
-                return assign_result
-                    .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
+                return assign_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()));
             }
             M::GetOwnPropertyDescriptor | M::HasOwn => {
                 // §20.1.2.10 / §20.1.2.13 step 1 — ToObject(O) throws
@@ -194,8 +197,8 @@ fn native_call(
                     let key_result = ctx.with_turn_parts(|interp, stack| {
                         interp.evaluate_to_property_key(stack, context, &key_arg)
                     });
-                    let coerced_key = key_result
-                        .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?;
+                    let coerced_key =
+                        key_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()))?;
                     let coerced_value = match &coerced_key {
                         crate::VmPropertyKey::Symbol(sym) => Value::symbol(*sym),
                         other => Value::string(
@@ -236,7 +239,7 @@ fn native_call(
         interp.try_function_object_static_call(stack, context.as_ref(), method, args)
     });
     if let Some(result) =
-        function_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
+        function_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()))?
     {
         return Ok(result);
     }
@@ -245,7 +248,7 @@ fn native_call(
             interp.try_proxy_object_static_call(stack, context, method, args)
         });
         if let Some(result) =
-            proxy_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
+            proxy_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()))?
         {
             return Ok(result);
         }
@@ -260,7 +263,7 @@ fn native_call(
             interp.object_static_call_stack_rooted(context, stack, method, args)
         });
         if let Some(result) =
-            static_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
+            static_result.map_err(|error| error.into_native(ctx.cx.interp, method.name()))?
         {
             return Ok(result);
         }
@@ -289,68 +292,80 @@ fn native_call(
     call_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))
 }
 
-fn set_from_entries_key_heap(
-    mut target: crate::object::JsObject,
-    key: &Value,
-    value: Value,
-    heap: &mut otter_gc::GcHeap,
+fn create_from_entries_key(
+    interp: &mut crate::Interpreter,
+    scope: &crate::handles::HandleScope,
+    target: Local<'_>,
+    key: Local<'_>,
+    value: Local<'_>,
 ) -> Result<(), VmError> {
-    if let Some(sym) = key.as_symbol(heap) {
-        crate::object::set_symbol(target, heap, sym, value);
-        return Ok(());
+    let current_key = interp.escape_scoped(key);
+    if current_key.as_symbol(interp.gc_heap_for_cx_mut()).is_some() {
+        return interp.scoped_define_symbol(
+            scope,
+            target,
+            key,
+            value,
+            crate::object::PropertyFlags::data_default(),
+        );
     }
-    let key_str = property_key_from_value(key, heap)?;
-    crate::object::set(&mut target, heap, &key_str, value);
-    Ok(())
+    let spelling = property_key_from_value(&current_key, interp.gc_heap_for_cx_mut())?;
+    interp.scoped_define_data(
+        scope,
+        target,
+        &spelling,
+        value,
+        crate::object::PropertyFlags::data_default(),
+    )
 }
 
-/// §20.1.2.7 step 5.b — read indices `"0"` and `"1"` from an entry
-/// candidate via the spec `[[Get]]`. Heap-only variant for the
-/// context-less `object_statics::call` path. Accepts Array pairs,
-/// ordinary Objects with indexed keys, and String / String-wrapper
-/// entries.
-fn read_entry_pair_heap(
-    entry: &Value,
-    heap: &mut otter_gc::GcHeap,
-) -> Result<(Value, Value), VmError> {
-    if let Some(pair) = entry.as_array() {
+/// Read an entry's two data components and immediately park each one.
+/// String character construction retains the first character across the second
+/// allocation and propagates the actual allocator error.
+fn read_entry_pair<'s>(
+    interp: &mut crate::Interpreter,
+    scope: &'s crate::handles::HandleScope,
+    entry: Local<'_>,
+) -> Result<(Local<'s>, Local<'s>), VmError> {
+    let current = interp.escape_scoped(entry);
+    if let Some(pair) = current.as_array() {
+        let key = crate::array::get(pair, interp.gc_heap_for_cx_mut(), 0);
+        let value = crate::array::get(pair, interp.gc_heap_for_cx_mut(), 1);
         return Ok((
-            crate::array::get(pair, heap, 0),
-            crate::array::get(pair, heap, 1),
+            interp.scoped_value(scope, key),
+            interp.scoped_value(scope, value),
         ));
     }
-    if let Some(obj) = entry.as_object() {
-        if let Some(s) = crate::object::string_data(obj, heap) {
-            let units = s.to_utf16_vec(heap);
-            let zero = units.first().copied().map_or(Value::undefined(), |u| {
-                crate::string::JsString::from_utf16_units(&[u], heap)
-                    .map(Value::string)
-                    .unwrap_or(Value::undefined())
-            });
-            let one = units.get(1).copied().map_or(Value::undefined(), |u| {
-                crate::string::JsString::from_utf16_units(&[u], heap)
-                    .map(Value::string)
-                    .unwrap_or(Value::undefined())
-            });
-            return Ok((zero, one));
-        }
-        let key = crate::object::get(obj, heap, "0").unwrap_or(Value::undefined());
-        let value = crate::object::get(obj, heap, "1").unwrap_or(Value::undefined());
+    let string = if let Some(object) = current.as_object() {
+        crate::object::string_data(object, interp.gc_heap_for_cx_mut())
+    } else {
+        current.as_string(interp.gc_heap_for_cx_mut())
+    };
+    if let Some(string) = string {
+        let units = string.to_utf16_vec(interp.gc_heap_for_cx_mut());
+        let mut character = |index| -> Result<Local<'s>, VmError> {
+            let value = match units.get(index) {
+                Some(unit) => Value::string(JsString::from_utf16_units(
+                    &[*unit],
+                    interp.gc_heap_for_cx_mut(),
+                )?),
+                None => Value::undefined(),
+            };
+            Ok(interp.scoped_value(scope, value))
+        };
+        let key = character(0)?;
+        let value = character(1)?;
         return Ok((key, value));
     }
-    if let Some(s) = entry.as_string(heap) {
-        let units = s.to_utf16_vec(heap);
-        let zero = units.first().copied().map_or(Value::undefined(), |u| {
-            crate::string::JsString::from_utf16_units(&[u], heap)
-                .map(Value::string)
-                .unwrap_or(Value::undefined())
-        });
-        let one = units.get(1).copied().map_or(Value::undefined(), |u| {
-            crate::string::JsString::from_utf16_units(&[u], heap)
-                .map(Value::string)
-                .unwrap_or(Value::undefined())
-        });
-        return Ok((zero, one));
+    if let Some(object) = current.as_object() {
+        let key = crate::object::get(object, interp.gc_heap_for_cx_mut(), "0")
+            .unwrap_or_else(Value::undefined);
+        let value = crate::object::get(object, interp.gc_heap_for_cx_mut(), "1")
+            .unwrap_or_else(Value::undefined);
+        return Ok((
+            interp.scoped_value(scope, key),
+            interp.scoped_value(scope, value),
+        ));
     }
     Err(VmError::TypeMismatch)
 }
@@ -488,7 +503,7 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let ordinary_result = ctx.with_turn_parts(|interp, stack| {
         interp.ordinary_get_prototype_value(stack, &exec_ctx, target, 0)
     });
-    ordinary_result.map_err(|err| object_native_error(ctx.cx.interp, "Object.getPrototypeOf", err))
+    ordinary_result.map_err(|err| err.into_native(ctx.cx.interp, "Object.getPrototypeOf"))
 }
 
 /// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
@@ -522,8 +537,7 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let set_result = ctx.with_turn_parts(|interp, stack| {
         interp.set_prototype_value_proxy_aware(stack, &exec_ctx, &target, &proto)
     });
-    let ok = set_result
-        .map_err(|err| object_native_error(ctx.cx.interp, "Object.setPrototypeOf", err))?;
+    let ok = set_result.map_err(|err| err.into_native(ctx.cx.interp, "Object.setPrototypeOf"))?;
     if !ok {
         return Err(NativeError::TypeError {
             name: "Object.setPrototypeOf",
@@ -549,8 +563,7 @@ fn native_prototype_to_string(
     // the tag getter cannot retroactively change the builtin tag.
     let builtin_tag = builtin_to_string_tag(ctx);
     let tag_result = explicit_to_string_tag_with_context(ctx, &exec_ctx);
-    let explicit_tag =
-        tag_result.map_err(|err| object_native_error(ctx.cx.interp, "toString", err))?;
+    let explicit_tag = tag_result.map_err(|err| err.into_native(ctx.cx.interp, "toString"))?;
     let tag = match explicit_tag {
         Some(t) => t,
         None => builtin_tag,
@@ -577,52 +590,67 @@ fn object_prototype_to_object(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let (proto_name, setter): (&str, fn(&mut JsObject, &mut otter_gc::GcHeap, &Value)) =
-        if this_value.is_nullish() {
-            return Err(NativeError::TypeError {
-                name: method_name,
-                reason: "cannot convert null or undefined to object".to_string(),
-            });
-        } else if this_value.is_boolean() {
-            ("Boolean", set_primitive_wrapper_data)
-        } else if this_value.is_number() {
-            ("Number", set_primitive_wrapper_data)
-        } else if this_value.is_string() {
-            ("String", set_primitive_wrapper_data)
-        } else if this_value.is_symbol() {
-            ("Symbol", set_primitive_wrapper_data)
-        } else if this_value.is_big_int() {
-            ("BigInt", set_primitive_wrapper_data)
-        } else {
-            return Ok(this_value);
-        };
-    let proto = ctx
-        .cx
-        .interp
-        .constructor_prototype_value(proto_name)
-        .ok()
-        .and_then(|v| v.as_object())
-        .or_else(|| ctx.cx.interp.object_prototype_object_opt());
-    let mut wrapper = ctx.alloc_object_with_roots(&[&this_value], &[])?;
-    if let Some(proto) = proto {
-        crate::object::set_prototype(wrapper, ctx.heap_mut(), Some(proto));
-    }
-    setter(&mut wrapper, ctx.heap_mut(), &this_value);
-    Ok(Value::object(wrapper))
+    let (proto_name, setter): (
+        &str,
+        fn(&mut JsObject, &mut otter_gc::GcHeap, &Value) -> Result<(), otter_gc::OutOfMemory>,
+    ) = if this_value.is_nullish() {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    } else if this_value.is_boolean() {
+        ("Boolean", set_primitive_wrapper_data)
+    } else if this_value.is_number() {
+        ("Number", set_primitive_wrapper_data)
+    } else if this_value.is_string() {
+        ("String", set_primitive_wrapper_data)
+    } else if this_value.is_symbol() {
+        ("Symbol", set_primitive_wrapper_data)
+    } else if this_value.is_big_int() {
+        ("BigInt", set_primitive_wrapper_data)
+    } else {
+        return Ok(this_value);
+    };
+    ctx.scope(|mut scope| {
+        let primitive = scope.value(this_value);
+        let proto = scope
+            .context()
+            .interp_mut()
+            .constructor_prototype_value(proto_name);
+        let proto = proto
+            .map_err(|error| object_native_error(scope.context().interp_mut(), method_name, error))?
+            .as_object()
+            .or_else(|| scope.context().interp_mut().object_prototype_object_opt());
+        let proto = proto.map(|proto| scope.value(Value::object(proto)));
+        let wrapper = scope.bare_object()?;
+        scope.set_prototype(wrapper, proto)?;
+        let mut receiver = scope
+            .raw(wrapper)
+            .as_object()
+            .expect("scoped primitive wrapper");
+        let value = scope.raw(primitive);
+        setter(&mut receiver, scope.context().heap_mut(), &value)?;
+        Ok(scope.finish(wrapper))
+    })
 }
 
-fn set_primitive_wrapper_data(wrapper: &mut JsObject, heap: &mut otter_gc::GcHeap, value: &Value) {
+fn set_primitive_wrapper_data(
+    wrapper: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    value: &Value,
+) -> Result<(), otter_gc::OutOfMemory> {
     if let Some(b) = value.as_boolean() {
-        crate::object::set_boolean_data(wrapper, heap, b);
+        crate::object::set_boolean_data(wrapper, heap, b)?;
     } else if let Some(n) = value.as_number() {
-        crate::object::set_number_data(wrapper, heap, n);
+        crate::object::set_number_data(wrapper, heap, n)?;
     } else if let Some(s) = value.as_string(heap) {
-        crate::object::set_string_data(wrapper, heap, s);
+        crate::object::set_string_data(wrapper, heap, s)?;
     } else if let Some(sym) = value.as_symbol(heap) {
-        crate::object::set_symbol_data(wrapper, heap, sym);
+        crate::object::set_symbol_data(wrapper, heap, sym)?;
     } else if let Some(bi) = value.as_big_int() {
-        crate::object::set_bigint_data(wrapper, heap, bi);
+        crate::object::set_bigint_data(wrapper, heap, bi)?;
     }
+    Ok(())
 }
 
 /// §20.1.3.5 `Object.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] )`.
@@ -647,8 +675,8 @@ fn native_prototype_to_locale_string(
         let callee_result = ctx.with_turn_parts(|interp, stack| {
             interp.get_property_value_for_call(stack, &context, this_value, "toString")
         });
-        let callee = callee_result
-            .map_err(|err| object_native_error(ctx.cx.interp, "toLocaleString", err))?;
+        let callee =
+            callee_result.map_err(|err| err.into_native(ctx.cx.interp, "toLocaleString"))?;
         if crate::is_callable_value(&callee) {
             return ctx.call(callee, this_value, &[]);
         }
@@ -676,8 +704,7 @@ fn native_prototype_has_own_property(
                 args.first().cloned().unwrap_or(Value::undefined()),
             )
         });
-        let key =
-            key_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
+        let key = key_result.map_err(|err| err.into_native(ctx.cx.interp, "hasOwnProperty"))?;
         if this_value.is_nullish() {
             return Err(NativeError::TypeError {
                 name: "hasOwnProperty",
@@ -685,10 +712,15 @@ fn native_prototype_has_own_property(
             });
         }
         let desc_result = ctx.with_turn_parts(|interp, stack| {
-            interp.ordinary_get_own_property_descriptor_value(stack, &context, this_value, &key, 0)
+            interp.ordinary_get_own_property_descriptor_value(
+                stack,
+                Some(&context),
+                this_value,
+                &key,
+                0,
+            )
         });
-        let desc =
-            desc_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
+        let desc = desc_result.map_err(|err| err.into_native(ctx.cx.interp, "hasOwnProperty"))?;
         return Ok(Value::boolean(desc.is_some()));
     }
     if this_value.is_nullish() {
@@ -739,8 +771,8 @@ fn native_prototype_property_is_enumerable(
                 args.first().cloned().unwrap_or(Value::undefined()),
             )
         });
-        let key = key_result
-            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
+        let key =
+            key_result.map_err(|error| error.into_native(ctx.cx.interp, "propertyIsEnumerable"))?;
         if this_value.is_nullish() {
             return Err(NativeError::TypeError {
                 name: "propertyIsEnumerable",
@@ -748,10 +780,16 @@ fn native_prototype_property_is_enumerable(
             });
         }
         let desc_result = ctx.with_turn_parts(|interp, stack| {
-            interp.ordinary_get_own_property_descriptor_value(stack, &context, this_value, &key, 0)
+            interp.ordinary_get_own_property_descriptor_value(
+                stack,
+                Some(&context),
+                this_value,
+                &key,
+                0,
+            )
         });
-        let desc = desc_result
-            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
+        let desc =
+            desc_result.map_err(|err| err.into_native(ctx.cx.interp, "propertyIsEnumerable"))?;
         return Ok(Value::boolean(
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable),
         ));
@@ -765,8 +803,10 @@ fn native_prototype_property_is_enumerable(
     }
     let enumerable = if let Some(obj) = this_clone.as_object() {
         let key_result = expect_property_key(args.first(), ctx.heap());
-        let key = key_result
-            .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
+        let key = key_result.map_err(|error| {
+            crate::CommittedValueError::JavaScript(error)
+                .into_native(ctx.cx.interp, "propertyIsEnumerable")
+        })?;
         match key {
             PropertyKey::String(key) => match crate::object::lookup_own(obj, ctx.heap(), &key) {
                 PropertyLookup::Data { flags, .. } | PropertyLookup::Accessor { flags, .. } => {
@@ -843,8 +883,7 @@ fn native_prototype_is_prototype_of(
         let proto_result = ctx.with_turn_parts(|interp, stack| {
             interp.ordinary_get_prototype_value(stack, &exec_ctx, current, 0)
         });
-        let proto =
-            proto_result.map_err(|err| object_native_error(ctx.cx.interp, "isPrototypeOf", err))?;
+        let proto = proto_result.map_err(|err| err.into_native(ctx.cx.interp, "isPrototypeOf"))?;
         if proto.is_null() {
             return Ok(Value::boolean(false));
         }
@@ -883,8 +922,7 @@ pub fn native_prototype_proto_get(
         let proto_result = ctx.with_turn_parts(|interp, stack| {
             interp.ordinary_get_prototype_value(stack, &exec_ctx, this_value, 0)
         });
-        let result =
-            proto_result.map_err(|err| object_native_error(ctx.cx.interp, "get __proto__", err))?;
+        let result = proto_result.map_err(|err| err.into_native(ctx.cx.interp, "get __proto__"))?;
         return Ok(result);
     }
     // Context-less fallback (sync embedders without a JS frame).
@@ -976,7 +1014,7 @@ pub fn native_prototype_proto_set(
     let set_result = ctx.with_turn_parts(|interp, stack| {
         interp.set_prototype_value_proxy_aware(stack, &exec_ctx, &this_value, &proto_value)
     });
-    let ok = set_result.map_err(|err| object_native_error(ctx.cx.interp, "set __proto__", err))?;
+    let ok = set_result.map_err(|err| err.into_native(ctx.cx.interp, "set __proto__"))?;
     if !ok {
         return Err(NativeError::TypeError {
             name: "set __proto__",
@@ -1061,8 +1099,7 @@ fn define_accessor_helper(
         let define_result = ctx.with_turn_parts(|interp, stack| {
             interp.define_own_property_value(stack, &exec_ctx, &this_value, &key, desc)
         });
-        let ok =
-            define_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
+        let ok = define_result.map_err(|err| err.into_native(ctx.cx.interp, method_name))?;
         if !ok {
             return Err(NativeError::TypeError {
                 name: method_name,
@@ -1080,14 +1117,14 @@ fn define_accessor_helper(
     };
     let ok = match key {
         PropertyKey::String(name) => {
-            crate::object::define_own_property_partial(&mut target, ctx.heap_mut(), &name, desc)
+            crate::object::define_own_property_partial(&mut target, ctx.heap_mut(), &name, desc)?
         }
         PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
             &mut target,
             ctx.heap_mut(),
             sym,
             desc,
-        ),
+        )?,
     };
     if !ok {
         return Err(NativeError::TypeError {
@@ -1156,10 +1193,15 @@ fn lookup_accessor_helper(
         };
         while let Some(value) = current {
             let desc_result = ctx.with_turn_parts(|interp, stack| {
-                interp.ordinary_get_own_property_descriptor_value(stack, &exec_ctx, value, &key, 0)
+                interp.ordinary_get_own_property_descriptor_value(
+                    stack,
+                    Some(&exec_ctx),
+                    value,
+                    &key,
+                    0,
+                )
             });
-            let desc =
-                desc_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
+            let desc = desc_result.map_err(|err| err.into_native(ctx.cx.interp, method_name))?;
             if let Some(desc) = desc {
                 return Ok(match desc.kind {
                     DescriptorKind::Accessor { getter, setter } => {
@@ -1175,8 +1217,7 @@ fn lookup_accessor_helper(
             let proto_result = ctx.with_turn_parts(|interp, stack| {
                 interp.ordinary_get_prototype_value(stack, &exec_ctx, value, 0)
             });
-            let proto =
-                proto_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
+            let proto = proto_result.map_err(|err| err.into_native(ctx.cx.interp, method_name))?;
             current = if proto.is_null() { None } else { Some(proto) };
         }
         return Ok(Value::undefined());
@@ -1361,17 +1402,8 @@ pub(crate) fn object_has_error_data_value(
     // `[[ErrorData]]` internal slot." Treat any of the realm error
     // prototypes as ordinary objects when probed directly — only
     // their (transitive) descendants carry the slot.
-    let kinds = [
-        ErrorKind::Error,
-        ErrorKind::TypeError,
-        ErrorKind::RangeError,
-        ErrorKind::SyntaxError,
-        ErrorKind::ReferenceError,
-        ErrorKind::URIError,
-        ErrorKind::EvalError,
-        ErrorKind::AggregateError,
-    ];
-    for kind in kinds {
+    let kinds = ErrorKind::all();
+    for &kind in kinds {
         if registry.prototype(kind) == obj {
             return false;
         }
@@ -1383,7 +1415,7 @@ pub(crate) fn object_has_error_data_value(
             return false;
         }
         hops += 1;
-        for kind in kinds {
+        for &kind in kinds {
             if registry.prototype(kind) == o {
                 return true;
             }
@@ -1401,7 +1433,7 @@ pub(crate) fn object_has_error_data_value(
 fn explicit_to_string_tag_with_context(
     ctx: &mut NativeCtx<'_>,
     exec_ctx: &crate::ExecutionContext,
-) -> Result<Option<String>, crate::VmError> {
+) -> Result<Option<String>, CommittedValueError> {
     // §20.1.3.6 steps 1-2 — `undefined` and `null` resolve to their
     // builtin tags before ToObject and never enter the `[[Get]]`
     // ladder. The `Hole` sentinel never reaches user code, but if it
@@ -1430,7 +1462,7 @@ fn explicit_to_string_tag_with_context(
     let outcome = ctx.with_turn_parts(|interp, stack| {
         interp.ordinary_get_value(
             stack,
-            exec_ctx,
+            Some(exec_ctx),
             base,
             this_value,
             &crate::VmPropertyKey::Symbol(tag_symbol),
@@ -1439,15 +1471,20 @@ fn explicit_to_string_tag_with_context(
     })?;
     let value = match outcome {
         crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx.cx.with_parts(|interp, stack| {
-            interp.run_callable_sync_rooted(
-                stack,
-                exec_ctx,
-                &getter,
-                this_value,
-                smallvec::SmallVec::new(),
-            )
-        })?,
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let receiver = *ctx.this_value();
+            ctx.cx.with_parts(|interp, stack| {
+                interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(exec_ctx),
+                        &getter,
+                        receiver,
+                        smallvec::SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)
+            })?
+        }
     };
     Ok(value
         .as_string(ctx.heap())
@@ -1496,18 +1533,27 @@ fn bound_function_has_own(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
-pub fn call(
+fn call(
     interp: &mut crate::Interpreter,
     method: otter_bytecode::method_id::ObjectMethod,
     args: &[Value],
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ObjectMethod as M;
+    let _runtime_roots = interp.scope_runtime_roots_guard();
     let gc_heap: &mut otter_gc::GcHeap = interp.gc_heap_for_cx_mut();
     match method {
         // §20.1.2.2 Object.create(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.create>
         M::Create => {
-            let proto = args.first().cloned().unwrap_or(Value::undefined());
+            let mut owned_arguments = args.to_vec();
+            let mut roots = otter_gc::RootScope::new(gc_heap);
+            // SAFETY: the owned argument vector remains stationary throughout
+            // root preparation and later descriptor installation.
+            unsafe { roots.add_value_vec(&mut owned_arguments) };
+            let proto = owned_arguments
+                .first()
+                .copied()
+                .unwrap_or(Value::undefined());
             let proto_value = if proto.is_object_type() {
                 Some(proto)
             } else if proto.is_null() {
@@ -1515,9 +1561,17 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let root = crate::object::root_for_prototype_value(gc_heap, proto_value)?;
-            let mut obj = rooted_object(gc_heap, root, &[&proto], &[args])?;
-            if let Some(props_arg) = args.get(1)
+            let root = crate::object::root_for_prototype_value(
+                gc_heap,
+                proto_value,
+                crate::object::ShapeState::ORDINARY,
+                &mut |_| {},
+            )?;
+            let mut obj = rooted_object(gc_heap, root, &[], &[])?;
+            let mut object_roots = otter_gc::RootScope::new(gc_heap);
+            // SAFETY: the actual result slot stays stationary until returned.
+            unsafe { object_roots.add_object(&mut obj) };
+            if let Some(props_arg) = owned_arguments.get(1)
                 && !props_arg.is_undefined()
             {
                 let props = props_arg.as_object().ok_or(VmError::TypeMismatch)?;
@@ -1527,12 +1581,19 @@ pub fn call(
                             .map(|(k, v)| (k.to_string(), v))
                             .collect()
                     });
-                for (key, desc_value) in entries {
-                    let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
+                let (keys, mut descriptors): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+                let mut descriptor_roots = otter_gc::RootScope::new(gc_heap);
+                // SAFETY: the vector is fixed after registration; each input
+                // is reloaded after the previous descriptor owner can collect.
+                unsafe { descriptor_roots.add_value_vec(&mut descriptors) };
+                for (index, key) in keys.into_iter().enumerate() {
+                    let desc_obj = descriptors[index]
+                        .as_object()
+                        .ok_or(VmError::TypeMismatch)?;
                     let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
                     if !crate::object::define_own_property_partial(
                         &mut obj, gc_heap, &key, descriptor,
-                    ) {
+                    )? {
                         return Err(VmError::TypeMismatch);
                     }
                 }
@@ -1553,13 +1614,13 @@ pub fn call(
                         gc_heap,
                         key,
                         descriptor,
-                    ),
+                    )?,
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
                         &mut target,
                         gc_heap,
                         *sym,
                         descriptor,
-                    ),
+                    )?,
                 };
                 if !ok {
                     let msg = format!("Cannot define property '{}'", key.label(gc_heap));
@@ -1574,13 +1635,13 @@ pub fn call(
                         gc_heap,
                         key,
                         descriptor,
-                    ),
+                    )?,
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
                         &mut statics,
                         gc_heap,
                         *sym,
                         descriptor,
-                    ),
+                    )?,
                 };
                 if !ok {
                     let msg = format!("Cannot define property '{}'", key.label(gc_heap));
@@ -1599,9 +1660,9 @@ pub fn call(
                         gc_heap,
                         key,
                         descriptor.complete_for_new_property(),
-                    ),
+                    )?,
                     PropertyKey::Symbol(sym) => {
-                        native.define_own_symbol_property(gc_heap, *sym, descriptor)
+                        native.define_own_symbol_property(gc_heap, *sym, descriptor)?
                     }
                 };
                 if !ok {
@@ -1639,11 +1700,11 @@ pub fn call(
                     let ok = match &key {
                         PropertyKey::String(k) => crate::object::define_own_property_partial(
                             &mut bag, gc_heap, k, descriptor,
-                        ),
+                        )?,
                         PropertyKey::Symbol(sym) => {
                             crate::object::define_own_symbol_property_partial(
                                 &mut bag, gc_heap, *sym, descriptor,
-                            )
+                            )?
                         }
                     };
                     if !ok {
@@ -1669,12 +1730,12 @@ pub fn call(
                     })?;
                 let gc_heap = interp.gc_heap_for_cx_mut();
                 let ok = match &key {
-                    PropertyKey::String(k) => {
-                        crate::object::define_own_property_partial(&mut bag, gc_heap, k, descriptor)
-                    }
+                    PropertyKey::String(k) => crate::object::define_own_property_partial(
+                        &mut bag, gc_heap, k, descriptor,
+                    )?,
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
                         &mut bag, gc_heap, *sym, descriptor,
-                    ),
+                    )?,
                 };
                 if !ok {
                     let msg = format!("Cannot define property '{}'", key.label(gc_heap));
@@ -1727,7 +1788,7 @@ pub fn call(
                             let gc_heap = interp.gc_heap_for_cx_mut();
                             if !crate::object::define_own_property_partial(
                                 &mut bag, gc_heap, k, descriptor,
-                            ) {
+                            )? {
                                 let msg =
                                     format!("Cannot define property '{}'", key.label(gc_heap));
                                 return Err(interp.err_type(msg.into()));
@@ -1745,7 +1806,7 @@ pub fn call(
                         let gc_heap = interp.gc_heap_for_cx_mut();
                         if !crate::object::define_own_symbol_property_partial(
                             &mut bag, gc_heap, *sym, descriptor,
-                        ) {
+                        )? {
                             let msg = format!("Cannot define property '{}'", key.label(gc_heap));
                             return Err(interp.err_type(msg.into()));
                         }
@@ -1786,7 +1847,7 @@ pub fn call(
                     gc_heap,
                     &key,
                     descriptor,
-                ) {
+                )? {
                     return Err(VmError::TypeMismatch);
                 }
             }
@@ -1805,31 +1866,16 @@ pub fn call(
                                 value, string_key, gc_heap,
                             )?
                         {
-                            return Ok(Value::object(descriptor_to_object_with_roots(
-                                &desc,
-                                gc_heap,
-                                &[],
-                                &[args],
-                            )?));
+                            return Ok(Value::object(descriptor_to_object(&desc, interp)?));
                         }
                         match crate::object::get_own_descriptor(target, gc_heap, string_key) {
-                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                                &desc,
-                                gc_heap,
-                                &[],
-                                &[args],
-                            )?)),
+                            Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                             None => Ok(Value::undefined()),
                         }
                     }
                     PropertyKey::Symbol(sym) => {
                         match crate::object::get_own_symbol_descriptor(target, gc_heap, *sym) {
-                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                                &desc,
-                                gc_heap,
-                                &[],
-                                &[args],
-                            )?)),
+                            Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                             None => Ok(Value::undefined()),
                         }
                     }
@@ -1842,12 +1888,7 @@ pub fn call(
                             gc_heap,
                             key,
                         ) {
-                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                                &desc,
-                                gc_heap,
-                                &[],
-                                &[args],
-                            )?)),
+                            Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                             None => Ok(Value::undefined()),
                         }
                     }
@@ -1857,12 +1898,7 @@ pub fn call(
                             gc_heap,
                             *sym,
                         ) {
-                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                                &desc,
-                                gc_heap,
-                                &[],
-                                &[args],
-                            )?)),
+                            Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                             None => Ok(Value::undefined()),
                         }
                     }
@@ -1872,12 +1908,7 @@ pub fn call(
                     return Ok(Value::undefined());
                 };
                 match native.own_property_descriptor(gc_heap, key)? {
-                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                        &desc,
-                        gc_heap,
-                        &[],
-                        &[args],
-                    )?)),
+                    Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                     None => Ok(Value::undefined()),
                 }
             } else if let Some(t) = first.and_then(|v| v.as_temporal(gc_heap)) {
@@ -1893,12 +1924,7 @@ pub fn call(
                     }
                 });
                 match desc {
-                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                        &desc,
-                        gc_heap,
-                        &[],
-                        &[args],
-                    )?)),
+                    Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                     None => Ok(Value::undefined()),
                 }
             } else if first.is_some_and(|v| v.is_map() || v.is_set() || v.is_generator()) {
@@ -1924,12 +1950,7 @@ pub fn call(
                     }
                 });
                 match desc {
-                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                        &desc,
-                        gc_heap,
-                        &[],
-                        &[args],
-                    )?)),
+                    Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                     None => Ok(Value::undefined()),
                 }
             } else if let Some(value) = first.and_then(|v| v.as_string(gc_heap)) {
@@ -1940,12 +1961,7 @@ pub fn call(
                     PropertyKey::Symbol(_) => None,
                 };
                 match desc {
-                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                        &desc,
-                        gc_heap,
-                        &[],
-                        &[args],
-                    )?)),
+                    Some(desc) => Ok(Value::object(descriptor_to_object(&desc, interp)?)),
                     None => Ok(Value::undefined()),
                 }
             } else if first.is_some_and(|v| {
@@ -1975,50 +1991,82 @@ pub fn call(
         // §20.1.2.11 Object.getOwnPropertyDescriptors(O)
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptors>
         M::GetOwnPropertyDescriptors => {
-            let target = expect_object(args.first())?;
-            let target_root = Value::object(target);
-            let root = crate::object::shape_body::null_root(gc_heap);
-            let mut result = rooted_object(gc_heap, root, &[&target_root], &[args])?;
-            let result_root = Value::object(result);
-            let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
-                crate::object::with_properties(target, gc_heap, |p| {
-                    (
-                        p.keys().map(|s| s.to_string()).collect(),
-                        p.symbol_keys().collect(),
-                    )
-                });
-            for key in keys {
-                if let Some(desc) = crate::object::get_own_descriptor(target, gc_heap, &key) {
-                    let value = Value::object(descriptor_to_object_with_roots(
-                        &desc,
-                        gc_heap,
-                        &[&target_root, &result_root],
-                        &[args],
-                    )?);
-                    crate::object::set(&mut result, gc_heap, &key, value);
-                }
-            }
-            for sym in symbols {
-                if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, sym) {
-                    let value = Value::object(descriptor_to_object_with_roots(
-                        &desc,
-                        gc_heap,
-                        &[&target_root, &result_root],
-                        &[args],
-                    )?);
-                    if !crate::object::set_symbol(result, gc_heap, sym, value) {
-                        return Err(VmError::TypeMismatch);
+            let target = Value::object(expect_object(args.first())?);
+            interp.with_handle_scope(|interp, scope| {
+                let target = interp.scoped_value(scope, target);
+                let current = interp
+                    .escape_scoped(target)
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
+                    crate::object::with_properties(current, interp.gc_heap_for_cx_mut(), |p| {
+                        (
+                            p.keys().map(str::to_owned).collect(),
+                            p.symbol_keys().collect(),
+                        )
+                    });
+                let symbols: Vec<Local<'_>> = symbols
+                    .into_iter()
+                    .map(|symbol| interp.scoped_value(scope, Value::symbol(symbol)))
+                    .collect();
+                let result = interp.scoped_object(scope)?;
+                for key in keys {
+                    let current = interp
+                        .escape_scoped(target)
+                        .as_object()
+                        .ok_or(VmError::TypeMismatch)?;
+                    if let Some(desc) = crate::object::get_own_descriptor(
+                        current,
+                        interp.gc_heap_for_cx_mut(),
+                        &key,
+                    ) {
+                        let value = interp.scoped_descriptor_object(scope, &desc)?;
+                        interp.scoped_define_data(
+                            scope,
+                            result,
+                            &key,
+                            value,
+                            crate::object::PropertyFlags::data_default(),
+                        )?;
                     }
                 }
-            }
-            Ok(Value::object(result))
+                for symbol in symbols {
+                    let current = interp
+                        .escape_scoped(target)
+                        .as_object()
+                        .ok_or(VmError::TypeMismatch)?;
+                    let key = interp
+                        .escape_scoped(symbol)
+                        .as_symbol(interp.gc_heap_for_cx_mut())
+                        .ok_or(VmError::TypeMismatch)?;
+                    if let Some(desc) = crate::object::get_own_symbol_descriptor(
+                        current,
+                        interp.gc_heap_for_cx_mut(),
+                        key,
+                    ) {
+                        let value = interp.scoped_descriptor_object(scope, &desc)?;
+                        interp.scoped_define_symbol(
+                            scope,
+                            result,
+                            symbol,
+                            value,
+                            crate::object::PropertyFlags::data_default(),
+                        )?;
+                    }
+                }
+                Ok(interp.escape_scoped(result))
+            })
         }
         // §20.1.2.6 Object.freeze(O)
         // <https://tc39.es/ecma262/#sec-object.freeze>
         M::Freeze => {
-            let arg = args.first().cloned().unwrap_or(Value::undefined());
-            if let Some(o) = arg.as_object() {
-                crate::object::freeze(o, gc_heap);
+            let mut arg = args.first().cloned().unwrap_or(Value::undefined());
+            let mut roots = otter_gc::RootScope::new(gc_heap);
+            // SAFETY: the returned value slot stays stationary through the
+            // integrity owner's allocating preparation and publication.
+            unsafe { roots.add_value(&mut arg) };
+            if let Some(mut o) = arg.as_object() {
+                crate::object::freeze(&mut o, gc_heap)?;
             } else if let Some(a) = arg.as_array() {
                 crate::array::set_integrity_level(a, gc_heap, true);
             }
@@ -2028,9 +2076,13 @@ pub fn call(
         }
         // §20.1.2.20 Object.seal(O)
         M::Seal => {
-            let arg = args.first().cloned().unwrap_or(Value::undefined());
-            if let Some(o) = arg.as_object() {
-                crate::object::seal(o, gc_heap);
+            let mut arg = args.first().cloned().unwrap_or(Value::undefined());
+            let mut roots = otter_gc::RootScope::new(gc_heap);
+            // SAFETY: the returned value slot stays stationary through the
+            // integrity owner's allocating preparation and publication.
+            unsafe { roots.add_value(&mut arg) };
+            if let Some(mut o) = arg.as_object() {
+                crate::object::seal(&mut o, gc_heap)?;
             } else if let Some(a) = arg.as_array() {
                 crate::array::set_integrity_level(a, gc_heap, false);
             }
@@ -2186,65 +2238,10 @@ pub fn call(
             })?;
             Ok(Value::array(array))
         }
-        // §20.1.2.1 Object.assign(target, ...sources). Copies own
-        // enumerable string-keyed data properties from each source
-        // into `target` using `[[Set]]` (so existing accessors on
-        // target invoke their setters). Foundation simplifies the
-        // [[Set]] step: we use the `set()` construction helper since
-        // the spec's full ladder is filed against the dispatch layer.
-        // Symbol-keyed properties + non-enumerable + accessor sources
-        // are left to follow-ups.
-        // <https://tc39.es/ecma262/#sec-object.assign>
-        M::Assign => {
-            let target_value = Value::object(expect_object(args.first())?);
-            interp.with_handle_scope(|interp, scope| {
-                // Park the target and every object source before the first
-                // write: `set` below can allocate (shape transition, storage
-                // growth) and move any raw carrier.
-                let target = interp.scoped_value(scope, target_value);
-                let mut sources = Vec::new();
-                for src in args.iter().skip(1) {
-                    if src.is_undefined() || src.is_null() {
-                        // Per spec, null/undefined sources are skipped.
-                        continue;
-                    }
-                    if src.as_object().is_none() {
-                        return Err(VmError::TypeMismatch);
-                    }
-                    sources.push(interp.scoped_value(scope, *src));
-                }
-                for src in sources {
-                    let source = interp
-                        .escape_scoped(src)
-                        .as_object()
-                        .ok_or(VmError::TypeMismatch)?;
-                    let raw_entries: Vec<(String, Value)> =
-                        crate::object::with_properties(source, interp.gc_heap_for_cx_mut(), |p| {
-                            p.enumerable_data_iter()
-                                .map(|(k, v)| (k.to_string(), v))
-                                .collect()
-                        });
-                    let entries: Vec<(String, crate::handles::Local<'_>)> = raw_entries
-                        .into_iter()
-                        .map(|(k, v)| (k, interp.scoped_value(scope, v)))
-                        .collect();
-                    for (k, v) in entries {
-                        let mut target_object = interp
-                            .escape_scoped(target)
-                            .as_object()
-                            .ok_or(VmError::TypeMismatch)?;
-                        let value = interp.escape_scoped(v);
-                        crate::object::set(
-                            &mut target_object,
-                            interp.gc_heap_for_cx_mut(),
-                            &k,
-                            value,
-                        );
-                    }
-                }
-                Ok(interp.escape_scoped(target))
-            })
-        }
+        // Object.assign requires the actual JS execution context and stack.
+        // native_call routes that method directly to do_object_assign; this
+        // private heap dispatcher cannot approximate getters, setters or symbols.
+        M::Assign => Err(VmError::InvalidOperand),
         // §20.1.2.7 Object.fromEntries(iterable). Foundation accepts
         // an array of `[k, v]` pairs (the most common shape) and a
         // Map; arbitrary iterables route through the user
@@ -2257,7 +2254,7 @@ pub fn call(
             }
             interp.with_handle_scope(|interp, scope| {
                 // Park the iterable, the result, and every snapshotted entry
-                // before the write loop: key coercion and `set` both allocate
+                // before the write loop: key coercion and descriptor preparation allocate
                 // and can move raw carriers between iterations.
                 let iter = interp.scoped_value(scope, iter_value);
                 let result = interp.scoped_object(scope)?;
@@ -2282,16 +2279,7 @@ pub fn call(
                             parked.push(interp.scoped_value(scope, value));
                         }
                         for pair in parked.chunks(2) {
-                            let result_object = interp
-                                .escape_scoped(result)
-                                .as_object()
-                                .ok_or(VmError::TypeMismatch)?;
-                            set_from_entries_key_heap(
-                                result_object,
-                                &interp.escape_scoped(pair[0]),
-                                interp.escape_scoped(pair[1]),
-                                interp.gc_heap_for_cx_mut(),
-                            )?;
+                            create_from_entries_key(interp, scope, result, pair[0], pair[1])?;
                         }
                         return Ok(interp.escape_scoped(result));
                     } else {
@@ -2299,19 +2287,8 @@ pub fn call(
                     }
                 };
                 for entry in entries {
-                    let entry_value = interp.escape_scoped(entry);
-                    let (key, value) =
-                        read_entry_pair_heap(&entry_value, interp.gc_heap_for_cx_mut())?;
-                    let result_object = interp
-                        .escape_scoped(result)
-                        .as_object()
-                        .ok_or(VmError::TypeMismatch)?;
-                    set_from_entries_key_heap(
-                        result_object,
-                        &key,
-                        value,
-                        interp.gc_heap_for_cx_mut(),
-                    )?;
+                    let (key, value) = read_entry_pair(interp, scope, entry)?;
+                    create_from_entries_key(interp, scope, result, key, value)?;
                 }
                 Ok(interp.escape_scoped(result))
             })
@@ -2537,65 +2514,17 @@ where
         .map_err(VmError::from)
 }
 
-fn descriptor_to_object_with_roots(
+fn descriptor_to_object(
     desc: &PropertyDescriptor,
-    gc_heap: &mut otter_gc::GcHeap,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    interp: &mut crate::Interpreter,
 ) -> Result<JsObject, VmError> {
-    let mut roots = Vec::with_capacity(value_roots.len() + 2);
-    roots.extend_from_slice(value_roots);
-    match &desc.kind {
-        DescriptorKind::Data { value } => roots.push(value),
-        DescriptorKind::Accessor { getter, setter } => {
-            if let Some(getter) = getter {
-                roots.push(getter);
-            }
-            if let Some(setter) = setter {
-                roots.push(setter);
-            }
-        }
-    }
-    let root = crate::object::shape_body::null_root(gc_heap);
-    let mut result = rooted_object(gc_heap, root, &roots, slice_roots)?;
-    match &desc.kind {
-        DescriptorKind::Data { value } => {
-            crate::object::set(&mut result, gc_heap, "value", *value);
-            crate::object::set(
-                &mut result,
-                gc_heap,
-                "writable",
-                Value::boolean(desc.writable()),
-            );
-        }
-        DescriptorKind::Accessor { getter, setter } => {
-            crate::object::set(
-                &mut result,
-                gc_heap,
-                "get",
-                (*getter).unwrap_or(Value::undefined()),
-            );
-            crate::object::set(
-                &mut result,
-                gc_heap,
-                "set",
-                (*setter).unwrap_or(Value::undefined()),
-            );
-        }
-    }
-    crate::object::set(
-        &mut result,
-        gc_heap,
-        "enumerable",
-        Value::boolean(desc.enumerable()),
-    );
-    crate::object::set(
-        &mut result,
-        gc_heap,
-        "configurable",
-        Value::boolean(desc.configurable()),
-    );
-    Ok(result)
+    interp.with_handle_scope(|interp, scope| {
+        let result = interp.scoped_descriptor_object(scope, desc)?;
+        interp
+            .escape_scoped(result)
+            .as_object()
+            .ok_or(VmError::TypeMismatch)
+    })
 }
 
 fn lookup_to_optional_bool(lookup: &PropertyLookup, heap: &otter_gc::GcHeap) -> Option<bool> {
@@ -2664,7 +2593,7 @@ fn native_to_property_key(
     };
     let key_result =
         ctx.with_turn_parts(|interp, stack| interp.to_property_key_sync(stack, &exec_ctx, value));
-    let key = key_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
+    let key = key_result.map_err(|err| err.into_native(ctx.cx.interp, method_name))?;
     match key {
         crate::VmPropertyKey::Symbol(sym) => Ok(PropertyKey::Symbol(sym)),
         crate::VmPropertyKey::Atom(atom) => Ok(PropertyKey::String(atom.name().to_string())),

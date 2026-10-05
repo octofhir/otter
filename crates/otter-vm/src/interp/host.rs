@@ -386,31 +386,6 @@ impl Interpreter {
         self.tracer = tracer;
     }
 
-    /// Register a module's verbatim source text so the VM can resolve a
-    /// frame's byte span to a `(line, column)` for `Error.prototype.stack`
-    /// and `util.getCallSites`. The runtime module loader calls this as it
-    /// loads each module fragment; replays simply rebuild the line index.
-    pub fn register_module_source(
-        &mut self,
-        module_url: impl Into<String>,
-        text: otter_resource::SharedSource,
-    ) {
-        self.module_sources.register(module_url, text);
-    }
-
-    /// Admit a host- or VM-synthesized source against the registry's
-    /// account and register it.
-    ///
-    /// # Errors
-    /// Returns the admission failure without retaining anything.
-    pub fn register_module_source_owned(
-        &mut self,
-        module_url: impl Into<String>,
-        text: String,
-    ) -> Result<(), otter_resource::SharedSourceError> {
-        self.module_sources.register_owned(module_url, text)
-    }
-
     /// Install the shared ledger charged for VM-retained allocations:
     /// synthesized sources, linked code-space chunks, installed generated
     /// code, and the heap's outstanding external backing-store bytes.
@@ -426,25 +401,15 @@ impl Interpreter {
         account: otter_resource::ResourceAccount,
     ) -> Result<(), otter_resource::ResourceError> {
         self.gc_heap.set_external_bytes_account(&account)?;
-        self.module_sources.set_account(account.clone());
+        self.resource_account = account.clone();
         self.jit_code_registry.set_account(account);
         Ok(())
     }
 
-    /// The ledger charged for VM-synthesized retained sources.
+    /// The isolate ledger used to admit source, code and external storage.
     #[must_use]
-    pub fn source_account(&self) -> otter_resource::ResourceAccount {
-        self.module_sources.account().clone()
-    }
-
-    /// Resolve a `(module_url, byte_offset)` to a 1-based `(line, column)`
-    /// position when the module's source has been registered.
-    pub(crate) fn source_line_col(&self, module_url: &str, byte_offset: u32) -> Option<(u32, u32)> {
-        self.module_sources.line_col(module_url, byte_offset)
-    }
-
-    pub(crate) fn source_line_text(&self, module_url: &str, line_number: u32) -> Option<&str> {
-        self.module_sources.line_text(module_url, line_number)
+    pub fn resource_account(&self) -> otter_resource::ResourceAccount {
+        self.resource_account.clone()
     }
 
     /// Read the live `Error.stackTraceLimit` and translate it to a frame
@@ -565,7 +530,6 @@ impl Interpreter {
     /// Propagates [`otter_gc::ImageError`]; a build leaves the nursery
     /// empty, so a capture taken right after one succeeds.
     pub(crate) fn capture_heap_image(&self) -> Result<otter_gc::HeapImage, otter_gc::ImageError> {
-        self.flush_constructor_observations(&self.gc_heap);
         self.gc_heap.capture_old_space()
     }
 
@@ -598,8 +562,10 @@ impl Interpreter {
 
     /// Frozen code directory with empty feedback for an isolate snapshot.
     #[must_use]
-    pub(crate) fn snapshot_code_space(&self) -> crate::code_space::snapshot::CodeSpaceSnapshot {
-        self.code_space.capture()
+    pub(crate) fn snapshot_code_space(
+        &self,
+    ) -> Result<crate::code_space::snapshot::CodeSpaceSnapshot, otter_resource::ResourceError> {
+        self.code_space.capture(&self.resource_account)
     }
 
     /// The property-name atom table, in id order. Restoring the list
@@ -700,13 +666,17 @@ impl Interpreter {
     /// every default-global binding (§17 + §19). Public entry for
     /// embedders that need to inject a runtime-side value into
     /// scripts (e.g. host-bound promises, capability tokens).
-    pub fn set_global(&mut self, name: &str, value: Value) {
+    pub fn set_global(&mut self, name: &str, value: Value) -> Result<(), VmError> {
+        let _runtime_roots = self.scope_runtime_roots_guard();
         let descriptor = crate::object::PropertyDescriptor::data(value, true, false, true);
-        let _ = crate::object::define_own_property(
-            self.global_this,
+        if !crate::object::define_own_property_in_place(
+            &mut self.global_this,
             &mut self.gc_heap,
             name,
             descriptor,
-        );
+        )? {
+            return Err(self.err_type(format!("Cannot define global property {name}").into()));
+        }
+        Ok(())
     }
 }

@@ -54,15 +54,6 @@ pub enum Unsupported {
     /// The selected machine backend could not allocate or finalize executable
     /// code. This is an ordinary interpreter fallback, never a process panic.
     Backend(BackendFailure),
-    /// A Machine IR stage produced a graph its verifier rejects. The rendered
-    /// verification error names the failing block, value or instruction, so
-    /// a decline report points at the exact malformed construct.
-    MachineVerification {
-        /// Pipeline stage whose output failed verification.
-        stage: &'static str,
-        /// Rendered [`crate::machine::VerificationError`].
-        error: String,
-    },
 }
 
 /// Fallible machine-backend operations that must preserve runtime fallback.
@@ -715,9 +706,9 @@ pub(crate) struct BaselinePlan {
     /// `ArrayConstruct` path. The byte PC is the stable join key consumed by
     /// both template planning and artifact capture.
     pub(crate) array_construct_alloc_safepoints: BTreeMap<u32, SafepointId>,
-    /// Allocating safepoints owned by `CreateContext` / `CopyContext`, keyed
+    /// Allocating safepoints owned by context and closure construction, keyed
     /// by byte PC like [`Self::array_construct_alloc_safepoints`].
-    pub(crate) context_alloc_safepoints: BTreeMap<u32, SafepointId>,
+    pub(crate) lexical_alloc_safepoints: BTreeMap<u32, SafepointId>,
 }
 
 impl BaselinePlan {
@@ -1236,11 +1227,13 @@ impl BaselinePlan {
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
         let mut array_construct_alloc_safepoints = BTreeMap::new();
-        let mut context_alloc_safepoints = BTreeMap::new();
+        let mut lexical_alloc_safepoints = BTreeMap::new();
         for lowered in &instructions {
             let allocating_site = match lowered.op {
                 Op::Add | Op::AddImm => Some(&mut add_alloc_safepoints),
-                Op::CreateContext | Op::CopyContext => Some(&mut context_alloc_safepoints),
+                Op::CreateContext | Op::CopyContext | Op::MakeFunction | Op::MakeClosure => {
+                    Some(&mut lexical_alloc_safepoints)
+                }
                 Op::ArrayConstruct => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = self::slice_range(&register_operands, operands.elements)?;
@@ -1252,11 +1245,7 @@ impl BaselinePlan {
                 let safepoint = next_safepoint;
                 next_safepoint = next_safepoint.saturating_add(1);
                 sites.insert(lowered.byte_pc, safepoint);
-                safepoint_records.push(SafepointRecord::frame_slot_window(
-                    safepoint,
-                    NO_FRAME_STATE,
-                    view.code_block.register_count,
-                ));
+                safepoint_records.push(SafepointRecord::window(safepoint, NO_FRAME_STATE));
             }
         }
 
@@ -1268,7 +1257,7 @@ impl BaselinePlan {
             safepoint_records,
             add_alloc_safepoints,
             array_construct_alloc_safepoints,
-            context_alloc_safepoints,
+            lexical_alloc_safepoints,
         })
     }
 

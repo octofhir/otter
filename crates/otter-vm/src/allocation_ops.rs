@@ -14,6 +14,8 @@
 //! # Invariants
 //! - Inputs are decoded from executable operands.
 //! - Helpers advance the current frame PC exactly once on success.
+//! - Empty objects and arrays select their own source-function realm through
+//!   `literal_allocation`, including native inlined slow transitions.
 //! - Object-with-prototype allocation parks both object and prototype in a
 //!   handle scope before either raw handle is used after a possible scavenge.
 //! - Runtime-rooted helpers install a direct temporary root provider only when
@@ -59,7 +61,6 @@ impl Interpreter {
         // stack on its own, so snapshot the runtime + frame roots here to keep
         // a collection at this site sound.
         let mut roots = Vec::new();
-        self.flush_constructor_observations(&self.gc_heap);
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
         let pool = self.cold_frames();
         for frame in stack.iter() {
@@ -85,7 +86,6 @@ impl Interpreter {
             return Vec::new();
         }
         let mut roots = Vec::new();
-        self.flush_constructor_observations(&self.gc_heap);
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
         self.gc_heap
             .trace_frame_root_providers(&mut |slot| roots.push(slot));
@@ -98,20 +98,14 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let root = self.null_prototype_root();
-        self.alloc_runtime_rooted_object_with_capacity(
-            root,
-            crate::object::DEFAULT_INLINE_CAPACITY,
-            value_roots,
-            slice_roots,
-        )
+        self.alloc_runtime_rooted_object_with_shape(root, value_roots, slice_roots)
     }
 
     /// An object of `root`'s lineage (whose prototype the root fixes) with
-    /// room for `capacity` in-object slots.
-    pub(crate) fn alloc_runtime_rooted_object_with_capacity(
+    /// the inline geometry owned by that exact shape.
+    pub(crate) fn alloc_runtime_rooted_object_with_shape(
         &mut self,
         root: crate::object::ShapeHandle,
-        capacity: usize,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
@@ -130,7 +124,6 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
-            capacity,
             &mut external_visit,
         )
         .map_err(VmError::from)
@@ -161,7 +154,6 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
-            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )
     }
@@ -203,7 +195,7 @@ impl Interpreter {
                 &mut interp.gc_heap,
                 tag_sym,
                 crate::object::PropertyDescriptor::data(module_str, false, false, false),
-            );
+            )?;
             Ok(interp
                 .escape_scoped(obj)
                 .as_object()
@@ -254,13 +246,13 @@ impl Interpreter {
                 &mut interp.gc_heap,
                 tag_sym,
                 crate::object::PropertyDescriptor::data(module_str, false, false, false),
-            );
+            )?;
             // §10.4.6 namespaces are non-extensible from creation.
             let obj_raw = interp
                 .escape_scoped(obj)
                 .as_object()
                 .expect("rooted module namespace remains an object");
-            crate::object::prevent_extensions(obj_raw, &mut interp.gc_heap);
+            crate::object::prevent_extensions(&mut { obj_raw }, &mut interp.gc_heap)?;
             Ok(interp
                 .escape_scoped(obj)
                 .as_object()
@@ -274,9 +266,6 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        // The prototype's root fixes the object's prototype; finding it never
-        // collects.
-        let root = self.object_root(Some(proto))?;
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for value in value_roots {
@@ -288,13 +277,16 @@ impl Interpreter {
                 }
             }
         };
-        crate::object::alloc_object_with_shape_roots(
+        let root = crate::object::heap_instance_root(
+            crate::object::ObjectPrototype::Object(proto),
             &mut self.gc_heap,
-            root,
             crate::object::DEFAULT_INLINE_CAPACITY,
+            crate::object::ShapeState::ORDINARY,
             &mut external_visit,
-        )
-        .map_err(VmError::from)
+        )?;
+        self.shape_runtime.register_shape(&self.gc_heap, root);
+        crate::object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut external_visit)
+            .map_err(VmError::from)
     }
 
     pub(crate) fn alloc_runtime_rooted_array_from_values<I>(
@@ -325,7 +317,7 @@ impl Interpreter {
         let array =
             crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
                 .map_err(VmError::from)?;
-        self.register_array_prototype_override(array);
+        let array = self.register_array_prototype_override(array)?;
         Ok(array)
     }
 
@@ -362,7 +354,7 @@ impl Interpreter {
         };
         let array =
             crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)?;
-        self.register_array_prototype_override(array);
+        let array = self.register_array_prototype_override(array)?;
         Ok(array)
     }
 
@@ -387,15 +379,14 @@ impl Interpreter {
                 }
             }
         };
-        Ok(Value::native_function(
-            NativeFunction::new_static_with_roots(
-                &mut self.gc_heap,
-                name,
-                length,
-                call,
-                &mut external_visit,
-            )?,
-        ))
+        let value = Value::native_function(NativeFunction::new_static_with_roots(
+            &mut self.gc_heap,
+            name,
+            length,
+            call,
+            &mut external_visit,
+        )?);
+        Ok(self.stamp_native_creation_realm(value))
     }
 
     /// Allocate a host-created native function while exposing runtime
@@ -419,15 +410,14 @@ impl Interpreter {
                 }
             }
         };
-        Ok(Value::native_function(
-            NativeFunction::from_call_with_roots(
-                &mut self.gc_heap,
-                name,
-                length,
-                call,
-                &mut external_visit,
-            )?,
-        ))
+        let value = Value::native_function(NativeFunction::from_call_with_roots(
+            &mut self.gc_heap,
+            name,
+            length,
+            call,
+            &mut external_visit,
+        )?);
+        Ok(self.stamp_native_creation_realm(value))
     }
 
     /// Allocate a host-created native constructor while exposing runtime roots
@@ -451,15 +441,14 @@ impl Interpreter {
                 }
             }
         };
-        Ok(Value::native_function(
-            NativeFunction::from_constructor_call_with_roots(
-                &mut self.gc_heap,
-                name,
-                length,
-                call,
-                &mut external_visit,
-            )?,
-        ))
+        let value = Value::native_function(NativeFunction::from_constructor_call_with_roots(
+            &mut self.gc_heap,
+            name,
+            length,
+            call,
+            &mut external_visit,
+        )?);
+        Ok(self.stamp_native_creation_realm(value))
     }
 
     pub(crate) fn alloc_runtime_rooted_iterator_state(
@@ -556,7 +545,6 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
-            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )
         .map_err(VmError::from)
@@ -599,7 +587,6 @@ impl Interpreter {
         crate::object::alloc_object_with_shape_roots(
             &mut self.gc_heap,
             shape_root,
-            crate::object::DEFAULT_INLINE_CAPACITY,
             &mut external_visit,
         )
         .map_err(VmError::from)
@@ -612,9 +599,7 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        // The prototype's root fixes the object's prototype; finding it never
-        // collects.
-        let root = self.object_root(Some(proto))?;
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -629,13 +614,16 @@ impl Interpreter {
                 }
             }
         };
-        crate::object::alloc_object_with_shape_roots(
+        let root = crate::object::heap_instance_root(
+            crate::object::ObjectPrototype::Object(proto),
             &mut self.gc_heap,
-            root,
             crate::object::DEFAULT_INLINE_CAPACITY,
+            crate::object::ShapeState::ORDINARY,
             &mut external_visit,
-        )
-        .map_err(VmError::from)
+        )?;
+        self.shape_runtime.register_shape(&self.gc_heap, root);
+        crate::object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut external_visit)
+            .map_err(VmError::from)
     }
 
     pub(crate) fn alloc_stack_rooted_array(
@@ -712,7 +700,7 @@ impl Interpreter {
         let array =
             crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
                 .map_err(VmError::from)?;
-        self.register_array_prototype_override(array);
+        let array = self.register_array_prototype_override(array)?;
         Ok(array)
     }
 
@@ -758,41 +746,11 @@ impl Interpreter {
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
-        let value = self.allocate_object_literal_value()?;
+        let value = self.allocate_object_literal_value(stack[top_idx].function_id)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
-    }
-
-    /// Allocate the ordinary object created by `Op::NewObject` without tying
-    /// allocation semantics to an interpreter frame representation.
-    ///
-    /// The runtime root provider traces materialized and native activations;
-    /// the returned value can therefore be committed through either a
-    /// `Frame` or an `ActiveFrameMut` after collection.
-    pub(crate) fn allocate_object_literal_value(&mut self) -> Result<Value, VmError> {
-        // `%Object.prototype%`'s root fixes the prototype; shapes never move,
-        // so the root survives the allocation.
-        let prototype = self.object_prototype_object_opt();
-        let root = self.object_root(prototype)?;
-        let obj = match crate::object::try_alloc_object_with_shape_no_collect(
-            &mut self.gc_heap,
-            root,
-            crate::object::DEFAULT_INLINE_CAPACITY,
-        ) {
-            Some(obj) => obj,
-            None => {
-                let _runtime_roots_guard = self.scope_runtime_roots_guard();
-                crate::object::alloc_object_with_shape_roots(
-                    &mut self.gc_heap,
-                    root,
-                    crate::object::DEFAULT_INLINE_CAPACITY,
-                    &mut |_: &mut dyn FnMut(*mut RawGc)| {},
-                )?
-            }
-        };
-        Ok(Value::object(obj))
     }
 
     /// `Op::NewObjectLiteral dst, count, first_key, values...` from a
@@ -808,9 +766,6 @@ impl Interpreter {
         let count = const_operand(operands.get(1))? as usize;
         let first_key = const_operand(operands.get(2))?;
         let function_id = stack[top_idx].function_id;
-        // Resolve the layout first: building it allocates shapes, while the
-        // values below are unrooted copies of the frame's registers.
-        let layout = self.object_literal_layout(context, function_id, first_key, count)?;
         let mut values = smallvec::SmallVec::<[Value; 8]>::with_capacity(count);
         {
             let frame = &stack[top_idx];
@@ -821,7 +776,8 @@ impl Interpreter {
                 )?);
             }
         }
-        let value = self.allocate_object_with_layout(layout, &mut values)?;
+        let value =
+            self.allocate_static_object_literal(context, function_id, first_key, &values)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
@@ -914,24 +870,11 @@ impl Interpreter {
                 elements.push(*read_register(frame, r)?);
             }
         }
-        let value = self.allocate_array_literal_value(elements)?;
+        let value = self.allocate_array_literal_value(stack[top_idx].function_id, elements)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
-    }
-
-    /// Allocate an array literal from already-decoded element values.
-    ///
-    /// The owned element buffer is traced by the array allocator while the
-    /// runtime provider keeps both materialized and native activations live.
-    /// Callers therefore need no stack index or physical-frame adapter.
-    pub(crate) fn allocate_array_literal_value<I>(&mut self, elements: I) -> Result<Value, VmError>
-    where
-        I: IntoIterator<Item = Value>,
-    {
-        let array = self.alloc_runtime_rooted_array_from_values(elements, &[], &[])?;
-        Ok(Value::array(array))
     }
 
     /// Materialize a verified dense virtual-object graph while one handle
@@ -977,10 +920,10 @@ impl Interpreter {
                     .collect::<Result<Vec<_>, _>>()?;
                 let value = match recipe.kind {
                     crate::deopt::VirtualObjectKind::PlainObject if fields.is_empty() => {
-                        interp.allocate_object_literal_value()?
+                        interp.allocate_object_in_active_realm()?
                     }
                     crate::deopt::VirtualObjectKind::FixedArray => {
-                        interp.allocate_array_literal_value(fields)?
+                        interp.allocate_array_in_active_realm(fields)?
                     }
                     crate::deopt::VirtualObjectKind::PlainObject => {
                         return Err(VmError::InvalidOperand);
@@ -1134,10 +1077,14 @@ impl Interpreter {
                 visitor(slot);
             }
         };
+        let realm_id = self.reaction_realm(Some(callback), self.active_realm_id)?;
+        let async_context = self.async_context();
         let registry = crate::weak_refs::alloc_finalization_registry_with_context_and_roots(
             &mut self.gc_heap,
             callback,
             Some(context.clone()),
+            realm_id,
+            async_context,
             &mut external_visit,
         )?;
         let frame = &mut stack[top_idx];

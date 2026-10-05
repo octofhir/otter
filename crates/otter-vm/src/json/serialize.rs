@@ -14,6 +14,8 @@
 //! - `serialize_json_object` / `serialize_json_array` — §25.5.2.4/.5.
 //!
 //! # Invariants
+//! - Plain reviver objects and stringify wrappers use the canonical handle
+//!   scope; their incoming leaves are parked before collecting preparation.
 //! - **Cycle / depth guard.** `state.stack` holds the identity
 //!   pointer of every object/array currently being serialised.
 //!   Revisiting one raises a `TypeError`; exceeding
@@ -26,6 +28,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-json.stringify>
 
+use crate::native_abi::CommittedValueError;
 use smallvec::{SmallVec, smallvec};
 
 use super::MAX_NESTING_DEPTH;
@@ -120,7 +123,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let value = args.first().copied().unwrap_or_else(Value::undefined);
         let replacer = args.get(1).copied().unwrap_or_else(Value::undefined);
         let space = args.get(2).copied().unwrap_or_else(Value::undefined);
@@ -133,12 +136,15 @@ impl Interpreter {
         // is the bottom of this call's scratch-root region.
         let value_root = self.json_root_push(value);
         let space_root = self.json_root_push(space);
-        let result: Result<(bool, String), VmError> = (|| {
+        let result: Result<(bool, String), CommittedValueError> = (|| {
             // §25.5.2.1 steps 4–5 — classify the replacer argument.
             if replacer.is_object_type() {
                 if replacer.is_callable() {
                     state.replacer_root = Some(self.json_root_push(replacer));
-                } else if self.json_is_array(&replacer)? {
+                } else if self
+                    .json_is_array(&replacer)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
                     state.property_list =
                         Some(self.json_build_property_list(stack, context, &replacer)?);
                 }
@@ -149,7 +155,9 @@ impl Interpreter {
 
             // §25.5.2.1 step 10 — wrapper = { "": value }.
             let rooted_value = self.json_root_get(value_root);
-            let wrapper = self.json_make_wrapper(rooted_value)?;
+            let wrapper = self
+                .json_make_wrapper(rooted_value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
 
             let mut buffer = String::with_capacity(self.json_stringify_capacity_hint);
             let wrote = self.serialize_json_property_into(
@@ -172,7 +180,7 @@ impl Interpreter {
             // repeated call on similarly-shaped data never re-grows from empty.
             self.json_stringify_capacity_hint = buffer.len();
             let s = JsString::from_str(&buffer, self.gc_heap_mut())
-                .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             Ok(Value::string(s))
         } else {
             Ok(Value::undefined())
@@ -191,11 +199,13 @@ impl Interpreter {
         unfiltered: Value,
         reviver: Value,
         source: Option<&crate::json::parse::SourceNode>,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let base_root = self.json_root_push(unfiltered);
         let reviver_root = self.json_root_push(reviver);
         let result = (|| {
-            let root = self.json_make_wrapper(self.json_root_get(base_root))?;
+            let root = self
+                .json_make_wrapper(self.json_root_get(base_root))
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             self.internalize_json_property(
                 stack,
                 context,
@@ -218,7 +228,7 @@ impl Interpreter {
         name: &str,
         reviver_root: usize,
         source: Option<&crate::json::parse::SourceNode>,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // `holder` and `value` are parked on the scratch root stack: every
         // recursive revive, the reviver context build, the key-argument
         // string, and the reviver call below can scavenge, and reading or
@@ -235,7 +245,10 @@ impl Interpreter {
             let value_root = self.json_root_push(value0);
 
             if self.json_root_get(value_root).is_object_type() {
-                if self.json_is_array(&self.json_root_get(value_root))? {
+                if self
+                    .json_is_array(&self.json_root_get(value_root))
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
                     let len = self.json_length(stack, context, &self.json_root_get(value_root))?;
                     for index in 0..len {
                         let key = index.to_string();
@@ -276,10 +289,13 @@ impl Interpreter {
             // own `source` property is present only for primitive leaves. Park
             // every reviver argument so a later argument's allocation cannot
             // dangle an earlier one before the call assembles them.
-            let name_arg = self.json_key_value(name)?;
+            let name_arg = self
+                .json_key_value(name)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let name_root = self.json_root_push(name_arg);
-            let context_obj =
-                self.json_make_reviver_context(self.json_root_get(value_root), source)?;
+            let context_obj = self
+                .json_make_reviver_context(self.json_root_get(value_root), source)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let context_root = self.json_root_push(context_obj);
             let args: SmallVec<[Value; 8]> = smallvec![
                 self.json_root_get(name_root),
@@ -288,7 +304,8 @@ impl Interpreter {
             ];
             let holder = self.json_root_get(holder_root);
             let reviver = self.json_root_get(reviver_root);
-            self.run_callable_sync_rooted(stack, context, &reviver, holder, args)
+            self.run_callable_sync_rooted(stack, Some(context), &reviver, holder, args)
+                .map_err(CommittedValueError::completed_call)
         })();
         self.json_root_pop_to(holder_root);
         result
@@ -315,25 +332,21 @@ impl Interpreter {
                 // its originally parsed value; a reviver that forward-
                 // replaces a slot makes the new value source-less. Compare
                 // against the re-parsed token via SameValue.
-                let still_original = crate::json::parse::parse(src, self.gc_heap_mut())
-                    .ok()
-                    .is_some_and(|parsed| {
+                let still_original = match crate::json::parse::parse(src, self.gc_heap_mut()) {
+                    Ok(parsed) => {
                         let leaf = self.json_root_get(value_root);
                         crate::abstract_ops::same_value(&leaf, &parsed, self.gc_heap())
-                    });
+                    }
+                    Err(crate::json::ParseError::OutOfMemory(error)) => return Err(error.into()),
+                    Err(crate::json::ParseError::Syntax { .. }) => false,
+                };
                 if still_original {
-                    let js = JsString::from_str(src, self.gc_heap_mut())
-                        .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
+                    let js = JsString::from_str(src, self.gc_heap_mut())?;
                     let mut obj_now = self
                         .json_root_get(obj_root)
                         .as_object()
                         .expect("rooted reviver context object");
-                    object::set(
-                        &mut obj_now,
-                        self.gc_heap_mut(),
-                        "source",
-                        Value::string(js),
-                    );
+                    self.create_data_property(&mut obj_now, "source", Value::string(js))?;
                 }
             }
             Ok(self.json_root_get(obj_root))
@@ -344,12 +357,12 @@ impl Interpreter {
 
     /// Allocate an empty `%Object.prototype%`-backed object.
     fn json_make_plain_object(&mut self) -> Result<object::JsObject, VmError> {
-        let object_proto = self.object_prototype_object_opt();
-        let root = self.object_root(object_proto)?;
-        object::alloc_object_with_roots(self.gc_heap_mut(), root, &mut |_: &mut dyn FnMut(
-            *mut otter_gc::raw::RawGc,
-        )| {})
-        .map_err(|_| self.err_type(("out of memory".to_string()).into()))
+        self.with_handle_scope(|this, scope| {
+            let object = this.scoped_object(scope)?;
+            this.escape_scoped(object)
+                .as_object()
+                .ok_or(VmError::TypeMismatch)
+        })
     }
 
     /// One key of InternalizeJSONProperty: recurse, then Delete on
@@ -363,7 +376,7 @@ impl Interpreter {
         key: &str,
         reviver_root: usize,
         source: Option<&crate::json::parse::SourceNode>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // The recursive revive moves the heap; root `holder` so the define /
         // delete below targets the live object, not a stale handle.
         let holder_root = self.json_root_push(holder);
@@ -413,7 +426,7 @@ impl Interpreter {
         key: &str,
         holder: Value,
         out: &mut String,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         // step 1 — value = ? Get(holder, key).
         // `holder` and the evolving `value` are parked on the scratch
         // root stack so the JS-string allocations below (key arguments,
@@ -459,7 +472,7 @@ impl Interpreter {
         holder_root: usize,
         value: Value,
         out: &mut String,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         let value_root = self.json_root_push(value);
         let rendered = self.serialize_json_property_rooted_into(
             stack,
@@ -488,19 +501,22 @@ impl Interpreter {
         holder_root: usize,
         value_root: usize,
         out: &mut String,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         // step 2 — invoke `toJSON` when present and callable.
         let value = self.json_root_get(value_root);
         if value.is_object_type() || value.is_big_int() {
             let to_json = self.get_property_value_for_call(stack, context, value, "toJSON")?;
             if to_json.is_callable() {
                 let to_json_root = self.json_root_push(to_json);
-                let key_arg = self.json_key_value(key)?;
+                let key_arg = self
+                    .json_key_value(key)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let args: SmallVec<[Value; 8]> = smallvec![key_arg];
                 let receiver = self.json_root_get(value_root);
                 let to_json = self.json_root_get(to_json_root);
-                let next =
-                    self.run_callable_sync_rooted(stack, context, &to_json, receiver, args)?;
+                let next = self
+                    .run_callable_sync_rooted(stack, Some(context), &to_json, receiver, args)
+                    .map_err(CommittedValueError::completed_call)?;
                 self.json_root_pop_to(to_json_root);
                 self.json_root_set(value_root, next);
             }
@@ -508,11 +524,15 @@ impl Interpreter {
 
         // step 3 — apply the replacer function.
         if let Some(replacer_root) = state.replacer_root {
-            let key_arg = self.json_key_value(key)?;
+            let key_arg = self
+                .json_key_value(key)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let args: SmallVec<[Value; 8]> = smallvec![key_arg, self.json_root_get(value_root)];
             let holder = self.json_root_get(holder_root);
             let replacer = self.json_root_get(replacer_root);
-            let next = self.run_callable_sync_rooted(stack, context, &replacer, holder, args)?;
+            let next = self
+                .run_callable_sync_rooted(stack, Some(context), &replacer, holder, args)
+                .map_err(CommittedValueError::completed_call)?;
             self.json_root_set(value_root, next);
         }
 
@@ -542,7 +562,7 @@ impl Interpreter {
                 WrapperKind::String => {
                     let s = self.coerce_to_string(stack, context, &value)?;
                     let js = JsString::from_str(&s, self.gc_heap_mut())
-                        .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     value = Value::string(js);
                 }
                 WrapperKind::Boolean(b) => value = Value::boolean(b),
@@ -581,11 +601,16 @@ impl Interpreter {
             return Ok(true);
         }
         if value.is_big_int() {
-            return Err(self.err_type((BIGINT_MESSAGE.to_string()).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type((BIGINT_MESSAGE.to_string()).into()),
+            ));
         }
         // step 11 — Object that is not callable.
         if value.is_object_type() && !value.is_callable() {
-            if self.json_is_array(&value)? {
+            if self
+                .json_is_array(&value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
                 self.serialize_json_array_into(stack, context, state, value, out)?;
             } else {
                 self.serialize_json_object_into(stack, context, state, value, out)?;
@@ -604,8 +629,9 @@ impl Interpreter {
         state: &mut JsonState,
         value: Value,
         out: &mut String,
-    ) -> Result<(), VmError> {
-        self.json_enter(state, &value)?;
+    ) -> Result<(), CommittedValueError> {
+        self.json_enter(state, &value)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         // Park the container: `json_enumerable_string_keys` mints a
         // `JsString` per key and each property may recurse, so a
         // scavenge can move `value` mid-loop. Re-read from the slot.
@@ -732,8 +758,9 @@ impl Interpreter {
         state: &mut JsonState,
         value: Value,
         out: &mut String,
-    ) -> Result<(), VmError> {
-        self.json_enter(state, &value)?;
+    ) -> Result<(), CommittedValueError> {
+        self.json_enter(state, &value)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         // Park the container so per-index recursion (which allocates
         // index-key strings and may scavenge) can't strand a stale copy.
         let value_root = self.json_root_push(value);
@@ -860,7 +887,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, CommittedValueError> {
         if let Some(arr) = value.as_array() {
             return Ok(crate::array::len(arr, self.gc_heap()));
         }
@@ -876,7 +903,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
-    ) -> Result<Vec<String>, VmError> {
+    ) -> Result<Vec<String>, CommittedValueError> {
         // Fast path — an ordinary object's enumerable own string keys
         // are read straight from its property table as Rust strings, in
         // ordinary own-key order. This skips both the per-key `JsString`
@@ -946,7 +973,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         replacer: &Value,
-    ) -> Result<Vec<String>, VmError> {
+    ) -> Result<Vec<String>, CommittedValueError> {
         let replacer_root = self.json_root_push(*replacer);
         let result = (|| {
             let len = self.json_length(stack, context, &self.json_root_get(replacer_root))?;
@@ -981,7 +1008,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         item: &Value,
-    ) -> Result<Option<String>, VmError> {
+    ) -> Result<Option<String>, CommittedValueError> {
         if let Some(s) = item.as_string(self.gc_heap()) {
             return Ok(Some(s.to_lossy_string(self.gc_heap())));
         }
@@ -1008,7 +1035,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         space: &Value,
-    ) -> Result<String, VmError> {
+    ) -> Result<String, CommittedValueError> {
         let space = if let Some(obj) = space.as_object() {
             let heap = self.gc_heap();
             if object::number_data(obj, heap).is_some() {
@@ -1044,41 +1071,28 @@ impl Interpreter {
     /// realm `%Object.prototype%`, carrying `""` as an own data
     /// property installed via CreateDataProperty (no `[[Set]]`).
     fn json_make_wrapper(&mut self, value: Value) -> Result<object::JsObject, VmError> {
-        let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            value.trace_value_slots(visitor);
-        };
-        let object_proto = self.object_prototype_object_opt();
-        let root = self.object_root(object_proto)?;
-        let obj = object::alloc_object_with_roots(self.gc_heap_mut(), root, &mut roots)
-            .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
-        // `set` interns the key and transitions the shape — allocations that
-        // can move the young receiver. Root `obj` (and `value`) and re-read the
-        // receiver afterwards so the write never goes through a stale handle,
-        // and return the moved handle.
-        let obj_root = self.json_root_push(Value::object(obj));
-        let value_root = self.json_root_push(value);
-        let result: Result<_, VmError> = {
-            let mut recv = self.json_root_get_object(obj_root);
-            let leaf = self.json_root_get(value_root);
-            object::set(&mut recv, self.gc_heap_mut(), "", leaf);
-            Ok(self.json_root_get_object(obj_root))
-        };
-        self.json_root_pop_to(obj_root);
-        result
-    }
-
-    /// Read a rooted object handle, refreshed after any intervening GC. Panics
-    /// if the rooted slot is not an object (a caller bug).
-    fn json_root_get_object(&self, root: usize) -> object::JsObject {
-        self.json_root_get(root)
-            .as_object()
-            .expect("rooted JSON handle must be an object")
+        self.with_handle_scope(|this, scope| {
+            // Park the incoming leaf before prototype/root/object preparation.
+            // The canonical define owner roots all pending descriptor storage;
+            // both handles are refreshed by the existing runtime root visitor.
+            let leaf = this.scoped_value(scope, value);
+            let receiver = this.scoped_object(scope)?;
+            this.scoped_define_data(
+                scope,
+                receiver,
+                "",
+                leaf,
+                object::PropertyFlags::new(true, true, true),
+            )?;
+            this.escape_scoped(receiver)
+                .as_object()
+                .ok_or(VmError::TypeMismatch)
+        })
     }
 
     /// Build the `key` argument passed to `toJSON` / the replacer.
     fn json_key_value(&mut self, key: &str) -> Result<Value, VmError> {
-        let s = JsString::from_str(key, self.gc_heap_mut())
-            .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
+        let s = JsString::from_str(key, self.gc_heap_mut())?;
         Ok(Value::string(s))
     }
 }

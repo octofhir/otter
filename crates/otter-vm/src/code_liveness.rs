@@ -129,7 +129,7 @@ pub(crate) fn census_candidate_ids(
         heap.for_each_live_payload::<crate::object::ExoticSlots, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });
-        heap.for_each_live_payload::<crate::object::SymbolPropsBody, _>(|_, body| {
+        heap.for_each_live_payload::<crate::object::symbol_table::SymbolPropsBody, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });
         heap.for_each_live_payload::<crate::object::AccessorCellBody, _>(|_, body| {
@@ -138,6 +138,13 @@ pub(crate) fn census_candidate_ids(
         heap.for_each_live_payload::<crate::closure_construct::ClosureRareBody, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });
+        heap.for_each_live_payload::<crate::constructor_layout::ConstructorLayoutBody, _>(
+            |_, body| {
+                // Layout keys are not JS callables. Real prototype values still
+                // participate in the same semantic census as immutable shapes.
+                body.visit_function_ids(&mut visit);
+            },
+        );
         heap.for_each_live_payload::<crate::array::ArrayExoticSlots, _>(|_, body| {
             body.visit_function_ids(&mut visit);
         });

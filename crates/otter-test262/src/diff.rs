@@ -1,7 +1,14 @@
 //! Baseline diff (`+N newly passing` / `-N regressed`).
 //!
-//! Loaded from two [`Baseline`] JSONs and reports per-test
-//! transitions. The CI gate (slice 105) fails on any regression.
+//! # Contents
+//! - Exact path-set and corpus checks, then per-test outcome transitions.
+//!
+//! # Invariants
+//! Missing tests never count as passing. New skips and changed skip policies
+//! fail the comparison even when aggregate skip counts remain unchanged.
+//!
+//! # See also
+//! - [`crate::report`] validates complete rows and their derived rollups.
 //!
 //! Spec: <https://tc39.es/ecma262/>
 
@@ -9,7 +16,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::report::{Baseline, FailingTest};
+use crate::provenance::RunnerProvenance;
+use crate::report::{Baseline, ReportError};
+use crate::results::Outcome;
 
 /// One row in the diff report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +26,7 @@ pub struct DiffRow {
     /// Test path.
     pub path: String,
     /// Outcome label in the previous baseline (`pass` / `fail` /
-    /// `skip` / `crash` / `timeout` / `oom` / `missing`).
+    /// `skip` / `crash` / `timeout` / `oom`).
     pub before: String,
     /// Outcome label in the current baseline.
     pub after: String,
@@ -28,14 +37,18 @@ pub struct DiffRow {
 }
 
 /// Diff result.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffReport {
+    /// Actual earlier executable and effective conditions.
+    pub previous_runner: RunnerProvenance,
+    /// Actual current executable and effective conditions.
+    pub current_runner: RunnerProvenance,
     /// Tests that were not Pass before but are Pass now.
     pub newly_passing: Vec<DiffRow>,
     /// Tests that were Pass before but aren't now (or transitioned
     /// to a worse-than-skip state).
     pub regressed: Vec<DiffRow>,
-    /// Tests whose outcome did not change.
+    /// Paths without a newly-passing or regressed transition.
     pub unchanged: u64,
 }
 
@@ -52,10 +65,14 @@ impl DiffReport {
         if self.is_clean() { 0 } else { 1 }
     }
 
-    /// Render the diff in the format from task 100 §"`--diff <previous>` mode".
+    /// Render exact transitions and both actual executable identities.
     #[must_use]
     pub fn to_text(&self, previous_path: &str) -> String {
         let mut out = String::new();
+        out.push_str(&format!(
+            "runner SHA256: {} -> {}\n",
+            self.previous_runner.executable_sha256, self.current_runner.executable_sha256
+        ));
         out.push_str(&format!(
             "test262 diff against {previous_path}:\n  +{} newly passing\n   -{} regressed",
             self.newly_passing.len(),
@@ -82,90 +99,55 @@ impl DiffReport {
     }
 }
 
-/// Compute the diff between two baselines.
-///
-/// `previous` and `current` are typically loaded via
-/// [`Baseline::from_path`]. The diff treats the union of the two
-/// `failing_tests` lists as the "non-Pass set"; any test missing
-/// from both is implicitly Pass on both sides.
-///
-/// **Limitation:** the canonical baseline JSON only carries the
-/// failing tests, not the full per-test result list. So the diff
-/// cannot tell `Pass-now / Skip-before` apart from `Pass-now /
-/// Pass-before` — both look identical when neither side records the
-/// test. This matches how V8/SpiderMonkey/Hermes publish their
-/// matrices.
-#[must_use]
-pub fn compute(previous: &Baseline, current: &Baseline) -> DiffReport {
-    let prev_failing: BTreeMap<&str, &FailingTest> = previous
-        .failing_tests
+/// Compare the same complete selection; an absent row never implies Pass.
+/// New or changed skips are regressions, including failures hidden by a skip.
+pub fn compute(previous: &Baseline, current: &Baseline) -> Result<DiffReport, ReportError> {
+    previous.validate()?;
+    current.validate_coverage(previous.tests.iter().map(|row| row.path.as_str()))?;
+    if previous.test262_commit != current.test262_commit {
+        return Err(ReportError::Invalid {
+            message: "cannot compare different Test262 corpus identities".to_owned(),
+        });
+    }
+    if !previous.runner.comparable_policy(&current.runner) {
+        return Err(ReportError::Invalid {
+            message: "cannot compare different target/assertion/effective semantic policy"
+                .to_owned(),
+        });
+    }
+    let previous_runner = previous.runner.clone();
+    let previous: BTreeMap<_, _> = previous
+        .tests
         .iter()
-        .map(|f| (f.path.as_str(), f))
+        .map(|row| (row.path.as_str(), &row.outcome))
         .collect();
-    let cur_failing: BTreeMap<&str, &FailingTest> = current
-        .failing_tests
-        .iter()
-        .map(|f| (f.path.as_str(), f))
-        .collect();
-
-    let mut newly_passing = Vec::new();
-    let mut regressed = Vec::new();
-
-    // Anything failing before that is no longer failing → newly passing.
-    for (path, prev_row) in &prev_failing {
-        if !cur_failing.contains_key(path) {
-            newly_passing.push(DiffRow {
-                path: (*path).to_string(),
-                before: prev_row.outcome.clone(),
-                after: "pass".to_string(),
-                reason: None,
-            });
+    let mut report = DiffReport {
+        previous_runner,
+        current_runner: current.runner.clone(),
+        newly_passing: Vec::new(),
+        regressed: Vec::new(),
+        unchanged: 0,
+    };
+    for row in &current.tests {
+        let before = previous[row.path.as_str()];
+        let after = &row.outcome;
+        let change = || DiffRow {
+            path: row.path.clone(),
+            before: before.label().to_owned(),
+            after: after.label().to_owned(),
+            reason: after.detail(),
+        };
+        if !matches!(before, Outcome::Pass) && matches!(after, Outcome::Pass) {
+            report.newly_passing.push(change());
+        } else if matches!(after, Outcome::Skipped { .. }) && before != after
+            || outcome_severity(after.label()) > outcome_severity(before.label())
+        {
+            report.regressed.push(change());
+        } else {
+            report.unchanged += 1;
         }
     }
-
-    // Anything failing now that wasn't failing before → regressed.
-    // Anything failing in both whose outcome label changed for the
-    // worse → also a regression (covers `fail → crash`, etc.).
-    for (path, cur_row) in &cur_failing {
-        match prev_failing.get(path) {
-            None => regressed.push(DiffRow {
-                path: (*path).to_string(),
-                before: "pass".to_string(),
-                after: cur_row.outcome.clone(),
-                reason: Some(cur_row.reason.clone()),
-            }),
-            Some(prev_row)
-                if outcome_severity(&cur_row.outcome) > outcome_severity(&prev_row.outcome) =>
-            {
-                regressed.push(DiffRow {
-                    path: (*path).to_string(),
-                    before: prev_row.outcome.clone(),
-                    after: cur_row.outcome.clone(),
-                    reason: Some(cur_row.reason.clone()),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    // Tests that flipped within the same severity (still failing
-    // for the same reason) count as unchanged for the gate; the
-    // unchanged tally below absorbs both "still pass" and "still
-    // fail with the same severity" states.
-    let touched = (newly_passing.len() + regressed.len()) as u64;
-    let union: u64 = prev_failing
-        .keys()
-        .chain(cur_failing.keys())
-        .collect::<std::collections::HashSet<_>>()
-        .len() as u64;
-    let total = current.totals.total.max(previous.totals.total);
-    let unchanged = total.saturating_sub(touched.max(union));
-
-    DiffReport {
-        newly_passing,
-        regressed,
-        unchanged,
-    }
+    Ok(report)
 }
 
 /// Order outcomes by severity so transitions like `fail → crash`
@@ -186,10 +168,17 @@ fn outcome_severity(label: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::{Outcome, TestResult};
+    use crate::results::{Outcome, SkipReason, TestResult};
 
     fn baseline_from(results: &[TestResult]) -> Baseline {
-        Baseline::from_results(results, "t", "e", "now")
+        Baseline::from_results(
+            results.to_vec(),
+            crate::provenance::synthetic(),
+            "t",
+            "e",
+            "now",
+        )
+        .unwrap()
     }
 
     fn pass(path: &str) -> TestResult {
@@ -230,7 +219,7 @@ mod tests {
     #[test]
     fn self_diff_is_clean() {
         let b = baseline_from(&[pass("a.js"), fail("b.js", "x")]);
-        let d = compute(&b, &b);
+        let d = compute(&b, &b).unwrap();
         assert!(d.is_clean());
         assert_eq!(d.exit_code(), 0);
         assert_eq!(d.regressed.len(), 0);
@@ -241,7 +230,7 @@ mod tests {
     fn regression_pass_to_fail_flagged() {
         let prev = baseline_from(&[pass("a.js"), pass("b.js")]);
         let cur = baseline_from(&[pass("a.js"), fail("b.js", "broke")]);
-        let d = compute(&prev, &cur);
+        let d = compute(&prev, &cur).unwrap();
         assert!(!d.is_clean());
         assert_eq!(d.exit_code(), 1);
         assert_eq!(d.regressed.len(), 1);
@@ -254,7 +243,7 @@ mod tests {
     fn newly_passing_tests_listed() {
         let prev = baseline_from(&[fail("a.js", "x")]);
         let cur = baseline_from(&[pass("a.js")]);
-        let d = compute(&prev, &cur);
+        let d = compute(&prev, &cur).unwrap();
         assert_eq!(d.newly_passing.len(), 1);
         assert_eq!(d.newly_passing[0].path, "a.js");
     }
@@ -263,7 +252,7 @@ mod tests {
     fn fail_to_crash_is_regression() {
         let prev = baseline_from(&[fail("a.js", "x")]);
         let cur = baseline_from(&[crash("a.js")]);
-        let d = compute(&prev, &cur);
+        let d = compute(&prev, &cur).unwrap();
         assert!(!d.is_clean());
         assert_eq!(d.regressed[0].after, "crash");
     }
@@ -272,10 +261,59 @@ mod tests {
     fn text_format_matches_template() {
         let prev = baseline_from(&[pass("a.js"), pass("b.js")]);
         let cur = baseline_from(&[pass("a.js"), fail("b.js", "broke")]);
-        let d = compute(&prev, &cur);
+        let d = compute(&prev, &cur).unwrap();
         let text = d.to_text("docs/.../prev.json");
         assert!(text.contains("newly passing"));
         assert!(text.contains("regressed"));
         assert!(text.contains("b.js"));
+    }
+    #[test]
+    fn same_count_skip_swap_is_a_regression() {
+        let mut skipped = pass("a.js");
+        skipped.outcome = Outcome::Skipped {
+            reason: SkipReason::Feature {
+                feature: "Atomics".to_owned(),
+            },
+        };
+        let previous = baseline_from(&[skipped.clone(), pass("b.js")]);
+        skipped.path = "b.js".to_owned();
+        let current = baseline_from(&[pass("a.js"), skipped]);
+        let diff = compute(&previous, &current).unwrap();
+        assert_eq!(diff.newly_passing[0].path, "a.js");
+        assert_eq!(diff.regressed[0].path, "b.js");
+        assert!(!diff.is_clean());
+    }
+
+    #[test]
+    fn missing_failure_never_becomes_a_pass_and_skip_never_hides_a_failure() {
+        let previous = baseline_from(&[fail("a.js", "failure"), pass("b.js")]);
+        let missing = baseline_from(&[pass("b.js")]);
+        assert!(compute(&previous, &missing).is_err());
+        let mut skipped = pass("a.js");
+        skipped.outcome = Outcome::Skipped {
+            reason: SkipReason::MissingFrontmatter,
+        };
+        let hidden = baseline_from(&[skipped, pass("b.js")]);
+        let diff = compute(&previous, &hidden).unwrap();
+        assert_eq!(diff.regressed.len(), 1);
+        assert!(diff.newly_passing.is_empty());
+    }
+
+    #[test]
+    fn intentional_binary_change_is_recorded_but_policy_change_is_rejected() {
+        let previous = baseline_from(&[pass("a.js")]);
+        let mut current = previous.clone();
+        current.runner.executable_sha256 = "1".repeat(64);
+        let diff = compute(&previous, &current).unwrap();
+        assert_ne!(
+            diff.previous_runner.executable_sha256,
+            diff.current_runner.executable_sha256
+        );
+        current
+            .runner
+            .semantic_config
+            .skip_flags
+            .push("module".to_owned());
+        assert!(compute(&previous, &current).is_err());
     }
 }

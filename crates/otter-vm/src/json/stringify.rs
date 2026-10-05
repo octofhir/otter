@@ -483,7 +483,15 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         let self_ref = Value::object(obj);
-        crate::object::set(&mut obj, &mut heap, "self", self_ref);
+        assert!(
+            crate::object::define_own_property_in_place(
+                &mut obj,
+                &mut heap,
+                "self",
+                crate::object::PropertyDescriptor::data(self_ref, true, true, true)
+            )
+            .expect("fixture property allocation")
+        );
         let err = stringify(&Value::object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
     }

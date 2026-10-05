@@ -55,9 +55,7 @@ fn coerce_to_string(ctx: &mut NativeCtx<'_>, value: Value) -> Result<String, Nat
         let string = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &value)
         });
-        return string.map_err(|error| {
-            crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS)
-        });
+        return string.map_err(|error| error.into_native(ctx.interp_mut(), CLASS));
     }
     Err(type_err("locale value cannot be converted to a string"))
 }
@@ -70,14 +68,13 @@ fn has_property(ctx: &mut NativeCtx<'_>, object: Value, key: &str) -> Result<boo
     let result = ctx.with_turn_parts(|interp, stack| {
         interp.ordinary_has_property_value(
             stack,
-            &exec,
+            Some(&exec),
             object,
             &crate::VmPropertyKey::String(key),
             0,
         )
     });
-    result
-        .map_err(|error| crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS))
+    result.map_err(|error| error.into_native(ctx.interp_mut(), CLASS))
 }
 
 fn validate_and_canon(tag: &str) -> Result<String, NativeError> {
@@ -237,7 +234,7 @@ fn to_length(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, NativeErro
     let len = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_length_or_throw(interp, stack, &exec, value)
     });
-    len.map_err(|error| crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS))
+    len.map_err(|error| error.into_native(ctx.interp_mut(), CLASS))
 }
 
 /// A locale is "supported" iff ICU has likely-subtags data for its
@@ -338,13 +335,8 @@ pub(crate) fn supported_locales_of(
                 let string = scope.with_turn_parts(|interp, stack| {
                     crate::coerce::to_string_or_throw(interp, stack, &exec, &locale_matcher)
                 });
-                let string = string.map_err(|error| {
-                    crate::native_function::vm_to_native_error(
-                        scope.context().interp_mut(),
-                        error,
-                        CLASS,
-                    )
-                })?;
+                let string = string
+                    .map_err(|error| error.into_native(scope.context().interp_mut(), CLASS))?;
                 if string != "lookup" && string != "best fit" {
                     return Err(range_err("invalid localeMatcher option"));
                 }
@@ -602,9 +594,7 @@ pub(crate) fn supported_values_of(
     let string = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_string_or_throw(interp, stack, &exec, &key_v)
     });
-    let key = string.map_err(|error| {
-        crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS)
-    })?;
+    let key = string.map_err(|error| error.into_native(ctx.interp_mut(), CLASS))?;
     let list: &[&str] = match key.as_str() {
         "calendar" => CALENDARS,
         "collation" => COLLATIONS,

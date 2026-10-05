@@ -9,10 +9,14 @@
 //! - [`fs`] - permission-gated `node:fs` / `fs` helpers.
 //! - [`napi`] - stable Node-API ABI and `.node` dynamic-library loader.
 //! - [`HOSTED_MODULES`] - static Node hosted-module specs.
+//! - `nodelib` - every builtin implemented in JavaScript, compiled at product
+//!   build time from the rows of `builtin_table.rs` by `build/builtins.rs`.
 //! - [`NodeApiBuilderExt`] - convenience helper for runtime builders.
 //!
 //! # Invariants
 //! - Node modules are opt-in and are not installed by `otter-runtime` itself.
+//! - No builtin is compiled at run time: each links lazily, on first
+//!   `require`, from its embedded verified module.
 //! - Permission checks happen at the Rust boundary before host resources open.
 //! - Native addons require both read and FFI capabilities and expose VM values
 //!   through persistent-root-backed ABI handles.
@@ -23,34 +27,24 @@
 //! - [`otter_runtime::CommonJsAddonLoader`]
 
 pub mod async_hooks;
-mod buffer;
 mod buffer_decode;
 pub mod child_process;
 pub mod crypto;
 pub mod dgram;
-pub mod diagnostics_channel;
 pub mod dns;
 pub mod error_source_ext;
-pub mod events;
 pub mod fs;
 mod fs_binding;
 mod fs_cp;
 mod fs_watch;
 pub mod globals;
-pub mod internal_errors_ext;
-pub mod internal_test_binding_ext;
 pub mod misc_modules;
 pub mod napi;
 pub mod net;
 mod nodelib;
 pub mod os;
-pub mod querystring;
-pub mod readline;
-pub mod stream;
-pub mod string_decoder;
 pub mod stubs;
 mod transport_payload;
-pub mod tty;
 pub mod url;
 pub mod util;
 pub mod zlib_stream;
@@ -62,17 +56,14 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("node:fs", nodelib::node_fs),
     HostedModule::cjs_only("fs", nodelib::node_fs),
     HostedModule::cjs_only("__fsnative", fs::fs_native_cjs_value),
-    HostedModule::cjs_only("node:fs/promises", fs::fs_promises_cjs_value),
-    HostedModule::cjs_only("fs/promises", fs::fs_promises_cjs_value),
+    HostedModule::cjs_only("node:fs/promises", nodelib::node_fs_promises),
+    HostedModule::cjs_only("fs/promises", nodelib::node_fs_promises),
     HostedModule::cjs_only("node:assert", nodelib::node_assert_vendored),
     HostedModule::cjs_only("assert", nodelib::node_assert_vendored),
     HostedModule::cjs_only("node:assert/strict", nodelib::node_assert_strict_vendored),
     HostedModule::cjs_only("assert/strict", nodelib::node_assert_strict_vendored),
     HostedModule::cjs_only("internal/url", nodelib::internal_url),
-    HostedModule::cjs_only(
-        "internal/test/binding",
-        internal_test_binding_ext::internal_test_binding_cjs_value,
-    ),
+    HostedModule::cjs_only("internal/test/binding", nodelib::internal_test_binding),
     HostedModule::cjs_only("node:async_hooks", async_hooks::async_hooks_cjs_value),
     HostedModule::cjs_only("async_hooks", async_hooks::async_hooks_cjs_value),
     HostedModule::cjs_only("node:dgram", nodelib::node_dgram),
@@ -81,8 +72,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("dns", dns::dns_cjs_value),
     HostedModule::cjs_only("node:dns/promises", dns::dns_cjs_value),
     HostedModule::cjs_only("dns/promises", dns::dns_cjs_value),
-    HostedModule::cjs_only("node:domain", misc_modules::domain_cjs_value),
-    HostedModule::cjs_only("domain", misc_modules::domain_cjs_value),
+    HostedModule::cjs_only("node:domain", nodelib::node_domain),
+    HostedModule::cjs_only("domain", nodelib::node_domain),
     HostedModule::cjs_only("node:console", nodelib::node_console),
     HostedModule::cjs_only("console", nodelib::node_console),
     HostedModule::cjs_only(
@@ -91,8 +82,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::cjs_only("internal/console/global", nodelib::internal_console_global),
     HostedModule::cjs_only("internal/cli_table", nodelib::internal_cli_table),
-    HostedModule::cjs_only("node:vm", misc_modules::vm_cjs_value),
-    HostedModule::cjs_only("vm", misc_modules::vm_cjs_value),
+    HostedModule::cjs_only("node:vm", nodelib::node_vm),
+    HostedModule::cjs_only("vm", nodelib::node_vm),
     HostedModule::cjs_only("node:process", misc_modules::process_cjs_value),
     HostedModule::cjs_only("process", misc_modules::process_cjs_value),
     HostedModule::cjs_only("node:path", nodelib::node_path),
@@ -222,10 +213,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         nodelib::internal_test_runner_reporter_v8_serializer,
     ),
     HostedModule::cjs_only("node:stream", nodelib::node_stream),
-    HostedModule::cjs_only("node:stream/web", stream::stream_web_cjs_value),
-    HostedModule::cjs_only("stream/web", stream::stream_web_cjs_value),
-    HostedModule::cjs_only("node:stream/consumers", stream::stream_consumers_cjs_value),
-    HostedModule::cjs_only("stream/consumers", stream::stream_consumers_cjs_value),
+    HostedModule::cjs_only("node:stream/web", nodelib::node_stream_web),
+    HostedModule::cjs_only("stream/web", nodelib::node_stream_web),
+    HostedModule::cjs_only("node:stream/consumers", nodelib::node_stream_consumers),
+    HostedModule::cjs_only("stream/consumers", nodelib::node_stream_consumers),
     HostedModule::cjs_only("node:timers", nodelib::node_timers),
     HostedModule::cjs_only("timers", nodelib::node_timers),
     HostedModule::cjs_only("node:timers/promises", nodelib::node_timers_promises),
@@ -236,10 +227,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         nodelib::internal_otter_timers_binding,
     ),
     HostedModule::cjs_only("internal/priority_queue", nodelib::internal_priority_queue),
-    HostedModule::cjs_only("node:readline", readline::readline_cjs_value),
-    HostedModule::cjs_only("readline", readline::readline_cjs_value),
-    HostedModule::cjs_only("node:readline/promises", readline::readline_cjs_value),
-    HostedModule::cjs_only("readline/promises", readline::readline_cjs_value),
+    HostedModule::cjs_only("node:readline", nodelib::node_readline),
+    HostedModule::cjs_only("readline", nodelib::node_readline),
+    HostedModule::cjs_only("node:readline/promises", nodelib::node_readline),
+    HostedModule::cjs_only("readline/promises", nodelib::node_readline),
     HostedModule::cjs_only("node:cluster", nodelib::node_cluster),
     HostedModule::cjs_only("cluster", nodelib::node_cluster),
     HostedModule::cjs_only("internal/linkedlist", nodelib::internal_linkedlist),
@@ -260,30 +251,27 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "internal/cluster/primary",
         nodelib::internal_cluster_primary,
     ),
-    HostedModule::cjs_only("node:crypto", crypto::crypto_cjs_value),
-    HostedModule::cjs_only("crypto", crypto::crypto_cjs_value),
+    HostedModule::cjs_only("node:crypto", nodelib::node_crypto),
+    HostedModule::cjs_only("crypto", nodelib::node_crypto),
     HostedModule::cjs_only("__cryptonative", crypto::crypto_native_cjs_value),
     HostedModule::cjs_only("node:zlib", nodelib::node_zlib),
     HostedModule::cjs_only("zlib", nodelib::node_zlib),
-    HostedModule::cjs_only("node:perf_hooks", misc_modules::perf_hooks_cjs_value),
-    HostedModule::cjs_only("perf_hooks", misc_modules::perf_hooks_cjs_value),
-    HostedModule::cjs_only("node:v8", misc_modules::v8_cjs_value),
-    HostedModule::cjs_only("v8", misc_modules::v8_cjs_value),
-    HostedModule::cjs_only("node:module", misc_modules::module_cjs_value),
-    HostedModule::cjs_only("module", misc_modules::module_cjs_value),
+    HostedModule::cjs_only("node:perf_hooks", nodelib::node_perf_hooks),
+    HostedModule::cjs_only("perf_hooks", nodelib::node_perf_hooks),
+    HostedModule::cjs_only("node:v8", nodelib::node_v8),
+    HostedModule::cjs_only("v8", nodelib::node_v8),
+    HostedModule::cjs_only("node:module", nodelib::node_module),
+    HostedModule::cjs_only("module", nodelib::node_module),
     HostedModule::cjs_only(
         "node:diagnostics_channel",
-        diagnostics_channel::diagnostics_channel_cjs_value,
+        nodelib::node_diagnostics_channel,
     ),
-    HostedModule::cjs_only(
-        "diagnostics_channel",
-        diagnostics_channel::diagnostics_channel_cjs_value,
-    ),
+    HostedModule::cjs_only("diagnostics_channel", nodelib::node_diagnostics_channel),
     HostedModule::cjs_only("stream", nodelib::node_stream),
-    HostedModule::cjs_only("node:querystring", querystring::querystring_cjs_value),
-    HostedModule::cjs_only("node:constants", misc_modules::constants_cjs_value),
-    HostedModule::cjs_only("constants", misc_modules::constants_cjs_value),
-    HostedModule::cjs_only("querystring", querystring::querystring_cjs_value),
+    HostedModule::cjs_only("node:querystring", nodelib::node_querystring),
+    HostedModule::cjs_only("node:constants", nodelib::node_constants),
+    HostedModule::cjs_only("constants", nodelib::node_constants),
+    HostedModule::cjs_only("querystring", nodelib::node_querystring),
     HostedModule::cjs_only("node:string_decoder", nodelib::node_string_decoder),
     HostedModule::cjs_only("string_decoder", nodelib::node_string_decoder),
     HostedModule::cjs_only(
@@ -294,8 +282,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("util", nodelib::node_util),
     HostedModule::cjs_only("node:util/types", util::util_types_cjs_value),
     HostedModule::cjs_only("util/types", util::util_types_cjs_value),
-    HostedModule::cjs_only("node:tty", tty::tty_cjs_value),
-    HostedModule::cjs_only("tty", tty::tty_cjs_value),
+    HostedModule::cjs_only("node:tty", nodelib::node_tty),
+    HostedModule::cjs_only("tty", nodelib::node_tty),
     HostedModule::cjs_only("node:net", nodelib::node_net),
     HostedModule::cjs_only("net", nodelib::node_net),
     HostedModule::cjs_only("internal/otter/net", net::net_binding_cjs_value),
@@ -364,8 +352,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::cjs_only("node:http", nodelib::node_http),
     HostedModule::cjs_only("http", nodelib::node_http),
-    HostedModule::cjs_only("node:https", misc_modules::https_cjs_value),
-    HostedModule::cjs_only("https", misc_modules::https_cjs_value),
+    HostedModule::cjs_only("node:https", nodelib::node_https),
+    HostedModule::cjs_only("https", nodelib::node_https),
     HostedModule::cjs_only("_http_common", nodelib::http_common),
     HostedModule::cjs_only("_http_agent", nodelib::http_agent),
     HostedModule::cjs_only("_http_client", nodelib::http_client),
@@ -408,12 +396,12 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("internal/watchdog", nodelib::internal_watchdog),
     HostedModule::new("node:worker_threads", stubs::install_worker_threads),
     HostedModule::new("worker_threads", stubs::install_worker_threads),
-    HostedModule::cjs_only("node:buffer", buffer::buffer_cjs_value),
-    HostedModule::cjs_only("buffer", buffer::buffer_cjs_value),
-    HostedModule::new_with_cjs_value("node:url", url::install_url_module, url::url_cjs_value),
-    HostedModule::new_with_cjs_value("url", url::install_url_module, url::url_cjs_value),
-    HostedModule::cjs_only("node:child_process", child_process::child_process_cjs_value),
-    HostedModule::cjs_only("child_process", child_process::child_process_cjs_value),
+    HostedModule::cjs_only("node:buffer", nodelib::node_buffer),
+    HostedModule::cjs_only("buffer", nodelib::node_buffer),
+    HostedModule::new_with_cjs_value("node:url", url::install_url_module, nodelib::node_url),
+    HostedModule::new_with_cjs_value("url", url::install_url_module, nodelib::node_url),
+    HostedModule::cjs_only("node:child_process", nodelib::node_child_process),
+    HostedModule::cjs_only("child_process", nodelib::node_child_process),
     HostedModule::cjs_only("__cpnative", child_process::child_process_native_cjs_value),
     HostedModule::cjs_only("__bufdecode", buffer_decode::decode_native_cjs_value),
     HostedModule::cjs_only("internal/bootstrap/realm", nodelib::bootstrap_realm),

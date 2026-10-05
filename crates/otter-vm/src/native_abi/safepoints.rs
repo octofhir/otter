@@ -1,32 +1,44 @@
 //! Code-object-owned safepoint and frame-map contracts.
 //!
 //! # Contents
-//! - [`FrameMap`] and [`SpillMap`] index immutable code-object side tables.
-//! - [`SafepointEntry`] maps a native return PC to logical state and a stub id.
-//! - [`SafepointRecord`] is the VM-owned expanded root map consumed by current
-//!   native frames.
+//! - [`SafepointEntry`] associates an exact native return offset with one record.
+//! - [`SafepointRecord`] is the VM-owned root map consumed by current native
+//!   frames: the native spill roots beyond the canonical register window.
 //!
 //! # Invariants
-//! - Machine code publishes only `(code_object_id, safepoint_id)`; it never
-//!   supplies a raw metadata-table pointer.
-//! - Every live tagged value is named exactly once by a frame or spill map.
+//! - A JS child or pending request carries its caller's actual return address;
+//!   the caller's code id resolves it in that exact retained generation.
+//! - Active C helpers publish `(code_object_id, safepoint_id)` before collection.
+//!   Neither boundary supplies a raw metadata-table pointer.
+//! - The collector traces every published frame's canonical register window
+//!   itself, so a record never names a window slot; it names exactly the live
+//!   tagged native spill slots.
 //! - Inline activation recipes use the same spill slots and code generation;
 //!   they own no moving values or alternate runtime frame layout. A publication
 //!   flag distinguishes generated native parents from runtime-published recipes.
 //! - Machine-register roots are saved to mapped spill slots before an
 //!   allocating or reentrant call.
+//! - Owned backing-byte accounting includes reserved tagged-vector capacity
+//!   and nested inline recipes, excluding the enclosing record itself.
 //!
 //! # See also
 //! - [`super::frame`] for the published activation.
 //! - [`super::metadata::CodeObjectMetadata`] for table ownership.
 
-use super::{FrameStateId, NO_FRAME_STATE, RuntimeStubId, SafepointId};
+use super::{FrameStateId, NO_FRAME_STATE, SafepointId};
 
 /// Rust resolver behind a machine-visible [`CodeRegistryView`].
 pub type SafepointResolverFn = unsafe extern "C" fn(
     context: u64,
     code_object_id: u64,
     safepoint_id: SafepointId,
+) -> *const SafepointRecord;
+
+/// Resolver of one absolute return address in an expected caller generation.
+pub type ReturnPcResolverFn = unsafe extern "C" fn(
+    context: u64,
+    code_object_id: u64,
+    return_pc: u64,
 ) -> *const SafepointRecord;
 
 /// Fixed code-registry lookup surface published on [`super::VmThread`].
@@ -42,6 +54,8 @@ pub struct CodeRegistryView {
     pub function_entries: u64,
     /// Number of indexed function identities in `function_entries`.
     pub function_entry_count: u64,
+    /// Address of the exact code-id/return-PC resolver. No mapping history scan.
+    pub resolve_return_pc: u64,
 }
 
 const _: [(); 16] = [(); std::mem::offset_of!(CodeRegistryView, function_entries)];
@@ -67,104 +81,111 @@ impl CodeRegistryView {
         let record = unsafe { resolver(self.context, code_object_id, safepoint_id) };
         (!record.is_null()).then_some(record)
     }
-}
-
-/// Storage class for one tagged value location at a safepoint.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaggedLocationKind {
-    /// Interpreter-visible register-window slot.
-    FrameSlot = 0,
-    /// Machine register in platform ABI numbering.
-    MachineRegister = 1,
-    /// Native spill slot relative to the spill-area base.
-    SpillSlot = 2,
-}
-
-/// One tagged `Value` location live at a safepoint.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TaggedLocation {
-    /// Storage class.
-    pub kind: TaggedLocationKind,
-    /// Register, frame-slot, or spill-slot index.
-    pub index: u16,
-}
-
-impl TaggedLocation {
-    /// Tagged interpreter-visible frame slot.
-    #[must_use]
-    pub const fn frame_slot(index: u16) -> Self {
-        Self {
-            kind: TaggedLocationKind::FrameSlot,
-            index,
+    /// Resolve a genuine return address in exactly the expected code object.
+    ///
+    /// # Safety
+    /// The resolver/context and owning code mapping remain live for this call.
+    pub unsafe fn resolve_return(
+        self,
+        code_object_id: u64,
+        return_pc: u64,
+    ) -> Option<*const SafepointRecord> {
+        if self.resolve_return_pc == 0 || return_pc == 0 {
+            return None;
         }
-    }
-
-    /// Tagged machine register.
-    #[must_use]
-    pub const fn machine_register(index: u16) -> Self {
-        Self {
-            kind: TaggedLocationKind::MachineRegister,
-            index,
-        }
-    }
-
-    /// Tagged native spill slot.
-    #[must_use]
-    pub const fn spill_slot(index: u16) -> Self {
-        Self {
-            kind: TaggedLocationKind::SpillSlot,
-            index,
-        }
+        let resolver: ReturnPcResolverFn = unsafe {
+            std::mem::transmute::<usize, ReturnPcResolverFn>(self.resolve_return_pc as usize)
+        };
+        let record = unsafe { resolver(self.context, code_object_id, return_pc) };
+        (!record.is_null()).then_some(record)
     }
 }
 
-/// Compact immutable frame-root map descriptor.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameMap {
-    /// Dense map id local to the owning code object.
-    pub id: u32,
-    /// First bitmap word in the code object's frame-map table.
-    pub bitmap_offset: u32,
-    /// Number of bitmap words.
-    pub bitmap_word_count: u16,
-    /// Number of initialized frame slots covered by the map.
-    pub slot_count: u16,
+/// Live tagged native spill slots at one safepoint: a bitmap over the code
+/// object's spill area, as V8's safepoint table records tagged stack slots.
+///
+/// A raw machine register is never a root at a collecting boundary (the
+/// register map saves it to its spill home first), so a slot index is the
+/// only location a record names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct SpillRoots {
+    /// Bit `i` set when spill slot `i` holds a live tagged value. The last
+    /// word is nonzero unless the set is empty.
+    words: Box<[u64]>,
 }
 
-/// Compact immutable native spill-root map descriptor.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpillMap {
-    /// Dense map id local to the owning code object.
-    pub id: u32,
-    /// First spill offset in the code object's location table.
-    pub location_offset: u32,
-    /// Number of tagged spill locations.
-    pub location_count: u16,
+impl SpillRoots {
+    /// The set of the given spill-slot indices.
+    #[must_use]
+    pub fn from_slots(slots: impl IntoIterator<Item = u16>) -> Self {
+        let mut words: Vec<u64> = Vec::new();
+        for slot in slots {
+            let word = usize::from(slot) / 64;
+            if words.len() <= word {
+                words.resize(word + 1, 0);
+            }
+            words[word] |= 1 << (slot % 64);
+        }
+        Self {
+            words: words.into_boxed_slice(),
+        }
+    }
+
+    /// Whether no slot is rooted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Number of rooted slots.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// One past the highest rooted slot index; zero when empty.
+    #[must_use]
+    pub fn end(&self) -> usize {
+        self.words.last().map_or(0, |last| {
+            (self.words.len() - 1) * 64 + (64 - last.leading_zeros() as usize)
+        })
+    }
+
+    /// Rooted slot indices in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.words.iter().enumerate().flat_map(|(index, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    (index * 64 + bit as usize) as u16
+                })
+            })
+        })
+    }
+
+    /// Owned bitmap bytes.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        std::mem::size_of_val(self.words.as_ref()) as u64
+    }
 }
 
-/// Machine-code return-PC safepoint entry.
+/// Exact machine return address association, owned by one code generation.
+/// Source and traced locations live only in the referenced SafepointRecord.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SafepointEntry {
-    /// Dense id local to the owning code object.
-    pub id: SafepointId,
-    /// Native return offset within the owning code object.
+    /// Offset immediately after a real CALL/BLR in the complete mapping.
     pub native_return_offset: u32,
-    /// Canonical instruction-index PC published before the call.
-    pub logical_pc: u32,
-    /// [`FrameMap::id`].
-    pub frame_map_id: u32,
-    /// [`SpillMap::id`].
-    pub spill_map_id: u32,
-    /// Deopt/side-exit frame state or [`NO_FRAME_STATE`].
-    pub frame_state_id: FrameStateId,
-    /// Runtime stub invoked at this return PC.
-    pub stub_id: RuntimeStubId,
+    /// Code-object-local source and root recipe.
+    pub safepoint_id: SafepointId,
 }
+const _: [(); 8] = [(); std::mem::size_of::<SafepointEntry>()];
 
 /// VM-owned expanded root map used by the current collector integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,8 +194,9 @@ pub struct SafepointRecord {
     pub id: SafepointId,
     /// Frame-state snapshot or [`NO_FRAME_STATE`].
     pub frame_state: FrameStateId,
-    /// Tagged values visible to the moving collector.
-    pub tagged_locations: Vec<TaggedLocation>,
+    /// Native spill slots holding live tagged values, beyond the canonical
+    /// register window the collector always traces.
+    pub spill_roots: SpillRoots,
     /// Logical inline descendants, with values indexed into the precise spill map.
     /// The owning code generation and this record's id select the recipe.
     pub inline_frames: Box<[crate::deopt::DeoptFrame<Option<u16>>]>,
@@ -189,63 +211,28 @@ pub struct SafepointRecord {
 pub const NO_CALL_PC: u32 = u32::MAX;
 
 impl SafepointRecord {
-    /// Build a full interpreter-visible register-window root set.
+    /// A record rooting nothing beyond the canonical register window, which
+    /// the collector traces for every published frame.
     #[must_use]
-    pub fn frame_slot_window(
-        id: SafepointId,
-        frame_state: FrameStateId,
-        register_count: u16,
-    ) -> Self {
+    pub fn window(id: SafepointId, frame_state: FrameStateId) -> Self {
         Self {
             inline_frames: Box::default(),
             call_pc: NO_CALL_PC,
             id,
             frame_state,
-            tagged_locations: (0..register_count)
-                .map(TaggedLocation::frame_slot)
-                .collect(),
+            spill_roots: SpillRoots::default(),
         }
     }
 
-    /// Expand one compact frame bitmap into the collector-facing root record.
-    ///
-    /// `bitmap_words` is the owning code object's complete immutable bitmap
-    /// table. `None` rejects a descriptor whose range or width does not cover
-    /// exactly `slot_count` frame slots.
+    /// Owned heap backing retained by this root record, excluding the record
+    /// itself: the spill bitmap and all inline frame slot slices, allocated
+    /// for the generation's complete lifetime.
     #[must_use]
-    pub fn from_frame_map(
-        frame_map: FrameMap,
-        frame_state: FrameStateId,
-        bitmap_words: &[u64],
-    ) -> Option<Self> {
-        let required_words = usize::from(frame_map.slot_count).div_ceil(u64::BITS as usize);
-        if usize::from(frame_map.bitmap_word_count) != required_words {
-            return None;
-        }
-        let start = usize::try_from(frame_map.bitmap_offset).ok()?;
-        let end = start.checked_add(required_words)?;
-        let words = bitmap_words.get(start..end)?;
-        let tagged_locations = (0..frame_map.slot_count)
-            .filter(|slot| {
-                let slot = usize::from(*slot);
-                words[slot / u64::BITS as usize] & (1_u64 << (slot % u64::BITS as usize)) != 0
-            })
-            .map(TaggedLocation::frame_slot)
-            .collect();
-        Some(Self {
-            inline_frames: Box::default(),
-            call_pc: NO_CALL_PC,
-            id: frame_map.id,
-            frame_state,
-            tagged_locations,
-        })
-    }
-
-    /// Heap storage retained by inline activation recipes (excluding this record).
-    #[must_use]
-    pub fn inline_retained_bytes(&self) -> u64 {
+    pub fn retained_bytes(&self) -> u64 {
         self.inline_frames.iter().fold(
-            std::mem::size_of_val(self.inline_frames.as_ref()) as u64,
+            self.spill_roots
+                .retained_bytes()
+                .saturating_add(std::mem::size_of_val(self.inline_frames.as_ref()) as u64),
             |bytes, frame| bytes.saturating_add(std::mem::size_of_val(frame.slots.as_ref()) as u64),
         )
     }
@@ -257,45 +244,57 @@ impl SafepointRecord {
     }
 }
 
-const _: [(); 4] = [(); std::mem::size_of::<TaggedLocation>()];
-const _: [(); 32] = [(); std::mem::size_of::<CodeRegistryView>()];
+const _: [(); 40] = [(); std::mem::size_of::<CodeRegistryView>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeRegistryView>()];
-const _: [(); 12] = [(); std::mem::size_of::<FrameMap>()];
-const _: [(); 12] = [(); std::mem::size_of::<SpillMap>()];
-const _: [(); 28] = [(); std::mem::size_of::<SafepointEntry>()];
+const _: [(); 8] = [(); std::mem::size_of::<SafepointEntry>()];
 const _: [(); 4] = [(); std::mem::align_of::<SafepointEntry>()];
-const _: [(); 8] = [(); std::mem::offset_of!(SafepointEntry, logical_pc)];
-const _: [(); 24] = [(); std::mem::offset_of!(SafepointEntry, stub_id)];
+const _: [(); 0] = [(); std::mem::offset_of!(SafepointEntry, native_return_offset)];
+const _: [(); 4] = [(); std::mem::offset_of!(SafepointEntry, safepoint_id)];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn frame_slot_window_covers_every_register() {
-        let record = SafepointRecord::frame_slot_window(3, NO_FRAME_STATE, 4);
-        assert_eq!(record.tagged_locations.len(), 4);
-        assert_eq!(record.tagged_locations[3], TaggedLocation::frame_slot(3));
+    fn window_record_roots_no_slot_beyond_the_traced_window() {
+        let record = SafepointRecord::window(3, NO_FRAME_STATE);
+        assert!(record.spill_roots.is_empty());
         assert!(!record.has_deopt_state());
     }
 
     #[test]
-    fn precise_frame_map_expands_only_set_slots() {
-        let map = FrameMap {
-            id: 7,
-            bitmap_offset: 1,
-            bitmap_word_count: 2,
-            slot_count: 65,
+    fn spill_roots_are_an_exact_ascending_bitmap() {
+        let roots = SpillRoots::from_slots([130, 0, 63, 64, 0]);
+        assert_eq!(roots.iter().collect::<Vec<_>>(), vec![0, 63, 64, 130]);
+        assert_eq!(roots.len(), 4);
+        assert_eq!(roots.end(), 131);
+        assert_eq!(roots.retained_bytes(), 3 * 8);
+        assert_eq!(SpillRoots::from_slots([]).end(), 0);
+        assert!(SpillRoots::from_slots([]).is_empty());
+    }
+
+    #[test]
+    fn retained_bytes_include_spill_bitmap_and_nested_inline_slots_once() {
+        let record = SafepointRecord {
+            id: 4,
+            frame_state: NO_FRAME_STATE,
+            spill_roots: SpillRoots::from_slots([0, 1, 70]),
+            inline_frames: Box::new([
+                crate::deopt::DeoptFrame::with_window(7, 11, None, [Some(0), None, Some(1)]),
+                crate::deopt::DeoptFrame::with_window(8, 12, None, [Some(1)]),
+            ]),
+            call_pc: NO_CALL_PC,
         };
-        let record = SafepointRecord::from_frame_map(map, NO_FRAME_STATE, &[u64::MAX, 0b101, 1])
-            .expect("valid precise frame map");
-        assert_eq!(
-            record.tagged_locations,
-            vec![
-                TaggedLocation::frame_slot(0),
-                TaggedLocation::frame_slot(2),
-                TaggedLocation::frame_slot(64),
-            ]
-        );
+        let inline_slots: usize = record
+            .inline_frames
+            .iter()
+            .map(|frame| std::mem::size_of_val(frame.slots.as_ref()))
+            .sum();
+        let expected =
+            2 * 8 + 2 * std::mem::size_of::<crate::deopt::DeoptFrame<Option<u16>>>() + inline_slots;
+        assert_eq!(record.retained_bytes(), expected as u64);
+        let mut record = record;
+        record.inline_frames = Box::default();
+        assert_eq!(record.retained_bytes(), 2 * 8);
     }
 }

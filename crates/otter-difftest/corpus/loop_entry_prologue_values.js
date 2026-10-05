@@ -1,5 +1,5 @@
-// Functions whose first bytecode is a loop header: the Machine entry is a
-// separate prologue, so loop-carried parameters, locals first read as
+// Functions whose first bytecode is a loop header: the optimizing tier's entry
+// block precedes that header, so loop-carried parameters, locals first read as
 // `undefined`, and typed arguments all merge with their back-edge values.
 function sumDown(n, step) {
   while (n > 0) {

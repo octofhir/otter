@@ -26,6 +26,8 @@
 //! - [`crate::object`]
 
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
+use crate::rooting::RootScopeExt;
 use smallvec::SmallVec;
 
 use otter_gc::raw::RawGc;
@@ -64,7 +66,7 @@ impl Interpreter {
         key: &str,
         value: &Value,
         strict: bool,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, CommittedValueError> {
         let Some((_getter, setter)) = crate::array::get_accessor(arr, &self.gc_heap, key) else {
             return Ok(false);
         };
@@ -72,13 +74,21 @@ impl Interpreter {
             Some(setter) if abstract_ops::is_callable(&setter) => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(*value);
-                self.run_callable_sync_rooted(stack, context, &setter, Value::array(arr), args)?;
+                self.run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &setter,
+                    Value::array(arr),
+                    args,
+                )
+                .map_err(CommittedValueError::completed_call)?;
             }
             _ => {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to accessor property '{key}' without a setter"),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
         }
         Ok(true)
@@ -146,7 +156,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // §7.1.19 ToPropertyKey — `String` / `Number` / `Symbol`
         // operands pass through to their existing per-receiver
         // arms unchanged; `Boolean` / `Null` / `Undefined` /
@@ -157,34 +167,41 @@ impl Interpreter {
         }
         if let Some(b) = value.as_boolean() {
             let s = if b { "true" } else { "false" };
-            let js = JsString::from_str(s, self.gc_heap_mut())?;
+            let js = JsString::from_str(s, self.gc_heap_mut())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(Value::string(js));
         }
         if value.is_null() {
-            let js = JsString::null_str(self.gc_heap_mut())?;
+            let js = JsString::null_str(self.gc_heap_mut())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(Value::string(js));
         }
         if value.is_undefined() || value.is_hole() {
-            let js = JsString::undefined_str(self.gc_heap_mut())?;
+            let js = JsString::undefined_str(self.gc_heap_mut())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(Value::string(js));
         }
         if let Some(b) = value.as_big_int() {
-            let js = JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())?;
+            let js = JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             return Ok(Value::string(js));
         }
         let key = self.to_property_key_sync(stack, context, value)?;
         match key {
             VmPropertyKey::Symbol(sym) => Ok(Value::symbol(sym)),
             VmPropertyKey::Atom(atom) => {
-                let s = JsString::from_str(atom.name(), self.gc_heap_mut())?;
+                let s = JsString::from_str(atom.name(), self.gc_heap_mut())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
             VmPropertyKey::String(s) => {
-                let s = JsString::from_str(s, self.gc_heap_mut())?;
+                let s = JsString::from_str(s, self.gc_heap_mut())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
             VmPropertyKey::OwnedString(s) => {
-                let s = JsString::from_str(&s, self.gc_heap_mut())?;
+                let s = JsString::from_str(&s, self.gc_heap_mut())
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Ok(Value::string(s))
             }
         }
@@ -197,16 +214,16 @@ impl Interpreter {
         receiver: &Value,
         string: JsString,
         name: &str,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // §10.4.3.5 StringGetOwnProperty: only indices below the length are
         // own; any other index continues to `%String.prototype%`.
         if let Some(unit) = string_index_property_name(name)
             .and_then(|index| string.char_code_at(index, &self.gc_heap))
         {
-            return Ok(Value::string(JsString::from_utf16_units(
-                &[unit],
-                &mut self.gc_heap,
-            )?));
+            return Ok(Value::string(
+                JsString::from_utf16_units(&[unit], &mut self.gc_heap)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+            ));
         }
         if name == "length" {
             return Ok(Value::number_u32(string.len()));
@@ -296,14 +313,14 @@ impl Interpreter {
                 let _ = key;
                 false
             } else {
-                crate::object::delete(o, &mut self.gc_heap, name)
+                crate::object::delete(&mut { o }, &mut self.gc_heap, name)?
             }
         } else if let Some(arr) = receiver.as_array() {
             crate::array::delete_named_property(arr, &mut self.gc_heap, name)
         } else if let Some(class) = receiver.as_class_constructor() {
             let statics = class.statics(&self.gc_heap);
             if crate::object::get_own_descriptor(statics, &self.gc_heap, name).is_some() {
-                crate::object::delete(statics, &mut self.gc_heap, name)
+                crate::object::delete(&mut { statics }, &mut self.gc_heap, name)?
             } else if name == "prototype" {
                 false
             } else if let Some(function_id) =
@@ -315,11 +332,11 @@ impl Interpreter {
                 })
             {
                 let owner = class.ctor(&self.gc_heap).as_closure(&self.gc_heap);
-                self.ordinary_function_delete_own_property(owner, function_id, name, false)
+                self.ordinary_function_delete_own_property(owner, function_id, name, false)?
             } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
-                native.delete_own_property(&mut self.gc_heap, name)
+                native.delete_own_property(&mut self.gc_heap, name)?
             } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
-                function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)
+                function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)?
             } else {
                 true
             }
@@ -330,11 +347,11 @@ impl Interpreter {
         }) {
             let owner = receiver.as_closure(&self.gc_heap);
             let has_prototype = context.function_has_prototype_property(function_id);
-            self.ordinary_function_delete_own_property(owner, function_id, name, has_prototype)
+            self.ordinary_function_delete_own_property(owner, function_id, name, has_prototype)?
         } else if let Some(native) = receiver.as_native_function() {
-            native.delete_own_property(&mut self.gc_heap, name)
+            native.delete_own_property(&mut self.gc_heap, name)?
         } else if let Some(bound) = receiver.as_bound_function() {
-            function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)
+            function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)?
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(n) = canonical_numeric_index_string(name) {
                 // §10.4.5.10 [[Delete]] — a valid integer index is a
@@ -342,19 +359,19 @@ impl Interpreter {
                 // deletes vacuously (true).
                 typed_array_valid_index(&t, &self.gc_heap, n).is_none()
             } else if let Some(bag) = t.expando(&self.gc_heap) {
-                crate::object::delete(bag, &mut self.gc_heap, name)
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
             } else {
                 true
             }
         } else if let Some(promise) = receiver.as_promise() {
             if let Some(bag) = promise.expando(&self.gc_heap) {
-                crate::object::delete(bag, &mut self.gc_heap, name)
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
             } else {
                 true
             }
         } else if let Some(dv) = receiver.as_data_view() {
             if let Some(bag) = dv.expando(&self.gc_heap) {
-                crate::object::delete(bag, &mut self.gc_heap, name)
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
             } else {
                 true
             }
@@ -365,7 +382,7 @@ impl Interpreter {
             if name == "lastIndex" {
                 false
             } else if let Some(bag) = r.expando(&self.gc_heap) {
-                crate::object::delete(bag, &mut self.gc_heap, name)
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
             } else {
                 true
             }
@@ -373,7 +390,7 @@ impl Interpreter {
             // Ordinary own properties live in the lazy expando; a missing
             // name deletes vacuously.
             if let Some(bag) = t.expando(&self.gc_heap) {
-                crate::object::delete(bag, &mut self.gc_heap, name)
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
             } else {
                 true
             }
@@ -381,7 +398,7 @@ impl Interpreter {
             // Ordinary own properties on a Map/Set/Generator live in the
             // lazy expando; a missing name deletes vacuously.
             if let Some(bag) = self.collection_expando(&receiver) {
-                crate::object::delete(bag, &mut self.gc_heap, name)
+                crate::object::delete(&mut { bag }, &mut self.gc_heap, name)?
             } else {
                 true
             }
@@ -447,8 +464,9 @@ impl Interpreter {
         obj_reg: u16,
         idx_reg: u16,
         strict: bool,
-    ) -> Result<(), VmError> {
-        let mut idx = *read_register(&stack[top_idx], idx_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let mut idx = *read_register(&stack[top_idx], idx_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if !crate::abstract_ops::is_primitive(&idx) {
             // §13.5.1.2 — ToPropertyKey runs the key's coercion (a
             // user `toString`) before the [[Delete]]; the receiver is
@@ -458,11 +476,15 @@ impl Interpreter {
                 crate::VmPropertyKey::Symbol(sym) => Value::symbol(sym),
                 other => {
                     let name = other.string_name().map(str::to_string).unwrap_or_default();
-                    Value::string(crate::JsString::from_str(&name, &mut self.gc_heap)?)
+                    Value::string(
+                        crate::JsString::from_str(&name, &mut self.gc_heap)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                    )
                 }
             };
         }
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let receiver = *read_register(&stack[top_idx], obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let frame = &mut stack[top_idx];
         let removed = if let Some(obj) = receiver.as_object() {
             // §10.4.6.10 [[Delete]] — a Module Namespace Exotic Object
@@ -477,7 +499,8 @@ impl Interpreter {
                 let name = s.to_lossy_string(&self.gc_heap);
                 match namespace_env {
                     Some(env) => crate::object::get(env, &self.gc_heap, &name).is_none(),
-                    None => crate::object::delete(obj, &mut self.gc_heap, &name),
+                    None => crate::object::delete(&mut { obj }, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 }
             } else if let Some(n) = idx.as_number() {
                 let name = match n.as_smi() {
@@ -486,10 +509,11 @@ impl Interpreter {
                 };
                 match namespace_env {
                     Some(env) => crate::object::get(env, &self.gc_heap, &name).is_none(),
-                    None => crate::object::delete(obj, &mut self.gc_heap, &name),
+                    None => crate::object::delete(&mut { obj }, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(arr) = receiver.as_array() {
             if let Some(n) = idx.as_number() {
@@ -509,7 +533,7 @@ impl Interpreter {
             } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::array::delete_symbol_property(arr, &mut self.gc_heap, sym)
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(class) = receiver.as_class_constructor() {
             let statics = class.statics(&self.gc_heap);
@@ -521,7 +545,8 @@ impl Interpreter {
                 .or_else(|| idx.as_number().map(|n| n.to_display_string()))
             {
                 if crate::object::get_own_descriptor(statics, &self.gc_heap, &name).is_some() {
-                    crate::object::delete(statics, &mut self.gc_heap, &name)
+                    crate::object::delete(&mut { statics }, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if name == "prototype" {
                     false
                 } else if let Some(function_id) =
@@ -534,15 +559,19 @@ impl Interpreter {
                 {
                     let owner = class.ctor(&self.gc_heap).as_closure(&self.gc_heap);
                     self.ordinary_function_delete_own_property(owner, function_id, &name, false)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
-                    native.delete_own_property(&mut self.gc_heap, &name)
+                    native
+                        .delete_own_property(&mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
                     function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else {
                     true
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(s) = receiver.as_string(&self.gc_heap) {
             if let Some(n) = idx.as_number() {
@@ -560,24 +589,28 @@ impl Interpreter {
                 let owner = receiver.as_closure(&self.gc_heap);
                 let has_prototype = context.function_has_prototype_property(function_id);
                 self.ordinary_function_delete_own_property(owner, function_id, &name, has_prototype)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(native) = receiver.as_native_function() {
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 native.delete_own_symbol_property(&mut self.gc_heap, sym)
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
-                native.delete_own_property(&mut self.gc_heap, &name)
+                native
+                    .delete_own_property(&mut self.gc_heap, &name)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(bound) = receiver.as_bound_function() {
             if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(s) = idx.as_string(&self.gc_heap) {
@@ -586,7 +619,8 @@ impl Interpreter {
                     Some(n) => typed_array_valid_index(&t, &self.gc_heap, n).is_none(),
                     None => {
                         if let Some(bag) = t.expando(&self.gc_heap) {
-                            crate::object::delete(bag, &mut self.gc_heap, &name)
+                            crate::object::delete(&mut { bag }, &mut self.gc_heap, &name)
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         } else {
                             true
                         }
@@ -609,7 +643,7 @@ impl Interpreter {
                     true
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(r) = receiver.as_regexp() {
             // §10.1.10 [[Delete]] — only `lastIndex` (non-configurable) and
@@ -626,14 +660,15 @@ impl Interpreter {
                 if name == "lastIndex" {
                     false
                 } else if let Some(bag) = r.expando(&self.gc_heap) {
-                    crate::object::delete(bag, &mut self.gc_heap, &name)
+                    crate::object::delete(&mut { bag }, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else {
                     true
                 }
             } else if idx.as_number().is_some() {
                 true
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(dv) = receiver.as_data_view() {
             // §25.3 — ordinary own properties live in the lazy expando;
@@ -646,22 +681,28 @@ impl Interpreter {
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 match dv.expando(&self.gc_heap) {
-                    Some(bag) => crate::object::delete(bag, &mut self.gc_heap, &name),
+                    Some(bag) => crate::object::delete(&mut { bag }, &mut self.gc_heap, &name)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                     None => true,
                 }
             } else if idx.as_number().is_some() {
                 true
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else {
-            return Err(VmError::TypeMismatch);
+            return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
         };
         if !removed && strict {
-            return Err(self.err_type(("Cannot delete property".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(("Cannot delete property".to_string()).into()),
+            ));
         }
-        write_register(frame, dst, Value::boolean(removed))?;
-        frame.advance_pc()?;
+        write_register(frame, dst, Value::boolean(removed))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -679,48 +720,64 @@ impl Interpreter {
         dst: u16,
         home: Value,
         key: SuperReadKey<'_>,
-    ) -> Result<(), VmError> {
-        // §13.3.7.1 — `GetThisBinding` then `GetSuperBase`, both
-        // before any `ToPropertyKey` coercion on a computed key (a
-        // key's `toString` must observe the pre-coercion super base).
-        let actual_this = stack[top_idx].this_value;
-        if actual_this.is_hole() {
-            return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
-        }
-        let base = self.get_prototype_for_op(&home)?;
-        if base.is_null() || base.is_undefined() {
-            return Err(self.err_type(
-                ("cannot read property of null or undefined super reference".to_string()).into(),
-            ));
-        }
-        let key = match key {
-            SuperReadKey::Resolved(k) => k,
-            SuperReadKey::Computed(raw) => {
-                let coerced = self.coerce_property_key_value(stack, context, raw)?;
-                if let Some(sym) = coerced.as_symbol(&self.gc_heap) {
-                    VmPropertyKey::Symbol(sym)
-                } else if let Some(s) = coerced.as_string(&self.gc_heap) {
-                    VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-                } else if let Some(n) = coerced.as_number() {
-                    VmPropertyKey::OwnedString(n.to_display_string())
-                } else {
-                    return Err(VmError::TypeMismatch);
-                }
+    ) -> Result<(), CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+
+            // §13.3.7.1 — `GetThisBinding` then `GetSuperBase`, both
+            // before any `ToPropertyKey` coercion on a computed key (a
+            // key's `toString` must observe the pre-coercion super base).
+            let actual_this = stack[top_idx].this_value;
+            if actual_this.is_hole() {
+                return Err(CommittedValueError::JavaScript(interp.err_this_uninit(
+                    "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string().into(),
+                )));
             }
-        };
-        let value = match self.ordinary_get_value(stack, context, base, actual_this, &key, 0)? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
-                stack,
-                context,
-                &getter,
-                actual_this,
-                SmallVec::new(),
-            )?,
-        };
-        write_register(&mut stack[top_idx], dst, value)?;
-        stack[top_idx].advance_pc()?;
-        Ok(())
+            let base = interp
+                .get_prototype_for_op(&home)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            if base.is_null() || base.is_undefined() {
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("cannot read property of null or undefined super reference".to_string()).into(),
+                )));
+            }
+            let base_root = interp.scoped_value(scope, base);
+            let receiver_root = interp.scoped_value(scope, actual_this);
+            let key = match key {
+                SuperReadKey::Resolved(k) => k,
+                SuperReadKey::Computed(raw) => {
+                    let coerced = interp.coerce_property_key_value(stack, context, raw)?;
+                    if let Some(sym) = coerced.as_symbol(&interp.gc_heap) {
+                        VmPropertyKey::Symbol(sym)
+                    } else if let Some(s) = coerced.as_string(&interp.gc_heap) {
+                        VmPropertyKey::OwnedString(s.to_lossy_string(&interp.gc_heap))
+                    } else if let Some(n) = coerced.as_number() {
+                        VmPropertyKey::OwnedString(n.to_display_string())
+                    } else {
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
+                    }
+                }
+            };
+            let value =
+                match interp.ordinary_get_value(stack, Some(context), interp.escape_scoped(base_root), interp.escape_scoped(receiver_root), &key, 0)? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(receiver_root),
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
+                };
+            write_register(&mut stack[top_idx], dst, value)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+            Ok(())
+
+        })
     }
 
     /// §13.3.5 MakeSuperPropertyReference + §6.2.5.5 PutValue
@@ -738,25 +795,25 @@ impl Interpreter {
         key: SuperReadKey<'_>,
         value: Value,
         strict: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let actual_this = stack[top_idx].this_value;
         if actual_this.is_hole() {
-            return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
+            return Err(CommittedValueError::JavaScript(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into())));
         }
         // §13.3.5.3 MakeSuperPropertyReference — `base` was resolved by
         // the lowering (home's [[GetPrototypeOf]]) BEFORE the RHS
         // evaluated, so a setPrototypeOf side effect inside the RHS is
         // not observable here.
         if base.is_null() || base.is_undefined() {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 ("cannot write property of null or undefined super reference".to_string()).into(),
-            ));
+            )));
         }
         let key = match key {
             SuperReadKey::Resolved(VmPropertyKey::String(s)) => s.to_string(),
             SuperReadKey::Resolved(k) => match k.string_name() {
                 Some(s) => s.to_string(),
-                None => return Err(VmError::TypeMismatch),
+                None => return Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
             },
             SuperReadKey::Computed(raw) => {
                 let coerced = self.coerce_property_key_value(stack, context, raw)?;
@@ -774,17 +831,19 @@ impl Interpreter {
                             args.push(value);
                             self.run_callable_sync_rooted(
                                 stack,
-                                context,
+                                Some(context),
                                 &setter,
                                 actual_this,
                                 args,
-                            )?;
+                            )
+                            .map_err(CommittedValueError::completed_call)?;
                         }
                         object::SetOutcome::Reject { .. } => {
                             self.failed_set_result(
                                 strict,
                                 "Cannot assign to read-only symbol property".to_string(),
-                            )?;
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         }
                         object::SetOutcome::AssignData
                         | object::SetOutcome::ExoticParent { .. } => {
@@ -796,24 +855,34 @@ impl Interpreter {
                                     .map(|c| c.statics(&self.gc_heap))
                             };
                             let Some(target) = target else {
-                                return Err(VmError::TypeMismatch);
+                                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                             };
-                            if !crate::object::set_symbol(target, &mut self.gc_heap, sym, value) {
+                            if !crate::object::ordinary_set_symbol_data_property(
+                                &mut { target },
+                                &mut self.gc_heap,
+                                sym,
+                                value,
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                            {
                                 self.failed_set_result(
                                     strict,
                                     "Cannot assign to read-only symbol property".to_string(),
-                                )?;
+                                )
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             }
                         }
                     }
-                    stack[top_idx].advance_pc()?;
+                    stack[top_idx]
+                        .advance_pc()
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     return Ok(());
                 } else if let Some(s) = coerced.as_string(&self.gc_heap) {
                     s.to_lossy_string(&self.gc_heap)
                 } else if let Some(n) = coerced.as_number() {
                     n.to_display_string()
                 } else {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
             }
         };
@@ -832,13 +901,15 @@ impl Interpreter {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync_rooted(stack, context, &setter, actual_this, args)?;
+                self.run_callable_sync_rooted(stack, Some(context), &setter, actual_this, args)
+                    .map_err(CommittedValueError::completed_call)?;
             }
             object::SetOutcome::Reject { .. } => {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to read-only property '{key}'"),
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
@@ -850,7 +921,8 @@ impl Interpreter {
                     actual_this,
                     1,
                 )? {
-                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
             }
             object::SetOutcome::AssignData => {
@@ -872,35 +944,45 @@ impl Interpreter {
                     if object::module_namespace_env(this_obj, &self.gc_heap).is_some() {
                         self.ordinary_get_own_property_descriptor_value(
                             stack,
-                            context,
+                            Some(context),
                             actual_this,
                             &VmPropertyKey::String(&key),
                             0,
                         )?;
                     }
-                    if !self.ordinary_set_data_property(this_obj, &key, value)? {
+                    if !self
+                        .ordinary_set_data_property(this_obj, &key, value)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    {
                         self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}'"),
-                        )?;
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     }
                 } else if let Some(c) = actual_this.as_class_constructor() {
                     // Static elements run with `this` = the class
                     // constructor; its own properties live on the
                     // statics object.
                     let statics = c.statics(&self.gc_heap);
-                    if !self.ordinary_set_data_property(statics, &key, value)? {
+                    if !self
+                        .ordinary_set_data_property(statics, &key, value)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    {
                         self.failed_set_result(
                             strict,
                             format!("Cannot assign to read-only property '{key}'"),
-                        )?;
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     }
                 } else {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
             }
         }
-        stack[top_idx].advance_pc()?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -939,10 +1021,13 @@ impl Interpreter {
         key: &str,
         value: Value,
         strict: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         match crate::object::resolve_set(obj, &self.gc_heap, key) {
             object::SetOutcome::AssignData => {
-                if self.ordinary_set_data_property(obj, key, value)? {
+                if self
+                    .ordinary_set_data_property(obj, key, value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
                     Ok(())
                 } else {
                     let message = self.extensibility_aware_set_message(
@@ -951,12 +1036,20 @@ impl Interpreter {
                         format!("Cannot assign to read-only property '{key}'"),
                     );
                     self.failed_set_result(strict, message)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))
                 }
             }
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync_rooted(stack, context, &setter, Value::object(obj), args)?;
+                self.run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &setter,
+                    Value::object(obj),
+                    args,
+                )
+                .map_err(CommittedValueError::completed_call)?;
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
@@ -966,6 +1059,7 @@ impl Interpreter {
                     format!("Cannot assign to property '{key}'"),
                 );
                 self.failed_set_result(strict, message)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
@@ -977,7 +1071,8 @@ impl Interpreter {
                     Value::object(obj),
                     1,
                 )? {
-                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
+                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 Ok(())
             }
@@ -995,23 +1090,38 @@ impl Interpreter {
         sym: crate::symbol::JsSymbol,
         value: Value,
         strict: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         match crate::object::resolve_symbol_set(obj, &self.gc_heap, sym) {
             object::SetOutcome::AssignData => {
-                if !crate::object::set_symbol(obj, &mut self.gc_heap, sym, value) {
-                    self.failed_set_result(strict, "Cannot assign to symbol property")?;
+                if !crate::object::ordinary_set_symbol_data_property(
+                    &mut { obj },
+                    &mut self.gc_heap,
+                    sym,
+                    value,
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
+                    self.failed_set_result(strict, "Cannot assign to symbol property")
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 Ok(())
             }
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync_rooted(stack, context, &setter, Value::object(obj), args)?;
+                self.run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &setter,
+                    Value::object(obj),
+                    args,
+                )
+                .map_err(CommittedValueError::completed_call)?;
                 Ok(())
             }
-            object::SetOutcome::Reject { .. } => {
-                self.failed_set_result(strict, "Cannot assign to symbol property")
-            }
+            object::SetOutcome::Reject { .. } => self
+                .failed_set_result(strict, "Cannot assign to symbol property")
+                .map_err(|error| CommittedValueError::JavaScript(error.into())),
             object::SetOutcome::ExoticParent { parent } => {
                 if !self.ordinary_set_data_value(
                     stack,
@@ -1022,7 +1132,8 @@ impl Interpreter {
                     Value::object(obj),
                     1,
                 )? {
-                    self.failed_set_result(strict, "Cannot assign to symbol property")?;
+                    self.failed_set_result(strict, "Cannot assign to symbol property")
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 Ok(())
             }
@@ -1061,32 +1172,40 @@ impl Interpreter {
         proto_name: &str,
         receiver: &Value,
         name: &str,
-    ) -> Result<Value, VmError> {
-        let proto = match self.collection_prototype_override_value(receiver) {
-            Some(proto) => proto,
-            None => self.constructor_prototype_value(proto_name)?,
-        };
-        let Some(proto_obj) = proto.as_object() else {
-            return Ok(Value::undefined());
-        };
-        let key = VmPropertyKey::String(name);
-        match self.ordinary_get_value(
-            stack,
-            context,
-            Value::object(proto_obj),
-            *receiver,
-            &key,
-            0,
-        )? {
-            VmGetOutcome::Value(value) => Ok(value),
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, *receiver);
+
+            let proto = match interp.collection_prototype_override_value(receiver) {
+                Some(proto) => proto,
+                None => interp
+                    .constructor_prototype_value(proto_name)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?,
+            };
+            let Some(proto_obj) = proto.as_object() else {
+                return Ok(Value::undefined());
+            };
+            let key = VmPropertyKey::String(name);
+            match interp.ordinary_get_value(
                 stack,
-                context,
-                &getter,
+                Some(context),
+                Value::object(proto_obj),
                 *receiver,
-                smallvec::SmallVec::new(),
-            ),
-        }
+                &key,
+                0,
+            )? {
+                VmGetOutcome::Value(value) => Ok(value),
+                VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        Some(context),
+                        &getter,
+                        interp.escape_scoped(receiver_root),
+                        smallvec::SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call),
+            }
+        })
     }
 }
 
@@ -1265,13 +1384,17 @@ pub(crate) fn regexp_ensure_expando_pub(
         return Ok(existing);
     }
     let mut recv = Value::regexp(*r);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the actual receiver value remains stationary until the pending
+    // bag is published or its typed state preparation error is returned.
+    unsafe { roots.add_value(&mut recv) };
     let recv_ptr: *mut Value = &mut recv;
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         // SAFETY: `recv` outlives the allocation; the collector rewrites
         // the embedded moving offset in place.
         unsafe { (*recv_ptr).trace_value_slot_mut(visitor) };
     };
-    let bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
+    let mut bag = crate::object::alloc_dictionary_object_with_roots(heap, &mut external_visit)?;
     let r = recv
         .as_regexp()
         .expect("receiver stays a regexp across the bag allocation");
@@ -1280,9 +1403,11 @@ pub(crate) fn regexp_ensure_expando_pub(
     // first own-property store materialises a fresh extensible bag and slips
     // past the frozen receiver.
     if !r.is_extensible(heap) {
-        crate::object::prevent_extensions(bag, heap);
+        crate::object::prevent_extensions(&mut bag, heap)?;
     }
-    r.set_expando(heap, bag);
+    recv.as_regexp()
+        .expect("rooted receiver remains a regexp")
+        .set_expando(heap, bag);
     Ok(bag)
 }
 

@@ -9,6 +9,7 @@
 //! - [`VmError`] — structured interpreter/runtime failure categories.
 //! - [`StackFrameSnapshot`] and [`RunError`] — error plus stack context returned
 //!   from VM entry points.
+//! - `diagnostics` — one typed renderer for in-flight and surfaced errors.
 //! - [`DEFAULT_MAX_STACK_DEPTH`] — execution-control constants shared with
 //!   embedders.
 //!
@@ -17,18 +18,23 @@
 //!   thread, but the VM observes it only at explicit checkpoints.
 //! - [`VmError::BudgetExceeded`] is a structured runtime rejection, not an
 //!   internal crash.
+//! - Diagnostic detail is read only for its corresponding error family.
 //! - [`RunError::frames`] is top-of-stack first and may be empty for setup
 //!   failures raised before a frame exists.
+//! - Direct-source [`VmError::OutOfMemory`] may become a catchable RangeError;
+//!   escaping completed [`RunError`] OOM is final and cannot build another value.
 //!
 //! # See also
 //! - [`crate::Interpreter`]
 //! - [`crate::work_budget`]
 //! - [Runtime principles](../../../docs/book/src/engine/runtime-principles.md)
 
+mod diagnostics;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Boxed JSON failure payload kept out of the hot [`VmError`] enum body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,16 +128,14 @@ impl InterruptFlag {
 /// Owned, dynamic payload for a raised [`VmError`].
 ///
 /// `VmError` itself is `Copy` so it propagates up the interpreter's hot
-/// `Result<_, VmError>` chain with zero drop glue (the previous boxed-string
-/// variants forced a non-trivial `drop_in_place::<VmError>` after every
-/// fallible op — 5–18% of self-time on interpreter-bound benches). The dynamic
-/// detail that used to live inline now lives in one per-isolate slot
+/// `Result<_, VmError>` chain without drop glue. Dynamic detail lives in
+/// one per-isolate slot
 /// (`Interpreter::pending_error_detail`): the raising helper stashes it, and
 /// the surfacing boundary (`vm_error_to_throwable_with_stack_roots`,
 /// `vm_to_native_error`, runtime diagnostics) reads it back paired with the
-/// `Copy` discriminant. Only one error is in flight per isolate at a time
-/// (`?` propagates eagerly), so a single slot is sound; the next raise
-/// overwrites it.
+/// `Copy` discriminant. Successful materialization retires the handled detail;
+/// diagnostics accept only the detail family paired with the current error.
+/// The next message-bearing raise overwrites this same slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ErrorDetail {
     /// A human-readable diagnostic message (TypeError / RangeError /
@@ -151,6 +155,8 @@ pub enum ErrorDetail {
     Coded(VmCodedError),
     /// Failed system call payload.
     Syscall(VmSyscallError),
+    /// Exact resource-admission failure for [`VmError::ResourceLimit`].
+    Resource(otter_resource::ResourceError),
 }
 
 /// Runtime errors raised by the interpreter.
@@ -166,9 +172,9 @@ pub enum VmError {
     /// An operand index was out of range. Indicates a compiler bug
     /// or a malformed bytecode dump.
     InvalidOperand,
-    /// An operand had the wrong type for its opcode (e.g.,
-    /// `STRING_CONCAT` on a non-string register). Indicates a
-    /// compiler bug at this slice.
+    /// A value was rejected by an opcode or a JavaScript wrong-type check.
+    /// Existing normative producers use this catchable TypeError channel;
+    /// malformed operand structure uses InvalidOperand instead.
     TypeMismatch,
     /// User-facing version of [`Self::TypeMismatch`]. Detail
     /// ([`ErrorDetail::Mismatch`]) carries the operation name and the
@@ -192,6 +198,10 @@ pub enum VmError {
         /// Heap cap (`0` = unlimited).
         heap_limit_bytes: u64,
     },
+    /// A source/code/external ledger refused admission. The exact existing
+    /// resource cause lives in [`ErrorDetail::Resource`]; this is fatal and
+    /// cannot become a JavaScript exception or cleanup completion.
+    ResourceLimit,
     /// `InterruptFlag` was tripped before the next checkpoint.
     Interrupted,
     /// A configured work budget rejected the current isolate slice at
@@ -252,16 +262,20 @@ pub enum VmError {
 }
 
 impl VmError {
-    /// Whether this ends the run wherever it is raised.
-    ///
-    /// A termination is not a JS exception: it carries no value a promise
-    /// could settle with, and turning one into a rejection would let the
-    /// run continue past the point that asked to stop. `process.exit()`
-    /// called from a microtask or an `async` body reaches every one of
-    /// those conversion sites.
+    /// A structural or control failure that cannot become a JavaScript throw
+    /// or a promise rejection. Heap exhaustion remains a catchable RangeError
+    /// in ordinary dispatch; cleanup owners must also preserve its typed cause.
     #[must_use]
-    pub const fn is_termination(&self) -> bool {
-        matches!(self, Self::Exit { .. } | Self::Interrupted)
+    pub const fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingReturn
+                | Self::ResourceLimit
+                | Self::InvalidOperand
+                | Self::Interrupted
+                | Self::BudgetExceeded
+                | Self::Exit { .. }
+        )
     }
 }
 
@@ -298,6 +312,7 @@ impl std::fmt::Display for VmError {
                 f,
                 "out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}"
             ),
+            VmError::ResourceLimit => write!(f, "resource admission refused"),
             VmError::Interrupted => write!(f, "interrupted"),
             VmError::BudgetExceeded => write!(f, "budget exceeded"),
             VmError::UnknownIntrinsic => write!(f, "unknown intrinsic method"),
@@ -340,9 +355,8 @@ pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
 pub const DEFAULT_MAX_SYNC_REENTRY_DEPTH: u32 = 256;
 
 /// One stack-frame snapshot captured at the moment an error is
-/// raised. Foundation slice 16 ships this — task 24 (exceptions)
-/// reuses it for catchable error frames.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// raised from the published VM/native activation stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StackFrameSnapshot {
     /// Bytecode function id of the frame. Lets `Error.captureStackTrace`
     /// match its `constructorOpt` argument by function identity rather
@@ -355,6 +369,9 @@ pub struct StackFrameSnapshot {
     pub module: String,
     /// Source span of the failing instruction (byte offsets).
     pub span: (u32, u32),
+    /// Exact defining-source location captured while its code chunk was live.
+    /// This owned data never pins executable code or consults a later URL map.
+    pub source_position: Option<crate::ErrorSourcePosition>,
 }
 
 /// Result type returned by [`crate::Interpreter::run`] on failure: the
@@ -377,6 +394,14 @@ pub struct RunError {
 }
 
 impl RunError {
+    /// A completed failure that cannot enter JavaScript catch/rejection logic.
+    /// An OOM escaping an executed extent has exhausted that extent's source
+    /// handlers and error projection; direct-source VmError OOM stays catchable.
+    #[must_use]
+    pub const fn is_fatal(&self) -> bool {
+        self.error.is_fatal() || matches!(self.error, VmError::OutOfMemory { .. })
+    }
+
     /// Convenience constructor for the no-frames case (e.g., setup
     /// errors before any frame exists). Carries no captured detail.
     #[must_use]
@@ -388,28 +413,12 @@ impl RunError {
         }
     }
 
-    /// Render the full user-facing message: the captured dynamic detail when
-    /// present, else `error`'s static `Display` text.
+    /// Render the user-facing message using only detail paired with this error
+    /// family. Detail from a previous caught failure cannot rename a structural
+    /// error or replace the current allocation-refusal scalars.
     #[must_use]
     pub fn message(&self) -> String {
-        match (&self.error, &self.detail) {
-            (_, Some(ErrorDetail::Message(m))) => m.to_string(),
-            (VmError::UndefinedIdentifier, Some(ErrorDetail::Name(n))) => {
-                format!("{n} is not defined")
-            }
-            (VmError::UnknownIntrinsic, Some(ErrorDetail::Name(n))) => {
-                format!("unknown intrinsic method `{n}`")
-            }
-            (_, Some(ErrorDetail::Name(n))) => n.to_string(),
-            (_, Some(ErrorDetail::Uncaught(v))) => format!("uncaught exception: {v}"),
-            (_, Some(ErrorDetail::Mismatch(p))) => {
-                format!("{}: cannot operate on a value of type {}", p.op, p.kind)
-            }
-            (_, Some(ErrorDetail::Json(p))) => p.message.clone(),
-            (_, Some(ErrorDetail::Coded(p))) => p.message.clone(),
-            (_, Some(ErrorDetail::Syscall(p))) => p.message.clone(),
-            (error, None) => error.to_string(),
-        }
+        self.error.render_with_detail(self.detail.as_ref())
     }
 }
 
@@ -462,3 +471,7 @@ mod tests {
         assert_eq!(error.to_string(), "interrupted");
     }
 }
+
+#[cfg(test)]
+#[path = "run_control/resource_tests.rs"]
+mod resource_tests;

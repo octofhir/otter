@@ -6,7 +6,8 @@
 //! CommonJS interop.
 //!
 //! # Contents
-//! - [`url_cjs_value`] installs legacy and WHATWG Node URL helpers.
+//! - The CommonJS surface (`url.js` + `url_legacy.js`) is the build-produced
+//!   `nodelib::embedded::node_url` module.
 //! - [`install_url_module`] exposes the file-URL helpers to ESM.
 //! - Native file-path conversion helpers use scoped handles for all results.
 //!
@@ -14,7 +15,7 @@
 //! - File URL conversion is pure string/path processing and opens no host
 //!   resource, so it requires no filesystem capability.
 //! - Every multi-allocation native result is built inside a handle scope.
-//! - The shim is parsed once per CommonJS module instantiation, not per call.
+//! - The CommonJS module links once per instantiation, never per call.
 //!
 //! # See also
 //! - Node.js `lib/url.js` and `lib/internal/url.js`.
@@ -23,20 +24,6 @@ use std::path::{Path, PathBuf};
 
 use otter_runtime::{CapabilitySet, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeCtx, NativeError, NativeScope, Value};
-
-const SHIM: &str = concat!(include_str!("url.js"), "\n", include_str!("url_legacy.js"));
-
-/// CommonJS export containing WHATWG constructors, legacy helpers, and file
-/// URL conversion functions.
-pub fn url_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:url", SHIM, module, require)
-}
 
 /// Named ESM surface used by ecosystem loaders.
 pub fn install_url_module<'scope>(

@@ -16,6 +16,7 @@ mod init;
 mod jit_call;
 mod jit_compile;
 mod jit_intrinsic_properties;
+mod jit_retraining;
 mod modules;
 mod protos;
 mod prototype_shapes;
@@ -26,4 +27,4 @@ mod stats;
 mod tests;
 mod trace_roots;
 
-pub(crate) use feedback::MethodFeedbackDirectory;
+pub(crate) use feedback::{MethodFeedbackDirectory, MethodFeedbackTarget};

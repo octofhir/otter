@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn material_family_transition_advances_epoch_once() {
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let code_block = element_code_block();
 
         assert!(interpreter.commit_element_family_feedback_transition(

@@ -4,6 +4,15 @@
 //! boundaries over ECMAScript WTF-16 input. ICU CLDR break-iterator
 //! locale tailoring is filed for the wider Intl follow-up.
 //!
+//! # Contents
+//! - WTF-16 segmentation and scoped segment records and iteration.
+//! - Scoped ordinary records for `resolvedOptions`.
+//!
+//! # Invariants
+//! - Every result record and string stays in the native traced handle arena.
+//! - Record fields use ordinary writable, enumerable, configurable data descriptors.
+//! - Allocation failure retains its actual native OutOfMemory cause.
+//!
 //! # See also
 //! - <https://tc39.es/ecma402/#segmenter-objects>
 
@@ -202,13 +211,8 @@ pub(crate) fn segmenter_segment(
         let input_string = scope.with_turn_parts(|interp, stack| {
             crate::coerce::to_js_string_or_throw(interp, stack, &exec, &text_value)
         });
-        let input_string = input_string.map_err(|error| {
-            crate::native_function::vm_to_native_error(
-                scope.context().interp_mut(),
-                error,
-                "segment",
-            )
-        })?;
+        let input_string = input_string
+            .map_err(|error| error.into_native(scope.context().interp_mut(), "segment"))?;
         let input = scope.value(Value::string(input_string));
         let input_units = input_string.to_utf16_vec(scope.context().heap());
         let segments = segment(&input_units, &payload.granularity);
@@ -281,10 +285,7 @@ fn segments_containing(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         crate::coerce::to_number_or_throw(interp, stack, &context, &index_arg)
     });
     let number = number
-        .map_err(|err| NativeError::TypeError {
-            name: "containing",
-            reason: err.to_string(),
-        })?
+        .map_err(|error| error.into_native(ctx.interp_mut(), "containing"))?
         .as_f64();
     let n = if number.is_nan() || number == 0.0 {
         0.0
@@ -358,14 +359,13 @@ pub(crate) fn segmenter_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
-    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
-    let granularity = Value::string(JsString::from_str(&payload.granularity, ctx.heap_mut())?);
-    let mut obj = ctx.alloc_object_with_roots(&[&locale, &granularity], &[])?;
-    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-    }
-    let heap = ctx.heap_mut();
-    crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "granularity", granularity);
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+        let flags = crate::object::PropertyFlags::data_default();
+        let locale = scope.string(&payload.locale)?;
+        scope.define(result, "locale", locale, flags)?;
+        let granularity = scope.string(&payload.granularity)?;
+        scope.define(result, "granularity", granularity, flags)?;
+        Ok(scope.finish(result))
+    })
 }

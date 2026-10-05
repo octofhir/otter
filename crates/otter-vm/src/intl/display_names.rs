@@ -6,6 +6,15 @@
 //! the supplied `fallback` option (`"code"` returns the input;
 //! `"none"` returns `undefined`).
 //!
+//! # Contents
+//! - Locale and option resolution and validated display-name lookups.
+//! - Scoped ordinary records for `resolvedOptions`.
+//!
+//! # Invariants
+//! - Every result record and string stays in the native traced handle arena.
+//! - Optional `languageDisplay` retains its presence and field order.
+//! - Record definitions preserve data attributes and typed allocation errors.
+//!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-displaynames-objects>
 
@@ -371,33 +380,21 @@ pub(crate) fn display_names_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
-    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
-    let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
-    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
-    let fallback = Value::string(JsString::from_str(&payload.fallback, ctx.heap_mut())?);
-    let language_display = if let Some(language_display) = payload.language_display.as_deref() {
-        Some(Value::string(JsString::from_str(
-            language_display,
-            ctx.heap_mut(),
-        )?))
-    } else {
-        None
-    };
-    let language_display_root = language_display.unwrap_or_else(Value::undefined);
-    let mut obj = ctx.alloc_object_with_roots(
-        &[&locale, &kind, &style, &fallback, &language_display_root],
-        &[],
-    )?;
-    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-    }
-    let heap = ctx.heap_mut();
-    crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "style", style);
-    crate::object::set(&mut obj, heap, "type", kind);
-    crate::object::set(&mut obj, heap, "fallback", fallback);
-    if !language_display_root.is_undefined() {
-        crate::object::set(&mut obj, heap, "languageDisplay", language_display_root);
-    }
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+        let flags = crate::object::PropertyFlags::data_default();
+        let locale = scope.string(&payload.locale)?;
+        scope.define(result, "locale", locale, flags)?;
+        let style = scope.string(&payload.style)?;
+        scope.define(result, "style", style, flags)?;
+        let kind = scope.string(&payload.kind)?;
+        scope.define(result, "type", kind, flags)?;
+        let fallback = scope.string(&payload.fallback)?;
+        scope.define(result, "fallback", fallback, flags)?;
+        if let Some(language_display) = payload.language_display.as_deref() {
+            let language_display = scope.string(language_display)?;
+            scope.define(result, "languageDisplay", language_display, flags)?;
+        }
+        Ok(scope.finish(result))
+    })
 }

@@ -16,6 +16,7 @@
 //! # See also
 //! - [`crate::Interpreter::drive_delete_property_proxy`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::{Op, Operand};
 
 use crate::{
@@ -37,10 +38,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         let saved_native_pc = frame.pc();
@@ -55,8 +56,10 @@ impl Interpreter {
                 // so resolve against the frame's own chunk.
                 let key = context
                     .property_atom_for_function(stack[frame_index].function_id, name_idx)
-                    .ok_or(VmError::InvalidOperand)?;
-                let receiver = *read_register(&stack[frame_index], obj_reg)?;
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                let receiver = *read_register(&stack[frame_index], obj_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 if receiver.as_object().is_some_and(|o| {
                     crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                 }) {
@@ -80,17 +83,20 @@ impl Interpreter {
                         obj_reg,
                         key,
                         strict,
-                    )?;
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
             }
             value if value == Op::DeleteElement as u8 => {
                 let obj_reg = arg1 as u16;
                 let idx_reg = arg2 as u16;
-                let receiver = *read_register(&stack[frame_index], obj_reg)?;
+                let receiver = *read_register(&stack[frame_index], obj_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 if receiver.as_object().is_some_and(|o| {
                     crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                 }) {
-                    let key_val = *read_register(&stack[frame_index], idx_reg)?;
+                    let key_val = *read_register(&stack[frame_index], idx_reg)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let symbol_like = key_val.as_symbol(&self.gc_heap).is_some()
                         || key_val
                             .as_string(&self.gc_heap)
@@ -114,7 +120,7 @@ impl Interpreter {
                     )?;
                 }
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         frame.set_pc(saved_native_pc);

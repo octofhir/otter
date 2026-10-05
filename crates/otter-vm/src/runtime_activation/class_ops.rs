@@ -15,6 +15,8 @@
 //! # See also
 //! - [`crate::class_ops`]
 
+use crate::rooting::RootScopeExt;
+
 use crate::{ClassConstructor, Value, VmError, abstract_ops, object};
 
 use super::RuntimeCall;
@@ -93,6 +95,12 @@ impl RuntimeCall<'_> {
                     statics_object,
                     &mut external_visit,
                 )?;
+                let mut class_root = Value::class_constructor(class);
+                let mut pending_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
+                // SAFETY: the new class slot remains stationary through state-root
+                // preparation. Its constructor/prototype/statics children are traced
+                // even before the VM destination is published.
+                unsafe { pending_roots.add_value(&mut class_root) };
                 let ctor = self.read(constructor)?;
                 let statics_object = self
                     .read(statics)?
@@ -117,16 +125,21 @@ impl RuntimeCall<'_> {
                 if class.ctor_proto(&vm.gc_heap).is_undefined()
                     && let Some(function_prototype) = vm.realm_intrinsics.function_prototype()
                 {
-                    let statics_object = self
+                    let mut statics_object = self
                         .read(statics)?
                         .as_object()
                         .ok_or(VmError::TypeMismatch)?;
-                    object::set_prototype(
-                        statics_object,
+                    if !object::set_prototype(
+                        &mut statics_object,
                         &mut vm.gc_heap,
                         Some(function_prototype),
-                    );
+                    )? {
+                        return Err(VmError::TypeError);
+                    }
                 }
+                let class = class_root
+                    .as_class_constructor()
+                    .ok_or(VmError::TypeMismatch)?;
                 self.write(destination, Value::class_constructor(class))?;
                 let constructor_descriptor = object::PartialPropertyDescriptor {
                     value: Some(Value::class_constructor(class)),

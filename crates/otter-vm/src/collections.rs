@@ -1157,12 +1157,20 @@ pub fn set_is_readonly(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
 /// Seal a host-owned Set snapshot and freeze its ordinary expando properties.
 /// ECMAScript `Object.freeze(new Set())` does not call this: normal Sets remain
 /// free to mutate their internal `[[SetData]]` after ordinary property freeze.
-pub fn set_make_readonly(set: JsSet, heap: &mut otter_gc::GcHeap) {
-    let expando = heap.read_payload(set, |body| body.expando);
-    heap.with_payload(set, |body| body.readonly = true);
-    if let Some(expando) = expando {
-        crate::object::freeze(expando, heap);
+pub fn set_make_readonly(
+    mut set: JsSet,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: this owner slot is stationary until the final latch write.
+    unsafe {
+        roots.add_raw_slot(std::ptr::addr_of_mut!(set).cast::<RawGc>());
     }
+    if let Some(mut expando) = heap.read_payload(set, |body| body.expando) {
+        crate::object::freeze(&mut expando, heap)?;
+    }
+    heap.with_payload(set, |body| body.readonly = true);
+    Ok(())
 }
 
 /// Snapshot value list in insertion order.
@@ -2186,7 +2194,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let s = alloc_set(&mut heap).unwrap();
         set_add(s, &mut heap, n(1)).unwrap();
-        set_make_readonly(s, &mut heap);
+        set_make_readonly(s, &mut heap).expect("readonly Set snapshot");
         set_add(s, &mut heap, n(2)).unwrap();
         assert!(!set_delete(s, &mut heap, &n(1)));
         set_clear(s, &mut heap);

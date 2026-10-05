@@ -74,7 +74,7 @@ pub(crate) fn string_list_from_iterable(
     ctx.with_turn_parts(|interp, stack| {
         let (iterator, next_method) = interp
             .get_iterator_sync(stack, &exec, &iterable)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
+            .map_err(|e| e.into_native(interp, name))?;
         let it_anchor = interp.push_iteration_anchor(iterator) - 1;
         let nm_anchor = interp.push_iteration_anchor(next_method) - 1;
         let mut out: Vec<String> = Vec::new();
@@ -88,16 +88,18 @@ pub(crate) fn string_list_from_iterable(
                     } else {
                         // §13.5.1 step 5.b.ii — a non-String element closes
                         // the iterator with the pending TypeError completion.
-                        let _ = interp.iterator_close_value_sync(stack, &exec, iterator);
-                        break Err(crate::NativeError::TypeError {
+                        let closed = interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator)
+                            .map_err(|error| error.into_native(interp, name));
+                        break closed.and(Err(crate::NativeError::TypeError {
                             name,
                             reason: "list elements must be strings".to_string(),
-                        });
+                        }));
                     }
                 }
                 Ok(None) => break Ok(()),
                 Err(e) => {
-                    break Err(crate::native_function::vm_to_native_error(interp, e, name));
+                    break Err(e.into_native(interp, name));
                 }
             }
         };
@@ -411,8 +413,7 @@ pub fn option_to_string(
         let prim = ctx.with_turn_parts(|interp, stack| {
             interp.to_primitive_string_hint_sync(stack, &exec, value)
         });
-        let prim =
-            prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
+        let prim = prim.map_err(|e| e.into_native(ctx.cx.interp, class))?;
         if let Some(s) = prim.as_string(ctx.heap()) {
             return Ok(s.to_lossy_string(ctx.heap()));
         }
@@ -533,7 +534,7 @@ pub fn get_number_option(
     let n = ctx
         .with_turn_parts(|interp, stack| {
             crate::coerce::to_number_or_throw(interp, stack, &exec, &v)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, class))
+                .map_err(|e| e.into_native(interp, class))
         })?
         .as_f64();
     if n.is_nan() || n < min || n > max {
@@ -551,36 +552,46 @@ pub fn get_number_option(
 pub(crate) fn unwrap_legacy_receiver(
     ctx: &mut NativeCtx<'_>,
     receiver: crate::Value,
-) -> Option<crate::intl::payload::JsIntl> {
+    name: &'static str,
+) -> Result<Option<crate::intl::payload::JsIntl>, NativeError> {
     if let Some(intl) = receiver.as_intl(ctx.heap()) {
-        return Some(intl);
+        return Ok(Some(intl));
     }
-    let symbol = *ctx.cx.interp.intl_fallback_symbol_for_trace()?;
+    let Some(symbol) = ctx.cx.interp.intl_fallback_symbol_for_trace().copied() else {
+        return Ok(None);
+    };
     if let Some(object) = receiver.as_object() {
-        return crate::object::get_symbol(object, ctx.heap(), symbol)?.as_intl(ctx.heap());
+        return Ok(crate::object::get_symbol(object, ctx.heap(), symbol)
+            .and_then(|value| value.as_intl(ctx.heap())));
     }
     if receiver.is_proxy() {
-        // §UnwrapDateTimeFormat step 2 — Get(dtf, %FallbackSymbol%) is
-        // an ordinary observable [[Get]], so a Proxy receiver's get
-        // trap fires and can hand back the chained formatter.
-        let exec = ctx.execution_context().cloned()?;
-        let got = ctx
-            .with_turn_parts(|interp, stack| {
+        // The observable Get may collect before returning a getter. Keep its
+        // receiver in the sole scoped root owner and reload it for the call.
+        let exec = ctx.execution_context().cloned();
+        return ctx.with_turn_parts(|interp, stack| {
+            interp.with_handle_scope(|interp, scope| {
+                let receiver = interp.scoped_value(scope, receiver);
+                let current = interp.escape_scoped(receiver);
                 let key = crate::VmPropertyKey::Symbol(symbol);
-                match interp.ordinary_get_value(stack, &exec, receiver, receiver, &key, 0)? {
-                    crate::VmGetOutcome::Value(v) => Ok(v),
+                let outcome = interp
+                    .ordinary_get_value(stack, exec.as_ref(), current, current, &key, 0)
+                    .map_err(|error| error.into_native(interp, name))?;
+                let got = match outcome {
+                    crate::VmGetOutcome::Value(value) => value,
                     crate::VmGetOutcome::InvokeGetter { getter } => interp
                         .run_callable_sync_rooted(
                             stack,
-                            &exec,
+                            exec.as_ref(),
                             &getter,
-                            receiver,
+                            interp.escape_scoped(receiver),
                             smallvec::SmallVec::new(),
-                        ),
-                }
+                        )
+                        .map_err(crate::native_abi::CommittedValueError::completed_call)
+                        .map_err(|error| error.into_native(interp, name))?,
+                };
+                Ok(got.as_intl(interp.gc_heap()))
             })
-            .ok()?;
-        return got.as_intl(ctx.heap());
+        });
     }
-    None
+    Ok(None)
 }

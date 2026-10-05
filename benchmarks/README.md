@@ -91,8 +91,8 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `upvalue-call-families.js` | Closure-backed plain, method, and base-constructor linkage with stack-owned upvalues | `15000450000` |
 | `base-construct-receiver.js` | Pre-shaped fixed, spread, and derived/super receiver preparation with two own fields | `15001950000` |
 | `arith-exit-repair.js` | Int32 negation producing `-0` and an accumulator leaving Int32, repaired by one widening recompile | `150000` |
-| `polluted-feedback.js` | Relational and additive sites that saw `undefined` once per call; Number operands take the generic operator's inline probe | `4287494` |
-| `mixed-relational.js` | A relational site whose right operand is always a String, completed by the committed generic operator | `4787500` |
+| `polluted-feedback.js` | Relational and additive sites that saw `undefined` once per call, run as baseline operations inside optimized code | `4287494` |
+| `mixed-relational.js` | A relational site whose right operand is always a String, run as a baseline operation without declining the function | `4787500` |
 
 Run one fixture per isolate. Warmups and measured samples reuse that isolate
 and the same precompiled invocation stub, but every invocation must return the
@@ -194,6 +194,27 @@ include frontend compilation and are separate from the kernel ranking metric.
 The probe lives in the benchmark crate so its focused build does not compile
 the runtime integration-test dependency graph.
 
+### Natural GC service and retained components
+
+`otter-resource-probe` (`--features engine`) records actual bounded collection
+service and exports Chrome Trace Event JSON after capture. It loads the unchanged
+classic init source once and invokes the same rooted JavaScript callable for
+warm and captured work, with an exact finite numeric checksum. Retention and
+release scripts require paired expected completions; the trace path must be fresh. Full service includes nested minor service and its
+trigger accounting; overflow, incomplete capture, split phases and collector
+failure remain explicit failures. Quantiles use nearest rank on individual
+records; missing classes have null values rather than zero pauses.
+
+Baseline, retained and released snapshots follow separate successful forced
+full collections outside natural capture. RSS, reconciled live GC-cell bytes,
+allocated spaces and off-slot reservations remain distinct components. This
+probe does not claim an equivalent Bun whole-mutator boundary or a matched
+GC-owned external footprint. See the
+[GC observation workflow](../docs/site/src/content/docs/engine/gc-observation.md).
+Capture still needs the normal externally enforced watchdog, exact source and
+binary identities, repeated rotated process blocks, paired controls and idle
+native host; its result alone is not a competitive score.
+
 ### Call execution
 
 The call workload is parsed and lowered before sampling. Every warmup and
@@ -238,10 +259,10 @@ cargo run --release -p otter-benchmark --features engine \
 
 The optimizing scalar-leaf row exercises the same optimizing pipeline as
 every other function. Before accepting optimizing samples, an untimed compile
-of the same snapshot must identify `otter-machine-ir scalar-function`; the
-validation hook then executes the exact measured code object. The validation
-marker records `backend=otter-machine-ir`. There is no backend-selection
-benchmark parameter or legacy fallback result.
+of the same snapshot must produce the graph tier's `optimized-ir.txt`
+artifact; the validation hook then executes the exact measured code object.
+The validation marker records `backend=otter-graph`. There is no
+backend-selection benchmark parameter.
 
 ### Managed memory
 
@@ -435,6 +456,105 @@ V8 v7 and Octane use shell-style multi-file loading in one runtime/realm:
 ```bash
 otter run base.js richards.js run-driver.js
 ```
+
+## Fixed-work process comparisons
+
+On an idle macOS host, compare preserved binaries on the same generated
+fixtures without running Cargo or a profiler concurrently:
+
+```bash
+python3 -B scripts/dev/fixed-work.py benchmarks/results/<fresh-directory> \
+  --otter benchmarks/results/<candidate>/bin/otter \
+  --reference-otter benchmarks/results/<reference>/bin/otter \
+  --engines otter-reference otter node bun --runs 5 --warmup 1
+```
+
+Each measured round rotates the engines and launches fresh processes; excluded
+warmups do not retain JIT state. This measures end-to-end fixed work, not
+steady-state throughput. The runner keeps raw stdout and `time -l` reports,
+validates exact stdout, and reports distributions for instructions, peak RSS,
+CPU time and elapsed time. `real_seconds` has the system tool's resolution;
+`launchToExitSeconds` uses a monotonic clock around process launch and blocking
+wait, including the `time` wrapper. Their measurement windows differ.
+
+The generated Script fixtures require Bun's disclosed indirect-eval loader.
+Silent stdout alone cannot prove a workload's result; fixtures need internal
+validation or a printed deterministic checksum. Inputs must be identical
+across engines and rounds. Preserve both binaries and rerun both when correcting
+a fixture; an earlier measurement with different input is historical evidence.
+
+Any missing engine or counter, mismatch, timeout, or changed input/binary/tree
+makes the capture non-scoreable. Binary and source hashes are recorded
+separately: the current tree does not prove a preserved binary's source or build
+profile. Dirty-tree investigation is never eligible as a published baseline.
+Retained memory, GC pause distributions and warm throughput require their own
+harnesses.
+
+Engine memory measurements preserve `full-gc-pause-time-total` and
+`minor-gc-pause-time-total` as separate raw samples. A full collection includes
+its initial minor collection, so adding these counters double-counts that
+phase. Historical `gc-time` records cannot be split retrospectively. The
+`memory` and `idle-memory` workloads use the interpreter; their retained-heap
+results do not establish native-frame root retention.
+
+## Persistent fixed-work comparisons
+
+The seven complete immutable JavaScript anchors live in
+`benchmarks/fixtures/fixed-work/`. Their content hashes match the original
+fixed-work fixtures. Prepare every anchor with the OXC-based generator:
+
+```bash
+cargo build --locked --release -p otter-benchmark --features warm-harness \
+  --bin otter-warm-harness
+target/release/otter-warm-harness prepare \
+  --anchors benchmarks/fixtures/fixed-work/anchors.json \
+  --out benchmarks/results/<fresh-prepared-directory> --warmups 3 --samples 5
+```
+
+Each output is a classic Script in one persistent realm. Original definitions,
+data and algorithms retain their source bytes. A common loader establishes
+the same shell environment for Bun and Node. The generator captures
+`process.hrtime.bigint` before benchmark globals can shadow host helpers;
+the complete original driver and its inner integrity checks run between the
+timestamps. Setup, deterministic reset, outer checks, formatting and output
+run outside that window. The manifest identifies copied source spans,
+decoded dynamic source, input hashes and exact useful-work counts.
+
+Capture a successful frozen-source build manifest containing release Otter,
+checked Otter and the release `otter-warm-harness` validator. Before timing,
+validate complete originals and generated persistent invocations in all four
+execution modes. Supply the predeclared matrix with the original anchor hashes:
+
+```bash
+python3 -B scripts/dev/fixed-work-semantics.py benchmarks/results/<fresh-semantics> \
+  --prepared benchmarks/results/<prepared-directory> --matrix <matrix.json> \
+  --otter <release-otter> --interpreter <checked-otter> \
+  --validator <release-otter-warm-harness> --build-manifest <build.json> \
+  --bun <native-bun> --node <native-node>
+python3 -B scripts/dev/fixed-work-warm.py benchmarks/results/<fresh-warm-capture> \
+  --prepared benchmarks/results/<prepared-directory> --matrix <matrix.json> \
+  --semantic-manifest benchmarks/results/<semantics-directory>/semantics.json \
+  --otter <release-otter> --validator <release-otter-warm-harness> \
+  --build-manifest <build.json> --bun <native-bun> --node <native-node> --rounds 5
+```
+
+Crypto's ciphertext oracle is frozen only after independent complete original
+runs agree. The semantic phase validates all excluded warmups and measured
+invocations; those durations are diagnostic and cannot become speed samples.
+Both drivers retain all seven required cases and missing or failed engines.
+The warm driver refuses a changed source, script, oracle, loader, validator,
+matrix or executable, unproved release build, active Cargo/rustc process or
+diagnostic/stress environment. A process-group watchdog bounds each execution.
+
+Competitive capture requires native macOS AArch64 or native Linux x86_64 and
+three whole-host idle observations before each engine block. Five independent
+process rounds each contain three excluded warmups and five measured full
+invocations. Engine block order rotates by case and round. Raw dependent
+invocations remain available; empirical spread and comparisons use independent
+process-block medians. Overlap requires fresh captures with 15 then 30 rounds.
+No slow observation is discarded. Complete timing coverage alone does not
+establish per-case victory, retained memory, RSS, startup or GC distributions;
+those require their separately declared measurements.
 
 ## Historical artifacts
 

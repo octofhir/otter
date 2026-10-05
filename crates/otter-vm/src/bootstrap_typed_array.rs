@@ -83,13 +83,15 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 call,
                 &[&abstract_proto_root],
             )
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            object::define_own_property(
+            .map_err(JsSurfaceError::from)?;
+            if !object::define_own_property(
                 abstract_proto,
                 heap,
                 name,
                 PropertyDescriptor::data(Value::native_function(f), true, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             Ok(())
         };
         install_method(heap, "forEach", 1, ta_proto_for_each)?;
@@ -124,13 +126,15 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 getter,
                 &[&abstract_proto_root],
             )
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            object::define_own_property(
+            .map_err(JsSurfaceError::from)?;
+            if !object::define_own_property(
                 abstract_proto,
                 heap,
                 name,
                 PropertyDescriptor::accessor(Some(Value::native_function(f)), None, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
             Ok(())
         };
         install_accessor(heap, "buffer", "get buffer", ta_buffer_getter)?;
@@ -145,14 +149,13 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         object::get(global, heap, ABSTRACT_CTOR_SLOT).and_then(|v| v.as_native_function())
     {
         let name_val = Value::string(
-            crate::string::JsString::from_str("TypedArray", heap)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?,
+            crate::string::JsString::from_str("TypedArray", heap).map_err(JsSurfaceError::from)?,
         );
         ctor.define_own_property(
             heap,
             "name",
             PropertyDescriptor::data(name_val, false, false, true),
-        );
+        )?;
     }
 
     // §22.2.6 — `%TypedArray%.prototype[@@toStringTag]` is an
@@ -183,12 +186,14 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
             .and_then(|proto| proto.as_object())
             .and_then(|proto| object::get(proto, heap, "toString"));
         if let Some(fun) = array_to_string {
-            object::define_own_property(
+            if !object::define_own_property(
                 abstract_proto,
                 heap,
                 "toString",
                 PropertyDescriptor::data(fun, true, false, true),
-            );
+            )? {
+                return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+            };
         }
         let abstract_proto_root = Value::object(abstract_proto);
         let getter = crate::bootstrap::native_static_with_value_roots(
@@ -198,8 +203,8 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
             tostring_tag_getter,
             &[&abstract_proto_root],
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        object::define_own_symbol_property_partial(
+        .map_err(JsSurfaceError::from)?;
+        if !object::define_own_symbol_property_partial(
             &mut abstract_proto,
             heap,
             tag_sym,
@@ -209,7 +214,9 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )? {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+        };
     }
 
     // Install `%TypedArray%.prototype[@@iterator] = values`.
@@ -217,7 +224,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         && let Some(values_value) = object::get(abstract_proto, heap, "values")
     {
         let iterator_sym = well_known.get(WellKnown::Iterator);
-        object::define_own_symbol_property_partial(
+        if !object::define_own_symbol_property_partial(
             &mut abstract_proto,
             heap,
             iterator_sym,
@@ -228,7 +235,9 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )? {
+            return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+        };
     }
     // §23.2 uint8array-base64 — Uint8Array.{fromBase64,fromHex} statics
     // and the toBase64 / toHex prototype methods.
@@ -292,7 +301,7 @@ fn drain_iterable_into_values<'scope>(
                 interp.iterator_next_full(exec_ctx, stack, &handle)
             });
             let (value, done) =
-                next.map_err(|e| vm_to_native(scope.context().interp_mut(), e, "TypedArray"))?;
+                next.map_err(|e| e.into_native(scope.context().interp_mut(), "TypedArray"))?;
             if done {
                 break;
             }
@@ -347,13 +356,13 @@ fn coerce_values_for_kind<'scope>(
         let converted = if kind.is_bigint() {
             let big = scope.with_turn_parts(|interp, stack| {
                 crate::coerce::to_big_int_or_throw(interp, stack, exec, &value)
-                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+                    .map_err(|e| e.into_native(interp, "TypedArray"))
             })?;
             Value::big_int(big)
         } else {
             let number = scope.with_turn_parts(|interp, stack| {
                 crate::coerce::to_number_or_throw(interp, stack, exec, &value)
-                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+                    .map_err(|e| e.into_native(interp, "TypedArray"))
             })?;
             Value::number(number)
         };
@@ -376,8 +385,8 @@ fn ta_get_via<'scope>(
     let source_raw = scope.raw(source);
     let outcome = scope.with_turn_parts(|interp, stack| {
         interp
-            .ordinary_get_value(stack, exec, source_raw, source_raw, key, 0)
-            .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+            .ordinary_get_value(stack, Some(exec), source_raw, source_raw, key, 0)
+            .map_err(|e| e.into_native(interp, "TypedArray"))
     })?;
     match outcome {
         crate::VmGetOutcome::Value(value) => Ok(scope.value(value)),
@@ -404,7 +413,7 @@ fn read_array_like_coerced<'scope>(
     let len_value_raw = scope.raw(len_value);
     let len_number = scope.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, exec, &len_value_raw)
-            .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+            .map_err(|e| e.into_native(interp, "TypedArray"))
     })?;
     let n = len_number.as_f64();
     let len = if n.is_nan() || n <= 0.0 {
@@ -434,13 +443,13 @@ fn read_array_like_coerced<'scope>(
         let converted = if kind.is_bigint() {
             let big = scope.with_turn_parts(|interp, stack| {
                 crate::coerce::to_big_int_or_throw(interp, stack, exec, &value)
-                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+                    .map_err(|e| e.into_native(interp, "TypedArray"))
             })?;
             Value::big_int(big)
         } else {
             let number = scope.with_turn_parts(|interp, stack| {
                 crate::coerce::to_number_or_throw(interp, stack, exec, &value)
-                    .map_err(|e| vm_to_native(interp, e, "TypedArray"))
+                    .map_err(|e| e.into_native(interp, "TypedArray"))
             })?;
             Value::number(number)
         };
@@ -689,7 +698,7 @@ fn ta_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
         let len_value = scope.raw(len_value);
         let len = scope.with_turn_parts(|interp, stack| {
             crate::coerce::to_length_or_throw(interp, stack, &exec, &len_value)
-                .map_err(|e| vm_to_native(interp, e, name))
+                .map_err(|e| e.into_native(interp, name))
         })?;
         let target = ta_create_from_constructor(&mut scope, receiver, len, name)?;
         for k in 0..len {
@@ -816,13 +825,13 @@ fn ta_from_store<'scope>(
     let converted = if target_kind.is_bigint() {
         let big = scope.with_turn_parts(|interp, stack| {
             crate::coerce::to_big_int_or_throw(interp, stack, exec, &mapped)
-                .map_err(|e| vm_to_native(interp, e, name))
+                .map_err(|e| e.into_native(interp, name))
         })?;
         Value::big_int(big)
     } else {
         let number = scope.with_turn_parts(|interp, stack| {
             crate::coerce::to_number_or_throw(interp, stack, exec, &mapped)
-                .map_err(|e| vm_to_native(interp, e, name))
+                .map_err(|e| e.into_native(interp, name))
         })?;
         Value::number(number)
     };
@@ -973,7 +982,7 @@ fn ta_ctor_dispatch(
                             &value,
                             crate::abstract_ops::ToPrimitiveHint::Number,
                         )
-                        .map_err(|error| vm_to_native(interp, error, typed_array_name(kind)))
+                        .map_err(|error| error.into_native(interp, typed_array_name(kind)))
                 })?;
                 rooted_args[idx] = scope.value(primitive);
             }
@@ -1181,9 +1190,7 @@ fn ta_proto_dispatch(
                     let number = scope.with_turn_parts(|interp, stack| {
                         interp
                             .coerce_to_number(stack, &context, &value)
-                            .map_err(|error| {
-                                crate::native_function::vm_to_native_error(interp, error, NAME)
-                            })
+                            .map_err(|error| error.into_native(interp, NAME))
                     })?;
                     arg_handles[idx] = scope.value(Value::number(number));
                 }
@@ -1257,9 +1264,7 @@ fn ta_species_dispatch(
             interp.typed_array_subarray_value_dispatch(stack, &context, &t, args)
         }
     });
-    result.map_err(|err| {
-        crate::native_function::vm_to_native_error(ctx.interp_mut(), err, method_name)
-    })
+    result.map_err(|err| err.into_native(ctx.interp_mut(), method_name))
 }
 
 fn ta_callback_dispatch(
@@ -1284,7 +1289,7 @@ fn ta_callback_dispatch(
     ctx.with_turn_parts(|interp, stack| {
         interp
             .typed_array_callback_value_dispatch(stack, &context, &t, method_name, args)
-            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, method_name))
+            .map_err(|err| err.into_native(interp, method_name))
     })
 }
 

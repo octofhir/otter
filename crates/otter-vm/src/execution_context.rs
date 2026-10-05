@@ -22,6 +22,8 @@
 //! - One context owns one live chunk payload in the interpreter's shared
 //!   [`crate::code_space::CodeSpace`]. Table reads are chunk-local; callers
 //!   resolve a foreign function id to its owning context before reading.
+//! - Source labels resolve only within that payload's immutable registry;
+//!   a later chunk using the same URL cannot replace an older function's text.
 //!
 //! # See also
 //!
@@ -105,9 +107,15 @@ impl ExecutionContext {
     /// # Errors
     /// Returns [`crate::BytecodeLinkError`] before constructing a context when
     /// the module is malformed.
-    pub fn from_module(module: BytecodeModule) -> Result<Self, crate::BytecodeLinkError> {
-        Arc::new(CodeSpace::default())
-            .link_module(module, &otter_resource::ResourceAccount::default())
+    pub fn from_module(
+        module: BytecodeModule,
+        sources: crate::source_registry::SourceRegistry,
+    ) -> Result<Self, crate::BytecodeLinkError> {
+        Arc::new(CodeSpace::default()).link_module(
+            module,
+            sources,
+            &otter_resource::ResourceAccount::default(),
+        )
     }
 
     /// Build a standalone context from decoded/cache bytecode while retaining
@@ -121,9 +129,13 @@ impl ExecutionContext {
     /// the retained proof cannot fit the fresh code space.
     pub fn from_verified_module(
         module: otter_bytecode::VerifiedBytecodeModule,
+        sources: crate::source_registry::SourceRegistry,
     ) -> Result<Self, crate::BytecodeLinkError> {
-        Arc::new(CodeSpace::default())
-            .link_verified_module(module, &otter_resource::ResourceAccount::default())
+        Arc::new(CodeSpace::default()).link_verified_module(
+            module,
+            sources,
+            &otter_resource::ResourceAccount::default(),
+        )
     }
 
     /// Wrap one linked chunk's payload. Only [`CodeSpace::link_module`] and
@@ -194,15 +206,24 @@ impl ExecutionContext {
         if self.covers_function(function_id) {
             return Ok(ResolvedCtx::Ambient(self));
         }
-        match self.space.resolve_chunk(function_id) {
+        Self::for_function_in(&self.space, function_id).map(ResolvedCtx::Owned)
+    }
+
+    /// Resolve a bytecode callable admitted without a source context through
+    /// its exact live code-space owner. No ambient realm chunk participates.
+    pub(crate) fn for_function_in(
+        space: &Arc<CodeSpace>,
+        function_id: u32,
+    ) -> Result<Self, FunctionResolutionError> {
+        match space.resolve_chunk(function_id) {
             ChunkResolution::Live {
                 function_base,
                 payload,
-            } => Ok(ResolvedCtx::Owned(Self::from_chunk_payload(
+            } => Ok(Self::from_chunk_payload(
                 payload,
                 function_base,
-                Arc::clone(&self.space),
-            ))),
+                Arc::clone(space),
+            )),
             ChunkResolution::Evicted {
                 function_base,
                 function_count,
@@ -226,6 +247,13 @@ impl ExecutionContext {
     #[must_use]
     pub fn module_name(&self) -> &str {
         &self.payload.module.module
+    }
+
+    /// Read immutable source belonging to this exact linked chunk.
+    /// Callers resolve foreign function IDs before using this accessor.
+    #[must_use]
+    pub(crate) fn source(&self, module_url: &str) -> Option<&crate::source_registry::ModuleSource> {
+        self.payload.sources.get(module_url)
     }
 
     /// Entry function for a script/module turn.
@@ -759,21 +787,28 @@ mod tests {
     }
 
     fn run_module_with_interpreter(module: BytecodeModule) -> (Value, Interpreter) {
-        let context = ExecutionContext::from_module(module).expect("valid bytecode fixture");
-        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(
+            module,
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid bytecode fixture");
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let value = interp.run(&context).expect("test bytecode runs");
         (value, interp)
     }
 
     #[test]
     fn string_constants_have_stable_property_atoms() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = interp
-            .link_module(module_with(
-                vec![instr(0, Op::ReturnUndefined, [])],
-                vec![string_constant("foo")],
-                1,
-            ))
+            .link_module(
+                module_with(
+                    vec![instr(0, Op::ReturnUndefined, [])],
+                    vec![string_constant("foo")],
+                    1,
+                ),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
 
         let key = context
@@ -785,31 +820,34 @@ mod tests {
 
     #[test]
     fn jit_snapshot_marks_array_length_loads() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(
-                    0,
-                    Op::LoadProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::Register(1),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(
-                    1,
-                    Op::LoadProperty,
-                    [
-                        Operand::Register(2),
-                        Operand::Register(1),
-                        Operand::ConstIndex(1),
-                    ],
-                ),
-                instr(2, Op::ReturnUndefined, []),
-            ],
-            vec![string_constant("length"), string_constant("value")],
-            3,
-        ))
+        let context = ExecutionContext::from_module(
+            module_with(
+                vec![
+                    instr(
+                        0,
+                        Op::LoadProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::Register(1),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(
+                        1,
+                        Op::LoadProperty,
+                        [
+                            Operand::Register(2),
+                            Operand::Register(1),
+                            Operand::ConstIndex(1),
+                        ],
+                    ),
+                    instr(2, Op::ReturnUndefined, []),
+                ],
+                vec![string_constant("length"), string_constant("value")],
+                3,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
 
         let view = context.jit_compile_snapshot(0).expect("function exists");
@@ -820,38 +858,41 @@ mod tests {
 
     #[test]
     fn jit_snapshot_marks_primitive_method_hints() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(
-                    0,
-                    Op::CallMethodValue,
-                    [
-                        Operand::Register(0),
-                        Operand::Register(1),
-                        Operand::ConstIndex(0),
-                        Operand::ConstIndex(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(
-                    1,
-                    Op::CallMethodValue,
-                    [
-                        Operand::Register(3),
-                        Operand::Register(1),
-                        Operand::ConstIndex(2),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(2, Op::ReturnUndefined, []),
-            ],
-            vec![
-                string_constant("charCodeAt"),
-                string_constant("unused"),
-                string_constant("value"),
-            ],
-            4,
-        ))
+        let context = ExecutionContext::from_module(
+            module_with(
+                vec![
+                    instr(
+                        0,
+                        Op::CallMethodValue,
+                        [
+                            Operand::Register(0),
+                            Operand::Register(1),
+                            Operand::ConstIndex(0),
+                            Operand::ConstIndex(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(
+                        1,
+                        Op::CallMethodValue,
+                        [
+                            Operand::Register(3),
+                            Operand::Register(1),
+                            Operand::ConstIndex(2),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(2, Op::ReturnUndefined, []),
+                ],
+                vec![
+                    string_constant("charCodeAt"),
+                    string_constant("unused"),
+                    string_constant("value"),
+                ],
+                4,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
 
         let view = context.jit_compile_snapshot(0).expect("function exists");
@@ -868,32 +909,38 @@ mod tests {
 
     #[test]
     fn sibling_jit_snapshot_resolves_load_number_from_its_own_chunk() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let owner = interp
-            .link_module(module_with(
-                vec![
-                    instr(
-                        0,
-                        Op::LoadNumber,
-                        [Operand::Register(0), Operand::ConstIndex(0)],
-                    ),
-                    instr(1, Op::ReturnValue, [Operand::Register(0)]),
-                ],
-                vec![Constant::Number {
-                    bits: 17.25_f64.to_bits(),
-                }],
-                1,
-            ))
+            .link_module(
+                module_with(
+                    vec![
+                        instr(
+                            0,
+                            Op::LoadNumber,
+                            [Operand::Register(0), Operand::ConstIndex(0)],
+                        ),
+                        instr(1, Op::ReturnValue, [Operand::Register(0)]),
+                    ],
+                    vec![Constant::Number {
+                        bits: 17.25_f64.to_bits(),
+                    }],
+                    1,
+                ),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         let owner_function = owner.function_base();
         let ambient = interp
-            .link_module(module_with(
-                vec![instr(0, Op::ReturnUndefined, [])],
-                vec![Constant::Number {
-                    bits: (-99.0_f64).to_bits(),
-                }],
-                0,
-            ))
+            .link_module(
+                module_with(
+                    vec![instr(0, Op::ReturnUndefined, [])],
+                    vec![Constant::Number {
+                        bits: (-99.0_f64).to_bits(),
+                    }],
+                    0,
+                ),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
 
         let owner = ambient
@@ -1015,36 +1062,39 @@ mod tests {
 
     #[test]
     fn property_ic_stats_record_load_hit_after_warmup() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(1, Op::LoadTrue, [Operand::Register(1)]),
-                instr(
-                    2,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(
-                    3,
-                    Op::LoadProperty,
-                    [
-                        Operand::Register(3),
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(4, Op::Return, [Operand::Register(3)]),
-            ],
-            vec![string_constant("foo")],
-            4,
-        ))
+        let context = ExecutionContext::from_module(
+            module_with(
+                vec![
+                    instr(0, Op::NewObject, [Operand::Register(0)]),
+                    instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                    instr(
+                        2,
+                        Op::StoreProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(
+                        3,
+                        Op::LoadProperty,
+                        [
+                            Operand::Register(3),
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(4, Op::Return, [Operand::Register(3)]),
+                ],
+                vec![string_constant("foo")],
+                4,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
         assert_eq!(
             interp.run(&context).expect("first run"),
@@ -1066,46 +1116,49 @@ mod tests {
         // Two receivers share one prototype, so they share its instance
         // root: the second pass through the load site hits the prototype hop
         // its first pass installed.
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(1, Op::LoadTrue, [Operand::Register(1)]),
-                instr(
-                    2,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(3, Op::LoadFalse, [Operand::Register(5)]),
-                instr(4, Op::NewObject, [Operand::Register(3)]),
-                instr(
-                    5,
-                    Op::SetPrototype,
-                    [Operand::Register(3), Operand::Register(0)],
-                ),
-                instr(
-                    6,
-                    Op::LoadProperty,
-                    [
-                        Operand::Register(4),
-                        Operand::Register(3),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(7, Op::JumpIfTrue, [Operand::Imm32(2), Operand::Register(5)]),
-                instr(8, Op::LoadTrue, [Operand::Register(5)]),
-                instr(9, Op::Jump, [Operand::Imm32(-6)]),
-                instr(10, Op::Return, [Operand::Register(4)]),
-            ],
-            vec![string_constant("foo")],
-            6,
-        ))
+        let context = ExecutionContext::from_module(
+            module_with(
+                vec![
+                    instr(0, Op::NewObject, [Operand::Register(0)]),
+                    instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                    instr(
+                        2,
+                        Op::StoreProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(3, Op::LoadFalse, [Operand::Register(5)]),
+                    instr(4, Op::NewObject, [Operand::Register(3)]),
+                    instr(
+                        5,
+                        Op::SetPrototype,
+                        [Operand::Register(3), Operand::Register(0)],
+                    ),
+                    instr(
+                        6,
+                        Op::LoadProperty,
+                        [
+                            Operand::Register(4),
+                            Operand::Register(3),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(7, Op::JumpIfTrue, [Operand::Imm32(2), Operand::Register(5)]),
+                    instr(8, Op::LoadTrue, [Operand::Register(5)]),
+                    instr(9, Op::Jump, [Operand::Imm32(-6)]),
+                    instr(10, Op::Return, [Operand::Register(4)]),
+                ],
+                vec![string_constant("foo")],
+                6,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
         assert_eq!(interp.run(&context).expect("run"), Value::boolean(true));
 
@@ -1146,8 +1199,12 @@ mod tests {
             5,
         );
 
-        let context = ExecutionContext::from_module(module).expect("valid bytecode fixture");
-        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(
+            module,
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid bytecode fixture");
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         // The trailing load can prepare Object.prototype on its first miss.
         // Stabilize that shared guard before measuring replay of the same
         // add-store site; otherwise the second store correctly relearns it.
@@ -1183,56 +1240,59 @@ mod tests {
     }
 
     #[test]
-    fn deleted_object_shape_does_not_install_later_store_ic() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(1, Op::LoadTrue, [Operand::Register(1)]),
-                instr(
-                    2,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(
-                    3,
-                    Op::DeleteProperty,
-                    [
-                        Operand::Register(3),
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(
-                    4,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(
-                    5,
-                    Op::LoadProperty,
-                    [
-                        Operand::Register(4),
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(6, Op::Return, [Operand::Register(4)]),
-            ],
-            vec![string_constant("foo")],
-            5,
-        ))
+    fn final_property_deletion_restores_cacheable_parent_shape_for_later_store() {
+        let context = ExecutionContext::from_module(
+            module_with(
+                vec![
+                    instr(0, Op::NewObject, [Operand::Register(0)]),
+                    instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                    instr(
+                        2,
+                        Op::StoreProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(
+                        3,
+                        Op::DeleteProperty,
+                        [
+                            Operand::Register(3),
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(
+                        4,
+                        Op::StoreProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(
+                        5,
+                        Op::LoadProperty,
+                        [
+                            Operand::Register(4),
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(6, Op::Return, [Operand::Register(4)]),
+                ],
+                vec![string_constant("foo")],
+                5,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         // The trailing load can prepare Object.prototype on its first miss.
         // Stabilize that shared guard before measuring replay of the same
         // add-store site; otherwise the second store correctly relearns it.
@@ -1269,73 +1329,78 @@ mod tests {
                 .expect("post-delete store site");
             assert_eq!(
                 deleted_store.entry_count(),
-                0,
+                1,
                 "{run}: post-delete store bank"
             );
             assert!(
                 matches!(
                     deleted_store.state(),
-                    crate::feedback::PropertyFeedbackState::Empty
+                    crate::feedback::PropertyFeedbackState::MonomorphicOwnData { .. }
+                        | crate::feedback::PropertyFeedbackState::Polymorphic
                 ),
-                "{run}: post-delete store must stay empty"
+                "{run}: exact parent-shape transition owns one replay proof"
             );
+            assert!(deleted_store.attempted(), "{run}: store reached dispatch");
         }
         let stats = interp.property_ic_stats();
-        assert_eq!(stats.store_installs, 1);
-        assert_eq!(interp.store_property_ic_count(), 1);
+        assert_eq!(stats.store_installs, 2);
+        assert_eq!(interp.store_property_ic_count(), 2);
     }
 
     #[test]
-    fn deleted_object_shape_does_not_install_later_load_ic() {
-        let context = ExecutionContext::from_module(module_with(
-            vec![
-                instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(1, Op::LoadTrue, [Operand::Register(1)]),
-                instr(
-                    2,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                        Operand::Register(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(
-                    3,
-                    Op::DeleteProperty,
-                    [
-                        Operand::Register(3),
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                    ],
-                ),
-                instr(
-                    4,
-                    Op::StoreProperty,
-                    [
-                        Operand::Register(0),
-                        Operand::ConstIndex(1),
-                        Operand::Register(1),
-                        Operand::Register(2),
-                    ],
-                ),
-                instr(
-                    5,
-                    Op::LoadProperty,
-                    [
-                        Operand::Register(4),
-                        Operand::Register(0),
-                        Operand::ConstIndex(1),
-                    ],
-                ),
-                instr(6, Op::Return, [Operand::Register(4)]),
-            ],
-            vec![string_constant("foo"), string_constant("bar")],
-            5,
-        ))
+    fn final_property_deletion_restores_cacheable_parent_shape_for_later_load() {
+        let context = ExecutionContext::from_module(
+            module_with(
+                vec![
+                    instr(0, Op::NewObject, [Operand::Register(0)]),
+                    instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                    instr(
+                        2,
+                        Op::StoreProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(
+                        3,
+                        Op::DeleteProperty,
+                        [
+                            Operand::Register(3),
+                            Operand::Register(0),
+                            Operand::ConstIndex(0),
+                        ],
+                    ),
+                    instr(
+                        4,
+                        Op::StoreProperty,
+                        [
+                            Operand::Register(0),
+                            Operand::ConstIndex(1),
+                            Operand::Register(1),
+                            Operand::Register(2),
+                        ],
+                    ),
+                    instr(
+                        5,
+                        Op::LoadProperty,
+                        [
+                            Operand::Register(4),
+                            Operand::Register(0),
+                            Operand::ConstIndex(1),
+                        ],
+                    ),
+                    instr(6, Op::Return, [Operand::Register(4)]),
+                ],
+                vec![string_constant("foo"), string_constant("bar")],
+                5,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
         assert_eq!(
             interp.run(&context).expect("first run"),
@@ -1346,7 +1411,16 @@ mod tests {
             Value::boolean(true)
         );
 
-        assert_eq!(interp.load_property_ic_count(), 0);
+        assert_eq!(interp.load_property_ic_count(), 1);
+        let load = context
+            .property_feedback_slot(
+                context.function_base(),
+                5,
+                crate::property_ic::PropertyIcKind::Load,
+            )
+            .expect("post-delete load site");
+        assert_eq!(load.entry_count(), 1);
+        assert!(load.attempted());
     }
 
     #[test]

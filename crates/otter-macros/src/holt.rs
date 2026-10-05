@@ -526,27 +526,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 global: ::otter_vm::__macro_support::JsObject,
                 well_known: &::otter_vm::__macro_support::symbol::WellKnownSymbols,
             ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
-                let ::core::option::Option::Some(mut namespace) =
+                let ::core::option::Option::Some(namespace) =
                     ::otter_vm::__macro_support::object::get(global, heap, #name)
                         .and_then(|v| v.as_object())
                 else {
                     return ::core::result::Result::Ok(());
                 };
-                let tag_sym = well_known.get(::otter_vm::__macro_support::symbol::WellKnown::ToStringTag);
-                let value = ::otter_vm::__macro_support::string::JsString::from_str(#tag, heap)
-                    .map_err(|_| ::otter_vm::__macro_support::JsSurfaceError::OutOfMemory)?;
-                ::otter_vm::__macro_support::object::define_own_symbol_property_partial(
-                    &mut namespace,
-                    heap,
-                    tag_sym,
-                    ::otter_vm::__macro_support::object::PartialPropertyDescriptor {
-                        value: ::core::option::Option::Some(::otter_vm::__macro_support::Value::string(value)),
-                        writable: ::core::option::Option::Some(false),
-                        enumerable: ::core::option::Option::Some(false),
-                        configurable: ::core::option::Option::Some(true),
-                        ..::core::default::Default::default()
-                    },
-                );
+                let mut builder = ::otter_vm::__macro_support::ObjectBuilder::from_object(heap, namespace);
+                builder.to_string_tag(well_known, #tag)?;
+                let _ = builder.build();
                 ::core::result::Result::Ok(())
             }
         },
@@ -592,8 +580,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 heap: &mut ::otter_gc::GcHeap,
                 global: ::otter_vm::__macro_support::JsObject,
             ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
-                let global_root = ::otter_vm::__macro_support::Value::object(global);
-                let namespace = ::otter_vm::__macro_support::NamespaceBuilder::from_spec_with_value_roots(
+                let mut global_root = ::otter_vm::__macro_support::Value::object(global);
+                let mut global_scope = ::otter_gc::RootScope::new(heap);
+                // SAFETY: the actual global slot stays stationary through this install.
+                unsafe {
+                    ::otter_vm::__macro_support::rooting::RootScopeExt::add_value(
+                        &mut global_scope, &mut global_root,
+                    );
+                }
+                let mut namespace = ::otter_vm::__macro_support::NamespaceBuilder::from_spec_with_value_roots(
                     heap,
                     &#spec_ident,
                     ::std::vec![global_root],
@@ -610,6 +605,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 // empty `[[Prototype]]` chain). Defaulting the
                 // flag to `false` preserves the existing per-port
                 // shape; Reflect and Atomics opt in.
+                let global = global_root.as_object().expect("holt!: global stays rooted");
                 if #link_object_prototype
                     && let ::core::option::Option::Some(object_ctor) =
                         ::otter_vm::__macro_support::object::get(global, heap, "Object")
@@ -618,18 +614,22 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         ::otter_vm::__macro_support::object::get(object_ctor, heap, "prototype")
                             .and_then(|v| v.as_object())
                 {
-                    ::otter_vm::__macro_support::object::set_prototype(
-                        namespace,
+                    if !::otter_vm::__macro_support::object::set_prototype(
+                        &mut namespace,
                         heap,
                         ::core::option::Option::Some(object_proto),
-                    );
+                    )? {
+                        return ::core::result::Result::Err(
+                            ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed("[[Prototype]]"),
+                        );
+                    }
                 }
                 ::otter_vm::__macro_support::bootstrap::define_global_value(
-                    global,
+                    global_root.as_object().expect("holt!: global after prototype transition"),
                     heap,
                     <Self as ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic>::NAME,
                     ::otter_vm::__macro_support::Value::object(namespace),
-                );
+                )?;
                 ::core::result::Result::Ok(())
             }
         }

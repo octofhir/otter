@@ -151,6 +151,9 @@ impl JitCtx {
         self.stage_call_request(callee, Value::undefined(), arguments)?;
         self.pending_call.header.flags =
             super::NativeFrameFlags::from_bits(super::NativeFrameFlags::TAIL_CALL);
+        let frame = unsafe { self.native_frame.as_ref() }.ok_or(VmError::InvalidOperand)?;
+        self.pending_call.caller = frame.caller;
+        self.pending_call.caller_return_pc = frame.caller_return_pc;
         Ok(())
     }
 
@@ -228,6 +231,9 @@ impl JitCtx {
 pub type JitEntry = extern "C" fn(*mut JitCtx) -> NativeResultPair;
 
 #[cfg(target_pointer_width = "64")]
-const _: [(); 192] = [(); std::mem::size_of::<JitCtx>()];
+// The canonical 128-byte request includes the original receiver, lexical
+// context identity and synchronous Super origin. No parallel compact request
+// is used by generated tiers or the trampoline.
+const _: [(); 232] = [(); std::mem::size_of::<JitCtx>()];
 
-const _: [(); 188] = [(); std::mem::offset_of!(JitCtx, completion_generation)];
+const _: [(); 228] = [(); std::mem::offset_of!(JitCtx, completion_generation)];

@@ -32,6 +32,8 @@ pub(crate) struct StackFrameSnapshotView<'a> {
     pub(crate) module: &'a str,
     /// Source byte span at the sampled instruction.
     pub(crate) span: (u32, u32),
+    /// Source retained by this exact owning code chunk, never an ambient URL map.
+    pub(crate) source: Option<&'a crate::source_registry::ModuleSource>,
 }
 
 /// Resolve one exact logical instruction into the shared borrowed stack view.
@@ -77,5 +79,6 @@ pub(crate) fn visit_frame_snapshot(
         function_name,
         module,
         span,
+        source: owner.and_then(|owner| owner.source(module)),
     })
 }

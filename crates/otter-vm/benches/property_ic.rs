@@ -93,22 +93,25 @@ fn named_property_loop(iterations: i32) -> ExecutionContext {
         instr(11, Op::Jump, [Operand::Imm32(-6)]),
         instr(12, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-ic-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-ic-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -181,22 +184,25 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
         instr(12, Op::Jump, [Operand::Imm32(-6)]),
         instr(13, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-computed-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-computed-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -256,22 +262,25 @@ fn own_named_load_loop(iterations: i32) -> ExecutionContext {
         instr(10, Op::Jump, [Operand::Imm32(-5)]),
         instr(11, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-own-load-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-own-load-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -332,22 +341,25 @@ fn own_named_store_loop(iterations: i32) -> ExecutionContext {
         instr(10, Op::Jump, [Operand::Imm32(-5)]),
         instr(11, Op::Return, [Operand::Register(4)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-own-store-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-own-store-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -413,22 +425,25 @@ fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
         instr(12, Op::Jump, [Operand::Imm32(-5)]),
         instr(13, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-prototype-load-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 10,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-prototype-load-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 10,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -488,22 +503,25 @@ fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
         instr(10, Op::Jump, [Operand::Imm32(-6)]),
         instr(11, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-delete-own-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 9,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-delete-own-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 9,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -552,22 +570,25 @@ fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
         instr(8, Op::Jump, [Operand::Imm32(-5)]),
         instr(9, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-delete-missing-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 7,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("missing")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-delete-missing-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 7,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("missing")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -633,22 +654,25 @@ fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
         instr(12, Op::Jump, [Operand::Imm32(-5)]),
         instr(13, Op::Return, [Operand::Register(6)]),
     ];
-    ExecutionContext::from_module(BytecodeModule {
-        module: "property-delete-inherited-bench.js".to_string(),
-        template_sites: Vec::new(),
-        source_kind: SourceKind::JavaScript,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            scratch: 10,
-            code: code.into(),
-            ..Function::default()
-        }],
-        constants: vec![string_constant("foo")],
-        module_resolutions: Vec::new(),
-        module_inits: Vec::new(),
-        function_source: None,
-    })
+    ExecutionContext::from_module(
+        BytecodeModule {
+            module: "property-delete-inherited-bench.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                scratch: 10,
+                code: code.into(),
+                ..Function::default()
+            }],
+            constants: vec![string_constant("foo")],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+            function_source: None,
+        },
+        crate::source_registry::SourceRegistry::default(),
+    )
     .expect("valid bytecode fixture")
 }
 
@@ -661,14 +685,14 @@ fn bench_property_ic(c: &mut Criterion) {
     let delete_own_context = named_delete_own_data_loop(1_000);
     let delete_missing_context = named_delete_missing_loop(1_000);
     let delete_inherited_context = named_delete_inherited_present_loop(1_000);
-    let mut named_interp = Interpreter::new();
-    let mut computed_interp = Interpreter::new();
-    let mut own_load_interp = Interpreter::new();
-    let mut own_store_interp = Interpreter::new();
-    let mut prototype_load_interp = Interpreter::new();
-    let mut delete_own_interp = Interpreter::new();
-    let mut delete_missing_interp = Interpreter::new();
-    let mut delete_inherited_interp = Interpreter::new();
+    let mut named_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut computed_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut own_load_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut own_store_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut prototype_load_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut delete_own_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut delete_missing_interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut delete_inherited_interp = Interpreter::new().expect("fixture interpreter bootstrap");
     named_interp.run(&named_context).expect("warm property ICs");
     computed_interp
         .run(&computed_context)

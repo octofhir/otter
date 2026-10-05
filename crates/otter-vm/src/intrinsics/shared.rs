@@ -155,10 +155,8 @@ pub(crate) fn native_new_target_prototype(
             let receiver = scope.raw(new_target);
             match scope.with_turn_parts(|interp, stack| {
                 interp
-                    .ordinary_get_value(stack, &exec, receiver, receiver, &key, 0)
-                    .map_err(|error| {
-                        crate::native_function::vm_to_native_error(interp, error, name)
-                    })
+                    .ordinary_get_value(stack, Some(&exec), receiver, receiver, &key, 0)
+                    .map_err(|error| error.into_native(interp, name))
             })? {
                 VmGetOutcome::Value(value) => Some(scope.value(value)),
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -226,13 +224,14 @@ pub(crate) fn install_placeholder(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let global_root = Value::object(global);
+    let mut global_root = Value::object(global);
     let mut placeholder_root = Value::undefined();
     let mut proto_root = Value::undefined();
     let mut scope = otter_gc::RootScope::new(heap);
-    // SAFETY: both canonical slots are declared before the scope and remain
-    // live until the placeholder has been attached to the global object.
+    // SAFETY: all three canonical slots precede the guard and remain live
+    // until the placeholder has been attached to the current global object.
     unsafe {
+        scope.add_value(&mut global_root);
         scope.add_value(&mut placeholder_root);
         scope.add_value(&mut proto_root);
     }
@@ -244,9 +243,19 @@ pub(crate) fn install_placeholder(
     let mut placeholder = placeholder_root
         .as_object()
         .expect("placeholder stays rooted across prototype allocation");
-    object::set(&mut placeholder, heap, "prototype", proto_root);
+    if !object::define_own_property_in_place(
+        &mut placeholder,
+        heap,
+        "prototype",
+        PropertyDescriptor::data(proto_root, true, true, true),
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+    }
     placeholder_root = Value::object(placeholder);
-    define_global(global, heap, name, placeholder_root);
+    let global = global_root
+        .as_object()
+        .expect("rooted global remains an object");
+    define_global(global, heap, name, placeholder_root)?;
     Ok(())
 }
 
@@ -257,14 +266,17 @@ pub(crate) fn define_global(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     value: Value,
-) {
+) -> Result<(), JsSurfaceError> {
     let descriptor = PropertyDescriptor::data(
         value,
         Attr::global_binding().writable,
         Attr::global_binding().enumerable,
         Attr::global_binding().configurable,
     );
-    let _ = object::define_own_property(global, heap, name, descriptor);
+    if !object::define_own_property(global, heap, name, descriptor)? {
+        return Err(JsSurfaceError::DefinePropertyFailed(name));
+    }
+    Ok(())
 }
 
 /// Convenience wrapper around [`define_global`] for installer call sites.
@@ -278,6 +290,6 @@ pub fn define_global_value(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     value: Value,
-) {
-    define_global(global, heap, name, value);
+) -> Result<(), JsSurfaceError> {
+    define_global(global, heap, name, value)
 }

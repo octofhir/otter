@@ -27,7 +27,7 @@ fn live_bytes(interp: &mut Interpreter, tag: u8) -> usize {
 
 #[test]
 fn promise_reaction_graph_survives_force_gc_when_rooted() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let retained = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
@@ -37,15 +37,21 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
         reject: Value::undefined(),
         context: None,
     };
-    promise.perform_then(interp.gc_heap_mut(), None, None, capability);
+    promise.perform_then_with_context(
+        interp.gc_heap_mut(),
+        None,
+        None,
+        capability,
+        None,
+        Value::undefined(),
+        0,
+        0,
+    );
 
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "promise",
-        Value::promise(promise),
-    );
+    interp
+        .create_data_property(&mut global, "promise", Value::promise(promise))
+        .expect("rooted promise property construction");
     let _ = retained;
     interp.force_gc().expect("force GC");
 
@@ -63,7 +69,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
 
 #[test]
 fn deep_promise_chain_is_reaped_when_unrooted() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.force_gc().expect("force GC");
     let baseline = live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG);
 
@@ -76,7 +82,16 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
             reject: Value::undefined(),
             context: None,
         };
-        current.perform_then(interp.gc_heap_mut(), None, None, capability);
+        current.perform_then_with_context(
+            interp.gc_heap_mut(),
+            None,
+            None,
+            capability,
+            None,
+            Value::undefined(),
+            0,
+            0,
+        );
         current = next;
     }
 
@@ -95,13 +110,14 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
 
 #[test]
 fn pending_promise_microtask_payload_roots_until_drained() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let payload = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     interp.microtasks_mut().enqueue(crate::Microtask {
         callee: Value::undefined(),
         this_value: Value::undefined(),
         args: smallvec![Value::object(payload)],
         context: None,
+        realm_id: 0,
         result_capability: None,
         async_context: Value::undefined(),
         kind: crate::MicrotaskKind::Call,
@@ -127,7 +143,7 @@ fn pending_promise_microtask_payload_roots_until_drained() {
 
 #[test]
 fn iterator_state_holding_array_object_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     let array =
         crate::test_support::array_from_elements_old(interp.gc_heap_mut(), [Value::object(object)])
@@ -141,12 +157,9 @@ fn iterator_state_holding_array_object_survives_force_gc() {
         })
         .expect("iterator");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "iter",
-        Value::iterator(iter),
-    );
+    interp
+        .create_data_property(&mut global, "iter", Value::iterator(iter))
+        .expect("rooted iter property construction");
 
     let _ = object;
     let _ = array;
@@ -167,7 +180,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
 
 #[test]
 fn generator_and_parked_frame_roots_register_values() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let function = empty_function();
     let mut frame = interp.test_frame_for_function(&function).expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
@@ -176,16 +189,13 @@ fn generator_and_parked_frame_roots_register_values() {
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "generator",
-        Value::generator(generator),
-    );
+    interp
+        .create_data_property(&mut global, "generator", Value::generator(generator))
+        .expect("rooted generator property construction");
 
     let _ = object;
     interp.force_gc().expect("force GC");
-    let mut global = *interp.global_this();
+    let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "generator")
         .expect("generator root survives force_gc");
     let Some(generator) = rooted.as_generator() else {
@@ -212,13 +222,20 @@ fn generator_and_parked_frame_roots_register_values() {
         reject: Value::undefined(),
         context: None,
     };
-    promise.perform_async_resume_then(interp.gc_heap_mut(), parked, 0, capability, None);
-    crate::object::set(
-        &mut global,
+    promise.perform_async_resume_then(
         interp.gc_heap_mut(),
-        "awaitPromise",
-        Value::promise(promise),
+        parked,
+        0,
+        capability,
+        None,
+        None,
+        Value::undefined(),
+        0,
     );
+    let mut global = *interp.global_this();
+    interp
+        .create_data_property(&mut global, "awaitPromise", Value::promise(promise))
+        .expect("rooted awaitPromise property construction");
 
     let _ = parked_object;
     interp.force_gc().expect("force GC");
@@ -239,7 +256,7 @@ fn generator_and_parked_frame_roots_register_values() {
 
 #[test]
 fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.force_gc().expect("force GC");
     let promise_baseline = live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG);
     let iter_baseline = live_bytes(&mut interp, ITERATOR_STATE_TYPE_TAG);

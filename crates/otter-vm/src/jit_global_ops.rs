@@ -19,6 +19,7 @@
 //! - [`crate::Interpreter::run_load_global_or_undefined_reg`]
 //! - [`crate::Interpreter::run_store_global_binding_reg`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::Op;
 
 use crate::{
@@ -41,16 +42,17 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         let saved_native_pc = frame.pc();
         match opcode {
             value if value == Op::LoadGlobalThis as u8 => {
-                self.run_load_global_this_reg(&mut stack[frame_index], arg0 as u16)?;
+                self.run_load_global_this_reg(&mut stack[frame_index], arg0 as u16)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::LoadGlobalOrUndefined as u8 => {
                 self.run_load_global_or_undefined_reg(
@@ -87,7 +89,8 @@ impl Interpreter {
                     &mut stack[frame_index],
                     arg1 as u32,
                     arg2 != 0,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::DeclareGlobalLex as u8 => {
                 self.run_declare_global_lex_reg(
@@ -95,7 +98,8 @@ impl Interpreter {
                     &mut stack[frame_index],
                     arg1 as u32,
                     arg2 != 0,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::ValidateGlobalDecl as u8 => {
                 self.run_validate_global_decl_reg(
@@ -103,12 +107,14 @@ impl Interpreter {
                     &mut stack[frame_index],
                     arg1 as u32,
                     arg2 as u32 as i32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::DefineGlobalVar as u8 => {
                 self.run_define_global_var_reg(
                     context,
-                    &mut stack[frame_index],
+                    stack,
+                    frame_index,
                     arg1 as u32,
                     arg0 as u16,
                 )?;
@@ -120,7 +126,8 @@ impl Interpreter {
                     arg1 as u32,
                     arg0 as u16,
                     arg2 != 0,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::InitGlobalLex as u8 => {
                 self.run_init_global_lex_reg(
@@ -128,7 +135,8 @@ impl Interpreter {
                     &mut stack[frame_index],
                     arg0 as u16,
                     arg1 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::GlobalBindingExists as u8 => {
                 self.run_global_binding_exists_reg(
@@ -139,7 +147,7 @@ impl Interpreter {
                     arg1 as u32,
                 )?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         frame.set_pc(saved_native_pc);

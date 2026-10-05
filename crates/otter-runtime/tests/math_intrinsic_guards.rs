@@ -5,7 +5,7 @@
 //! - Object-to-primitive coercion on the generic boundary.
 //! - Optimizing Int32 `abs` / `max` / `min`, including `INT32_MIN` and a
 //!   post-tier-up method replacement.
-//! - Shared Machine method hits, cold coercion/Number cases, and receiver guards.
+//! - Optimized method hits, cold coercion/Number cases, and receiver guards.
 //! - Mapped argument methods read the current parameter cell on the cold path.
 //! - Reentrant coercion roots pending objects and already-coerced strings.
 //! - Numeric conversion stops on the first error and respects builtin arity.
@@ -15,12 +15,16 @@
 //! - User-visible coercion and replacement remain observable.
 //! - Optimizing results match the interpreter oracle exactly.
 //! - Warm method hits use generated code without per-call runtime transitions.
+//! - Optimizing generations count no entries: a probe ran there when it
+//!   entered no Template generation and either performed no interpreter
+//!   property load (a hit) or crossed the committed method boundary (a miss).
 //!
 //! # See also
-//! - `otter_jit::machine` for shared guarded Math method lowering.
+//! - `jit_resolved_native_leaves` for declared Math leaves at explicit-receiver
+//!   calls across every tier.
 
 use otter_runtime::{
-    JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Otter, Runtime,
+    ExecutionResult, JitDebugRequest, JitDebugTier, JitSelection, Otter, Runtime,
     RuntimeExecutionStats, SourceInput,
 };
 
@@ -189,6 +193,23 @@ for (let warm = 0; warm < 4010; warm++) {
 }
 "#;
 
+/// Panic unless `setup` captured an optimizing bundle for `function`.
+fn assert_optimized(setup: &ExecutionResult, function: &str) {
+    assert!(
+        setup
+            .jit_artifacts()
+            .expect("enabled artifact batch")
+            .bundles()
+            .iter()
+            .any(|bundle| {
+                bundle.manifest().function_name() == function
+                    && bundle.manifest().tier() == JitDebugTier::Optimizing
+            }),
+        "{function} must optimize before probes: {:?}",
+        setup.jit_debug_report()
+    );
+}
+
 fn math_completion(runtime: &mut Runtime, source: &str, module: &str) -> String {
     runtime
         .run_script(SourceInput::from_javascript(source), module)
@@ -198,7 +219,7 @@ fn math_completion(runtime: &mut Runtime, source: &str, module: &str) -> String 
 }
 
 #[test]
-fn guarded_math_method_hits_stay_in_machine_code() {
+fn guarded_math_method_hits_stay_in_optimized_code() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
@@ -210,47 +231,7 @@ fn guarded_math_method_hits_stay_in_machine_code() {
             "guarded-math-method-setup.js",
         )
         .expect("warm Math method functions");
-    let bundle = setup
-        .jit_artifacts()
-        .expect("enabled artifact batch")
-        .bundles()
-        .iter()
-        .rev()
-        .find(|bundle| {
-            bundle.manifest().function_name() == "guardedMathLoop"
-                && bundle.manifest().tier() == JitDebugTier::Optimizing
-        })
-        .unwrap_or_else(|| panic!("Math loop must optimize: {:?}", setup.jit_debug_report()));
-    let code_map: serde_json::Value = serde_json::from_slice(
-        bundle
-            .file(JitArtifactFileName::CodeMap)
-            .expect("Math code map")
-            .contents(),
-    )
-    .expect("valid Math code map");
-    let method_hits = code_map["regions"]
-        .as_array()
-        .expect("code-map regions")
-        .iter()
-        .filter(|region| region["kind"] == "machineMethodIntrinsic")
-        .count();
-    assert_eq!(
-        method_hits, 3,
-        "abs/min/max must each have a generated Machine method hit: {code_map}"
-    );
-    let relocations = std::str::from_utf8(
-        bundle
-            .file(JitArtifactFileName::Relocations)
-            .expect("Math relocations")
-            .contents(),
-    )
-    .expect("relocations are UTF-8");
-    for leaf in ["math_abs_leaf", "math_min_leaf", "math_max_leaf"] {
-        assert!(
-            !relocations.contains(leaf),
-            "the generated Math hit must replace {leaf}: {relocations}"
-        );
-    }
+    assert_optimized(&setup, "guardedMathLoop");
     drop(setup);
 
     let before = runtime.execution_stats();
@@ -263,7 +244,7 @@ fn guarded_math_method_hits_stay_in_machine_code() {
         "704"
     );
     let after = runtime.execution_stats();
-    assert!(after.jit_optimized_entries > before.jit_optimized_entries);
+    assert_ran_optimized(before, after, "guardedMathLoop(Math, 128);");
     assert_eq!(after.jit_optimized_deopts, before.jit_optimized_deopts);
     assert_eq!(after.jit_code_generations, before.jit_code_generations);
     assert_eq!(
@@ -291,49 +272,13 @@ fn warmed_math_runtime(selection: JitSelection) -> Runtime {
         )
         .expect("warm Math matrix");
     if selection == JitSelection::ProductionTiered {
-        let artifacts = setup.jit_artifacts().expect("Math matrix artifacts");
         for name in [
             "guardedInt32MathAbs",
             "guardedInt32MathMin",
             "guardedInt32MathMax",
             "guardedInt32InheritedAbs",
         ] {
-            let bundle = artifacts
-                .bundles()
-                .iter()
-                .rev()
-                .find(|bundle| {
-                    bundle.manifest().function_name() == name
-                        && bundle.manifest().tier() == JitDebugTier::Optimizing
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{name} must optimize before probes: {:?}",
-                        setup.jit_debug_report()
-                    )
-                });
-            let code_map = std::str::from_utf8(
-                bundle
-                    .file(JitArtifactFileName::CodeMap)
-                    .expect("Math code map")
-                    .contents(),
-            )
-            .expect("code map is UTF-8");
-            assert!(
-                code_map.contains("machineMethodIntrinsic"),
-                "{name}: {code_map}"
-            );
-            assert_eq!(
-                code_map.matches("machineCacheIrGuardOrdinaryState").count(),
-                1,
-                "every receiver and holder must prove ordinary descriptor state: {name}: {code_map}"
-            );
-            if name == "guardedInt32InheritedAbs" {
-                assert!(
-                    code_map.contains("machineCacheIrGuardPrototypeValidity"),
-                    "the inherited site must guard its holder before replacement: {code_map}"
-                );
-            }
+            assert_optimized(&setup, name);
         }
     }
     drop(setup);
@@ -372,19 +317,38 @@ fn assert_math_method_probe(
     assert_math_method_delta(before, after, source, expect_cold);
 }
 
+/// Optimizing generations count no entries. A hit probe called from the
+/// interpreter ran in the optimized generation when it entered no Template
+/// generation and the interpreter performed none of its property loads.
+fn assert_ran_optimized(before: RuntimeExecutionStats, after: RuntimeExecutionStats, source: &str) {
+    assert_no_template_entry(before, after, source);
+    assert_eq!(
+        (after.property_load_hits, after.property_load_misses),
+        (before.property_load_hits, before.property_load_misses),
+        "the interpreter must not run the probed body: {source}"
+    );
+}
+
+fn assert_no_template_entry(
+    before: RuntimeExecutionStats,
+    after: RuntimeExecutionStats,
+    source: &str,
+) {
+    assert_eq!(
+        after.jit_generated_template_entries, before.jit_generated_template_entries,
+        "the probe must not enter a Template generation: {source}"
+    );
+}
+
+/// A cold miss proves optimized execution by crossing the committed method
+/// boundary, which only generated code uses; a hit by [`assert_ran_optimized`].
 fn assert_math_method_delta(
     before: RuntimeExecutionStats,
     after: RuntimeExecutionStats,
     source: &str,
     expect_cold: bool,
 ) {
-    let native_entries = after.jit_optimized_entries - before.jit_optimized_entries
-        + after.jit_generated_optimizing_entries
-        - before.jit_generated_optimizing_entries;
-    assert!(
-        native_entries > 0,
-        "the probe must enter Machine code: {source}"
-    );
+    assert_no_template_entry(before, after, source);
     assert_eq!(
         after.jit_optimized_deopts, before.jit_optimized_deopts,
         "{source}"
@@ -399,6 +363,7 @@ fn assert_math_method_delta(
             "the miss must use the committed method boundary: {source}"
         );
     } else {
+        assert_ran_optimized(before, after, source);
         assert_eq!(
             after.jit_code_generations, before.jit_code_generations,
             "{source}"
@@ -410,7 +375,7 @@ fn assert_math_method_delta(
                 after.jit_reentrant_stub_transitions - before.jit_reentrant_stub_transitions,
             ),
             (0, 0, 0),
-            "the same Machine generation must regain its hot hit: {source}"
+            "the same optimized generation must regain its hot hit: {source}"
         );
     }
 }
@@ -418,11 +383,13 @@ fn assert_math_method_delta(
 #[test]
 fn guarded_math_method_cold_misses_rejoin_without_deopt() {
     let mut runtime = warmed_math_runtime(JitSelection::ProductionTiered);
+    // The declared `abs` entry completes every Number, so `INT32_MIN` is a
+    // hit whose result leaves the Int32 range rather than a miss.
     assert_math_method_probe(
         &mut runtime,
         "guardedInt32MathAbs(Math, -2147483648);",
         "2147483648",
-        true,
+        false,
     );
     assert_math_method_probe(&mut runtime, "guardedInt32MathAbs(Math, -7);", "7", false);
     math_completion(
@@ -558,33 +525,7 @@ for (let warm = 0; warm < 4010; warm++) invokeMappedMath(mappedMath.receiver);
             )
             .expect("warm mapped Math method");
         if selection == JitSelection::ProductionTiered {
-            let bundle = setup
-                .jit_artifacts()
-                .expect("mapped Math artifacts")
-                .bundles()
-                .iter()
-                .rev()
-                .find(|bundle| {
-                    bundle.manifest().function_name() == "invokeMappedMath"
-                        && bundle.manifest().tier() == JitDebugTier::Optimizing
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "mapped Math caller must optimize: {:?}",
-                        setup.jit_debug_report()
-                    )
-                });
-            let code_map = std::str::from_utf8(
-                bundle
-                    .file(JitArtifactFileName::CodeMap)
-                    .expect("mapped Math code map")
-                    .contents(),
-            )
-            .expect("code map is UTF-8");
-            assert!(
-                code_map.contains("machineMethodIntrinsic"),
-                "the mapped receiver must exercise the guarded Math probe: {code_map}"
-            );
+            assert_optimized(&setup, "invokeMappedMath");
         }
         drop(setup);
         assert_eq!(

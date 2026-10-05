@@ -21,8 +21,9 @@
 //! - Script and module commands carry opaque realm ids; async settlement and
 //!   disposal are routed on the owning isolate.
 //! - Command replies carry only owned public data.
-//! - Process lifecycle listeners run inside the current diagnostics batch;
-//!   they never begin or drain a public top-level capture.
+//! - Process lifecycle listeners run inside the current diagnostics batch
+//!   through rooted, observable native calls. They create no synthetic Script
+//!   chunk and never begin a public top-level capture.
 //! - Dropping a waiting future does not drop the isolate mid-turn; the
 //!   runner observes the cancelled reply channel at the completion point.
 //! - Dropping the last handle joins the runner, except after a timed-out
@@ -510,6 +511,11 @@ impl ModulePreparation {
             let response = response.map_err(|error| match error {
                 crate::module_loader::RemoteModuleError::Cancelled => {
                     crate::module_graph::GraphError::Interrupted
+                }
+                crate::module_loader::RemoteModuleError::Resource { error } => {
+                    crate::module_graph::GraphError::Loader(
+                        crate::module_loader::LoaderError::Resource { error },
+                    )
                 }
                 other => crate::module_graph::GraphError::Loader(
                     crate::module_loader::LoaderError::Load {
@@ -1391,7 +1397,7 @@ enum GuaranteedPayload {
         target_url: String,
         /// Boxed: a linked program embeds a whole bytecode module and its
         /// shared source snapshot, far larger than the sibling variants.
-        result: Result<Box<crate::module_graph::LinkedProgram>, String>,
+        result: Result<Box<crate::module_graph::LinkedProgram>, crate::module_graph::GraphError>,
     },
 }
 
@@ -2683,7 +2689,6 @@ struct InboxDynamicImportLoader {
 struct PendingDynamicImportPreparation {
     inbox: InboxSender,
     post: Option<(u64, String, QueuedCompletion)>,
-    cancellation_error: String,
 }
 
 impl PendingDynamicImportPreparation {
@@ -2696,15 +2701,20 @@ impl PendingDynamicImportPreparation {
         Self {
             inbox,
             post: Some((token, target_url, completion)),
-            cancellation_error: "dynamic import preparation was cancelled".to_string(),
         }
     }
 
-    fn finish(mut self, result: Result<crate::module_graph::LinkedProgram, String>) {
+    fn finish(
+        mut self,
+        result: Result<crate::module_graph::LinkedProgram, crate::module_graph::GraphError>,
+    ) {
         self.send(result.map(Box::new));
     }
 
-    fn send(&mut self, result: Result<Box<crate::module_graph::LinkedProgram>, String>) {
+    fn send(
+        &mut self,
+        result: Result<Box<crate::module_graph::LinkedProgram>, crate::module_graph::GraphError>,
+    ) {
         let Some((token, target_url, completion)) = self.post.take() else {
             return;
         };
@@ -2722,8 +2732,7 @@ impl PendingDynamicImportPreparation {
 impl Drop for PendingDynamicImportPreparation {
     fn drop(&mut self) {
         if self.post.is_some() {
-            let error = std::mem::take(&mut self.cancellation_error);
-            self.send(Err(error));
+            self.send(Err(crate::module_graph::GraphError::Interrupted));
         }
     }
 }
@@ -3286,8 +3295,7 @@ impl IsolateRunner {
                         task_handle.spawn(async move {
                             let result = preparation
                                 .prepare_remote_entry(preparation_target, cancellation)
-                                .await
-                                .map_err(|error| error.to_string());
+                                .await;
                             pending.finish(result);
                         });
                     }
@@ -3489,10 +3497,7 @@ impl IsolateRunner {
     /// completes with that code), `Ok(None)` on a normal return, and `Err`
     /// when a listener threw — an uncaught exception, exactly as in Node.
     fn emit_before_exit(&mut self) -> Result<Option<u8>, OtterError> {
-        let script = "typeof process === 'object' && typeof process.emit === 'function' \
-            ? (process.emit('beforeExit', typeof process.exitCode === 'number' ? process.exitCode : 0), 0) \
-            : 0";
-        match self.run_process_lifecycle_script(script) {
+        match self.runtime.emit_process_before_exit() {
             Ok(result) if result.explicit_exit() => Ok(Some(result.exit_code())),
             Ok(_) => Ok(None),
             Err(error) => Err(error),
@@ -3500,8 +3505,8 @@ impl IsolateRunner {
     }
 
     /// Fire the process `'exit'` event exactly once after a run completes and
-    /// fold a listener's replacement code into the result. Runs the hook as a
-    /// bare script — never through [`Self::drive_event_loop_to_idle`] — so a
+    /// fold a listener's replacement code into the result. Invokes the hook
+    /// through its rooted native scope — never through the idle driver — so a
     /// handle the run left open cannot stall completion.
     ///
     /// A failed run still fires the event, exactly as Node's uncaught path
@@ -3541,10 +3546,7 @@ impl IsolateRunner {
                     return (Err(error), None);
                 }
                 let code = u8::try_from(error.exit_code().clamp(0, 255)).unwrap_or(1);
-                let script = format!(
-                    "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, true) : {code}"
-                );
-                let final_code = match self.run_process_lifecycle_script(script) {
+                let final_code = match self.runtime.emit_process_exit(code, true) {
                     Ok(emit_result) => emit_result
                         .completion_string()
                         .parse::<i64>()
@@ -3563,11 +3565,16 @@ impl IsolateRunner {
                 return (Err(error), override_code);
             }
         };
-        let code = inner.exit_code();
-        let script = format!(
-            "typeof process === 'object' && typeof process.__otterEmitExit === 'function' ? process.__otterEmitExit({code}, false) : {code}"
-        );
-        match self.run_process_lifecycle_script(script) {
+        // Node emits `'exit'` with `process.exitCode` as it stands when the
+        // loop goes idle: a timer or `'beforeExit'` listener may have assigned
+        // it after entry evaluation sampled the completion. An explicit exit
+        // already carries its requested code.
+        let code = if inner.explicit_exit() {
+            inner.exit_code()
+        } else {
+            crate::process::exit_code(&self.runtime.interp)
+        };
+        match self.runtime.emit_process_exit(code, false) {
             Ok(emit_result) => {
                 // Normal completion answers the hook's final code as the
                 // completion value; a nested `process.exit(newCode)` in a
@@ -3585,20 +3592,6 @@ impl IsolateRunner {
             // Node's does.
             Err(error) => (Err(error), None),
         }
-    }
-
-    /// Execute process hooks inside the current command's capture. Public
-    /// `eval` owns a new top-level batch and cannot be used for lifecycle work.
-    fn run_process_lifecycle_script(
-        &mut self,
-        script: impl Into<String>,
-    ) -> Result<ExecutionResult, OtterError> {
-        self.runtime
-            .run_script_with_context(
-                SourceInput::from_javascript(script.into()),
-                "<process-lifecycle>",
-            )
-            .map(|(result, _)| result)
     }
 
     fn drive_event_loop_to_idle(
@@ -3984,7 +3977,7 @@ mod inbox_tests {
             payload: GuaranteedPayload::DynamicImportGraphPrepared {
                 token: sequence,
                 target_url: sequence.to_string(),
-                result: Err("test completion".to_string()),
+                result: Err(crate::module_graph::GraphError::Interrupted),
             },
             completion: QueuedCompletion::admit_host(pool, counters, RuntimeLiveness::Unref)
                 .expect("test host completion admission"),
@@ -4266,7 +4259,7 @@ mod inbox_tests {
                     ..
                 },
                 ..
-            }) if error.contains("cancelled")
+            }) if matches!(error, crate::module_graph::GraphError::Interrupted)
         ));
         cancel_runtime_message(message, &counters);
         assert_eq!(counters.pending_ref_host_ops.load(Ordering::Relaxed), 0);
@@ -4689,7 +4682,7 @@ mod inbox_tests {
             payload: GuaranteedPayload::DynamicImportGraphPrepared {
                 token: prepared_token,
                 target_url: "file:///unused.mjs".to_string(),
-                result: Err("late prepared result".to_string()),
+                result: Err(crate::module_graph::GraphError::Interrupted),
             },
             completion: QueuedCompletion::admit_host(
                 &runner.completion_pool,

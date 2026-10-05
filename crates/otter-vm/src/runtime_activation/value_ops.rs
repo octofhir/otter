@@ -132,33 +132,43 @@ impl RuntimeCall<'_> {
     /// actual argument list. The immutable CodeBlock is authoritative for the
     /// method name and argument count; validating both before entering the VM
     /// keeps this boundary effect-once even when lookup or the callee throws.
-    pub fn call_method_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
-        let (receiver, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
-        let (function_id, call_pc) = self.semantic_source()?;
+    pub fn call_method_values(&mut self, values: &[Value]) -> Result<Value, CommittedValueError> {
+        let (receiver, args) = values
+            .split_first()
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let (function_id, call_pc) = self
+            .semantic_source()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let context = self
             .context
             .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let function = context
             .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let instruction = function
             .instr_at_index(call_pc as usize)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if instruction.instruction_pc != call_pc
             || function.op(instruction) != otter_bytecode::Op::CallMethodValue
         {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let name_index = function
             .const_index(instruction, 2)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let argument_count = function
             .const_index(instruction, 3)
             .and_then(|count| usize::try_from(count).ok())
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if args.len() != argument_count {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
 
         // The native entry has already copied the machine-owned packet. Keep
@@ -181,33 +191,43 @@ impl RuntimeCall<'_> {
     /// Resolve the callable of the exact published `CallMethodValue` from
     /// `[receiver]`, recording the site's method and call feedback. The
     /// generated caller enters the call trampoline with the result.
-    pub fn resolve_method_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
+    pub fn resolve_method_values(
+        &mut self,
+        values: &[Value],
+    ) -> Result<Value, CommittedValueError> {
         let [receiver] = values else {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         };
-        let (function_id, call_pc) = self.semantic_source()?;
+        let (function_id, call_pc) = self
+            .semantic_source()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let context = self
             .context
             .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let function = context
             .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let instruction = function
             .instr_at_index(call_pc as usize)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         if instruction.instruction_pc != call_pc
             || function.op(instruction) != otter_bytecode::Op::CallMethodValue
         {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let name_index = function
             .const_index(instruction, 2)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let argument_count = function
             .const_index(instruction, 3)
             .and_then(|count| usize::try_from(count).ok())
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         vm.jit_runtime_resolve_method(
@@ -238,14 +258,15 @@ impl RuntimeCall<'_> {
         object: u16,
         key: u16,
         value: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall owns the canonical published descriptor.
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_define_data_property(stack, context, &mut frame, object, key, value)
     }
 
@@ -256,63 +277,20 @@ impl RuntimeCall<'_> {
         target: u16,
         key: u16,
         descriptor: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: RuntimeCall exclusively owns this validated descriptor.
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_define_own_property(stack, context, &mut frame, target, key, descriptor)
     }
 
-    /// Allocate a closure over the context in `context_reg` from the current
-    /// published activation.
-    pub fn make_closure(
-        &mut self,
-        function_id: u32,
-        dst: u16,
-        function_index: u32,
-        context_reg: u16,
-    ) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = &self.context;
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall validated and exclusively owns this descriptor
-        // for the duration of the semantic operation.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_make_closure(
-            context,
-            &mut frame,
-            function_id,
-            dst,
-            function_index,
-            context_reg,
-        )
-    }
-
-    /// Allocate one capture-free function value through the current
-    /// activation without requiring a materialized interpreter frame.
-    pub fn make_function(
-        &mut self,
-        function_id: u32,
-        dst: u16,
-        function_index: u32,
-    ) -> Result<(), VmError> {
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        let context = &self.context;
-        let frame = self.frame.as_ptr();
-        // SAFETY: RuntimeCall exclusively owns the validated published
-        // descriptor for this semantic operation.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
-        vm.jit_runtime_make_function(context, &mut frame, function_id, dst, function_index)
-    }
-
     /// Complete generic ECMAScript addition.
-    pub fn add(&mut self, dst: u16, lhs: u16, rhs: u16) -> Result<(), VmError> {
+    pub fn add(&mut self, dst: u16, lhs: u16, rhs: u16) -> Result<(), CommittedValueError> {
         // SAFETY: RuntimeCall brands exclusive mutator access for this exact
         // operation; neither reference is retained by the raw frame view.
         let vm = unsafe { &mut *self.vm.as_ptr() };
@@ -322,7 +300,8 @@ impl RuntimeCall<'_> {
         // SAFETY: RuntimeCall construction validated and exclusively owns the
         // published descriptor; ActiveFrame stores no borrowed register slice.
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_add(stack, context, &mut frame, dst, lhs, rhs)
     }
 
@@ -332,14 +311,15 @@ impl RuntimeCall<'_> {
         dst: u16,
         lhs: u16,
         operation: NumericRuntimeOp,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_numeric_op(stack, context, &mut frame, dst, lhs, operation)
     }
 
@@ -349,14 +329,15 @@ impl RuntimeCall<'_> {
         dst: u16,
         src: u16,
         operation: UnaryCoercionOp,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_coerce_unary(stack, context, &mut frame, dst, src, operation)
     }
 
@@ -367,14 +348,17 @@ impl RuntimeCall<'_> {
         dst: u16,
         src: u16,
         hint_index: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // SAFETY: immutable context is live for the branded call extent; the
         // returned token is consumed before any VM transition.
         let token = &self
             .context
             .string_constant_str_for_function(self.function_id(), hint_index)
-            .ok_or(VmError::InvalidOperand)?;
-        let hint = UnaryPrimitiveHint::from_token(token).ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let hint = UnaryPrimitiveHint::from_token(token)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         self.coerce_unary(dst, src, UnaryCoercionOp::ToPrimitive { hint })
     }
 
@@ -382,17 +366,19 @@ impl RuntimeCall<'_> {
     pub fn new_array_value(&mut self, elements: &[Value]) -> Result<Value, VmError> {
         // SAFETY: the branded runtime call exclusively owns VM access and its
         // published native roots remain active through the shared allocator.
+        let (function_id, _) = self.semantic_source()?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        vm.allocate_array_literal_value(elements.iter().copied())
+        vm.allocate_array_literal_value(function_id, elements.iter().copied())
     }
 
     /// Read one compiler-proven activation-local arguments property.
-    pub fn arguments_value(&mut self, key: Option<Value>) -> Result<Value, VmError> {
+    pub fn arguments_value(&mut self, key: Option<Value>) -> Result<Value, CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         // SAFETY: RuntimeCall retains the validated published native descriptor.
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(self.frame.as_ptr()) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         vm.jit_read_arguments(&self.context, stack, &mut frame, key)
     }
 
@@ -415,49 +401,41 @@ impl RuntimeCall<'_> {
     /// Allocate the published `Op::NewObjectLiteral` object from boxed values
     /// copied before collection.
     pub fn new_object_literal_value(&mut self, values: &[Value]) -> Result<Value, VmError> {
-        let function_id = self.function_id();
+        let (function_id, pc) = self.semantic_source()?;
+        let owner = self
+            .context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
         let first_key = {
-            let function = self
-                .context
+            let function = owner
                 .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
             let instruction = function
-                .instr_at_index(self.pc() as usize)
+                .instr_at_index(pc as usize)
                 .ok_or(VmError::InvalidOperand)?;
             if function.op(instruction) != otter_bytecode::Op::NewObjectLiteral {
+                return Err(VmError::InvalidOperand);
+            }
+            if crate::operand_decode::const_operand(function.operand_view(instruction).get(1))?
+                as usize
+                != values.len()
+            {
                 return Err(VmError::InvalidOperand);
             }
             crate::operand_decode::const_operand(function.operand_view(instruction).get(2))?
         };
         // SAFETY: as `new_array_value`.
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let mut values = smallvec::SmallVec::<[Value; 8]>::from_slice(values);
-        // The first execution builds the site's shape chain, which allocates;
-        // the copied values stay rooted, and are rewritten, across it.
-        let layout = {
-            use crate::rooting::RootScopeExt as _;
-            let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);
-            // SAFETY: `values` precedes `roots` and does not move or resize
-            // until the scope drops at the end of this block.
-            unsafe {
-                for value in values.iter_mut() {
-                    roots.add_value(value);
-                }
-            }
-            let layout =
-                vm.object_literal_layout(&self.context, function_id, first_key, values.len());
-            drop(roots);
-            layout?
-        };
-        vm.allocate_object_with_layout(layout, &mut values)
+        vm.allocate_static_object_literal(&owner, function_id, first_key, values)
     }
 
     /// Allocate an ordinary object without an interpreter destination.
     pub fn new_object_value(&mut self) -> Result<Value, VmError> {
         // SAFETY: as `new_array_value`; the returned handle is published by
         // generated code before the next allocating operation.
+        let (function_id, _) = self.semantic_source()?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        vm.allocate_object_literal_value()
+        vm.allocate_object_literal_value(function_id)
     }
 
     /// Materialize one verified dense virtual-object graph under a single GC
@@ -502,7 +480,11 @@ impl RuntimeCall<'_> {
     /// The published frame supplies only the exact feedback identity and GC
     /// root map. Operand words are JavaScript values, never register indices,
     /// and the operation returns its value directly without frame replay.
-    pub fn load_element_value(&mut self, receiver: Value, key: Value) -> Result<Value, VmError> {
+    pub fn load_element_value(
+        &mut self,
+        receiver: Value,
+        key: Value,
+    ) -> Result<Value, CommittedValueError> {
         let function_id = self.function_id();
         let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
@@ -524,13 +506,14 @@ impl RuntimeCall<'_> {
         function_id: u32,
         dst: u16,
         name_index: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let context = &self.context;
         let frame = self.frame.as_ptr();
         // SAFETY: as [`Self::add`].
         let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(frame) }
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         let stack = unsafe { &mut *self.stack.as_ptr() };
         vm.jit_runtime_load_global(stack, context, &mut frame, function_id, dst, name_index)
     }
@@ -567,13 +550,14 @@ impl RuntimeCall<'_> {
         function_id: u32,
         instruction_pc: u32,
         receiver: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let ambient = &self.context;
         let context = ambient
             .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         vm.jit_runtime_load_property_value(stack, &context, function_id, instruction_pc, receiver)
     }
 
@@ -586,19 +570,16 @@ impl RuntimeCall<'_> {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
         let ambient = &self.context;
         let context = ambient
             .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        // Template stores retain their per-site CacheIR behavior. Only an
-        // optimizing cold miss needs to seed the shared table used by the
-        // already-installed megamorphic generated sibling.
-        let fill_megamorphic_cache = unsafe {
-            self.frame.as_ref().header.kind == crate::native_abi::NativeFrameKind::Optimizing
-        };
+            .map_err(|_| VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        // Every tier enters the same committed store and publishes the same
+        // eligible action facts for subsequent live shared-table probes.
         vm.jit_runtime_store_property_value(
             stack,
             &context,
@@ -606,7 +587,6 @@ impl RuntimeCall<'_> {
             instruction_pc,
             receiver,
             value,
-            fill_megamorphic_cache,
         )
     }
 
@@ -620,7 +600,7 @@ impl RuntimeCall<'_> {
         receiver: Value,
         key: Value,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let function_id = self.function_id();
         let instruction_pc = self.pc();
         let vm = unsafe { &mut *self.vm.as_ptr() };
@@ -647,6 +627,8 @@ impl RuntimeCall<'_> {
 mod tests {
     use std::ptr::NonNull;
 
+    use crate::CommittedValueError;
+
     use otter_bytecode::{
         BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind,
     };
@@ -665,39 +647,42 @@ mod tests {
             Operand::Register(1),
             Operand::Register(2),
         ];
-        ExecutionContext::from_module(BytecodeModule {
-            module: "runtime-value-element-test.js".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::JavaScript,
-            functions: vec![Function {
-                id: 0,
-                name: "elementBoundary".to_string(),
-                locals: 3,
-                code: vec![
-                    Instruction {
-                        pc: 0,
-                        op: Op::LoadElement,
-                        operands: element_operands.clone(),
-                    },
-                    Instruction {
-                        pc: 1,
-                        op: Op::LoadElement,
-                        operands: element_operands,
-                    },
-                    Instruction {
-                        pc: 2,
-                        op: Op::ReturnUndefined,
-                        operands: Vec::new(),
-                    },
-                ]
-                .into(),
-                ..Function::default()
-            }],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+        ExecutionContext::from_module(
+            BytecodeModule {
+                module: "runtime-value-element-test.js".to_string(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::JavaScript,
+                functions: vec![Function {
+                    id: 0,
+                    name: "elementBoundary".to_string(),
+                    locals: 3,
+                    code: vec![
+                        Instruction {
+                            pc: 0,
+                            op: Op::LoadElement,
+                            operands: element_operands.clone(),
+                        },
+                        Instruction {
+                            pc: 1,
+                            op: Op::LoadElement,
+                            operands: element_operands,
+                        },
+                        Instruction {
+                            pc: 2,
+                            op: Op::ReturnUndefined,
+                            operands: Vec::new(),
+                        },
+                    ]
+                    .into(),
+                    ..Function::default()
+                }],
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
@@ -825,14 +810,14 @@ mod tests {
     #[test]
     fn stack_owned_value_elements_use_published_feedback_identity() {
         let context = element_context();
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let array =
             crate::array::from_elements_old_for_fixture(&mut vm.gc_heap, [Value::number_f64(4.0)])
                 .expect("packed array fixture");
         let receiver = Value::array(array);
         let key = Value::number_i32(0);
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [Value::undefined(); 3];
         let mut frame = Frame::new(
             VmFrameHeader {
@@ -890,7 +875,7 @@ mod tests {
 
     #[test]
     fn stack_owned_named_properties_use_explicit_source_without_mutating_caller() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut module = named_property_module();
         let mut outer = module.functions[0].clone();
         outer.id = 1;
@@ -904,10 +889,12 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         module.functions.push(outer);
-        let context = vm.link_module(module).expect("valid bytecode fixture");
+        let context = vm
+            .link_module(module, crate::source_registry::SourceRegistry::default())
+            .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let mut receiver = vm
-            .allocate_object_literal_value()
+            .allocate_object_literal_value(0)
             .expect("ordinary receiver");
         let mut setup_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
         // SAFETY: `receiver` remains live until `setup_roots` is dropped after
@@ -915,15 +902,15 @@ mod tests {
         unsafe {
             setup_roots.add_value(&mut receiver);
         }
-        let object = receiver.as_object().expect("ordinary object");
-        vm.set_property(object, "x", Value::number_i32(11))
+        let mut object = receiver.as_object().expect("ordinary object");
+        vm.create_data_property(&mut object, "x", Value::number_i32(11))
             .expect("x fixture");
-        let object = receiver.as_object().expect("relocated ordinary object");
-        vm.set_property(object, "y", Value::number_i32(22))
+        let mut object = receiver.as_object().expect("relocated ordinary object");
+        vm.create_data_property(&mut object, "y", Value::number_i32(22))
             .expect("y fixture");
         drop(setup_roots);
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [
             Value::undefined(),
             receiver,
@@ -977,19 +964,22 @@ mod tests {
         call.set_pc(3);
         assert!(matches!(
             call.load_property_value(0, call.pc(), receiver),
-            Err(VmError::InvalidOperand)
+            Err(CommittedValueError::Fatal(VmError::InvalidOperand))
         ));
     }
 
     #[test]
     fn stack_owned_wide_method_span_decodes_count_and_records_exact_target() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = vm
-            .link_module(wide_method_module())
+            .link_module(
+                wide_method_module(),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let mut receiver = vm
-            .allocate_object_literal_value()
+            .allocate_object_literal_value(0)
             .expect("ordinary method receiver");
         {
             let mut setup_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
@@ -998,8 +988,8 @@ mod tests {
             unsafe {
                 setup_roots.add_value(&mut receiver);
             }
-            vm.set_property(
-                receiver.as_object().expect("method receiver object"),
+            vm.create_data_property(
+                &mut receiver.as_object().expect("method receiver object"),
                 "run",
                 Value::function(1),
             )
@@ -1039,7 +1029,7 @@ mod tests {
         ];
         vm.with_runtime_turn(&mut stack, |turn| {
             let (vm, stack) = turn.into_parts();
-            let mut activation = VmRuntimeActivation::new(vm, stack, &context);
+            let mut activation = VmRuntimeActivation::new(vm, stack, Some(&context));
             // SAFETY: activation/frame/register storage and the copied packet
             // remain live and exclusively owned for this boundary scope. The
             // exact activation stack is published by this runtime turn.
@@ -1054,12 +1044,12 @@ mod tests {
             );
             assert!(matches!(
                 call.call_method_values(&packet[..5]),
-                Err(VmError::InvalidOperand)
+                Err(CommittedValueError::Fatal(VmError::InvalidOperand))
             ));
             call.set_pc(1);
             assert!(matches!(
                 call.call_method_values(&packet),
-                Err(VmError::InvalidOperand)
+                Err(CommittedValueError::Fatal(VmError::InvalidOperand))
             ));
         });
 
@@ -1074,13 +1064,16 @@ mod tests {
 
     #[test]
     fn named_store_boundary_publishes_canonical_inline_add_transition() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = vm
-            .link_module(named_property_module())
+            .link_module(
+                named_property_module(),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let mut first = vm
-            .allocate_object_literal_value()
+            .allocate_object_literal_value(0)
             .expect("first ordinary receiver");
         let mut second = {
             let mut allocation_roots = otter_gc::RootScope::new(&mut vm.gc_heap);
@@ -1089,7 +1082,7 @@ mod tests {
             unsafe {
                 allocation_roots.add_value(&mut first);
             }
-            vm.allocate_object_literal_value()
+            vm.allocate_object_literal_value(0)
                 .expect("second ordinary receiver")
         };
         {
@@ -1118,16 +1111,18 @@ mod tests {
             );
             // The fixture targets the null-prototype transition program so the
             // property key need not already be interned on `%Object.prototype%`.
-            crate::object::set_prototype(
-                first.as_object().expect("first object"),
-                vm.gc_heap_mut(),
-                None,
+            let mut first_object = first.as_object().expect("first object");
+            assert!(
+                crate::object::set_prototype(&mut first_object, vm.gc_heap_mut(), None,)
+                    .expect("null-prototype fixture transition")
             );
-            crate::object::set_prototype(
-                second.as_object().expect("second object"),
-                vm.gc_heap_mut(),
-                None,
+            first = Value::object(first_object);
+            let mut second_object = second.as_object().expect("second object");
+            assert!(
+                crate::object::set_prototype(&mut second_object, vm.gc_heap_mut(), None,)
+                    .expect("null-prototype fixture transition")
             );
+            second = Value::object(second_object);
         }
         let parent_shape =
             crate::object::shape(first.as_object().expect("first object"), vm.gc_heap()).offset();
@@ -1138,7 +1133,7 @@ mod tests {
         );
 
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [first, second, Value::undefined(), Value::undefined()];
         let mut frame = Frame::new(
             VmFrameHeader {
@@ -1183,12 +1178,12 @@ mod tests {
         };
 
         let context = element_context();
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let scalar_object = vm
-            .allocate_array_literal_value([Value::number_i32(99)])
+            .allocate_array_literal_value(0, [Value::number_i32(99)])
             .expect("scalar array field");
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [Value::undefined(); 3];
         registers[0] = scalar_object;
         let mut frame = Frame::new(
@@ -1249,9 +1244,12 @@ mod tests {
 
     #[test]
     fn named_store_default_prototype_keeps_cell_rhs_on_canonical_boundary() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = vm
-            .link_module(named_property_module())
+            .link_module(
+                named_property_module(),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let mut first = Value::undefined();
@@ -1270,13 +1268,15 @@ mod tests {
                 setup_roots.add_value(&mut second_rhs);
             }
             first = vm
-                .allocate_object_literal_value()
+                .allocate_object_literal_value(0)
                 .expect("first ordinary peer");
             second = vm
-                .allocate_object_literal_value()
+                .allocate_object_literal_value(0)
                 .expect("second ordinary peer");
-            first_rhs = vm.allocate_object_literal_value().expect("first cell RHS");
-            second_rhs = vm.allocate_object_literal_value().expect("second cell RHS");
+            first_rhs = vm.allocate_object_literal_value(0).expect("first cell RHS");
+            second_rhs = vm
+                .allocate_object_literal_value(0)
+                .expect("second cell RHS");
             assert!(
                 vm.ordinary_set_data_property(
                     first.as_object().expect("first ordinary peer"),
@@ -1353,7 +1353,7 @@ mod tests {
                 .expect("publish stack-owned test frame");
         }
         {
-            let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+            let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
             // SAFETY: the activation, published frame, and register array are
             // exclusively owned for both transition calls.
             let mut call = unsafe {
@@ -1393,9 +1393,12 @@ mod tests {
 
     #[test]
     fn named_store_transition_encodes_direct_terminal_prototype_guard() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = vm
-            .link_module(named_property_module())
+            .link_module(
+                named_property_module(),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let mut prototype = Value::object(
@@ -1414,25 +1417,34 @@ mod tests {
                 allocation_roots.add_value(&mut second);
             }
             first = vm
-                .allocate_object_literal_value()
+                .allocate_object_literal_value(0)
                 .expect("first direct-prototype receiver");
             second = vm
-                .allocate_object_literal_value()
+                .allocate_object_literal_value(0)
                 .expect("second direct-prototype receiver");
-            let prototype = prototype.as_object().expect("prototype object");
-            crate::object::set_prototype(
-                first.as_object().expect("first object"),
-                vm.gc_heap_mut(),
-                Some(prototype),
+            let mut first_object = first.as_object().expect("first object");
+            assert!(
+                crate::object::set_prototype(
+                    &mut first_object,
+                    vm.gc_heap_mut(),
+                    Some(prototype.as_object().expect("prototype object")),
+                )
+                .expect("first prototype fixture transition")
             );
-            crate::object::set_prototype(
-                second.as_object().expect("second object"),
-                vm.gc_heap_mut(),
-                Some(prototype),
+            first = Value::object(first_object);
+            let mut second_object = second.as_object().expect("second object");
+            assert!(
+                crate::object::set_prototype(
+                    &mut second_object,
+                    vm.gc_heap_mut(),
+                    Some(prototype.as_object().expect("prototype object")),
+                )
+                .expect("second prototype fixture transition")
             );
+            second = Value::object(second_object);
         }
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [prototype, first, second, Value::undefined()];
         let mut frame = Frame::new(
             VmFrameHeader {
@@ -1459,21 +1471,23 @@ mod tests {
 
     #[test]
     fn strict_named_store_boundary_rejects_non_extensible_receiver() {
-        let mut vm = Interpreter::new();
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut module = named_property_module();
         module.functions[0].is_strict = true;
-        let context = vm.link_module(module).expect("valid bytecode fixture");
+        let context = vm
+            .link_module(module, crate::source_registry::SourceRegistry::default())
+            .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let receiver = vm
-            .allocate_object_literal_value()
+            .allocate_object_literal_value(0)
             .expect("ordinary receiver");
-        crate::object::prevent_extensions(
-            receiver.as_object().expect("receiver object"),
-            vm.gc_heap_mut(),
-        );
+        let mut receiver_object = receiver.as_object().expect("receiver object");
+        crate::object::prevent_extensions(&mut receiver_object, vm.gc_heap_mut())
+            .expect("non-extensible fixture transition");
+        let receiver = Value::object(receiver_object);
 
         let mut stack = crate::test_support::FrameChainFixture::new();
-        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, &context);
+        let mut activation = VmRuntimeActivation::new(&mut vm, &mut stack, Some(&context));
         let mut registers = [
             receiver,
             Value::undefined(),

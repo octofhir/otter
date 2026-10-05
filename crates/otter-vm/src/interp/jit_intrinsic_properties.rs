@@ -92,7 +92,10 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
         proof: impl FnOnce(u32) -> JitIntrinsicPrototype,
     ) -> Option<JitCacheIrProgram> {
-        if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
+        // An ordinary dictionary prototype is a valid migration input.
+        // Reject semantic lookup facts before preparation, then require the
+        // actual finalized keyed holder after the canonical migration.
+        if object::state(prototype, &self.gc_heap).is_opaque() {
             return None;
         }
         if !matches!(
@@ -102,6 +105,9 @@ impl Interpreter {
             return None;
         }
         self.migrate_slow_to_fast(&mut prototype);
+        if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
+            return None;
+        }
         let shape = object::keyed_shape(prototype, &self.gc_heap);
         if shape.is_null() {
             return None;
@@ -111,7 +117,7 @@ impl Interpreter {
         if !matches!(lookup, object::PropertyLookup::Data { .. }) {
             return None;
         }
-        let value_byte = u32::from(hit.slot) * std::mem::size_of::<crate::Value>() as u32;
+        let field = crate::object::field_location_at(prototype, &self.gc_heap, u32::from(hit.slot));
         Some(JitCacheIrProgram {
             ops: Box::new([
                 JitCacheIrOp::LoadIntrinsicPrototype {
@@ -121,18 +127,15 @@ impl Interpreter {
                 },
                 JitCacheIrOp::GuardShape {
                     object: 1,
-                    shape: self.bake_shape(shape),
+                    shape: self.bake_shape(shape)?,
                 },
                 JitCacheIrOp::GuardAtomSlot {
                     object: 1,
                     atom: key.atom().id().raw(),
-                    value_byte,
+                    field,
                     writable: false,
                 },
-                JitCacheIrOp::LoadField {
-                    object: 1,
-                    value_byte,
-                },
+                JitCacheIrOp::LoadField { object: 1, field },
             ]),
         })
     }
@@ -166,7 +169,7 @@ impl Interpreter {
         if !object::watch_dictionary_slot(prototype, &mut self.gc_heap, hit.slot) {
             return None;
         }
-        let value_byte = u32::from(hit.slot) * std::mem::size_of::<crate::Value>() as u32;
+        let field = crate::object::field_location_at(prototype, &self.gc_heap, u32::from(hit.slot));
         Some(JitCacheIrProgram {
             ops: Box::new([
                 JitCacheIrOp::LoadIntrinsicPrototype {
@@ -180,10 +183,7 @@ impl Interpreter {
                     },
                 },
                 JitCacheIrOp::GuardDictionaryLayout { object: 1, layout },
-                JitCacheIrOp::LoadField {
-                    object: 1,
-                    value_byte,
-                },
+                JitCacheIrOp::LoadField { object: 1, field },
             ]),
         })
     }
@@ -195,8 +195,74 @@ mod tests {
     use crate::property_atom::{NameInterner, PropertyAtom};
 
     #[test]
+    fn ordinary_eligibility_preserves_intrinsic_collection_and_string_proofs() {
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let names = NameInterner::default();
+        let key = |name: &'static str| {
+            AtomizedPropertyKey::new(PropertyAtom::new(names.intern(name)), name)
+        };
+
+        for (name, type_tag, prototype) in [
+            (
+                "get",
+                crate::collections::MAP_BODY_TYPE_TAG,
+                interpreter.realm_intrinsics.map_prototype().unwrap(),
+            ),
+            (
+                "has",
+                crate::collections::SET_BODY_TYPE_TAG,
+                interpreter.realm_intrinsics.set_prototype().unwrap(),
+            ),
+        ] {
+            let initial_state = object::state(prototype, &interpreter.gc_heap);
+            assert!(initial_state.is_dictionary() && !initial_state.is_opaque());
+            assert!(!object::supports_fast_property_ic(
+                prototype,
+                &interpreter.gc_heap
+            ));
+            let programs = interpreter.jit_intrinsic_property_programs(key(name));
+            assert!(object::supports_fast_property_ic(
+                prototype,
+                &interpreter.gc_heap
+            ));
+            let shape = object::keyed_shape(prototype, &interpreter.gc_heap);
+            assert!(!shape.is_null());
+            assert!(!object::state(prototype, &interpreter.gc_heap).is_provisional());
+            assert!(
+                programs.iter().any(|program| matches!(
+                    program.ops.first(),
+                    Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+                        if target.type_tag == type_tag
+                ) && program.ops.iter().any(|op| matches!(
+                    op, JitCacheIrOp::GuardShape { object: 1, shape: baked }
+                        if *baked == shape.offset()
+                ))),
+                "ordinary dictionary preparation publishes the exact migrated holder proof"
+            );
+        }
+
+        let string_prototype = interpreter.realm_intrinsics.string_prototype().unwrap();
+        assert!(!object::supports_fast_property_ic(
+            string_prototype,
+            &interpreter.gc_heap
+        ));
+        let string_program = interpreter
+            .string_property_program(key("charCodeAt"))
+            .unwrap();
+        assert!(matches!(
+            string_program.ops.first(),
+            Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+                if target.type_tag == crate::string::JS_STRING_BODY_TYPE_TAG
+        ));
+        assert!(matches!(
+            string_program.ops.get(1),
+            Some(JitCacheIrOp::GuardDictionaryLayout { .. })
+        ));
+    }
+
+    #[test]
     fn collection_size_has_no_intrinsic_property_program() {
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let names = NameInterner::default();
         let key = |name: &'static str| {
             AtomizedPropertyKey::new(PropertyAtom::new(names.intern(name)), name)
@@ -216,18 +282,30 @@ mod tests {
             interpreter.realm_intrinsics.map_prototype().unwrap(),
             interpreter.realm_intrinsics.set_prototype().unwrap(),
         ] {
-            assert!(object::define_own_property(
-                prototype,
-                &mut interpreter.gc_heap,
-                "size",
-                object::PropertyDescriptor::data(crate::Value::number_i32(900), true, false, true),
-            ));
+            assert!(
+                object::define_own_property(
+                    prototype,
+                    &mut interpreter.gc_heap,
+                    "size",
+                    object::PropertyDescriptor::data(
+                        crate::Value::number_i32(900),
+                        true,
+                        false,
+                        true
+                    ),
+                )
+                .expect("descriptor fixture allocation")
+            );
+            assert!(object::is_dictionary(prototype, &interpreter.gc_heap));
+            let mut prepared = prototype;
+            interpreter.migrate_slow_to_fast(&mut prepared);
+            assert_eq!(prepared, prototype, "pinned realm holder remains current");
             assert!(object::supports_fast_property_ic(
-                prototype,
+                prepared,
                 &interpreter.gc_heap
             ));
             assert!(matches!(
-                object::lookup_own_slot(prototype, &interpreter.gc_heap, "size"),
+                object::lookup_own_slot(prepared, &interpreter.gc_heap, "size"),
                 (Some(_), object::PropertyLookup::Data { .. })
             ));
         }

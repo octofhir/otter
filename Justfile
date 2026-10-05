@@ -197,15 +197,16 @@ test262-dir dir:
 test262-full *args:
     bash scripts/test262-full-run.sh {{args}}
 
-# Render the interactive conformance dashboard from the latest merged
-# baseline and refresh the copy shipped inside the contributor book.
+# Render only a complete current-format report with the same runner binary
+# and refresh the copy published by the documentation site.
 test262-site:
     cargo run --release -p otter-test262 --bin otter-test262 -- site test262_results/latest.json --output test262_results/site/index.html
+    mkdir -p docs/site/public/conformance
     cp test262_results/latest.json docs/site/public/conformance/data.json
 
 # Generate ES_CONFORMANCE.md from a test262 results JSON (default: latest run).
-test262-conformance input="test262_results/run.json":
-    cargo run -p otter-test262 -- conformance {{input}} --output ES_CONFORMANCE.md
+test262-conformance input="test262_results/latest.json":
+    cargo run --release -p otter-test262 --bin otter-test262 -- conformance {{input}} --output ES_CONFORMANCE.md
 
 # === Test262 (active engine, crates/otter-test262) ===
 #

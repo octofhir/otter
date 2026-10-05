@@ -4,7 +4,7 @@ use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, Value};
 
 /// Run `body` with a native context over a fresh interpreter.
 fn with_context<R>(body: impl FnOnce(&mut NativeCtx<'_>) -> R) -> R {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     NativeCtx::with_host_context(&mut interp, NativeCallInfo::default_call(), None, body)
 }
 

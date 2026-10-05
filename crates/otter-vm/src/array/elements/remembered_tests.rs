@@ -38,6 +38,54 @@ fn assert_marker(heap: &GcHeap, value: Value, marker: u64) {
 }
 
 #[test]
+fn young_slab_relocation_refreshes_old_owner_cache_and_traces_children() {
+    let mut heap = GcHeap::new().expect("heap");
+    heap.set_gc_stress(0, false);
+    // SAFETY: the heap outlives the scope and every root in it.
+    let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let owner = scope.local(array::alloc_array_old_for_fixture(&mut heap).expect("old owner"));
+    let child = scope.local(heap.alloc(Child { marker: 317 }).expect("young child"));
+    array::push(
+        owner.get(),
+        &mut heap,
+        Value::from_other_gc(child.get().raw()),
+    )
+    .expect("tagged slab");
+    let (before, address) = heap.read_payload(owner.get(), |body| {
+        (body.slab.offset(), body.elements_ptr.get())
+    });
+    let slab = heap.read_payload(owner.get(), |body| body.slab);
+    // SAFETY: this rooted owner keeps the newly allocated slab live.
+    assert!(unsafe { (*slab.as_header_ptr()).is_young() });
+    heap.collect_minor(EmptyRoots)
+        .expect("real slab relocation");
+    heap.read_payload(owner.get(), |body| {
+        assert_ne!(body.slab.offset(), before);
+        assert_ne!(body.elements_ptr.get(), address);
+        assert!(body.element_cache_is_current());
+    });
+    assert_marker(&heap, array::get(owner.get(), &heap, 0), 317);
+    heap.collect_minor(EmptyRoots)
+        .expect("second relocation and promotion");
+    heap.read_payload(owner.get(), |body| assert!(body.element_cache_is_current()));
+    assert_marker(&heap, array::get(owner.get(), &heap, 0), 317);
+    // Growth adopts a fresh young slab into this old shell and repeats the
+    // same handle/cache/barrier ownership, including copied tagged children.
+    array::set(owner.get(), &mut heap, 63, Value::number_i32(7)).expect("grow slab");
+    heap.collect_minor(EmptyRoots)
+        .expect("replacement slab relocation");
+    heap.read_payload(owner.get(), |body| assert!(body.element_cache_is_current()));
+    assert_marker(&heap, array::get(owner.get(), &heap, 0), 317);
+    assert_eq!(
+        array::get(owner.get(), &heap, 63)
+            .as_number()
+            .unwrap()
+            .as_f64(),
+        7.0
+    );
+}
+
+#[test]
 fn remembered_appends_scan_linear_slots_through_growth() {
     const COUNT: usize = 1024;
     let mut heap = GcHeap::new().expect("heap");

@@ -391,7 +391,7 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
     if manifest["tier"] == "template" {
         assert!(tier_input.starts_with("; otter template plan\n"));
     } else {
-        assert!(tier_input.starts_with("; backend=otter-machine-ir scalar-function\n"));
+        assert!(tier_input.starts_with("; otter graph\n"));
     }
 
     let code_map: serde_json::Value = serde_json::from_slice(
@@ -419,7 +419,7 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
         &std::fs::read(directory.join("safepoints.json")).expect("read safepoints"),
     )
     .expect("valid safepoints");
-    assert!(safepoints["safepoints"].is_array());
+    assert!(safepoints["records"].is_array());
 }
 
 #[cfg(target_arch = "aarch64")]

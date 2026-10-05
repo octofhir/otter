@@ -54,7 +54,7 @@ romp! {
     name = "acme",
     ident = ACME_EXTENSION,
     classes = [CounterIntrinsic, AcmeIntrinsic],   // classes AND namespaces
-    js = [],                                       // optional pure-JS members
+    js = None,                                     // no JS bundle
 }
 ```
 

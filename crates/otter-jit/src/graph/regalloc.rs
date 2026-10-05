@@ -1,26 +1,41 @@
-//! Straight-forward linear register allocation over the graph's emission
-//! order.
+//! Register allocation over live intervals with canonical, representation-
+//! specific spill homes planned before the final allocation walk.
 //!
 //! # Contents
 //! - [`Location`] — a general register, a floating-point register, a frame
 //!   slot, or a constant rematerialized at the use.
-//! - [`allocate`] — one forward walk assigning every input, result,
-//!   temporary and deopt value a location, recording the moves that make the
-//!   walk's register state real.
+//! - [`allocate`] — discovers spill requirements, colors their live
+//!   intervals, then assigns inputs, results, temporaries and edge moves.
 //! - [`Allocation`] — the per-node and per-edge result consumed by code
 //!   generation.
 //!
 //! # Invariants
-//! - Every value is stored to its spill slot right after its definition (a
-//!   phi at its block's start), once it has one; a slot is therefore valid at
-//!   every point its value is live, on every path.
-//! - Tagged values spill to tagged slots, which are part of the frame window
-//!   the collector traces; unboxed values spill to untagged slots below it.
+//! - A memory-spilled value is stored at its definition (a phi at block
+//!   entry). Register-only values materialize their homes on collecting slow
+//!   paths or cold exits, before anything can read or relocate those homes.
+//! - Tagged values have tagged homes; unboxed values have untagged homes.
+//!   Each collecting boundary roots exactly its written live tagged homes;
+//!   no other tagged home is read by the collector there.
+//! - Collecting slow paths preserve only control-flow-live register values
+//!   ([`super::liveness`]), through their canonical homes. A linear interval
+//!   may cover paths that never ran a value's definition.
+//! - At a collecting boundary, a tagged home is a root exactly when a value
+//!   assigned to it is live in the CFG or read by the node or its
+//!   reconstruction states, and that value's home is written there: stored at
+//!   its definition, or saved by the boundary's own slow path. A home never
+//!   written for its current value is never a root, so no home is cleared.
+//! - Eager and lazy deopt recipes read canonical homes or constants.
+//!   An abandoned native body roots only the selected recipe's tagged homes
+//!   until writeback transfers recovery values to interpreter ownership.
 //! - A call spills every value live past it and leaves no value in a
 //!   register.
-//! - A value used by a node's eager deopt stays live, and so keeps its
-//!   register, until after the node's result is assigned: a result never
-//!   overwrites a register an exit still reads.
+//! - A value used by a node's eager deopt keeps a readable register or home
+//!   until after the node's result is assigned: a result never overwrites
+//!   the only location an exit still reads.
+//! - Fixed arithmetic clobbers are evicted into canonical definition homes
+//!   before inputs are assigned in both allocation walks. Inputs and
+//!   temporaries avoid those registers; a fixed result writes them late.
+//! - A fixed count operand that remains a constant reserves no register.
 //! - A block's entry register state is the state of its first predecessor in
 //!   emission order, restricted to values live at the block; every other
 //!   predecessor ends with moves that recreate it ([`Allocation::edges`]).
@@ -29,29 +44,23 @@
 //! - [`super::ir::Constraints`] — the per-node contract.
 //! - [`super::arm64`] — emits the moves and nodes with these locations.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
-use super::ir::{BlockId, Graph, InputPolicy, Kind, NodeId, Repr, ResultPolicy};
+use super::ir::{BlockId, Constraints, Graph, InputPolicy, Kind, NodeId, Repr, ResultPolicy};
+use super::registers::RegisterContract;
 
 /// Where a value lives at one point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Location {
     Gp(u8),
     Fp(u8),
-    /// A tagged slot of the window tail (index past the interpreter
-    /// registers).
+    /// A tagged slot in the leading spill region.
     TaggedSlot(u32),
-    /// An untagged slot below the window.
+    /// An untagged slot after the tagged spill region.
     UntaggedSlot(u32),
     /// A constant node, rematerialized where it is used.
     Constant(NodeId),
-}
-
-impl Location {
-    pub(crate) fn is_register(self) -> bool {
-        matches!(self, Self::Gp(_) | Self::Fp(_))
-    }
 }
 
 /// A move inserted before a node.
@@ -74,14 +83,24 @@ pub(crate) struct NodeAllocation {
     pub(crate) eager: Vec<Location>,
     /// Locations of the lazy frame state's registers, in state order.
     pub(crate) lazy: Vec<Location>,
+    /// Cold parallel moves that materialize an eager exit's canonical homes.
+    pub(crate) eager_spills: Vec<Move>,
+    /// Cold parallel moves that materialize a lazy exit's canonical homes.
+    pub(crate) lazy_spills: Vec<Move>,
     /// The node's value is dead and nothing is emitted for it.
     pub(crate) skipped: bool,
     /// Registers holding live tagged and untagged values across the node,
     /// for nodes whose slow path saves them itself.
     pub(crate) live_registers: SmallVec<[(Location, Repr); 8]>,
-    /// For a node that may collect (a call, a back-edge poll): the tagged
-    /// slots holding values live across it, which its safepoint roots.
-    pub(crate) gc_roots: Option<Vec<u32>>,
+    /// Exact-live registers and their canonical homes around a collecting
+    /// slow path. Values absent on an OSR or another incoming path never
+    /// enter this list.
+    pub(crate) live_homes: SmallVec<[(Location, Location); 8]>,
+    /// The exact collector roots among tagged homes at this collecting
+    /// boundary (a call, a collecting slow path or a loop poll), ascending.
+    /// `None` for nodes that never reach a collecting boundary: no safepoint
+    /// record may name them.
+    pub(crate) rooted_tagged_homes: Option<Box<[u32]>>,
 }
 
 /// Moves on one control edge, resolved in parallel at the end of the
@@ -101,6 +120,9 @@ pub(crate) struct Allocation {
     pub(crate) nodes: Vec<NodeAllocation>,
     /// Spill slot of each value that has one.
     pub(crate) spill: FxHashMap<NodeId, Location>,
+    /// Values whose homes must already be valid when a register is evicted.
+    /// Other homes are materialized by the collecting slow path or exit.
+    pub(crate) definition_spills: FxHashSet<NodeId>,
     /// Moves per `(predecessor, successor)` edge.
     pub(crate) edges: FxHashMap<(BlockId, BlockId), EdgeMoves>,
     pub(crate) tagged_slots: u32,
@@ -111,14 +133,28 @@ impl Allocation {
     pub(crate) fn node(&self, id: NodeId) -> &NodeAllocation {
         &self.nodes[id.0 as usize]
     }
-}
 
-/// Allocatable general registers.
-pub(crate) const GP_REGISTERS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-/// Allocatable floating-point registers.
-pub(crate) const FP_REGISTERS: &[u8] = &[
-    0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-];
+    /// Tagged homes a finalized cold reconstruction recipe reads, ascending.
+    /// Native SSA execution is abandoned at this boundary, so its future
+    /// reads keep no home alive. Recipes already contain every frame of an
+    /// inline chain, including the descendant entry bindings. The exit's cold
+    /// moves write every one of these homes before writeback can collect.
+    pub(crate) fn recipe_tagged_homes(locations: &[Location]) -> Vec<u32> {
+        let mut homes: Vec<u32> = locations
+            .iter()
+            .filter_map(|&location| match location {
+                Location::TaggedSlot(slot) => Some(slot),
+                Location::UntaggedSlot(_) | Location::Constant(_) => None,
+                Location::Gp(_) | Location::Fp(_) => {
+                    unreachable!("a finalized reconstruction recipe reads homes or constants")
+                }
+            })
+            .collect();
+        homes.sort_unstable();
+        homes.dedup();
+        homes
+    }
+}
 
 /// Register file state of one class.
 #[derive(Debug, Clone)]
@@ -158,6 +194,7 @@ struct ValueState {
 }
 
 struct Allocator<'g> {
+    registers: RegisterContract,
     graph: &'g Graph,
     layout: &'g [BlockId],
     position: Vec<u32>,
@@ -175,20 +212,30 @@ struct Allocator<'g> {
     entry_states: FxHashMap<BlockId, Vec<(NodeId, Location)>>,
     exit_states: FxHashMap<BlockId, Vec<(NodeId, Location)>>,
     current: NodeId,
+    /// Control-flow liveness, including deopt frame-state uses.
+    liveness: super::liveness::Liveness,
+    /// Final homes are immutable during the second allocation walk.
+    planned: bool,
 }
 
 const NO_POSITION: u32 = u32::MAX;
 
 /// Allocate `graph` in `layout` order.
-pub(crate) fn allocate(graph: &Graph, layout: &[BlockId]) -> Allocation {
+pub(crate) fn allocate(
+    graph: &Graph,
+    layout: &[BlockId],
+    registers: RegisterContract,
+) -> Allocation {
+    registers.validate();
     let mut allocator = Allocator {
+        registers,
         graph,
         layout,
         position: vec![NO_POSITION; graph.nodes.len()],
         block_start: FxHashMap::default(),
         values: FxHashMap::default(),
-        gp: RegisterFile::new(GP_REGISTERS),
-        fp: RegisterFile::new(FP_REGISTERS),
+        gp: RegisterFile::new(registers.general),
+        fp: RegisterFile::new(registers.floating),
         out: Allocation {
             nodes: vec![NodeAllocation::default(); graph.nodes.len()],
             ..Allocation::default()
@@ -199,14 +246,90 @@ pub(crate) fn allocate(graph: &Graph, layout: &[BlockId]) -> Allocation {
         entry_states: FxHashMap::default(),
         exit_states: FxHashMap::default(),
         current: NodeId(0),
+        liveness: super::liveness::Liveness::compute(graph, layout),
+        planned: false,
     };
     allocator.number();
     allocator.collect_uses();
     allocator.walk();
+    let homes = allocator.plan_homes();
+    allocator.out = homes;
+    allocator.gp = RegisterFile::new(registers.general);
+    allocator.fp = RegisterFile::new(registers.floating);
+    for state in allocator.values.values_mut() {
+        state.gp = 0;
+        state.fp = 0;
+    }
+    allocator.free_tagged.clear();
+    allocator.free_untagged.clear();
+    allocator.expiries.clear();
+    allocator.entry_states.clear();
+    allocator.exit_states.clear();
+    allocator.planned = true;
+    allocator.walk();
+    allocator.plan_rooted_tagged_homes();
     allocator.out
 }
 
 impl<'g> Allocator<'g> {
+    /// Project complete CFG/state/input liveness onto final physical homes
+    /// at every collecting boundary, keeping only homes written for their
+    /// current value: a definition spill, or a register this boundary's own
+    /// slow path saves. A call leaves every value live past it in its home.
+    fn plan_rooted_tagged_homes(&mut self) {
+        for &block in self.layout {
+            let data = self.graph.block(block);
+            let control = data
+                .control
+                .into_iter()
+                .filter(|&control| matches!(self.graph.node(control).kind, Kind::JumpLoop(_)));
+            for node in data.body.iter().copied().chain(control) {
+                let data = self.graph.node(node);
+                let properties = data.kind.properties();
+                if !properties.call
+                    && !properties.may_collect
+                    && !matches!(data.kind, Kind::JumpLoop(_))
+                {
+                    continue;
+                }
+                let reads: FxHashSet<NodeId> = data
+                    .inputs
+                    .iter()
+                    .copied()
+                    .chain(
+                        data.eager
+                            .iter()
+                            .chain(data.lazy.iter())
+                            .flat_map(|&state| self.graph.state_values(state)),
+                    )
+                    .collect();
+                let mut rooted: Vec<u32> = self.out.nodes[node.0 as usize]
+                    .live_homes
+                    .iter()
+                    .filter_map(|&(_, home)| match home {
+                        Location::TaggedSlot(slot) => Some(slot),
+                        _ => None,
+                    })
+                    .collect();
+                for (&value, &home) in &self.out.spill {
+                    // The result's home may still contain an earlier colored
+                    // occupant. Its value does not exist before the call.
+                    if value == node || !self.out.definition_spills.contains(&value) {
+                        continue;
+                    }
+                    if let Location::TaggedSlot(slot) = home
+                        && (self.liveness.is_live_after(node, value) || reads.contains(&value))
+                    {
+                        rooted.push(slot);
+                    }
+                }
+                rooted.sort_unstable();
+                rooted.dedup();
+                self.out.nodes[node.0 as usize].rooted_tagged_homes = Some(rooted.into());
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Positions and uses
     // ------------------------------------------------------------------
@@ -380,7 +503,7 @@ impl<'g> Allocator<'g> {
     }
 
     /// Current location of `value` (register preferred).
-    fn location_of(&self, value: NodeId) -> Option<Location> {
+    fn location_of(&mut self, value: NodeId) -> Option<Location> {
         if self.graph.node(value).kind.is_constant() {
             return Some(Location::Constant(value));
         }
@@ -391,7 +514,11 @@ impl<'g> Allocator<'g> {
                 registers.trailing_zeros() as u8,
             ));
         }
-        self.out.spill.get(&value).copied()
+        let home = self.out.spill.get(&value).copied();
+        if home.is_some() {
+            self.out.definition_spills.insert(value);
+        }
+        home
     }
 
     fn bind(&mut self, value: NodeId, register: u8) {
@@ -419,9 +546,18 @@ impl<'g> Allocator<'g> {
     }
 
     fn ensure_spill_slot(&mut self, value: NodeId) -> Location {
+        self.out.definition_spills.insert(value);
+        self.ensure_home(value)
+    }
+
+    fn ensure_home(&mut self, value: NodeId) -> Location {
         if let Some(&slot) = self.out.spill.get(&value) {
             return slot;
         }
+        assert!(
+            !self.planned,
+            "every spill home is planned before final allocation"
+        );
         // The slot is written at the definition, so a released slot is
         // reusable only when its last value died before this one exists.
         let defined = match self.pos(value) {
@@ -529,6 +665,10 @@ impl<'g> Allocator<'g> {
     /// Put `value` into exactly `register`.
     fn fixed_input(&mut self, value: NodeId, register: u8) {
         let float = self.is_float(value);
+        assert!(
+            !float,
+            "a fixed general input cannot have floating representation"
+        );
         if self.file(float).holder(register) == Some(value) {
             self.block_register(float, register);
             return;
@@ -537,11 +677,19 @@ impl<'g> Allocator<'g> {
             .location_of(value)
             .expect("a live value has a location");
         if self.file(float).holder(register).is_some() {
-            // Move the occupant aside when it stays live.
+            // Move the occupant aside when it stays live. A call keeps no
+            // register: there its slot holds it.
             let occupant = self.file(float).holder(register).expect("an occupant");
             let at = self.pos(self.current);
             self.unbind(float, register);
-            if self.is_live_after(occupant, at.saturating_sub(1))
+            let call = self.graph.node(self.current).kind.properties().call;
+            if call
+                && self.is_live_after(occupant, at.saturating_sub(1))
+                && !self.graph.node(occupant).kind.is_constant()
+                && self.registers_of(occupant) == 0
+            {
+                self.ensure_spill_slot(occupant);
+            } else if self.is_live_after(occupant, at.saturating_sub(1))
                 && !self.graph.node(occupant).kind.is_constant()
                 && self.registers_of(occupant) == 0
             {
@@ -672,6 +820,106 @@ impl<'g> Allocator<'g> {
         self.out.nodes[phi.0 as usize].result = Some(location);
     }
 
+    /// Reserve implicit writes before any input can be placed in their
+    /// registers. Discovery and final assignment use the same eviction order.
+    fn prepare_constraints(&mut self, constraints: &Constraints) -> u32 {
+        let validate = |register: u8| {
+            assert!(
+                register < 32 && self.gp.allocatable & (1 << register) != 0,
+                "fixed general register must belong to the allocation pool"
+            );
+        };
+        let mut clobbers = 0;
+        for &register in &constraints.fixed_gp_clobbers {
+            validate(register);
+            let bit = 1 << register;
+            assert_eq!(clobbers & bit, 0, "duplicate fixed general clobber");
+            clobbers |= bit;
+        }
+        for &policy in &constraints.inputs {
+            if let InputPolicy::FixedGp(register) | InputPolicy::FixedGpOrConstant(register) =
+                policy
+            {
+                validate(register);
+                assert_eq!(
+                    clobbers & (1 << register),
+                    0,
+                    "an input cannot occupy an implicit clobber"
+                );
+            }
+        }
+        if let ResultPolicy::FixedGp(register) = constraints.result {
+            validate(register);
+        }
+        self.gp.blocked = clobbers;
+        self.fp.blocked = 0;
+        for &register in &constraints.fixed_gp_clobbers {
+            self.evict(false, register);
+        }
+        clobbers
+    }
+
+    /// Fixed words move first so other inputs cannot consume their registers.
+    /// Immediate fixed-count inputs do not enter that pass.
+    fn allocate_inputs(
+        &mut self,
+        values: &[NodeId],
+        constraints: &Constraints,
+    ) -> SmallVec<[Location; 4]> {
+        assert_eq!(
+            values.len(),
+            constraints.inputs.len(),
+            "one policy per input"
+        );
+        let graph = self.graph;
+        let mut inputs: SmallVec<[Location; 4]> = values.iter().map(|_| Location::Gp(0)).collect();
+        for (index, (&input, policy)) in values.iter().zip(&constraints.inputs).enumerate() {
+            if let InputPolicy::FixedGp(register) | InputPolicy::FixedGpOrConstant(register) =
+                *policy
+                && !(matches!(policy, InputPolicy::FixedGpOrConstant(_))
+                    && graph.node(input).kind.is_constant())
+            {
+                self.fixed_input(input, register);
+                inputs[index] = Location::Gp(register);
+            }
+        }
+        for (index, (&input, policy)) in values.iter().zip(&constraints.inputs).enumerate() {
+            inputs[index] = match *policy {
+                InputPolicy::Register => {
+                    let register = self.input_register(input);
+                    Self::register_location(self.is_float(input), register)
+                }
+                InputPolicy::Any => {
+                    let location = self.location_of(input).expect("a live input");
+                    match location {
+                        Location::Gp(register) => self.block_register(false, register),
+                        Location::Fp(register) => self.block_register(true, register),
+                        _ => {}
+                    }
+                    location
+                }
+                InputPolicy::Home => {
+                    if graph.node(input).kind.is_constant() {
+                        Location::Constant(input)
+                    } else {
+                        self.ensure_spill_slot(input)
+                    }
+                }
+                InputPolicy::RegisterOrConstant | InputPolicy::FixedGpOrConstant(_)
+                    if graph.node(input).kind.is_constant() =>
+                {
+                    Location::Constant(input)
+                }
+                InputPolicy::RegisterOrConstant => {
+                    let register = self.input_register(input);
+                    Self::register_location(self.is_float(input), register)
+                }
+                InputPolicy::FixedGp(_) | InputPolicy::FixedGpOrConstant(_) => inputs[index],
+            };
+        }
+        inputs
+    }
+
     fn allocate_node(&mut self, node: NodeId) {
         let graph = self.graph;
         let data = graph.node(node);
@@ -685,40 +933,12 @@ impl<'g> Allocator<'g> {
             self.out.nodes[node.0 as usize].skipped = true;
             return;
         }
-        let constraints = data.kind.constraints(data.inputs.len());
-        self.gp.blocked = 0;
-        self.fp.blocked = 0;
-        // Fixed inputs first, so arbitrary ones avoid their registers.
-        let mut inputs: SmallVec<[Location; 4]> =
-            data.inputs.iter().map(|_| Location::Gp(0)).collect();
-        for (index, (&input, policy)) in data.inputs.iter().zip(&constraints.inputs).enumerate() {
-            if let InputPolicy::FixedGp(register) = *policy {
-                self.fixed_input(input, register);
-                inputs[index] = Location::Gp(register);
-            }
-        }
-        for (index, (&input, policy)) in data.inputs.iter().zip(&constraints.inputs).enumerate() {
-            match *policy {
-                InputPolicy::Register => {
-                    let register = self.input_register(input);
-                    inputs[index] = Self::register_location(self.is_float(input), register);
-                }
-                InputPolicy::Any => {
-                    inputs[index] = self.location_of(input).expect("a live input");
-                }
-                InputPolicy::FixedGp(_) => {}
-            }
-        }
+        let constraints = data.kind.constraints(data.inputs.len(), &self.registers);
+        let fixed_clobbers = self.prepare_constraints(&constraints);
+        let inputs = self.allocate_inputs(&data.inputs, &constraints);
         self.out.nodes[node.0 as usize].inputs = inputs.clone();
         if properties.call {
             self.spill_all_live(at);
-            let roots = self.tagged_roots(at, node);
-            self.out.nodes[node.0 as usize].gc_roots = Some(roots);
-        } else if properties.may_collect {
-            // The slow path saves live registers in snapshot slots and roots
-            // them with the live spill slots.
-            let roots = self.tagged_roots(at, node);
-            self.out.nodes[node.0 as usize].gc_roots = Some(roots);
         }
         // Temporaries.
         let mut gp_temps = SmallVec::new();
@@ -755,6 +975,9 @@ impl<'g> Allocator<'g> {
                 }
             }
         }
+        // Releasing a dying input cannot reopen an implicit write for a
+        // temporary or an ordinary result.
+        self.gp.blocked |= fixed_clobbers;
         if !properties.call {
             // Live registers a slow path must preserve.
             let mut live = SmallVec::new();
@@ -764,13 +987,17 @@ impl<'g> Allocator<'g> {
                     // node's own exits read: a throw rebuilds the frame
                     // from those locations after the runtime returns.
                     if let Some(value) = self.file(float).holder(register)
-                        && (self.is_live_after(value, at)
+                        && (self.liveness.is_live_after(node, value)
                             || (properties.may_collect && eager_values.contains(&value)))
                     {
-                        live.push((
-                            Self::register_location(float, register),
-                            self.graph.node(value).repr,
-                        ));
+                        let location = Self::register_location(float, register);
+                        live.push((location, graph.node(value).repr));
+                        if properties.may_collect {
+                            let home = self.canonical_location(value);
+                            self.out.nodes[node.0 as usize]
+                                .live_homes
+                                .push((location, home));
+                        }
                     }
                 }
             }
@@ -781,16 +1008,13 @@ impl<'g> Allocator<'g> {
             let float = data.repr.is_float();
             let register = match constraints.result {
                 ResultPolicy::FixedGp(register) => {
+                    assert!(
+                        !float,
+                        "a fixed general result cannot have floating representation"
+                    );
                     self.evict(false, register);
                     register
                 }
-                ResultPolicy::SameAsInput(index) => match inputs[index as usize] {
-                    Location::Gp(register) | Location::Fp(register) => {
-                        self.evict(float, register);
-                        register
-                    }
-                    _ => self.take_register(float),
-                },
                 ResultPolicy::Register | ResultPolicy::None => self.take_register(float),
             };
             if self.values.contains_key(&node) {
@@ -801,32 +1025,14 @@ impl<'g> Allocator<'g> {
         }
         // Deopt locations.
         if let Some(state) = data.eager {
-            let locations = graph
-                .state_values(state)
-                .into_iter()
-                .map(|value| self.location_of(value).expect("a deopt value is live"))
-                .collect();
+            let (locations, spills) = self.deopt_locations(state);
             self.out.nodes[node.0 as usize].eager = locations;
+            self.out.nodes[node.0 as usize].eager_spills = spills;
         }
         if let Some(state) = data.lazy {
-            let locations = graph
-                .state_values(state)
-                .into_iter()
-                .map(|value| {
-                    if value == node {
-                        self.out.nodes[node.0 as usize].result.expect("a result")
-                    } else {
-                        // After a call nothing is in a register.
-                        self.out
-                            .spill
-                            .get(&value)
-                            .copied()
-                            .or_else(|| self.location_of(value))
-                            .expect("a lazy deopt value is spilled")
-                    }
-                })
-                .collect();
+            let (locations, spills) = self.deopt_locations(state);
             self.out.nodes[node.0 as usize].lazy = locations;
+            self.out.nodes[node.0 as usize].lazy_spills = spills;
         }
         self.release_dead(at);
         self.gp.blocked = 0;
@@ -867,32 +1073,14 @@ impl<'g> Allocator<'g> {
         let graph = self.graph;
         let data = graph.node(control);
         let at = self.pos(control);
-        let constraints = data.kind.constraints(data.inputs.len());
-        self.gp.blocked = 0;
-        self.fp.blocked = 0;
-        let mut inputs: SmallVec<[Location; 4]> = SmallVec::new();
-        for (&input, policy) in data.inputs.iter().zip(&constraints.inputs) {
-            let location = match *policy {
-                InputPolicy::FixedGp(register) => {
-                    self.fixed_input(input, register);
-                    Location::Gp(register)
-                }
-                InputPolicy::Register => {
-                    let register = self.input_register(input);
-                    Self::register_location(self.is_float(input), register)
-                }
-                InputPolicy::Any => self.location_of(input).expect("a live input"),
-            };
-            inputs.push(location);
-        }
+        let constraints = data.kind.constraints(data.inputs.len(), &self.registers);
+        self.prepare_constraints(&constraints);
+        let inputs = self.allocate_inputs(&data.inputs, &constraints);
         self.out.nodes[control.0 as usize].inputs = inputs;
         if let Some(state) = data.eager {
-            let locations = graph
-                .state_values(state)
-                .into_iter()
-                .map(|value| self.location_of(value).expect("a deopt value is live"))
-                .collect();
+            let (locations, spills) = self.deopt_locations(state);
             self.out.nodes[control.0 as usize].eager = locations;
+            self.out.nodes[control.0 as usize].eager_spills = spills;
         }
         let targets: SmallVec<[BlockId; 2]> = match data.kind {
             Kind::Jump(target) | Kind::JumpLoop(target) => smallvec::smallvec![target],
@@ -925,22 +1113,42 @@ impl<'g> Allocator<'g> {
                 }
             }
         }
-        // A back edge's poll saves every occupied register around its call.
+        // A poll preserves its exit state as well as values read by the edge.
+        let eager_values = data
+            .eager
+            .map(|state| graph.state_values(state))
+            .unwrap_or_default();
         let mut occupied = SmallVec::new();
         for (float, file) in [(false, &self.gp), (true, &self.fp)] {
             for register in 0..32u8 {
-                if let Some(value) = file.holder(register) {
+                if let Some(value) = file.holder(register)
+                    && (self.liveness.is_live_after(control, value)
+                        || eager_values.contains(&value))
+                {
                     occupied.push((
                         Self::register_location(float, register),
-                        self.graph.node(value).repr,
+                        graph.node(value).repr,
                     ));
                 }
             }
         }
         self.out.nodes[control.0 as usize].live_registers = occupied;
         if matches!(data.kind, Kind::JumpLoop(_)) {
-            let roots = self.tagged_roots(at, control);
-            self.out.nodes[control.0 as usize].gc_roots = Some(roots);
+            // The poll may deopt or throw as well as resume its edge.
+            // Frame-state-only values already have canonical homes.
+            let values: Vec<(NodeId, Location)> = self
+                .snapshot()
+                .into_iter()
+                .filter(|(value, _)| {
+                    self.liveness.is_live_after(control, *value) || eager_values.contains(value)
+                })
+                .collect();
+            for (value, location) in values {
+                let home = self.canonical_location(value);
+                self.out.nodes[control.0 as usize]
+                    .live_homes
+                    .push((location, home));
+            }
         }
         // The edge reads every value live at its target, including values
         // whose last use is this jump (a back edge extends the loop's
@@ -978,10 +1186,13 @@ impl<'g> Allocator<'g> {
                                 .is_constant()
                                 .then_some(Location::Constant(value))
                         });
-                    if let Some(from) = from
-                        && from != to
-                    {
-                        edge.moves.push(Move { from, to });
+                    if let Some(from) = from {
+                        if matches!(from, Location::TaggedSlot(_) | Location::UntaggedSlot(_)) {
+                            self.out.definition_spills.insert(value);
+                        }
+                        if from != to {
+                            edge.moves.push(Move { from, to });
+                        }
                     }
                 }
             } else {
@@ -992,33 +1203,87 @@ impl<'g> Allocator<'g> {
         }
     }
 
-    /// The tagged slots of values live after `at`, or read by `node`'s own
-    /// frame states, sorted.
-    fn tagged_roots(&self, at: u32, node: NodeId) -> Vec<u32> {
-        let data = self.graph.node(node);
-        let state_values: SmallVec<[NodeId; 16]> = data
-            .eager
-            .iter()
-            .chain(data.lazy.iter())
-            .flat_map(|&state| self.graph.state_values(state))
-            .filter(|&value| value != node)
-            .collect();
-        let mut roots: Vec<u32> = self
-            .out
-            .spill
-            .iter()
-            .filter_map(|(&value, &location)| match location {
-                Location::TaggedSlot(index)
-                    if self.is_live_after(value, at) || state_values.contains(&value) =>
-                {
-                    Some(index)
+    /// A frame-state value's only authoritative location across exits.
+    fn canonical_location(&mut self, value: NodeId) -> Location {
+        if self.graph.node(value).kind.is_constant() {
+            Location::Constant(value)
+        } else {
+            self.ensure_home(value)
+        }
+    }
+
+    /// Keep recipes in canonical homes without moving exit-only stores
+    /// onto the hot path. A collecting completion has already saved the
+    /// same values; ordinary guard exits perform these moves before calling
+    /// the writeback entry.
+    fn deopt_locations(&mut self, state: super::ir::FrameStateId) -> (Vec<Location>, Vec<Move>) {
+        let mut locations = Vec::new();
+        let mut spills = Vec::new();
+        for value in self.graph.state_values(state) {
+            let from = self
+                .location_of(value)
+                .or(self.out.nodes[value.0 as usize].result)
+                .expect("a deopt value is live");
+            let to = self.canonical_location(value);
+            locations.push(to);
+            if from != to && !matches!(to, Location::Constant(_)) {
+                spills.push(Move { from, to });
+            }
+        }
+        (locations, spills)
+    }
+
+    /// Color the discovered homes by their complete live intervals. The
+    /// final walk can activate a home at any use without changing its
+    /// location or the frame's tagged/untagged boundary.
+    fn plan_homes(&self) -> Allocation {
+        let mut values: Vec<NodeId> = self.out.spill.keys().copied().collect();
+        values.sort_unstable_by_key(|&value| (self.pos(value), value));
+        let mut out = Allocation {
+            nodes: vec![NodeAllocation::default(); self.graph.nodes.len()],
+            definition_spills: self.out.definition_spills.clone(),
+            ..Allocation::default()
+        };
+        let mut tagged: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
+            std::collections::BinaryHeap::new();
+        let mut untagged: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
+            std::collections::BinaryHeap::new();
+        let mut free_tagged = std::collections::BinaryHeap::new();
+        let mut free_untagged = std::collections::BinaryHeap::new();
+        for value in values {
+            let start = self.pos(value);
+            let is_tagged = self.graph.node(value).repr == Repr::Tagged;
+            let (active, free, count) = if is_tagged {
+                (&mut tagged, &mut free_tagged, &mut out.tagged_slots)
+            } else {
+                (&mut untagged, &mut free_untagged, &mut out.untagged_slots)
+            };
+            while let Some(&std::cmp::Reverse((end, slot))) = active.peek() {
+                if end >= start {
+                    break;
                 }
-                _ => None,
-            })
-            .collect();
-        roots.sort_unstable();
-        roots.dedup();
-        roots
+                active.pop();
+                free.push(std::cmp::Reverse(slot));
+            }
+            let slot = free.pop().map_or_else(
+                || {
+                    let slot = *count;
+                    *count += 1;
+                    slot
+                },
+                |std::cmp::Reverse(slot)| slot,
+            );
+            active.push(std::cmp::Reverse((self.last_use(value), slot)));
+            out.spill.insert(
+                value,
+                if is_tagged {
+                    Location::TaggedSlot(slot)
+                } else {
+                    Location::UntaggedSlot(slot)
+                },
+            );
+        }
+        out
     }
 
     fn snapshot(&self) -> Vec<(NodeId, Location)> {
@@ -1033,3 +1298,7 @@ impl<'g> Allocator<'g> {
         state
     }
 }
+
+#[cfg(test)]
+#[path = "regalloc_tests.rs"]
+mod tests;

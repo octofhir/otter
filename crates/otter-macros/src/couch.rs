@@ -792,7 +792,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 let ctor = ctor_value
                     .as_native_function()
                     .expect("couch!: constructor stays a native function across allocation");
-                if !ctor.define_own_property(heap, method_spec.name, desc) {
+                if !ctor.define_own_property(heap, method_spec.name, desc)? {
                     return ::core::result::Result::Err(
                         ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(method_spec.name),
                     );
@@ -830,7 +830,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     heap,
                     method_spec.name,
                     desc,
-                ) {
+                )? {
                     return ::core::result::Result::Err(
                         ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(method_spec.name),
                     );
@@ -850,7 +850,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             let ctor = ctor_value
                 .as_native_function()
                 .expect("couch!: constructor stays a native function across allocation");
-            #path(heap, global, ctor)?;
+            #path(heap, global_root.as_object().expect("couch!: global for post install"), ctor)?;
         },
         None => quote! {},
     };
@@ -860,11 +860,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             // Custom prototype parent — caller provides a resolver
             // that returns the JsObject to link `[[Prototype]]` to.
             let parent_proto = #path(global, heap);
-            ::otter_vm::__macro_support::object::set_prototype(
-                prototype,
+            if !::otter_vm::__macro_support::object::set_prototype(
+                &mut prototype,
                 heap,
                 ::core::option::Option::Some(parent_proto),
-            );
+            )? {
+                return ::core::result::Result::Err(
+                    ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed("[[Prototype]]"),
+                );
+            }
         },
         None => quote! {
             // Default — link to `%Object.prototype%` per §19.4 when
@@ -876,11 +880,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     ::otter_vm::__macro_support::object::get(object_ctor, heap, "prototype")
                         .and_then(|v| v.as_object())
             {
-                ::otter_vm::__macro_support::object::set_prototype(
-                    prototype,
+                if !::otter_vm::__macro_support::object::set_prototype(
+                    &mut prototype,
                     heap,
                     ::core::option::Option::Some(object_proto),
-                );
+                )? {
+                    return ::core::result::Result::Err(
+                        ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed("[[Prototype]]"),
+                    );
+                }
             } else if let ::core::option::Option::Some(object_ctor_value) =
                 ::otter_vm::__macro_support::object::get(global, heap, "Object")
                 && let ::core::option::Option::Some(object_ctor_native) =
@@ -890,11 +898,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 && let ::otter_vm::__macro_support::object::DescriptorKind::Data { value } = desc.kind
                 && let ::core::option::Option::Some(object_proto) = value.as_object()
             {
-                ::otter_vm::__macro_support::object::set_prototype(
-                    prototype,
+                if !::otter_vm::__macro_support::object::set_prototype(
+                    &mut prototype,
                     heap,
                     ::core::option::Option::Some(object_proto),
-                );
+                )? {
+                    return ::core::result::Result::Err(
+                        ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed("[[Prototype]]"),
+                    );
+                }
             }
         },
     };
@@ -950,27 +962,12 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     } else {
                         ::core::option::Option::None
                     };
-                    let ::core::option::Option::Some(mut prototype) = prototype else {
+                    let ::core::option::Option::Some(prototype) = prototype else {
                         return ::core::result::Result::Ok(());
                     };
-                    let tag_sym =
-                        well_known.get(::otter_vm::__macro_support::symbol::WellKnown::ToStringTag);
-                    let value = ::otter_vm::__macro_support::string::JsString::from_str(#tag, heap)
-                        .map_err(|_| ::otter_vm::__macro_support::JsSurfaceError::OutOfMemory)?;
-                    ::otter_vm::__macro_support::object::define_own_symbol_property_partial(
-                        &mut prototype,
-                        heap,
-                        tag_sym,
-                        ::otter_vm::__macro_support::object::PartialPropertyDescriptor {
-                            value: ::core::option::Option::Some(
-                                ::otter_vm::__macro_support::Value::string(value),
-                            ),
-                            writable: ::core::option::Option::Some(false),
-                            enumerable: ::core::option::Option::Some(false),
-                            configurable: ::core::option::Option::Some(true),
-                            ..::core::default::Default::default()
-                        },
-                    );
+                    let mut builder = ::otter_vm::__macro_support::ObjectBuilder::from_object(heap, prototype);
+                    builder.to_string_tag(well_known, #tag)?;
+                    let _ = builder.build();
                     ::core::result::Result::Ok(())
                 }
             }
@@ -985,7 +982,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             // parent object; bind the constructor as an own data
             // property (writable / non-enumerable / configurable,
             // matching the conventional builtin shape).
-            let host = #path(global, heap);
+            let host = #path(global_root.as_object().expect("couch!: global for nested binding"), heap);
             let bind_desc = ::otter_vm::__macro_support::object::PropertyDescriptor::data(
                 ctor_value,
                 true,
@@ -997,7 +994,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 heap,
                 <Self as ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic>::NAME,
                 bind_desc,
-            ) {
+            )? {
                 return ::core::result::Result::Err(
                     ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(
                         <Self as ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic>::NAME,
@@ -1007,11 +1004,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         },
         None => quote! {
             ::otter_vm::__macro_support::bootstrap::define_global_value(
-                global,
+                global_root.as_object().expect("couch!: global for binding"),
                 heap,
                 <Self as ::otter_vm::__macro_support::intrinsic_install::BuiltinIntrinsic>::NAME,
                 ctor_value,
-            );
+            )?;
         },
     };
 
@@ -1142,7 +1139,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     let ctor = ctor_value
                         .as_native_function()
                         .expect("couch!: constructor stays a native function across allocation");
-                    if !ctor.define_own_property(heap, method_spec.name, desc) {
+                    if !ctor.define_own_property(heap, method_spec.name, desc)? {
                         return ::core::result::Result::Err(
                             ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(method_spec.name),
                         );
@@ -1178,7 +1175,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     let ctor = ctor_value
                         .as_native_function()
                         .expect("couch!: constructor stays a native function across allocation");
-                    if !ctor.define_own_property(heap, const_spec.name, desc) {
+                    if !ctor.define_own_property(heap, const_spec.name, desc)? {
                         return ::core::result::Result::Err(
                             ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(const_spec.name),
                         );
@@ -1195,11 +1192,12 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 // `prototype_value` copies by reference, so the collector keeps
                 // them current and no raw handle is read across an allocation.
                 if #prototype_block_needed {
-                    let prototype = ::otter_vm::__macro_support::bootstrap::alloc_object_with_value_roots_pub(
+                    let mut prototype = ::otter_vm::__macro_support::bootstrap::alloc_object_with_value_roots_pub(
                         heap,
                         &[&global_root, &ctor_value],
                     )
                     .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
+                    let global = global_root.as_object().expect("couch!: global for prototype parent");
                     #prototype_parent_link
                     let mut prototype_value = ::otter_vm::__macro_support::Value::object(prototype);
                     let mut prototype_scope = ::otter_gc::RootScope::new(heap);
@@ -1235,7 +1233,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                             heap,
                             method_spec.name,
                             desc,
-                        ) {
+                        )? {
                             return ::core::result::Result::Err(
                                 ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(method_spec.name),
                             );
@@ -1296,7 +1294,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                             heap,
                             accessor_spec.name,
                             descriptor,
-                        ) {
+                        )? {
                             return ::core::result::Result::Err(
                                 ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(
                                     accessor_spec.name,
@@ -1335,7 +1333,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                             heap,
                             const_spec.name,
                             desc,
-                        ) {
+                        )? {
                             return ::core::result::Result::Err(
                                 ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed(const_spec.name),
                             );
@@ -1350,7 +1348,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     let ctor = ctor_value
                         .as_native_function()
                         .expect("couch!: constructor stays a native function across allocation");
-                    if !ctor.define_own_property(heap, "prototype", proto_desc) {
+                    if !ctor.define_own_property(heap, "prototype", proto_desc)? {
                         return ::core::result::Result::Err(
                             ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed("prototype"),
                         );
@@ -1369,12 +1367,16 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     let prototype = prototype_value
                         .as_object()
                         .expect("couch!: prototype stays an object across allocation");
-                    let _ = ::otter_vm::__macro_support::object::define_own_property(
+                    if !::otter_vm::__macro_support::object::define_own_property(
                         prototype,
                         heap,
                         "constructor",
                         ctor_back_desc,
-                    );
+                    )? {
+                        return ::core::result::Result::Err(
+                            ::otter_vm::__macro_support::JsSurfaceError::DefinePropertyFailed("constructor"),
+                        );
+                    }
                 }
 
                 #bind_call

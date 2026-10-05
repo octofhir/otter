@@ -35,7 +35,7 @@ use crate::runtime_state::RuntimeState;
 /// what matters is that the walker terminates and emits some roots.
 #[test]
 fn root_walker_runs_with_empty_state() {
-    let interp = Interpreter::default();
+    let interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let state = RuntimeState::new(&interp);
     let mut count = 0usize;
     state.trace_roots(&mut |_slot| {
@@ -51,7 +51,7 @@ fn root_walker_runs_with_empty_state() {
 fn pending_uncaught_throw_is_enumerated_as_a_root() {
     use otter_gc::raw::RawGc;
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let thrown = crate::object::alloc_fixture_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
         .expect("alloc object");
     interp.set_pending_uncaught_throw(crate::Value::object(thrown));
@@ -74,7 +74,7 @@ fn upvalue_cell_root_survives_force_gc() {
     };
     use otter_gc::Traceable;
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     // Allocate a fresh upvalue cell carrying a primitive payload. The cell is
     // rooted only via the local handle here. After we drop the handle and force
     // a full GC, the body should be reclaimed because no walker root reaches it.
@@ -119,7 +119,7 @@ fn context_root_survives_force_gc() {
     use crate::context::{self, CONTEXT_BODY_TYPE_TAG, ContextShape};
     use crate::{Value, eval_env};
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.force_gc().expect("settle bootstrap garbage");
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[CONTEXT_BODY_TYPE_TAG as usize].live_bytes;
@@ -195,7 +195,7 @@ fn context_root_survives_force_gc() {
 fn globals_keep_object_alive() {
     use crate::object::OBJECT_BODY_TYPE_TAG;
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     // Allocate a fresh object and stash it on globalThis under
     // a unique key. From this point the only path to the body
@@ -205,11 +205,19 @@ fn globals_keep_object_alive() {
     let stashed =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "__gc_roots_test_stash",
-        crate::Value::object(stashed),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "__gc_roots_test_stash",
+            crate::object::PropertyDescriptor::data(
+                crate::Value::object(stashed),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
     let after_alloc =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
@@ -245,7 +253,7 @@ fn globals_keep_object_alive() {
 fn module_env_keeps_object_alive() {
     use crate::object::OBJECT_BODY_TYPE_TAG;
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     // Register a fresh empty `module_env` object under a
     // synthetic URL. Then stash a property on it whose value
@@ -261,11 +269,19 @@ fn module_env_keeps_object_alive() {
 
     let stashed =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
-    crate::object::set(
-        &mut module_env,
-        interp.gc_heap_mut(),
-        "stash",
-        crate::Value::object(stashed),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut module_env,
+            interp.gc_heap_mut(),
+            "stash",
+            crate::object::PropertyDescriptor::data(
+                crate::Value::object(stashed),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
     let after_alloc =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
@@ -289,7 +305,7 @@ fn module_env_keeps_object_alive() {
 
 #[test]
 fn error_class_registry_prototypes_survive_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.force_gc().expect("force GC");
 
     let registry = interp.error_classes_clone();
@@ -306,16 +322,19 @@ fn error_class_registry_prototypes_survive_force_gc() {
 
 #[test]
 fn array_element_root_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
     crate::array::push(arr, interp.gc_heap_mut(), crate::Value::boolean(true))
         .expect("push element");
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__array_root",
-        crate::Value::array(arr),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__array_root",
+            crate::object::PropertyDescriptor::data(crate::Value::array(arr), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = arr;
@@ -335,7 +354,7 @@ fn array_element_root_survives_force_gc() {
 
 #[test]
 fn packed_array_widening_traces_new_object_element() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
     crate::array::push(arr, interp.gc_heap_mut(), crate::Value::number_i32(1))
         .expect("push numeric element");
@@ -345,11 +364,14 @@ fn packed_array_widening_traces_new_object_element() {
     );
 
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__packed_array_root",
-        crate::Value::array(arr),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__packed_array_root",
+            crate::object::PropertyDescriptor::data(crate::Value::array(arr), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
     let object = crate::object::alloc_fixture_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
         .expect("alloc object");
@@ -373,7 +395,7 @@ fn packed_array_widening_traces_new_object_element() {
 
 #[test]
 fn map_entry_root_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
     let stashed =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc object");
@@ -387,11 +409,14 @@ fn map_entry_root_survives_force_gc() {
     .expect("map set");
 
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__map_root",
-        crate::Value::map(map),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__map_root",
+            crate::object::PropertyDescriptor::data(crate::Value::map(map), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = map;
@@ -411,7 +436,7 @@ fn map_entry_root_survives_force_gc() {
 
 #[test]
 fn weak_collections_root_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("alloc WeakMap");
     let set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("alloc WeakSet");
     let key = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc key");
@@ -428,23 +453,32 @@ fn weak_collections_root_survives_force_gc() {
         .expect("weak set add");
 
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__weak_map_root",
-        crate::Value::weak_map(map),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__weak_map_root",
+            crate::object::PropertyDescriptor::data(crate::Value::weak_map(map), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__weak_set_root",
-        crate::Value::weak_set(set),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__weak_set_root",
+            crate::object::PropertyDescriptor::data(crate::Value::weak_set(set), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__weak_key_root",
-        crate::Value::object(key),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__weak_key_root",
+            crate::object::PropertyDescriptor::data(crate::Value::object(key), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = map;
@@ -485,18 +519,26 @@ fn weak_collections_root_survives_force_gc() {
 fn promise_resolution_root_survives_force_gc() {
     use crate::promise::{JsPromise, PromiseState};
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     promise.fulfill(interp.gc_heap_mut(), crate::Value::object(object));
 
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__promise_root",
-        crate::Value::promise(promise),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__promise_root",
+            crate::object::PropertyDescriptor::data(
+                crate::Value::promise(promise),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = object;
@@ -519,7 +561,7 @@ fn promise_resolution_root_survives_force_gc() {
 /// must be traced while the job is pending.
 #[test]
 fn microtask_payload_root_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     interp.microtasks_mut().enqueue(crate::Microtask {
@@ -527,6 +569,7 @@ fn microtask_payload_root_survives_force_gc() {
         this_value: crate::Value::undefined(),
         args: smallvec::smallvec![crate::Value::object(object)],
         context: None,
+        realm_id: 0,
         result_capability: None,
         async_context: crate::Value::undefined(),
         kind: crate::MicrotaskKind::Call,
@@ -556,7 +599,7 @@ fn parked_frame_keeps_alive() {
     use crate::{PromiseCapability, Value};
     use otter_bytecode::Function;
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.force_gc().expect("force GC");
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[PARKED_FRAME_BODY_TYPE_TAG as usize].live_bytes;
@@ -587,14 +630,20 @@ fn parked_frame_keeps_alive() {
             context: None,
         },
         None,
+        None,
+        Value::undefined(),
+        0,
     );
 
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__parked_frame_promise_root",
-        Value::promise(promise),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__parked_frame_promise_root",
+            crate::object::PropertyDescriptor::data(Value::promise(promise), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = object;
@@ -612,7 +661,7 @@ fn parked_frame_keeps_alive() {
 
 #[test]
 fn bound_function_root_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let target = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("target");
     let bound_this = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this");
     let bound = crate::test_support::alloc_bound_function(
@@ -623,11 +672,19 @@ fn bound_function_root_survives_force_gc() {
     )
     .expect("bound");
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__bound_root",
-        crate::Value::bound_function(bound),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__bound_root",
+            crate::object::PropertyDescriptor::data(
+                crate::Value::bound_function(bound),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = target;
@@ -648,15 +705,18 @@ fn bound_function_root_survives_force_gc() {
 
 #[test]
 fn regexp_root_survives_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let pattern: Vec<u16> = "a+".encode_utf16().collect();
     let re = crate::JsRegExp::compile(interp.gc_heap_mut(), &pattern, "g").expect("regexp");
     let mut global_this = *interp.global_this();
-    crate::object::set(
-        &mut global_this,
-        interp.gc_heap_mut(),
-        "__regexp_root",
-        crate::Value::regexp(re),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global_this,
+            interp.gc_heap_mut(),
+            "__regexp_root",
+            crate::object::PropertyDescriptor::data(crate::Value::regexp(re), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let _ = re;

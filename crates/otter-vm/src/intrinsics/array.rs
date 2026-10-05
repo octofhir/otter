@@ -44,7 +44,7 @@ fn install_array_prototype_length(
         return Ok(());
     };
     let desc = PropertyDescriptor::data(Value::number_i32(0), true, false, false);
-    if !object::define_own_property(prototype, heap, "length", desc) {
+    if !object::define_own_property(prototype, heap, "length", desc)? {
         return Err(JsSurfaceError::DefinePropertyFailed("length"));
     }
     Ok(())
@@ -139,7 +139,11 @@ fn apply_array_new_target_prototype(
         None
     };
     if let Some(proto) = proto {
-        ctx.set_array_prototype_override_checked(arr, proto);
+        ctx.set_array_prototype_override_checked(arr, proto)
+            .map_err(|_| NativeError::TypeError {
+                name: "Array",
+                reason: "out of memory while setting array prototype".to_owned(),
+            })?;
     }
     Ok(())
 }

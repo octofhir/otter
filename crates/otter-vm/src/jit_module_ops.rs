@@ -14,6 +14,7 @@
 //! - [`crate::module_ops`]
 //! - [`crate::Interpreter::run_star_reexport_regs`]
 
+use crate::native_abi::CommittedValueError;
 use otter_bytecode::Op;
 
 use crate::{ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack};
@@ -30,10 +31,10 @@ impl Interpreter {
         arg0: u64,
         arg1: u64,
         arg2: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         match opcode {
@@ -44,7 +45,8 @@ impl Interpreter {
                     frame_index,
                     arg0 as u16,
                     arg1 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::ImportNamespaceDeferred as u8 => {
                 self.run_import_namespace_deferred_reg(
@@ -53,7 +55,8 @@ impl Interpreter {
                     frame_index,
                     arg0 as u16,
                     arg1 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::ModuleNamespaceObject as u8 => {
                 self.run_module_namespace_object_reg(
@@ -62,7 +65,8 @@ impl Interpreter {
                     frame_index,
                     arg0 as u16,
                     arg1 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::LoadImportBinding as u8 => {
                 self.run_load_import_binding_reg(
@@ -72,13 +76,15 @@ impl Interpreter {
                     arg0 as u16,
                     arg1 as u32,
                     arg2 as u32,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::StarReexport as u8 => {
                 self.run_star_reexport_regs(context, stack, frame_index, arg0 as u16, arg1 as u16)?;
             }
             value if value == Op::MarkModuleEvaluated as u8 => {
-                self.run_mark_module_evaluated_const(context, stack, frame_index, arg0 as u32)?;
+                self.run_mark_module_evaluated_const(context, stack, frame_index, arg0 as u32)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             value if value == Op::ImportMetaResolve as u8 => {
                 self.run_import_meta_resolve_regs(
@@ -87,9 +93,10 @@ impl Interpreter {
                     frame_index,
                     arg0 as u16,
                     arg1 as u16,
-                )?;
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         Ok(())

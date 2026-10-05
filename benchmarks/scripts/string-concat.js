@@ -1,4 +1,4 @@
-// Primitive string concatenation through the allocating Machine IR call ABI.
+// Primitive string concatenation through an allocating call out of compiled code.
 // The first result stays live across the second moving-GC safepoint.
 
 function engineConcat3(prefix, value, suffix) {

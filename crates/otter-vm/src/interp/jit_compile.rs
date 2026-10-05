@@ -9,7 +9,8 @@
 //!   callee tier.
 //! - Call/method target profiling and reoptimization eviction.
 //! - Plain, method and optimizing base-constructor snapshots share one bounded
-//!   ancestry tree. Template construction keeps generated call linkage.
+//!   owned tree, including bounded recursive bodies. Template construction
+//!   keeps generated call linkage.
 //! - Cross-script recompilation resolves the defining code owner before baking.
 //!
 //! # Invariants
@@ -17,18 +18,29 @@
 //! reference permanent or non-moving allocations; anything movable goes
 //! through a runtime stub instead.
 //! Compile requests use the function's defining context, even when a later
-//! script triggered invalidation or reentry.
+//! script triggered invalidation or reentry. Global proofs and body splices
+//! require the linked source realm to be active; foreign calls retain their
+//! source-aware committed operations instead of baking the caller's cells.
 //! Compiled code is published only after the registry accepts its metadata and
 //! exact isolate-epoch dependency snapshot.
 //! Caller compilation never recursively compiles its generated-call targets.
 //! Property shape preparation precedes nested body and method snapshots, so
 //! metadata migration cannot immediately stale a freshly captured method guard.
+//! The sole ordinary shape baker refuses dictionary and opaque identities. A
+//! provisional constructor lineage is an immutable layout like any other and
+//! is baked for guards; only receiver allocation plans refuse a provisional
+//! root. A refusal drops that specialized operation or call plan while
+//! Generic semantics and runtime IC training remain available.
 #![allow(unused_imports)]
 use crate::*;
 
 #[path = "inline_snapshot_budget.rs"]
 mod inline_snapshot_budget;
 use inline_snapshot_budget::InlineSnapshotBudget;
+
+#[cfg(test)]
+#[path = "jit_compile_binding_tests.rs"]
+mod binding_tests;
 
 /// Internal result of one Template compiler invocation.
 ///
@@ -125,8 +137,6 @@ impl Interpreter {
                 self.jit_template_osr_fids.remove(&fid);
                 self.jit_entry_osr_only.remove(&fid);
                 self.jit_osr_disabled.insert((fid, u32::MAX));
-                self.jit_osr_counts
-                    .retain(|(counted_fid, _), _| *counted_fid != fid);
             }
             TemplateCompileOutcome::Deferred => {}
         }
@@ -172,8 +182,7 @@ impl Interpreter {
             .iter()
             .filter(|instruction| instruction.op(&view.code_block) == Op::LoadGlobalOrThrow)
             .count();
-        let entry_count = u64::from(self.jit_call_counts.get(&fid).copied().unwrap_or(0))
-            .saturating_add(self.jit_code_registry.generated_entries_for_function(fid));
+        let source_work = view.code_block.source_work().total();
         let exit_count = u64::from(self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0))
             .saturating_add(
                 self.jit_optimized_exit_profiles
@@ -190,7 +199,7 @@ impl Interpreter {
             register_count: u32::from(view.code_block.register_count),
             parameter_count: u32::from(view.code_block.param_count),
             bytecode_instruction_count: u64::try_from(view.instructions.len()).unwrap_or(u64::MAX),
-            entry_count,
+            source_work,
             exit_count,
             call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
             method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
@@ -207,7 +216,7 @@ impl Interpreter {
                 view.direct_methods.values().map(Vec::len).sum::<usize>(),
             )
             .unwrap_or(u32::MAX),
-            static_native_calls: u32::try_from(view.static_native_calls.len()).unwrap_or(u32::MAX),
+            native_calls: u32::try_from(view.native_calls.len()).unwrap_or(u32::MAX),
             inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
             inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
         };
@@ -252,16 +261,45 @@ impl Interpreter {
                             jit::JitCacheIrOp::GuardShape { shape, .. } => Some(*shape),
                             _ => None,
                         })?;
-                        let value_byte = program.ops.iter().find_map(|op| match op {
-                            jit::JitCacheIrOp::LoadField { value_byte, .. }
-                            | jit::JitCacheIrOp::StoreField { value_byte, .. } => Some(*value_byte),
+                        let field = program.ops.iter().find_map(|op| match op {
+                            jit::JitCacheIrOp::LoadField { field, .. }
+                            | jit::JitCacheIrOp::StoreField { field, .. } => Some(*field),
                             _ => None,
                         })?;
-                        Some(jit_debug::JitDebugPropertyProgram { shape, value_byte })
+                        Some(jit_debug::JitDebugPropertyProgram { shape, field })
                     })
                     .collect(),
             });
         }
+    }
+
+    fn record_jit_install_declined(
+        &mut self,
+        fid: u32,
+        code_object_id: u64,
+        tier: jit_debug::JitDebugTier,
+        error: crate::jit_registry::JitInstallError,
+    ) {
+        if !self.reserve_jit_debug_event() {
+            return;
+        }
+        let reason = match error {
+            crate::jit_registry::JitInstallError::InvalidCode => {
+                jit_debug::JitInstallDeclineReason::InvalidCode
+            }
+            crate::jit_registry::JitInstallError::ResourceBudget { required_bytes } => {
+                jit_debug::JitInstallDeclineReason::ResourceBudget {
+                    required_bytes,
+                    available_bytes: self.jit_code_registry.available_code_bytes(),
+                }
+            }
+        };
+        self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::InstallDeclined {
+            function_id: fid,
+            code_object_id,
+            tier,
+            reason,
+        });
     }
 
     fn record_jit_compile_finished(
@@ -447,14 +485,29 @@ impl Interpreter {
     /// without recompilation. A declined optimizer leaves the baseline target
     /// untouched.
     ///
-    /// Unsupported functions return `None`; hotness survives invalidation, so
-    /// the normal resolver can immediately rebuild a baseline body.
+    /// Unsupported functions return `None`; a retraining function stays in the
+    /// interpreter before any compile preparation or allocation begins.
     pub(crate) fn compile_optimized_jit_function(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if self.jit_retraining_blocks(fid) {
+            return None;
+        }
+        let available_code_bytes = self.jit_code_registry.available_code_bytes();
+        if !self
+            .jit_tier_work_decision(
+                context,
+                fid,
+                crate::tier_policy::CostedTier::Optimizing,
+                available_code_bytes,
+            )?
+            .should_compile()
+        {
+            return None;
+        }
         let roots_start = self.jit_compile_roots.borrow().len();
         let code = self.compile_optimized_jit_function_session(context, fid, osr_pc, roots_start);
         self.jit_compile_roots.borrow_mut().truncate(roots_start);
@@ -478,6 +531,7 @@ impl Interpreter {
         let context = &*owner;
         self.prewarm_string_constant_cells(context, fid)?;
         let mut snapshot = context.jit_compile_snapshot(fid)?;
+        self.bake_literal_allocations(&mut snapshot, context, fid)?;
         // The optimizing tier consumes the same baked compile inputs as the
         // template tier: without the cage base and body offsets no inline access
         // can be emitted at all, and without monomorphic call-site candidates
@@ -495,8 +549,8 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
         );
         self.bake_guarded_method_calls(&mut snapshot);
+        self.bake_forward_apply(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
-        self.bake_constructor_field_transitions(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
         Self::bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
@@ -523,9 +577,22 @@ impl Interpreter {
                 });
         let function = snapshot.code_block.clone();
         let code_object_id = self.jit_next_code_object_id;
-        let queued_ns = self.jit_debug.monotonic_ns();
-        let compile_started_ns = self.jit_debug.monotonic_ns();
-        let compile_started = std::time::Instant::now();
+        let capture_timing = self.jit_debug.request().events_enabled();
+        let queued_ns = if capture_timing {
+            self.jit_debug.monotonic_ns()
+        } else {
+            0
+        };
+        let compile_started_ns = if capture_timing {
+            self.jit_debug.monotonic_ns()
+        } else {
+            0
+        };
+        let compile_started = capture_timing.then(std::time::Instant::now);
+        self.jit_runtime_stats.compile_attempts =
+            self.jit_runtime_stats.compile_attempts.saturating_add(1);
+        self.optimizing_tier_policy
+            .record_compile_attempt(fid, crate::tier_policy::CostedTier::Optimizing);
         let status = hook.compile_optimized_function(jit::JitCompileRequest {
             snapshot,
             debug: self.jit_debug.request(),
@@ -533,15 +600,9 @@ impl Interpreter {
             osr_pc,
             code_object_id,
         });
-        let compile_duration_ns = compile_started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-        self.optimizing_tier_policy.record_compile_duration(
-            fid,
-            crate::tier_policy::CostedTier::Optimizing,
-            compile_duration_ns,
-        );
+        let compile_duration_ns = compile_started.map_or(0, |started| {
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+        });
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Optimizing,
@@ -558,19 +619,37 @@ impl Interpreter {
                     self.record_jit_artifact(*artifact);
                 }
                 self.jit_next_code_object_id += 1;
-                // Generated callers do not take a per-call executable lease.
-                // Any published native frame pins the current retirement
-                // epoch, including across reentrant compilation/invalidation.
-                if !self.jit_has_native_frames() {
-                    self.jit_code_registry.retire_unreferenced();
-                }
-                let installed = self.jit_code_registry.install_compiled(
+                // Generated callers take no per-call executable lease; the
+                // published frame chain names every executing generation.
+                self.retire_unreferenced_jit_code();
+                let roots = self.finalized_compile_roots(roots_start);
+                let admission = self.jit_code_registry.install_compiled(
                     code_object_id,
                     code.clone(),
                     &function,
+                    None,
+                    roots,
                 );
+                if let Err(crate::jit_registry::JitInstallError::ResourceBudget {
+                    required_bytes,
+                }) = admission
+                {
+                    self.optimizing_tier_policy.record_resource_refusal(
+                        &function,
+                        crate::tier_policy::CostedTier::Optimizing,
+                        required_bytes,
+                    );
+                }
+                if let Err(error) = admission {
+                    self.record_jit_install_declined(
+                        fid,
+                        code_object_id,
+                        jit_debug::JitDebugTier::Optimizing,
+                        error,
+                    );
+                }
+                let installed = admission.is_ok();
                 if installed {
-                    self.retain_compiled_roots(code_object_id, roots_start);
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                 }
@@ -582,28 +661,28 @@ impl Interpreter {
 
     /// Resolve or compile one whole-body optimizer object for loop OSR.
     ///
-    /// Back-edge hotness is independent of function-entry promotion: a
-    /// single-call loop can therefore compile here before the entry policy is
-    /// hot. Successful code is shared with later function entries. A failed
-    /// early feedback snapshot is not cached as a permanent entry-tier miss;
-    /// the current header falls back to template OSR and future entry feedback
-    /// may still make the function optimizable.
+    /// Entry and OSR share the function's exact source-work owner, so a
+    /// single-call loop can fund admission without a second back-edge ledger.
+    /// Successful code is shared with later function entries. An actual hook
+    /// decline waits for a new feedback epoch; pre-hook deferral and resource
+    /// refusal leave OSR eligible when work or physical headroom permits it.
     ///
     /// Optimized code enters at most the one header it was compiled for. When
     /// the current code cannot enter `osr_pc`, this header's back-edge crossed
     /// its tier threshold while the function kept running below the optimized
-    /// tier, so the function is recompiled for it (SpiderMonkey's `osrPc`
-    /// mismatch recompile). The replacement serves function entries as well.
+    /// tier, so the function is recompiled for it. The replacement serves
+    /// function entries as well.
     pub(crate) fn resolve_optimized_osr_code(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
         osr_pc: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        if !self
-            .jit_hook
-            .as_ref()
-            .is_some_and(|hook| hook.optimizing_tier_enabled())
+        if self.jit_retraining_blocks(fid)
+            || !self
+                .jit_hook
+                .as_ref()
+                .is_some_and(|hook| hook.optimizing_tier_enabled())
         {
             return None;
         }
@@ -615,24 +694,24 @@ impl Interpreter {
                 return Some(code.clone());
             }
         }
-        // A declined body is retried at a back-edge only when its feedback epoch
-        // has advanced since the last failed attempt: the optimizer's whole-body
-        // subset check is structural (unsupported opcode) except for
-        // feedback-driven representation, so re-running it while the feedback is
-        // unchanged always fails again and would recompile on every hot iteration.
+        // A declined compile is retried at a back-edge only when the feedback
+        // epoch has advanced since the last failed attempt: on unchanged
+        // feedback the optimizer declines again, and would recompile on every
+        // hot iteration.
         let epoch = self.code_space.feedback_epoch(fid);
-        if matches!(self.jit_optimized_code.get(&fid), Some(None))
-            && self.jit_optimized_declined_epoch.get(&fid) == Some(&epoch)
-        {
+        if self.jit_optimized_declined_epoch.get(&fid) == Some(&epoch) {
             return None;
         }
+        let prior_attempts = self
+            .optimizing_tier_policy
+            .compile_attempts(fid, crate::tier_policy::CostedTier::Optimizing);
         let compiled = self.compile_optimized_jit_function(context, fid, Some(osr_pc));
-        // Every attempt restarts the function's back-edge observation, as
-        // V8's tiering budget restarts after an optimization: a later
-        // replacement must again earn its measured compile cost from loop
-        // executions it actually observed, not from the loop's lifetime.
-        self.jit_osr_counts
-            .retain(|&(function, _), _| function != fid);
+        let attempted = self
+            .optimizing_tier_policy
+            .compile_attempts(fid, crate::tier_policy::CostedTier::Optimizing)
+            > prior_attempts;
+        // Actual compiler attempts increase the sole owner's required work;
+        // subsequent dispatch/Template paths must fund replacement admission.
         match compiled {
             Some(compiled) => {
                 self.jit_optimized_code.insert(fid, Some(compiled.clone()));
@@ -641,8 +720,19 @@ impl Interpreter {
                 Some(compiled)
             }
             None => {
-                self.jit_optimized_code.insert(fid, None);
-                self.jit_optimized_declined_epoch.insert(fid, epoch);
+                if let Some(function) = context.exec_function(fid) {
+                    let blocked = self
+                        .optimizing_tier_policy
+                        .decide(
+                            function,
+                            crate::tier_policy::CostedTier::Optimizing,
+                            self.jit_code_registry.available_code_bytes(),
+                        )
+                        .resource_blocked();
+                    if attempted && !blocked {
+                        self.jit_optimized_declined_epoch.insert(fid, epoch);
+                    }
+                }
                 None
             }
         }
@@ -658,7 +748,18 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
     ) -> TemplateCompileOutcome {
-        if !self.jit_template_compiling.insert(fid) {
+        let available_code_bytes = self.jit_code_registry.available_code_bytes();
+        if self.jit_retraining_blocks(fid)
+            || !self
+                .jit_tier_work_decision(
+                    context,
+                    fid,
+                    crate::tier_policy::CostedTier::Template,
+                    available_code_bytes,
+                )
+                .is_some_and(crate::tier_policy::TierWorkDecision::should_compile)
+            || !self.jit_template_compiling.insert(fid)
+        {
             return TemplateCompileOutcome::Deferred;
         }
         let outcome = self.compile_jit_function_unchecked(context, fid, osr_pc);
@@ -714,8 +815,8 @@ impl Interpreter {
         self.bake_property_cache_ir(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid, jit_debug::JitDebugTier::Template);
         self.bake_guarded_method_calls(&mut view);
+        self.bake_forward_apply(&mut view);
         self.bake_element_accesses(&mut view);
-        self.bake_constructor_field_transitions(&mut view);
         Self::bake_context_allocations(&mut view);
         Self::bake_closure_allocations(&mut view, context);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
@@ -741,9 +842,22 @@ impl Interpreter {
                         .unwrap_or_else(|| "<unknown>".to_string()),
                     module: view.code_block.module_url().to_string(),
                 });
-        let queued_ns = self.jit_debug.monotonic_ns();
-        let compile_started_ns = self.jit_debug.monotonic_ns();
-        let compile_started = std::time::Instant::now();
+        let capture_timing = self.jit_debug.request().events_enabled();
+        let queued_ns = if capture_timing {
+            self.jit_debug.monotonic_ns()
+        } else {
+            0
+        };
+        let compile_started_ns = if capture_timing {
+            self.jit_debug.monotonic_ns()
+        } else {
+            0
+        };
+        let compile_started = capture_timing.then(std::time::Instant::now);
+        self.jit_runtime_stats.compile_attempts =
+            self.jit_runtime_stats.compile_attempts.saturating_add(1);
+        self.optimizing_tier_policy
+            .record_compile_attempt(fid, crate::tier_policy::CostedTier::Template);
         let status = hook.compile_function(jit::JitCompileRequest {
             snapshot: view,
             debug: self.jit_debug.request(),
@@ -751,15 +865,9 @@ impl Interpreter {
             osr_pc,
             code_object_id,
         });
-        let compile_duration_ns = compile_started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
-        self.optimizing_tier_policy.record_compile_duration(
-            fid,
-            crate::tier_policy::CostedTier::Template,
-            compile_duration_ns,
-        );
+        let compile_duration_ns = compile_started.map_or(0, |started| {
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+        });
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Template,
@@ -777,25 +885,56 @@ impl Interpreter {
                 }
                 self.jit_next_code_object_id += 1;
                 // Sweep before registering: cached/installed users hold an
-                // `Arc`; executing generated generations are protected by the
-                // isolate's published native-activation epoch.
-                if !self.jit_has_native_frames() {
-                    self.jit_code_registry.retire_unreferenced();
-                }
-                let installed = self.jit_code_registry.install_compiled(
+                // `Arc`; executing generations are named by published frames.
+                self.retire_unreferenced_jit_code();
+                let roots = self.finalized_compile_roots(roots_start);
+                let required_bytes = crate::jit_registry::JitCodeRegistry::retained_admission_bytes(
+                    code.as_ref(),
+                    &roots,
+                );
+                let admission = self.jit_code_registry.install_compiled(
                     code_object_id,
                     code.clone(),
                     &function,
+                    if hook.optimizing_tier_enabled() {
+                        self.optimizing_tier_policy
+                            .decide(
+                                &function,
+                                crate::tier_policy::CostedTier::Optimizing,
+                                self.jit_code_registry
+                                    .available_code_bytes()
+                                    .saturating_sub(required_bytes),
+                            )
+                            .work_target
+                    } else {
+                        None
+                    },
+                    roots,
                 );
+                if let Err(crate::jit_registry::JitInstallError::ResourceBudget {
+                    required_bytes,
+                }) = admission
+                {
+                    self.optimizing_tier_policy.record_resource_refusal(
+                        &function,
+                        crate::tier_policy::CostedTier::Template,
+                        required_bytes,
+                    );
+                }
+                if let Err(error) = admission {
+                    self.record_jit_install_declined(
+                        fid,
+                        code_object_id,
+                        jit_debug::JitDebugTier::Template,
+                        error,
+                    );
+                }
+                let installed = admission.is_ok();
                 if installed {
-                    self.retain_compiled_roots(code_object_id, roots_start);
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
-                    self.optimizing_tier_policy.observe_template_generation(
-                        fid,
-                        u64::from(self.jit_call_counts.get(&fid).copied().unwrap_or(0)),
-                        self.code_space.feedback_epoch(fid),
-                    );
+                    self.optimizing_tier_policy
+                        .observe_template_generation(&function);
                 }
                 if installed {
                     TemplateCompileOutcome::Installed(code)
@@ -811,12 +950,21 @@ impl Interpreter {
     /// Name `shape` in the code being compiled and return the compressed
     /// handle generated code compares or publishes. Hidden classes are
     /// collectable, so the compilation keeps the shape alive and the
-    /// installed code object takes it over ([`Self::retain_compiled_roots`]).
-    pub(crate) fn bake_shape(&self, shape: crate::object::ShapeHandle) -> u32 {
+    /// installed code object takes it over ([`Self::finalized_compile_roots`]).
+    /// Unsupported state declines only this native proof, never publishes a
+    /// fabricated zero identity or permanently poisons dynamic IC feedback.
+    pub(crate) fn bake_shape(&self, shape: crate::object::ShapeHandle) -> Option<u32> {
+        if shape.is_null() {
+            return None;
+        }
+        let state = crate::object::shape_body::state_of(shape);
+        if state.is_dictionary() || state.is_opaque() {
+            return None;
+        }
         self.jit_compile_roots
             .borrow_mut()
             .push(crate::jit_roots::CompilationRoot::Shape(shape));
-        shape.offset()
+        Some(shape.offset())
     }
 
     /// A fresh callee identity cell for one call site of the generation being
@@ -848,11 +996,11 @@ impl Interpreter {
     }
 
     /// [`Self::bake_shape`] for a shape feedback names by id; `None` when
-    /// that shape has been collected since.
+    /// that shape has been collected since or cannot authorize a native proof.
     pub(crate) fn bake_shape_id(&self, id: crate::object::ShapeId) -> Option<u32> {
         self.shape_runtime
             .handle_for_id(id)
-            .map(|shape| self.bake_shape(shape))
+            .and_then(|shape| self.bake_shape(shape))
     }
 
     /// The live layout of a method holder as a generated guard names it: its
@@ -863,19 +1011,101 @@ impl Interpreter {
     ) -> Option<jit::JitMethodHolder> {
         let shape = crate::object::keyed_shape(holder, &self.gc_heap);
         if !shape.is_null() {
-            return Some(jit::JitMethodHolder::Shape(self.bake_shape(shape)));
+            return self.bake_shape(shape).map(jit::JitMethodHolder::Shape);
         }
+        let state = crate::object::state(holder, &self.gc_heap);
+        if !state.is_dictionary() {
+            return None;
+        }
+        if state.is_opaque()
+            && (Some(holder) != self.realm_intrinsics.string_prototype()
+                || state.bits() & crate::object::ShapeState::OPAQUE_LOOKUP_MASK
+                    != crate::object::ShapeState::STRING_WRAPPER_MASK)
+        {
+            return None;
+        }
+        // The only opaque dictionary holder admitted here is the pinned
+        // source-realm String prototype. Its callers prove primitive receiver
+        // type plus nonvirtual names (fixed builtin names or explicit index/
+        // length exclusion), then own Data and watched layout/live callable.
         crate::object::dictionary_layout(holder, &self.gc_heap)
             .map(|layout| jit::JitMethodHolder::Dictionary(u64::from(layout)))
     }
 
     /// Retain all assumptions baked since this compile session began.
-    fn retain_compiled_roots(&mut self, code_object_id: u64, roots_start: usize) {
+    fn finalized_compile_roots(
+        &self,
+        roots_start: usize,
+    ) -> Box<[crate::jit_roots::CompilationRoot]> {
         let mut roots = self.jit_compile_roots.borrow()[roots_start..].to_vec();
         roots.sort_unstable_by_key(crate::jit_roots::CompilationRoot::key);
         roots.dedup_by_key(|root| root.key());
-        self.jit_code_registry
-            .retain_roots(code_object_id, roots.into_boxed_slice());
+        roots.into_boxed_slice()
+    }
+
+    /// Prepare exact source-realm literal shapes and scalar dense geometry.
+    fn bake_literal_allocations(
+        &mut self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<()> {
+        let realm_id = self.function_realm_ids.get(&fid).copied().unwrap_or(0);
+        view.literal_allocations.realm_id = realm_id;
+        view.literal_allocations.group_allowed = self.gc_heap.machine_allocation_allowed();
+        for (pc, instruction) in view.instructions.iter().enumerate() {
+            match instruction.op(&view.code_block) {
+                Op::NewObject => {
+                    let plan = self
+                        .with_host_realm_id(realm_id, |vm| {
+                            let prototype = vm.object_prototype_object_opt();
+                            let root = vm.object_root(
+                                prototype,
+                                crate::object::DEFAULT_INLINE_CAPACITY,
+                                crate::object::ShapeState::ORDINARY,
+                            )?;
+                            Ok(vm
+                                .bake_shape(root)
+                                .map(jit::JitEmptyObjectAllocationPlan::new))
+                        })
+                        .ok()?;
+                    view.literal_allocations.object = plan;
+                }
+                Op::NewObjectLiteral => {
+                    let count = instruction.const_index(&view.code_block, 1)? as usize;
+                    let first_key = instruction.const_index(&view.code_block, 2)?;
+                    let plan = self
+                        .with_host_realm_id(realm_id, |vm| {
+                            let layout =
+                                vm.object_literal_layout(context, fid, first_key, count)?;
+                            let shape = vm
+                                .shape_runtime
+                                .handle_for_id(layout.shape_id())
+                                .ok_or(crate::VmError::TypeMismatch)?;
+                            let Some(_) = vm.bake_shape(shape) else {
+                                return Ok(None);
+                            };
+                            Ok(jit::JitObjectLiteralAllocationPlan::new(shape, count))
+                        })
+                        .ok()?;
+                    if let Some(plan) = plan {
+                        view.literal_allocations
+                            .objects
+                            .insert(u32::try_from(pc).ok()?, plan);
+                    }
+                }
+                Op::NewArray => {
+                    let count = instruction.const_index(&view.code_block, 1)? as usize;
+                    if let Some(plan) = jit::JitArrayLiteralAllocationPlan::new(count) {
+                        view.literal_allocations
+                            .arrays
+                            .insert(u32::try_from(pc).ok()?, plan);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(())
     }
 
     /// Plan inline context allocation for every scope of this function and
@@ -919,6 +1149,10 @@ impl Interpreter {
         context: &ExecutionContext,
     ) {
         let mut plans = rustc_hash::FxHashMap::default();
+        let Ok(owner) = context.for_function(view.code_block.id) else {
+            view.closure_allocations = plans;
+            return;
+        };
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             if !matches!(op, Op::MakeClosure | Op::MakeFunction) {
@@ -926,14 +1160,14 @@ impl Interpreter {
             }
             let Some(function_id) = instruction
                 .const_index(&view.code_block, 1)
-                .and_then(|index| context.function_id_constant(index))
+                .and_then(|index| owner.function_id_constant(index))
             else {
                 continue;
             };
             // A generator or async function starts from its kind's
             // prototype, not the ordinary `%Function.prototype%` lookup; its
             // closures take the allocating runtime entry.
-            let plain = context.for_function(function_id).ok().is_some_and(|owner| {
+            let plain = owner.for_function(function_id).ok().is_some_and(|owner| {
                 owner.function(function_id).is_some_and(|function| {
                     !function.is_generator && !function.is_async && !function.is_async_generator
                 })
@@ -941,7 +1175,7 @@ impl Interpreter {
             if !plain {
                 continue;
             }
-            let arrow = op == Op::MakeClosure && context.function_is_arrow(function_id);
+            let arrow = op == Op::MakeClosure && owner.function_is_arrow(function_id);
             let flags = crate::closure::CLOSURE_FLAGS_ORDINARY_LOOKUP
                 | if arrow {
                     crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS
@@ -976,8 +1210,7 @@ impl Interpreter {
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
     ) {
-        view.property_lookup_cache = Some(self.property_cache.jit_layout());
-        view.store_transition_cache = Some(self.store_transition_cache.jit_layout());
+        view.property_action_cache = Some(self.property_cache.jit_layout());
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -1003,73 +1236,46 @@ impl Interpreter {
             })
             .collect();
         for (byte_pc, instruction_pc, op, name_index) in sites {
-            // A method call's lookup shares the load table.
+            // A method call's lookup shares the action cache.
             let kind = if op == Op::StoreProperty {
                 crate::property_ic::PropertyIcKind::Store
             } else {
                 crate::property_ic::PropertyIcKind::Load
             };
-            let Some(slot) = view
-                .code_block
-                .property_feedback_at(instruction_pc as usize, kind)
-            else {
+            let Some(key) = name_index.and_then(|name_index| {
+                context.property_atom_for_function(view.code_block.id, name_index)
+            }) else {
                 continue;
             };
-            if slot.is_megamorphic() {
-                if let Some(key) = name_index.and_then(|name_index| {
-                    context.property_atom_for_function(view.code_block.id, name_index)
-                }) {
-                    view.property_megamorphic_accesses
-                        .insert(byte_pc, key.atom().id().raw());
-                }
+            let slot = view
+                .code_block
+                .property_feedback_at(instruction_pc as usize, kind);
+            let shared = slot.is_some_and(|slot| slot.is_megamorphic());
+            view.property_accesses.insert(
+                byte_pc,
+                jit::JitPropertyAccess {
+                    atom: key.atom().id().raw(),
+                    shared,
+                },
+            );
+            let Some(slot) = slot else {
+                continue;
+            };
+            if shared {
                 continue;
             }
             let mut programs = slot
                 .jit_programs(
-                    |shape_id| self.bake_shape_id(shape_id).filter(|&offset| offset != 0),
+                    |shape_id| self.bake_shape_id(shape_id),
                     |cell| self.bake_prototype_validity(cell),
                 )
                 .unwrap_or_default();
-            if op != Op::StoreProperty
-                && let Some(key) = name_index.and_then(|name_index| {
-                    context.property_atom_for_function(view.code_block.id, name_index)
-                })
-            {
+            if op != Op::StoreProperty {
                 programs.extend(self.jit_intrinsic_property_programs(key));
             }
             if !programs.is_empty() {
                 view.property_programs.insert(byte_pc, programs);
             }
-        }
-    }
-
-    /// Publish exact constructor field transitions learned during rooted
-    /// receiver preparation. The byte-PC key keeps the descriptor attached to
-    /// the original `StoreProperty`; generated guard failure deoptimizes before
-    /// that operation and never replays a committed store.
-    fn bake_constructor_field_transitions(&self, view: &mut jit::JitCompileSnapshot) {
-        if let Some(transitions) = self
-            .constructor_field_transition_cache
-            .get(&view.code_block.id)
-        {
-            view.constructor_field_transitions = transitions
-                .iter()
-                .filter_map(|(&byte_pc, transition)| {
-                    let from_shape = self.bake_shape_id(transition.from_shape)?;
-                    let to_shape = self.bake_shape_id(transition.to_shape)?;
-                    let prototype_validity =
-                        self.bake_prototype_validity(&transition.prototype_validity)?;
-                    Some((
-                        byte_pc,
-                        jit::JitConstructorFieldTransition {
-                            from_shape,
-                            to_shape,
-                            prototype_validity,
-                            slot: transition.slot,
-                        },
-                    ))
-                })
-                .collect();
         }
     }
 
@@ -1124,10 +1330,9 @@ impl Interpreter {
         }
     }
 
-    /// Describe one exact ordinary-array dense representation behind the
-    /// body's element cache. Both the exotic sidecar and the physical element
-    /// kind are guarded: a custom prototype/descriptor or a monotonic
-    /// numeric-to-tagged transition must leave generated code before access.
+    /// Describe one exact present-own array representation behind the body's
+    /// element cache. Prototype-only sidecars are legal; descriptor/accessor
+    /// baggage and a numeric-to-tagged transition leave before access.
     fn dense_element_access(
         element: jit::JitElementRepr,
         dense_kind: u32,
@@ -1141,10 +1346,9 @@ impl Interpreter {
         jit::JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             guards: [
-                // The sidecar is a 4-byte GC handle: read exactly it.
                 Some(jit::JitBodyGuard::clear(
-                    header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-                    jit::JitGuardWidth::Word32,
+                    header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
+                    jit::JitGuardWidth::Byte,
                 )),
                 Some(jit::JitBodyGuard {
                     byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
@@ -1168,13 +1372,14 @@ impl Interpreter {
     /// kinds.
     fn holey_double_element_access() -> jit::JitElementAccess {
         let header = otter_gc::header::HEADER_SIZE as u32;
-        let [exotic, _] = Self::dense_element_access(
-            jit::JitElementRepr::Float64,
-            crate::array::DENSE_ELEMENT_KIND_HOLEY_DOUBLE,
-        )
-        .guards;
         jit::JitElementAccess {
-            guards: [exotic, None],
+            guards: [
+                Some(jit::JitBodyGuard::clear(
+                    header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+                    jit::JitGuardWidth::Word32,
+                )),
+                None,
+            ],
             holes: Some(jit::JitHoleBitmap {
                 capacity_byte: crate::array::elements::CAPACITY_FROM_DATA_BYTE,
                 kind_byte: header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
@@ -1237,20 +1442,7 @@ impl Interpreter {
     /// object/array bodies, so this only enables when the compile snapshot has a
     /// cage base.
     pub(crate) fn bake_string_layout(view: &mut jit::JitCompileSnapshot) {
-        let header = otter_gc::header::HEADER_SIZE as u32;
-        let repr = header + std::mem::offset_of!(crate::string::JsStringBody, repr) as u32;
-        view.string_layout = jit::JitStringLayout {
-            string_type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
-            string_len_byte: header + std::mem::offset_of!(crate::string::JsStringBody, len) as u32,
-            string_repr_byte: repr,
-            string_repr_payload_byte: repr
-                + crate::string::gc_body::STRING_REPR_PAYLOAD_BYTE as u32,
-            string_body_size: header + std::mem::size_of::<crate::string::JsStringBody>() as u32,
-            inline_flat_tag: crate::string::gc_body::STRING_REPR_INLINE_FLAT,
-            seq_flat_tag: crate::string::gc_body::STRING_REPR_SEQ_FLAT,
-            inline_latin1_tag: crate::string::gc_body::STRING_REPR_INLINE_LATIN1,
-            seq_latin1_tag: crate::string::gc_body::STRING_REPR_SEQ_LATIN1,
-        };
+        view.string_layout = jit::JitStringLayout::default();
         view.cage_base = otter_gc::cage_base() as usize;
     }
 
@@ -1264,8 +1456,7 @@ impl Interpreter {
         context: &ExecutionContext,
         code_block: &CodeBlock,
         instruction: &jit::JitInstructionMetadata,
-    ) -> Option<(u32, u32)> {
-        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
+    ) -> Option<(u32, crate::object::FieldLocation)> {
         let op = instruction.op(code_block);
         let kind = match op {
             Op::LoadProperty => crate::property_ic::PropertyIcKind::Load,
@@ -1279,7 +1470,13 @@ impl Interpreter {
         {
             crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } => {
                 let shape = self.bake_shape_id(shape_id)?;
-                Some((shape, u32::from(slot) * SLOT_BYTES))
+                Some((
+                    shape,
+                    crate::object::field_location(
+                        self.shape_runtime.handle_for_id(shape_id)?,
+                        u32::from(slot),
+                    ),
+                ))
             }
             crate::feedback::PropertyFeedbackState::Empty => {
                 let slot = self.class_annotation_property_slot(context, code_block, instruction)?;
@@ -1301,8 +1498,7 @@ impl Interpreter {
         context: &ExecutionContext,
         code_block: &CodeBlock,
         instruction: &jit::JitInstructionMetadata,
-    ) -> Option<(u32, u32)> {
-        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
+    ) -> Option<(u32, crate::object::FieldLocation)> {
         let name_operand = match instruction.op(code_block) {
             Op::LoadProperty => 2,
             Op::StoreProperty => 1,
@@ -1327,7 +1523,10 @@ impl Interpreter {
         };
         let key = context.property_atom(name_idx)?;
         let slot = crate::object::shape_offset_of_str(&self.gc_heap, shape, key.name())?;
-        Some((self.bake_shape(shape), slot * SLOT_BYTES))
+        Some((
+            self.bake_shape(shape)?,
+            crate::object::field_location(shape, slot),
+        ))
     }
 
     /// Whether a method-call site's feedback has already saturated to
@@ -1427,7 +1626,7 @@ impl Interpreter {
                     jit::JitCacheIrOp::LoadIntrinsicPrototype { target, .. },
                     jit::JitCacheIrOp::GuardShape { shape, .. },
                     _,
-                    jit::JitCacheIrOp::LoadField { value_byte, .. },
+                    jit::JitCacheIrOp::LoadField { field, .. },
                 ] = *program.ops
                 else {
                     return None;
@@ -1435,7 +1634,7 @@ impl Interpreter {
                 Some(jit::JitFunctionCallLookup {
                     receiver: target,
                     holder_shape: shape,
-                    call_value_byte: value_byte,
+                    call_field: field,
                 })
             }
             _ => return None,
@@ -1481,7 +1680,7 @@ impl Interpreter {
             };
             let Some(MethodCallFeedback::MonoNativeLeaf {
                 stub_id,
-                method_value_byte,
+                method_field,
                 recv_shape,
                 prototype,
             }) = self.method_target_feedback(site)
@@ -1517,14 +1716,15 @@ impl Interpreter {
             else {
                 continue;
             };
+            let Some(shape) = self.bake_shape(recv_shape_handle) else {
+                continue;
+            };
             view.guarded_method_calls.insert(
                 byte_pc,
                 jit::JitGuardedMethodCall {
-                    receiver: jit::JitGuardedReceiver::Shape {
-                        shape: self.bake_shape(recv_shape_handle),
-                    },
+                    receiver: jit::JitGuardedReceiver::Shape { shape },
                     holder,
-                    method_value_byte,
+                    method_field,
                     builtin_native_ref,
                     entry_stub_id: stub_id,
                     safepoint_id: native_abi::NO_SAFEPOINT,
@@ -1556,11 +1756,17 @@ impl Interpreter {
         }
         let recv_shape = crate::object::shape_id(recv, &self.gc_heap);
         let resolved = crate::cache_ir::resolve_atom_data_slot(recv, &self.gc_heap, name)?;
+        // A wide dictionary holder can keep ordinary data semantics without
+        // having a keyed layout that native method linkage can guard. The
+        // receiver's shape does not describe that holder's storage bank.
+        if resolved.hit.shape.is_null() {
+            return None;
+        }
         self.shape_runtime
-            .register_root(&self.gc_heap, recv_shape_handle);
+            .register_shape(&self.gc_heap, recv_shape_handle);
         if !resolved.holder_root.is_null() {
             self.shape_runtime
-                .register_root(&self.gc_heap, resolved.holder_root);
+                .register_shape(&self.gc_heap, resolved.holder_root);
         }
         Some(MethodSite {
             recv_shape,
@@ -1568,39 +1774,28 @@ impl Interpreter {
                 validity: resolved.validity,
                 holder_root: resolved.holder_root_id,
             },
-            method_value_byte: u32::from(resolved.hit.slot)
-                * std::mem::size_of::<crate::Value>() as u32,
+            method_field: crate::object::field_location(
+                resolved.hit.shape,
+                u32::from(resolved.hit.slot),
+            ),
         })
     }
 
-    /// Drop any compiled body for `fid` (and re-arm its OSR headers) so the next
-    /// tier-up recompiles it. Called when call/method feedback for one of its
-    /// sites first matures: a function whose hot loop calls out is often compiled
-    /// by an *earlier* loop in the same body, before the callee feedback exists,
-    /// so its inline sites baked nothing. Recompiling once the feedback is warm
-    /// lets those sites inline. The currently-running body, if any, stays alive
-    /// through its `Arc` until the frame returns.
+    /// Drop `fid`'s optimized body so the next tier-up recompiles it. Called
+    /// when call/method feedback for one of its sites matures: a function
+    /// whose hot loop calls out is often optimized by an *earlier* loop in
+    /// the same body, before the callee feedback exists, so its inline sites
+    /// baked nothing. Its baseline body stays installed: unbaked feedback
+    /// reaches baseline sites through the shared caches and committed
+    /// misses, so rebuilding it would only churn code memory. The running
+    /// optimized body, if any, stays alive through its `Arc` until it returns.
     pub(crate) fn evict_compiled_for_reopt(&mut self, fid: u32) {
-        self.invalidate_jit_function(fid);
-    }
-
-    /// Replace an executing generated caller immediately after one of its
-    /// runtime-selected call sites gains a target.
-    ///
-    /// The active generation remains leased by the native activation while its
-    /// stable function cell publishes the replacement. This is used by dynamic
-    /// forwarding, whose current body is itself the only path able to keep
-    /// sampling targets after a generated caller invalidates its old snapshot.
-    pub(crate) fn recompile_active_caller_for_feedback(
-        &mut self,
-        context: &ExecutionContext,
-        fid: u32,
-    ) {
-        self.invalidate_jit_function(fid);
-        self.jit_runtime_stats.compile_attempts =
-            self.jit_runtime_stats.compile_attempts.saturating_add(1);
-        let outcome = self.compile_jit_function(context, fid, None);
-        self.retain_template_compile_outcome(fid, outcome);
+        let mut affected = self.jit_code_registry.invalidate_optimizing_function(fid);
+        if affected.binary_search(&fid).is_err() {
+            affected.push(fid);
+            affected.sort_unstable();
+        }
+        self.discard_invalidated_jit_state(&affected);
     }
 
     /// Resolve the stable entry cell for one compiler-native call.
@@ -1634,6 +1829,12 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) {
+        // The linked FID owns its realm. A foreign call may reach compilation
+        // while the caller's realm is active; those cells cannot prove this
+        // source's bindings. Keep the source-aware committed operation instead.
+        if self.foreign_function_realm(fid).is_some() {
+            return;
+        }
         for instruction in &view.instructions {
             if instruction.op(&view.code_block) != Op::LoadGlobalOrThrow {
                 continue;
@@ -1658,6 +1859,10 @@ impl Interpreter {
             else {
                 continue;
             };
+            let state = crate::object::state(self.global_this, &self.gc_heap);
+            if state.is_opaque() {
+                continue;
+            }
             let shape = crate::object::keyed_shape(self.global_this, &self.gc_heap);
             let (shape, dictionary) = if shape.is_null() {
                 // A dictionary global object is proven by its slot layout, so
@@ -1678,15 +1883,21 @@ impl Interpreter {
                 }
                 (u64::from(layout), true)
             } else {
-                (u64::from(self.bake_shape(shape)), false)
+                let Some(shape) = self.bake_shape(shape) else {
+                    continue;
+                };
+                (u64::from(shape), false)
             };
-            const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
             view.global_object_loads.insert(
                 instruction.byte_pc,
                 jit::JitGlobalObjectLoad {
                     shape,
                     dictionary,
-                    value_byte: u32::from(hit.slot) * SLOT_BYTES,
+                    field: crate::object::field_location_at(
+                        self.global_this,
+                        &self.gc_heap,
+                        u32::from(hit.slot),
+                    ),
                     global_lexical_epoch: self.global_lexical_epoch,
                 },
             );
@@ -1704,27 +1915,37 @@ impl Interpreter {
     /// Object-record reads additionally guard the live declarative-record epoch
     /// and the global object's hidden class or dictionary slot layout, so later
     /// eval/script lexicals, deletions and redefinitions miss before reading
-    /// the baked slot; appending unrelated globals keeps the proof.
+    /// the baked slot; appending unrelated dictionary globals keeps the proof.
+    /// Ordinary hits prove one eligible finalized immutable shape. Descriptor,
+    /// extensibility and lookup-state changes install another identity. Writes
+    /// refuse prototype-role shapes at admission; dictionary hits also prove
+    /// their dynamic state and watched slot layout before any effect.
     fn bake_binding_hit_proofs(
         &mut self,
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
     ) {
+        // The linked FID owns its realm. A foreign call may reach compilation
+        // while the caller's realm is active; those cells cannot prove this
+        // source's bindings. Keep the source-aware committed operation instead.
+        if self.foreign_function_realm(fid).is_some() {
+            return;
+        }
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             let Some(binding) = otter_bytecode::opcode_schema::opcode_schema(op).binding else {
                 continue;
             };
-            let name_operand = match binding {
+            let (name_operand, writing) = match binding {
                 otter_bytecode::opcode_schema::BindingSemantics::Read(
                     otter_bytecode::opcode_schema::BindingRead::Global { name, .. }
                     | otter_bytecode::opcode_schema::BindingRead::Exists { name, .. },
-                ) => name,
+                ) => (name, false),
                 otter_bytecode::opcode_schema::BindingSemantics::Write(
                     otter_bytecode::opcode_schema::BindingWrite::Global { name, .. }
                     | otter_bytecode::opcode_schema::BindingWrite::GlobalChecked { name, .. },
-                ) => name,
+                ) => (name, true),
                 _ => continue,
             };
             let Some(name_index) =
@@ -1750,6 +1971,10 @@ impl Interpreter {
             else {
                 continue;
             };
+            let state = crate::object::state(self.global_this, &self.gc_heap);
+            if state.is_opaque() || (writing && state.is_prototype()) {
+                continue;
+            }
             let shape = crate::object::keyed_shape(self.global_this, &self.gc_heap);
             let (shape, dictionary) = if shape.is_null() {
                 // A dictionary global object is proven by its slot layout, so
@@ -1770,15 +1995,21 @@ impl Interpreter {
                 }
                 (u64::from(layout), true)
             } else {
-                (u64::from(self.bake_shape(shape)), false)
+                let Some(shape) = self.bake_shape(shape) else {
+                    continue;
+                };
+                (u64::from(shape), false)
             };
-            const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
             view.binding_hit_proofs.insert(
                 instruction.byte_pc,
                 jit::BindingHitProof::GlobalObject {
                     shape,
                     dictionary,
-                    value_byte: u32::from(hit.slot) * SLOT_BYTES,
+                    field: crate::object::field_location_at(
+                        self.global_this,
+                        &self.gc_heap,
+                        u32::from(hit.slot),
+                    ),
                     global_lexical_epoch: self.global_lexical_epoch,
                     writable: flags.writable(),
                 },
@@ -1799,6 +2030,9 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<()> {
+        if self.jit_retraining_blocks(fid) {
+            return None;
+        }
         let owner = context.for_function(fid).ok()?;
         let function = owner.exec_function(fid)?;
         let mut instruction_index = 0usize;
@@ -1861,9 +2095,9 @@ impl Interpreter {
     ///
     /// A body compiled inside another function resolves its constants, global
     /// cells, hidden classes and call plans against *itself*, exactly as it
-    /// would as an outermost function: a spliced instruction that read the
-    /// caller's tables would find nothing to fold against and could only lower
-    /// as an exit. Nested candidates share the root preparation budget and use
+    /// would as an outermost function. Only a source in the active realm may
+    /// prepare a splice: another realm's body cannot inherit the physical
+    /// caller's global cells. Nested candidates share the root budget and use
     /// this body's own feedback; the compiler decides which bodies to splice.
     fn bake_inline_body(
         &mut self,
@@ -1872,12 +2106,19 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
     ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
-        if !budget.enter(fid) {
+        // An inline body shares the physical caller's active-global cells.
+        // Source identity alone does not make a foreign realm's globals active.
+        // Refuse the optional splice before preparing any ambient proofs.
+        if self.jit_retraining_blocks(fid)
+            || self.foreign_function_realm(fid).is_some()
+            || !budget.enter()
+        {
             return None;
         }
         let result = (|| {
             self.prewarm_string_constant_cells(context, fid)?;
             let mut body = context.jit_compile_snapshot(fid)?;
+            self.bake_literal_allocations(&mut body, context, fid)?;
             Self::bake_typed_array_layout(&mut body);
             Self::bake_string_layout(&mut body);
             self.bake_string_constant_cells(&mut body, context, fid)?;
@@ -1886,12 +2127,29 @@ impl Interpreter {
             self.bake_property_cache_ir(&mut body, context);
             self.bake_call_site_plans(&mut body, context, fid, tier, budget);
             self.bake_guarded_method_calls(&mut body);
+            self.bake_forward_apply(&mut body);
             self.bake_element_accesses(&mut body);
+            Self::bake_context_allocations(&mut body);
+            Self::bake_closure_allocations(&mut body, context);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
         })();
         budget.leave();
         result
+    }
+
+    /// Name `%Function.prototype.apply%` for a body that forwards its
+    /// arguments, so generated code can prove a forwarding site's method.
+    fn bake_forward_apply(&self, view: &mut jit::JitCompileSnapshot) {
+        let forwards = view
+            .instructions
+            .iter()
+            .any(|instruction| instruction.op(&view.code_block) == Op::CallForwardArguments);
+        if forwards {
+            view.forward_apply_native_ref =
+                crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply
+                    .native_ref(&self.gc_heap);
+        }
     }
 
     /// Bake the typed reasons at which earlier optimized generations of `fid`
@@ -1908,14 +2166,25 @@ impl Interpreter {
             .get(&fid)
             .cloned()
             .unwrap_or_default();
+        let code_block = &snapshot.code_block;
         snapshot.optimized_exit_reasons = self
             .jit_optimized_exit_profiles
-            .keys()
+            .iter()
             // An insufficient-feedback exit only collected feedback, and a
             // runtime transition resumed a call no speculation guarded; the
-            // site speculates again from what it has observed since.
-            .filter_map(|&(profile_fid, pc, reason)| {
+            // site speculates again from what it has observed since. So does
+            // a property site whose inline cache learned another receiver
+            // program after its shape guard failed: the receiver that left
+            // is now part of the feedback.
+            .filter_map(|(&(profile_fid, pc, reason), profile)| {
+                let relearned = reason == native_abi::ExitReason::ShapeGuard
+                    && profile.feedback_population.is_some_and(|population| {
+                        code_block
+                            .property_site_population(pc as usize)
+                            .is_some_and(|current| current != population)
+                    });
                 (profile_fid == fid
+                    && !relearned
                     && !matches!(
                         reason,
                         native_abi::ExitReason::InsufficientFeedback
@@ -1967,18 +2236,12 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
     ) {
-        self.bake_call_site_plans(
-            view,
-            context,
-            fid,
-            tier,
-            &mut InlineSnapshotBudget::new(fid),
-        );
+        self.bake_call_site_plans(view, context, fid, tier, &mut InlineSnapshotBudget::new());
     }
 
     /// Call-site plan baking shared by an outermost body and a spliced one.
     ///
-    /// Every body owns its nested candidate tables. One ancestry/depth/work
+    /// Every body owns its nested candidate tables. One depth/work
     /// budget bounds the whole tree independently of generated-entry tiering.
     fn bake_call_site_plans(
         &mut self,
@@ -2046,6 +2309,11 @@ impl Interpreter {
                     feedback::OrdinaryCallTarget::FunctionPrototypeCall(_)
                 );
                 let callee_fid = match target.target {
+                    feedback::OrdinaryCallTarget::Native => {
+                        view.native_calls
+                            .insert(call_byte_pc, jit::JitNativeCall::Native);
+                        continue;
+                    }
                     feedback::OrdinaryCallTarget::Bytecode(callee_fid)
                     | feedback::OrdinaryCallTarget::FunctionPrototypeCall(callee_fid) => callee_fid,
                     feedback::OrdinaryCallTarget::StaticNative(stub_id) => {
@@ -2059,13 +2327,13 @@ impl Interpreter {
                                 .expect(
                                     "a builtin the site already called is interned in this isolate",
                                 );
-                        view.static_native_calls.insert(
+                        view.native_calls.insert(
                             call_byte_pc,
-                            jit::JitStaticNativeCall {
+                            jit::JitNativeCall::Leaf(jit::JitStaticNativeCall {
                                 builtin_native_ref,
                                 leaf_stub_id: stub_id,
                                 argument_count: declaration.argument_count,
-                            },
+                            }),
                         );
                         self.record_jit_inline_candidate(
                             fid,
@@ -2168,12 +2436,11 @@ impl Interpreter {
                     debug_assert_eq!(plan.function_id, callee_fid);
                     plan.callee_cell = self.bake_callee_identity_cell();
                     let receiver_allocation = if is_construct && !callee.is_derived_constructor {
-                        let new_target_function_id = match op {
-                            Op::New | Op::NewSpread => callee_fid,
-                            Op::SuperConstruct | Op::SuperConstructSpread => fid,
-                            _ => callee_fid,
-                        };
-                        self.bake_receiver_allocation_plan(callee_fid, new_target_function_id)
+                        view.code_block
+                            .construct_family_at(instruction_pc as usize)
+                            .and_then(|family| {
+                                self.bake_receiver_allocation_plan(callee_fid, family)
+                            })
                     } else {
                         None
                     };
@@ -2300,7 +2567,7 @@ impl Interpreter {
                             method_fid,
                             recv_shape,
                             prototype,
-                            method_value_byte,
+                            method_field,
                         } => {
                             let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
                                 SmallVec::new();
@@ -2308,7 +2575,7 @@ impl Interpreter {
                                 method_fid,
                                 recv_shape,
                                 prototype,
-                                method_value_byte,
+                                method_field,
                                 hits: 1,
                             });
                             Some(PolySnapshot {
@@ -2446,7 +2713,7 @@ impl Interpreter {
             recv_shape,
             prototype_validity,
             holder_root,
-            method_value_byte: target.method_value_byte,
+            method_field: target.method_field,
         })
     }
 
@@ -2501,75 +2768,52 @@ impl Interpreter {
         })
     }
 
-    /// Bake the allocation program for one construct edge. Class wrappers use
-    /// the template-wide capacity proof; ordinary closures additionally guard
-    /// their current weak sample and per-instance capacity before allocation.
+    /// Bake the finalized actual new.target family observed at this source
+    /// site. Unknown/provisional/changed/unsupported owners have no fit plan.
     fn bake_receiver_allocation_plan(
         &self,
         base_function_id: u32,
-        new_target_function_id: u32,
+        family_id: u64,
     ) -> Option<jit::JitReceiverAllocationPlan> {
-        let key = (base_function_id, new_target_function_id);
-        // A receiver whose learned instance size outgrows every in-object
-        // capacity needs the runtime preparation's reserved slab.
-        let learned = self
-            .constructor_instance_profiles
-            .get(&key)
-            .map_or(0, |profile| profile.learned_field_count(&self.gc_heap));
-        let class_allocation = learned <= crate::object::MAX_INLINE_CAPACITY;
-        let capacity = self
-            .constructor_field_capacity_cache
-            .get(&key)
-            .copied()
-            .unwrap_or(0);
-        if capacity > crate::object::MAX_INLINE_CAPACITY {
+        let (layout, new_target_function_id, new_target_is_class) =
+            self.finalized_constructor_layout_for_id(family_id, base_function_id)?;
+        let root_handle = self.gc_heap.read_payload(
+            layout,
+            crate::constructor_layout::ConstructorLayoutBody::root,
+        );
+        if crate::object::shape_body::state_of(root_handle).is_provisional() {
             return None;
         }
-        let simple_init = self
-            .simple_constructor_init_cache
-            .get(&base_function_id)
-            .and_then(Option::as_ref);
-        let mut proofs = self
-            .constructor_prototype_validity_cache
-            .iter()
-            .filter(|((base, target, _), cell)| (*base, *target) == key && cell.is_valid());
-        let single_proof = proofs.next().filter(|_| proofs.next().is_none());
-        // An empty receiver adopts the live prototype's root and needs no
-        // absence proof. Only publishing preinitialized fields depends on an
-        // exact chain; each later store owns its own semantic guard.
-        if capacity == 0 || simple_init.is_none() || single_proof.is_none() {
-            return Some(jit::JitReceiverAllocationPlan {
-                new_target_function_id,
-                class_allocation,
-                receiver_shape: 0,
-                initial_field_count: 0,
-                inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(
-                    capacity.max(learned),
-                ))
-                .ok()?,
-                prototype_validity: None,
-                prototype_root: 0,
-            });
-        };
-        let ((_, _, prototype_root_id), cell) = single_proof?;
-        let prototype_root = self.bake_shape_id(*prototype_root_id)?;
-        let prototype_validity = self.bake_prototype_validity(cell)?;
+        let root_id = crate::object::shape_body::id_of(root_handle);
+        let inline_capacity = crate::object::shape_body::inline_capacity_of(root_handle);
+        if inline_capacity > crate::object::MAX_INLINE_CAPACITY {
+            return None;
+        }
+        let prototype_root = self.bake_shape(root_handle)?;
+        let cell = self
+            .gc_heap
+            .read_payload(layout, |body| body.preparation_validity())?;
+        let prototype_validity = self.bake_prototype_validity(&cell)?;
         let (receiver_shape, initial_field_count) = match (
-            simple_init,
+            self.simple_constructor_init_cache
+                .get(&base_function_id)
+                .and_then(Option::as_ref),
             self.simple_constructor_shape_cache
-                .get(&(base_function_id, *prototype_root_id))
+                .get(&(base_function_id, root_id))
                 .copied(),
         ) {
-            (Some(init), Some(shape)) if init.fields.len() <= capacity => {
-                // Generated allocation derives the slot count from this
-                // shape, so it must name exactly the initial fields.
+            (Some(init), Some(shape))
+                if init.fields.len() <= inline_capacity
+                    && !crate::object::shape_body::state_of(shape).is_provisional()
+                    && crate::object::shape_body::inline_capacity_of(shape) == inline_capacity =>
+            {
                 debug_assert_eq!(
                     crate::object::shape_property_count(shape, &self.gc_heap) as usize,
                     init.fields.len(),
-                    "simple-constructor shape and initial fields diverged"
+                    "source initial fields and final shape diverged"
                 );
                 (
-                    self.bake_shape(shape),
+                    self.bake_shape(shape)?,
                     u8::try_from(init.fields.len()).ok()?,
                 )
             }
@@ -2577,21 +2821,19 @@ impl Interpreter {
         };
         Some(jit::JitReceiverAllocationPlan {
             new_target_function_id,
-            class_allocation,
+            new_target_is_class,
+            family_id,
             receiver_shape,
             initial_field_count,
-            inline_capacity: u8::try_from(crate::object::receiver_inline_capacity(
-                capacity.max(learned),
-            ))
-            .ok()?,
+            inline_capacity: u8::try_from(inline_capacity).ok()?,
             prototype_validity: Some(prototype_validity),
             prototype_root,
         })
     }
 
     /// Bake one inline-method candidate body for a `(method, receiver shape)`
-    /// target, resolving its sealed property loads/stores to value-slab byte
-    /// offsets against the receiver shape. Returns `None` when the method shape
+    /// target, resolving its sealed property loads/stores to banked field
+    /// locations against the receiver shape. Returns `None` when the method shape
     /// is ineligible (generator/async/derived-constructor/etc.), its view is
     /// missing, or any body property fails to resolve to a sealed receiver slot.
     /// Shared by the monomorphic and polymorphic method-inline bake paths.
@@ -2621,16 +2863,16 @@ impl Interpreter {
             Some(body) => body,
             None => self.bake_inline_body(context, target.method_fid, tier, budget)?,
         };
-        // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
-        // byte offset; bail out if any property is absent, an accessor, or spills
-        // past the inline value capacity. A receiver property resolves against
+        // Resolve every body `LoadProperty`/`StoreProperty` to a logical own
+        // field; bail out if a property is absent or an accessor. The shape
+        // fixes its bank and relative index. A receiver property resolves against
         // the identity-guarded receiver shape (no per-op guard); a non-receiver
         // property falls back to its own monomorphic site feedback and records
         // the shape the inliner must guard. Loads carry the name at operand 2,
         // stores at operand 1.
-        let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        let mut prop_fields: rustc_hash::FxHashMap<u32, crate::object::FieldLocation> =
+            rustc_hash::FxHashMap::default();
         let mut prop_shapes: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
-        const SLOT_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
         for instr in &method_view.instructions {
             let name_operand = match instr.op(&method_view.code_block) {
                 Op::LoadProperty => 2,
@@ -2645,22 +2887,25 @@ impl Interpreter {
             let key = context.property_atom(name_idx)?;
             let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
             if let Some(slot) = self.shape_offset_of(recv_shape, key.name()) {
-                prop_offsets.insert(instr.byte_pc, slot * SLOT_BYTES);
+                prop_fields.insert(
+                    instr.byte_pc,
+                    crate::object::field_location(recv_shape, slot),
+                );
                 continue;
             }
             // Not a receiver property: use the op's own monomorphic own-data site
             // feedback (shape offset, slot byte). Anything else — polymorphic,
             // prototype, accessor, or unobserved — is not inlinable.
-            let (shape_off, value_byte) =
+            let (shape_off, field) =
                 self.monomorphic_own_property_feedback(context, &method_view.code_block, instr)?;
-            prop_offsets.insert(instr.byte_pc, value_byte);
+            prop_fields.insert(instr.byte_pc, field);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }
         let guard = self.bake_method_guard(target)?;
         Some(jit::JitInlineMethod {
             body: method_view,
             guard,
-            prop_offsets,
+            prop_fields,
             prop_shapes,
         })
     }
@@ -2693,11 +2938,7 @@ fn reserve_guarded_entry_safepoint(
     }
     view.safepoints.insert(
         call.safepoint_id,
-        native_abi::SafepointRecord::frame_slot_window(
-            call.safepoint_id,
-            native_abi::NO_FRAME_STATE,
-            view.code_block.register_count,
-        ),
+        native_abi::SafepointRecord::window(call.safepoint_id, native_abi::NO_FRAME_STATE),
     );
     true
 }
@@ -2711,8 +2952,142 @@ mod tests {
     use crate::{ActivationStack, Interpreter, Value};
 
     #[test]
+    fn method_feedback_declines_a_wide_dictionary_holder_without_losing_its_data() {
+        let mut module = crate::test_support::minimal_bytecode_module("wide-method-holder.js");
+        module.constants = vec![Constant::String {
+            utf16: "method".encode_utf16().collect(),
+        }];
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let context = interpreter
+            .link_module(module, crate::source_registry::SourceRegistry::default())
+            .expect("caller context");
+        interpreter.with_handle_scope(|interpreter, scope| {
+            let prototype = interpreter.scoped_object_bare(scope).expect("prototype");
+            for index in 0..crate::object::MAX_FAST_PROPERTIES {
+                let mut object = interpreter.escape_scoped(prototype).as_object().unwrap();
+                interpreter
+                    .create_data_property(
+                        &mut object,
+                        &format!("p{index}"),
+                        Value::number_i32(index as i32),
+                    )
+                    .expect("prototype field");
+            }
+            let mut object = interpreter.escape_scoped(prototype).as_object().unwrap();
+            interpreter
+                .create_data_property(&mut object, "method", Value::number_i32(317))
+                .unwrap();
+            let receiver = interpreter
+                .scoped_object_with_proto(scope, prototype)
+                .expect("receiver");
+            let mut value = interpreter.escape_scoped(receiver);
+            let mut object = value.as_object().expect("object receiver");
+            interpreter.migrate_slow_to_fast(&mut object);
+            value = Value::object(object);
+            let property = context.property_atom_for_function(0, 0).unwrap();
+            let prototype = interpreter.escape_scoped(prototype).as_object().unwrap();
+            assert_eq!(
+                crate::object::prototype(object, interpreter.gc_heap()),
+                Some(prototype),
+                "migration retains the exact inherited holder"
+            );
+            assert!(!crate::object::keyed_shape(object, interpreter.gc_heap()).is_null());
+            assert!(crate::object::is_dictionary(
+                prototype,
+                interpreter.gc_heap()
+            ));
+            assert!(crate::object::keyed_shape(prototype, interpreter.gc_heap()).is_null());
+            assert_eq!(
+                crate::object::with_properties(prototype, interpreter.gc_heap(), |properties| {
+                    properties.keys().count()
+                }),
+                crate::object::MAX_FAST_PROPERTIES as usize + 1,
+                "the real holder exceeds ordinary migration capacity"
+            );
+            let descriptor =
+                crate::object::get_own_descriptor(prototype, interpreter.gc_heap(), "method")
+                    .expect("wide holder retains its actual own data descriptor");
+            assert!(descriptor.writable() && descriptor.enumerable() && descriptor.configurable());
+            assert!(
+                matches!(descriptor.kind, crate::object::DescriptorKind::Data { value }
+                if value == Value::number_i32(317))
+            );
+            assert!(
+                crate::cache_ir::resolve_atom_data_slot(object, interpreter.gc_heap(), property,)
+                    .is_none(),
+                "the central runtime CacheIR owner refuses dictionary holder proofs"
+            );
+            assert!(
+                interpreter
+                    .method_site_for_receiver(&context, 0, 0, &mut value)
+                    .is_none()
+            );
+            assert_eq!(
+                crate::object::get(value.as_object().unwrap(), interpreter.gc_heap(), "method"),
+                Some(Value::number_i32(317))
+            );
+        });
+    }
+
+    #[test]
+    fn retraining_blocks_prewarm_and_inline_body_baking_before_preparation() {
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let context = interpreter
+            .link_module(
+                crate::test_support::minimal_bytecode_module("retraining-bake.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .unwrap();
+        interpreter.optimizing_tier_policy.begin_retraining(0, 1);
+        assert!(
+            interpreter
+                .prewarm_string_constant_cells(&context, 0)
+                .is_none()
+        );
+        let mut budget = super::InlineSnapshotBudget::new();
+        assert!(
+            interpreter
+                .bake_inline_body(
+                    &context,
+                    0,
+                    crate::jit_debug::JitDebugTier::Optimizing,
+                    &mut budget
+                )
+                .is_none()
+        );
+        assert!(interpreter.string_constant_cells.is_empty());
+    }
+
+    #[test]
+    fn repeated_inline_site_history_suppresses_the_source_snapshot_guard() {
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
+        let context = interpreter
+            .link_module(
+                crate::test_support::minimal_bytecode_module("inline-source-history.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .unwrap();
+        let exit = crate::native_abi::SideExit::new(
+            37,
+            crate::native_abi::ExitReason::IdentityGuard,
+            crate::native_abi::ExitAction::Recompile,
+        );
+        interpreter.note_jit_optimized_bail_at(&context, 99, 99, exit, (0, 0), false);
+        interpreter.note_jit_optimized_bail_at(&context, 100, 100, exit, (0, 0), false);
+        let mut source = context.jit_compile_snapshot(0).unwrap();
+        interpreter.bake_optimized_exit_profile(&mut source, 0);
+        assert!(source.optimized_exit_reasons[&0].contains(&exit.reason()));
+        let mut outer = context.jit_compile_snapshot(0).unwrap();
+        interpreter.bake_optimized_exit_profile(&mut outer, 99);
+        assert!(
+            outer.optimized_exit_reasons.is_empty(),
+            "the diagnostic outer resume PC is not the guarded source operation"
+        );
+    }
+
+    #[test]
     fn fresh_interpreter_has_no_executable_code_residency() {
-        let interpreter = Interpreter::new();
+        let interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         assert_eq!(interpreter.jit_code_residency().code_bytes, 0);
         assert_eq!(interpreter.jit_code_residency().unique_code_objects, 0);
     }
@@ -2754,9 +3129,9 @@ mod tests {
             module_inits: Vec::new(),
             function_source: None,
         };
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = interpreter
-            .link_module(module)
+            .link_module(module, crate::source_registry::SourceRegistry::default())
             .expect("valid bytecode fixture");
         assert!(
             interpreter
@@ -2868,9 +3243,9 @@ mod tests {
             module_inits: Vec::new(),
             function_source: None,
         };
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let context = interpreter
-            .link_module(module)
+            .link_module(module, crate::source_registry::SourceRegistry::default())
             .expect("valid bytecode fixture");
         let mut stack = ActivationStack::new();
         let (caller, nested) = interpreter.with_runtime_turn(&mut stack, |turn| {
@@ -2910,4 +3285,107 @@ mod tests {
             .expect("caller executes after snapshot/GC/nested prewarm");
         assert!(result.is_string());
     }
+
+    #[test]
+    fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
+        use crate::object::{LookupFact, ShapeState, shape_body};
+        let mut interpreter = Interpreter::new().expect("shape baker runtime");
+        let context = interpreter
+            .link_module(
+                crate::test_support::minimal_bytecode_module(
+                    "shape-baker-nonordinary-prototype.js",
+                ),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .expect("actual linked function prototype");
+        let prototype_function = Value::function(context.function_base());
+        let mut stack = ActivationStack::new();
+        interpreter.with_runtime_turn(&mut stack, |turn| {
+            let (vm, _) = turn.into_parts();
+            let ordinary = vm
+                .object_root(None, 4, ShapeState::ORDINARY)
+                .expect("ordinary root");
+            let ordinary_id = shape_body::id_of(ordinary);
+            assert_eq!(vm.bake_shape(ordinary), Some(ordinary.offset()));
+            assert_eq!(vm.bake_shape_id(ordinary_id), Some(ordinary.offset()));
+            // Reads can prove finalized non-extensible/prototype ordinary
+            // state; write emitters retain their independent role guard.
+            for state in [
+                ShapeState::ORDINARY.with_extensible(false),
+                ShapeState::ORDINARY.with_prototype_role(true),
+            ] {
+                let shape = vm
+                    .object_root(None, 4, state)
+                    .expect("eligible ordinary state root");
+                assert_eq!(vm.bake_shape(shape), Some(shape.offset()));
+                assert_eq!(
+                    vm.bake_shape_id(shape_body::id_of(shape)),
+                    Some(shape.offset())
+                );
+            }
+            // A provisional constructor lineage is an immutable layout every
+            // guard may name; only an allocation plan refuses its root.
+            let provisional = vm
+                .object_root(None, 4, ShapeState::ORDINARY.with_provisional(true))
+                .expect("provisional state root");
+            assert_eq!(vm.bake_shape(provisional), Some(provisional.offset()));
+            assert!(crate::jit::JitObjectLiteralAllocationPlan::new(provisional, 0).is_none());
+            let retained = vm.jit_compile_roots.borrow().len();
+            assert_eq!(vm.bake_shape(crate::object::ShapeHandle::null()), None);
+            assert_eq!(vm.jit_compile_roots.borrow().len(), retained);
+            for state in [
+                ShapeState::ORDINARY.with_lookup(LookupFact::StringWrapper, true),
+                ShapeState::ORDINARY.with_lookup(LookupFact::MappedArguments, true),
+                ShapeState::ORDINARY.with_lookup(LookupFact::HostLookup, true),
+                ShapeState::ORDINARY.with_lookup(LookupFact::NonOrdinaryPrototype, true),
+            ] {
+                // The sole root owner derives this fact from the actual
+                // prototype. A null prototype cannot fabricate that bit.
+                let shape = if state.bits() & ShapeState::OPAQUE_PROTOTYPE_MASK != 0 {
+                    vm.value_root(prototype_function, 4, ShapeState::ORDINARY)
+                } else {
+                    vm.object_root(None, 4, state)
+                }
+                .expect("actual immutable state root");
+                if state.bits() & ShapeState::OPAQUE_PROTOTYPE_MASK != 0 {
+                    assert!(matches!(
+                        vm.gc_heap.read_payload(shape, shape_body::ShapeBody::prototype),
+                        shape_body::ShapePrototype::Value(value) if value == prototype_function
+                    ));
+                }
+                assert_eq!(shape_body::state_of(shape), state);
+                let before = vm.jit_compile_roots.borrow().len();
+                assert_eq!(vm.bake_shape(shape), None);
+                assert_eq!(vm.bake_shape_id(shape_body::id_of(shape)), None);
+                assert_eq!(vm.jit_compile_roots.borrow().len(), before);
+                assert!(crate::jit::JitObjectLiteralAllocationPlan::new(shape, 0).is_none());
+            }
+            let dictionary = shape_body::dictionary_of(ordinary);
+            assert!(shape_body::state_of(dictionary).is_dictionary());
+            let before = vm.jit_compile_roots.borrow().len();
+            assert_eq!(vm.bake_shape(dictionary), None);
+            assert_eq!(vm.jit_compile_roots.borrow().len(), before);
+            assert!(crate::jit::JitObjectLiteralAllocationPlan::new(dictionary, 0).is_none());
+
+            // Pinned primitive String holders are an explicit dictionary
+            // proof domain with nonvirtual names, never an ordinary shape.
+            for hint in [
+                crate::jit::JitMethodHint::StringCharCodeAt,
+                crate::jit::JitMethodHint::StringIndexOf,
+            ] {
+                let call = vm
+                    .jit_primitive_method_call(hint)
+                    .expect("actual pinned String leaf proof");
+                assert!(matches!(
+                    call.holder,
+                    crate::jit::JitMethodHolder::Dictionary(_)
+                ));
+                assert_eq!(call.safepoint_id, crate::native_abi::NO_SAFEPOINT);
+            }
+        });
+    }
 }
+
+#[cfg(test)]
+#[path = "jit_compile_group_tests.rs"]
+mod group_policy_tests;

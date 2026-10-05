@@ -35,11 +35,16 @@
 //!   instruction cells and their monotonic material-transition epoch.
 //! - Execution feedback belongs to one isolate. Snapshot copies preserve
 //!   admitted code while creating empty feedback through `executable_snapshot`.
+//! - Each escapable CodeBlock retains its own physical-body lease. The function
+//!   pointer table and independently escapable source-work cell own separate
+//!   leases; no snapshot/JIT handle depends on a donor chunk's aggregate charge.
 //!
 //! # See also
 //! - [`crate::execution_context`]
 //! - [`otter_bytecode::Instruction`]
 
+#[path = "executable_allocation.rs"]
+pub(crate) mod allocation;
 #[path = "code_block_cfg.rs"]
 pub(crate) mod code_block_cfg;
 #[path = "executable_snapshot.rs"]
@@ -48,8 +53,9 @@ mod executable_snapshot;
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, Function, FunctionCode, FunctionCodeBuilder, Op,
     Operand, SpanEntry, VerifiedBytecodeModule, VerifiedFunction,
-    encoding::{measure_wordcode_function, translate_spans_to_byte_pcs},
+    encoding::measure_wordcode_function,
 };
+use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease};
 use std::sync::Arc;
 
 use code_block_cfg::CodeBlockControlFlow;
@@ -61,10 +67,11 @@ pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 /// The builder owns dense IC-site assignment while the VM creates an
 /// [`crate::ExecutionContext`]. Dispatch receives only the frozen
 /// [`ExecutableModule`] produced by [`Self::freeze`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ExecutableModuleBuilder {
     functions: Vec<Arc<CodeBlock>>,
     next_property_ic_site: u32,
+    table_lease: ResourceLease,
 }
 
 impl ExecutableModuleBuilder {
@@ -74,7 +81,8 @@ impl ExecutableModuleBuilder {
     pub(crate) fn from_bytecode(module: &otter_bytecode::BytecodeModule) -> Self {
         let verified = VerifiedBytecodeModule::new(module.clone())
             .expect("executable test fixture must be valid bytecode");
-        Self::from_verified_bytecode_with_ic_base(&verified, 0)
+        Self::from_verified_bytecode_with_ic_base(&verified, 0, &ResourceAccount::default())
+            .expect("admit executable fixture")
     }
 
     /// Build a transient executable view from a retained admission proof.
@@ -84,46 +92,71 @@ impl ExecutableModuleBuilder {
     pub(crate) fn from_verified_bytecode_with_ic_base(
         verified: &VerifiedBytecodeModule,
         property_ic_base: u32,
-    ) -> Self {
+        account: &ResourceAccount,
+    ) -> Result<Self, ResourceError> {
         let module = verified.module();
+        let mut table_lease = account.reserve_exact(
+            ResourceClass::SourceModuleBytes,
+            (std::mem::size_of::<ExecutableModule>() as u64).saturating_add(
+                allocation::array_bytes::<Arc<CodeBlock>>(module.functions.len()),
+            ),
+        )?;
+        let functions = allocation::try_vec(module.functions.len(), &mut table_lease)?;
         let mut builder = Self {
-            functions: Vec::with_capacity(module.functions.len()),
+            functions,
             next_property_ic_site: property_ic_base,
+            table_lease,
         };
         for (index, function) in module.functions.iter().enumerate() {
             let proof = verified
                 .function(index)
                 .expect("verified carrier has one proof per function");
-            builder.push_function(function, proof, &module.module);
+            builder.push_function(function, proof, &module.module, account)?;
         }
-        builder
+        Ok(builder)
     }
 
-    fn push_function(&mut self, function: &Function, proof: &VerifiedFunction, module_url: &str) {
+    fn push_function(
+        &mut self,
+        function: &Function,
+        proof: &VerifiedFunction,
+        module_url: &str,
+        account: &ResourceAccount,
+    ) -> Result<(), ResourceError> {
         let function = Arc::new(CodeBlock::from_verified_bytecode(
             function,
             proof,
             module_url,
             &mut self.next_property_ic_site,
-        ));
+            account,
+        )?);
         self.functions.push(function);
+        Ok(())
     }
 
     /// Seal mutable build buffers into the VM-owned frozen execution product.
     #[must_use]
-    pub(crate) fn freeze(self) -> ExecutableModule {
-        ExecutableModule {
-            functions: self.functions.into_boxed_slice(),
+    pub(crate) fn freeze(self) -> Result<ExecutableModule, ResourceError> {
+        let functions = self.functions.into_boxed_slice();
+        let mut lease = self.table_lease;
+        lease.resize(
+            (std::mem::size_of::<ExecutableModule>() as u64)
+                .saturating_add(allocation::array_bytes::<Arc<CodeBlock>>(functions.len())),
+        )?;
+        Ok(ExecutableModule {
+            functions,
             property_ic_site_end: self.next_property_ic_site,
-        }
+            _table_lease: lease,
+        })
     }
 }
 
 /// VM-owned executable view of a bytecode module.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ExecutableModule {
     functions: Box<[Arc<CodeBlock>]>,
     property_ic_site_end: u32,
+    _table_lease: ResourceLease,
 }
 
 /// Stable directory entry mapping a globally dense method site id back to its
@@ -148,7 +181,9 @@ impl ExecutableModule {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_bytecode(module: &otter_bytecode::BytecodeModule) -> Self {
-        ExecutableModuleBuilder::from_bytecode(module).freeze()
+        ExecutableModuleBuilder::from_bytecode(module)
+            .freeze()
+            .expect("admit executable fixture table")
     }
 
     /// Build a frozen execution view from a retained admission proof. Dense
@@ -157,9 +192,14 @@ impl ExecutableModule {
     pub(crate) fn from_verified_bytecode_with_ic_base(
         verified: &VerifiedBytecodeModule,
         property_ic_base: u32,
-    ) -> Self {
-        ExecutableModuleBuilder::from_verified_bytecode_with_ic_base(verified, property_ic_base)
-            .freeze()
+        account: &ResourceAccount,
+    ) -> Result<Self, ResourceError> {
+        ExecutableModuleBuilder::from_verified_bytecode_with_ic_base(
+            verified,
+            property_ic_base,
+            account,
+        )?
+        .freeze()
     }
 
     /// Function-table lookup by chunk-local function index.
@@ -181,19 +221,17 @@ impl ExecutableModule {
         self.property_ic_site_end
     }
 
-    /// Heap bytes this execution view retains for the owning chunk's
-    /// lifetime: the function table plus every CodeBlock body. Saturating, so
-    /// a saturated total still exceeds any real budget and fails admission
-    /// closed.
+    /// Exact physical leases retained by this view and its shared block/counter
+    /// allocations. A block/counter keeps its charge after this table drops.
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
-        let mut total = std::mem::size_of_val::<[Arc<CodeBlock>]>(&self.functions) as u64;
-        for code_block in &self.functions {
-            total = total
-                .saturating_add(std::mem::size_of::<CodeBlock>() as u64)
-                .saturating_add(code_block.retained_bytes());
-        }
-        total
+        self.functions
+            .iter()
+            .fold(self._table_lease.amount(), |total, block| {
+                total
+                    .saturating_add(block._lease.amount())
+                    .saturating_add(block.source_work.retained_bytes())
+            })
     }
 
     /// Build directory entries for method sites in this chunk.
@@ -283,6 +321,12 @@ impl ExecutableModule {
 }
 
 impl CodeBlock {
+    /// The exact shared source-work allocation retained by compiled code.
+    #[must_use]
+    pub fn source_work(&self) -> &Arc<crate::native_abi::SourceWork> {
+        &self.source_work
+    }
+
     /// Whether the function materializes `arguments`, so its activation
     /// observes its actual arguments.
     #[must_use]
@@ -319,6 +363,7 @@ impl CodeBlock {
     #[must_use]
     pub fn requires_argument_frame(&self) -> bool {
         self.needs_arguments
+            || self.has_rest
             || self
                 .code
                 .iter()
@@ -332,6 +377,7 @@ impl CodeBlock {
         crate::jit::JitCompileSnapshot {
             code_block: Arc::clone(self),
             derived_constructor: self.is_derived_constructor,
+            literal_allocations: crate::jit::JitLiteralAllocationPlans::default(),
             // Baked by `Interpreter::compile_jit_function`, which holds the
             // cage base and the live property-IC tables.
             cage_base: 0,
@@ -350,21 +396,11 @@ impl CodeBlock {
                 + crate::object::EXOTIC_SLOTS_DICTIONARY_LAYOUT_OFFSET as u32,
             exotic_instance_root_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::EXOTIC_SLOTS_INSTANCE_ROOT_OFFSET as u32,
-            object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32,
-            object_slab_handle_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::OBJECT_BODY_SLAB_HANDLE_OFFSET as u32,
+            field_layout: crate::object::FieldLayout::current(),
             shape_property_count_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_PROPERTY_COUNT_OFFSET as u32,
-            object_inline_capacity_byte: crate::object::OBJECT_CELL_INLINE_CAPACITY_BYTE as u32,
-            object_slab_capacity_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::slot_slab::SLOT_SLAB_CAPACITY_OFFSET as u32,
-            object_slab_words_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::slot_slab::SLOT_SLAB_WORDS_OFFSET as u32,
-            object_flags_byte: crate::object::OBJECT_CELL_FLAGS_BYTE as u32,
             object_exotic_handle_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32,
-            object_fixed_cell_bytes: crate::object::object_cell_bytes(0) as u32,
             gc_barrier: crate::jit::JitGcBarrierLayout {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
@@ -372,8 +408,10 @@ impl CodeBlock {
             },
             shape_prototype_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_PROTOTYPE_OFFSET as u32,
-            shape_kind_byte: otter_gc::header::HEADER_SIZE as u32
-                + crate::object::SHAPE_BODY_KIND_OFFSET as u32,
+            shape_inline_capacity_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::SHAPE_BODY_INLINE_CAPACITY_OFFSET as u32,
+            shape_state_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::SHAPE_BODY_STATE_OFFSET as u32,
             closure_call_layout: crate::jit::JitClosureCallLayout {
                 function_id_byte: gc_header_bytes
                     + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,
@@ -391,10 +429,8 @@ impl CodeBlock {
                     + crate::closure_construct::CLOSURE_RARE_OWN_PROPS_OFFSET as u32,
                 prototype_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_OFFSET as u32,
-                learned_instance_fields_byte: gc_header_bytes
-                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET as u32,
-                last_instance_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET as u32,
+                constructor_layouts_byte: gc_header_bytes
+                    + crate::closure_construct::CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET as u32,
             },
             class_constructor_layout: crate::jit::JitClassConstructorLayout {
                 type_tag: crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
@@ -404,6 +440,16 @@ impl CodeBlock {
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_PROTO_OFFSET as u32,
                 prototype_byte: gc_header_bytes
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_PROTOTYPE_OFFSET as u32,
+                constructor_layouts_byte: gc_header_bytes
+                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_LAYOUTS_OFFSET as u32,
+            },
+            constructor_layout: crate::jit::JitConstructorLayout {
+                family_id_byte: gc_header_bytes
+                    + crate::constructor_layout::CONSTRUCTOR_LAYOUT_FAMILY_ID_OFFSET as u32,
+                root_byte: gc_header_bytes
+                    + crate::constructor_layout::CONSTRUCTOR_LAYOUT_ROOT_OFFSET as u32,
+                samples_remaining_byte: gc_header_bytes
+                    + crate::constructor_layout::CONSTRUCTOR_LAYOUT_SAMPLES_REMAINING_OFFSET as u32,
             },
             primitive_cell_type_tags: [
                 crate::string::JS_STRING_BODY_TYPE_TAG,
@@ -465,6 +511,14 @@ impl CodeBlock {
                     call_attempted: self
                         .feedback_at(index)
                         .is_some_and(crate::feedback::InstructionFeedback::call_attempted),
+                    property_attempted: match self.op_at(index) {
+                        Some(Op::LoadProperty | Op::CallMethodValue) => self
+                            .property_feedback_at(index, crate::property_ic::PropertyIcKind::Load),
+                        Some(Op::StoreProperty | Op::StorePropertyStrict) => self
+                            .property_feedback_at(index, crate::property_ic::PropertyIcKind::Store),
+                        _ => None,
+                    }
+                    .is_some_and(crate::feedback::PropertyFeedbackSlot::attempted),
                     // A site that has never executed falls back to the
                     // compiler's TypeScript annotation, which is enough for the
                     // optimizing tier to pick a guarded numeric lowering
@@ -497,7 +551,7 @@ impl CodeBlock {
             global_object_loads: rustc_hash::FxHashMap::default(),
             // Baked from the authoritative typed `Op::Call` distribution by
             // `Interpreter::bake_inline_callees`.
-            static_native_calls: rustc_hash::FxHashMap::default(),
+            native_calls: rustc_hash::FxHashMap::default(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live
             // per-site feedback and can resolve callee bodies); the raw snapshot
             // carries none.
@@ -509,12 +563,11 @@ impl CodeBlock {
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
+            forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
-            property_lookup_cache: None,
-            store_transition_cache: None,
-            property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
+            property_action_cache: None,
+            property_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
-            constructor_field_transitions: rustc_hash::FxHashMap::default(),
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
@@ -560,11 +613,31 @@ impl CodeBlock {
                 )
             })
             .collect();
+        let account = ResourceAccount::default();
+        let mut fixture_lease = account
+            .reserve_exact(
+                ResourceClass::SourceModuleBytes,
+                crate::feedback::FeedbackVector::allocation_bytes(
+                    instructions.iter().map(|instruction| instruction.op),
+                )
+                .saturating_add(CodeBlockControlFlow::allocation_bytes(&wordcode, handlers)),
+            )
+            .expect("admit fixture feedback/control-flow");
         let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
             instructions.iter().map(|instruction| instruction.op),
-        );
-        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode, handlers);
-        Arc::new(Self {
+            &mut fixture_lease,
+        )
+        .expect("prepare fixture feedback");
+        let control_flow =
+            CodeBlockControlFlow::from_verified_wordcode(&wordcode, handlers, &mut fixture_lease)
+                .expect("prepare fixture control flow");
+        let mut body = Self {
+            _lease: account
+                .reserve_exact(
+                    ResourceClass::SourceModuleBytes,
+                    std::mem::size_of::<Self>() as u64,
+                )
+                .expect("admit fixture body"),
             id,
             param_count,
             register_count,
@@ -590,11 +663,18 @@ impl CodeBlock {
             bytecode_byte_len,
             control_flow,
             feedback,
+            source_work: Arc::new(
+                crate::native_abi::SourceWork::new(&account).expect("admit fixture work cell"),
+            ),
             byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
             number_hints: Box::new([]),
             class_hints: Box::new([]),
-        })
+        };
+        body._lease
+            .resize((std::mem::size_of::<Self>() as u64).saturating_add(body.retained_bytes()))
+            .expect("admit fixture body tables");
+        Arc::new(body)
     }
 
     /// Byte-offset source-map entries, sorted by `pc`. Empty when the
@@ -646,6 +726,21 @@ impl CodeBlock {
         self.feedback.property_slot(index, kind)
     }
 
+    /// Receiver programs the inline cache of the named property site at
+    /// instruction `index` holds ([`crate::feedback::PropertyFeedbackSlot::population`]);
+    /// `None` when the instruction is not a named property access.
+    #[must_use]
+    pub(crate) fn property_site_population(&self, index: usize) -> Option<u32> {
+        let kind = match self.op_at(index)? {
+            Op::LoadProperty | Op::CallMethodValue => crate::property_ic::PropertyIcKind::Load,
+            Op::StoreProperty | Op::StorePropertyStrict => {
+                crate::property_ic::PropertyIcKind::Store
+            }
+            _ => return None,
+        };
+        Some(self.property_feedback_at(index, kind)?.population())
+    }
+
     /// Advance the shared epoch for isolate-owned feedback that changed
     /// outside the dense CodeBlock cells.
     pub(crate) fn bump_feedback_epoch(&self) {
@@ -681,6 +776,18 @@ impl CodeBlock {
         target: crate::feedback::OrdinaryCallTarget,
     ) -> crate::feedback::CallTargetTransition {
         self.feedback.record_call(instruction_index, target)
+    }
+
+    /// Last finalized actual constructor family selected at this exact source
+    /// site. No GC value or template-id alias is recorded here.
+    pub(crate) fn construct_family_at(&self, index: usize) -> Option<u64> {
+        self.feedback.call_slot(index)?.construct_family()
+    }
+
+    /// Record a monotonic scalar family through the same dense owner. The
+    /// noalloc observation is evaluated only while this exact cell can change.
+    pub(crate) fn record_construct_family(&self, index: usize, observe: impl FnOnce() -> u64) {
+        self.feedback.record_construct_family(index, observe);
     }
 
     /// Cold serialized byte PC for one logical instruction index.
@@ -1084,6 +1191,9 @@ pub struct CodeBlock {
     /// Tier-neutral advisory feedback parallel to `code`, including its single
     /// monotonic transition epoch, shared without hash lookup.
     feedback: crate::feedback::FeedbackVector,
+    /// Address-stable entered-opcode attempts; policy and native code retain
+    /// this same allocation, never a copied execution ledger.
+    source_work: Arc<crate::native_abi::SourceWork>,
     /// Cold serialized byte PCs parallel to `code`.
     byte_pcs: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
@@ -1106,6 +1216,7 @@ pub struct CodeBlock {
     /// compile instead of refusing it for lack of a profile; a wrong annotation
     /// misses the guard the site already emits.
     pub(crate) class_hints: Box<[(u32, u32)]>,
+    _lease: ResourceLease,
 }
 
 impl CodeBlock {
@@ -1146,52 +1257,103 @@ impl CodeBlock {
         proof: &VerifiedFunction,
         module_url: &str,
         next_property_ic_site: &mut u32,
-    ) -> Self {
+        account: &ResourceAccount,
+    ) -> Result<Self, ResourceError> {
         let register_count = proof.register_count();
         let code_byte_len = proof.layout().total_bytes;
-        let instr_to_byte_pc = proof.layout().instr_to_byte_pc.clone();
-        let control_flow =
-            CodeBlockControlFlow::from_verified_wordcode(&function.code, &function.handlers);
-        let mut overflow_operand_words = Vec::new();
-        let code = function
+        let count = function.code.len();
+        let overflow_count = function
             .code
             .iter()
-            .enumerate()
-            .map(|(idx, instr)| {
-                let property_ic_site = match instr.op {
-                    // `CallMethodValue` shares the load-IC table: a prototype
-                    // method is a data slot on the prototype, so its resolution
-                    // is cached by receiver shape exactly like a `LoadProperty`.
-                    Op::LoadProperty
-                    | Op::StoreProperty
-                    | Op::StorePropertyStrict
-                    | Op::CallMethodValue => {
-                        let site = *next_property_ic_site;
-                        *next_property_ic_site = next_property_ic_site
-                            .checked_add(1)
-                            .expect("property IC site table exceeds u32");
-                        site
-                    }
-                    _ => NO_PROPERTY_IC_SITE,
-                };
-                CodeBlockInstruction::from_wordcode(
-                    &function.code,
-                    idx,
-                    function.id,
-                    idx as u32,
-                    property_ic_site,
-                    &mut overflow_operand_words,
-                )
+            .map(|instruction| {
+                if instruction.operand_count() > 4 {
+                    instruction.operand_count()
+                } else {
+                    0
+                }
             })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .sum::<usize>();
+        let module_url = if function.module_url.is_empty() {
+            module_url
+        } else {
+            &function.module_url
+        };
+        let mut requested = (std::mem::size_of::<Self>() as u64)
+            .saturating_add(allocation::array_bytes::<CodeBlockInstruction>(count))
+            .saturating_add(allocation::array_bytes::<u32>(overflow_count))
+            .saturating_add(allocation::array_bytes::<u32>(count))
+            .saturating_add(allocation::array_bytes::<SpanEntry>(function.spans.len()))
+            .saturating_add(allocation::array_bytes::<ExecMappedArgumentBinding>(
+                function.mapped_argument_bindings.len(),
+            ))
+            .saturating_add(allocation::array_bytes::<otter_bytecode::ScopeDescriptor>(
+                function.scopes.len(),
+            ))
+            .saturating_add(module_url.len() as u64)
+            .saturating_add(crate::feedback::FeedbackVector::allocation_bytes(
+                function.code.iter().map(|instruction| instruction.op),
+            ))
+            .saturating_add(CodeBlockControlFlow::allocation_bytes(
+                &function.code,
+                &function.handlers,
+            ))
+            .saturating_add(allocation::array_bytes::<(u32, u32)>(
+                function.class_hint_sites.len(),
+            ));
+        if !function.number_hint_sites.is_empty() {
+            requested =
+                requested.saturating_add(allocation::array_bytes::<u64>(count.div_ceil(64)));
+        }
+        for scope in &function.scopes {
+            requested = requested.saturating_add(allocation::array_bytes::<
+                otter_bytecode::SlotDescriptor,
+            >(scope.slots.len()));
+            for slot in &scope.slots {
+                requested = requested.saturating_add(slot.name.len() as u64);
+            }
+        }
+        let mut lease = account.reserve_exact(ResourceClass::SourceModuleBytes, requested)?;
+        let instr_to_byte_pc = allocation::try_copy(&proof.layout().instr_to_byte_pc, &mut lease)?;
+        let control_flow = CodeBlockControlFlow::from_verified_wordcode(
+            &function.code,
+            &function.handlers,
+            &mut lease,
+        )?;
+        let mut overflow_operand_words = allocation::try_vec(overflow_count, &mut lease)?;
+        let mut code = allocation::try_vec(count, &mut lease)?;
+        for (idx, instruction) in function.code.iter().enumerate() {
+            let property_ic_site = match instruction.op {
+                Op::LoadProperty
+                | Op::StoreProperty
+                | Op::StorePropertyStrict
+                | Op::CallMethodValue => {
+                    let site = *next_property_ic_site;
+                    *next_property_ic_site = next_property_ic_site
+                        .checked_add(1)
+                        .expect("property IC site table exceeds u32");
+                    site
+                }
+                _ => NO_PROPERTY_IC_SITE,
+            };
+            code.push(CodeBlockInstruction::from_wordcode(
+                &function.code,
+                idx,
+                function.id,
+                idx as u32,
+                property_ic_site,
+                &mut overflow_operand_words,
+            ));
+        }
+        let code = code.into_boxed_slice();
         let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
             function.code.iter().map(|instruction| instruction.op),
-        );
+            &mut lease,
+        )?;
         let number_hints = if function.number_hint_sites.is_empty() {
             Box::new([]) as Box<[u64]>
         } else {
-            let mut bits = vec![0u64; code.len().div_ceil(64)];
+            let mut bits = allocation::try_vec(count.div_ceil(64), &mut lease)?;
+            bits.resize(count.div_ceil(64), 0u64);
             for &site in &function.number_hint_sites {
                 let index = site as usize;
                 if index < code.len() {
@@ -1200,26 +1362,39 @@ impl CodeBlock {
             }
             bits.into_boxed_slice()
         };
-        let mut class_hints: Vec<(u32, u32)> = function
-            .class_hint_sites
-            .iter()
-            .filter(|site| (site.pc as usize) < code.len())
-            .map(|site| (site.pc, site.class_function_id))
-            .collect();
+        let mut class_hints = allocation::try_vec(function.class_hint_sites.len(), &mut lease)?;
+        class_hints.extend(
+            function
+                .class_hint_sites
+                .iter()
+                .filter(|site| (site.pc as usize) < code.len())
+                .map(|site| (site.pc, site.class_function_id)),
+        );
         class_hints.sort_unstable_by_key(|&(pc, _)| pc);
         class_hints.dedup_by_key(|&mut (pc, _)| pc);
         let class_hints = class_hints.into_boxed_slice();
-        let mapped_argument_bindings = function
-            .mapped_argument_bindings
-            .iter()
-            .map(|binding| ExecMappedArgumentBinding {
+        let mut mapped_argument_bindings =
+            allocation::try_vec(function.mapped_argument_bindings.len(), &mut lease)?;
+        mapped_argument_bindings.extend(function.mapped_argument_bindings.iter().map(|binding| {
+            ExecMappedArgumentBinding {
                 argument_index: binding.argument_index,
                 storage: binding.storage,
-            })
-            .collect();
-        let byte_spans =
-            translate_spans_to_byte_pcs(&function.spans, &instr_to_byte_pc, code_byte_len)
-                .into_boxed_slice();
+            }
+        }));
+        let mapped_argument_bindings = mapped_argument_bindings.into_boxed_slice();
+        let mut byte_spans = allocation::try_vec(function.spans.len(), &mut lease)?;
+        byte_spans.extend(function.spans.iter().map(|entry| {
+            SpanEntry {
+                pc: instr_to_byte_pc
+                    .get(entry.pc as usize)
+                    .copied()
+                    .unwrap_or(code_byte_len),
+                span: entry.span,
+            }
+        }));
+        let byte_spans = byte_spans.into_boxed_slice();
+        let module_url = allocation::try_string(module_url, &mut lease)?.into_boxed_str();
+        let scopes = allocation::try_scopes(&function.scopes, &mut lease)?;
         let makes_function = function
             .code
             .iter()
@@ -1227,7 +1402,8 @@ impl CodeBlock {
         let observes_this = makes_function
             || function.contains_direct_eval
             || function.code.iter().any(|instr| instr.op == Op::LoadThis);
-        Self {
+        let mut body = Self {
+            _lease: lease,
             id: function.id,
             makes_function,
             observes_this,
@@ -1245,23 +1421,23 @@ impl CodeBlock {
             arguments_object_kind: function.arguments_object_kind,
             mapped_argument_bindings,
             is_module: function.is_module,
-            module_url: if function.module_url.is_empty() {
-                module_url.into()
-            } else {
-                function.module_url.clone().into_boxed_str()
-            },
-            scopes: function.scopes.clone().into_boxed_slice(),
+            module_url,
+            scopes,
             contains_direct_eval: function.contains_direct_eval,
             code,
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             bytecode_byte_len: code_byte_len,
             control_flow,
             feedback,
+            source_work: Arc::new(crate::native_abi::SourceWork::new(account)?),
             byte_pcs: instr_to_byte_pc,
             byte_spans,
             number_hints,
             class_hints,
-        }
+        };
+        body._lease
+            .resize((std::mem::size_of::<Self>() as u64).saturating_add(body.retained_bytes()))?;
+        Ok(body)
     }
 
     /// `true` when the compiler marked this instruction's operands as
@@ -1572,10 +1748,8 @@ mod tests {
                     + crate::closure_construct::CLOSURE_RARE_OWN_PROPS_OFFSET as u32,
                 prototype_byte: gc_header_bytes
                     + crate::closure_construct::CLOSURE_RARE_PROTOTYPE_OFFSET as u32,
-                learned_instance_fields_byte: gc_header_bytes
-                    + crate::closure_construct::CLOSURE_RARE_LEARNED_INSTANCE_FIELDS_OFFSET as u32,
-                last_instance_byte: gc_header_bytes
-                    + crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET as u32,
+                constructor_layouts_byte: gc_header_bytes
+                    + crate::closure_construct::CLOSURE_RARE_CONSTRUCTOR_LAYOUTS_OFFSET as u32,
             }
         );
     }
@@ -1587,8 +1761,15 @@ mod tests {
         let snapshot = function.jit_compile_snapshot();
         let header = otter_gc::header::HEADER_SIZE as u32;
 
-        assert_eq!(snapshot.object_flags_byte, 2);
-        assert_eq!(snapshot.object_inline_capacity_byte, 3);
+        assert_eq!(
+            snapshot.shape_state_byte,
+            header + crate::object::SHAPE_BODY_STATE_OFFSET as u32
+        );
+        assert_eq!(
+            snapshot.shape_inline_capacity_byte,
+            otter_gc::header::HEADER_SIZE as u32
+                + crate::object::SHAPE_BODY_INLINE_CAPACITY_OFFSET as u32
+        );
         assert_eq!(
             snapshot.object_exotic_handle_byte,
             header + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32
@@ -1848,7 +2029,7 @@ mod tests {
         assert_eq!(builder.functions.len(), 1);
         assert_eq!(builder.next_property_ic_site, 1);
 
-        let executable = builder.freeze();
+        let executable = builder.freeze().unwrap();
         let exec_fn = executable.function(0).unwrap();
         assert_eq!(exec_fn.code.len(), 3);
         assert_eq!(executable.property_ic_site_end(), 1);

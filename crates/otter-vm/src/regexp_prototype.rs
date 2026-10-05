@@ -697,13 +697,13 @@ pub(crate) fn get_property_runtime(
             interp
                 .ordinary_get_value(
                     stack,
-                    &exec,
+                    Some(&exec),
                     receiver,
                     receiver,
                     &crate::VmPropertyKey::String(key),
                     0,
                 )
-                .map_err(vm_err_to_native(interp, name))
+                .map_err(|error| error.into_native(interp, name))
         })?;
         match outcome {
             crate::VmGetOutcome::Value(value) => {
@@ -793,7 +793,7 @@ fn set_property_runtime(
                     receiver,
                     0,
                 )
-                .map_err(vm_err_to_native(interp, name))
+                .map_err(|error| error.into_native(interp, name))
         })?;
         // `Set(O, P, V, true)` — a `[[Set]]` returning false (e.g. a
         // non-writable `lastIndex`) is a TypeError, not a silent no-op.
@@ -855,7 +855,7 @@ pub(crate) fn coerce_to_jsstring_runtime(
                         &current,
                         crate::abstract_ops::ToPrimitiveHint::String,
                     )
-                    .map_err(vm_err_to_native(interp, name))
+                    .map_err(|error| error.into_native(interp, name))
             })?
         };
         let primitive = scope.value(primitive);
@@ -903,7 +903,7 @@ fn to_length_runtime(
                         &current,
                         crate::abstract_ops::ToPrimitiveHint::Number,
                     )
-                    .map_err(vm_err_to_native(interp, name))
+                    .map_err(|error| error.into_native(interp, name))
             })?
         };
         let primitive = scope.value(primitive);
@@ -955,7 +955,7 @@ fn to_integer_or_infinity_runtime(
                         &current,
                         crate::abstract_ops::ToPrimitiveHint::Number,
                     )
-                    .map_err(vm_err_to_native(interp, name))
+                    .map_err(|error| error.into_native(interp, name))
             })?
         };
         let primitive = scope.value(primitive);
@@ -1051,6 +1051,8 @@ pub(crate) fn regexp_exec_runtime(
 /// through the native runtime bridges used by the rest of
 /// `RegExp.prototype`: `RegExpExec`, `Get(match, "0")`, `ToString`,
 /// `Get(R, "lastIndex")`, `ToLength`, and `Set(R, "lastIndex", …)`.
+/// Each native error is projected once while these roots and source are live;
+/// completed failures retain their terminal disposition through IteratorNext.
 pub(crate) fn regexp_string_iterator_next_runtime(
     interp: &mut crate::Interpreter,
     stack: &mut crate::ActivationStack,
@@ -1059,7 +1061,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     input: JsString,
     global: bool,
     full_unicode: bool,
-) -> Result<Option<Value>, crate::VmError> {
+) -> Result<Option<Value>, crate::CommittedValueError> {
     let name = "RegExp String Iterator.next";
     const MATCHER: usize = 0;
     const INPUT: usize = 1;
@@ -1082,14 +1084,24 @@ pub(crate) fn regexp_string_iterator_next_runtime(
         let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
         let ctx = &mut ctx;
 
-        (|| -> Result<Option<Value>, crate::VmError> {
+        (|| -> Result<Option<Value>, crate::CommittedValueError> {
             let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
             let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
             let input = input
                 .as_string(ctx.heap())
-                .ok_or(crate::VmError::InvalidOperand)?;
-            let result = regexp_exec_runtime(ctx, &matcher, input, name)
-                .map_err(|e| ctx.native_error_to_vm(e))?;
+                .ok_or(crate::CommittedValueError::Fatal(
+                    crate::VmError::InvalidOperand,
+                ))?;
+            let result = regexp_exec_runtime(ctx, &matcher, input, name).map_err(|e| {
+                ctx.with_turn_parts(|interp, stack| {
+                    crate::error_ops::native_error_to_committed_with_stack(
+                        interp,
+                        stack,
+                        Some(context),
+                        e,
+                    )
+                })
+            })?;
             ctx.interp_mut()
                 .set_iteration_anchor(anchor_base + RESULT, result);
             if ctx
@@ -1101,31 +1113,66 @@ pub(crate) fn regexp_string_iterator_next_runtime(
             }
             if global {
                 let result = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
-                let matched = get_property_runtime(ctx, &result, "0", name)
-                    .map_err(|e| ctx.native_error_to_vm(e))?;
+                let matched = get_property_runtime(ctx, &result, "0", name).map_err(|e| {
+                    ctx.with_turn_parts(|interp, stack| {
+                        crate::error_ops::native_error_to_committed_with_stack(
+                            interp,
+                            stack,
+                            Some(context),
+                            e,
+                        )
+                    })
+                })?;
                 ctx.interp_mut()
                     .set_iteration_anchor(anchor_base + INTERMEDIATE, matched);
                 let matched = ctx
                     .interp_mut()
                     .iteration_anchor(anchor_base + INTERMEDIATE);
-                let matched_str = coerce_to_jsstring_runtime(ctx, &matched, name)
-                    .map_err(|e| ctx.native_error_to_vm(e))?;
+                let matched_str = coerce_to_jsstring_runtime(ctx, &matched, name).map_err(|e| {
+                    ctx.with_turn_parts(|interp, stack| {
+                        crate::error_ops::native_error_to_committed_with_stack(
+                            interp,
+                            stack,
+                            Some(context),
+                            e,
+                        )
+                    })
+                })?;
                 if matched_str.is_empty() {
                     let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
                     let last_index = get_property_runtime(ctx, &matcher, "lastIndex", name)
-                        .map_err(|e| ctx.native_error_to_vm(e))?;
+                        .map_err(|e| {
+                            ctx.with_turn_parts(|interp, stack| {
+                                crate::error_ops::native_error_to_committed_with_stack(
+                                    interp,
+                                    stack,
+                                    Some(context),
+                                    e,
+                                )
+                            })
+                        })?;
                     ctx.interp_mut()
                         .set_iteration_anchor(anchor_base + INTERMEDIATE, last_index);
                     let last_index = ctx
                         .interp_mut()
                         .iteration_anchor(anchor_base + INTERMEDIATE);
-                    let this_index = to_length_runtime(ctx, &last_index, name)
-                        .map_err(|e| ctx.native_error_to_vm(e))?
-                        as usize;
+                    let this_index = to_length_runtime(ctx, &last_index, name).map_err(|e| {
+                        ctx.with_turn_parts(|interp, stack| {
+                            crate::error_ops::native_error_to_committed_with_stack(
+                                interp,
+                                stack,
+                                Some(context),
+                                e,
+                            )
+                        })
+                    })? as usize;
                     let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
-                    let input = input
-                        .as_string(ctx.heap())
-                        .ok_or(crate::VmError::InvalidOperand)?;
+                    let input =
+                        input
+                            .as_string(ctx.heap())
+                            .ok_or(crate::CommittedValueError::Fatal(
+                                crate::VmError::InvalidOperand,
+                            ))?;
                     let next_index = input.with_utf16(ctx.heap(), |units| {
                         advance_string_index(units, this_index, full_unicode)
                     });
@@ -1137,7 +1184,16 @@ pub(crate) fn regexp_string_iterator_next_runtime(
                         Value::number_f64(next_index as f64),
                         name,
                     )
-                    .map_err(|e| ctx.native_error_to_vm(e))?;
+                    .map_err(|e| {
+                        ctx.with_turn_parts(|interp, stack| {
+                            crate::error_ops::native_error_to_committed_with_stack(
+                                interp,
+                                stack,
+                                Some(context),
+                                e,
+                            )
+                        })
+                    })?;
                 }
             }
             Ok(Some(
@@ -1566,13 +1622,13 @@ pub(crate) fn get_symbol_property_runtime(
             interp
                 .ordinary_get_value(
                     stack,
-                    &exec,
+                    Some(&exec),
                     receiver,
                     receiver,
                     &crate::VmPropertyKey::Symbol(sym),
                     0,
                 )
-                .map_err(vm_err_to_native(interp, name))
+                .map_err(|error| error.into_native(interp, name))
         })?;
         match outcome {
             crate::VmGetOutcome::Value(value) => {
@@ -1941,7 +1997,7 @@ pub fn native_regexp_symbol_split(
             let n = ctx
                 .with_turn_parts(|interp, stack| {
                     crate::coerce::to_number_or_throw(interp, stack, &exec, &limit)
-                        .map_err(vm_err_to_native(interp, name))
+                        .map_err(|error| error.into_native(interp, name))
                 })?
                 .as_f64();
             if n.is_nan() {
@@ -2375,55 +2431,58 @@ mod tests {
     /// `Get`/`Set(lastIndex)` ladder has an execution context to run on.
     fn empty_context() -> crate::ExecutionContext {
         use otter_bytecode::{BytecodeModule, Function, Instruction, SourceKind, SpanEntry};
-        crate::ExecutionContext::from_module(BytecodeModule {
-            module: "regexp-proto-test.ts".to_string(),
-            template_sites: Vec::new(),
-            source_kind: SourceKind::TypeScript,
-            functions: vec![Function {
-                id: 0,
-                name: "<main>".to_string(),
-                span: (0, 0),
-                locals: 0,
-                scratch: 0,
-                param_count: 0,
-                length: 0,
-                scopes: Vec::new(),
-                is_strict: false,
-                is_arrow: false,
-                is_method: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_derived_constructor: false,
-                is_module: false,
-                needs_arguments: false,
-                uses_arguments_callee: false,
-                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
-                mapped_argument_bindings: Vec::new(),
-                source_text_range: None,
-                source_text_span: None,
-                module_url: String::new(),
-                contains_direct_eval: false,
-                code: vec![Instruction {
-                    pc: 0,
-                    op: otter_bytecode::Op::ReturnUndefined,
-                    operands: vec![],
-                }]
-                .into(),
-                spans: vec![SpanEntry {
-                    pc: 0,
+        crate::ExecutionContext::from_module(
+            BytecodeModule {
+                module: "regexp-proto-test.ts".to_string(),
+                template_sites: Vec::new(),
+                source_kind: SourceKind::TypeScript,
+                functions: vec![Function {
+                    id: 0,
+                    name: "<main>".to_string(),
                     span: (0, 0),
+                    locals: 0,
+                    scratch: 0,
+                    param_count: 0,
+                    length: 0,
+                    scopes: Vec::new(),
+                    is_strict: false,
+                    is_arrow: false,
+                    is_method: false,
+                    has_rest: false,
+                    is_async: false,
+                    is_generator: false,
+                    is_async_generator: false,
+                    is_derived_constructor: false,
+                    is_module: false,
+                    needs_arguments: false,
+                    uses_arguments_callee: false,
+                    arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                    mapped_argument_bindings: Vec::new(),
+                    source_text_range: None,
+                    source_text_span: None,
+                    module_url: String::new(),
+                    contains_direct_eval: false,
+                    code: vec![Instruction {
+                        pc: 0,
+                        op: otter_bytecode::Op::ReturnUndefined,
+                        operands: vec![],
+                    }]
+                    .into(),
+                    spans: vec![SpanEntry {
+                        pc: 0,
+                        span: (0, 0),
+                    }],
+                    handlers: Vec::new(),
+                    number_hint_sites: Vec::new(),
+                    class_hint_sites: Vec::new(),
                 }],
-                handlers: Vec::new(),
-                number_hint_sites: Vec::new(),
-                class_hint_sites: Vec::new(),
-            }],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
@@ -2473,7 +2532,7 @@ mod tests {
 
     #[test]
     fn test_returns_boolean() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let _runtime_roots = interp.scope_runtime_roots_guard();
         let mut re = make("ab+c", "", &mut interp);
         let mut text = Value::undefined();
@@ -2494,7 +2553,7 @@ mod tests {
 
     #[test]
     fn exec_returns_array_or_null() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let _runtime_roots = interp.scope_runtime_roots_guard();
         let mut re = make("(a)(b)", "", &mut interp);
         let mut text = Value::undefined();
@@ -2535,7 +2594,7 @@ mod tests {
 
     #[test]
     fn exec_result_arrays_use_native_rooted_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let _runtime_roots = interp.scope_runtime_roots_guard();
         let mut re = make("(?<first>a)(b)", "d", &mut interp);
         let mut text = Value::undefined();
@@ -2569,7 +2628,7 @@ mod tests {
 
     #[test]
     fn exec_global_walks_through_text() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let _runtime_roots = interp.scope_runtime_roots_guard();
         let mut re = make("a", "g", &mut interp);
         let mut text = Value::undefined();

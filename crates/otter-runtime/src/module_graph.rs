@@ -163,7 +163,7 @@ struct ModuleGraph {
     entry_url: String,
     nodes: BTreeMap<String, ModuleNode>,
     /// `module_url → verbatim source text` for every real compiled
-    /// module, forwarded to the interpreter so `Error.prototype.stack`
+    /// module, retained in the linked code payload so `Error.prototype.stack`
     /// and `util.getCallSites` can resolve frame spans to `(line, col)`.
     module_sources: BTreeMap<String, otter_resource::SharedSource>,
 }
@@ -1721,12 +1721,8 @@ fn load_program_inner(
             url: entry_url.clone(),
             message: e.to_string(),
         })?;
-        otter_resource::SharedSource::read_utf8(loader.resource_account(), &mut file).map_err(
-            |error| LoaderError::Load {
-                url: entry_url.clone(),
-                message: format!("bounded source read failed: {error}"),
-            },
-        )?
+        otter_resource::SharedSource::read_utf8(loader.resource_account(), &mut file)
+            .map_err(|error| LoaderError::source_error(&entry_url, error))?
     };
     if let (Some(timings), Some(started)) = (&mut timings, load_started) {
         timings.load_time_ns = duration_ns(started.elapsed());

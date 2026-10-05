@@ -21,6 +21,10 @@
 //!     https://tc39.es/ecma262/#sec-number.prototype.tofixed
 //!   ) — `digits` clamped to `0..=20`.
 //!
+//!
+//! Native coercion and callback failures finish through the existing committed
+//! completion owner: local allocation refusals retain their authored native OOM
+//! facts, while completed terminal failures retain exact detail and source frames.
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-number-prototype-object>
 
@@ -87,25 +91,9 @@ fn coerce_numeric_args(
                         crate::abstract_ops::ToPrimitiveHint::Number,
                     )
                 });
-                match result {
-                    Ok(primitive) => outputs.push(scope.value(primitive)),
-                    Err(crate::VmError::Uncaught) => {
-                        let value = match scope.context().interp_mut().take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(message)) => message,
-                            _ => Default::default(),
-                        };
-                        return Err(NativeError::Thrown {
-                            name,
-                            message: value.into(),
-                        });
-                    }
-                    Err(error) => {
-                        return Err(NativeError::TypeError {
-                            name,
-                            reason: error.to_string(),
-                        });
-                    }
-                }
+                let primitive = result
+                    .map_err(|error| error.into_native(scope.context().interp_mut(), name))?;
+                outputs.push(scope.value(primitive));
             } else {
                 outputs.push(input);
             }
@@ -173,9 +161,8 @@ fn to_string_radix(
                     reason: "missing execution context".to_string(),
                 })?;
             let number = ctx.with_turn_parts(|interp, stack| {
-                crate::coerce::to_number_or_throw(interp, stack, &exec, &v).map_err(|error| {
-                    crate::native_function::vm_to_native_error(interp, error, name)
-                })
+                crate::coerce::to_number_or_throw(interp, stack, &exec, &v)
+                    .map_err(|error| error.into_native(interp, name))
             })?;
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };

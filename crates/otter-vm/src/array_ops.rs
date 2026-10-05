@@ -18,11 +18,15 @@
 //! - `Array.from` roots its copied arguments for the complete observable
 //!   iterator/property/callback sequence and reloads them after GC safepoints.
 //!
+//! - Typed iterator step/close and completed mapper calls retain terminal
+//!   disposition; local array construction and property errors still throw.
+//!
 //! # See also
 //! - [`crate::array_statics`]
 //! - [`crate::executable`]
 
 use crate::activation_stack::ActivationStack;
+use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
@@ -40,21 +44,30 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
+    ) -> Result<(), CommittedValueError> {
+        let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
         let top_idx = stack.len() - 1;
-        let args = collect_array_args(&stack[top_idx], operands)?;
+        let args =
+            collect_array_args(&stack[top_idx], operands).map_err(CommittedValueError::Fatal)?;
 
-        stack[top_idx].advance_pc()?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(CommittedValueError::Fatal)?;
         let result = match op {
-            Op::ArrayConstruct => self.array_construct_stack_rooted(stack, &args)?,
+            Op::ArrayConstruct => self
+                .array_construct_stack_rooted(stack, &args)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
             Op::ArrayFrom => self.array_from_sync(stack, context, Value::undefined(), &args)?,
-            Op::ArrayOf => self.array_of_stack_rooted(stack, &args)?,
-            _ => return Err(VmError::InvalidOperand),
+            Op::ArrayOf => self
+                .array_of_stack_rooted(stack, &args)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         };
 
-        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-        write_register(frame, dst, result)
+        let frame = stack
+            .last_mut()
+            .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        write_register(frame, dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// §23.1.1.1 `Array(...values)`.
@@ -107,7 +120,7 @@ impl Interpreter {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         let arr = array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)?;
-        self.register_array_prototype_override(arr);
+        let arr = self.register_array_prototype_override(arr)?;
         let arr =
             initialize_array_length_with_roots(arr, &mut self.gc_heap, len, &mut external_visit)?;
         Ok(Value::array(arr))
@@ -155,7 +168,7 @@ impl Interpreter {
         context: &ExecutionContext,
         constructor: Value,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let items = args.first().copied().unwrap_or_else(Value::undefined);
         let map_fn = args.get(1).copied().unwrap_or_else(Value::undefined);
         let this_arg = args.get(2).copied().unwrap_or_else(Value::undefined);
@@ -168,9 +181,9 @@ impl Interpreter {
             let map_fn = interp.escape_scoped(map_fn_handle);
             let has_map = !map_fn.is_undefined();
             if has_map && !interp.is_callable_runtime(&map_fn) {
-                return Err(
-                    interp.err_type(("Array.from mapFn must be callable".to_string()).into())
-                );
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    ("Array.from mapFn must be callable".to_string()).into(),
+                )));
             }
             let constructor = interp.escape_scoped(constructor_handle);
             let use_ctor = !constructor.is_undefined()
@@ -182,14 +195,21 @@ impl Interpreter {
                 && let Some(arr) = items.as_array()
             {
                 let len = crate::array::len(arr, &interp.gc_heap);
-                let result = interp.scoped_array(scope, len)?;
+                let result = interp
+                    .scoped_array(scope, len)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let value_handle = interp.scoped_value(scope, Value::undefined());
                 for index in 0..len {
                     let items = interp.escape_scoped(items_handle);
-                    let arr = items.as_array().ok_or(VmError::InvalidOperand)?;
+                    let arr = items
+                        .as_array()
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let value = crate::array::get(arr, &interp.gc_heap, index);
                     interp.set_scoped(value_handle, value);
-                    interp.scoped_set_index(scope, result, index, value_handle)?;
+                    interp
+                        .scoped_set_index(scope, result, index, value_handle)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 return Ok(interp.escape_scoped(result));
             }
@@ -197,7 +217,7 @@ impl Interpreter {
             if !has_map && let Some(arr) = items.as_array() {
                 let len = crate::array::len(arr, &interp.gc_heap);
                 let anchor_base = interp.push_iteration_anchor(items) - 1;
-                let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                let result = (|interp: &mut Self| -> Result<Value, CommittedValueError> {
                     let constructor = interp.escape_scoped(constructor_handle);
                     let target = interp.array_from_make_target(
                         stack,
@@ -209,7 +229,10 @@ impl Interpreter {
                     let target_anchor = interp.push_iteration_anchor(target) - 1;
                     for index in 0..len {
                         let items = interp.escape_scoped(items_handle);
-                        let arr = items.as_array().ok_or(VmError::InvalidOperand)?;
+                        let arr = items
+                            .as_array()
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                         let value = crate::array::get(arr, &interp.gc_heap, index);
                         let target = interp.iteration_anchor(target_anchor);
                         interp.create_data_property_or_throw(
@@ -247,7 +270,7 @@ impl Interpreter {
                 let iterator_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
                 match interp.ordinary_get_value(
                     stack,
-                    context,
+                    Some(context),
                     items,
                     items,
                     &VmPropertyKey::Symbol(iterator_sym),
@@ -256,22 +279,24 @@ impl Interpreter {
                     VmGetOutcome::Value(value) => value,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let items = interp.escape_scoped(items_handle);
-                        interp.run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            items,
-                            SmallVec::new(),
-                        )?
+                        interp
+                            .run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &getter,
+                                items,
+                                SmallVec::new(),
+                            )
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             };
 
             if !iterator_method.is_undefined() && !iterator_method.is_null() {
                 if !interp.is_callable_runtime(&iterator_method) {
-                    return Err(
-                        interp.err_type(("iterator method is not callable".to_string()).into())
-                    );
+                    return Err(CommittedValueError::JavaScript(
+                        interp.err_type(("iterator method is not callable".to_string()).into()),
+                    ));
                 }
                 // Step 6 — iterator path. `A = Construct(C)` (no length
                 // forwarded; the count is unknown up front) or a fresh
@@ -283,7 +308,7 @@ impl Interpreter {
                 // Constructing the target allocates: the iterator method rides
                 // an anchor across it.
                 interp.push_iteration_anchor(iterator_method);
-                let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                let result = (|interp: &mut Self| -> Result<Value, CommittedValueError> {
                     let constructor = interp.escape_scoped(constructor_handle);
                     let target = interp.array_from_make_target(
                         stack,
@@ -319,8 +344,8 @@ impl Interpreter {
                         ) {
                             Ok(Some(value)) => value,
                             Ok(None) => break Ok(()),
-                            // `next` threw: the iterator is already done, no close.
-                            Err(err) => break Err(err),
+                            // `next` completed abruptly: it is done, and no close follows.
+                            Err(error) => break Err(error),
                         };
                         let mapped = if has_map {
                             let map_fn = interp.iteration_anchor(anchor_base + 1);
@@ -329,15 +354,25 @@ impl Interpreter {
                             cb_args.push(value);
                             cb_args.push(Value::number_f64(k as f64));
                             match interp.run_callable_sync_rooted(
-                                stack, context, &map_fn, this_arg, cb_args,
+                                stack,
+                                Some(context),
+                                &map_fn,
+                                this_arg,
+                                cb_args,
                             ) {
                                 Ok(mapped) => mapped,
                                 Err(err) => {
+                                    let error = CommittedValueError::completed_call(err);
+                                    let CommittedValueError::JavaScript(err) = error else {
+                                        break Err(error);
+                                    };
                                     let iterator = interp.iteration_anchor(iterator_anchor);
                                     interp.iterator_close_discarding_completion(
-                                        stack, context, &iterator,
-                                    );
-                                    break Err(err);
+                                        stack,
+                                        Some(context),
+                                        &iterator,
+                                    )?;
+                                    break Err(CommittedValueError::JavaScript(err));
                                 }
                             }
                         } else {
@@ -352,8 +387,15 @@ impl Interpreter {
                             &k.to_string(),
                             mapped,
                         ) {
-                            interp.iterator_close_discarding_completion(stack, context, &iterator);
-                            break Err(err);
+                            let CommittedValueError::JavaScript(err) = err else {
+                                break Err(err);
+                            };
+                            interp.iterator_close_discarding_completion(
+                                stack,
+                                Some(context),
+                                &iterator,
+                            )?;
+                            break Err(CommittedValueError::JavaScript(err));
                         }
                         k = k.saturating_add(1);
                     };
@@ -375,13 +417,13 @@ impl Interpreter {
             // Step 4 — array-like path.
             let items = interp.escape_scoped(items_handle);
             if items.is_undefined() || items.is_null() {
-                return Err(interp.err_type(
+                return Err(CommittedValueError::JavaScript(interp.err_type(
                     ("Array.from requires an iterable or array-like".to_string()).into(),
-                ));
+                )));
             }
             let length_value = match interp.ordinary_get_value(
                 stack,
-                context,
+                Some(context),
                 items,
                 items,
                 &VmPropertyKey::String("length"),
@@ -390,16 +432,19 @@ impl Interpreter {
                 VmGetOutcome::Value(value) => value,
                 VmGetOutcome::InvokeGetter { getter } => {
                     let items = interp.escape_scoped(items_handle);
-                    interp.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &getter,
-                        items,
-                        SmallVec::new(),
-                    )?
+                    interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            items,
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?
                 }
             };
-            let len = to_length(&length_value, &interp.gc_heap)?;
+            let len = to_length(&length_value, &interp.gc_heap)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let constructor = interp.escape_scoped(constructor_handle);
             let target =
                 interp.array_from_make_target(stack, context, use_ctor, &constructor, Some(len))?;
@@ -411,24 +456,32 @@ impl Interpreter {
             interp.push_iteration_anchor(interp.escape_scoped(items_handle));
             interp.push_iteration_anchor(interp.escape_scoped(map_fn_handle));
             interp.push_iteration_anchor(interp.escape_scoped(this_arg_handle));
-            let result = (|interp: &mut Self| -> Result<Value, VmError> {
+            let result = (|interp: &mut Self| -> Result<Value, CommittedValueError> {
                 for index in 0..len {
                     let key = VmPropertyKey::OwnedString(index.to_string());
                     let items = interp.iteration_anchor(anchor_base + ITEMS);
-                    let value =
-                        match interp.ordinary_get_value(stack, context, items, items, &key, 0)? {
-                            VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => {
-                                let items = interp.iteration_anchor(anchor_base + ITEMS);
-                                interp.run_callable_sync_rooted(
+                    let value = match interp.ordinary_get_value(
+                        stack,
+                        Some(context),
+                        items,
+                        items,
+                        &key,
+                        0,
+                    )? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            let items = interp.iteration_anchor(anchor_base + ITEMS);
+                            interp
+                                .run_callable_sync_rooted(
                                     stack,
-                                    context,
+                                    Some(context),
                                     &getter,
                                     items,
                                     SmallVec::new(),
-                                )?
-                            }
-                        };
+                                )
+                                .map_err(CommittedValueError::completed_call)?
+                        }
+                    };
                     let mapped = if has_map {
                         let map_fn = interp.iteration_anchor(anchor_base + MAP_FN);
                         let this_arg = interp.iteration_anchor(anchor_base + THIS_ARG);
@@ -436,7 +489,14 @@ impl Interpreter {
                         cb_args.push(value);
                         cb_args.push(Value::number_f64(index as f64));
                         interp
-                            .run_callable_sync_rooted(stack, context, &map_fn, this_arg, cb_args)?
+                            .run_callable_sync_rooted(
+                                stack,
+                                Some(context),
+                                &map_fn,
+                                this_arg,
+                                cb_args,
+                            )
+                            .map_err(CommittedValueError::completed_call)?
                     } else {
                         value
                     };
@@ -474,13 +534,14 @@ impl Interpreter {
         use_ctor: bool,
         constructor: &Value,
         len: Option<usize>,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         if use_ctor {
             let mut ctor_args: SmallVec<[Value; 8]> = SmallVec::new();
             if let Some(len) = len {
                 ctor_args.push(Value::number_f64(len as f64));
             }
-            self.run_construct_sync_rooted(stack, context, constructor, *constructor, ctor_args)
+            self.run_construct_sync_rooted(stack, context, constructor, *constructor, ctor_args, 0)
+                .map_err(CommittedValueError::completed_call)
         } else {
             // §23.1.2.1 step 6.b — the non-constructor branch is
             // `ArrayCreate(len)`, which rejects a length past 2^32 - 1
@@ -488,13 +549,14 @@ impl Interpreter {
             if let Some(len) = len
                 && len > u32::MAX as usize
             {
-                return Err(self.err_range(("Invalid array length".to_string()).into()));
+                return Err(CommittedValueError::JavaScript(
+                    self.err_range(("Invalid array length".to_string()).into()),
+                ));
             }
-            Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
-                Vec::new(),
-                &[],
-                &[],
-            )?))
+            Ok(Value::array(
+                self.alloc_runtime_rooted_array_from_values(Vec::new(), &[], &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+            ))
         }
     }
 
@@ -516,14 +578,14 @@ impl Interpreter {
         context: &ExecutionContext,
         constructor: Value,
         items: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let use_ctor = !constructor.is_undefined()
             && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
         let len = items.len();
         let target =
             self.array_from_make_target(stack, context, use_ctor, &constructor, Some(len))?;
         let anchor_base = self.push_iteration_anchor(target) - 1;
-        let result = (|interp: &mut Self| -> Result<(), VmError> {
+        let result = (|interp: &mut Self| -> Result<(), CommittedValueError> {
             for (k, value) in items.iter().enumerate() {
                 interp.create_data_property_or_throw(
                     stack,
@@ -607,55 +669,58 @@ mod tests {
     };
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(BytecodeModule {
-            module: "array-ops-test.ts".to_string(),
-            template_sites: Vec::new(),
-            source_kind: BcSourceKind::TypeScript,
-            functions: vec![Function {
-                id: 0,
-                name: "<main>".to_string(),
-                span: (0, 0),
-                locals: 0,
-                scratch: 0,
-                param_count: 0,
-                length: 0,
-                scopes: Vec::new(),
-                is_strict: false,
-                is_arrow: false,
-                is_method: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_derived_constructor: false,
-                is_module: false,
-                needs_arguments: false,
-                uses_arguments_callee: false,
-                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
-                mapped_argument_bindings: Vec::new(),
-                source_text_range: None,
-                source_text_span: None,
-                module_url: String::new(),
-                contains_direct_eval: false,
-                code: vec![Instruction {
-                    pc: 0,
-                    op: Op::ReturnUndefined,
-                    operands: vec![],
-                }]
-                .into(),
-                spans: vec![SpanEntry {
-                    pc: 0,
+        ExecutionContext::from_module(
+            BytecodeModule {
+                module: "array-ops-test.ts".to_string(),
+                template_sites: Vec::new(),
+                source_kind: BcSourceKind::TypeScript,
+                functions: vec![Function {
+                    id: 0,
+                    name: "<main>".to_string(),
                     span: (0, 0),
+                    locals: 0,
+                    scratch: 0,
+                    param_count: 0,
+                    length: 0,
+                    scopes: Vec::new(),
+                    is_strict: false,
+                    is_arrow: false,
+                    is_method: false,
+                    has_rest: false,
+                    is_async: false,
+                    is_generator: false,
+                    is_async_generator: false,
+                    is_derived_constructor: false,
+                    is_module: false,
+                    needs_arguments: false,
+                    uses_arguments_callee: false,
+                    arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                    mapped_argument_bindings: Vec::new(),
+                    source_text_range: None,
+                    source_text_span: None,
+                    module_url: String::new(),
+                    contains_direct_eval: false,
+                    code: vec![Instruction {
+                        pc: 0,
+                        op: Op::ReturnUndefined,
+                        operands: vec![],
+                    }]
+                    .into(),
+                    spans: vec![SpanEntry {
+                        pc: 0,
+                        span: (0, 0),
+                    }],
+                    handlers: Vec::new(),
+                    number_hint_sites: Vec::new(),
+                    class_hint_sites: Vec::new(),
                 }],
-                handlers: Vec::new(),
-                number_hint_sites: Vec::new(),
-                class_hint_sites: Vec::new(),
-            }],
-            constants: Vec::new(),
-            module_resolutions: Vec::new(),
-            module_inits: Vec::new(),
-            function_source: None,
-        })
+                constants: Vec::new(),
+                module_resolutions: Vec::new(),
+                module_inits: Vec::new(),
+                function_source: None,
+            },
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
@@ -713,7 +778,7 @@ mod tests {
 
     #[test]
     fn array_from_sync_uses_runtime_rooted_result_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::number_i32(7)],
@@ -748,7 +813,7 @@ mod tests {
 
     #[test]
     fn array_of_uses_stack_rooted_result_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let module = empty_module();
         let mut stack: crate::test_support::FrameChainFixture =
             crate::test_support::FrameChainFixture::new();
@@ -776,7 +841,7 @@ mod tests {
 
     #[test]
     fn array_construct_length_uses_stack_rooted_shell_and_growth() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let module = empty_module();
         let mut stack: crate::test_support::FrameChainFixture =
             crate::test_support::FrameChainFixture::new();
@@ -812,7 +877,7 @@ mod tests {
 
     #[test]
     fn array_construct_moderate_length_materializes_dense_holes() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let module = empty_module();
         let mut stack: crate::test_support::FrameChainFixture =
             crate::test_support::FrameChainFixture::new();

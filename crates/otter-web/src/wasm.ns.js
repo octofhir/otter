@@ -1,13 +1,14 @@
 // The JS half of the native `WebAssembly` namespace. Runs as a
 // `#[js_namespace]` factory glue: `__ns` is the `WebAssembly` namespace
 // object and `natives` is the private compute bag (here it holds
-// `buildInstance`, moved off the public object by the macro).
+// `buildInstance`, `errorClasses` and `jsTag`, moved off the public
+// object by the macro).
 //
 // This layer owns the pieces that are cleaner in JS: relocating the
 // native reference-type constructors onto the namespace, the
-// `CompileError` / `LinkError` / `RuntimeError` subclasses, the
+// original intrinsic `CompileError` / `LinkError` / `RuntimeError` classes, the
 // synchronous `Instance` class (which delegates to the native
-// `buildInstance` and re-types its thrown error), the namespace brand,
+// `buildInstance`), the namespace brand,
 // and the streaming forms that read a `Response` body before delegating
 // to the native `compile` / `instantiate`.
 
@@ -30,47 +31,17 @@ relocate('Table');
 relocate('Tag');
 relocate('Exception');
 
-// The three error interfaces are ordinary Error subclasses.
-function makeErrorClass(name) {
-  const ErrorClass = class extends Error {
-    constructor(message) {
-      super(message);
-    }
-  };
-  Object.defineProperty(ErrorClass, 'name', { value: name, configurable: true });
-  Object.defineProperty(ErrorClass.prototype, 'name', {
-    value: name,
-    writable: true,
-    enumerable: false,
-    configurable: true,
-  });
-  return ErrorClass;
-}
-__ns.CompileError = makeErrorClass('CompileError');
-__ns.LinkError = makeErrorClass('LinkError');
-__ns.RuntimeError = makeErrorClass('RuntimeError');
+// The constructors and prototypes are the original traced realm intrinsics.
+// Engine failures never read these replaceable namespace properties.
+const errorClasses = natives.errorClasses();
+__ns.CompileError = errorClasses.CompileError;
+__ns.LinkError = errorClasses.LinkError;
+__ns.RuntimeError = errorClasses.RuntimeError;
 
-// `new WebAssembly.Instance(module, importObject)` is synchronous. The
-// native `buildInstance` returns a fully formed instance object (own
-// `exports`, prototype set to this class's prototype); a link/compile/
-// runtime failure arrives as a `"<Kind>: <message>"` string that is
-// re-typed into the matching error class here.
+// Synchronous native instantiation preserves actual classes and user throws.
 const Instance = class Instance {
   constructor(module, importObject) {
-    try {
-      return natives.buildInstance(module, importObject);
-    } catch (error) {
-      const text = String((error && error.message) || error);
-      const separator = text.indexOf(': ');
-      if (separator > 0) {
-        const kind = text.slice(0, separator);
-        const rest = text.slice(separator + 2);
-        if (kind === 'LinkError') throw new __ns.LinkError(rest);
-        if (kind === 'CompileError') throw new __ns.CompileError(rest);
-        if (kind === 'RuntimeError') throw new __ns.RuntimeError(rest);
-      }
-      throw error;
-    }
+    return natives.buildInstance(module, importObject);
   }
 };
 Object.defineProperty(Instance.prototype, Symbol.toStringTag, {
@@ -88,17 +59,6 @@ Object.defineProperty(__ns, '__instanceProto', {
   writable: false,
   enumerable: false,
   configurable: true,
-});
-
-// A wasm export that `throw`s surfaces its exception to native code, which
-// re-throws the JS value through this hidden re-thrower so the value's
-// identity (a `WebAssembly.Exception`, or the original JS value carried by a
-// `JSTag` exception) is preserved as the caught value.
-Object.defineProperty(__ns, '__throw', {
-  value: (value) => { throw value; },
-  writable: false,
-  enumerable: false,
-  configurable: false,
 });
 
 // `WebAssembly.JSTag` is the realm-wide well-known tag (parameters:

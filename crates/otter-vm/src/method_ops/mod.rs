@@ -15,6 +15,8 @@
 //!   execution can re-enter the VM.
 //! - Callback receivers, elements, accumulators, and results stay in traced
 //!   anchors across moving GC; nested calls share the current activation stack.
+//! - Generator resumption keeps the completed-body disposition through
+//!   direct method dispatch; local decode/preparation errors still throw.
 //! - Ordinary method lookup still funnels into `Interpreter::invoke`.
 //! - Composite root scopes forward pre-collection observation flushing before
 //!   any receiver, argument or interpreter root can move.
@@ -24,6 +26,7 @@
 //! - [`crate::executable`]
 
 use crate::activation_stack::ActivationStack;
+use crate::runtime_activation::CommittedValueError;
 use smallvec::SmallVec;
 
 use crate::function_ops::BindMetadataGet;
@@ -261,11 +264,22 @@ impl Interpreter {
     pub(crate) fn generator_resume_request(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         g: crate::generator::JsGenerator,
         recv_value: Value,
         kind: GeneratorResumeKind,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
+        let source_function = g.with_body(&self.gc_heap, |body| {
+            body.frame.as_ref().map(|frame| frame.header.function_id)
+        });
+        let source = match source_function {
+            Some(function_id) => Some(
+                self.function_context(context, function_id)
+                    .map_err(CommittedValueError::Fatal)?,
+            ),
+            None => context.cloned(),
+        };
+        let context = source.as_ref();
         let is_async_gen = g.is_async(&self.gc_heap);
         if is_async_gen {
             // §27.6.3 — async-generator method calls always
@@ -278,13 +292,13 @@ impl Interpreter {
                 | GeneratorResumeKind::Return(v)
                 | GeneratorResumeKind::Throw(v) => self.push_iteration_anchor(*v) - 1,
             };
-            let cap = match promise_dispatch::PromiseBuilder::with_context(context.clone())
+            let cap = match promise_dispatch::PromiseBuilder::with_context(context.cloned())
                 .capability_stack_rooted(self, stack, &[&recv_value], &[])
             {
                 Ok(cap) => cap,
                 Err(err) => {
                     self.pop_iteration_anchors_to(arg_slot);
-                    return Err(err.into());
+                    return Err(CommittedValueError::JavaScript(err.into()));
                 }
             };
             let arg = self.iteration_anchor(arg_slot);
@@ -327,7 +341,7 @@ impl Interpreter {
         context: &ExecutionContext,
         name: &str,
         args: &mut [Value],
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // Each entry is `(arg index, is_int)` in the exact order the spec
         // coerces the operands, so observable side effects (and abrupt
         // completions) fire in spec order — e.g. `lastIndexOf` runs
@@ -378,7 +392,7 @@ impl Interpreter {
                 .copied()
                 .map(|value| interp.scoped_value(scope, value))
                 .collect();
-            let result = (|| -> Result<(), VmError> {
+            let result = (|| -> Result<(), CommittedValueError> {
                 for &(idx, is_int) in order {
                     let Some(&handle) = handles.get(idx) else {
                         continue;
@@ -436,7 +450,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl Into<crate::executable::OperandView<'a>>,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.do_call_method_value_inner(stack, context, MethodOperands::Decoded(operands.into()))
     }
 
@@ -448,7 +462,7 @@ impl Interpreter {
         context: &ExecutionContext,
         function: &CodeBlock,
         instruction: &CodeBlockInstruction,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.do_call_method_value_inner(
             stack,
             context,
@@ -459,28 +473,73 @@ impl Interpreter {
         )
     }
 
+    /// Observe the resolved native value at the existing source, without [[Get]]
+    /// replay or retaining a movable callback across invocation.
+    fn record_method_native_call(
+        &mut self,
+        operands: MethodOperands<'_>,
+        method: Value,
+        receiver: Value,
+    ) {
+        if self.jit_hook.is_none() || method.as_native_function().is_none() {
+            return;
+        }
+        let source = match operands {
+            MethodOperands::Execution {
+                function,
+                instruction,
+            } => Some((function, instruction)),
+            #[cfg(test)]
+            MethodOperands::Decoded(_) => None,
+        };
+        if let Some((function, instruction)) = source {
+            self.record_resolved_call_feedback(
+                function,
+                instruction.instruction_pc,
+                function.id,
+                method,
+                receiver,
+            );
+        }
+    }
+
     fn do_call_method_value_inner(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: MethodOperands<'_>,
-    ) -> Result<(), VmError> {
-        let dst = operands.register(0).ok_or(VmError::InvalidOperand)?;
-        let recv_reg = operands.register(1).ok_or(VmError::InvalidOperand)?;
-        let name_idx = operands.const_index(2).ok_or(VmError::InvalidOperand)?;
-        let argc = operands.const_index(3).ok_or(VmError::InvalidOperand)? as usize;
+    ) -> Result<(), CommittedValueError> {
+        let dst = operands
+            .register(0)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
+        let recv_reg = operands
+            .register(1)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
+        let name_idx = operands
+            .const_index(2)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
+        let argc = operands
+            .const_index(3)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)? as usize;
         let top_idx = stack.len() - 1;
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
             return result;
         }
-        let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+        let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+            .map_err(CommittedValueError::Fatal)?;
         if recv_value.is_nullish() {
             let label = if recv_value.is_null() {
                 "null"
             } else {
                 "undefined"
             };
-            return Err(self.err_type((format!("Cannot read properties of {label}")).into()));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type((format!("Cannot read properties of {label}")).into()),
+            ));
         }
         // Resolving the call-site IC id here installs the same cache the JIT
         // method-call stub reads (shared site space).
@@ -504,8 +563,13 @@ impl Interpreter {
                     crate::object::load_own_data_slot_by_shape(obj, &self.gc_heap, hit)
                 && self.is_callable_runtime(&method)
             {
-                stack[top_idx].advance_pc()?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(CommittedValueError::Fatal)?;
+                self.record_method_native_call(operands, method, recv_value);
+                return self
+                    .invoke(stack, context, &method, recv_value, arg_values, dst)
+                    .map_err(CommittedValueError::JavaScript);
             }
             // The receiver shape moved on or the slot is no longer a callable
             // data property; drop the cache and fall back to full resolution,
@@ -540,9 +604,15 @@ impl Interpreter {
                 self.method_feedback
                     .install_method_ic(method_site, MethodCallIc::Ordinary(hit));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         // Ordinary dense array whose `%Array.prototype%` slot is untouched —
         // dispatch the builtin directly (see `try_fast_array_proto_method`).
@@ -554,16 +624,20 @@ impl Interpreter {
             arg_values.as_slice(),
         ) {
             let value = result?;
-            stack[top_idx].advance_pc()?;
-            write_register(&mut stack[top_idx], dst, value)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         if let Some(result) =
             self.try_collection_method_call_ic(method_site, recv_value, arg_values.as_slice())
         {
-            let value = result?;
-            stack[top_idx].advance_pc()?;
-            write_register(&mut stack[top_idx], dst, value)?;
+            let value = result.map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         // One atomized key for the whole slow path: the builtin arms read its
@@ -571,7 +645,8 @@ impl Interpreter {
         // shape walk compares ids instead of string content.
         let method_key = context
             .property_atom_for_function(stack[top_idx].function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
+            .ok_or(VmError::InvalidOperand)
+            .map_err(CommittedValueError::Fatal)?;
         let name = method_key.name();
         if let Some(result) = self.try_fast_array_proto_method(
             stack,
@@ -582,8 +657,10 @@ impl Interpreter {
             arg_values.as_slice(),
         ) {
             let value = result?;
-            stack[top_idx].advance_pc()?;
-            write_register(&mut stack[top_idx], dst, value)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         // Ordinary Map/Set whose realm prototype slot is the untouched builtin —
@@ -595,9 +672,11 @@ impl Interpreter {
             name,
             arg_values.as_slice(),
         ) {
-            let value = result?;
-            stack[top_idx].advance_pc()?;
-            write_register(&mut stack[top_idx], dst, value)?;
+            let value = result.map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         // The method-resolution IC and the fast array/collection probes above can
@@ -605,17 +684,24 @@ impl Interpreter {
         // the receiver, so the `recv_value` cached at entry is a moved-from handle
         // for every resolution branch below. Re-read the live handle from its
         // register once, here, before any of them run.
-        let recv_value = *read_register(&stack[top_idx], recv_reg)?;
+        let recv_value =
+            *read_register(&stack[top_idx], recv_reg).map_err(CommittedValueError::Fatal)?;
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
 
         // Iterator-helpers / generator resumption methods always
@@ -640,13 +726,19 @@ impl Interpreter {
                 self.is_callable_runtime(&method)
             };
             if route_to_invoke {
-                stack[top_idx].advance_pc()?;
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(CommittedValueError::Fatal)?;
                 let (recv_value, arg_values) =
-                    read_method_call_values(stack, top_idx, operands, argc)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                    read_method_call_values(stack, top_idx, operands, argc)
+                        .map_err(CommittedValueError::Fatal)?;
+                self.record_method_native_call(operands, method, recv_value);
+                return self
+                    .invoke(stack, context, &method, recv_value, arg_values, dst)
+                    .map_err(CommittedValueError::JavaScript);
             }
             if recv_value.is_iterator() {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
             // Generator natives fall through to the resume block,
             // which threads the resumption argument and the async
@@ -658,7 +750,8 @@ impl Interpreter {
         // resume helper drives a sub-dispatch until the next Yield
         // or completion.
         // <https://tc39.es/ecma262/#sec-generator-objects>
-        let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+        let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+            .map_err(CommittedValueError::Fatal)?;
         if let Some(g) = recv_value.as_generator() {
             let kind = match name {
                 "next" => Some(GeneratorResumeKind::Next(
@@ -673,10 +766,14 @@ impl Interpreter {
                 _ => None,
             };
             if let Some(kind) = kind {
-                let result = self.generator_resume_request(stack, context, g, recv_value, kind)?;
-                let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                write_register(frame, dst, result)?;
-                frame.advance_pc()?;
+                let result =
+                    self.generator_resume_request(stack, Some(context), g, recv_value, kind)?;
+                let frame = stack
+                    .last_mut()
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(CommittedValueError::Fatal)?;
+                write_register(frame, dst, result).map_err(CommittedValueError::Fatal)?;
+                frame.advance_pc().map_err(CommittedValueError::Fatal)?;
                 return Ok(());
             }
         }
@@ -712,10 +809,15 @@ impl Interpreter {
                 && let Some(method) = crate::object::get(proto, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
             {
-                stack[top_idx].advance_pc()?;
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(CommittedValueError::Fatal)?;
                 let (recv_value, arg_values) =
-                    read_method_call_values(stack, top_idx, operands, argc)?;
-                self.invoke(stack, context, &method, recv_value, arg_values, dst)?;
+                    read_method_call_values(stack, top_idx, operands, argc)
+                        .map_err(CommittedValueError::Fatal)?;
+                self.record_method_native_call(operands, method, recv_value);
+                self.invoke(stack, context, &method, recv_value, arg_values, dst)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 return Ok(());
             }
         }
@@ -726,30 +828,42 @@ impl Interpreter {
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
         if name == "charCodeAt"
             && recv_value.is_string()
-            && let Some(result) =
-                self.try_fast_primitive_string_char_code_at(recv_value, arg_values.as_slice())?
+            && let Some(result) = self
+                .try_fast_primitive_string_char_code_at(recv_value, arg_values.as_slice())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         {
-            stack[top_idx].advance_pc()?;
-            write_register(&mut stack[top_idx], dst, result)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
         if name == "toString"
             && recv_value.is_number()
-            && let Some(result) =
-                self.try_fast_primitive_number_to_string(recv_value, arg_values.as_slice())?
+            && let Some(result) = self
+                .try_fast_primitive_number_to_string(recv_value, arg_values.as_slice())
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         {
-            stack[top_idx].advance_pc()?;
-            write_register(&mut stack[top_idx], dst, result)?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            write_register(&mut stack[top_idx], dst, result).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
@@ -777,10 +891,16 @@ impl Interpreter {
                     && let Some(method) = self.resolve_method_ic(proto, atomized_key, slot)
                     && self.is_callable_runtime(&method)
                 {
-                    stack[top_idx].advance_pc()?;
+                    stack[top_idx]
+                        .advance_pc()
+                        .map_err(CommittedValueError::Fatal)?;
                     let (recv_value, arg_values) =
-                        read_method_call_values(stack, top_idx, operands, argc)?;
-                    return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                        read_method_call_values(stack, top_idx, operands, argc)
+                            .map_err(CommittedValueError::Fatal)?;
+                    self.record_method_native_call(operands, method, recv_value);
+                    return self
+                        .invoke(stack, context, &method, recv_value, arg_values, dst)
+                        .map_err(CommittedValueError::JavaScript);
                 }
                 // No IC site (an interpreted call site allocates none) or an IC
                 // miss: resolve the method directly on the intrinsic prototype
@@ -794,37 +914,51 @@ impl Interpreter {
                 let key = VmPropertyKey::String(name);
                 let method = match self.ordinary_get_value(
                     stack,
-                    context,
+                    Some(context),
                     Value::object(proto),
                     recv_value,
                     &key,
                     0,
                 )? {
                     VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &getter,
-                        recv_value,
-                        SmallVec::new(),
-                    )?,
+                    VmGetOutcome::InvokeGetter { getter } => self
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            recv_value,
+                            SmallVec::new(),
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 };
                 if self.is_callable_runtime(&method) {
-                    stack[top_idx].advance_pc()?;
+                    stack[top_idx]
+                        .advance_pc()
+                        .map_err(CommittedValueError::Fatal)?;
                     let (recv_value, arg_values) =
-                        read_method_call_values(stack, top_idx, operands, argc)?;
-                    return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                        read_method_call_values(stack, top_idx, operands, argc)
+                            .map_err(CommittedValueError::Fatal)?;
+                    self.record_method_native_call(operands, method, recv_value);
+                    return self
+                        .invoke(stack, context, &method, recv_value, arg_values, dst)
+                        .map_err(CommittedValueError::JavaScript);
                 }
             }
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         // §9.4.5 integer-indexed exotic: an own expando property shadows
         // any inherited prototype method.
@@ -832,11 +966,17 @@ impl Interpreter {
             self.typed_array_own_method_value_for_call(stack, context, recv_value, name)?
         {
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
         if recv_value.is_typed_array() {
@@ -844,11 +984,17 @@ impl Interpreter {
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
         // `replaceAll` with a callable replaceValue dispatch through
@@ -879,12 +1025,18 @@ impl Interpreter {
                     .unwrap_or_else(Value::undefined);
                 if method.as_native_function().is_none() {
                     if !self.is_callable_runtime(&method) {
-                        return Err(VmError::NotCallable);
+                        return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                     }
-                    stack[top_idx].advance_pc()?;
+                    stack[top_idx]
+                        .advance_pc()
+                        .map_err(CommittedValueError::Fatal)?;
                     let (recv_value, arg_values) =
-                        read_method_call_values(stack, top_idx, operands, argc)?;
-                    return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                        read_method_call_values(stack, top_idx, operands, argc)
+                            .map_err(CommittedValueError::Fatal)?;
+                    self.record_method_native_call(operands, method, recv_value);
+                    return self
+                        .invoke(stack, context, &method, recv_value, arg_values, dst)
+                        .map_err(CommittedValueError::JavaScript);
                 }
             }
             // §22.1.3.18 step 7 — `searchString = ? ToString(searchValue)`.
@@ -893,7 +1045,8 @@ impl Interpreter {
             // callback-capable implementation. The coercion runs user code
             // and the coerced string allocates, so the receiver and the
             // actuals are read from their registers only afterwards.
-            let (_, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+            let (_, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
             let needs_coerce = !arg_values.first().is_some_and(|v| v.is_string());
             let mut coerced_search = None;
             if needs_coerce {
@@ -909,9 +1062,9 @@ impl Interpreter {
                 } else if let Some(b) = original.as_big_int() {
                     b.to_decimal_string(&self.gc_heap)
                 } else if original.is_symbol() {
-                    return Err(self.err_type(
+                    return Err(CommittedValueError::JavaScript(self.err_type(
                         ("Cannot convert a Symbol value to a string".to_string()).into(),
-                    ));
+                    )));
                 } else if original.is_object()
                     || original.is_array()
                     || original.is_function()
@@ -940,22 +1093,23 @@ impl Interpreter {
                     } else if let Some(b) = primitive.as_big_int() {
                         b.to_decimal_string(&self.gc_heap)
                     } else if primitive.is_symbol() {
-                        return Err(self.err_type(
+                        return Err(CommittedValueError::JavaScript(self.err_type(
                             ("Cannot convert a Symbol value to a string".to_string()).into(),
-                        ));
+                        )));
                     } else {
-                        return Err(VmError::TypeMismatch);
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
                 } else {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
-                coerced_search = Some(Value::string(JsString::from_str(
-                    &coerced,
-                    self.gc_heap_mut(),
-                )?));
+                coerced_search = Some(Value::string(
+                    JsString::from_str(&coerced, self.gc_heap_mut())
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
+                ));
             }
             let (recv_value, mut coerced_args) =
-                read_method_call_values(stack, top_idx, operands, argc)?;
+                read_method_call_values(stack, top_idx, operands, argc)
+                    .map_err(CommittedValueError::Fatal)?;
             let recv_value = if recv_value.is_string() {
                 recv_value
             } else {
@@ -963,12 +1117,15 @@ impl Interpreter {
                     .as_object()
                     .and_then(|obj| crate::object::string_data(obj, &self.gc_heap))
                     .map(Value::string)
-                    .ok_or(VmError::InvalidOperand)?
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
             };
             if let (Some(search), Some(slot)) = (coerced_search, coerced_args.first_mut()) {
                 *slot = search;
             }
-            stack[top_idx].advance_pc()?;
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
             let result = self.dispatch_string_callable_replace(
                 stack,
                 context,
@@ -977,7 +1134,7 @@ impl Interpreter {
                 name == "replaceAll",
             )?;
             let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
+            write_register(frame, dst, result).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
         if recv_value.as_function().is_some() || recv_value.as_closure(&self.gc_heap).is_some() {
@@ -987,7 +1144,7 @@ impl Interpreter {
                     .get_method_value_for_call(context, stack, recv_value, method_key)?
                     .unwrap_or_else(Value::undefined);
                 if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 if is_function_intrinsic
                     && is_function_prototype_intrinsic_value(
@@ -997,7 +1154,8 @@ impl Interpreter {
                     )
                 {
                     let (recv_value, arg_values) =
-                        read_method_call_values(stack, top_idx, operands, argc)?;
+                        read_method_call_values(stack, top_idx, operands, argc)
+                            .map_err(CommittedValueError::Fatal)?;
                     return self.dispatch_function_method(
                         stack,
                         context,
@@ -1007,10 +1165,16 @@ impl Interpreter {
                         dst,
                     );
                 }
-                stack[top_idx].advance_pc()?;
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(CommittedValueError::Fatal)?;
                 let (recv_value, arg_values) =
-                    read_method_call_values(stack, top_idx, operands, argc)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                    read_method_call_values(stack, top_idx, operands, argc)
+                        .map_err(CommittedValueError::Fatal)?;
+                self.record_method_native_call(operands, method, recv_value);
+                return self
+                    .invoke(stack, context, &method, recv_value, arg_values, dst)
+                    .map_err(CommittedValueError::JavaScript);
             }
         }
         // Functions / closures inherit Object.prototype-style
@@ -1026,30 +1190,48 @@ impl Interpreter {
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         if recv_value.as_native_function().is_some() && object_prototype_dispatch_method_name(name)
         {
             let method = self.ordinary_method_value_for_call(stack, context, recv_value, name)?;
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         if recv_value.as_bound_function().is_some() && object_prototype_dispatch_method_name(name) {
             let method = self.ordinary_method_value_for_call(stack, context, recv_value, name)?;
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
         // §7.1.18 ToObject — `String.prototype.hasOwnProperty(idx)`,
         // `(0).propertyIsEnumerable("toString")`, etc. inherit
@@ -1070,34 +1252,49 @@ impl Interpreter {
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
 
         if self.is_callable_runtime(&recv_value)
             && !recv_value.is_proxy()
             && function_prototype_intrinsic_name(name)
-            && self.callable_has_own_function_method_shadow(context, recv_value, name)?
+            && self
+                .callable_has_own_function_method_shadow(context, recv_value, name)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
         {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, method_key)?
                 .unwrap_or_else(Value::undefined);
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
 
         if self.is_callable_runtime(&recv_value)
             && !recv_value.is_proxy()
             && function_prototype_intrinsic_name(name)
         {
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
             return self.dispatch_function_method(
                 stack,
                 context,
@@ -1113,12 +1310,13 @@ impl Interpreter {
         // install, fast array/collection dispatch) can allocate and a young-gen
         // scavenge then relocates the receiver, leaving the cached `recv_value`
         // pointing at a moved-from object whose prototype walk misses the method.
-        let recv_value = *read_register(&stack[top_idx], recv_reg)?;
+        let recv_value =
+            *read_register(&stack[top_idx], recv_reg).map_err(CommittedValueError::Fatal)?;
         if let Some(method) =
             self.get_method_value_for_call(context, stack, recv_value, method_key)?
         {
             if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
+                return Err(CommittedValueError::JavaScript(VmError::NotCallable));
             }
             if self.is_callable_runtime(&recv_value)
                 && function_prototype_intrinsic_name(name)
@@ -1129,7 +1327,8 @@ impl Interpreter {
                 )
             {
                 let (recv_value, arg_values) =
-                    read_method_call_values(stack, top_idx, operands, argc)?;
+                    read_method_call_values(stack, top_idx, operands, argc)
+                        .map_err(CommittedValueError::Fatal)?;
                 return self.dispatch_function_method(
                     stack,
                     context,
@@ -1139,9 +1338,15 @@ impl Interpreter {
                     dst,
                 );
             }
-            stack[top_idx].advance_pc()?;
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
         }
 
         // `Function.prototype.{call, apply, bind, toString}` on a
@@ -1150,7 +1355,8 @@ impl Interpreter {
         if matches!(name, "call" | "apply" | "bind" | "toString")
             && self.is_callable_runtime(&recv_value)
         {
-            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
             return self.dispatch_function_method(
                 stack,
                 context,
@@ -1161,7 +1367,9 @@ impl Interpreter {
             );
         }
 
-        Err(self.err_unknown_intrinsic(name.to_string().into()))
+        Err(CommittedValueError::JavaScript(
+            self.err_unknown_intrinsic(name.to_string().into()),
+        ))
     }
 
     /// `true` when `recv_value`'s prototype defines a builtin method
@@ -1241,7 +1449,7 @@ impl Interpreter {
         recv: Value,
         name: &str,
         args: &[Value],
-    ) -> Option<Result<Value, VmError>> {
+    ) -> Option<Result<Value, CommittedValueError>> {
         let arr = recv.as_array()?;
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
             return None;
@@ -1288,7 +1496,7 @@ impl Interpreter {
         site: usize,
         recv: Value,
         args: &[Value],
-    ) -> Option<Result<Value, VmError>> {
+    ) -> Option<Result<Value, CommittedValueError>> {
         let ic = match self.method_feedback.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
@@ -1625,8 +1833,9 @@ impl Interpreter {
         dst: u16,
         recv_reg: u16,
         value_bits: u64,
-    ) -> Result<(), VmError> {
-        let recv = *read_register(&stack[frame_index], recv_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let recv = *read_register(&stack[frame_index], recv_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let value = Value::from_bits(value_bits);
         let result = self.dispatch_array_builtin_rooted(
             stack,
@@ -1635,7 +1844,8 @@ impl Interpreter {
             recv,
             &[value],
         )?;
-        write_register(&mut stack[frame_index], dst, result)?;
+        write_register(&mut stack[frame_index], dst, result)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -1646,7 +1856,7 @@ impl Interpreter {
         tag: crate::array_prototype::ArrayMethodTag,
         recv: Value,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let roots = ArrayFastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
             recv,
@@ -1837,15 +2047,34 @@ impl Interpreter {
         context: &ExecutionContext,
         recv_value: Value,
         name: &str,
-    ) -> Result<Value, VmError> {
-        let key = VmPropertyKey::String(name);
-        match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
-            VmGetOutcome::Value(value) => Ok(value),
-            VmGetOutcome::InvokeGetter { getter } => {
-                let args: SmallVec<[Value; 8]> = SmallVec::new();
-                self.run_callable_sync_rooted(stack, context, &getter, recv_value, args)
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, recv_value);
+
+            let key = VmPropertyKey::String(name);
+            match interp.ordinary_get_value(
+                stack,
+                Some(context),
+                recv_value,
+                recv_value,
+                &key,
+                0,
+            )? {
+                VmGetOutcome::Value(value) => Ok(value),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let args: SmallVec<[Value; 8]> = SmallVec::new();
+                    interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(receiver_root),
+                            args,
+                        )
+                        .map_err(CommittedValueError::completed_call)
+                }
             }
-        }
+        })
     }
 
     fn typed_array_own_method_value_for_call(
@@ -1854,7 +2083,7 @@ impl Interpreter {
         context: &ExecutionContext,
         recv_value: Value,
         name: &str,
-    ) -> Result<Option<Value>, VmError> {
+    ) -> Result<Option<Value>, CommittedValueError> {
         let Some(t) = recv_value.as_typed_array(&self.gc_heap) else {
             return Ok(None);
         };
@@ -1864,15 +2093,16 @@ impl Interpreter {
         match crate::object::lookup_own(bag, &self.gc_heap, name) {
             crate::object::PropertyLookup::Data { value, .. } => Ok(Some(value)),
             crate::object::PropertyLookup::Accessor { getter, .. } => match getter {
-                Some(getter) if self.is_callable_runtime(&getter) => {
-                    Ok(Some(self.run_callable_sync_rooted(
+                Some(getter) if self.is_callable_runtime(&getter) => Ok(Some(
+                    self.run_callable_sync_rooted(
                         stack,
-                        context,
+                        Some(context),
                         &getter,
                         recv_value,
                         SmallVec::new(),
-                    )?))
-                }
+                    )
+                    .map_err(CommittedValueError::completed_call)?,
+                )),
                 _ => Ok(Some(Value::undefined())),
             },
             crate::object::PropertyLookup::Absent => Ok(None),
@@ -1889,141 +2119,205 @@ impl Interpreter {
         stack: &mut ActivationStack,
         recv_value: Value,
         method_key: AtomizedPropertyKey<'_>,
-    ) -> Result<Option<Value>, VmError> {
-        let name = method_key.name();
-        // A bound function is an exotic object whose ordinary `[[Get]]`
-        // resolves own metadata first and then walks `%Function.prototype%`
-        // (§10.4.1.3); `ordinary_get_value` owns that walk, so it routes with
-        // the property-bearing receivers below.
-        let is_property_bearing = recv_value.is_object()
-            || recv_value.as_bound_function().is_some()
-            || recv_value.is_proxy()
-            || recv_value.is_array()
-            || recv_value.is_regexp()
-            || recv_value.is_map()
-            || recv_value.is_set()
-            || recv_value.is_weak_map()
-            || recv_value.is_weak_set()
-            || recv_value.is_weak_ref()
-            || recv_value.is_finalization_registry()
-            || recv_value.is_promise()
-            || recv_value.is_array_buffer()
-            || recv_value.is_data_view()
-            || recv_value.is_typed_array()
-            || recv_value.is_intl()
-            || recv_value.is_generator()
-            || recv_value.is_iterator();
-        if is_property_bearing {
-            // Property-bearing exotic receivers route through
-            // `ordinary_get_value` so user-installed own properties
-            // shadow the builtin fallback path.
-            let key = VmPropertyKey::atom(method_key);
-            return match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
-                VmGetOutcome::Value(value) => Ok(Some(value)),
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    Ok(Some(self.run_callable_sync_rooted(
-                        stack, context, &getter, recv_value, args,
-                    )?))
-                }
-            };
-        }
-        if let Some(c) = recv_value.as_class_constructor() {
-            let value = if name == "prototype" {
-                Value::object(c.prototype(&self.gc_heap))
-            } else {
-                // Go through the full `[[Get]]` ladder so accessor
-                // descriptors on static members invoke their getter.
-                let statics = Value::object(c.statics(&self.gc_heap));
+    ) -> Result<Option<Value>, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, recv_value);
+
+            let name = method_key.name();
+            // A bound function is an exotic object whose ordinary `[[Get]]`
+            // resolves own metadata first and then walks `%Function.prototype%`
+            // (§10.4.1.3); `ordinary_get_value` owns that walk, so it routes with
+            // the property-bearing receivers below.
+            let is_property_bearing = recv_value.is_object()
+                || recv_value.as_bound_function().is_some()
+                || recv_value.is_proxy()
+                || recv_value.is_array()
+                || recv_value.is_regexp()
+                || recv_value.is_map()
+                || recv_value.is_set()
+                || recv_value.is_weak_map()
+                || recv_value.is_weak_set()
+                || recv_value.is_weak_ref()
+                || recv_value.is_finalization_registry()
+                || recv_value.is_promise()
+                || recv_value.is_array_buffer()
+                || recv_value.is_data_view()
+                || recv_value.is_typed_array()
+                || recv_value.is_intl()
+                || recv_value.is_generator()
+                || recv_value.is_iterator();
+            if is_property_bearing {
+                // Property-bearing exotic receivers route through
+                // `ordinary_get_value` so user-installed own properties
+                // shadow the builtin fallback path.
                 let key = VmPropertyKey::atom(method_key);
-                match self.ordinary_get_value(stack, context, statics, statics, &key, 0)? {
-                    VmGetOutcome::Value(v) => v,
+                return match interp.ordinary_get_value(
+                    stack,
+                    Some(context),
+                    recv_value,
+                    recv_value,
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(value) => Ok(Some(value)),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, statics, args)?
-                    }
-                }
-            };
-            return Ok(Some(value));
-        }
-        if let Some(fid) = recv_value.as_function().or_else(|| {
-            recv_value
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        }) {
-            // §10.1.8 OrdinaryGet on a callable receiver — user
-            // properties resolve via the function-properties side table.
-            let owner = recv_value.as_closure(&self.gc_heap);
-            return Ok(Some(self.function_property_get_with_receiver(
-                stack,
-                context,
-                owner,
-                fid,
-                Some(recv_value),
-                name,
-            )?));
-        }
-        if let Some(native) = recv_value.as_native_function() {
-            // Native callable receiver — own properties first, then the
-            // §10.1.8 OrdinaryGet walk up `%Function.prototype%` /
-            // `%Object.prototype%` so a user-installed method (e.g.
-            // `Function.prototype.slice = String.prototype.slice`)
-            // resolves for calls exactly as it does for property reads.
-            let value = match native
-                .own_property_descriptor(&mut self.gc_heap, name)?
-                .map(|desc| descriptor_value(&desc))
-            {
-                Some(value) => value,
-                // §10.1.8 — explicit [[Prototype]] chain (per-kind
-                // TypedArray ctor → %TypedArray%) resolves inherited
-                // statics before the %Function.prototype% fallback.
-                None => match native.prototype_override(&self.gc_heap) {
-                    Some(parent) => {
-                        let key = VmPropertyKey::String(name);
-                        match self
-                            .ordinary_get_value(stack, context, parent, recv_value, &key, 0)?
-                        {
-                            VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => self
+                        Ok(Some(
+                            interp
                                 .run_callable_sync_rooted(
                                     stack,
-                                    context,
+                                    Some(context),
                                     &getter,
-                                    recv_value,
-                                    SmallVec::new(),
-                                )?,
+                                    interp.escape_scoped(receiver_root),
+                                    args,
+                                )
+                                .map_err(CommittedValueError::completed_call)?,
+                        ))
+                    }
+                };
+            }
+            if let Some(c) = recv_value.as_class_constructor() {
+                let value = if name == "prototype" {
+                    Value::object(c.prototype(&interp.gc_heap))
+                } else {
+                    // Go through the full `[[Get]]` ladder so accessor
+                    // descriptors on static members invoke their getter.
+                    let statics = Value::object(c.statics(&interp.gc_heap));
+                    let key = VmPropertyKey::atom(method_key);
+                    match interp.ordinary_get_value(
+                        stack,
+                        Some(context),
+                        statics,
+                        statics,
+                        &key,
+                        0,
+                    )? {
+                        VmGetOutcome::Value(v) => v,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            interp
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    Some(context),
+                                    &getter,
+                                    Value::object(
+                                        interp
+                                            .escape_scoped(receiver_root)
+                                            .as_class_constructor()
+                                            .ok_or(CommittedValueError::Fatal(
+                                                VmError::InvalidOperand,
+                                            ))?
+                                            .statics(&interp.gc_heap),
+                                    ),
+                                    args,
+                                )
+                                .map_err(CommittedValueError::completed_call)?
                         }
                     }
-                    None => self
-                        .load_function_prototype_method(name)
-                        .or_else(|| self.load_object_prototype_method(name))
-                        .unwrap_or_else(Value::undefined),
-                },
-            };
-            return Ok(Some(value));
-        }
-        if recv_value.is_boolean()
-            || recv_value.is_number()
-            || recv_value.is_string()
-            || recv_value.is_symbol()
-            || recv_value.is_big_int()
-            || recv_value.is_temporal()
-        {
-            // §7.1.18 ToObject — primitive receivers walk the
-            // constructor's prototype to surface inherited
-            // `Object.prototype.*` methods.
-            let key = VmPropertyKey::String(name);
-            return match self.ordinary_get_value(stack, context, recv_value, recv_value, &key, 0)? {
-                VmGetOutcome::Value(value) => Ok(Some(value)),
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    Ok(Some(self.run_callable_sync_rooted(
-                        stack, context, &getter, recv_value, args,
-                    )?))
-                }
-            };
-        }
-        Ok(None)
+                };
+                return Ok(Some(value));
+            }
+            if let Some(fid) = recv_value.as_function().or_else(|| {
+                recv_value
+                    .as_closure(&interp.gc_heap)
+                    .map(|c| c.cached_function_id)
+            }) {
+                // §10.1.8 OrdinaryGet on a callable receiver — user
+                // properties resolve via the function-properties side table.
+                let owner = recv_value.as_closure(&interp.gc_heap);
+                return Ok(Some(interp.function_property_get_with_receiver(
+                    stack,
+                    context,
+                    owner,
+                    fid,
+                    Some(recv_value),
+                    name,
+                )?));
+            }
+            if let Some(native) = recv_value.as_native_function() {
+                // Native callable receiver — own properties first, then the
+                // §10.1.8 OrdinaryGet walk up `%Function.prototype%` /
+                // `%Object.prototype%` so a user-installed method (e.g.
+                // `Function.prototype.slice = String.prototype.slice`)
+                // resolves for calls exactly as it does for property reads.
+                let value = match native
+                    .own_property_descriptor(&mut interp.gc_heap, name)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                    .map(|desc| descriptor_value(&desc))
+                {
+                    Some(value) => value,
+                    // §10.1.8 — explicit [[Prototype]] chain (per-kind
+                    // TypedArray ctor → %TypedArray%) resolves inherited
+                    // statics before the %Function.prototype% fallback.
+                    None => match native.prototype_override(&interp.gc_heap) {
+                        Some(parent) => {
+                            let key = VmPropertyKey::String(name);
+                            match interp.ordinary_get_value(
+                                stack,
+                                Some(context),
+                                parent,
+                                recv_value,
+                                &key,
+                                0,
+                            )? {
+                                VmGetOutcome::Value(value) => value,
+                                VmGetOutcome::InvokeGetter { getter } => interp
+                                    .run_callable_sync_rooted(
+                                        stack,
+                                        Some(context),
+                                        &getter,
+                                        interp.escape_scoped(receiver_root),
+                                        SmallVec::new(),
+                                    )
+                                    .map_err(CommittedValueError::completed_call)?,
+                            }
+                        }
+                        None => interp
+                            .load_function_prototype_method(name)
+                            .or_else(|| interp.load_object_prototype_method(name))
+                            .unwrap_or_else(Value::undefined),
+                    },
+                };
+                return Ok(Some(value));
+            }
+            if recv_value.is_boolean()
+                || recv_value.is_number()
+                || recv_value.is_string()
+                || recv_value.is_symbol()
+                || recv_value.is_big_int()
+                || recv_value.is_temporal()
+            {
+                // §7.1.18 ToObject — primitive receivers walk the
+                // constructor's prototype to surface inherited
+                // `Object.prototype.*` methods.
+                let key = VmPropertyKey::String(name);
+                return match interp.ordinary_get_value(
+                    stack,
+                    Some(context),
+                    recv_value,
+                    recv_value,
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(value) => Ok(Some(value)),
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        Ok(Some(
+                            interp
+                                .run_callable_sync_rooted(
+                                    stack,
+                                    Some(context),
+                                    &getter,
+                                    interp.escape_scoped(receiver_root),
+                                    args,
+                                )
+                                .map_err(CommittedValueError::completed_call)?,
+                        ))
+                    }
+                };
+            }
+            Ok(None)
+        })
     }
 
     /// §22.1.3.18 / §22.1.3.19 callable replaceValue path. Walks
@@ -2038,16 +2332,18 @@ impl Interpreter {
         receiver: &Value,
         args: &SmallVec<[Value; 8]>,
         replace_all: bool,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         use crate::string::JsString;
         self.with_handle_scope(|interp, scope| {
             let recv = receiver
                 .as_string(&interp.gc_heap)
-                .ok_or(VmError::TypeMismatch)?;
+                .ok_or(VmError::TypeMismatch)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let needle = args
                 .first()
                 .and_then(|v| v.as_string(&interp.gc_heap))
-                .ok_or(VmError::TypeMismatch)?;
+                .ok_or(VmError::TypeMismatch)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let callback = args.get(1).copied().unwrap_or_else(Value::undefined);
             let recv_units = recv.to_utf16_vec(&interp.gc_heap);
             let needle_units = needle.to_utf16_vec(&interp.gc_heap);
@@ -2070,13 +2366,15 @@ impl Interpreter {
                         Value::number_f64(pos as f64),
                         interp.escape_scoped(recv_handle),
                     ];
-                    let raw = interp.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &interp.escape_scoped(callback_handle),
-                        Value::undefined(),
-                        cb_args,
-                    )?;
+                    let raw = interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &interp.escape_scoped(callback_handle),
+                            Value::undefined(),
+                            cb_args,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                     interp.set_scoped(result_handle, raw);
                     let raw = interp.escape_scoped(result_handle);
                     let replacement = if let Some(string) = raw.as_string(&interp.gc_heap) {
@@ -2084,7 +2382,8 @@ impl Interpreter {
                     } else {
                         let display = raw.display_string(&interp.gc_heap);
                         JsString::from_str(&display, &mut interp.gc_heap)
-                            .map_err(|_| VmError::TypeMismatch)?
+                            .map_err(crate::oom_to_vm)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                             .to_utf16_vec(&interp.gc_heap)
                     };
                     out.extend_from_slice(&replacement);
@@ -2094,7 +2393,8 @@ impl Interpreter {
                 }
                 return Ok(Value::string(
                     JsString::from_utf16_units(&out, &mut interp.gc_heap)
-                        .map_err(|_| VmError::TypeMismatch)?,
+                        .map_err(crate::oom_to_vm)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 ));
             }
             if recv_units.len() < needle_len {
@@ -2110,13 +2410,15 @@ impl Interpreter {
                         Value::number_f64(cursor as f64),
                         interp.escape_scoped(recv_handle),
                     ];
-                    let raw = interp.run_callable_sync_rooted(
-                        stack,
-                        context,
-                        &interp.escape_scoped(callback_handle),
-                        Value::undefined(),
-                        cb_args,
-                    )?;
+                    let raw = interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &interp.escape_scoped(callback_handle),
+                            Value::undefined(),
+                            cb_args,
+                        )
+                        .map_err(CommittedValueError::completed_call)?;
                     interp.set_scoped(result_handle, raw);
                     let raw = interp.escape_scoped(result_handle);
                     let replacement = if let Some(string) = raw.as_string(&interp.gc_heap) {
@@ -2124,7 +2426,8 @@ impl Interpreter {
                     } else {
                         let display = raw.display_string(&interp.gc_heap);
                         JsString::from_str(&display, &mut interp.gc_heap)
-                            .map_err(|_| VmError::TypeMismatch)?
+                            .map_err(crate::oom_to_vm)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                             .to_utf16_vec(&interp.gc_heap)
                     };
                     out.extend_from_slice(&replacement);
@@ -2140,7 +2443,8 @@ impl Interpreter {
             out.extend_from_slice(&recv_units[cursor..]);
             Ok(Value::string(
                 JsString::from_utf16_units(&out, &mut interp.gc_heap)
-                    .map_err(|_| VmError::TypeMismatch)?,
+                    .map_err(crate::oom_to_vm)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
             ))
         })
     }
@@ -2185,9 +2489,10 @@ impl Interpreter {
         callee: Value,
         this_arg: Value,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let owned: SmallVec<[Value; 8]> = args.iter().copied().collect();
-        self.run_callable_sync_rooted(stack, context, &callee, this_arg, owned)
+        self.run_callable_sync_rooted(stack, Some(context), &callee, this_arg, owned)
+            .map_err(CommittedValueError::completed_call)
     }
 
     pub(crate) fn typed_array_callback_value_dispatch(
@@ -2197,23 +2502,24 @@ impl Interpreter {
         t: &crate::binary::typed_array::JsTypedArray,
         name: &str,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let ta_value = Value::typed_array(*t);
         // §23.2.4.4 ValidateTypedArray — a detached or out-of-bounds
         // backing buffer (a fixed-length view whose resizable buffer
         // shrank past its end) throws before the length read or any
         // callback runs.
         if t.is_out_of_bounds(&self.gc_heap) {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 (format!(
                     "TypedArray.prototype.{name} called on a detached or out-of-bounds ArrayBuffer"
                 ))
                 .into(),
-            ));
+            )));
         }
         let len = t.length(&self.gc_heap);
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-        let callee = require_callable(args.first())?;
+        let callee = require_callable(args.first())
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
 
         // Every value reused after a callback lives in the collector-traced
         // iteration-anchor range. Callback execution may move the receiver,
@@ -2232,15 +2538,18 @@ impl Interpreter {
         self.push_iteration_anchor(Value::undefined());
         self.push_iteration_anchor(args.get(1).copied().unwrap_or(Value::undefined()));
 
-        let result = (|interp: &mut Self| -> Result<Value, VmError> {
+        let result = (|interp: &mut Self| -> Result<Value, CommittedValueError> {
             match name {
                 "forEach" => {
                     for i in 0..len {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         interp.run_typed_array_callback(
                             stack,
@@ -2264,7 +2573,8 @@ impl Interpreter {
                     let t = interp
                         .iteration_anchor(anchor_base + RECEIVER)
                         .as_typed_array(&interp.gc_heap)
-                        .ok_or(VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let a = interp.typed_array_species_create(stack, context, &t, len)?;
                     let a_value = Value::typed_array(a);
                     let target_kind = a.kind();
@@ -2273,8 +2583,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let mapped = interp.run_typed_array_callback(
                             stack,
@@ -2293,12 +2606,14 @@ impl Interpreter {
                             &mut interp.gc_heap,
                             target_kind,
                             &mapped,
-                        )?;
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, coerced);
                         let output = interp
                             .iteration_anchor(output_anchor)
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                         let coerced = interp.iteration_anchor(anchor_base + CARRIED);
                         output.set(&mut interp.gc_heap, i, &coerced);
                     }
@@ -2316,8 +2631,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let selected = interp.run_typed_array_callback(
                             stack,
@@ -2340,7 +2658,8 @@ impl Interpreter {
                     let t = interp
                         .iteration_anchor(anchor_base + RECEIVER)
                         .as_typed_array(&interp.gc_heap)
-                        .ok_or(VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let a = interp.typed_array_species_create(stack, context, &t, kept_len)?;
                     let target_kind = a.kind();
                     let output_anchor = interp.push_iteration_anchor(Value::typed_array(a)) - 1;
@@ -2350,12 +2669,14 @@ impl Interpreter {
                             &mut interp.gc_heap,
                             target_kind,
                             &kept,
-                        )?;
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, coerced);
                         let output = interp
                             .iteration_anchor(output_anchor)
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                         let coerced = interp.iteration_anchor(anchor_base + CARRIED);
                         output.set(&mut interp.gc_heap, i, &coerced);
                     }
@@ -2367,8 +2688,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2394,8 +2718,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2421,8 +2748,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2448,8 +2778,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2475,8 +2808,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2502,8 +2838,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let hit = interp.run_typed_array_callback(
                             stack,
@@ -2527,7 +2866,7 @@ impl Interpreter {
                     let has_init = args.len() >= 2;
                     let reverse = name == "reduceRight";
                     if len == 0 && !has_init {
-                        return Err(VmError::TypeMismatch);
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
                     let step: i64 = if reverse { -1 } else { 1 };
                     let start_idx = if has_init {
@@ -2537,8 +2876,11 @@ impl Interpreter {
                         let t = interp
                             .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let seed_value = interp.ta_live_element(&t, seed)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let seed_value = interp
+                            .ta_live_element(&t, seed)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, seed_value);
                         seed as i64 + step
                     };
@@ -2547,8 +2889,11 @@ impl Interpreter {
                         let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
                         let t = ta_value
                             .as_typed_array(&interp.gc_heap)
-                            .ok_or(VmError::InvalidOperand)?;
-                        let value = interp.ta_live_element(&t, i as usize)?;
+                            .ok_or(VmError::InvalidOperand)
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        let value = interp
+                            .ta_live_element(&t, i as usize)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         interp.set_iteration_anchor(anchor_base + ELEMENT, value);
                         let next_acc = interp.run_typed_array_callback(
                             stack,
@@ -2567,7 +2912,7 @@ impl Interpreter {
                     }
                     Ok(interp.iteration_anchor(anchor_base + CARRIED))
                 }
-                _ => Err(VmError::TypeMismatch),
+                _ => Err(CommittedValueError::JavaScript(VmError::TypeMismatch)),
             }
         })(self);
         self.pop_iteration_anchors_to(anchor_base);
@@ -2586,7 +2931,7 @@ impl Interpreter {
         context: &ExecutionContext,
         exemplar: &crate::binary::typed_array::JsTypedArray,
         length: usize,
-    ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
+    ) -> Result<crate::binary::typed_array::JsTypedArray, CommittedValueError> {
         let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
         argv.push(Value::number(NumberValue::from_f64(length as f64)));
         self.typed_array_create_via_species(stack, context, exemplar, argv, Some(length))
@@ -2607,7 +2952,7 @@ impl Interpreter {
         exemplar: &crate::binary::typed_array::JsTypedArray,
         argv: SmallVec<[Value; 8]>,
         min_length: Option<usize>,
-    ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
+    ) -> Result<crate::binary::typed_array::JsTypedArray, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let exemplar_handle = interp.scoped_value(scope, Value::typed_array(*exemplar));
             let argv_handles: SmallVec<[crate::Local<'_>; 8]> = argv
@@ -2618,14 +2963,15 @@ impl Interpreter {
             let exemplar_value = interp.escape_scoped(exemplar_handle);
             let exemplar = exemplar_value
                 .as_typed_array(&interp.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let default_name = exemplar.kind().name();
             let Some(default_ctor) =
                 crate::object::get(interp.global_this, &interp.gc_heap, default_name)
             else {
-                return Err(
-                    interp.err_type((format!("%{default_name}% intrinsic is missing")).into())
-                );
+                return Err(CommittedValueError::JavaScript(interp.err_type(
+                    (format!("%{default_name}% intrinsic is missing")).into(),
+                )));
             };
             let default_ctor_handle = interp.scoped_value(scope, default_ctor);
             let constructor = interp.species_constructor_value(
@@ -2640,33 +2986,41 @@ impl Interpreter {
                 .map(|handle| interp.escape_scoped(*handle))
                 .collect();
             let constructor = interp.escape_scoped(constructor_handle);
-            let result = interp.run_construct_sync_rooted(
-                stack,
-                context,
-                &constructor,
-                constructor,
-                rooted_argv,
-            )?;
+            let result = interp
+                .run_construct_sync_rooted(
+                    stack,
+                    context,
+                    &constructor,
+                    constructor,
+                    rooted_argv,
+                    0,
+                )
+                .map_err(CommittedValueError::completed_call)?;
             let result_handle = interp.scoped_value(scope, result);
             let result = interp.escape_scoped(result_handle);
             let Some(new_ta) = result.as_typed_array(&interp.gc_heap) else {
-                return Err(interp.err_type(
+                return Err(CommittedValueError::JavaScript(interp.err_type(
                     ("Species constructor did not return a TypedArray".to_string()).into(),
-                ));
+                )));
             };
             if new_ta.buffer(&interp.gc_heap).is_detached(&interp.gc_heap) {
-                return Err(interp.err_type(
-                    ("Species constructor returned a TypedArray with a detached buffer"
-                        .to_string())
-                    .into(),
+                return Err(CommittedValueError::JavaScript(
+                    interp.err_type(
+                        ("Species constructor returned a TypedArray with a detached buffer"
+                            .to_string())
+                        .into(),
+                    ),
                 ));
             }
             if let Some(min) = min_length
                 && new_ta.length(&interp.gc_heap) < min
             {
-                return Err(interp.err_type(
-                    ("Species constructor returned a TypedArray smaller than required".to_string())
+                return Err(CommittedValueError::JavaScript(
+                    interp.err_type(
+                        ("Species constructor returned a TypedArray smaller than required"
+                            .to_string())
                         .into(),
+                    ),
                 ));
             }
             Ok(new_ta)
@@ -2689,7 +3043,7 @@ impl Interpreter {
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let source_handle = interp.scoped_value(scope, Value::typed_array(*t));
             let arg_handles: SmallVec<[crate::Local<'_>; 2]> = args
@@ -2701,7 +3055,8 @@ impl Interpreter {
             let source = interp
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             // §23.2.3.27 step 4 — `[[ArrayLength]]` is `0` for a detached
             // buffer; `subarray` does not itself throw on detachment.
             let src_len = source.length(&interp.gc_heap) as i64;
@@ -2727,7 +3082,8 @@ impl Interpreter {
             let source = interp
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let buffer = source.buffer(&interp.gc_heap);
             let bpe = source.kind().bytes_per_element();
             // §23.2.3.30 step 13 — [[ByteOffset]] is the construction-time
@@ -2766,7 +3122,7 @@ impl Interpreter {
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         args: &[Value],
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let source_handle = interp.scoped_value(scope, Value::typed_array(*t));
             let arg_handles: SmallVec<[crate::Local<'_>; 2]> = args
@@ -2778,11 +3134,12 @@ impl Interpreter {
             let source = interp
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if source.is_out_of_bounds(&interp.gc_heap) {
-                return Err(interp.err_type(
+                return Err(CommittedValueError::JavaScript(interp.err_type(
                     ("Cannot slice a detached or out-of-bounds TypedArray".to_string()).into(),
-                ));
+                )));
             }
             let len = source.length(&interp.gc_heap) as i64;
             let start_arg = arg_handles
@@ -2807,7 +3164,8 @@ impl Interpreter {
             let source = interp
                 .escape_scoped(source_handle)
                 .as_typed_array(&interp.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let a = interp.typed_array_species_create(stack, context, &source, count)?;
             let result_handle = interp.scoped_value(scope, Value::typed_array(a));
             if count > 0 {
@@ -2819,13 +3177,14 @@ impl Interpreter {
                 let source = interp
                     .escape_scoped(source_handle)
                     .as_typed_array(&interp.gc_heap)
-                    .ok_or(VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 if source.is_out_of_bounds(&interp.gc_heap) {
-                    return Err(interp.err_type(
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("TypedArray buffer was detached or resized out of bounds during slice"
                             .to_string())
                         .into(),
-                    ));
+                    )));
                 }
                 let base = k as usize;
                 let cur_len = source.length(&interp.gc_heap);
@@ -2833,12 +3192,14 @@ impl Interpreter {
                 let target_kind = interp
                     .escape_scoped(result_handle)
                     .as_typed_array(&interp.gc_heap)
-                    .ok_or(VmError::InvalidOperand)?
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
                     .kind();
                 let source_kind = interp
                     .escape_scoped(source_handle)
                     .as_typed_array(&interp.gc_heap)
-                    .ok_or(VmError::InvalidOperand)?
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?
                     .kind();
                 if source_kind == target_kind {
                     // §23.2.3.27 step 15.e — a same-type transfer copies
@@ -2848,11 +3209,13 @@ impl Interpreter {
                     let source = interp
                         .escape_scoped(source_handle)
                         .as_typed_array(&interp.gc_heap)
-                        .ok_or(VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let target = interp
                         .escape_scoped(result_handle)
                         .as_typed_array(&interp.gc_heap)
-                        .ok_or(VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let bpe = source_kind.bytes_per_element();
                     let src_start = source.byte_offset(&interp.gc_heap) + base * bpe;
                     let dst_start = target.byte_offset(&interp.gc_heap);
@@ -2895,22 +3258,26 @@ impl Interpreter {
                     let source = interp
                         .escape_scoped(source_handle)
                         .as_typed_array(&interp.gc_heap)
-                        .ok_or(VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let value = source
                         .get(&mut interp.gc_heap, base + n)
-                        .map_err(crate::oom_to_vm)?;
+                        .map_err(crate::oom_to_vm)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     interp.set_scoped(element_handle, value);
                     let value = interp.escape_scoped(element_handle);
                     let coerced = crate::binary::dispatch::coerce_element_for_store(
                         &mut interp.gc_heap,
                         target_kind,
                         &value,
-                    )?;
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     interp.set_scoped(element_handle, coerced);
                     let target = interp
                         .escape_scoped(result_handle)
                         .as_typed_array(&interp.gc_heap)
-                        .ok_or(VmError::InvalidOperand)?;
+                        .ok_or(VmError::InvalidOperand)
+                        .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                     let coerced = interp.escape_scoped(element_handle);
                     target.set(&mut interp.gc_heap, n, &coerced);
                 }
@@ -2928,7 +3295,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         arg: Option<&Value>,
-    ) -> Result<f64, VmError> {
+    ) -> Result<f64, CommittedValueError> {
         let n = match arg {
             None => return Ok(0.0),
             Some(v) if v.is_undefined() => return Ok(0.0),
@@ -2951,15 +3318,18 @@ impl Interpreter {
         name: &str,
         args: SmallVec<[Value; 8]>,
         dst: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let top_idx = stack.len() - 1;
         match name {
             "call" => {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
-                stack[top_idx].advance_pc()?;
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
             "apply" => {
                 let mut iter = args.into_iter();
@@ -2971,8 +3341,11 @@ impl Interpreter {
                         self.create_list_from_array_like(stack, context, arg_array)?
                     }
                 };
-                stack[top_idx].advance_pc()?;
+                stack[top_idx]
+                    .advance_pc()
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))
             }
             "bind" => {
                 let mut iter = args.into_iter();
@@ -2980,7 +3353,10 @@ impl Interpreter {
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
                 let target = *callee;
                 let pc = stack[top_idx].pc;
-                match self.callable_bind_metadata_get(context, &target, "length")? {
+                match self
+                    .callable_bind_metadata_get(context, &target, "length")
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
                     BindMetadataGet::Value(target_length) => self
                         .continue_bind_function_after_length(
                             stack,
@@ -3003,6 +3379,7 @@ impl Interpreter {
                             target_length: None,
                         });
                         self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))
                     }
                 }
             }
@@ -3016,7 +3393,7 @@ impl Interpreter {
                 // §20.2.3.5 step 1 — throw a TypeError when `this` is not
                 // callable (e.g. a Proxy wrapping a non-callable target).
                 if !self.is_callable_runtime(callee) {
-                    return Err(VmError::NotCallable);
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
                 }
                 let display = {
                     let owner_bag = self.callable_bag_for_value(callee);
@@ -3031,13 +3408,19 @@ impl Interpreter {
                     function_metadata::callable_to_string(&mut ctx, callee)
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    .map_err(|_| VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::string(s))?;
-                frame.advance_pc()?;
+                write_register(frame, dst, Value::string(s))
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                frame
+                    .advance_pc()
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 Ok(())
             }
-            _ => Err(self.err_unknown_intrinsic(name.to_string().into())),
+            _ => Err(CommittedValueError::JavaScript(
+                self.err_unknown_intrinsic(name.to_string().into()),
+            )),
         }
     }
 }

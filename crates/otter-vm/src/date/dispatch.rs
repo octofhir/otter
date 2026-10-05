@@ -64,7 +64,13 @@ pub fn call(
                 requested_bytes: err.requested_bytes(),
                 heap_limit_bytes: err.heap_limit_bytes(),
             };
-            let root = object::root_for_prototype(heap, prototype).map_err(oom)?;
+            let root = object::root_for_prototype(
+                heap,
+                prototype,
+                object::ShapeState::ORDINARY,
+                external_visit,
+            )
+            .map_err(oom)?;
             let mut obj =
                 object::alloc_object_with_roots(heap, root, external_visit).map_err(oom)?;
             object::set_date_data(&mut obj, heap, time);

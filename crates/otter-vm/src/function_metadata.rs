@@ -113,7 +113,7 @@ pub(crate) fn bound_own_property_descriptor(
     bound: &BoundFunction,
     gc_heap: &mut otter_gc::GcHeap,
     key: &str,
-) -> Result<Option<PropertyDescriptor>, VmError> {
+) -> Result<Option<PropertyDescriptor>, otter_gc::OutOfMemory> {
     enum Slot {
         Builtin { name: String, length: NumberValue },
         Deleted,
@@ -240,23 +240,30 @@ pub(crate) fn bound_define_own_property(
     bound: &BoundFunction,
     heap: &mut otter_gc::GcHeap,
     key: &str,
-    descriptor: PropertyDescriptor,
-) -> bool {
-    let existing = match bound_own_property_descriptor(bound, heap, key) {
-        Ok(existing) => existing,
-        Err(_) => return false,
-    };
-    let descriptor = match existing {
+    mut descriptor: PropertyDescriptor,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    use crate::rooting::RootScopeExt;
+    let mut owner = Value::bound_function(*bound);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the actual target and descriptor slots remain stationary through
+    // name materialization and ordinary property-bag allocation.
+    unsafe {
+        roots.add_value(&mut owner);
+        roots.add_pelt(&mut descriptor);
+    }
+    let existing = bound_own_property_descriptor(bound, heap, key)?;
+    let bound = owner.as_bound_function().expect("rooted bound function");
+    descriptor = match existing {
         Some(existing) => match object::validate_descriptor_update(&existing, &descriptor, heap) {
             Some(merged) => merged,
-            None => return false,
+            None => return Ok(false),
         },
         None if key == "name" || key == "length" => descriptor,
         None => descriptor,
     };
     if key != "name" && key != "length" {
         let own_properties = heap.read_payload(bound.inner, |body| body.own_properties);
-        return object::define_own_property(own_properties, heap, key, descriptor);
+        return object::define_own_property(own_properties, heap, key, descriptor.clone());
     }
     let barrier_descriptor = descriptor.clone();
     let success = heap.with_payload(bound.inner, |body| {
@@ -265,13 +272,13 @@ pub(crate) fn bound_define_own_property(
             "length" => &mut body.length_property,
             _ => unreachable!("ordinary bound properties return before metadata update"),
         };
-        *slot = BoundFunctionMetadataProperty::Overridden(descriptor);
+        *slot = BoundFunctionMetadataProperty::Overridden(descriptor.clone());
         true
     });
     if success {
         heap.record_write(bound.inner, &barrier_descriptor);
     }
-    success
+    Ok(success)
 }
 
 /// Delete a configurable bound function metadata property.
@@ -279,12 +286,18 @@ pub(crate) fn bound_delete_own_property(
     bound: &BoundFunction,
     heap: &mut otter_gc::GcHeap,
     key: &str,
-) -> bool {
+) -> Result<bool, otter_gc::OutOfMemory> {
     if key != "name" && key != "length" {
-        let own_properties = heap.read_payload(bound.inner, |body| body.own_properties);
-        return object::delete(own_properties, heap, key);
+        let mut owner = bound.inner;
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: this old-space bound shell stays live while its actual bag is prepared.
+        unsafe {
+            roots.add_raw_slot(std::ptr::addr_of_mut!(owner).cast::<otter_gc::raw::RawGc>());
+        }
+        let mut own_properties = heap.read_payload(owner, |body| body.own_properties);
+        return object::delete(&mut own_properties, heap, key);
     }
-    heap.with_payload(bound.inner, |body| {
+    Ok(heap.with_payload(bound.inner, |body| {
         let slot = match key {
             "name" => &mut body.name_property,
             "length" => &mut body.length_property,
@@ -300,7 +313,7 @@ pub(crate) fn bound_delete_own_property(
         }
         *slot = BoundFunctionMetadataProperty::Deleted;
         true
-    })
+    }))
 }
 
 /// `true` for the compiler's internal anonymous-callable display

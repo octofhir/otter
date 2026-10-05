@@ -65,7 +65,27 @@ use std::sync::Arc;
 use otter_bytecode::{Op, Operand};
 use serde::Serialize;
 
-pub use crate::property_cache::jit::{JitPropertyLookupCache, JitStoreTransitionCache};
+pub use crate::property_cache::jit::JitPropertyActionCache;
+pub use crate::property_cache::{PropertyLoadAction, PropertyStoreAction};
+
+/// Exact named-site atom and current Graph shared-feedback eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitPropertyAccess {
+    /// Isolate-global atom captured from this immutable source name.
+    pub atom: u32,
+    /// The site currently has terminal megamorphic property feedback.
+    pub shared: bool,
+}
+
+mod literal_allocations;
+pub use literal_allocations::{
+    JitArrayLiteralAllocationPlan, JitDenseArrayAllocationPlan, JitEmptyArrayAllocationPlan,
+    JitEmptyObjectAllocationPlan, JitLiteralAllocationPlans, JitObjectLiteralAllocationPlan,
+    ordinary_object_header_word,
+};
+
+mod string_layout;
+pub use string_layout::JitStringLayout;
 
 mod native_callable;
 pub use native_callable::JitNativeCallLayout;
@@ -107,6 +127,10 @@ pub struct JitContextAllocationPlan {
     pub body_word: u64,
     /// Initial value of every trailing word.
     pub initial_words: Box<[u64]>,
+    /// Own DerivedThis slot, if this scope binds a derived constructor's this.
+    /// Generated clients publish the resulting cell on the matching physical
+    /// frame; the value of the slot is never copied into this plan.
+    pub derived_this_slot: Option<u16>,
 }
 
 /// The inline allocation plan for a context of `code_block`'s scope
@@ -160,6 +184,7 @@ pub fn context_allocation_plan(
             | (u64::from(scope_index_word) << 32)
             | (u64::from(slot_count) << 48),
         initial_words: initial_words.into_boxed_slice(),
+        derived_this_slot: crate::context_ops::derived_this_slot(descriptor).ok()?,
     })
 }
 
@@ -171,14 +196,15 @@ pub const JIT_YOUNG_CLOSURE_HEADER_WORD: u64 = crate::closure::JS_CLOSURE_BODY_T
 pub const JIT_CLOSURE_CELL_BYTES: u32 =
     (otter_gc::header::HEADER_SIZE + std::mem::size_of::<crate::closure::JsClosureBody>()) as u32;
 
-// A carve writes the call header as one word (function id, then flags) and
-// clears the rare handle and the last-instance observation with one store.
+// A carve writes the call header as one word (function id, then flags),
+// then clears the rare handle and its required alignment padding with one
+// store. No instance observation occupies the fixed closure cell.
 const _: () = {
     assert!(crate::closure::CLOSURE_CALL_HEADER_FUNCTION_ID_OFFSET == 0);
     assert!(crate::closure::CLOSURE_CALL_HEADER_FLAGS_OFFSET == 4);
     assert!(
-        crate::closure::CLOSURE_BODY_LAST_INSTANCE_OFFSET
-            == crate::closure::CLOSURE_BODY_RARE_OFFSET + 4
+        crate::closure::CLOSURE_BODY_RARE_OFFSET + 8
+            == std::mem::size_of::<crate::closure::JsClosureBody>()
     );
 };
 
@@ -297,10 +323,8 @@ pub struct JitClosureCallLayout {
     /// Byte offset of the function's `prototype` slot value (the hole until
     /// the default object is allocated), from the rare record.
     pub prototype_byte: u32,
-    /// Byte offset of the `u16` learned instance size, from the rare record.
-    pub learned_instance_fields_byte: u32,
-    /// Byte offset of the last-receiver observation, from the closure.
-    pub last_instance_byte: u32,
+    /// Traced compressed family-list head, from the decompressed rare record.
+    pub constructor_layouts_byte: u32,
 }
 
 /// Machine-readable class-constructor wrapper layout.
@@ -315,6 +339,20 @@ pub struct JitClassConstructorLayout {
     pub super_constructor_byte: u32,
     /// Byte offset from the wrapper body to its live instance prototype.
     pub prototype_byte: u32,
+    /// Byte offset from the wrapper body to its traced exact-family head.
+    pub constructor_layouts_byte: u32,
+}
+
+/// One VM-owned layout of the traced constructor family cell. Every offset
+/// includes the GC header and is consumed only after a live owner-head load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitConstructorLayout {
+    /// Header-inclusive byte offset of the exact family's monotonic identity.
+    pub family_id_byte: u32,
+    /// Header-inclusive byte offset of the traced receiver root shape.
+    pub root_byte: u32,
+    /// Header-inclusive byte offset of the remaining provisional samples.
+    pub samples_remaining_byte: u32,
 }
 
 /// Address-stable validity word for a complete ordinary prototype chain.
@@ -336,39 +374,33 @@ pub struct JitPrototypeValidity {
 pub struct JitReceiverAllocationPlan {
     /// Expected underlying function of the live `new.target` class or closure.
     pub new_target_function_id: u32,
-    /// Class wrappers retain the template-wide capacity admission proof.
-    pub class_allocation: bool,
+    /// Actual new.target family belongs to a class wrapper, not a closure.
+    pub new_target_is_class: bool,
+    /// Nonzero monotonic identity of the exact actual constructor family.
+    /// This scalar never retains a callable or a receiver by itself.
+    pub family_id: u64,
     /// Initial receiver hidden class naming its initial fields; generated
     /// code proves the prototype it fixes is the live prototype. `0` for a
-    /// receiver with no initial fields: it takes the root the live prototype
-    /// caches for its instances.
+    /// receiver with no initial fields: it uses the exact `prototype_root`.
     pub receiver_shape: u32,
     /// Number of already-visible undefined slots described by that shape.
     pub initial_field_count: u8,
     /// In-object slots of the allocated receiver: room for its initial
     /// fields and every field its constructor is known to add.
     pub inline_capacity: u8,
-    /// Complete ordinary prototype proof, absent for unprepared allocation.
+    /// Optional chain validity used by preinitialized own-field proofs.
     pub prototype_validity: Option<JitPrototypeValidity>,
-    /// Root shape fixing the prototype proved above; zero when unprepared.
+    /// Nonzero exact capacity root; its live prototype is checked before allocation.
     pub prototype_root: u32,
 }
 
 impl JitReceiverAllocationPlan {
-    /// GC header word of the receiver cell: the ordinary-object tag, the
-    /// young flag, the object flag byte (a fresh object is exactly
-    /// extensible), the in-object capacity byte and the cell size.
+    /// Ordinary-object GC header: type tag, young flag and cell size only.
+    /// Immutable shape state owns extensibility/lookup facts, and the shape
+    /// fixes inline capacity; neither is duplicated in the cell header.
     #[must_use]
     pub fn cell_header_word(&self, cell_bytes: u32) -> u64 {
-        let [flags_byte, capacity_byte] = [
-            crate::object::OBJECT_CELL_FLAGS_BYTE,
-            crate::object::OBJECT_CELL_INLINE_CAPACITY_BYTE,
-        ];
-        u64::from(crate::object::OBJECT_BODY_TYPE_TAG)
-            | (u64::from(JIT_GC_YOUNG_FLAG) << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
-            | (u64::from(JIT_OBJECT_FLAG_EXTENSIBLE) << (8 * flags_byte))
-            | (u64::from(self.inline_capacity) << (8 * capacity_byte))
-            | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET))
+        literal_allocations::ordinary_object_header_word(cell_bytes)
     }
 }
 
@@ -411,60 +443,7 @@ pub const JIT_TYPEOF_TAGS: JitTypeOfTags = JitTypeOfTags {
     ],
 };
 
-/// Shape kind bit of a dictionary shape: its objects keep their keys in
-/// dictionary storage, and the shape id alone does not fix their layout.
-pub const JIT_SHAPE_KIND_DICTIONARY: u8 = crate::object::SHAPE_KIND_DICTIONARY;
-
-/// `[[Extensible]]` bit of an ordinary object's flag byte.
-pub const JIT_OBJECT_FLAG_EXTENSIBLE: u8 = crate::object::ObjectFlags::EXTENSIBLE;
-/// Stores to prototypes invalidate their subscribed chain proofs.
-pub const JIT_OBJECT_FLAG_USED_AS_PROTOTYPE: u8 = crate::object::ObjectFlags::USED_AS_PROTOTYPE;
-/// In-place attribute override bit: the shape no longer describes the slots'
-/// attributes.
-pub const JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN: u8 =
-    crate::object::ObjectFlags::SLOT_ATTRS_OVERRIDDEN;
-/// Prototype-chain opacity bit: the shape does not authorize named lookup.
-pub const JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE: u8 = crate::object::ObjectFlags::CHAIN_LINK_OPAQUE;
-/// Dictionary-compatible cache mode bit: a delete retired append-only shape
-/// assumptions.
-pub const JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE: u8 =
-    crate::object::ObjectFlags::DICTIONARY_COMPATIBLE;
-/// Flags a shape-state guard requires clear on a receiver or chain link.
-pub const JIT_OBJECT_SHAPE_STATE_MASK: u8 =
-    JIT_OBJECT_FLAG_DICTIONARY_COMPATIBLE | JIT_OBJECT_FLAG_CHAIN_LINK_OPAQUE;
-/// Flags an ordinary-lookup guard requires clear.
-pub const JIT_OBJECT_ORDINARY_LOOKUP_MASK: u8 =
-    JIT_OBJECT_SHAPE_STATE_MASK | JIT_OBJECT_FLAG_SLOT_ATTRS_OVERRIDDEN;
-
-/// One constructor-owned add-property transition executable in generated code.
-///
-/// The receiver and every ordinary prototype shape are guarded immediately
-/// before the store. A miss therefore leaves the canonical `StoreProperty`
-/// operation completely unstarted; a hit appends exactly one pre-reserved
-/// slot, publishes the child hidden class, and performs the ordinary barrier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JitConstructorFieldTransition {
-    /// Receiver hidden class before the field is added.
-    pub from_shape: u32,
-    /// Receiver hidden class after the field is added.
-    pub to_shape: u32,
-    /// Complete inherited-property proof.
-    pub prototype_validity: JitPrototypeValidity,
-    /// Appended own-slot index.
-    pub slot: u16,
-}
-
-/// GC-movement-stable VM plan behind [`JitConstructorFieldTransition`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JitConstructorFieldTransitionPlan {
-    pub(crate) from_shape: crate::object::ShapeId,
-    pub(crate) to_shape: crate::object::ShapeId,
-    pub(crate) prototype_validity:
-        std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
-    pub(crate) slot: u16,
-}
-
-const _: [(); 52] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 48] = [(); std::mem::size_of::<JitClosureCallLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
 const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
 const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
@@ -474,6 +453,10 @@ const _: [(); 16] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_ta
 const _: [(); 20] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_flag)];
 const _: [(); 24] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag)];
 const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags)];
+const _: [(); 32] = [(); std::mem::offset_of!(JitClosureCallLayout, rare_byte)];
+const _: [(); 36] = [(); std::mem::offset_of!(JitClosureCallLayout, own_props_byte)];
+const _: [(); 40] = [(); std::mem::offset_of!(JitClosureCallLayout, prototype_byte)];
+const _: [(); 44] = [(); std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte)];
 
 /// Machine-readable [`crate::context::ContextBody`] layout.
 ///
@@ -549,21 +532,16 @@ pub struct JitCompileSnapshot {
     /// representable or the site is absent and uses its committed cold edge.
     /// A `CallMethodValue` site's programs describe its method lookup.
     pub property_programs: rustc_hash::FxHashMap<u32, Vec<JitCacheIrProgram>>,
-    /// Stable layout of this isolate's existing shared property lookup table.
-    /// Generated load probes read its live entries without a runtime call.
-    pub property_lookup_cache: Option<JitPropertyLookupCache>,
-    /// Fixed shared add-property transition table read by megamorphic stores.
-    pub store_transition_cache: Option<JitStoreTransitionCache>,
-    /// Terminal megamorphic named accesses, method lookups included: source
-    /// byte PC to isolate-global atom. Generated stores admit only an own writable data-slot proof;
-    /// negative and unsupported table results keep the committed cold operation.
-    pub property_megamorphic_accesses: rustc_hash::FxHashMap<u32, u32>,
+    /// Stable layout of this isolate's one shared key/action table.
+    /// Generated loads and stores consume independent facts under one key.
+    pub property_action_cache: Option<JitPropertyActionCache>,
+    /// Every immutable named access, including method lookup, keyed by byte PC.
+    /// The atom is available to baseline shared probes; `shared` preserves the
+    /// optimizing tier's existing terminal-feedback admission.
+    pub property_accesses: rustc_hash::FxHashMap<u32, JitPropertyAccess>,
     /// Direct physical hit proofs for schema-owned binding sites, keyed by
     /// byte-PC. See [`BindingHitProof`].
     pub binding_hit_proofs: rustc_hash::FxHashMap<u32, BindingHitProof>,
-    /// Constructor `StoreProperty` sites with a pre-reserved, guarded hidden
-    /// class transition, keyed by byte-PC.
-    pub constructor_field_transitions: rustc_hash::FxHashMap<u32, JitConstructorFieldTransition>,
     /// Inline `CreateContext` plans keyed by `(function id, scope index)` —
     /// for this function and every body inlined into it.
     pub context_allocations: rustc_hash::FxHashMap<(u32, u32), JitContextAllocationPlan>,
@@ -571,6 +549,8 @@ pub struct JitCompileSnapshot {
     /// byte-PC. A site without a plan (a generator or async function) takes
     /// the allocating runtime entry.
     pub closure_allocations: rustc_hash::FxHashMap<u32, JitClosureAllocationPlan>,
+    /// Empty literal geometry and intrinsic shape prepared for this exact source body.
+    pub literal_allocations: JitLiteralAllocationPlans,
     /// Typed reasons observed at each logical PC in earlier optimized
     /// generations. The reason identity remains available to later policy and
     /// lowering instead of collapsing distinct failures into a PC-only bit.
@@ -621,48 +601,14 @@ pub struct JitCompileSnapshot {
     /// root shape a prototype caches for its instances; null until the
     /// runtime first creates an instance of it.
     pub exotic_instance_root_byte: u32,
-    /// Byte offset from a decompressed object pointer to its first in-object
-    /// slot (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`). While the slab
-    /// handle is null, string-keyed slot `i` is the word at
-    /// `object_inline_values_byte + 8 * i`.
-    pub object_inline_values_byte: u32,
-    /// Byte offset from a decompressed object pointer to the out-of-line slab
-    /// handle (`HEADER_SIZE + OBJECT_BODY_SLAB_HANDLE_OFFSET`). The emitter
-    /// reads this 4-byte handle to pick the slot base: null means the slots
-    /// live in-object, non-null means they moved to the out-of-line slab.
-    /// The slot count cannot decide this — the capacity model can spill a
-    /// small object early.
-    pub object_slab_handle_byte: u32,
-    /// Byte offset from a decompressed shape cell pointer to its `u32`
-    /// property count — a shaped object's slot count.
+    /// One VM-owned description of dynamic inline-or-slab field storage.
+    pub field_layout: crate::object::FieldLayout,
+    /// Header-inclusive offset of a shaped object's u32 live property count.
     pub shape_property_count_byte: u32,
-    /// Byte offset from a decompressed object pointer to its `u8` in-object
-    /// capacity, the second body-owned GC-header byte. An add-transition into
-    /// an object whose slots are still in-object proves the appended slot
-    /// index is below it.
-    pub object_inline_capacity_byte: u32,
-    /// Byte offset from a decompressed out-of-line slab cell pointer to its
-    /// `u32` word capacity (`HEADER_SIZE + SLOT_SLAB_CAPACITY_OFFSET`). An
-    /// add-transition into a spilled object proves in generated code that the
-    /// appended slot index is below this capacity before it publishes; a slot
-    /// at or beyond it needs the runtime's slab growth.
-    pub object_slab_capacity_byte: u32,
-    /// Byte offset from a decompressed out-of-line slab cell pointer to its
-    /// first word (`HEADER_SIZE + size_of::<SlotSlabBody>()`).
-    pub object_slab_words_byte: u32,
-    /// Byte offset of the ordinary object's one-byte flag set, the first
-    /// body-owned GC-header byte (see [`JIT_OBJECT_FLAG_EXTENSIBLE`] and its
-    /// siblings). Shape-state guards test the bits they require with one
-    /// load.
-    pub object_flags_byte: u32,
     /// Byte offset of the 4-byte rare-state GC handle. Conservative generated
     /// property programs require a zero handle; programs that prove ordinary
     /// named lookup separately can admit benign sidecars such as symbol keys.
     pub object_exotic_handle_byte: u32,
-    /// Bytes of an ordinary object cell before its in-object slots, header
-    /// included. A receiver with `n` in-object slots occupies
-    /// `object_fixed_cell_bytes + 8 * n` bytes.
-    pub object_fixed_cell_bytes: u32,
     /// Static GC layout for the inline generational write barrier emitted on a
     /// pointer-valued `StoreProperty`. Isolate-independent `#[repr(C)]` / `const`
     /// values; the card-mark is gated on [`cage_base`](Self::cage_base) being
@@ -674,15 +620,20 @@ pub struct JitCompileSnapshot {
     /// or non-ordinary prototype. Prototype-chain guards read the receiver's
     /// shape, then this word, without runtime resolution.
     pub shape_prototype_byte: u32,
-    /// Byte offset from a decompressed shape cell pointer to its `u8` kind
-    /// flags (see [`JIT_SHAPE_KIND_DICTIONARY`]).
-    pub shape_kind_byte: u32,
+    /// Header-inclusive offset of the sole immutable [`crate::object::ShapeState`]
+    /// byte on a decompressed shape. Exact eligible baked shape identity fixes
+    /// these facts; only dynamic/shared and dictionary probes read them live.
+    pub shape_state_byte: u32,
+    /// Immutable inline-prefix capacity on the shape cell.
+    pub shape_inline_capacity_byte: u32,
     /// Complete VM-owned closure-call ABI contract. Method identity guards use
     /// its function-id offset; native call linkage additionally consumes its
     /// flags, context word, and canonical bound-value metadata.
     pub closure_call_layout: JitClosureCallLayout,
     /// VM-baked class wrapper layout used by generated construct guards.
     pub class_constructor_layout: JitClassConstructorLayout,
+    /// Exact actual-constructor family guard offsets.
+    pub constructor_layout: JitConstructorLayout,
     /// GC body tags whose cell values remain ECMAScript primitives.
     pub primitive_cell_type_tags: [u8; 3],
     /// Ready-to-use byte offsets and type tags for baseline collection method
@@ -706,10 +657,10 @@ pub struct JitCompileSnapshot {
     /// global-declarative epoch and the global object's hidden class before
     /// reading the current `Value` slot word.
     pub global_object_loads: rustc_hash::FxHashMap<u32, JitGlobalObjectLoad>,
-    /// Guarded static-native leaf calls keyed by the caller's `Op::Call`
-    /// byte-PC. Each plan names one exact bootstrap function identity and one
-    /// machine-code operation; misses side-exit before effects.
-    pub static_native_calls: rustc_hash::FxHashMap<u32, JitStaticNativeCall>,
+    /// Native source call plans keyed by byte PC. Exact audited leaves retain
+    /// their bootstrap identity; general native plans prove only the live kind.
+    /// Every guard miss enters the committed canonical call before any effect.
+    pub native_calls: rustc_hash::FxHashMap<u32, JitNativeCall>,
     /// Compiler-native ordinary-call candidates keyed by byte PC. Fixed and
     /// spread calls have one target; forwarded arguments admit the bounded
     /// feedback population. Each synchronous target has a stable non-OSR entry
@@ -759,6 +710,11 @@ pub struct JitCompileSnapshot {
     /// `%Function.prototype.call%`. Generated code proves the intrinsic and
     /// calls the function it ran directly, with the first argument as `this`.
     pub function_prototype_calls: rustc_hash::FxHashMap<u32, JitFunctionPrototypeCallSite>,
+    /// External-reference index of `%Function.prototype.apply%` for a body
+    /// that forwards its arguments (`Op::CallForwardArguments`): generated
+    /// code proves a forwarding site's method is the intrinsic before it
+    /// passes the activation's actual arguments on.
+    pub forward_apply_native_ref: Option<u32>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -939,7 +895,7 @@ impl JitIntrinsicPrototype {
 /// Layout proof for the object owning a guarded method slot.
 ///
 /// Either form pins which key the slot at
-/// [`JitGuardedMethodCall::method_value_byte`] belongs to; the builtin identity
+/// [`JitGuardedMethodCall::method_field`] belongs to; the builtin identity
 /// guard then proves the slot's live value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitMethodHolder {
@@ -967,7 +923,7 @@ pub enum JitMethodHolder {
 ///
 /// The layout fields are the same lowered cache program a property site
 /// caches — guarded receiver shape, an optional guarded prototype holder, and
-/// the slot byte — so generated code reuses the way walk and the prototype hop
+/// the logical field — so generated code reuses the way walk and the prototype hop
 /// rather than describing this access a second time. The entry id then selects
 /// the call, exactly as it does at an ordinary call site: the family the id
 /// resolves in is what decides the call protocol, so a read, an in-place
@@ -980,8 +936,8 @@ pub struct JitGuardedMethodCall {
     /// prototype of a [`JitGuardedReceiver::Shape`] receiver, or the pinned
     /// prototype of an exotic one.
     pub holder: JitMethodHolder,
-    /// Byte offset of the method slot inside the holder's value slab.
-    pub method_value_byte: u32,
+    /// Shape-owned method bank and relative index in the holder.
+    pub method_field: crate::object::FieldLocation,
     /// External-reference index of the exact bootstrap function guarded before
     /// the entry runs. Isolate-local and build-stable, so unlike a raw entry
     /// address it can be compared by generated code without a relocation.
@@ -1031,8 +987,8 @@ pub struct JitFunctionCallLookup {
     pub receiver: JitIntrinsicPrototype,
     /// Hidden class of `%Function.prototype%` when the site was compiled.
     pub holder_shape: u32,
-    /// Byte offset of the `call` slot inside the holder's value slab.
-    pub call_value_byte: u32,
+    /// Shape-owned storage bank and index of the holder's `call` slot.
+    pub call_field: crate::object::FieldLocation,
 }
 
 /// Proof that a site's callee is `%Function.prototype.call%`: the method a
@@ -1111,14 +1067,14 @@ pub struct JitMethodGuard {
     pub prototype_validity: Option<JitPrototypeValidity>,
     /// Root shape whose traced prototype is the method holder; zero for own.
     pub holder_root: u32,
-    /// Byte offset inside the holder object's value slab for the method slot.
-    pub method_value_byte: u32,
+    /// Shape-owned method bank and relative index in the holder.
+    pub method_field: crate::object::FieldLocation,
 }
 
 /// A method the baseline may splice into a caller's `Op::CallMethodValue` site.
 /// Carries the method's body plus the shared identity guard. Per body
-/// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
-/// decompressed receiver.
+/// `LoadProperty`/`StoreProperty` byte-PC, the logical own field within the
+/// receiver's shape-owned storage bank.
 /// Method identity is verified before body entry by the receiver shape and
 /// one prototype validity cell. The holder is read from a traced root shape;
 /// the current slot must still identify [`JitMethodGuard::method_fid`].
@@ -1134,11 +1090,11 @@ pub struct JitInlineMethod {
     pub body: Arc<JitCompileSnapshot>,
     /// Exact receiver/prototype/method-slot guard shared with generated calls.
     pub guard: JitMethodGuard,
-    /// Body `LoadProperty`/`StoreProperty` byte-PC → value slab byte offset. A
+    /// Body `LoadProperty`/`StoreProperty` byte-PC → logical own field. A
     /// receiver-shape property is baked from the identity-guarded receiver shape;
     /// a non-receiver property is baked from its own monomorphic site feedback,
     /// with the required shape recorded in [`Self::prop_shapes`].
-    pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
+    pub prop_fields: rustc_hash::FxHashMap<u32, crate::object::FieldLocation>,
     /// Body byte-PC → the compressed shape-handle offset a **non-receiver**
     /// property access must match, for the guard the inliner emits before the
     /// slot load/store. A receiver property is absent here — the entry
@@ -1248,8 +1204,8 @@ pub enum JitCacheIrOp {
         object: u8,
         /// Isolate-global atom identity captured by the CacheIR program.
         atom: u32,
-        /// Byte offset of the atom's value inside the object's value slab.
-        value_byte: u32,
+        /// Shape-owned storage bank and relative field index for this atom.
+        field: crate::object::FieldLocation,
         /// Whether the terminal operation requires a writable data slot.
         writable: bool,
     },
@@ -1272,23 +1228,23 @@ pub enum JitCacheIrOp {
     LoadField {
         /// Already-guarded object operand owning the slot.
         object: u8,
-        /// Byte offset inside its value slab.
-        value_byte: u32,
+        /// Shape-owned storage bank and relative field index.
+        field: crate::object::FieldLocation,
     },
     /// Write one already-guarded existing own data field.
     StoreField {
         /// Already-guarded receiver operand owning the slot.
         object: u8,
-        /// Byte offset inside its value slab.
-        value_byte: u32,
+        /// Shape-owned storage bank and relative field index.
+        field: crate::object::FieldLocation,
     },
     /// Prove that an ordinary receiver can append the named slot without
     /// allocating or changing storage representation.
     GuardExtensible {
         /// CacheIR object operand receiving the new own slot.
         object: u8,
-        /// Byte offset of the slot that must be the exact next append.
-        value_byte: u32,
+        /// Logical field that must be the exact next append.
+        field: crate::object::FieldLocation,
     },
     /// Publish the child hidden class and new logical slot length after every
     /// miss-capable guard has completed.
@@ -1332,16 +1288,38 @@ pub struct JitStaticNativeCall {
     pub argument_count: u8,
 }
 
+/// Selected native entry for one source call site.
+///
+/// A leaf is an exact bootstrap identity and its declared NoAlloc operation.
+/// `Native` proves only the live cell kind: its current callback, policy,
+/// captures and realm are selected by the canonical Host native kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitNativeCall {
+    /// An exact audited leaf declaration.
+    Leaf(JitStaticNativeCall),
+    /// Any NativeFunction, entered through the private Native kind convention.
+    Native,
+}
+
+impl JitNativeCall {
+    /// Exact leaf payload, when this plan permits the declared leaf ABI.
+    #[must_use]
+    pub const fn leaf(&self) -> Option<&JitStaticNativeCall> {
+        match self {
+            Self::Leaf(leaf) => Some(leaf),
+            Self::Native => None,
+        }
+    }
+}
+
 /// VM-resolved direct-call target for one eligible compiled callee.
 ///
-/// This is metadata only: frame reservation/rooting stays VM-owned, while the
-/// backend consumes `entry_cell` once it can emit the matching frame build and
-/// call/return sequence. Runtime-selected linkage uses this same carrier in
-/// aligned native scratch: `repr(C)` and explicit field offsets expose only the
-/// initialized primitive fields needed by generated code. Padding and Rust
-/// option/enum payload layouts are never decoded. It contains no moving roots
-/// and is private VM/JIT plumbing, not an embedding or external ABI.
-#[repr(C)]
+/// The compiler consumes identity and call semantics, then emits a branch
+/// through the permanent `entry_cell`. Every caller passes only its actual
+/// span; register-window geometry and missing-formal initialization belong to
+/// the callee. Generated code never decodes this Rust DTO or its enum layout.
+/// It contains no moving roots and is private VM/JIT plumbing, not an
+/// embedding or external ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitDirectCallPlan {
     /// Callee function id in the executable module.
@@ -1362,10 +1340,6 @@ pub struct JitDirectCallPlan {
     pub is_derived_constructor: bool,
     /// The target's `FUNCTION_CALL_*` call semantics.
     pub call_flags: u32,
-    /// Number of formal parameter registers.
-    pub param_count: u16,
-    /// Total callee register-window length.
-    pub register_count: u16,
     /// Address of the site's callee identity cell: the last callee value
     /// proved to be this target. Zero when the site has none.
     pub callee_cell: u64,
@@ -1380,7 +1354,7 @@ pub struct JitDirectCallPlan {
 /// guards; tier promotion patches the cell without invalidating this caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitDirectCallee {
-    /// Function identity, stable entry cell, and callee register-window shape.
+    /// Function identity, stable entry cell, and call semantics.
     pub plan: JitDirectCallPlan,
     /// Optional guarded safepoint-free receiver allocation program.
     pub receiver_allocation: Option<JitReceiverAllocationPlan>,
@@ -1403,13 +1377,13 @@ pub enum BindingHitProof {
     /// Guarded own-data slot in the global object record.
     GlobalObject {
         /// Expected ordinary shape handle, or the dictionary slot-layout
-        /// epoch that keeps this key at `value_byte` while unrelated globals
+        /// epoch that keeps this key at `field` while unrelated globals
         /// are added.
         shape: u64,
         /// Whether `shape` names a dictionary slot-layout epoch.
         dictionary: bool,
-        /// Byte offset of the property inside the object's value slab.
-        value_byte: u32,
+        /// Logical property field in the object's selected storage.
+        field: crate::object::FieldLocation,
         /// Global declarative epoch that keeps later lexicals from shadowing it.
         global_lexical_epoch: u64,
         /// Whether the proven own data descriptor is writable.
@@ -1450,8 +1424,8 @@ pub struct JitGlobalObjectLoad {
     /// Whether [`Self::shape`] names the dictionary slot-layout epoch rather
     /// than an ordinary compressed shape handle.
     pub dictionary: bool,
-    /// Byte offset of the property inside the object's value slab.
-    pub value_byte: u32,
+    /// Logical property field in the object's selected storage.
+    pub field: crate::object::FieldLocation,
     /// Global declarative-record epoch captured with the slot lookup. A
     /// mismatch means a later lexical declaration may shadow this property.
     pub global_lexical_epoch: u64,
@@ -1623,9 +1597,10 @@ pub struct JitElementAccess {
     pub length_byte: u32,
     /// Width of that count.
     pub length_width: JitGuardWidth,
-    /// Where the element base pointer lives. The storage is a plain host
-    /// allocation, so it survives a moving collection of the body; every
-    /// mutation refreshes it.
+    /// Where the VM-maintained element base pointer lives. Ordinary arrays
+    /// may own a moving young slab; tracing and mutation refresh this cache.
+    /// Generated addresses must be reloaded from the rooted receiver after
+    /// any collecting or reentrant operation.
     pub base: JitElementBase,
     /// How one element is stored.
     pub element: JitElementRepr,
@@ -1654,7 +1629,8 @@ pub struct JitHoleBitmap {
 }
 
 impl JitElementAccess {
-    /// Build the VM's complete ordinary packed-double Array access program.
+    /// Build the VM's complete packed-double own Array access program.
+    /// A prototype-only sidecar is legal because every accessed slot is present.
     #[must_use]
     pub fn packed_double_array() -> Self {
         let header = std::mem::size_of::<otter_gc::GcHeader>() as u32;
@@ -1662,8 +1638,8 @@ impl JitElementAccess {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             guards: [
                 Some(JitBodyGuard::clear(
-                    header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
-                    JitGuardWidth::Word32,
+                    header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
+                    JitGuardWidth::Byte,
                 )),
                 Some(Self::packed_double_kind_guard(
                     header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32,
@@ -1692,14 +1668,14 @@ impl JitElementAccess {
         }
     }
 
-    /// Whether this immutable guard program proves an ordinary Array whose
-    /// complete live dense prefix is stored as raw hole-free doubles.
+    /// Whether this immutable guard program proves an Array whose complete
+    /// live dense prefix has default own semantics and raw hole-free doubles.
     ///
     /// The physical discriminant remains VM-private; JIT backends consume the
     /// semantic layout through this snapshot-owned predicate.
     #[must_use]
     pub fn is_packed_double_array(&self) -> bool {
-        let [Some(exotic), Some(kind)] = self.guards else {
+        let [Some(own), Some(kind)] = self.guards else {
             return false;
         };
         let header = std::mem::size_of::<otter_gc::GcHeader>() as u32;
@@ -1712,36 +1688,13 @@ impl JitElementAccess {
             )
             && self.length_byte == header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32
             && self.length_width == JitGuardWidth::Word32
-            && exotic.byte == header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32
-            && exotic.width == JitGuardWidth::Word32
-            && exotic.expect == 0
+            && own.byte == header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32
+            && own.width == JitGuardWidth::Byte
+            && own.expect == 0
             && kind.byte == header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32
             && kind.width == JitGuardWidth::Byte
             && kind.expect == crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE
     }
-}
-
-/// Ready-to-use byte offsets and tags for inline primitive string fast paths.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct JitStringLayout {
-    /// `GcHeader::type_tag` of a `JsStringBody` (guarded at byte 0).
-    pub string_type_tag: u8,
-    /// Offset to `JsStringBody.len`, the UTF-16 code-unit length.
-    pub string_len_byte: u32,
-    /// Offset to the stable [`crate::string::JsStringBodyRepr`] tag.
-    pub string_repr_byte: u32,
-    /// Offset to the contiguous representation payload.
-    pub string_repr_payload_byte: u32,
-    /// Offset immediately after the body, where sequential units begin.
-    pub string_body_size: u32,
-    /// Stable tag for inline UTF-16 units.
-    pub inline_flat_tag: u8,
-    /// Stable tag for sequential UTF-16 units.
-    pub seq_flat_tag: u8,
-    /// Stable tag for inline Latin-1 units.
-    pub inline_latin1_tag: u8,
-    /// Stable tag for sequential Latin-1 units.
-    pub seq_latin1_tag: u8,
 }
 
 /// Static GC layout the optimizing tier needs to emit an inline generational
@@ -1792,6 +1745,9 @@ pub struct JitInstructionMetadata {
     /// non-callable, static-native, or otherwise unsupported hot site reports
     /// `true` even when it has no compiler-native direct target.
     pub call_attempted: bool,
+    /// Whether this named-property site reached semantic dispatch, independently
+    /// of whether its receivers admit an attached CacheIR program.
+    pub property_attempted: bool,
     /// Arithmetic representation observations frozen for this canonical PC.
     pub(crate) arith_feedback: ArithFeedback,
     /// Address of the live arithmetic observation byte baseline code
@@ -1808,6 +1764,7 @@ impl JitInstructionMetadata {
             method_hint: JitMethodHint::None,
             load_number: None,
             call_attempted: false,
+            property_attempted: false,
             arith_feedback: ArithFeedback::default(),
             arith_cell: 0,
         }
@@ -1896,6 +1853,7 @@ impl JitCompileSnapshot {
         Self {
             code_block,
             derived_constructor: false,
+            literal_allocations: JitLiteralAllocationPlans::default(),
             cage_base: 0,
             array_layout: JitArrayLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
@@ -1904,20 +1862,16 @@ impl JitCompileSnapshot {
             object_shape_byte: 0,
             exotic_dictionary_layout_byte: 0,
             exotic_instance_root_byte: 0,
-            object_inline_values_byte: 0,
-            object_slab_handle_byte: 0,
+            field_layout: crate::object::FieldLayout::current(),
             shape_property_count_byte: 0,
-            object_inline_capacity_byte: 0,
-            object_slab_capacity_byte: 0,
-            object_slab_words_byte: 0,
-            object_flags_byte: 0,
             object_exotic_handle_byte: 0,
-            object_fixed_cell_bytes: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             shape_prototype_byte: 0,
-            shape_kind_byte: 0,
+            shape_state_byte: 0,
+            shape_inline_capacity_byte: 0,
             closure_call_layout: JitClosureCallLayout::default(),
             class_constructor_layout: JitClassConstructorLayout::default(),
+            constructor_layout: JitConstructorLayout::default(),
             primitive_cell_type_tags: [0; 3],
             global_lexical_value_byte: 0,
             context_layout: JitContextLayout::current(),
@@ -1927,7 +1881,7 @@ impl JitCompileSnapshot {
             global_lexical_loads: rustc_hash::FxHashMap::default(),
             string_constant_cells: rustc_hash::FxHashMap::default(),
             global_object_loads: rustc_hash::FxHashMap::default(),
-            static_native_calls: rustc_hash::FxHashMap::default(),
+            native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),
             direct_constructs: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),
@@ -1936,12 +1890,11 @@ impl JitCompileSnapshot {
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
+            forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
-            property_lookup_cache: None,
-            store_transition_cache: None,
-            property_megamorphic_accesses: rustc_hash::FxHashMap::default(),
+            property_action_cache: None,
+            property_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
-            constructor_field_transitions: rustc_hash::FxHashMap::default(),
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),
             optimized_exit_reasons: std::collections::BTreeMap::new(),
@@ -2004,6 +1957,16 @@ impl JitCompileSnapshot {
             .get_mut(instruction_pc as usize)
             .expect("test feedback PC belongs to the snapshot")
             .call_attempted = true;
+    }
+
+    /// Mark one backend-test property site as previously attempted.
+    /// Production snapshots read the CodeBlock-owned property's lifecycle state.
+    #[doc(hidden)]
+    pub fn seed_property_attempted_for_test(&mut self, instruction_pc: u32) {
+        self.instructions
+            .get_mut(instruction_pc as usize)
+            .expect("test feedback PC belongs to the snapshot")
+            .property_attempted = true;
     }
 }
 
@@ -2147,7 +2110,7 @@ pub struct VmRuntimeActivation {
     pub(crate) vm: *mut crate::Interpreter,
     /// Active stable-address frame stack.
     pub(crate) stack: *mut crate::ActivationStack,
-    /// Linked execution context.
+    /// Optional admitted source context; native-only turns have no bytecode chunk.
     pub(crate) context: *const crate::ExecutionContext,
 }
 
@@ -2156,9 +2119,13 @@ impl VmRuntimeActivation {
     pub(crate) fn new(
         vm: &mut crate::Interpreter,
         stack: &mut crate::ActivationStack,
-        context: &crate::ExecutionContext,
+        context: Option<&crate::ExecutionContext>,
     ) -> Self {
-        Self { vm, stack, context }
+        Self {
+            vm,
+            stack,
+            context: context.map_or(std::ptr::null(), std::ptr::from_ref),
+        }
     }
 
     /// Owning interpreter address. Dereferencing requires the activation's
@@ -2183,11 +2150,9 @@ impl VmRuntimeActivation {
     #[must_use]
     pub unsafe fn owner_context(self, function_id: u32) -> Option<crate::ExecutionContext> {
         // SAFETY: forwarded from the caller's liveness contract.
-        let ambient = unsafe { self.context.as_ref() }?;
-        ambient
-            .for_function(function_id)
+        let vm = unsafe { self.vm.as_ref() }?;
+        vm.function_context(unsafe { self.context.as_ref() }, function_id)
             .ok()
-            .map(|owner| (*owner).clone())
     }
 
     /// Current VM-owned execution context for this dynamic entry.
@@ -2214,13 +2179,19 @@ const _: [(); 0] = [(); std::mem::offset_of!(VmRuntimeActivation, vm)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmRuntimeActivation, stack)];
 const _: [(); 16] = [(); std::mem::offset_of!(VmRuntimeActivation, context)];
 
-/// Per-site optimizing exit evidence and current-generation pressure.
+/// Lifetime optimizing exit evidence for one source site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JitExitProfile {
     /// Cold policy carried by the generated exit.
     pub action: crate::native_abi::ExitAction,
-    /// Exits observed in the current optimizing generation.
+    /// Exits observed across generations until the owning chunk is evicted.
     pub count: u32,
+    /// For a shape-guard exit at a named property site, the receiver
+    /// programs its inline cache held when the exit was taken
+    /// ([`crate::executable::CodeBlock::property_site_population`]). A cache
+    /// that has grown since describes the receiver that left, so the site
+    /// speculates again; an unchanged one cannot, so the site stays generic.
+    pub feedback_population: Option<u32>,
 }
 
 /// Type-erased compiled-code handle owned by the JIT implementation.
@@ -2255,7 +2226,27 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         &[]
     }
 
-    /// Size in bytes of the finalized native code mapping.
+    /// Source functions whose bodies were actually spliced into this code.
+    /// The immutable list is sorted, unique, and excludes this code's own
+    /// function. It covers bodies with no exits or safepoints. Ordinary
+    /// function-cell call targets do not belong here: their tier is selected
+    /// independently on each entry.
+    fn spliced_functions(&self) -> &[u32] {
+        &[]
+    }
+
+    /// Base address of the complete executable mapping, retained by this owner.
+    /// It is distinct from a tier or call entry address inside that mapping.
+    fn native_code_address(&self) -> Option<u64> {
+        None
+    }
+
+    /// Exact sorted associations of real machine returns to source/root records.
+    fn return_sites(&self) -> &[crate::native_abi::SafepointEntry] {
+        &[]
+    }
+
+    /// Size in bytes of the complete finalized native code mapping.
     fn code_len(&self) -> usize;
 
     /// Total bytes this installed code object retains: the executable
@@ -2325,8 +2316,8 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
 /// On-demand snapshot of executable code retained by one interpreter.
 ///
 /// Code objects are deduplicated by allocation identity across the canonical
-/// shared Template cache, the separate Machine cache, and auxiliary direct-call
-/// caches. `code_bytes` sums finalized native buffer lengths, not Rust metadata
+/// shared Template cache, the separate optimizing cache, and auxiliary
+/// direct-call caches. `code_bytes` sums finalized native buffer lengths, not Rust metadata
 /// or page-rounding overhead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCodeResidency {
@@ -2362,15 +2353,28 @@ pub struct JitCodeGenerationSnapshot {
     pub lifecycle: CodeLifetimeState,
     /// Whether the stable entry cell still accepts new leases.
     pub linked: bool,
+    /// Whether the permanent function entry cell currently selects this exact
+    /// generation. A linked fallback tier can be Installed without being the
+    /// current function-cell destination.
+    pub current_entry: bool,
+    /// Actual private-JavaScript call entry relative to this retained native
+    /// mapping, checked against its physical byte length. `None` means there
+    /// is no in-mapping call entry or the mapping has retired. This describes
+    /// emitted capability independently of the compile trigger and linkage.
+    pub call_entry_offset: Option<u32>,
     /// Native activations currently holding an entry lease.
     pub active_count: u32,
     /// Formal parameter count frozen into the entry cell.
     pub param_count: u16,
     /// Initialized tagged register-window length.
     pub register_count: u16,
-    /// Generated native entries observed for this exact generation.
+    /// Template generated native entries observed for this exact generation.
+    /// The Graph backend omits entry accounting, so zero does not prove that
+    /// an optimizing generation never ran. Ordinary VM/OSR entries are also
+    /// outside this generated-call counter.
     pub generated_entries: u64,
-    /// Generated entries that returned normally.
+    /// Recorded Template generated entries minus their cold deopts.
+    /// Graph generations report zero because their entries are uncounted.
     pub generated_returns: u64,
     /// Generated entries that cold-deoptimized.
     pub generated_deopts: u64,
@@ -2487,7 +2491,7 @@ mod layout_tests {
 
     #[test]
     fn closure_call_layout_has_stable_c_field_offsets() {
-        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 52);
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 48);
         assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
         let fields = [
             std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
@@ -2501,10 +2505,9 @@ mod layout_tests {
             std::mem::offset_of!(JitClosureCallLayout, rare_byte),
             std::mem::offset_of!(JitClosureCallLayout, own_props_byte),
             std::mem::offset_of!(JitClosureCallLayout, prototype_byte),
-            std::mem::offset_of!(JitClosureCallLayout, learned_instance_fields_byte),
-            std::mem::offset_of!(JitClosureCallLayout, last_instance_byte),
+            std::mem::offset_of!(JitClosureCallLayout, constructor_layouts_byte),
         ];
-        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]);
+        assert_eq!(fields, [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]);
     }
 
     #[test]

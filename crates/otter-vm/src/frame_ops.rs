@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn binding_kernels_preserve_the_pc_in_every_tier() {
-        let interpreter = Interpreter::new();
+        let interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let self_value = Value::function(31);
         let this_value = Value::number_i32(17);
         for kind in [
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn derived_this_hole_is_the_named_reference_error() {
-        let interpreter = Interpreter::new();
+        let interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut slots = [Value::undefined()];
         let mut frame = frame_fixture(&mut slots, Value::function(7), Value::hole());
         let mut active = ActiveFrameMut::from_frame(&mut frame);

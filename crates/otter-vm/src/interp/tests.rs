@@ -109,11 +109,12 @@ fn complete_staged(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     context: &ExecutionContext,
-    staged: Result<(), VmError>,
-) -> Result<(), VmError> {
+    staged: Result<(), crate::CommittedValueError>,
+) -> Result<(), crate::CommittedValueError> {
     staged?;
     if stack.staged_request_mut().is_some() {
         crate::test_support::complete_staged_call(interp, stack, context)
+            .map_err(crate::CommittedValueError::completed_call)
     } else {
         Ok(())
     }
@@ -122,9 +123,11 @@ fn complete_staged(
 #[test]
 fn rooted_dispatch_rejects_a_different_activation_stack() {
     let module = module_with(Vec::new(), 1);
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
-    let mut other_interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
+    let mut other_interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut published = crate::test_support::FrameChainFixture::new();
     let mut unrelated = crate::test_support::FrameChainFixture::new();
 
@@ -197,8 +200,10 @@ fn returns_undefined_for_load_then_return() {
         ],
         1,
     );
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert_eq!(interp.run(&context).unwrap(), Value::undefined());
 }
 
@@ -237,8 +242,10 @@ fn strict_store_global_binding_rejects_non_writable_global_property() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
 
     let err = interp
         .run(&context)
@@ -278,8 +285,10 @@ fn load_string_constant_reuses_traced_cache_entry() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
 
     assert!(interp.run(&context).unwrap().is_string());
     assert_eq!(interp.string_constant_cell_count_for_test(), 1);
@@ -324,12 +333,18 @@ fn load_string_constant_cells_distinguish_standalone_contexts() {
         }
     }
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let first = interp
-        .link_module(module_with_string("first.ts", "first literal"))
+        .link_module(
+            module_with_string("first.ts", "first literal"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let second = interp
-        .link_module(module_with_string("second.ts", "second literal"))
+        .link_module(
+            module_with_string("second.ts", "second literal"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
 
     assert!(interp.run(&first).unwrap().is_string());
@@ -371,9 +386,12 @@ fn string_constant_cell_stays_address_stable_across_growth_and_gc() {
         }
     }
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let anchor = interp
-        .link_module(module_with_literal(0))
+        .link_module(
+            module_with_literal(0),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     assert!(interp.run(&anchor).expect("materialize anchor").is_string());
     let before = interp
@@ -382,7 +400,10 @@ fn string_constant_cell_stays_address_stable_across_growth_and_gc() {
 
     for index in 1..257 {
         let context = interp
-            .link_module(module_with_literal(index))
+            .link_module(
+                module_with_literal(index),
+                crate::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         assert!(interp.run(&context).expect("materialize churn").is_string());
     }
@@ -433,8 +454,10 @@ fn load_bigint_constant_reuses_traced_cache_entry() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
 
     assert!(interp.run(&context).unwrap().is_big_int());
     assert_eq!(interp.bigint_constant_cache_len_for_test(), 1);
@@ -479,12 +502,18 @@ fn load_bigint_constant_cache_distinguishes_standalone_contexts() {
         }
     }
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let first = interp
-        .link_module(module_with_bigint("first.ts", "1"))
+        .link_module(
+            module_with_bigint("first.ts", "1"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let second = interp
-        .link_module(module_with_bigint("second.ts", "2"))
+        .link_module(
+            module_with_bigint("second.ts", "2"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
 
     assert!(interp.run(&first).unwrap().is_big_int());
@@ -602,8 +631,10 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert_eq!(
         interp.run(&context).unwrap(),
         Value::number(NumberValue::Smi(312))
@@ -674,8 +705,10 @@ fn direct_bytecode_call_window_populates_arguments_object() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let Some(args) = (interp.run(&context).unwrap()).as_object() else {
         panic!("expected arguments object");
     };
@@ -763,8 +796,10 @@ fn direct_bytecode_call_window_populates_rest_arguments() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let Some(rest) = (interp.run(&context).unwrap()).as_array() else {
         panic!("expected rest array");
@@ -829,9 +864,11 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let completion = interp.run(&context).unwrap();
     assert!(crate::is_callable(&completion));
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -858,9 +895,12 @@ fn bytecode_function_prototype_preserves_the_shared_caller_frame() {
     module
         .functions
         .push(test_function(1, "target", 0, 1, Vec::new()));
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -875,7 +915,7 @@ fn bytecode_function_prototype_preserves_the_shared_caller_frame() {
         match interp
             .ordinary_get_value(
                 stack,
-                &context,
+                Some(&context),
                 target,
                 target,
                 &VmPropertyKey::String("prototype"),
@@ -912,37 +952,41 @@ fn handle_scoped_function_prototype_keeps_sibling_handle_live_without_a_frame() 
     module
         .functions
         .push(test_function(1, "target", 0, 1, Vec::new()));
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let mut stack = crate::test_support::FrameChainFixture::new();
     let target = Value::function(1);
     let arg = Value::string(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
 
     let prototype = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
         interp
-            .with_handle_scope(|interp, scope| -> Result<Value, VmError> {
-                let target = interp.scoped_value(scope, target);
-                let arg = interp.scoped_value(scope, arg);
-                let target_value = interp.escape_scoped(target);
-                let result = interp.ordinary_get_value(
-                    stack,
-                    &context,
-                    target_value,
-                    target_value,
-                    &VmPropertyKey::String("prototype"),
-                    0,
-                )?;
-                assert!(
-                    interp.escape_scoped(arg).is_string(),
-                    "unrelated handle remains live across nested allocation"
-                );
-                match result {
-                    VmGetOutcome::Value(value) => Ok(value),
-                    VmGetOutcome::InvokeGetter { .. } => {
-                        panic!("function prototype is a data property")
+            .with_handle_scope(
+                |interp, scope| -> Result<Value, crate::CommittedValueError> {
+                    let target = interp.scoped_value(scope, target);
+                    let arg = interp.scoped_value(scope, arg);
+                    let target_value = interp.escape_scoped(target);
+                    let result = interp.ordinary_get_value(
+                        stack,
+                        Some(&context),
+                        target_value,
+                        target_value,
+                        &VmPropertyKey::String("prototype"),
+                        0,
+                    )?;
+                    assert!(
+                        interp.escape_scoped(arg).is_string(),
+                        "unrelated handle remains live across nested allocation"
+                    );
+                    match result {
+                        VmGetOutcome::Value(value) => Ok(value),
+                        VmGetOutcome::InvokeGetter { .. } => {
+                            panic!("function prototype is a data property")
+                        }
                     }
-                }
-            })
+                },
+            )
             .expect("prototype")
     });
     assert!(
@@ -962,9 +1006,12 @@ fn handle_scoped_function_prototype_keeps_sibling_handle_live_without_a_frame() 
 #[test]
 fn bytecode_instanceof_function_prototype_uses_stack_roots() {
     let module = module_with(Vec::new(), 4);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
     let mut stack: crate::test_support::FrameChainFixture =
@@ -1024,8 +1071,10 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
         function_source: None,
     };
     let outer = module_with(Vec::new(), 4);
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(outer).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(outer, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| {
         Ok(crate::CompiledEvalSource::Fresh(compiled.clone()))
     })));
@@ -1068,7 +1117,7 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
 #[test]
 fn get_iterator_map_snapshot_uses_old_iterator_state_allocation_with_frame_roots() {
     let module = module_with(Vec::new(), 5);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
     crate::collections::map_set(
         map,
@@ -1121,7 +1170,7 @@ fn get_iterator_map_snapshot_uses_old_iterator_state_allocation_with_frame_roots
 #[test]
 fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots() {
     let module = module_with(Vec::new(), 4);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let iterator_obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
 
     let mut stack: crate::test_support::FrameChainFixture =
@@ -1134,7 +1183,9 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
         Some(PendingGetIterator { pc: 0, dst: 1 });
     frame.registers[1] = Value::object(iterator_obj);
     stack.push(frame);
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let operands = vec![Operand::Register(1), Operand::Register(0)];
 
     let before = interp.gc_heap_mut().stats().old_allocated_bytes;
@@ -1176,7 +1227,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let source = crate::array::from_elements_old_for_fixture(
         interp.gc_heap_mut(),
         [Value::number(NumberValue::from_i32(12))],
@@ -1185,7 +1236,10 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     let mapper =
         native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper).unwrap();
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1241,9 +1295,12 @@ fn call_method_on_nullish_receiver_reports_type_error() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1268,7 +1325,10 @@ fn call_method_on_nullish_receiver_reports_type_error() {
     }
     .expect_err("nullish method call should reject before intrinsic fallback");
 
-    assert!(matches!(err, VmError::TypeError));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::TypeError)
+    ));
     assert_eq!(
         interp.error_detail(),
         Some(run_control::ErrorDetail::Message(
@@ -1291,9 +1351,12 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1318,7 +1381,10 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
     }
     .expect_err("missing primitive method should reject as non-callable");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -1335,18 +1401,21 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("String")
         .expect("String.prototype")
         .as_object()
         .expect("String.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "slice",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "slice",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let mut recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
     let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
@@ -1355,7 +1424,10 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
     unsafe { roots.add_value(&mut recv) };
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1380,12 +1452,15 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable String.prototype.slice should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
 fn call_method_string_char_code_at_builtin_fast_path() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
@@ -1405,7 +1480,7 @@ fn call_method_string_char_code_at_callable_shadow_falls_back() {
         Ok(Value::number_i32(777))
     }
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("String")
@@ -1419,7 +1494,15 @@ fn call_method_string_char_code_at_callable_shadow_falls_back() {
     let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
         .expect("replacement");
     proto = proto_root.as_object().expect("String.prototype root");
-    object::set(&mut proto, interp.gc_heap_mut(), "charCodeAt", replacement);
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "charCodeAt",
+            replacement
+        )
+        .expect("fixture assignment allocation")
+    );
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
     let stack = call_char_code_at(&mut interp, recv).expect("charCodeAt shadow should resolve");
@@ -1429,31 +1512,37 @@ fn call_method_string_char_code_at_callable_shadow_falls_back() {
 
 #[test]
 fn call_method_string_char_code_at_non_callable_shadows_builtin() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("String")
         .expect("String.prototype")
         .as_object()
         .expect("String.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "charCodeAt",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "charCodeAt",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
     let err = call_char_code_at(&mut interp, recv)
         .expect_err("non-callable String.prototype.charCodeAt should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 fn call_char_code_at(
     interp: &mut Interpreter,
     mut recv: Value,
-) -> Result<crate::test_support::FrameChainFixture, VmError> {
+) -> Result<crate::test_support::FrameChainFixture, crate::CommittedValueError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1471,7 +1560,10 @@ fn call_char_code_at(
     // linking and frame publication.
     unsafe { roots.add_value(&mut recv) };
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     assert!(
         recv.as_string(interp.gc_heap()).is_some(),
@@ -1520,21 +1612,27 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Number")
         .expect("Number.prototype")
         .as_object()
         .expect("Number.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "toString",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "toString",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1559,12 +1657,15 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Number.prototype.toString should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
 fn call_method_number_to_string_builtin_fast_path() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     let stack = call_number_to_string(&mut interp, Value::number_i32(42), None)
         .expect("Number.prototype.toString should resolve");
@@ -1583,7 +1684,7 @@ fn call_method_number_to_string_callable_shadow_falls_back() {
         Ok(Value::number_i32(777))
     }
 
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let mut proto = interp
         .constructor_prototype_value("Number")
@@ -1597,7 +1698,15 @@ fn call_method_number_to_string_callable_shadow_falls_back() {
     let replacement = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement)
         .expect("replacement");
     proto = proto_root.as_object().expect("Number.prototype root");
-    object::set(&mut proto, interp.gc_heap_mut(), "toString", replacement);
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "toString",
+            replacement
+        )
+        .expect("fixture assignment allocation")
+    );
 
     let stack = call_number_to_string(&mut interp, Value::number_i32(42), None)
         .expect("Number.prototype.toString shadow should resolve");
@@ -1607,7 +1716,7 @@ fn call_method_number_to_string_callable_shadow_falls_back() {
 
 #[test]
 fn call_method_number_to_string_non_decimal_radix_falls_back() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     let stack = call_number_to_string(
         &mut interp,
@@ -1627,7 +1736,7 @@ fn call_number_to_string(
     interp: &mut Interpreter,
     recv: Value,
     arg: Option<Value>,
-) -> Result<crate::test_support::FrameChainFixture, VmError> {
+) -> Result<crate::test_support::FrameChainFixture, crate::CommittedValueError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1641,7 +1750,10 @@ fn call_number_to_string(
         function_source: None,
     };
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1691,21 +1803,27 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Boolean")
         .expect("Boolean.prototype")
         .as_object()
         .expect("Boolean.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "valueOf",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "valueOf",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1730,7 +1848,10 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Boolean.prototype.valueOf should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -1747,23 +1868,29 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("BigInt")
         .expect("BigInt.prototype")
         .as_object()
         .expect("BigInt.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "toString",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "toString",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let bigint =
         crate::bigint::BigIntValue::from_i32(interp.gc_heap_mut(), 7).expect("bigint allocation");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1788,7 +1915,10 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable BigInt.prototype.toString should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -1805,22 +1935,28 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Symbol")
         .expect("Symbol.prototype")
         .as_object()
         .expect("Symbol.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "valueOf",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "valueOf",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let symbol = JsSymbol::new(interp.gc_heap_mut(), None).expect("symbol allocation");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1845,7 +1981,10 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Symbol.prototype.valueOf should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -1862,17 +2001,20 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("WeakRef")
         .expect("WeakRef.prototype")
         .as_object()
         .expect("WeakRef.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "deref",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "deref",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let target = Value::object(
         crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target object"),
@@ -1881,7 +2023,10 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
         crate::test_support::alloc_weak_ref(interp.gc_heap_mut(), &target).expect("weak ref");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1906,7 +2051,10 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable WeakRef.prototype.deref should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -1927,17 +2075,20 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("FinalizationRegistry")
         .expect("FinalizationRegistry.prototype")
         .as_object()
         .expect("FinalizationRegistry.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "unregister",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "unregister",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let cleanup =
         native_value_static(interp.gc_heap_mut(), "cleanup", 0, cleanup).expect("cleanup function");
@@ -1945,7 +2096,10 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
         .expect("registry");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -1970,7 +2124,10 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable FinalizationRegistry.prototype.unregister should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -1987,14 +2144,25 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &[], &[]).unwrap();
     let mut bag = property_dispatch::promise_ensure_expando_pub(interp.gc_heap_mut(), &promise)
         .expect("promise expando");
-    object::set(&mut bag, interp.gc_heap_mut(), "then", Value::number_i32(1));
+    assert!(
+        object::define_own_property_in_place(
+            &mut bag,
+            interp.gc_heap_mut(),
+            "then",
+            crate::object::PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2019,7 +2187,10 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable own promise method should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2036,22 +2207,28 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &[], &[]).unwrap();
     let mut proto = interp
         .constructor_prototype_value("Promise")
         .expect("Promise.prototype")
         .as_object()
         .expect("Promise.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "then",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "then",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2076,7 +2253,10 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Promise.prototype.then should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2093,7 +2273,7 @@ fn call_method_array_own_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let array =
         crate::array::from_elements_old_for_fixture(interp.gc_heap_mut(), [Value::number_i32(1)])
             .expect("array allocation");
@@ -2101,7 +2281,10 @@ fn call_method_array_own_non_callable_shadows_builtin() {
         .expect("array expando property");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2126,7 +2309,10 @@ fn call_method_array_own_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable own array method should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2143,15 +2329,26 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let units: Vec<u16> = "x".encode_utf16().collect();
     let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
     let mut bag = property_dispatch::regexp_ensure_expando_pub(interp.gc_heap_mut(), &regexp)
         .expect("regexp expando");
-    object::set(&mut bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
+    assert!(
+        object::define_own_property_in_place(
+            &mut bag,
+            interp.gc_heap_mut(),
+            "exec",
+            crate::object::PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2176,7 +2373,10 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable own regexp method should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2193,23 +2393,29 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("RegExp")
         .expect("RegExp.prototype")
         .as_object()
         .expect("RegExp.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "exec",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "exec",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let units: Vec<u16> = "x".encode_utf16().collect();
     let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2234,7 +2440,10 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable RegExp.prototype.exec should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2251,25 +2460,34 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Date")
         .expect("Date.prototype")
         .as_object()
         .expect("Date.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "getTime",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "getTime",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let mut date =
         crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("date object");
-    object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
+    assert!(
+        object::set_prototype(&mut date, interp.gc_heap_mut(), Some(proto))
+            .expect("fixture prototype transition")
+    );
     object::set_date_data(&mut date, interp.gc_heap_mut(), 0.0);
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2294,7 +2512,10 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Date.prototype.getTime should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2311,25 +2532,34 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Date")
         .expect("Date.prototype")
         .as_object()
         .expect("Date.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "setTime",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "setTime",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let mut date =
         crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("date object");
-    object::set_prototype(date, interp.gc_heap_mut(), Some(proto));
+    assert!(
+        object::set_prototype(&mut date, interp.gc_heap_mut(), Some(proto))
+            .expect("fixture prototype transition")
+    );
     object::set_date_data(&mut date, interp.gc_heap_mut(), 0.0);
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2354,7 +2584,10 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Date.prototype.setTime should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2371,7 +2604,7 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let buffer = crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
         .expect("array buffer");
     let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
@@ -2386,10 +2619,21 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
     let mut bag =
         property_dispatch::typed_array_ensure_expando_pub(interp.gc_heap_mut(), &typed_array)
             .expect("typed array expando");
-    object::set(&mut bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
+    assert!(
+        object::define_own_property_in_place(
+            &mut bag,
+            interp.gc_heap_mut(),
+            "map",
+            crate::object::PropertyDescriptor::data(Value::number_i32(1), true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2414,7 +2658,10 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable own typed array method should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2431,17 +2678,20 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Int8Array")
         .expect("Int8Array.prototype")
         .as_object()
         .expect("Int8Array.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "map",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "map",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let buffer = crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
         .expect("array buffer");
@@ -2456,7 +2706,10 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
     .expect("typed array");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2481,7 +2734,10 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Int8Array.prototype.map should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2498,17 +2754,20 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Int8Array")
         .expect("Int8Array.prototype")
         .as_object()
         .expect("Int8Array.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "slice",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "slice",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let buffer = crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
         .expect("array buffer");
@@ -2523,7 +2782,10 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
     .expect("typed array");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2548,7 +2810,10 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Int8Array.prototype.slice should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2565,17 +2830,20 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Iterator")
         .expect("Iterator.prototype")
         .as_object()
         .expect("Iterator.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "toArray",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "toArray",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let source = crate::array::from_elements_old_for_fixture(
         interp.gc_heap_mut(),
@@ -2584,7 +2852,10 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
     .expect("source array");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2613,7 +2884,10 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
     }
     .expect_err("non-callable Iterator.prototype.toArray should shadow helper");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2630,22 +2904,28 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Map")
         .expect("Map.prototype")
         .as_object()
         .expect("Map.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "forEach",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "forEach",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2670,7 +2950,10 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
     }
     .expect_err("non-callable Map.prototype.forEach should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2687,22 +2970,28 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Set")
         .expect("Set.prototype")
         .as_object()
         .expect("Set.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "forEach",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "forEach",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2727,7 +3016,10 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
     }
     .expect_err("non-callable Set.prototype.forEach should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2744,22 +3036,28 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Map")
         .expect("Map.prototype")
         .as_object()
         .expect("Map.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "get",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "get",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2784,7 +3082,10 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
     }
     .expect_err("non-callable Map.prototype.get should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2801,22 +3102,28 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Set")
         .expect("Set.prototype")
         .as_object()
         .expect("Set.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "add",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "add",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2841,7 +3148,10 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
     }
     .expect_err("non-callable Set.prototype.add should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2858,22 +3168,28 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("WeakMap")
         .expect("WeakMap.prototype")
         .as_object()
         .expect("WeakMap.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "get",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "get",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let weak_map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("weak map");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2898,7 +3214,10 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
     }
     .expect_err("non-callable WeakMap.prototype.get should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2915,22 +3234,28 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("WeakSet")
         .expect("WeakSet.prototype")
         .as_object()
         .expect("WeakSet.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "add",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "add",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let weak_set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("weak set");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -2955,7 +3280,10 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
     }
     .expect_err("non-callable WeakSet.prototype.add should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -2972,24 +3300,30 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("ArrayBuffer")
         .expect("ArrayBuffer.prototype")
         .as_object()
         .expect("ArrayBuffer.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "slice",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "slice",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let buffer = crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
         .expect("array buffer");
     let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3014,7 +3348,10 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable ArrayBuffer.prototype.slice should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3031,17 +3368,20 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("DataView")
         .expect("DataView.prototype")
         .as_object()
         .expect("DataView.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "getUint8",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "getUint8",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let buffer = crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
         .expect("array buffer");
@@ -3050,7 +3390,10 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
         crate::binary::JsDataView::new(interp.gc_heap_mut(), buffer, 0, 1).expect("data view");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3075,7 +3418,10 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable DataView.prototype.getUint8 should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3092,22 +3438,28 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Set")
         .expect("Set.prototype")
         .as_object()
         .expect("Set.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "union",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "union",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3132,7 +3484,10 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
     }
     .expect_err("non-callable Set.prototype.union should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3149,9 +3504,12 @@ fn call_method_function_own_non_callable_shadows_call() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3190,7 +3548,10 @@ fn call_method_function_own_non_callable_shadows_call() {
     }
     .expect_err("non-callable own function call should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3207,9 +3568,12 @@ fn call_method_function_own_non_callable_shadows_object_method() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3248,7 +3612,10 @@ fn call_method_function_own_non_callable_shadows_object_method() {
     }
     .expect_err("non-callable own hasOwnProperty should shadow Object.prototype");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3265,12 +3632,18 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("object");
-    object::set_prototype(obj, interp.gc_heap_mut(), None);
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("object");
+    assert!(
+        object::set_prototype(&mut obj, interp.gc_heap_mut(), None)
+            .expect("fixture prototype transition")
+    );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3295,7 +3668,10 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
     }
     .expect_err("null-prototype object should not inherit Object.prototype methods");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3316,22 +3692,28 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Object")
         .expect("Object.prototype")
         .as_object()
         .expect("Object.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "hasOwnProperty",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "hasOwnProperty",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let native = native_value_static(interp.gc_heap_mut(), "target", 0, noop).expect("native");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3356,7 +3738,10 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Object.prototype.hasOwnProperty should shadow native intercept");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3373,21 +3758,27 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut proto = interp
         .constructor_prototype_value("Object")
         .expect("Object.prototype")
         .as_object()
         .expect("Object.prototype object");
-    object::set(
-        &mut proto,
-        interp.gc_heap_mut(),
-        "hasOwnProperty",
-        Value::number_i32(1),
+    assert!(
+        object::ordinary_set_data_property(
+            &mut proto,
+            interp.gc_heap_mut(),
+            "hasOwnProperty",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3412,7 +3803,10 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable Object.prototype.hasOwnProperty should shadow primitive intercept");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
 }
 
 #[test]
@@ -3433,7 +3827,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let _runtime_roots = interp.scope_runtime_roots_guard();
     let proto = interp
         .constructor_prototype_value("String")
@@ -3442,19 +3836,26 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         .expect("String.prototype object");
     let mut obj =
         object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("string wrapper");
-    object::set_prototype(obj, interp.gc_heap_mut(), Some(proto));
+    assert!(
+        object::set_prototype(&mut obj, interp.gc_heap_mut(), Some(proto))
+            .expect("fixture prototype transition")
+    );
     let obj_anchor = interp.push_iteration_anchor(Value::object(obj)) - 1;
     let data = JsString::from_str("abc", interp.gc_heap_mut()).expect("string data");
     obj = interp
         .iteration_anchor(obj_anchor)
         .as_object()
         .expect("rooted string wrapper");
-    object::set_string_data(&mut obj, interp.gc_heap_mut(), data);
-    object::set(
-        &mut obj,
-        interp.gc_heap_mut(),
-        "replace",
-        Value::number_i32(1),
+    object::set_string_data(&mut obj, interp.gc_heap_mut(), data)
+        .expect("string-wrapper fixture allocation");
+    assert!(
+        object::ordinary_set_data_property(
+            &mut obj,
+            interp.gc_heap_mut(),
+            "replace",
+            Value::number_i32(1)
+        )
+        .expect("fixture assignment allocation")
     );
     let mut search = Value::undefined();
     let mut repl = Value::undefined();
@@ -3469,7 +3870,10 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     repl = native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
 
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3498,15 +3902,20 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
     }
     .expect_err("non-callable own String wrapper replace should shadow builtin");
 
-    assert!(matches!(err, VmError::NotCallable));
+    assert!(matches!(
+        err,
+        crate::CommittedValueError::JavaScript(VmError::NotCallable)
+    ));
     interp.pop_iteration_anchors_to(obj_anchor);
 }
 
 #[test]
 fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
     let module = module_with(Vec::new(), 2);
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let source = crate::array::from_elements_old_for_fixture(
         interp.gc_heap_mut(),
         [Value::number(NumberValue::from_i32(21))],
@@ -3542,8 +3951,10 @@ fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
 #[test]
 fn iterator_to_list_map_pairs_use_runtime_rooted_array_allocation() {
     let module = module_with(Vec::new(), 4);
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
     crate::collections::map_set(
         map,
@@ -3581,7 +3992,7 @@ fn iterator_to_list_map_pairs_use_runtime_rooted_array_allocation() {
 
 #[test]
 fn iterator_result_record_uses_runtime_rooted_young_allocation() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let value = Value::number(NumberValue::from_i32(44));
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -3606,7 +4017,7 @@ fn iterator_result_record_uses_runtime_rooted_young_allocation() {
 
 #[test]
 fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let pair = crate::array::from_elements_old_for_fixture(
         interp.gc_heap_mut(),
         [
@@ -3631,7 +4042,10 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
         function_source: None,
     };
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -3692,9 +4106,11 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
         ],
         2,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let Some(obj) = (interp.run(&context).unwrap()).as_object() else {
         panic!("NewError should return an object");
     };
@@ -3709,7 +4125,7 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
 #[test]
 fn vm_error_throwable_uses_stack_rooted_allocation() {
     let module = module_with(Vec::new(), 1);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
     stack.push(
@@ -3721,7 +4137,8 @@ fn vm_error_throwable_uses_stack_rooted_allocation() {
 
     let error = interp
         .vm_error_to_throwable_with_stack_roots(None, &stack, &VmError::TypeMismatch)
-        .and_then(|v| v.as_object())
+        .expect("throwable allocation succeeds")
+        .as_object()
         .expect("TypeMismatch should convert to a throwable object");
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -3741,7 +4158,7 @@ fn vm_error_throwable_uses_stack_rooted_allocation() {
 #[test]
 fn oom_throwable_uses_range_error_prototype() {
     let module = module_with(Vec::new(), 1);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
     stack.push(
@@ -3759,7 +4176,8 @@ fn oom_throwable_uses_range_error_prototype() {
                 heap_limit_bytes: 2 * 1024 * 1024,
             },
         )
-        .and_then(|v| v.as_object())
+        .expect("throwable allocation succeeds")
+        .as_object()
         .expect("OutOfMemory should convert to a throwable object");
 
     assert!(object::has_in_proto_chain(
@@ -3771,7 +4189,7 @@ fn oom_throwable_uses_range_error_prototype() {
 
 #[test]
 fn host_rooted_object_and_array_helpers_use_young_allocation() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     let mut host = interp
@@ -3786,11 +4204,14 @@ fn host_rooted_object_and_array_helpers_use_young_allocation() {
             &[elements.as_slice()],
         )
         .expect("host array allocation");
-    object::set(
-        &mut host,
-        interp.gc_heap_mut(),
-        "items",
-        Value::array(array),
+    assert!(
+        object::define_own_property_in_place(
+            &mut host,
+            interp.gc_heap_mut(),
+            "items",
+            crate::object::PropertyDescriptor::data(Value::array(array), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -3823,9 +4244,11 @@ fn bytecode_new_weak_ref_uses_young_allocation_with_frame_roots() {
         ],
         2,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_weak_ref());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -3864,9 +4287,11 @@ fn bytecode_new_finalization_registry_uses_young_allocation_with_frame_roots() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_finalization_registry());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -3926,8 +4351,10 @@ fn direct_bytecode_async_call_window_populates_parameters() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let Some(promise) = (interp.run(&context).unwrap()).as_promise() else {
         panic!("expected async function call to return a promise");
     };
@@ -3974,8 +4401,10 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let body_frame = interp.test_frame_for_function(&generator_body).unwrap();
     let body_frame = interp.park_active_frame(&body_frame);
     let generator =
@@ -4027,8 +4456,10 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
     stack.push(interp.test_frame_for_function(&main).unwrap());
@@ -4090,8 +4521,10 @@ fn top_level_async_entry_returns_the_awaited_completion() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert_eq!(
         interp.run(&context).unwrap(),
         Value::number(NumberValue::Smi(512))
@@ -4127,8 +4560,10 @@ fn promise_fulfilled_of_allocates_the_body_in_old_space() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let Some(promise) = (interp.run(&context).unwrap()).as_promise() else {
         panic!("expected promise");
     };
@@ -4158,7 +4593,7 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let result_promise = {
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         JsPromiseHandle::pending_with_roots(interp.gc_heap_mut(), &mut external_visit)
@@ -4171,7 +4606,9 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
     stack.push(frame);
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
@@ -4195,9 +4632,12 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
     }
 
     let module = module_with(Vec::new(), 3);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let executor_value =
         native_value_static(interp.gc_heap_mut(), "executor", 2, executor).expect("executor");
@@ -4231,9 +4671,12 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
 #[test]
 fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
     let module = module_with(Vec::new(), 3);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -4349,8 +4792,10 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let Some(args) = (interp.run(&context).unwrap()).as_object() else {
         panic!("expected constructor-returned arguments object");
     };
@@ -4415,9 +4860,11 @@ fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_object());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4492,9 +4939,11 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_object());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4520,12 +4969,14 @@ fn work_budget_stats_record_work_and_budget_observations() {
         ],
         1,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.set_work_budget(WorkBudget {
         max_work_units_per_turn: Some(1),
         ..WorkBudget::default()
     });
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert_eq!(interp.run(&context).unwrap(), Value::undefined());
     let stats = interp.work_budget_stats();
     assert_eq!(stats.turns_started, 1);
@@ -4553,13 +5004,15 @@ fn work_budget_can_reject_on_work_limit() {
         ],
         1,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.set_work_budget(WorkBudget {
         on_exceeded: WorkBudgetExceededAction::Reject,
         max_work_units_per_turn: Some(0),
         ..WorkBudget::default()
     });
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let err = interp.run(&context).unwrap_err();
     assert!(matches!(err.error, VmError::BudgetExceeded));
     let stats = interp.work_budget_stats();
@@ -4584,8 +5037,10 @@ fn work_budget_stats_record_heap_allocations() {
         ],
         1,
     );
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_object());
     let stats = interp.work_budget_stats();
     assert!(stats.allocated_objects_observed >= 1);
@@ -4611,9 +5066,11 @@ fn bytecode_new_object_uses_young_allocation_with_frame_roots() {
         ],
         1,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_object());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4648,9 +5105,11 @@ fn bytecode_new_array_uses_young_allocation_with_frame_roots() {
         ],
         2,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert!(interp.run(&context).unwrap().is_array());
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4665,69 +5124,106 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
         vec![
             Instruction {
                 pc: 0,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(1)],
+                op: Op::ArrayPush,
+                operands: vec![Operand::Register(0), Operand::Register(1)],
             },
             Instruction {
                 pc: 1,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(1), Operand::Imm32(2)],
-            },
-            Instruction {
-                pc: 2,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(2), Operand::Imm32(3)],
-            },
-            Instruction {
-                pc: 3,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(3), Operand::Imm32(4)],
-            },
-            Instruction {
-                pc: 4,
-                op: Op::NewArray,
-                operands: vec![
-                    Operand::Register(4),
-                    Operand::ConstIndex(4),
-                    Operand::Register(0),
-                    Operand::Register(1),
-                    Operand::Register(2),
-                    Operand::Register(3),
-                ],
-            },
-            Instruction {
-                pc: 5,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(5), Operand::Imm32(5)],
-            },
-            Instruction {
-                pc: 6,
-                op: Op::ArrayPush,
-                operands: vec![Operand::Register(4), Operand::Register(5)],
-            },
-            Instruction {
-                pc: 7,
                 op: Op::Return,
-                operands: vec![Operand::Register(4)],
+                operands: vec![Operand::Register(0)],
             },
         ],
-        6,
+        3,
     );
-    let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().old_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
-    let result = interp.run(&context).unwrap();
-    let Some(array) = (result).as_array() else {
-        panic!("ArrayPush program should return the grown array");
-    };
-    let values =
-        crate::array::with_elements(array, interp.gc_heap_mut(), |elements| elements.to_vec());
-    assert_eq!(values.len(), 5);
-    assert_eq!(values[4], Value::number(NumberValue::from_i32(5)));
-    let after = interp.gc_heap_mut().stats().old_allocated_bytes;
-    assert!(
-        after > before,
-        "ArrayPush should grow dense backing storage through the root-aware path"
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    interp.gc_heap_mut().set_gc_stress(0, false);
+    let context = interp
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid bytecode fixture");
+    let mut frame = interp
+        .test_frame_for_function(&module.functions[0])
+        .expect("published frame");
+    let (old_array, old_child, old_sentinel, old_slab) = interp
+        .with_handle_scope(|interp, scope| {
+            let child = interp.scoped_object(scope)?;
+            let value = interp.escape_scoped(child);
+            let value = interp.allocate_array_in_active_realm([
+                value,
+                Value::number_i32(2),
+                Value::number_i32(3),
+                Value::number_i32(4),
+            ])?;
+            let array = interp.scoped_value(scope, value);
+            let sentinel = interp.scoped_object(scope)?;
+            frame.registers[0] = interp.escape_scoped(array);
+            frame.registers[1] = interp.escape_scoped(child);
+            // This object is absent from the array and the pending push. Only
+            // the published frame can keep it live during the slab allocation.
+            frame.registers[2] = interp.escape_scoped(sentinel);
+            let array = frame.registers[0].as_array().unwrap();
+            let slab = interp.gc_heap().read_payload(array, |body| body.slab);
+            assert!(unsafe { (*slab.as_header_ptr()).is_young() });
+            Ok::<_, VmError>((
+                array.offset(),
+                frame.registers[1].as_object().unwrap().offset(),
+                frame.registers[2].as_object().unwrap().offset(),
+                slab.offset(),
+            ))
+        })
+        .expect("young growth inputs");
+    let mut stack = crate::test_support::FrameChainFixture::new();
+    stack.push(frame);
+    interp.gc_heap_mut().set_gc_stress(1, false);
+    let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        let before = interp.gc_heap_mut().gc_stats().clone();
+        let frame = std::ptr::from_mut(&mut stack[0]);
+        let result = crate::test_support::resume_prepared_frame(interp, stack, &context, frame)
+            .expect("bytecode ArrayPush and Return");
+        let after = interp.gc_heap_mut().gc_stats().clone();
+        assert_eq!(after.minor_gc_cycles, before.minor_gc_cycles + 1);
+        assert!(after.minor_root_slots_scanned > before.minor_root_slots_scanned);
+        assert!(after.minor_slot_updates >= before.minor_slot_updates + 3);
+        let slab_tag = crate::array::elements::ELEMENT_SLAB_BODY_TYPE_TAG as usize;
+        assert_eq!(
+            after.by_type[slab_tag].alloc_count_total,
+            before.by_type[slab_tag].alloc_count_total + 1,
+            "ArrayPush must allocate exactly one replacement slab"
+        );
+        result
+    });
+    let frame = stack.pop().expect("retained fixture windows");
+    let array = result.as_array().expect("grown array result");
+    assert_eq!(result, frame.registers[0]);
+    assert_ne!(array.offset(), old_array, "growth evacuated the owner");
+    assert_ne!(frame.registers[1].as_object().unwrap().offset(), old_child);
+    assert_ne!(
+        frame.registers[2].as_object().unwrap().offset(),
+        old_sentinel
+    );
+    assert_ne!(frame.registers[1], frame.registers[2]);
+    let values = crate::array::with_elements(array, interp.gc_heap(), |elements| elements.to_vec());
+    assert_eq!(
+        values,
+        vec![
+            frame.registers[1],
+            Value::number_i32(2),
+            Value::number_i32(3),
+            Value::number_i32(4),
+            frame.registers[1],
+        ]
+    );
+    interp.gc_heap().read_payload(array, |body| {
+        assert_ne!(body.slab.offset(), old_slab);
+        assert!(body.element_cache_is_current());
+        assert!(unsafe { (*body.slab.as_header_ptr()).is_young() });
+    });
+    // Reading the unrelated object's body also detects a stale frame-only root.
+    assert_ne!(
+        crate::object::shape_id(frame.registers[2].as_object().unwrap(), interp.gc_heap()),
+        crate::object::ShapeId::UNASSIGNED
     );
 }
 
@@ -4737,84 +5233,116 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
         vec![
             Instruction {
                 pc: 0,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(1)],
-            },
-            Instruction {
-                pc: 1,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(1), Operand::Imm32(2)],
-            },
-            Instruction {
-                pc: 2,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(2), Operand::Imm32(3)],
-            },
-            Instruction {
-                pc: 3,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(3), Operand::Imm32(4)],
-            },
-            Instruction {
-                pc: 4,
-                op: Op::NewArray,
+                op: Op::StoreElement,
                 operands: vec![
-                    Operand::Register(4),
-                    Operand::ConstIndex(4),
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::Register(2),
-                    Operand::Register(3),
                 ],
             },
             Instruction {
-                pc: 5,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(5), Operand::Imm32(4)],
-            },
-            Instruction {
-                pc: 6,
-                op: Op::LoadInt32,
-                operands: vec![Operand::Register(6), Operand::Imm32(99)],
-            },
-            Instruction {
-                pc: 7,
-                op: Op::StoreElement,
-                operands: vec![
-                    Operand::Register(4),
-                    Operand::Register(5),
-                    Operand::Register(6),
-                ],
-            },
-            Instruction {
-                pc: 8,
+                pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(4)],
+                operands: vec![Operand::Register(0)],
             },
         ],
-        8,
+        4,
     );
-    let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().old_allocated_bytes;
-    let context = interp.link_module(module).expect("valid bytecode fixture");
-    let result = interp.run(&context).unwrap();
-    let Some(array) = (result).as_array() else {
-        panic!("StoreElement program should return the grown array");
-    };
-    let values =
-        crate::array::with_elements(array, interp.gc_heap_mut(), |elements| elements.to_vec());
-    assert_eq!(values.len(), 5);
-    assert_eq!(values[4], Value::number(NumberValue::from_i32(99)));
-    let after = interp.gc_heap_mut().stats().old_allocated_bytes;
-    assert!(
-        after > before,
-        "StoreElement should grow dense backing storage through the root-aware path"
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    interp.gc_heap_mut().set_gc_stress(0, false);
+    let context = interp
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid bytecode fixture");
+    let mut frame = interp
+        .test_frame_for_function(&module.functions[0])
+        .expect("published frame");
+    let (old_array, old_child, old_sentinel, old_slab) = interp
+        .with_handle_scope(|interp, scope| {
+            let child = interp.scoped_object(scope)?;
+            let value = interp.escape_scoped(child);
+            let value = interp.allocate_array_in_active_realm([
+                value,
+                Value::number_i32(2),
+                Value::number_i32(3),
+                Value::number_i32(4),
+            ])?;
+            let array = interp.scoped_value(scope, value);
+            let sentinel = interp.scoped_object(scope)?;
+            frame.registers[0] = interp.escape_scoped(array);
+            frame.registers[1] = Value::number_i32(4);
+            frame.registers[2] = interp.escape_scoped(child);
+            // The growth operation never receives this object's word. Its
+            // sole owner is the collector's published frame-root provider.
+            frame.registers[3] = interp.escape_scoped(sentinel);
+            let array = frame.registers[0].as_array().unwrap();
+            let slab = interp.gc_heap().read_payload(array, |body| body.slab);
+            assert!(unsafe { (*slab.as_header_ptr()).is_young() });
+            Ok::<_, VmError>((
+                array.offset(),
+                frame.registers[2].as_object().unwrap().offset(),
+                frame.registers[3].as_object().unwrap().offset(),
+                slab.offset(),
+            ))
+        })
+        .expect("young growth inputs");
+    let mut stack = crate::test_support::FrameChainFixture::new();
+    stack.push(frame);
+    interp.gc_heap_mut().set_gc_stress(1, false);
+    let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        let before = interp.gc_heap_mut().gc_stats().clone();
+        let frame = std::ptr::from_mut(&mut stack[0]);
+        let result = crate::test_support::resume_prepared_frame(interp, stack, &context, frame)
+            .expect("bytecode StoreElement and Return");
+        let after = interp.gc_heap_mut().gc_stats().clone();
+        assert_eq!(after.minor_gc_cycles, before.minor_gc_cycles + 1);
+        assert!(after.minor_root_slots_scanned > before.minor_root_slots_scanned);
+        assert!(after.minor_slot_updates >= before.minor_slot_updates + 3);
+        let slab_tag = crate::array::elements::ELEMENT_SLAB_BODY_TYPE_TAG as usize;
+        assert_eq!(
+            after.by_type[slab_tag].alloc_count_total,
+            before.by_type[slab_tag].alloc_count_total + 1,
+            "StoreElement must allocate exactly one replacement slab"
+        );
+        result
+    });
+    let frame = stack.pop().expect("retained fixture windows");
+    let array = result.as_array().expect("grown array result");
+    assert_eq!(result, frame.registers[0]);
+    assert_ne!(array.offset(), old_array, "growth evacuated the owner");
+    assert_ne!(frame.registers[2].as_object().unwrap().offset(), old_child);
+    assert_ne!(
+        frame.registers[3].as_object().unwrap().offset(),
+        old_sentinel
+    );
+    assert_ne!(frame.registers[2], frame.registers[3]);
+    let values = crate::array::with_elements(array, interp.gc_heap(), |elements| elements.to_vec());
+    assert_eq!(
+        values,
+        vec![
+            frame.registers[2],
+            Value::number_i32(2),
+            Value::number_i32(3),
+            Value::number_i32(4),
+            frame.registers[2],
+        ]
+    );
+    interp.gc_heap().read_payload(array, |body| {
+        assert_ne!(body.slab.offset(), old_slab);
+        assert!(body.element_cache_is_current());
+        assert!(unsafe { (*body.slab.as_header_ptr()).is_young() });
+    });
+    assert_ne!(
+        crate::object::shape_id(frame.registers[3].as_object().unwrap(), interp.gc_heap()),
+        crate::object::ShapeId::UNASSIGNED
     );
 }
 
 #[test]
 fn work_budget_stats_record_host_ops_and_external_bytes() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.set_work_budget(WorkBudget {
         max_host_ops_per_turn: Some(0),
         max_external_bytes: Some(0),
@@ -4850,9 +5378,9 @@ fn missing_return_is_rejected_at_verification() {
         pc: 0,
         span: (0, 0),
     }];
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let error = interp
-        .link_module(module)
+        .link_module(module, crate::source_registry::SourceRegistry::default())
         .expect_err("terminator-less body must fail verification");
     assert!(
         error.to_string().contains("reaches function end"),
@@ -4904,21 +5432,24 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
     // One activation per execution turn: the handler-less frame is
     // completed and the throw escapes its floor.
     stack.push(interp.test_frame_for_function(&main).unwrap());
     let context = interp
-        .link_module(module_with(
-            vec![Instruction {
-                pc: 0,
-                op: Op::ReturnUndefined,
-                operands: vec![],
-            }],
-            1,
-        ))
+        .link_module(
+            module_with(
+                vec![Instruction {
+                    pc: 0,
+                    op: Op::ReturnUndefined,
+                    operands: vec![],
+                }],
+                1,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let err = interp
         .unwind_throw(
@@ -4980,7 +5511,7 @@ fn unwind_throw_lands_in_catch_handler() {
         number_hint_sites: Vec::new(),
         class_hint_sites: Vec::new(),
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
     let frame = interp.test_frame_for_function(&main).unwrap();
@@ -5011,7 +5542,9 @@ fn unwind_throw_lands_in_catch_handler() {
         target: 2,
         exception: 1,
     }];
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     interp
         .unwind_throw(
             &context,
@@ -5033,7 +5566,7 @@ fn is_callable_recognises_call_shapes() {
             .expect("closure");
     assert!(is_callable(&Value::closure(closure_handle)));
     let mut heap = crate::object::fixture_heap();
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let bound = crate::test_support::alloc_bound_function(
         &mut interp,
         Value::function(7),
@@ -5055,7 +5588,7 @@ fn native_call_context_receives_method_receiver() {
     }
 
     let module = module_with(vec![], 1);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let callee =
         native_value_static(interp.gc_heap_mut(), "returnThis", 0, return_this).expect("native");
     let receiver =
@@ -5068,7 +5601,10 @@ fn native_call_context_receives_method_receiver() {
             .unwrap(),
     );
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
@@ -5097,7 +5633,7 @@ fn native_construct_context_walks_the_live_caller_stack() {
     }
 
     let module = module_with(vec![], 2);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let callee = Value::native_function(
         NativeFunction::new_constructor_static(
             interp.gc_heap_mut(),
@@ -5113,7 +5649,9 @@ fn native_construct_context_walks_the_live_caller_stack() {
         .expect("caller frame");
     frame.registers[0] = callee;
     stack.push(frame);
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let operands = vec![
         Operand::Register(1),
         Operand::Register(0),
@@ -5121,7 +5659,9 @@ fn native_construct_context_walks_the_live_caller_stack() {
     ];
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        let staged = interp.do_construct(stack, &context, &operands);
+        let staged = interp
+            .do_construct(stack, &context, &operands)
+            .map_err(crate::CommittedValueError::completed_call);
         complete_staged(interp, stack, &context, staged)
     })
     .expect("native construct");
@@ -5154,7 +5694,7 @@ fn direct_native_call_uses_contiguous_argument_window() {
     }
 
     let module = module_with(vec![], 4);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let callee = native_value_static(interp.gc_heap_mut(), "sum", 2, sum_smi_args).expect("native");
     let mut stack: crate::test_support::FrameChainFixture =
         crate::test_support::FrameChainFixture::new();
@@ -5166,7 +5706,10 @@ fn direct_native_call_uses_contiguous_argument_window() {
     frame.registers[2] = Value::number(NumberValue::Smi(13));
     stack.push(frame);
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let operands = vec![
         Operand::Register(3),
@@ -5177,7 +5720,9 @@ fn direct_native_call_uses_contiguous_argument_window() {
     ];
 
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        let staged = interp.do_call(stack, &context, &operands);
+        let staged = interp
+            .do_call(stack, &context, &operands)
+            .map_err(crate::CommittedValueError::completed_call);
         complete_staged(interp, stack, &context, staged)
     })
     .unwrap();
@@ -5196,11 +5741,19 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
     }
 
     let module = module_with(vec![], 4);
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let apply = native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
     let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
     let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-    object::set(&mut handler, interp.gc_heap_mut(), "apply", apply);
+    assert!(
+        object::define_own_property_in_place(
+            &mut handler,
+            interp.gc_heap_mut(),
+            "apply",
+            crate::object::PropertyDescriptor::data(apply, true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
     let proxy = Value::proxy(
         crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::object(handler)).unwrap(),
     );
@@ -5215,7 +5768,10 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
     frame.registers[2] = Value::number(NumberValue::Smi(11));
     stack.push(frame);
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let operands = vec![
         Operand::Register(3),
@@ -5227,7 +5783,9 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        let staged = interp.do_call(stack, &context, &operands);
+        let staged = interp
+            .do_call(stack, &context, &operands)
+            .map_err(crate::CommittedValueError::completed_call);
         complete_staged(interp, stack, &context, staged)
     })
     .unwrap();
@@ -5284,11 +5842,19 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let construct =
         native_value_static(interp.gc_heap_mut(), "construct", 3, return_proxy_arg).unwrap();
     let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-    object::set(&mut handler, interp.gc_heap_mut(), "construct", construct);
+    assert!(
+        object::define_own_property_in_place(
+            &mut handler,
+            interp.gc_heap_mut(),
+            "construct",
+            crate::object::PropertyDescriptor::data(construct, true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
     let proxy = Value::proxy(
         crate::proxy::JsProxy::new(
             interp.gc_heap_mut(),
@@ -5306,7 +5872,10 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
     frame.registers[1] = proxy;
     stack.push(frame);
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     let operands = vec![
         Operand::Register(0),
@@ -5316,7 +5885,9 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        let staged = interp.do_construct(stack, &context, &operands);
+        let staged = interp
+            .do_construct(stack, &context, &operands)
+            .map_err(crate::CommittedValueError::completed_call);
         complete_staged(interp, stack, &context, staged)
     })
     .unwrap();
@@ -5340,12 +5911,22 @@ fn run_callable_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
     }
 
     let module = module_with(Vec::new(), 1);
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let apply = native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
     let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
     let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-    object::set(&mut handler, interp.gc_heap_mut(), "apply", apply);
+    assert!(
+        object::define_own_property_in_place(
+            &mut handler,
+            interp.gc_heap_mut(),
+            "apply",
+            crate::object::PropertyDescriptor::data(apply, true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
     let proxy = Value::proxy(
         crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::object(handler)).unwrap(),
     );
@@ -5407,14 +5988,16 @@ fn rooted_construct_receiver_uses_shared_turn_young_allocation() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let mut stack = crate::test_support::FrameChainFixture::new();
     let target = Value::function(1);
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.run_construct_sync_rooted(stack, &context, &target, target, SmallVec::new())
+        interp.run_construct_sync_rooted(stack, &context, &target, target, SmallVec::new(), 0)
     })
     .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5460,12 +6043,22 @@ fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
         module_inits: Vec::new(),
         function_source: None,
     };
-    let mut interp = Interpreter::new();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     let construct =
         native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
     let mut handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-    object::set(&mut handler, interp.gc_heap_mut(), "construct", construct);
+    assert!(
+        object::define_own_property_in_place(
+            &mut handler,
+            interp.gc_heap_mut(),
+            "construct",
+            crate::object::PropertyDescriptor::data(construct, true, true, true)
+        )
+        .expect("fixture property allocation")
+    );
     let proxy = Value::proxy(
         crate::proxy::JsProxy::new(
             interp.gc_heap_mut(),
@@ -5479,7 +6072,7 @@ fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
-        interp.run_construct_sync_rooted(stack, &context, &proxy, proxy, args)
+        interp.run_construct_sync_rooted(stack, &context, &proxy, proxy, args, 0)
     })
     .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5605,7 +6198,7 @@ fn arrow_closure_overrides_call_site_this() {
     // Build the closure by hand and dispatch via `invoke`. The
     // bound_this is a marker string — if `LoadThis` returns it,
     // the lexical override is working.
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let bound = JsString::from_str("outer", interp.gc_heap_mut()).unwrap();
     let closure_handle = crate::closure::alloc_closure(
         interp.gc_heap_mut(),
@@ -5624,7 +6217,10 @@ fn arrow_closure_overrides_call_site_this() {
             .unwrap(),
     );
     let context = interp
-        .link_module(module.clone())
+        .link_module(
+            module.clone(),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     // Caller-supplied this is `Null` — the closure must override. The
     // trampoline classifies the arrow and binds its lexical receiver.
@@ -5653,10 +6249,12 @@ fn interrupt_handle_breaks_loop() {
         ],
         1,
     );
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let handle = interp.interrupt_handle();
     handle.interrupt();
-    let context = interp.link_module(module).expect("valid bytecode fixture");
+    let context = interp
+        .link_module(module, crate::source_registry::SourceRegistry::default())
+        .expect("valid bytecode fixture");
     assert_eq!(
         interp.run(&context).unwrap_err().error,
         VmError::Interrupted
@@ -5726,32 +6324,38 @@ fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
 
 #[test]
 fn snapshot_restore_republishes_owned_interpreter_destinations() {
-    let mut vm = Interpreter::new();
+    let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
     let context = vm
-        .link_module(module_with(
-            vec![Instruction {
-                pc: 0,
-                op: Op::ReturnUndefined,
-                operands: vec![],
-            }],
-            3,
-        ))
+        .link_module(
+            module_with(
+                vec![Instruction {
+                    pc: 0,
+                    op: Op::ReturnUndefined,
+                    operands: vec![],
+                }],
+                3,
+            ),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .unwrap();
     let donor = vm
         .current_direct_callee_plan(context.exec_function(0).unwrap())
         .unwrap();
     let snapshot = vm.capture_isolate_snapshot().unwrap();
-    let restored = Interpreter::from_isolate_snapshot(&snapshot).unwrap();
+    let restored =
+        Interpreter::from_isolate_snapshot(&snapshot, &otter_resource::ResourceAccount::default())
+            .unwrap();
     let mut visited = 0;
     restored.code_space.visit_live_functions(|function| {
         let plan = restored.current_direct_callee_plan(function).unwrap();
         assert_eq!(plan.function_id, function.id);
-        assert_eq!(plan.register_count, function.register_count);
         assert_eq!(plan.tier, native_abi::NativeFrameKind::Interpreter);
         assert_eq!(plan.code_object_id, 0);
         assert_ne!(plan.entry_cell, donor.entry_cell);
         // SAFETY: restoration owns fresh permanent function and entry cells.
         let cell = unsafe { &*(plan.entry_cell as *const native_abi::FunctionEntryCell) };
+        assert_eq!(cell.register_count, function.register_count);
+        assert_eq!(cell.param_count, function.param_count);
         assert_ne!(cell.current_generation(), 0);
         visited += 1;
     });

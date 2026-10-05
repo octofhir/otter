@@ -31,6 +31,7 @@
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`stats`] — per-heap counters and per-type rows.
+//! - [`observation`] — bounded owned records of synchronous collection service.
 //! - [`snapshot`] — Rust-side heap snapshot + retained-size walker.
 //! - [`census`] — per-space, per-type-tag heap census.
 //! - [`test_support`] — public Traceable helpers for downstream
@@ -84,6 +85,7 @@ pub mod host_refs;
 pub mod lab;
 #[doc(hidden)]
 pub mod marking;
+pub mod observation;
 pub mod oom;
 pub mod page;
 pub mod root_scope;
@@ -112,6 +114,9 @@ pub use heap::{
 };
 pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use lab::{LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, LinearAllocationArea};
+pub use observation::{
+    GcPauseCapture, GcPauseCaptureError, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger,
+};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use root_scope::{ErasedSlotTracer, RootScope};

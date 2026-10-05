@@ -55,6 +55,8 @@ pub struct ClassConstructorBody {
     /// prototype keeps the parallel walk-able chain; this slot
     /// preserves identity for getPrototypeOf / super-base checks.
     pub ctor_proto: Value,
+    /// Receiver layouts belong to the wrapper, not its callable template.
+    pub(crate) constructor_layouts: crate::constructor_layout::ConstructorLayout,
 }
 
 impl ClassConstructorBody {
@@ -63,6 +65,10 @@ impl ClassConstructorBody {
         crate::code_liveness::visit_value(&self.ctor_proto, visitor);
     }
 }
+
+/// Byte offset of the traced exact-constructor family head.
+pub(crate) const CLASS_CONSTRUCTOR_BODY_LAYOUTS_OFFSET: usize =
+    std::mem::offset_of!(ClassConstructorBody, constructor_layouts);
 
 /// Byte offset of the underlying callable in [`ClassConstructorBody`].
 pub const CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET: usize =
@@ -84,6 +90,22 @@ pub struct ClassConstructor {
 }
 
 impl ClassConstructor {
+    /// Traced family head of this exact constructor object.
+    pub(crate) fn constructor_layouts(
+        self,
+        heap: &otter_gc::GcHeap,
+    ) -> crate::constructor_layout::ConstructorLayout {
+        heap.read_payload(self.inner, |body| body.constructor_layouts)
+    }
+    pub(crate) fn set_constructor_layouts(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        layouts: crate::constructor_layout::ConstructorLayout,
+    ) {
+        heap.with_payload(self.inner, |body| body.constructor_layouts = layouts);
+        heap.record_write(self.inner, &layouts);
+    }
+
     /// Allocate a class constructor while exposing caller-owned roots
     /// across the body allocation.
     pub(crate) fn new_with_roots(
@@ -108,6 +130,7 @@ impl ClassConstructor {
                     prototype,
                     statics,
                     ctor_proto: Value::undefined(),
+                    constructor_layouts: crate::constructor_layout::ConstructorLayout::null(),
                 },
                 &mut visit,
             )?,

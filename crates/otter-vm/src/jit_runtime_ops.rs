@@ -22,6 +22,7 @@
 //! - `crate::property_dispatch` for typed property and element slow paths.
 //! - `otter-jit::template` for the machine-code stubs calling these operations.
 
+use crate::native_abi::CommittedValueError;
 use crate::{
     ActiveFrameMut, ExecutionContext, Interpreter, Value, VmError, abstract_ops,
     arithmetic_dispatch::NumericRuntimeOp,
@@ -89,16 +90,17 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         operation: NumericRuntimeOp,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let lhs = frame.read(lhs)?;
+        let lhs = frame.read(lhs).map_err(CommittedValueError::Fatal)?;
         let rhs = operation
             .rhs_register()
             .map(|register| frame.read(register))
-            .transpose()?;
+            .transpose()
+            .map_err(CommittedValueError::Fatal)?;
         record_completed_arith(context, frame, lhs, rhs.unwrap_or(lhs));
         let result = self.numeric_runtime_value(stack, context, operation, lhs, rhs)?;
-        frame.write(dst, result)
+        frame.write(dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Execute generic ECMAScript addition against the canonical activation.
@@ -110,13 +112,13 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         rhs: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let lhs = frame.read(lhs)?;
-        let rhs = frame.read(rhs)?;
+        let lhs = frame.read(lhs).map_err(CommittedValueError::Fatal)?;
+        let rhs = frame.read(rhs).map_err(CommittedValueError::Fatal)?;
         record_completed_arith(context, frame, lhs, rhs);
         let result = self.add_value(stack, context, lhs, rhs)?;
-        frame.write(dst, result)
+        frame.write(dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Complete a coercive unary operation against the canonical activation.
@@ -134,11 +136,11 @@ impl Interpreter {
         dst: u16,
         src: u16,
         operation: UnaryCoercionOp,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let input = frame.read(src)?;
+        let input = frame.read(src).map_err(CommittedValueError::Fatal)?;
         let result = self.coerce_unary_value(stack, context, input, operation)?;
-        frame.write(dst, result)
+        frame.write(dst, result).map_err(CommittedValueError::Fatal)
     }
 
     /// Evaluate one typed coercive unary operation independently of frame
@@ -150,7 +152,7 @@ impl Interpreter {
         context: &ExecutionContext,
         input: Value,
         operation: UnaryCoercionOp,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         match operation {
             UnaryCoercionOp::ToNumeric => {
                 crate::coerce::to_numeric_or_throw(self, stack, context, &input)
@@ -170,7 +172,7 @@ impl Interpreter {
         object: u16,
         key: u16,
         value: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.run_define_data_property_active(stack, context, frame, object, key, value)
     }
 
@@ -236,72 +238,8 @@ impl Interpreter {
         target: u16,
         key: u16,
         descriptor: u16,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.run_define_own_property_active(stack, context, frame, target, key, descriptor)
-    }
-
-    /// Allocate a closure directly from the published native frame.
-    ///
-    /// The closure closes over the context in `context_reg`; the canonical
-    /// native `this` / `new.target` supply an arrow's lexical copies. No
-    /// interpreter [`Frame`] adapter is required.
-    pub fn jit_runtime_make_closure(
-        &mut self,
-        context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
-        function_id: u32,
-        dst: u16,
-        function_index: u32,
-        context_reg: u16,
-    ) -> Result<(), VmError> {
-        if frame.function_id() != function_id {
-            return Err(VmError::InvalidOperand);
-        }
-        let resolved = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let saved_pc = frame.pc();
-        // §10.2.1.1 — an arrow closes over the enclosing activation's
-        // `new.target`. The published frame carries it for both native and
-        // materialized activations; undefined is the unbound state.
-        let new_target = frame.new_target_value();
-        let lexical_new_target = (!new_target.is_undefined()).then_some(new_target);
-        let result = self.run_make_closure_active_regs(
-            &resolved,
-            frame,
-            dst,
-            function_index,
-            context_reg,
-            lexical_new_target,
-        );
-        frame.set_pc(saved_pc);
-        result
-    }
-
-    /// Allocate a distinct capture-free function value directly in a
-    /// published stack-owned native frame.
-    ///
-    /// The native descriptor publishes the exact SELF value and direct-eval
-    /// environment needed by nested function creation. The compiled PC remains
-    /// owned by generated code.
-    pub fn jit_runtime_make_function(
-        &mut self,
-        context: &ExecutionContext,
-        frame: &mut ActiveFrameMut<'_>,
-        function_id: u32,
-        dst: u16,
-        function_index: u32,
-    ) -> Result<(), VmError> {
-        if frame.function_id() != function_id {
-            return Err(VmError::InvalidOperand);
-        }
-        let resolved = context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
-        let saved_pc = frame.pc();
-        let result = self.run_make_function_active_reg(&resolved, frame, dst, function_index);
-        frame.set_pc(saved_pc);
-        result
     }
 }
 
@@ -329,9 +267,10 @@ mod tests {
     use crate::native_abi::{Frame, NativeFrameFlags, NativeFrameKind, VmFrameHeader};
 
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "jit-numeric-native-frame-test.js",
-        ))
+        ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("jit-numeric-native-frame-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
@@ -351,7 +290,7 @@ mod tests {
         );
         assert_eq!(UnaryPrimitiveHint::from_token("invalid"), None);
 
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut stack = crate::ActivationStack::new();
         let primitive = interp
             .coerce_unary_value(
@@ -395,7 +334,7 @@ mod tests {
             // and unmoved for the active view's scoped lifetime.
             let mut frame =
                 unsafe { ActiveFrameMut::from_ptr(&mut native) }.expect("valid native activation");
-            let mut interp = Interpreter::new();
+            let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
             let mut stack = crate::ActivationStack::new();
             let context = empty_context();
 

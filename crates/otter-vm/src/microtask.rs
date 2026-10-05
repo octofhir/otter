@@ -29,9 +29,16 @@
 //! - **Work-budget checkpoint**: each task debits the isolate's unified
 //!   [`crate::WorkBudget`]. Yield mode rotates the owning work slice between
 //!   tasks without allowing a later macrotask to overtake the drain.
-//! - **Exception policy**: foundation propagates the **first**
-//!   error out of the drain. Promise reactions use spec-style rejection
-//!   scheduling when they are queued through the promise machinery.
+//! - **Exception policy**: an escaping error stops this checkpoint and leaves
+//!   later jobs queue-owned for a deliberate later turn. Promise reaction
+//!   failures reject their capability through the canonical fallible owner.
+//!
+//! # Invariants
+//! - Each job owns its admitted realm and traced async context. Dispatch never
+//!   substitutes the latest script context or drain realm.
+//! - The suspended ambient async context is rooted while a job runs and is
+//!   restored on success and failure.
+//! - Disposed-origin jobs are consumed without invoking JavaScript.
 //!
 //! # Contents
 //! - [`Microtask`] — task record (callee + this + inline args).
@@ -39,6 +46,8 @@
 //!
 //! # See also
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
+
+mod ownership;
 
 use std::collections::VecDeque;
 
@@ -74,11 +83,13 @@ pub struct Microtask {
     /// [`MicrotaskKind::AsyncResume`] the slot at index 0 carries
     /// the resolved value (fulfilment) or rejection reason.
     pub args: SmallVec<[Value; 4]>,
-    /// Execution context that owns the queued callable / parked
-    /// frame. Host-driven settlement can happen after another
-    /// script has run, so the microtask carries its dispatch
-    /// context.
+    /// Admitted source context. A native-only job may carry `None`; bytecode
+    /// dispatch resolves its exact callable FunctionID through CodeSpace.
+    /// Parked frames retain their own source context.
     pub context: Option<ExecutionContext>,
+    /// Job realm selected at admission, independent of the callable source
+    /// chunk and the realm active when the queue is drained.
+    pub realm_id: u32,
     /// Optional `{resolve, reject}` capability to settle with the
     /// task's outcome. Promise reaction jobs use this so the
     /// handler's return value flows into the next promise in the
@@ -190,7 +201,7 @@ pub struct MicrotaskQueue {
     /// nested calls return immediately (no-op) so a microtask body
     /// can call `drain_microtasks` itself without recursing.
     drain_depth: u32,
-    /// Generation counter. Incremented at every `mem::take` swap.
+    /// Generation counter. Incremented at every FIFO generation swap.
     /// Exposed via [`Self::generation`] for embedder telemetry.
     generation: u64,
     /// Persistent high-water mark. The drain reuses the swapped
@@ -241,14 +252,24 @@ impl MicrotaskQueue {
         if self.drain_depth > 0 {
             return None;
         }
-        self.drain_depth += 1;
-        self.generation += 1;
+        self.drain_depth = 1;
+        Some(self.next_generation())
+    }
+
+    /// Move the next FIFO generation while retaining the single drain extent.
+    /// Rejection and finalization checkpoints run inside this same extent.
+    pub(crate) fn next_generation(&mut self) -> usize {
+        debug_assert_eq!(self.drain_depth, 1);
         debug_assert!(self.in_flight.is_empty());
-        // Swap the current generation into `in_flight`. Tasks
-        // enqueued during the drain go on `pending`, which the
-        // caller's outer loop picks up on the next iteration.
+        self.generation += 1;
         std::mem::swap(&mut self.pending, &mut self.in_flight);
-        Some(self.in_flight.len())
+        self.in_flight.len()
+    }
+
+    /// Whether the current generation has work; budget checks run before a
+    /// record is removed from this collector-traced owner.
+    pub(crate) fn has_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
     }
 
     /// Pop the next task of the in-flight generation, if any.
@@ -373,6 +394,7 @@ mod tests {
             this_value: Value::undefined(),
             args: SmallVec::new(),
             context: None,
+            realm_id: 0,
             result_capability: None,
             async_context: Value::undefined(),
             kind: MicrotaskKind::Call,

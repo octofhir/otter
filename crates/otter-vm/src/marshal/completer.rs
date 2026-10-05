@@ -31,9 +31,12 @@
 //! - A suspended completion materializes its JS result and drains reactions in
 //!   the realm that created the promise. A disposed origin drops the root
 //!   instead of settling into another realm.
-//! - Rejection reasons materialize as real `TypeError` instances when
-//!   the captured execution context allows constructor re-entry, and
-//!   degrade to string reasons otherwise.
+//! - Each deferred job starts a fresh pending-throw boundary. Worker errors
+//!   carry owned diagnostic text; only a synchronous throw raised by that
+//!   job's IntoJs conversion consumes the current rooted JavaScript value.
+//! - Rejection reasons use pinned realm error intrinsics. Structural errors, allocation failure and microtask
+//!   drain errors return through the host job's RunError; no fallback settles
+//!   with a fabricated string or silently leaves a failed turn pending.
 //!
 //! # See also
 //! - [`crate::host_completion`] — the sink contract this rides.
@@ -97,9 +100,7 @@ impl PromiseCompleter {
         if let Err(error) = self.sink.complete(
             admission,
             HostCompletionJob::new_with_cancel(
-                move |interp| {
-                    settle_from_root(interp, root, realm_id, context, result);
-                },
+                move |interp| settle_from_root(interp, root, realm_id, context, result),
                 move |interp| {
                     interp.persistent_root_remove(root);
                 },
@@ -126,6 +127,7 @@ impl Drop for PromiseCompleter {
                 HostCompletionJob::new_with_cancel(
                     move |interp| {
                         interp.persistent_root_remove(root);
+                        Ok(())
                     },
                     move |interp| {
                         interp.persistent_root_remove(root);
@@ -158,13 +160,20 @@ fn settle_from_root<R: IntoJs>(
     realm_id: u32,
     context: Option<ExecutionContext>,
     result: Result<R, JsError>,
-) {
-    let outcome = interp.with_host_realm_id(realm_id, move |interp| {
-        settle_from_root_in_active_realm(interp, root, context, result);
-        Ok(())
-    });
-    if outcome.is_err() {
-        let _ = interp.persistent_root_remove(root);
+) -> Result<(), crate::RunError> {
+    match crate::host_completion::with_rooted_origin_realm(
+        interp,
+        root,
+        realm_id,
+        move |interp, root| settle_from_root_in_active_realm(interp, root, context, result),
+    ) {
+        Ok(Some(result)) => result,
+        Ok(None) => Ok(()),
+        Err(error) => Err(crate::RunError {
+            error,
+            frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+            detail: interp.take_error_detail(),
+        }),
     }
 }
 
@@ -173,86 +182,64 @@ fn settle_from_root_in_active_realm<R: IntoJs>(
     root: PersistentRootId,
     context: Option<ExecutionContext>,
     result: Result<R, JsError>,
-) {
+) -> Result<(), crate::RunError> {
     let Some(promise_value) = interp.persistent_root_remove(root) else {
-        return;
+        return Ok(());
     };
     if promise_value.as_promise().is_none() {
-        return;
+        return Err(crate::RunError::bare(crate::VmError::InvalidOperand));
     }
-    NativeCtx::with_host_context(
+    let conversion = NativeCtx::with_host_context(
         interp,
         NativeCallInfo::default_call(),
         context.as_ref(),
         |ctx| {
             ctx.scope(|scope| {
                 let mut cx = MarshalCx::new(scope);
-                // The promise handle must survive the conversion allocations.
                 let promise_handle = cx.park(promise_value);
-                let settled = match result {
-                    Ok(value) => value.into_js(&mut cx).map(|out| (out, true)),
-                    Err(error) => reject_reason(&mut cx, &error).map(|out| (out, false)),
+                let converted = match result {
+                    Ok(value) => value.into_js(&mut cx),
+                    Err(error) => Err(error),
                 };
-                let (out, fulfil) = match settled {
-                    Ok(pair) => pair,
-                    Err(error) => match reject_reason(&mut cx, &error) {
-                        Ok(out) => (out, false),
-                        // Conversion of the failure itself failed (OOM-class);
-                        // leave the promise unsettled rather than lie.
-                        Err(_) => return,
-                    },
+                let (out, fulfil) = match converted {
+                    Ok(value) => (value, true),
+                    Err(error) if error.is_out_of_memory() => return Err(error),
+                    Err(error) => (cx.error_value(error)?, false),
                 };
                 let raw_out = cx.escape(out);
-                let Some(promise) = cx.escape(promise_handle).as_promise() else {
-                    return;
-                };
-                let jobs = if fulfil {
-                    promise.fulfill(cx.heap_mut(), raw_out)
-                } else {
-                    promise.reject(cx.heap_mut(), raw_out)
-                };
+                let promise = cx
+                    .escape(promise_handle)
+                    .as_promise()
+                    .ok_or_else(|| JsError::Native(crate::NativeError::InvalidOperand))?;
                 let interp = cx.ctx().interp_mut();
-                interp.note_settle_rejection(&jobs);
-                for job in jobs.jobs {
-                    interp.microtasks_mut().enqueue(job);
+                if fulfil {
+                    crate::promise_dispatch::resolve_promise_from_interpreter(
+                        interp,
+                        promise,
+                        raw_out,
+                        context.clone(),
+                    )
+                    .map_err(|error| JsError::from_vm(interp, error))?;
+                } else {
+                    let jobs = promise.reject(interp.gc_heap_mut(), raw_out);
+                    interp.note_settle_rejection(&jobs, context.as_ref());
+                    for job in jobs.jobs {
+                        interp.microtasks_mut().enqueue(job);
+                    }
                 }
-            });
+                Ok::<(), JsError>(())
+            })
+            .map_err(|error| ctx.native_error_to_vm(error.into_native("host completion")))
         },
     );
-    // Drain with the settling context as the fallback: the reactions this
-    // settlement unblocks can queue further microtasks of their own (an async
-    // reaction that `await`s again — e.g. `(await fetch(...)).text()`), and
-    // those continuation jobs have no origin context. Falling back to `None`
-    // there aborts the drain mid-chain, stranding the tail; the settling
-    // context lets it run to completion.
-    let _ = interp.drain_microtasks_with_default(context);
-}
-
-/// Build the JS rejection reason for a binding error: a real error
-/// instance when the captured context allows constructor re-entry,
-/// else the rendered message string.
-fn reject_reason<'s>(
-    cx: &mut MarshalCx<'_, '_, 's>,
-    error: &JsError,
-) -> Result<Local<'s>, JsError> {
-    let (ctor_name, message) = match error {
-        JsError::Type(m) => ("TypeError", m.clone()),
-        JsError::Range(m) => ("RangeError", m.clone()),
-        JsError::Dom { name, message } => ("TypeError", format!("{name}: {message}")),
-        JsError::Thrown(m) => ("Error", m.clone()),
-    };
-    if cx.ctx().execution_context().is_some()
-        && let Some(ctor) = cx.ctx().global_value(ctor_name)
-    {
-        let ctor_handle = cx.park(ctor);
-        let message_handle = cx.string(&message)?;
-        let raw_ctor = cx.escape(ctor_handle);
-        let raw_message = cx.escape(message_handle);
-        if let Ok(instance) = cx.ctx().construct(raw_ctor, &[raw_message]) {
-            return Ok(cx.park(instance));
-        }
-    }
-    cx.string(&message)
+    conversion.map_err(|error| crate::RunError {
+        error,
+        frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+        detail: interp.take_error_detail(),
+    })?;
+    // Reactions created during settlement may have no explicit origin. The
+    // original settling context remains the fallback for the complete drain.
+    interp.drain_microtasks(|_, _| Ok(false))
 }
 
 impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
@@ -278,7 +265,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let interp = self.ctx().interp_mut();
         let realm_id = interp.active_host_realm_id();
         let handle = crate::promise_dispatch::pending_runtime_rooted(interp, &[], &[])
-            .map_err(|err| JsError::Type(err.to_string()))?;
+            .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?;
         let promise_value = Value::promise(handle);
         let root = interp.persistent_root_insert(promise_value);
         let parked = self.park(promise_value);
@@ -358,9 +345,10 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                 Ok(value) => value
                     .into_js(self)
                     .and_then(|out| self.promise_fulfilled(out)),
-                Err(error) => {
-                    reject_reason(self, &error).and_then(|reason| self.promise_rejected(reason))
-                }
+                Err(error) if error.is_out_of_memory() => Err(error),
+                Err(error) => self
+                    .error_value(error)
+                    .and_then(|reason| self.promise_rejected(reason)),
             };
             let outcome = if promise.is_ok() {
                 HostCompletionOutcome::Completed
@@ -388,3 +376,6 @@ async fn drive<R: IntoJs + Send + 'static>(
         Err(error) => completer.reject(error),
     }
 }
+
+#[cfg(test)]
+mod tests;

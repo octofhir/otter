@@ -29,11 +29,13 @@ compatibility ABI is retained inside the active runtime.
 
 ## Compiled activation ownership
 
-Interpreter, Template and Machine execution share one published native frame
+Interpreter, Template and optimized execution share one published native frame
 chain. Every bytecode function generation is entered through one JavaScript
 call ABI: the context, the callee, the receiver as given, `new.target`
 (`undefined` exactly for `[[Call]]`), the actual count and the actual span on
-the caller's stack, padded with `undefined` to the callee's formal count.
+the caller's stack. The span contains exactly the actual arguments; alignment
+slack is never a formal argument. The callee initializes missing formals to
+`undefined` in its register window.
 
 - A compiled generation's entry builds its one native frame in the callee
   prologue, publishes the activation record inside it, binds the receiver,
@@ -41,17 +43,22 @@ the caller's stack, padded with `undefined` to the callee's formal count.
   The record names the caller's span as its actual arguments; nothing is
   copied for the callee.
 - A Template frame carries the interpreter register window it executes on.
-  A Machine frame has none: its moving values live in safepoint root homes,
-  and a side exit reserves and writes the window before the interpreter
-  continues on the same record.
+  An optimized frame keeps its values in registers and spill slots, rooted
+  precisely at each safepoint. A body that runs no baseline operation on the
+  window publishes its record without a window when enough actuals are present.
+  An underarity entry initializes and publishes the reserved window before
+  receiver conversion or constructor allocation, so missing-formal loads use
+  the same unconditional register-base access. The side exit that rebuilds an
+  unpublished interpreter frame publishes the reserved window, and the
+  interpreter continues on the same record.
 - A caller that proved its callee enters the current generation through the
   target's permanent function entry cell. The proof is one compare against
   the call site's identity cell, which the code object retains and the
   collector rewrites: it holds the last callee the full identity proof
   accepted there, and any other value takes that proof and replaces it.
 - Every other callee, and every interpreter destination, enters the generic
-  entry. A bytecode function with a compiled generation and enough actuals
-  is entered directly; anything else is classified in the call trampoline:
+  entry. A bytecode function with a compiled generation is entered directly,
+  including underarity calls; anything else is classified in the call trampoline:
   bound and class wrappers, host frames for native, proxy and other
   callables, and interpreter frames with their windows.
 
@@ -61,6 +68,31 @@ and PC from those recipes; they do not create temporary physical frames.
 Exact deoptimization creates missing interpreter activations through the same
 trampoline. Stack diagnostics recover inline sources from the current code
 object and safepoint.
+
+## Platform C boundaries
+
+The x86-64 JavaScript convention is private engine plumbing on every platform.
+Generated calls through a function entry cell, generic JavaScript classification,
+and proper tail calls retain that convention and the actual-only stack span.
+Rust runtime helpers and external function-entry/OSR transfers use the platform
+C ABI. Their descriptor determines the result representation and fixed physical
+argument shape; packed `Variadic` sites specify their physical count explicitly.
+
+System V helpers return the existing `NativeResultPair` in `rax`/`rdx`.
+Microsoft x64 helpers receive a hidden aggregate-result pointer, reserve shadow
+space and place the shifted trailing arguments on the stack. The emitter reads
+that same pair back into `rax`/`rdx` and releases its temporary call area. Scalar
+word and floating-point leaves follow their scalar C signatures. The private
+frame's published root pointer does not depend on the temporary C call area.
+External Microsoft entries preserve `rdi`/`rsi` and all 128 bits of
+`xmm6`–`xmm15` around private execution. Internal JavaScript entries bypass the
+external wrapper.
+
+Template and Graph share `SpillArea`, `ActivationExits` and `CallEntryCold`, and
+one native-frame emitter per architecture. Tagged canonical homes are initialized
+before publication. A tier transfer saves and restores the interpreter frame's
+previous root words; an underarity call publishes its initialized window before
+any collecting receiver or constructor helper.
 
 ## Receiver and `new.target`
 
@@ -89,10 +121,10 @@ across calls.
   defaulted to `undefined`.
 - Trailing arguments beyond the declared `length` are included
   verbatim; native code must read indices defensively.
-- `Value` is `Copy` and 8 bytes; reading `args[i]` does not need any
-  rooting.
-- The slice is borrowed; copy out the values you need before any GC
-  point.
+- `Value` is `Copy` and 8 bytes. A copied value remains current only until
+  the next collecting or reentrant operation.
+- Park every argument needed after such an operation with `scope.value`,
+  before the first allocation. A handle read resolves its collector-updated slot.
 
 ## Return protocol
 
@@ -128,45 +160,38 @@ cross the `!Send` boundary that `tokio::spawn` rejects. Use
 allocate the error object via the high-level helpers and `throw` it
 through the dispatch context.
 
-## Allocation
+## Allocation and rooting
 
-All allocation must go through the `NativeCtx` helpers, which keep the
-caller's arguments and the constructed value's intermediates rooted
-across the GC point:
+Build values inside `ctx.scope(|mut scope| …)`. Its `NativeScope` builders park
+every result in a collector-traced `Local`; moving collection rewrites that
+handle's arena slot. Park incoming arguments with `scope.value` and use
+`scope.this()` for the receiver before allocating or calling JavaScript.
 
-| Surface | Use case |
-|---|---|
-| `ctx.alloc_object_with_roots(value_roots, slice_roots)` | Plain object with extra GC roots. |
-| `ctx.alloc_host_object_with_roots(value_roots, slice_roots)` | Object backed by `HostObjectData`. |
-| `ctx.alloc_map()` / `alloc_set()` / `alloc_weak_*()` | Collection bodies. |
-| `ctx.alloc_iterator_state(state, roots)` | Iterator state body. |
-| `ctx.alloc_weak_ref(target, roots)` | Weak reference. |
-| `ctx.alloc_finalization_registry(callback, roots)` | Finalization registry. |
-| `ctx.array_from_elements(elements)` / `_with_roots` | Plain dense array. |
-| `ctx.array_push(arr, value, roots)` / `array_set(arr, idx, value, roots)` | Array mutation that may grow. |
-| `ctx.fulfilled_promise_with_roots(value, roots)` | Settled promise. |
-| `ctx.queue_microtask(callee, this, args, capability)` | Microtask enqueue. |
+```rust
+ctx.scope(|mut scope| {
+    let object = scope.object()?;
+    let text = scope.string("ready")?;
+    scope.set(object, "state", text)?;
+    Ok(scope.finish(object))
+})
+```
 
-`ctx.heap()` and `ctx.heap_mut()` exist as an escape hatch for code
-that needs the raw `GcHeap` for one of the in-progress migrations
-(currently \~150 call sites). New native bindings **must** prefer the
-high-level helpers above; raw `heap_mut()` access will move to
-`pub(crate)` once the migration finishes. Touching the heap without
-threading through the rooting helpers above is the canonical way to
-introduce a use-after-free bug.
+Resolve handles for each operation. A raw `Value`, object offset, or copied
+argument must never survive a later allocation, slab growth, getter, or setter.
+The dispatcher roots the active call's values; those roots cannot update an
+untracked copy in a Rust local. `scope.finish` consumes the scope to hand one
+completed value directly back to the dispatcher.
 
-## Rooting rules
+Interpreter-internal drivers use `Interpreter::with_handle_scope` over the
+same arena. `Array.prototype.push`, for example, roots its receiver and all
+pending arguments before reading array-like length, growing a dense slab, or
+performing a generic `Set`; subsequent writes reread those handles after any
+collection or setter reentry. Low-level `*_with_roots` internals own their
+pending operands and write barriers. New native bindings use handle scopes
+instead of manual root slices.
 
-- Anything live across a GC point inside the native body must be
-  rooted. The `*_with_roots` family takes `&[&Value]` plus
-  `&[&[Value]]` so callers can declare both individual values and
-  borrowed slices.
-- The dispatch loop has already rooted the active call frame, its
-  registers, and the receiver. Native code only needs to root values
-  it allocates or extracts inside the body, before any further
-  allocation.
-- `ctx.with_gc_session(|session| { … })` opens a branded session for
-  multi-step allocation sequences that share roots.
+See [Handle Scopes: Building JS Values](/extensions/handle-scopes/) for the
+construction contract and stress checks.
 
 ## Microtasks and promises
 
@@ -212,3 +237,10 @@ or old call path.
   — `NativeFastFn`, `NativeCall`, `NativeError`, `NativeFunction`.
 - [`crates/otter-vm/tests/compile_fail/`](https://github.com/octofhir/otter/tree/main/crates/otter-vm/tests/compile_fail)
   — every forbidden pattern enforced at compile time.
+
+Template source work is charged once per activation: the call-entry prologue
+adds the body's opcode count to the function-owned saturating `SourceWork`
+scalar, and loops charge at back-edge polls. Only baseline entries charge it;
+the activation record carries no per-operation work state. The aligned compiled
+loads/stores obey the scalar's single-mutator relaxed atomic-word contract;
+code objects retain the exact source allocation throughout active retirement.

@@ -5,12 +5,13 @@
 //! - Changing primitive-string receivers sharing one pinned prototype method.
 //! - Global-lexical, dense-element, and exotic-length reads in a cached loop.
 //! - Element/property slow reads that mutate methods and globals during reentry.
-//! - Interpreter parity and artifact proof that retired raw caches stay absent.
+//! - Interpreter parity, graph-tier artifacts, and proof that retired raw
+//!   caches stay absent.
 //!
 //! # Invariants
 //! - A changing exotic receiver is validated at the explicit operation.
 //! - Reentry and mutation remain visible to later method/global reads.
-//! - Machine artifacts contain no loop-local raw-address cache regions.
+//! - Artifacts contain no loop-local raw-address cache regions.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
@@ -198,9 +199,9 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) 
             "optimizing-loop-method-guard-cache.js",
         )
         .expect("loop proof matrix");
-    let (legacy_regions, machine_bundles) = completion.jit_artifacts().map_or((0, 0), |batch| {
+    let (legacy_regions, graph_bundles) = completion.jit_artifacts().map_or((0, 0), |batch| {
         let mut legacy_regions = 0;
-        let mut machine_bundles = 0;
+        let mut graph_bundles = 0;
         for bundle in batch.bundles() {
             if let Some(file) = bundle.file(otter_runtime::JitArtifactFileName::CodeMap) {
                 let map: serde_json::Value =
@@ -213,28 +214,25 @@ fn run(selection: JitSelection, artifacts: bool) -> (String, u64, usize, usize) 
                                 region["kind"].as_str(),
                                 Some("loopInvariantMethodGuardCache")
                                     | Some("loopInvariantGlobalObjectLoadCache")
-                                    | Some("machinePackedDoubleViewCacheClear")
                             )
                         })
                         .count()
                 });
             }
-            if let Some(file) = bundle.file(otter_runtime::JitArtifactFileName::OptimizedIr) {
-                let ir = std::str::from_utf8(file.contents()).expect("UTF-8 Machine IR");
-                if ir.starts_with("; backend=otter-machine-ir scalar-function\n") {
-                    machine_bundles += 1;
-                    assert!(ir.contains("; licm-hoisted="));
-                    assert!(ir.contains("machine-ir explicit-loop-preheaders"));
-                }
+            if bundle
+                .file(otter_runtime::JitArtifactFileName::OptimizedIr)
+                .is_some_and(|file| file.contents().starts_with(b"; otter graph\n"))
+            {
+                graph_bundles += 1;
             }
         }
-        (legacy_regions, machine_bundles)
+        (legacy_regions, graph_bundles)
     });
     (
         completion.completion_string().to_owned(),
         runtime.execution_stats().jit_optimized_entries,
         legacy_regions,
-        machine_bundles,
+        graph_bundles,
     )
 }
 
@@ -251,14 +249,11 @@ fn loop_proof_invalidation_preserves_semantics() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn artifacts_expose_licm_and_no_retired_raw_caches() {
-    let (compiled, optimized_entries, legacy_regions, machine_bundles) =
+fn artifacts_come_from_the_graph_tier_without_retired_raw_caches() {
+    let (compiled, optimized_entries, legacy_regions, graph_bundles) =
         run(JitSelection::ProductionTiered, true);
     assert_eq!(compiled, "[125696,8,352,1,420,420,2816,272,684,64]");
     assert!(optimized_entries > 0, "fixture must enter optimizing code");
     assert_eq!(legacy_regions, 0, "retired cache regions must stay absent");
-    assert!(
-        machine_bundles > 0,
-        "fixture must publish Machine artifacts"
-    );
+    assert!(graph_bundles > 0, "fixture must publish graph artifacts");
 }

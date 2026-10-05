@@ -201,8 +201,10 @@ pub enum IcSiteKind {
 /// Lifecycle state of one inline-cache site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IcSiteState {
-    /// No cache record has been installed yet.
+    /// Property semantic dispatch has never been attempted.
     Empty,
+    /// The site executed but has no representable cache program.
+    Uncacheable,
     /// One or more census-bounded guarded entries are installed.
     Polymorphic {
         /// Installed entries in install order.
@@ -381,6 +383,7 @@ pub(crate) fn snapshot_load_state(
     use crate::property_ic::PropertyIcEntry;
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
+        PropertyIcEntry::Uncacheable => IcSiteState::Uncacheable,
         PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
         PropertyIcEntry::Polymorphic { entries } => {
             let mapped = entries
@@ -429,6 +432,7 @@ pub(crate) fn snapshot_store_state(
     use crate::property_ic::PropertyIcEntry;
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
+        PropertyIcEntry::Uncacheable => IcSiteState::Uncacheable,
         PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
         PropertyIcEntry::Polymorphic { entries } => {
             let mapped = entries
@@ -484,7 +488,7 @@ pub(crate) fn build_shape_transition_snapshot(
     use crate::object::ShapeBody;
     use crate::string::to_utf16_vec;
 
-    let root_handle = crate::object::shape_body::null_root(heap);
+    let root_handle = crate::object::shape_body::null_root_head(heap);
     let root_shape_id = heap.read_payload(root_handle, ShapeBody::id).raw();
 
     let mut nodes = Vec::new();

@@ -1,8 +1,8 @@
 //! Corpus traversal + per-test execution driver for the Test262
 //! runner.
 //!
-//! Slice 101 shipped the bare walk; slice 103 layers the per-test
-//! [`Outcome`] taxonomy and [`run_one`] driver on top. The driver:
+//! # Contents
+//! The driver records one owned outcome per selected corpus path:
 //!
 //! 1. Skip via `test262_config.toml` (`known_panics`,
 //!    `ignored_tests`).
@@ -19,6 +19,12 @@
 //! 8. Map the engine outcome onto [`Outcome`] per ECMA-262 +
 //!    test262 INTERPRETING.md negative-test rules.
 //!
+//! # Invariants
+//! Each path yields one owned final result with complete diagnostics. A skip
+//! records the exact policy cause; it is never inferred from missing execution.
+//!
+//! # See also
+//! - [`crate::results`] and [`crate::report`].
 //! Spec: <https://tc39.es/ecma262/>
 //! Spec: <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
 
@@ -27,7 +33,6 @@ use std::time::Duration;
 
 use ignore::WalkBuilder;
 use otter_runtime::{Diagnostic, DiagnosticKind, IoErrorKind, OtterError, Runtime, SourceInput};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::Test262Config;
@@ -35,6 +40,7 @@ use crate::feature_map::FeatureMap;
 use crate::harness::HarnessCache;
 use crate::isolation::{WatchdogOutcome, fresh_runtime, run_with_watchdog};
 use crate::metadata::{Frontmatter, FrontmatterError, NegativePhase, TestFlag};
+use crate::results::{Outcome, SkipReason, TestResult};
 
 /// Resolved on-disk paths for a test262 checkout.
 #[derive(Debug, Clone)]
@@ -86,7 +92,10 @@ pub fn ensure_corpus_present(repo_root: &Path) -> Result<CorpusPaths, CorpusErro
 /// start of the path so batch runners can keep directory shards
 /// disjoint (`built-ins/RegExp/` would otherwise also match
 /// `annexB/built-ins/RegExp/...`).
-pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
+///
+/// # Errors
+/// Returns a corpus I/O error instead of silently omitting an unreadable entry.
+pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Result<Vec<PathBuf>, CorpusError> {
     let mut out: Vec<PathBuf> = Vec::new();
     let walker = WalkBuilder::new(&paths.test_dir)
         .standard_filters(true)
@@ -94,9 +103,17 @@ pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
         .git_exclude(true)
         .hidden(false)
         .build();
-    for entry in walker.flatten() {
+    for entry in walker {
+        let entry = entry.map_err(|error| CorpusError::Io {
+            path: paths.test_dir.clone(),
+            message: error.to_string(),
+        })?;
         let path = entry.path();
-        if !path.is_file() {
+        let metadata = std::fs::metadata(path).map_err(|error| CorpusError::Io {
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+        if !metadata.is_file() {
             continue;
         }
         let Some(ext) = path.extension() else {
@@ -126,66 +143,12 @@ pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
         out.push(path.to_path_buf());
     }
     out.sort();
-    out
+    Ok(out)
 }
 
 /// Same as [`list_tests`] but only returns the count.
-#[must_use]
-pub fn count_tests(paths: &CorpusPaths, filter: Option<&str>) -> usize {
-    list_tests(paths, filter).len()
-}
-
-/// The per-test outcome taxonomy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Outcome {
-    /// Test body returned normally (or threw the spec-required
-    /// negative error).
-    Pass,
-    /// Test failed conformance.
-    Fail {
-        /// Human-readable reason (rendered into the report).
-        reason: String,
-        /// Optional engine stack trace.
-        stack: Option<String>,
-    },
-    /// Test was skipped — config / strict-mode policy / unsupported
-    /// feature.
-    Skipped {
-        /// What was skipped (`<feature>` / `"foundation-always-strict"` /
-        /// `"ignored by config"` / `"known panic"`).
-        feature: String,
-    },
-    /// Engine panicked while running the test.
-    Crash {
-        /// Panic payload (rendered).
-        panic: String,
-    },
-    /// Per-test wall-clock budget exceeded.
-    Timeout {
-        /// Configured budget that fired (ms).
-        ms: u64,
-    },
-    /// Engine heap cap fired.
-    OutOfMemory {
-        /// Bytes the engine reported as "requested at cap".
-        bytes: u64,
-    },
-}
-
-/// Per-test result record consumed by the report writer (slice 104).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestResult {
-    /// Test path relative to `vendor/test262/test/`.
-    pub path: String,
-    /// `esid:` from the frontmatter (if any).
-    pub esid: Option<String>,
-    /// Decoded `features:` for the test.
-    pub features: Vec<String>,
-    /// Final outcome.
-    pub outcome: Outcome,
-    /// Wall-clock duration.
-    pub wall_ms: u64,
+pub fn count_tests(paths: &CorpusPaths, filter: Option<&str>) -> Result<usize, CorpusError> {
+    list_tests(paths, filter).map(|tests| tests.len())
 }
 
 /// Per-worker donor image for snapshot-per-test isolation. `Rc`
@@ -224,7 +187,7 @@ impl ExecConfig {
     }
 }
 
-/// Run a single test through the foundation-phase driver. The
+/// Run one test through the isolated conformance driver. The
 /// driver allocates a fresh `Runtime` per test, applies the
 /// timeout + heap cap, and never panics — engine panics surface
 /// as [`Outcome::Crash`] so a single bad test cannot derail the
@@ -245,24 +208,28 @@ pub fn run_one(
 
     // 1. Skip via config (no fs read needed). Cheap and lets us
     //    short-circuit known-bad files.
-    if exec.config.is_known_panic(&rel_path) {
+    if let Some(pattern) = exec.config.first_known_panic(&rel_path) {
         return result_with(
             rel_path,
             None,
             Vec::new(),
             Outcome::Skipped {
-                feature: "known panic".to_string(),
+                reason: SkipReason::KnownPanic {
+                    pattern: pattern.to_owned(),
+                },
             },
             start,
         );
     }
-    if exec.config.is_ignored(&rel_path) {
+    if let Some(pattern) = exec.config.first_ignored(&rel_path) {
         return result_with(
             rel_path,
             None,
             Vec::new(),
             Outcome::Skipped {
-                feature: "ignored by config".to_string(),
+                reason: SkipReason::Ignored {
+                    pattern: pattern.to_owned(),
+                },
             },
             start,
         );
@@ -293,7 +260,10 @@ pub fn run_one(
             None,
             Vec::new(),
             Outcome::Skipped {
-                feature: "source too large".to_string(),
+                reason: SkipReason::SourceTooLarge {
+                    bytes: source.len() as u64,
+                    limit: 2 * 1024 * 1024,
+                },
             },
             start,
         );
@@ -308,7 +278,7 @@ pub fn run_one(
                 None,
                 Vec::new(),
                 Outcome::Skipped {
-                    feature: "no frontmatter".to_string(),
+                    reason: SkipReason::MissingFrontmatter,
                 },
                 start,
             );
@@ -337,7 +307,9 @@ pub fn run_one(
             rel_path,
             esid,
             features,
-            Outcome::Skipped { feature: feat },
+            Outcome::Skipped {
+                reason: SkipReason::Feature { feature: feat },
+            },
             start,
         );
     }
@@ -351,7 +323,9 @@ pub fn run_one(
             esid,
             features,
             Outcome::Skipped {
-                feature: format!("flag:{flag}"),
+                reason: SkipReason::Flag {
+                    flag: flag.to_owned(),
+                },
             },
             start,
         );
@@ -467,7 +441,7 @@ pub fn run_one(
             Outcome::Pass
         } else {
             Outcome::Skipped {
-                feature: "no strictness variant".to_string(),
+                reason: SkipReason::NoStrictnessVariant,
             }
         }
     };
@@ -577,9 +551,7 @@ fn label_variant_outcome(variant: &str, outcome: Outcome) -> Outcome {
         },
         Outcome::Timeout { ms } => Outcome::Timeout { ms },
         Outcome::OutOfMemory { bytes } => Outcome::OutOfMemory { bytes },
-        Outcome::Skipped { feature } => Outcome::Skipped {
-            feature: format!("{variant}: {feature}"),
-        },
+        Outcome::Skipped { reason } => Outcome::Skipped { reason },
         Outcome::Pass => Outcome::Pass,
     }
 }
@@ -1011,7 +983,7 @@ fn result_with(
     }
 }
 
-/// Errors raised by [`ensure_corpus_present`].
+/// Errors raised by corpus discovery and traversal.
 #[derive(Debug, Error)]
 pub enum CorpusError {
     /// Submodule directory is missing entirely.
@@ -1038,4 +1010,50 @@ pub enum CorpusError {
         /// Underlying error message.
         message: String,
     },
+}
+
+#[cfg(test)]
+mod traversal_tests {
+    use super::*;
+
+    #[test]
+    fn traversal_and_count_fail_when_corpus_tree_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CorpusPaths {
+            root: dir.path().to_owned(),
+            test_dir: dir.path().join("missing"),
+            harness_dir: dir.path().join("harness"),
+        };
+        assert!(matches!(
+            list_tests(&paths, None),
+            Err(CorpusError::Io { .. })
+        ));
+        assert!(matches!(
+            count_tests(&paths, None),
+            Err(CorpusError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn traversal_is_sorted_and_excludes_only_fixture_files_from_selected_js() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CorpusPaths {
+            root: dir.path().to_owned(),
+            test_dir: dir.path().join("test"),
+            harness_dir: dir.path().join("harness"),
+        };
+        std::fs::create_dir_all(paths.test_dir.join("language")).unwrap();
+        for file in ["b.js", "a.js", "helper_FIXTURE.js", "notes.txt"] {
+            std::fs::write(paths.test_dir.join("language").join(file), "// fixture").unwrap();
+        }
+        let selected = list_tests(&paths, Some("^language/")).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|path| relative_path(path, &paths.test_dir))
+                .collect::<Vec<_>>(),
+            ["language/a.js", "language/b.js"]
+        );
+        assert_eq!(count_tests(&paths, None).unwrap(), 2);
+    }
 }

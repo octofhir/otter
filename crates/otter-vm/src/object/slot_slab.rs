@@ -1,7 +1,7 @@
 //! Out-of-line property storage, allocated inside the GC heap.
 //!
-//! An object keeps its string-keyed slots in its in-object slots while they
-//! fit. Past that it needs a growable array, and
+//! An object permanently keeps its shape-sized prefix in its own cell.
+//! Only fields beyond that prefix live in this growable suffix, and
 //! where that array lives decides whether the object is self-contained.
 //! A `Vec` would put it in malloc memory the collector does not own: the
 //! object could not be captured into a page image, a restored copy would
@@ -23,6 +23,7 @@
 //!
 //! # Invariants
 //!
+//! - Indices are relative to the overflow suffix, never the logical slot zero.
 //! - The trailing array holds exactly `capacity` words and is initialized to
 //!   `Value::undefined()` before the slab becomes observable.
 //! - A slab never shrinks in place and never reallocates itself: growth
@@ -35,6 +36,7 @@
 
 use otter_gc::raw::SlotVisitor;
 
+use super::{FieldLayout, FieldLocation};
 use crate::Value;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SlotSlabBody`].
@@ -65,7 +67,7 @@ impl SlotSlabBody {
     /// Trailing bytes a slab of `capacity` words needs.
     #[must_use]
     pub fn trailing_bytes(capacity: usize) -> usize {
-        capacity * std::mem::size_of::<Value>()
+        FieldLocation::words_bytes(capacity)
     }
 
     /// Header for a slab of `capacity` words.
@@ -90,7 +92,9 @@ impl SlotSlabBody {
         // past `self` and runs for `capacity` words.
         unsafe {
             (self as *const Self as *mut u8)
-                .add(std::mem::size_of::<Self>())
+                .add(
+                    FieldLayout::current().slab_words_byte as usize - otter_gc::header::HEADER_SIZE,
+                )
                 .cast()
         }
     }
@@ -99,7 +103,13 @@ impl SlotSlabBody {
         for index in 0..self.capacity() {
             // SAFETY: every capacity word is initialized when the slab is
             // published and remains initialized for its lifetime.
-            crate::code_liveness::visit_value(unsafe { &*self.words_ptr().add(index) }, visitor);
+            crate::code_liveness::visit_value(
+                unsafe {
+                    &*FieldLocation::overflow(u32::try_from(index).expect("slab index exceeds u32"))
+                        .word_ptr(self.words_ptr())
+                },
+                visitor,
+            );
         }
     }
 }
@@ -112,7 +122,10 @@ impl otter_gc::SafeTraceable for SlotSlabBody {
         for index in 0..self.capacity() {
             // SAFETY: `index < capacity`, and the array is live for the
             // body's lifetime.
-            let word = unsafe { base.add(index) };
+            let word = unsafe {
+                FieldLocation::overflow(u32::try_from(index).expect("slab index exceeds u32"))
+                    .word_ptr(base)
+            };
             // SAFETY: same in-range word as above. `Value` owns the precise
             // cell/immediate discrimination and exposes its embedded moving
             // GC offset directly to the collector.
@@ -143,19 +156,23 @@ pub fn alloc_slot_slab(
     capacity: usize,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<SlotSlabHandle, otter_gc::OutOfMemory> {
-    let slab = heap.alloc_variable_with_roots(
+    heap.alloc_variable_with_roots_initialized(
         SlotSlabBody::new(capacity),
         SlotSlabBody::trailing_bytes(capacity),
         external_visit,
-    )?;
-    heap.with_payload(slab, |body| {
-        for index in 0..body.capacity() {
-            // SAFETY: the allocation reserved exactly `capacity` trailing
-            // `Value` words and no observer can see the slab before return.
-            unsafe { *body.words_ptr().add(index) = Value::undefined() };
-        }
-    });
-    Ok(slab)
+        |body| {
+            for index in 0..body.capacity() {
+                // SAFETY: this allocation reserved exactly `capacity`
+                // trailing words; initialization precedes publication.
+                unsafe {
+                    *FieldLocation::overflow(
+                        u32::try_from(index).expect("slab index exceeds u32"),
+                    )
+                    .word_ptr(body.words_ptr()) = Value::undefined()
+                };
+            }
+        },
+    )
 }
 
 /// Allocate a slab whose visible prefix already contains `values`.
@@ -193,7 +210,12 @@ pub fn alloc_slot_slab_with_values(
                 let value = values.get(index).copied().unwrap_or_else(Value::undefined);
                 // SAFETY: `index < capacity`; the cell is unpublished and its
                 // trailing array was reserved by this allocation.
-                unsafe { *body.words_ptr().add(index) = value };
+                unsafe {
+                    *FieldLocation::overflow(
+                        u32::try_from(index).expect("slab index exceeds u32"),
+                    )
+                    .word_ptr(body.words_ptr()) = value
+                };
             }
         },
     )
@@ -206,14 +228,17 @@ mod tests {
 
     #[test]
     fn a_fresh_slab_is_empty_and_sized() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slab = alloc_slot_slab(interp.gc_heap_mut(), 12, &mut |_| {}).expect("slab");
         let capacity = interp.gc_heap().read_payload(slab, SlotSlabBody::capacity);
         assert_eq!(capacity, 12);
         for index in 0..capacity {
             let word = interp.gc_heap().read_payload(slab, |body| {
                 // SAFETY: index is within the capacity just read.
-                unsafe { *body.words_ptr().add(index) }
+                unsafe {
+                    *FieldLocation::overflow(u32::try_from(index).expect("slab index exceeds u32"))
+                        .word_ptr(body.words_ptr())
+                }
             });
             assert_eq!(word, Value::undefined(), "word {index} starts empty");
         }
@@ -221,19 +246,27 @@ mod tests {
 
     #[test]
     fn words_round_trip_through_the_trailing_array() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let slab = alloc_slot_slab(interp.gc_heap_mut(), 4, &mut |_| {}).expect("slab");
         interp.gc_heap_mut().with_payload(slab, |body| {
             for index in 0..body.capacity() {
                 // SAFETY: index is within the slab's capacity.
-                unsafe { *body.words_ptr().add(index) = Value::number_i32(index as i32) };
+                unsafe {
+                    *FieldLocation::overflow(
+                        u32::try_from(index).expect("slab index exceeds u32"),
+                    )
+                    .word_ptr(body.words_ptr()) = Value::number_i32(index as i32)
+                };
             }
             true
         });
         for index in 0..4usize {
             let word = interp.gc_heap().read_payload(slab, |body| {
                 // SAFETY: index is within the slab's capacity.
-                unsafe { *body.words_ptr().add(index) }
+                unsafe {
+                    *FieldLocation::overflow(u32::try_from(index).expect("slab index exceeds u32"))
+                        .word_ptr(body.words_ptr())
+                }
             });
             assert_eq!(word, Value::number_i32(index as i32));
         }
@@ -241,7 +274,7 @@ mod tests {
 
     #[test]
     fn values_can_be_installed_before_the_slab_is_published() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let mut values = [Value::number_i32(7), Value::number_i32(11)];
         let slab = alloc_slot_slab_with_values(interp.gc_heap_mut(), 4, &mut values, &mut |_| {})
             .expect("slab");
@@ -249,7 +282,12 @@ mod tests {
             (0..body.capacity())
                 .map(|index| {
                     // SAFETY: the iterator is bounded by the slab capacity.
-                    unsafe { *body.words_ptr().add(index) }
+                    unsafe {
+                        *FieldLocation::overflow(
+                            u32::try_from(index).expect("slab index exceeds u32"),
+                        )
+                        .word_ptr(body.words_ptr())
+                    }
                 })
                 .collect::<Vec<_>>()
         });

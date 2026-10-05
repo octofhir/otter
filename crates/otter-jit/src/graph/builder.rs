@@ -8,7 +8,8 @@
 //! - The per-opcode lowering in [`Builder::visit`]: every instruction becomes
 //!   specialized nodes, a [`Kind::Generic`] node, or an unconditional deopt.
 //! - [`Known`] — facts about values that hold along the current path
-//!   (alternative representations, proved shapes), merged at joins.
+//!   (alternative representations, proved shapes and Object receivers), merged
+//!   at joins.
 //!
 //! # Invariants
 //! - No instruction makes the whole function fail: anything without a
@@ -31,6 +32,17 @@
 //!   move element storage; context parents never change and are always kept.
 //! - The finished graph has no trivial phi: one that merges a single value
 //!   (apart from itself) is replaced by that value everywhere.
+//! - A receiver proved to be an ECMAScript Object needs no sloppy `this`
+//!   conversion. The proof belongs to its SSA value, survives heap mutation,
+//!   and is intersected at joins. An inlined LoadThis inherits the actual
+//!   caller binding instead of assuming its callee has already converted it.
+//! - Empty property programs do not prove a cold branch. Only a site whose
+//!   source-owned attempt state is unset can leave for insufficient feedback.
+//! - A proven global read keeps its actual source snapshot and byte PC.
+//!   Its live value is effectful; a pre-effect guard resumes that source
+//!   binding operation, including the full chain of inlined frames.
+//! - Own fields carry their immutable bank and index in one access node; no
+//!   movable suffix address escapes into SSA or crosses a collecting boundary.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -53,6 +65,26 @@ use super::ir::{
     InlinedBody, Kind, NodeId, Repr,
 };
 
+#[cfg(test)]
+#[path = "builder_feedback_tests.rs"]
+mod feedback_tests;
+
+#[cfg(test)]
+#[path = "builder_allocation_tests.rs"]
+mod allocation_tests;
+
+#[cfg(test)]
+#[path = "builder_field_tests.rs"]
+mod field_tests;
+
+#[cfg(test)]
+#[path = "builder_receiver_inline_tests.rs"]
+mod receiver_inline_tests;
+
+#[cfg(test)]
+#[path = "builder_binding_tests.rs"]
+mod binding_tests;
+
 const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 
 /// What is known about one value along the current path.
@@ -67,7 +99,8 @@ pub(crate) struct NodeInfo {
     /// Shapes the value is proved to have (an ordinary object with one of
     /// them).
     pub(crate) shapes: Option<SmallVec<[u32; 4]>>,
-    /// The value is proved to be a heap cell.
+    /// The value is proved to be an ECMAScript Object receiver, so ordinary
+    /// sloppy `this` binding returns this same value without allocation.
     pub(crate) heap_object: bool,
     /// The value is proved to be a Number.
     pub(crate) number: bool,
@@ -136,6 +169,12 @@ pub(crate) struct Known {
     /// The parent of each context loaded on this path. Context chains never
     /// change, so no heap write forgets these.
     parents: FxHashMap<NodeId, NodeId>,
+    /// `(index, length)` pairs a bounds check proved on this path; both are
+    /// immutable values, so no write forgets these.
+    bounds: FxHashSet<(NodeId, NodeId)>,
+    /// Elements read on this path: `(element base, index)` to the load and
+    /// the value it read, until an element store or a call.
+    elements_read: FxHashMap<(NodeId, NodeId), (Kind, NodeId)>,
 }
 
 impl Known {
@@ -180,6 +219,9 @@ impl Known {
             .retain(|key, value| other.fields.get(key) == Some(value));
         self.parents
             .retain(|context, parent| other.parents.get(context) == Some(parent));
+        self.bounds.retain(|pair| other.bounds.contains(pair));
+        self.elements_read
+            .retain(|key, read| other.elements_read.get(key) == Some(read));
     }
 
     /// Forget every fact a heap write may invalidate.
@@ -191,6 +233,7 @@ impl Known {
             info.storage = None;
         }
         self.fields.clear();
+        self.elements_read.clear();
     }
 
     /// The value a store just wrote to `key`. A store through another node
@@ -243,6 +286,7 @@ impl Known {
         for info in self.info.values_mut() {
             info.storage = None;
         }
+        self.elements_read.clear();
     }
 
     /// The heap facts on this path.
@@ -310,8 +354,6 @@ struct Incoming {
 /// Why graph construction stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuildError {
-    /// The bytecode could not be analysed.
-    Analysis(super::bytecode::AnalysisError),
     /// The OSR PC does not start a reachable block.
     OsrTarget,
 }
@@ -344,6 +386,9 @@ pub(crate) struct LoopHeader {
     /// Whether an entry value may be speculated to be an int32: no earlier
     /// optimized code left at the header for a type mismatch.
     pub(crate) speculate: bool,
+    /// Whether invariant checks may move out of the loop: no earlier
+    /// optimized code left at the header for a shape or layout mismatch.
+    pub(crate) hoist: bool,
 }
 
 struct Builder<'a> {
@@ -1242,16 +1287,16 @@ impl<'a> Builder<'a> {
                 .filter(|(_, phi)| data.phis.contains(phi))
                 .collect();
             let header_pc = self.analysis.blocks[header].start;
-            let speculate = !self
-                .view
-                .optimized_exit_reasons
-                .get(&header_pc)
-                .is_some_and(|reasons| reasons.contains(&ExitReason::TypeMismatch));
+            let exits = self.view.optimized_exit_reasons.get(&header_pc);
+            let speculate =
+                !exits.is_some_and(|reasons| reasons.contains(&ExitReason::TypeMismatch));
+            let hoist = !exits.is_some_and(|reasons| reasons.contains(&ExitReason::ShapeGuard));
             headers.push(LoopHeader {
                 block,
                 state,
                 phis,
                 speculate,
+                hoist,
             });
         }
         headers.sort_by_key(|header| header.block);
@@ -1493,12 +1538,99 @@ impl<'a> Builder<'a> {
                 let value = self.constant_number(number);
                 self.write(instruction.writes[0], value);
             }
+            Op::LoadGlobalOrThrow | Op::LoadGlobalOrUndefined
+                if !self.exited_for(ExitReason::ShapeGuard)
+                    && self
+                        .view
+                        .binding_hit_proofs
+                        .contains_key(&instruction.byte_pc) =>
+            {
+                let value = self.add(
+                    Kind::LoadGlobalBinding(instruction.byte_pc),
+                    &[],
+                    Repr::Tagged,
+                );
+                self.write(instruction.writes[0], value);
+            }
             Op::LoadLocal | Op::StoreLocal => {
                 let value = self.read(instruction.reads[0]);
                 self.write(instruction.writes[0], value);
             }
             Op::LoadSelf => {
                 let value = self.closure();
+                self.write(instruction.writes[0], value);
+            }
+            Op::NewObject => {
+                let value = self.add(Kind::NewObject, &[], Repr::Tagged);
+                self.known.entry(value).heap_object = true;
+                self.write(instruction.writes[0], value);
+            }
+            Op::NewArray if instruction.const_index(1) == Some(0) => {
+                let value = self.add(Kind::NewArrayEmpty, &[], Repr::Tagged);
+                self.known.entry(value).heap_object = true;
+                self.write(instruction.writes[0], value);
+            }
+            Op::NewObjectLiteral | Op::NewArray => {
+                let inputs = instruction
+                    .reads
+                    .iter()
+                    .map(|register| self.read(*register))
+                    .collect::<Vec<_>>();
+                let inputs = inputs
+                    .into_iter()
+                    .map(|value| self.tagged(value))
+                    .collect::<Vec<_>>();
+                let kind = if op == Op::NewObjectLiteral {
+                    Kind::NewObjectLiteral
+                } else {
+                    Kind::NewArrayLiteral
+                };
+                let value = self.add(kind, &inputs, Repr::Tagged);
+                self.known.entry(value).heap_object = true;
+                self.write(instruction.writes[0], value);
+            }
+            Op::CreateContext => {
+                let Some(scope) = instruction
+                    .imm32(2)
+                    .and_then(|scope| u32::try_from(scope).ok())
+                else {
+                    return self.generic(instruction);
+                };
+                let parent = self.read(instruction.reads[0]);
+                let parent = self.tagged(parent);
+                let value = self.add(Kind::NativeNewContext(scope), &[parent], Repr::Tagged);
+                self.write(instruction.writes[0], value);
+            }
+            Op::CopyContext => {
+                let source = self.read(instruction.reads[0]);
+                let source = self.tagged(source);
+                let value = self.add(Kind::CopyContext, &[source], Repr::Tagged);
+                self.write(instruction.writes[0], value);
+            }
+            Op::MakeFunction | Op::MakeClosure => {
+                let inputs = if op == Op::MakeClosure {
+                    let context = self.read(instruction.reads[0]);
+                    let context = self.tagged(context);
+                    let (this, new_target) = match &self.inline {
+                        Some(inline) => (inline.caller.this, inline.caller.new_target),
+                        None => {
+                            let this = self.add(Kind::LoadThis, &[], Repr::Tagged);
+                            let new_target = self.add(Kind::LoadNewTarget, &[], Repr::Tagged);
+                            (this, new_target)
+                        }
+                    };
+                    [context, this, new_target]
+                } else {
+                    [self.undefined; 3]
+                };
+                let value = self.add(Kind::NewClosure, &inputs, Repr::Tagged);
+                self.write(instruction.writes[0], value);
+            }
+            Op::LoadNewTarget => {
+                let value = match &self.inline {
+                    Some(inline) => inline.caller.new_target,
+                    None => self.add(Kind::LoadNewTarget, &[], Repr::Tagged),
+                };
                 self.write(instruction.writes[0], value);
             }
             Op::LoadClosureContext => {
@@ -1509,7 +1641,21 @@ impl<'a> Builder<'a> {
             Op::LoadThis if !self.view.derived_constructor => {
                 let value = match &self.inline {
                     Some(inline) => inline.caller.this,
-                    None => self.add(Kind::LoadThis, &[], Repr::Tagged),
+                    None => {
+                        let value = self.add(Kind::LoadThis, &[], Repr::Tagged);
+                        // A real ordinary sloppy entry already performed
+                        // OrdinaryCallBindThis. Use the CodeBlock's canonical
+                        // immutable entry contract; strict/lexical bindings
+                        // may still be primitives, and inline bindings must
+                        // retain only their caller's actual SSA proof.
+                        if self.view.code_block.call_flags()
+                            & otter_vm::native_abi::FUNCTION_CALL_NO_RECEIVER_CONVERSION
+                            == 0
+                        {
+                            self.known.entry(value).heap_object = true;
+                        }
+                        value
+                    }
                 };
                 self.write(instruction.writes[0], value);
             }
@@ -1576,6 +1722,7 @@ impl<'a> Builder<'a> {
             Op::New => self.visit_call(instruction, true),
             Op::CallWithThis => self.visit_call_with_this(instruction),
             Op::CallMethodValue => self.visit_call_method(instruction),
+            Op::CallForwardArguments => self.visit_call_forward(instruction),
             Op::LogicalNot | Op::ToBoolean => {
                 let value = self.read(instruction.reads[0]);
                 let value = self.tagged(value);
@@ -1637,14 +1784,24 @@ impl<'a> Builder<'a> {
             .map(|callee| &callee.body)
     }
 
-    /// Whether a call of `plan`'s target binds the `this` value the caller
-    /// passes unchanged, so an inlined `body` needs no binding of its own:
-    /// the body never observes `this`, or is a strict non-arrow function.
-    fn binds_this_as_is(body: &JitCompileSnapshot, plan: otter_vm::jit::JitDirectCallPlan) -> bool {
+    /// Whether the target observes the actual receiver unchanged. An Object
+    /// needs no OrdinaryCallBindThis conversion even in a sloppy body. Arrows
+    /// that observe `this` still require their closure's lexical binding.
+    fn binds_this_as_is(
+        &self,
+        body: &JitCompileSnapshot,
+        plan: otter_vm::jit::JitDirectCallPlan,
+        receiver: NodeId,
+    ) -> bool {
         let code = body.code_block.as_ref();
         !code.observes_this()
-            || (plan.this_mode == otter_vm::jit::JitDirectCallThisMode::StrictOrLexical
-                && !code.is_arrow())
+            || (!code.is_arrow()
+                && (plan.this_mode == otter_vm::jit::JitDirectCallThisMode::StrictOrLexical
+                    || (plan.this_mode == otter_vm::jit::JitDirectCallThisMode::SloppyGlobal
+                        && self
+                            .known
+                            .get(receiver)
+                            .is_some_and(|info| info.heap_object))))
     }
 
     /// The callable the body being visited runs as.
@@ -1742,7 +1899,11 @@ impl<'a> Builder<'a> {
         );
         let int32 = feedback.speculates_int32() && !self.exited_before();
         let numeric = feedback.is_numeric_only() || int32;
-        if bitwise && numeric {
+        // A comparison's boolean converts to 0 or 1 without a check.
+        let operands_convert = [lhs, rhs]
+            .iter()
+            .all(|&value| self.graph.node(value).kind.produces_boolean() || self.is_number(value));
+        if bitwise && (numeric || operands_convert) {
             let a = self.truncated_int32(lhs, int32);
             let b = self.truncated_int32(rhs, int32);
             // `>>>` is unsigned: once a result left the int32 range here, it
@@ -1792,13 +1953,27 @@ impl<'a> Builder<'a> {
             self.write(instruction.writes[0], result);
             return;
         }
+        if op == Op::Add && feedback.is_primitive_string_concat_only() {
+            let a = self.tagged(lhs);
+            let b = self.tagged(rhs);
+            let result = self.add(Kind::PrimitiveAdd, &[a, b], Repr::Tagged);
+            self.write(instruction.writes[0], result);
+            return;
+        }
         self.generic(instruction);
     }
 
-    /// An int32 operand of a bitwise operator: exact when the site only saw
-    /// int32, `ToInt32` of any number otherwise.
+    /// An int32 operand of a bitwise operator: `ToInt32` of the number or
+    /// the comparison's boolean. An unboxed double truncates, which never
+    /// fails; a tagged value is checked to be an int32 when the site only
+    /// saw int32.
     fn truncated_int32(&mut self, value: NodeId, int32: bool) -> NodeId {
-        if int32 || self.graph.node(value).repr == Repr::Int32 {
+        if self.graph.node(value).kind.produces_boolean() {
+            return self.add(Kind::BooleanToInt32, &[value], Repr::Int32);
+        }
+        let repr = self.graph.node(value).repr;
+        let known_int32 = self.known.get(value).and_then(|info| info.int32);
+        if repr == Repr::Int32 || known_int32.is_some() || (int32 && repr == Repr::Tagged) {
             return self.int32(value);
         }
         let double = self.float64(value);
@@ -1911,6 +2086,11 @@ impl<'a> Builder<'a> {
         if !numeric {
             if strict {
                 self.visit_strict_equal(instruction, lhs, rhs, condition);
+            } else if feedback.is_primitive_string_concat_only() {
+                let a = self.tagged(lhs);
+                let b = self.tagged(rhs);
+                let value = self.add(Kind::PrimitiveCompare(condition), &[a, b], Repr::Tagged);
+                self.write(instruction.writes[0], value);
             } else {
                 self.generic(instruction);
             }
@@ -2044,7 +2224,12 @@ impl<'a> Builder<'a> {
 
     fn visit_load_property(&mut self, instruction: &Instruction) {
         let byte_pc = instruction.byte_pc;
-        let Some(access) = super::feedback::own_data_load(self.view, byte_pc) else {
+        // A site that already left on a receiver its shapes did not describe
+        // is compiled to the lookup that serves every receiver.
+        let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| super::feedback::own_data_load(self.view, byte_pc))
+            .flatten()
+        else {
             return self.visit_named_load(instruction);
         };
         let object = self.read(instruction.reads[0]);
@@ -2053,14 +2238,13 @@ impl<'a> Builder<'a> {
         let key = FieldKey {
             object,
             property: true,
-            offset: access.offset,
+            offset: access.field.cache_key() as i32,
         };
         if let Some(&value) = self.known.fields.get(&key) {
             self.write(instruction.writes[0], value);
             return;
         }
-        let base = self.add(Kind::LoadSlotBase, &[object], Repr::Word);
-        let value = self.add(Kind::LoadTaggedField(access.offset), &[base], Repr::Tagged);
+        let value = self.add(Kind::LoadOwnField(access.field), &[object], Repr::Tagged);
         self.known.fields.insert(key, value);
         self.write(instruction.writes[0], value);
     }
@@ -2075,13 +2259,17 @@ impl<'a> Builder<'a> {
             .flatten()
             .is_some();
         if !programs {
-            let atom = self.view.property_megamorphic_accesses.get(&byte_pc);
+            let atom = self
+                .view
+                .property_accesses
+                .get(&byte_pc)
+                .filter(|site| site.shared);
             if self.view.instructions[self.pc as usize].load_array_length {
                 return self.generic(instruction);
             }
             if atom.is_none()
                 && !self.view.property_programs.contains_key(&byte_pc)
-                && !self.view.feedback_exits.contains(&self.pc)
+                && !self.view.instructions[self.pc as usize].property_attempted
             {
                 return self.deopt(DeoptReason::InsufficientFeedback);
             }
@@ -2094,7 +2282,7 @@ impl<'a> Builder<'a> {
 
     /// `[[Get]]` of the named site at `byte_pc` on `object`: the site's
     /// feedback programs inline, or, for a megamorphic site or one whose
-    /// receivers no program describes, a probe of the shared lookup table
+    /// receivers no program describes, a probe of the shared property action table
     /// that completes in the runtime on a miss.
     fn named_lookup(&mut self, byte_pc: u32, object: NodeId) -> NodeId {
         if !self.exited_for(ExitReason::ShapeGuard)
@@ -2121,9 +2309,10 @@ impl<'a> Builder<'a> {
         }
         let atom = self
             .view
-            .property_megamorphic_accesses
+            .property_accesses
             .get(&byte_pc)
-            .copied();
+            .filter(|site| site.shared)
+            .map(|site| site.atom);
         self.add(
             Kind::LoadPropertyCached { pc: self.pc, atom },
             &[object],
@@ -2132,7 +2321,10 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_store_property(&mut self, instruction: &Instruction) {
-        let Some(access) = super::feedback::own_data_store(self.view, instruction.byte_pc) else {
+        let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
+            .then(|| super::feedback::own_data_store(self.view, instruction.byte_pc))
+            .flatten()
+        else {
             return self.visit_named_store(instruction);
         };
         let object = self.read(instruction.reads[0]);
@@ -2140,10 +2332,9 @@ impl<'a> Builder<'a> {
         let value = self.read(instruction.reads[1]);
         let value = self.tagged(value);
         self.check_shapes(object, &access.shapes, true);
-        let base = self.add(Kind::LoadSlotBase, &[object], Repr::Word);
         self.add(
-            Kind::StoreTaggedField(access.offset),
-            &[base, value],
+            Kind::StoreOwnField(access.field),
+            &[object, value],
             Repr::None,
         );
         self.add(Kind::WriteBarrier, &[object, value], Repr::None);
@@ -2151,7 +2342,7 @@ impl<'a> Builder<'a> {
             FieldKey {
                 object,
                 property: true,
-                offset: access.offset,
+                offset: access.field.cache_key() as i32,
             },
             value,
         );
@@ -2198,8 +2389,8 @@ impl<'a> Builder<'a> {
                             shape = Some(child);
                             transition = true;
                         }
-                        Op::StoreField { value_byte, .. } => {
-                            offsets.push(value_byte as i32);
+                        Op::StoreField { field, .. } => {
+                            offsets.push(field.cache_key() as i32);
                         }
                         _ => {}
                     }
@@ -2232,12 +2423,13 @@ impl<'a> Builder<'a> {
         }
         let atom = self
             .view
-            .property_megamorphic_accesses
+            .property_accesses
             .get(&byte_pc)
-            .copied();
+            .filter(|site| site.shared)
+            .map(|site| site.atom);
         if atom.is_none()
             && !self.view.property_programs.contains_key(&byte_pc)
-            && !self.view.feedback_exits.contains(&self.pc)
+            && !self.view.instructions[self.pc as usize].property_attempted
         {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
@@ -2311,8 +2503,9 @@ impl<'a> Builder<'a> {
         if !construct
             && self
                 .view
-                .static_native_calls
-                .contains_key(&instruction.byte_pc)
+                .native_calls
+                .get(&instruction.byte_pc)
+                .is_some_and(|target| target.leaf().is_some())
         {
             return self.generic(instruction);
         }
@@ -2352,7 +2545,7 @@ impl<'a> Builder<'a> {
                 .map(|&register| self.read(register))
                 .collect();
             let undefined = self.undefined;
-            if Self::binds_this_as_is(body, plan)
+            if self.binds_this_as_is(body, plan, undefined)
                 && self.inline_call(instruction, body, plan, callee, undefined, &values)
             {
                 return;
@@ -2367,7 +2560,7 @@ impl<'a> Builder<'a> {
         let node = self.add(
             Kind::CallJs {
                 pc: self.pc,
-                plan,
+                plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 construct,
                 receiver: false,
                 allocation,
@@ -2403,10 +2596,11 @@ impl<'a> Builder<'a> {
         arguments: &[NodeId],
         plan: Option<otter_vm::jit::JitDirectCallPlan>,
     ) {
-        // A strict non-arrow callee binds the explicit receiver as it is.
+        // Strict non-arrows bind this value as-is; sloppy bodies also do so
+        // when this actual receiver already has an Object proof.
         if let Some(plan) = plan
             && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
-            && Self::binds_this_as_is(body, plan)
+            && self.binds_this_as_is(body, plan, receiver)
             && self.inline_call(instruction, body, plan, callee, receiver, arguments)
         {
             return;
@@ -2418,10 +2612,82 @@ impl<'a> Builder<'a> {
         let node = self.add(
             Kind::CallJs {
                 pc: self.pc,
-                plan,
+                plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 construct: false,
                 receiver: true,
                 allocation: None,
+            },
+            &inputs,
+            Repr::Tagged,
+        );
+        let destination = instruction.writes[0];
+        let lazy = self.lazy_state(Some((destination, node)));
+        self.graph.node_mut(node).lazy = Some(lazy);
+        self.write(destination, node);
+    }
+
+    /// `dst = callee.apply(this, arguments)` over the activation's own
+    /// `arguments`, never materialized: once the method is proved to be
+    /// `%Function.prototype.apply%` and no arguments object exists, a call
+    /// of `callee` with the activation's actual arguments, each mapped
+    /// formal read from where it lives now. An inlined body has no
+    /// activation whose actuals it could pass.
+    fn visit_call_forward(&mut self, instruction: &Instruction) {
+        let (Some(method), Some(callee), Some(this)) = (
+            instruction.register(1),
+            instruction.register(2),
+            instruction.register(3),
+        ) else {
+            return self.generic(instruction);
+        };
+        let Some(apply) = self.view.forward_apply_native_ref else {
+            return self.generic(instruction);
+        };
+        if self.inline.is_some() || self.exited_for(ExitReason::IdentityGuard) {
+            return self.generic(instruction);
+        }
+        if !self.view.instructions[self.pc as usize].call_attempted {
+            return self.deopt(DeoptReason::InsufficientFeedback);
+        }
+        let method = self.read(method);
+        let method = self.tagged(method);
+        self.add(Kind::CheckNative(apply), &[method], Repr::None);
+        self.add(Kind::CheckArgumentsElided, &[], Repr::None);
+        let callee = self.read(callee);
+        let callee = self.tagged(callee);
+        let this = self.read(this);
+        let this = self.tagged(this);
+        let mut inputs: SmallVec<[NodeId; 4]> = smallvec::smallvec![callee, this];
+        let mut bindings: Vec<u16> = Vec::new();
+        let slots_byte = self.view.context_layout.slots_byte as i32;
+        let view = self.view;
+        for (argument_index, storage) in view.code_block.forwarded_argument_bindings() {
+            let value = match storage {
+                otter_bytecode::ArgumentBindingStorage::Register { reg } => {
+                    let value = self.read(reg);
+                    self.tagged(value)
+                }
+                otter_bytecode::ArgumentBindingStorage::Context { reg, slot } => {
+                    let context = self.read(reg);
+                    let context = self.tagged(context);
+                    let offset = slots_byte + i32::from(slot) * 8;
+                    self.add(Kind::LoadTaggedField(offset), &[context], Repr::Tagged)
+                }
+            };
+            inputs.push(value);
+            bindings.push(argument_index);
+        }
+        let plan = self
+            .view
+            .direct_callees
+            .get(&instruction.byte_pc)
+            .filter(|targets| targets.len() == 1)
+            .map(|targets| targets[0].plan);
+        let node = self.add(
+            Kind::CallForward {
+                pc: self.pc,
+                plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
+                bindings: bindings.into_boxed_slice(),
             },
             &inputs,
             Repr::Tagged,
@@ -2462,13 +2728,20 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
-        // A native leaf target is entered by the baseline operation without
-        // a frame.
-        if self
+        // The loaded callable and actuals already belong to this instruction.
+        // Only a passive exact-arity declaration can leave before this call;
+        // mutating and unsupported leaf shapes keep the baseline operation.
+        let leaf = self
             .view
-            .static_native_calls
-            .contains_key(&instruction.byte_pc)
-        {
+            .native_calls
+            .get(&instruction.byte_pc)
+            .and_then(|target| target.leaf())
+            .copied();
+        let pure = leaf.and_then(|target| {
+            super::native_leaf::admit(self.view, target, arguments.len())
+                .map(|declaration| (target, declaration))
+        });
+        if leaf.is_some() && (pure.is_none() || self.exited_for(ExitReason::IdentityGuard)) {
             return self.generic(instruction);
         }
         let callee = self.read(callee);
@@ -2482,6 +2755,22 @@ impl<'a> Builder<'a> {
                 self.tagged(value)
             })
             .collect();
+        if let Some((target, declaration)) = pure {
+            self.add(
+                Kind::CheckNative(target.builtin_native_ref),
+                &[callee],
+                Repr::None,
+            );
+            let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
+            if declaration.this_operand {
+                inputs.push(this);
+            }
+            inputs.extend(arguments.iter().copied());
+            inputs.resize(2, self.undefined);
+            let node = self.add(Kind::NativeLeaf(target.leaf_stub_id), &inputs, Repr::Tagged);
+            self.write(instruction.writes[0], node);
+            return;
+        }
         // A loaded `f.call` called with `f` as receiver calls `f`.
         if !self.exited_for(ExitReason::IdentityGuard)
             && let Some(site) = self.view.function_prototype_calls.get(&instruction.byte_pc)
@@ -2544,12 +2833,17 @@ impl<'a> Builder<'a> {
         let lookup = self.view.property_programs.contains_key(&byte_pc)
             || self
                 .view
-                .property_megamorphic_accesses
-                .contains_key(&byte_pc);
+                .property_accesses
+                .get(&byte_pc)
+                .is_some_and(|site| site.shared);
         // A native leaf method is entered by the baseline operation without
         // a frame.
         if (fold.is_none() && method.is_none() && polymorphic.is_none() && !lookup)
-            || self.view.static_native_calls.contains_key(&byte_pc)
+            || self
+                .view
+                .native_calls
+                .get(&byte_pc)
+                .is_some_and(|target| target.leaf().is_some())
             || self.view.guarded_method_calls.contains_key(&byte_pc)
         {
             return self.generic(instruction);
@@ -2793,7 +3087,9 @@ impl<'a> Builder<'a> {
         let index = self.read(index);
         let index = self.element_index(index);
         let fact = self.elements_of(receiver, access);
-        self.add(Kind::CheckBounds, &[index, fact.length], Repr::None);
+        if self.known.bounds.insert((index, fact.length)) {
+            self.add(Kind::CheckBounds, &[index, fact.length], Repr::None);
+        }
         (fact, index)
     }
 
@@ -2828,6 +3124,28 @@ impl<'a> Builder<'a> {
         let receiver = self.read(instruction.reads[0]);
         let receiver = self.tagged(receiver);
         let (fact, index) = self.element_address(receiver, instruction.reads[1], access);
+        if access.element == JitElementRepr::Boxed {
+            // The descriptor admits a prototype-only sidecar. Prove an own
+            // slot before reading: a hole must use committed prototype lookup.
+            self.add(Kind::CheckElementPresent, &[fact.base, index], Repr::None);
+        }
+        let kind = match access.element {
+            JitElementRepr::Float64 if let Some(holes) = access.holes => {
+                Kind::LoadHoleyFloat64Element(holes)
+            }
+            JitElementRepr::Uint32 if self.exited_for(ExitReason::TypeMismatch) => {
+                Kind::LoadElementUint32ToFloat64
+            }
+            element => Kind::LoadElement(element),
+        };
+        // The element read once on this path, with nothing stored since.
+        if let Some((read, value)) = self.known.elements_read.get(&(fact.base, index))
+            && *read == kind
+        {
+            let value = *value;
+            self.write(instruction.writes[0], value);
+            return;
+        }
         let value = match access.element {
             JitElementRepr::Float64 if let Some(holes) = access.holes => self.add(
                 Kind::LoadHoleyFloat64Element(holes),
@@ -2853,6 +3171,9 @@ impl<'a> Builder<'a> {
             ),
             element => self.add(Kind::LoadElement(element), &[fact.base, index], Repr::Int32),
         };
+        self.known
+            .elements_read
+            .insert((fact.base, index), (kind, value));
         self.write(instruction.writes[0], value);
     }
 
@@ -2913,6 +3234,8 @@ impl<'a> Builder<'a> {
             &[fact.base, index, stored],
             Repr::None,
         );
+        // Views of one buffer alias: no element read on this path survives.
+        self.known.elements_read.clear();
         if element == JitElementRepr::Boxed {
             self.add(
                 Kind::ElementWriteBarrier,

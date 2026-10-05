@@ -98,7 +98,7 @@ impl Interpreter {
         value: Local<'_>,
     ) -> Result<Local<'s>, VmError> {
         let value = self.handle_arena.get(value.index());
-        self.scoped_promise_settled(scope, value, true)
+        self.scoped_promise_settled(scope, value, true, None)
     }
 
     /// Allocate a pre-rejected promise whose reason is the handle
@@ -107,9 +107,10 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         reason: Local<'_>,
+        context: Option<&ExecutionContext>,
     ) -> Result<Local<'s>, VmError> {
         let reason = self.handle_arena.get(reason.index());
-        self.scoped_promise_settled(scope, reason, false)
+        self.scoped_promise_settled(scope, reason, false, context)
     }
 
     fn scoped_promise_settled<'s>(
@@ -117,6 +118,7 @@ impl Interpreter {
         scope: &'s HandleScope,
         payload: Value,
         fulfilled: bool,
+        context: Option<&ExecutionContext>,
     ) -> Result<Local<'s>, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         // The payload local is stored into the promise body by the same
@@ -139,7 +141,11 @@ impl Interpreter {
                 &mut external_visit,
             )?
         };
-        Ok(self.scoped_value(scope, Value::promise(promise)))
+        let local = self.scoped_value(scope, Value::promise(promise));
+        if !fulfilled {
+            self.note_born_rejection(promise, context);
+        }
+        Ok(local)
     }
 
     /// Drain an iterable to completion (§7.4.13 IteratorToList) and
@@ -155,17 +161,19 @@ impl Interpreter {
         scope: &'s HandleScope,
         context: Option<&ExecutionContext>,
         iterable: Local<'_>,
-    ) -> Result<Vec<Local<'s>>, VmError> {
+    ) -> Result<Vec<Local<'s>>, crate::CommittedValueError> {
         let value = self.handle_arena.get(iterable.index());
         let elements = if let Some(array) = value.as_array() {
             crate::array::with_elements(array, &self.gc_heap, <[Value]>::to_vec)
         } else if let Some(context) = context {
             self.iterator_to_list_sync(context, stack, &value)?
         } else {
-            return Err(self.err_type(
-                "cannot iterate a non-array iterable without an execution context"
-                    .to_string()
-                    .into(),
+            return Err(crate::CommittedValueError::JavaScript(
+                self.err_type(
+                    "cannot iterate a non-array iterable without an execution context"
+                        .to_string()
+                        .into(),
+                ),
             ));
         };
         // Park immediately: nothing allocates between the walk's return

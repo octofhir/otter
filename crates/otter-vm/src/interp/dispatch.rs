@@ -5,6 +5,15 @@
 //! the JIT tier-up/backedge hooks, and additive optimizing-tier back-edge
 //! accounting. Deliberately a single function — splitting it would defeat the
 //! dispatch-locality the interpreter depends on.
+//!
+//! # Invariants
+//! Retraining charges only fetched interpreter opcodes, never static loop
+//! spans or compiled execution. Activation-local evidence survives staged calls.
+//! Completed terminal semantic failures leave through `DispatchOutcome::Fatal`;
+//! ordinary source errors retain the existing `VmError` handler path.
+//!
+//! # See also
+//! - [`super::jit_retraining`] for deopt replacement admission.
 #![allow(unused_imports)]
 use super::call_dispatch::DispatchOutcome;
 use crate::*;
@@ -63,7 +72,7 @@ impl Interpreter {
         let mut tick_pc = u32::MAX;
         let outcome = self.dispatch_ticks(entry_context, stack, floor, &mut tick_pc);
         let staged = matches!(outcome, Ok(DispatchOutcome::Call));
-        if (staged || outcome.is_err())
+        if (staged || outcome.is_err() || matches!(outcome, Ok(DispatchOutcome::Fatal(_))))
             && tick_pc != u32::MAX
             && !stack.is_at_floor(floor)
             && let Some(frame) = stack.last_mut()
@@ -245,6 +254,12 @@ impl Interpreter {
                 };
             let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
             let op = function.op(instr);
+            if jit_installed {
+                function.source_work().charge(1);
+            }
+            if jit_installed && self.optimizing_tier_policy.has_retraining() {
+                self.note_interpreted_retraining_step(&mut stack[top_idx]);
+            }
             // Feedback is dense in the owning CodeBlock. Interpreter-only
             // execution keeps the cell untouched and pays no atomic update.
             let feedback = if jit_installed {
@@ -349,7 +364,7 @@ impl Interpreter {
                             self.function_prototype_call_target(register(1)?, register(2)?)
                         })
                         .flatten();
-                    let static_native_target = if jit_installed {
+                    let native_target = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
                             .and_then(|register| {
@@ -358,13 +373,7 @@ impl Interpreter {
                                     .and_then(|frame| frame.registers.get(register as usize))
                                     .copied()
                             })
-                            .and_then(Value::as_native_function)
-                            .and_then(|native| {
-                                crate::jit_static_native::jit_static_call_target(
-                                    native,
-                                    &self.gc_heap,
-                                )
-                            })
+                            .and_then(|callee| self.native_call_target(callee))
                     } else {
                         None
                     };
@@ -384,11 +393,7 @@ impl Interpreter {
                         } else if let Some(function_id) = staged_target {
                             Some(crate::feedback::OrdinaryCallTarget::Bytecode(function_id))
                         } else {
-                            static_native_target.map(|declaration| {
-                                crate::feedback::OrdinaryCallTarget::StaticNative(
-                                    declaration.leaf_stub_id,
-                                )
-                            })
+                            native_target
                         }
                     {
                         let transition = self.record_ordinary_call_feedback(
@@ -403,6 +408,16 @@ impl Interpreter {
                     continue;
                 }
                 Op::TailCall => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            function
+                                .register(instr, 1)
+                                .and_then(|register| {
+                                    stack[top_idx].registers.get(register as usize).copied()
+                                })
+                                .and_then(|callee| self.native_call_target(callee))
+                        })
+                        .flatten();
                     // Cooperative cancellation is polled at back-edges
                     // (`apply_branch`) and here: unbounded execution needs
                     // either a back-edge or an unbounded tail-call chain, and
@@ -419,8 +434,12 @@ impl Interpreter {
                         );
                     }
                     self.do_tail_call_exec(stack, function, instr)?;
-                    if jit_installed && let Some(function_id) = self.staged_bytecode_target(stack) {
-                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(function_id);
+                    if jit_installed
+                        && let Some(target) = self
+                            .staged_bytecode_target(stack)
+                            .map(crate::feedback::OrdinaryCallTarget::Bytecode)
+                            .or(native_target)
+                    {
                         let transition = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
@@ -433,6 +452,27 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallForwardArguments => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            let frame = &stack[top_idx];
+                            let operand = |index| {
+                                function.register(instr, index).and_then(|register| {
+                                    frame.registers.get(register as usize).copied()
+                                })
+                            };
+                            let method = operand(1)?;
+                            let callee = if crate::method_ops::is_function_prototype_intrinsic_value(
+                                method,
+                                &self.gc_heap,
+                                crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply,
+                            ) {
+                                operand(2)?
+                            } else {
+                                method
+                            };
+                            self.native_call_target(callee)
+                        })
+                        .flatten();
                     if jit_installed {
                         self.record_call_attempt_feedback(
                             function,
@@ -440,9 +480,19 @@ impl Interpreter {
                             function_id,
                         );
                     }
-                    self.do_call_forward_arguments_exec(stack, context, function, instr)?;
-                    if jit_installed && let Some(function_id) = self.staged_bytecode_target(stack) {
-                        let target = crate::feedback::OrdinaryCallTarget::Bytecode(function_id);
+                    (match self.do_call_forward_arguments_exec(stack, context, function, instr) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
+                    if jit_installed
+                        && let Some(target) = self
+                            .staged_bytecode_target(stack)
+                            .map(crate::feedback::OrdinaryCallTarget::Bytecode)
+                            .or(native_target)
+                    {
                         let transition = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
@@ -510,7 +560,13 @@ impl Interpreter {
                         }
                         _ => None,
                     };
-                    self.do_call_method_value_exec(stack, context, function, instr)?;
+                    match self.do_call_method_value_exec(stack, context, function, instr) {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
                     // Feedback comes from the staged request. `f.call(...)` stages `%Function.prototype.call%` with `f`
                     // as its receiver; the site records the function it runs.
                     let function_call_target = jit_installed
@@ -554,13 +610,28 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallSpread => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            function
+                                .register(instr, 1)
+                                .and_then(|register| {
+                                    stack[top_idx].registers.get(register as usize).copied()
+                                })
+                                .and_then(|callee| self.native_call_target(callee))
+                        })
+                        .flatten();
                     let operands = function.operand_view(instr);
                     self.do_call_spread(stack, operands)?;
-                    if jit_installed && let Some(function_id) = self.staged_bytecode_target(stack) {
+                    if jit_installed
+                        && let Some(target) = self
+                            .staged_bytecode_target(stack)
+                            .map(crate::feedback::OrdinaryCallTarget::Bytecode)
+                            .or(native_target)
+                    {
                         let transition = self.record_ordinary_call_feedback(
                             function,
                             instr.instruction_pc,
-                            crate::feedback::OrdinaryCallTarget::Bytecode(function_id),
+                            target,
                         );
                         if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
@@ -569,6 +640,20 @@ impl Interpreter {
                     continue;
                 }
                 Op::New => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            function
+                                .register(instr, 1)
+                                .and_then(|register| {
+                                    stack[top_idx].registers.get(register as usize).copied()
+                                })
+                                .and_then(|callee| {
+                                    callee
+                                        .as_native_function()
+                                        .map(|_| crate::feedback::OrdinaryCallTarget::Native)
+                                })
+                        })
+                        .flatten();
                     if jit_installed {
                         self.record_call_attempt_feedback(
                             function,
@@ -623,9 +708,33 @@ impl Interpreter {
                         }
                     }
 
+                    if let Some(target) = native_target {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                    }
                     continue;
                 }
                 Op::SuperConstruct => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            function
+                                .register(instr, 1)
+                                .and_then(|register| {
+                                    stack[top_idx].registers.get(register as usize).copied()
+                                })
+                                .and_then(|callee| {
+                                    callee
+                                        .as_native_function()
+                                        .map(|_| crate::feedback::OrdinaryCallTarget::Native)
+                                })
+                        })
+                        .flatten();
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -671,9 +780,33 @@ impl Interpreter {
                         }
                     }
 
+                    if let Some(target) = native_target {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                    }
                     continue;
                 }
                 Op::NewSpread => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            function
+                                .register(instr, 1)
+                                .and_then(|register| {
+                                    stack[top_idx].registers.get(register as usize).copied()
+                                })
+                                .and_then(|callee| {
+                                    callee
+                                        .as_native_function()
+                                        .map(|_| crate::feedback::OrdinaryCallTarget::Native)
+                                })
+                        })
+                        .flatten();
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -716,9 +849,33 @@ impl Interpreter {
                         }
                     }
 
+                    if let Some(target) = native_target {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                    }
                     continue;
                 }
                 Op::SuperConstructSpread => {
+                    let native_target = jit_installed
+                        .then(|| {
+                            function
+                                .register(instr, 1)
+                                .and_then(|register| {
+                                    stack[top_idx].registers.get(register as usize).copied()
+                                })
+                                .and_then(|callee| {
+                                    callee
+                                        .as_native_function()
+                                        .map(|_| crate::feedback::OrdinaryCallTarget::Native)
+                                })
+                        })
+                        .flatten();
                     let direct_construct_fid = if jit_installed {
                         register_operand(function.operand(instr, 1))
                             .ok()
@@ -761,6 +918,16 @@ impl Interpreter {
                         }
                     }
 
+                    if let Some(target) = native_target {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            target,
+                        );
+                        if transition.evict_for_reopt() {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
+                    }
                     continue;
                 }
                 Op::BindThisValue => {
@@ -819,7 +986,13 @@ impl Interpreter {
                     let awaited_result = self.do_await(stack, context, dst, awaited);
                     let result = self.iteration_anchor(anchor);
                     self.pop_iteration_anchors_to(anchor);
-                    awaited_result?;
+                    match awaited_result {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
                     if stack.is_at_floor(floor) {
                         return Ok(DispatchOutcome::Returned(result));
                     }
@@ -869,8 +1042,19 @@ impl Interpreter {
                             &mut self.gc_heap,
                             crate::generator::AsyncGeneratorState::SuspendedYield,
                         );
-                        self.async_generator_complete_step(context, &owner, Ok(yielded), false)?;
-                        self.async_generator_resume_next(stack, context, &owner)?;
+                        self.async_generator_complete_step(
+                            Some(context),
+                            &owner,
+                            Ok(yielded),
+                            false,
+                        )?;
+                        match self.async_generator_resume_next(stack, Some(context), &owner) {
+                            Ok(()) => {}
+                            Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                            Err(CommittedValueError::Fatal(error)) => {
+                                return Ok(DispatchOutcome::Fatal(error));
+                            }
+                        }
                     }
                     return Ok(DispatchOutcome::Returned(Value::undefined()));
                 }
@@ -903,7 +1087,13 @@ impl Interpreter {
                             &mut self.gc_heap,
                             crate::generator::AsyncGeneratorState::SuspendedYield,
                         );
-                        self.async_generator_yield_awaited(stack, context, &owner, yielded)?;
+                        (match self.async_generator_yield_awaited(stack, context, &owner, yielded) {
+                            Ok(value) => value,
+                            Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                            Err(CommittedValueError::Fatal(error)) => {
+                                return Ok(DispatchOutcome::Fatal(error));
+                            }
+                        });
                     }
                     return Ok(DispatchOutcome::Returned(yielded));
                 }
@@ -921,8 +1111,19 @@ impl Interpreter {
                     // §27.5.1 step 3: the prototype is read after
                     // FunctionDeclarationInstantiation; the generator object is
                     // this call's completion.
-                    let generator =
-                        self.resolve_started_generator(stack, context, owner, callee, function_id)?;
+                    let generator = match self.resolve_started_generator(
+                        stack,
+                        context,
+                        owner,
+                        callee,
+                        function_id,
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     return Ok(DispatchOutcome::Returned(generator));
                 }
                 // §7.1.4 ToNumber — the shared synchronous helper owns the
@@ -930,7 +1131,13 @@ impl Interpreter {
                 Op::ToNumber => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_to_number_regs(context, stack, top_idx, dst, src)?;
+                    (match self.run_to_number_regs(context, stack, top_idx, dst, src) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §7.1.1 `ToPrimitive` ladder. Each invocation of
@@ -957,7 +1164,13 @@ impl Interpreter {
                         stack[top_idx].advance_pc()?;
                         continue;
                     }
-                    self.drive_to_primitive(stack, context, function.operand_view(instr))?;
+                    (match self.drive_to_primitive(stack, context, function.operand_view(instr)) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §7.4.3 `GetIterator`. Built-in iterables fall
@@ -966,7 +1179,13 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
                     let operands = function.operand_view(instr);
-                    if self.drive_get_iterator(stack, context, operands)? {
+                    if match self.drive_get_iterator(stack, context, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
                     let dst = instr.reg(0);
@@ -977,7 +1196,14 @@ impl Interpreter {
                 Op::GetAsyncIterator => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_get_async_iterator_regs(context, &mut *stack, top_idx, dst, src)?;
+                    (match self.run_get_async_iterator_regs(context, &mut *stack, top_idx, dst, src)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §7.4.5 `IteratorNext`. Built-in iterators step
@@ -995,9 +1221,14 @@ impl Interpreter {
                     match self.drive_iterator_next(stack, context, operands) {
                         Ok(true) => continue,
                         Ok(false) => {}
-                        Err(e) => {
+                        Err(error) => {
                             self.iterator_mark_done(iterator);
-                            return Err(e);
+                            match error {
+                                CommittedValueError::JavaScript(error) => return Err(error),
+                                CommittedValueError::Fatal(error) => {
+                                    return Ok(DispatchOutcome::Fatal(error));
+                                }
+                            }
                         }
                     }
                     let value_dst = instr.reg(0);
@@ -1014,7 +1245,13 @@ impl Interpreter {
                 // §7.4.11 IteratorClose for a normal completion.
                 Op::IteratorClose => {
                     let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
-                    self.iterator_close_value_sync(stack, context, iterator)?;
+                    match self.iterator_close_value_sync(stack, Some(context), iterator) {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -1022,7 +1259,13 @@ impl Interpreter {
                 // rethrows its own value next.
                 Op::IteratorCloseThrow => {
                     let iterator = *read_register(&stack[top_idx], instr.reg(0))?;
-                    self.iterator_close_for_throw(stack, context, iterator)?;
+                    match self.iterator_close_for_throw(stack, Some(context), iterator) {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -1033,7 +1276,13 @@ impl Interpreter {
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
                     // §7.4.11 steps 3-5: an iterator without a `return`
                     // is already closed, and the caller skips the await.
-                    let outcome = self.async_iterator_return_call(stack, context, iterator)?;
+                    let outcome = match self.async_iterator_return_call(stack, context, iterator) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     match outcome {
                         Some(result) => {
@@ -1081,10 +1330,29 @@ impl Interpreter {
                             crate::property_ic::PropertyIcKind::Load,
                         )
                         .ok_or(VmError::InvalidOperand)?;
-                    if self.drive_load_property(stack, context, dst, obj_reg, key, slot)? {
+                    if match self.drive_load_property(stack, context, dst, obj_reg, key, slot) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
-                    self.run_load_property_reg(context, &mut *stack, top_idx, dst, obj_reg, key)?;
+                    (match self.run_load_property_reg(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        dst,
+                        obj_reg,
+                        key,
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LoadElement => {
@@ -1101,11 +1369,25 @@ impl Interpreter {
                             recv,
                         );
                     }
-                    if self.drive_load_element(stack, context, operands)? {
+                    if match self.drive_load_element(stack, context, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
                     let (dst, recv_reg, idx_reg) = instr.reg3();
-                    self.run_load_element_regs(context, stack, top_idx, dst, recv_reg, idx_reg)?;
+                    (match self
+                        .run_load_element_regs(context, stack, top_idx, dst, recv_reg, idx_reg)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LoadSuperProperty => {
@@ -1117,28 +1399,40 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?
                         .name();
                     let home = *read_register(&stack[top_idx], home_reg)?;
-                    self.run_load_super_property(
+                    (match self.run_load_super_property(
                         context,
                         stack,
                         top_idx,
                         dst,
                         home,
                         SuperReadKey::Resolved(VmPropertyKey::String(name)),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LoadSuperElement => {
                     let (dst, home_reg, key_reg) = instr.reg3();
                     let home = *read_register(&stack[top_idx], home_reg)?;
                     let key_raw = *read_register(&stack[top_idx], key_reg)?;
-                    self.run_load_super_property(
+                    (match self.run_load_super_property(
                         context,
                         stack,
                         top_idx,
                         dst,
                         home,
                         SuperReadKey::Computed(key_raw),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::SetSuperProperty => {
@@ -1152,7 +1446,7 @@ impl Interpreter {
                     let home = *read_register(&stack[top_idx], home_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
                     let strict = context.function_is_strict(stack[top_idx].function_id);
-                    self.run_store_super_property(
+                    (match self.run_store_super_property(
                         context,
                         stack,
                         top_idx,
@@ -1160,7 +1454,13 @@ impl Interpreter {
                         SuperReadKey::Resolved(VmPropertyKey::String(name)),
                         value,
                         strict,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::SetSuperElement => {
@@ -1169,7 +1469,7 @@ impl Interpreter {
                     let key_raw = *read_register(&stack[top_idx], key_reg)?;
                     let value = *read_register(&stack[top_idx], value_reg)?;
                     let strict = context.function_is_strict(stack[top_idx].function_id);
-                    self.run_store_super_property(
+                    (match self.run_store_super_property(
                         context,
                         stack,
                         top_idx,
@@ -1177,7 +1477,13 @@ impl Interpreter {
                         SuperReadKey::Computed(key_raw),
                         value,
                         strict,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §10.1.9 [[Set]] — accessor setter dispatch follows
@@ -1186,7 +1492,13 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
                     let operands = function.operand_view(instr);
-                    if self.drive_store_property(stack, context, operands, false)? {
+                    if match self.drive_store_property(stack, context, operands, false) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
                     let obj_reg = instr.reg(0);
@@ -1195,7 +1507,7 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    self.run_store_property_reg(
+                    (match self.run_store_property_reg(
                         context,
                         &mut *stack,
                         top_idx,
@@ -1203,14 +1515,26 @@ impl Interpreter {
                         key,
                         src,
                         false,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §15.7.1 — class heritage / computed-key stores keep
                 // strict PutValue semantics inside a sloppy frame.
                 Op::StorePropertyStrict => {
                     let operands = function.operand_view(instr);
-                    if self.drive_store_property(stack, context, operands, true)? {
+                    if match self.drive_store_property(stack, context, operands, true) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
                     let obj_reg = instr.reg(0);
@@ -1219,7 +1543,7 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    self.run_store_property_reg(
+                    (match self.run_store_property_reg(
                         context,
                         &mut *stack,
                         top_idx,
@@ -1227,7 +1551,13 @@ impl Interpreter {
                         key,
                         src,
                         true,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §15.7.1 — `StoreElementStrict` keeps strict PutValue
@@ -1263,7 +1593,7 @@ impl Interpreter {
                             frame.read(src_reg)?,
                         )
                     };
-                    self.store_element_values(
+                    (match self.store_element_values(
                         stack,
                         context,
                         function_id,
@@ -1271,7 +1601,13 @@ impl Interpreter {
                         key,
                         value,
                         strict,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     // The synchronous helper completed the full effect (or
                     // threw), so publish exactly one resume increment.
                     stack[top_idx].advance_pc()?;
@@ -1281,13 +1617,19 @@ impl Interpreter {
                     let (dst, lhs, rhs) = instr.reg3();
                     let lhs = *read_register(&stack[top_idx], lhs)?;
                     let rhs = *read_register(&stack[top_idx], rhs)?;
-                    let result = self.object_protocol_value(
+                    let result = match self.object_protocol_value(
                         stack,
                         context,
                         crate::ObjectProtocolValueOp::Instanceof,
                         lhs,
                         rhs,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -1300,13 +1642,19 @@ impl Interpreter {
                     let (dst, lhs, rhs) = instr.reg3();
                     let lhs = *read_register(&stack[top_idx], lhs)?;
                     let rhs = *read_register(&stack[top_idx], rhs)?;
-                    let result = self.object_protocol_value(
+                    let result = match self.object_protocol_value(
                         stack,
                         context,
                         crate::ObjectProtocolValueOp::HasProperty,
                         lhs,
                         rhs,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -1314,7 +1662,13 @@ impl Interpreter {
                 }
                 Op::DeleteProperty => {
                     let operands = function.operand_view(instr);
-                    if self.drive_delete_property_proxy(stack, context, operands)? {
+                    if match self.drive_delete_property_proxy(stack, context, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
                     let dst = instr.reg(0);
@@ -1332,12 +1686,18 @@ impl Interpreter {
                     if receiver.as_object().is_some_and(|o| {
                         crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                     }) {
-                        self.ensure_deferred_namespace_ready(
+                        (match self.ensure_deferred_namespace_ready(
                             stack,
                             context,
                             &receiver,
                             key.name() != "then",
-                        )?;
+                        ) {
+                            Ok(value) => value,
+                            Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                            Err(CommittedValueError::Fatal(error)) => {
+                                return Ok(DispatchOutcome::Fatal(error));
+                            }
+                        });
                     }
                     let frame = &mut stack[top_idx];
                     self.run_delete_property_reg(context, frame, dst, obj_reg, key, strict)?;
@@ -1345,7 +1705,13 @@ impl Interpreter {
                 }
                 Op::DeleteElement => {
                     let operands = function.operand_view(instr);
-                    if self.drive_delete_element_proxy(stack, context, operands)? {
+                    if match self.drive_delete_element_proxy(stack, context, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    } {
                         continue;
                     }
                     let (dst, obj_reg, idx_reg) = instr.reg3();
@@ -1359,16 +1725,28 @@ impl Interpreter {
                             || key_val
                                 .as_string(&self.gc_heap)
                                 .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "then");
-                        self.ensure_deferred_namespace_ready(
+                        (match self.ensure_deferred_namespace_ready(
                             stack,
                             context,
                             &receiver,
                             !symbol_like,
-                        )?;
+                        ) {
+                            Ok(value) => value,
+                            Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                            Err(CommittedValueError::Fatal(error)) => {
+                                return Ok(DispatchOutcome::Fatal(error));
+                            }
+                        });
                     }
-                    self.run_delete_element_regs(
+                    (match self.run_delete_element_regs(
                         context, stack, top_idx, dst, obj_reg, idx_reg, strict,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §28.2.4.1 / .2 Proxy.[[GetPrototypeOf]] /
@@ -1379,13 +1757,19 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.object_protocol_value(
+                    let result = match self.object_protocol_value(
                         stack,
                         context,
                         crate::ObjectProtocolValueOp::GetPrototype,
                         source,
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -1396,13 +1780,19 @@ impl Interpreter {
                     let proto_reg = instr.reg(1);
                     let object = *read_register(&stack[top_idx], obj_reg)?;
                     let prototype = *read_register(&stack[top_idx], proto_reg)?;
-                    self.object_protocol_value(
+                    match self.object_protocol_value(
                         stack,
                         context,
                         crate::ObjectProtocolValueOp::SetPrototype,
                         object,
                         prototype,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -1420,7 +1810,13 @@ impl Interpreter {
                 // into the eval hook with a synthesised wrapper.
                 Op::NewFunction => {
                     let operands = function.operand_view(instr);
-                    self.run_new_function_operands(context, stack, operands)?;
+                    (match self.run_new_function_operands(context, stack, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LoadArgumentsLength | Op::LoadArgumentsElement => {
@@ -1428,7 +1824,13 @@ impl Interpreter {
                     let key = (op == Op::LoadArgumentsElement)
                         .then(|| read_register(&stack[top_idx], instr.reg(1)).copied())
                         .transpose()?;
-                    let value = self.read_frame_arguments(context, stack, top_idx, key)?;
+                    let value = match self.read_frame_arguments(context, stack, top_idx, key) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     write_register(&mut stack[top_idx], dst, value)?;
                     stack[top_idx].advance_pc()?;
                     continue;
@@ -1510,14 +1912,20 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::LoadLength,
                         source,
                         Value::undefined(),
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -1551,14 +1959,20 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::TypeOf,
                         source,
                         Value::undefined(),
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -1591,14 +2005,20 @@ impl Interpreter {
                 Op::LoadNewTarget => {
                     let dst = instr.reg(0);
                     let new_target = stack[top_idx].new_target();
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::LoadNewTarget,
                         Value::undefined(),
                         Value::undefined(),
                         new_target,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -1737,21 +2157,33 @@ impl Interpreter {
                 Op::NewError => {
                     let dst = instr.reg(0);
                     let msg_reg = instr.reg(1);
-                    self.run_new_error_regs(context, &mut *stack, top_idx, dst, msg_reg)?;
+                    (match self.run_new_error_regs(context, &mut *stack, top_idx, dst, msg_reg) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::NewBuiltinError => {
                     let dst = instr.reg(0);
                     let kind_idx = instr.const_word(1);
                     let msg_reg = instr.reg(2);
-                    self.run_new_builtin_error_regs(
+                    (match self.run_new_builtin_error_regs(
                         context,
                         &mut *stack,
                         top_idx,
                         dst,
                         kind_idx,
                         msg_reg,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LoadBuiltinError => {
@@ -1770,13 +2202,28 @@ impl Interpreter {
                 Op::LoadGlobalOrThrow => {
                     let dst = instr.reg(0);
                     let name_idx = instr.const_word(1);
-                    self.run_load_global_or_throw_reg(context, stack, top_idx, dst, name_idx)?;
+                    (match self.run_load_global_or_throw_reg(context, stack, top_idx, dst, name_idx)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LoadGlobalOrUndefined => {
                     let dst = instr.reg(0);
                     let name_idx = instr.const_word(1);
-                    self.run_load_global_or_undefined_reg(context, stack, top_idx, dst, name_idx)?;
+                    (match self
+                        .run_load_global_or_undefined_reg(context, stack, top_idx, dst, name_idx)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::DeclareGlobalVar => {
@@ -1863,7 +2310,7 @@ impl Interpreter {
                     } else {
                         otter_bytecode::opcode_schema::BindingMissing::Undefined
                     };
-                    let value = self.load_lookup_global_value(
+                    let value = match self.load_lookup_global_value(
                         context,
                         stack,
                         function_id,
@@ -1871,7 +2318,13 @@ impl Interpreter {
                         name_idx,
                         depth,
                         missing,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, value)?;
                     frame.advance_pc()?;
@@ -1885,7 +2338,7 @@ impl Interpreter {
                         *read_register(frame, value_reg)?,
                         *read_register(frame, ctx)?,
                     );
-                    self.store_lookup_global_value(
+                    (match self.store_lookup_global_value(
                         context,
                         stack,
                         function_id,
@@ -1893,7 +2346,13 @@ impl Interpreter {
                         name_idx,
                         mode,
                         value,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -1938,7 +2397,7 @@ impl Interpreter {
                         *read_register(frame, value_reg)?,
                         *read_register(frame, reference_reg)?,
                     );
-                    self.store_ref_value(
+                    (match self.store_ref_value(
                         context,
                         stack,
                         function_id,
@@ -1946,7 +2405,13 @@ impl Interpreter {
                         name_idx,
                         mode,
                         value,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -2009,9 +2474,15 @@ impl Interpreter {
                     let value_reg = instr.reg(0);
                     let name_idx = instr.const_word(1);
                     let strict = function.imm32(instr, 2).unwrap_or(0) != 0;
-                    self.run_store_global_binding_reg(
+                    (match self.run_store_global_binding_reg(
                         context, stack, top_idx, value_reg, name_idx, strict,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::InitGlobalLex => {
@@ -2034,9 +2505,15 @@ impl Interpreter {
                 // setters (unlike StoreProperty's Set semantics).
                 Op::DefineDataProperty => {
                     let (obj_reg, key_reg, value_reg) = instr.reg3();
-                    self.run_define_data_property_regs(
+                    (match self.run_define_data_property_regs(
                         context, stack, top_idx, obj_reg, key_reg, value_reg,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     stack[top_idx].advance_pc()?;
                     continue;
                 }
@@ -2056,7 +2533,14 @@ impl Interpreter {
                 // invokes its getter with the receiver as `this`.
                 Op::PrivateGet => {
                     let (dst, obj_reg, key_reg) = instr.reg3();
-                    self.run_private_get_reg(context, stack, top_idx, dst, obj_reg, key_reg)?;
+                    (match self.run_private_get_reg(context, stack, top_idx, dst, obj_reg, key_reg)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §7.3.32 PrivateSet — brand check, private methods
@@ -2064,7 +2548,15 @@ impl Interpreter {
                 // an own field writes in place preserving attributes.
                 Op::PrivateSet => {
                     let (obj_reg, key_reg, value_reg) = instr.reg3();
-                    self.run_private_set_reg(context, stack, top_idx, obj_reg, key_reg, value_reg)?;
+                    (match self
+                        .run_private_set_reg(context, stack, top_idx, obj_reg, key_reg, value_reg)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §7.1.3 ToNumeric: Number / BigInt pass through, an
@@ -2078,7 +2570,13 @@ impl Interpreter {
                     let result = if value.is_number() {
                         value
                     } else {
-                        crate::coerce::to_numeric_or_throw(self, stack, context, &value)?
+                        match crate::coerce::to_numeric_or_throw(self, stack, context, &value) {
+                            Ok(value) => value,
+                            Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                            Err(CommittedValueError::Fatal(error)) => {
+                                return Ok(DispatchOutcome::Fatal(error));
+                            }
+                        }
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
@@ -2093,14 +2591,20 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::ToObject,
                         source,
                         Value::undefined(),
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -2113,14 +2617,20 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::ToPropertyKey,
                         source,
                         Value::undefined(),
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -2134,7 +2644,15 @@ impl Interpreter {
                 Op::PrivateBrandCheck => {
                     let obj_reg = instr.reg(0);
                     let brand_reg = instr.reg(1);
-                    self.run_private_brand_check_reg(context, stack, top_idx, obj_reg, brand_reg)?;
+                    (match self
+                        .run_private_brand_check_reg(context, stack, top_idx, obj_reg, brand_reg)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 // §13.4.2 UpdateExpression numeric step — ToNumeric
@@ -2143,7 +2661,15 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let delta = function.imm32(instr, 2).unwrap_or(1);
-                    self.run_increment_regs(stack, context, top_idx, dst, src, delta, feedback)?;
+                    (match self
+                        .run_increment_regs(stack, context, top_idx, dst, src, delta, feedback)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::ValidateGlobalDecl => {
@@ -2156,8 +2682,15 @@ impl Interpreter {
                 Op::DefineGlobalVar => {
                     let name_idx = instr.const_word(0);
                     let value_reg = instr.reg(1);
-                    let frame = &mut stack[top_idx];
-                    self.run_define_global_var_reg(context, frame, name_idx, value_reg)?;
+                    (match self
+                        .run_define_global_var_reg(context, stack, top_idx, name_idx, value_reg)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::ImportNamespace => {
@@ -2272,16 +2805,30 @@ impl Interpreter {
                 Op::GlobalBindingExists => {
                     let dst = instr.reg(0);
                     let name_idx = const_operand(function.operand(instr, 1))?;
-                    self.run_global_binding_exists_reg(context, stack, top_idx, dst, name_idx)?;
+                    (match self
+                        .run_global_binding_exists_reg(context, stack, top_idx, dst, name_idx)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::StoreGlobalChecked => {
                     let value_reg = instr.reg(0);
                     let name_idx = const_operand(function.operand(instr, 1))?;
                     let exists_reg = instr.reg(2);
-                    self.run_store_global_checked_reg(
+                    (match self.run_store_global_checked_reg(
                         context, stack, top_idx, value_reg, name_idx, exists_reg,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::Jump => {
@@ -2405,19 +2952,31 @@ impl Interpreter {
                 }
                 Op::Add => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_add_regs(stack, context, top_idx, dst, lhs, rhs, feedback)?;
+                    (match self.run_add_regs(stack, context, top_idx, dst, lhs, rhs, feedback) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::AddImm => {
                     let (dst, lhs) = (instr.reg(0), instr.reg(1));
                     let imm = instr.imm(2);
-                    self.run_add_imm(stack, context, top_idx, dst, lhs, imm, feedback)?;
+                    (match self.run_add_imm(stack, context, top_idx, dst, lhs, imm, feedback) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::SubImm => {
                     let (dst, lhs) = (instr.reg(0), instr.reg(1));
                     let imm = instr.imm(2);
-                    self.run_numeric_imm(
+                    (match self.run_numeric_imm(
                         stack,
                         context,
                         top_idx,
@@ -2427,13 +2986,19 @@ impl Interpreter {
                         number::sub,
                         bigint_sub_op,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::BitwiseAndImm => {
                     let (dst, lhs) = (instr.reg(0), instr.reg(1));
                     let imm = instr.imm(2);
-                    self.run_numeric_imm(
+                    (match self.run_numeric_imm(
                         stack,
                         context,
                         top_idx,
@@ -2443,13 +3008,26 @@ impl Interpreter {
                         number::bitwise_and,
                         bigint_and_op,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LessThanImm => {
                     let (dst, lhs) = (instr.reg(0), instr.reg(1));
                     let imm = instr.imm(2);
-                    self.run_less_than_imm(stack, context, top_idx, dst, lhs, imm, feedback)?;
+                    (match self.run_less_than_imm(stack, context, top_idx, dst, lhs, imm, feedback)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::EqualImm => {
@@ -2485,19 +3063,25 @@ impl Interpreter {
                     let operation = otter_bytecode::scalar_semantics::numeric_binary_semantics(op)
                         .expect("numeric dispatch group has shared semantics")
                         .operation;
-                    self.run_numeric_binary_regs(
+                    (match self.run_numeric_binary_regs(
                         stack,
                         context,
                         top_idx,
                         [dst, lhs, rhs],
                         operation,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::BitwiseAnd => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
+                    (match self.run_numeric_regs(
                         stack,
                         context,
                         top_idx,
@@ -2507,12 +3091,18 @@ impl Interpreter {
                         number::bitwise_and,
                         bigint_and_op,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::BitwiseOr => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
+                    (match self.run_numeric_regs(
                         stack,
                         context,
                         top_idx,
@@ -2522,12 +3112,18 @@ impl Interpreter {
                         number::bitwise_or,
                         bigint_or_op,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::BitwiseXor => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
+                    (match self.run_numeric_regs(
                         stack,
                         context,
                         top_idx,
@@ -2537,12 +3133,18 @@ impl Interpreter {
                         number::bitwise_xor,
                         bigint_xor_op,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::Shl => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
+                    (match self.run_numeric_regs(
                         stack,
                         context,
                         top_idx,
@@ -2552,12 +3154,18 @@ impl Interpreter {
                         number::shl,
                         bigint::ops::shl,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::Shr => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_numeric_regs(
+                    (match self.run_numeric_regs(
                         stack,
                         context,
                         top_idx,
@@ -2567,29 +3175,61 @@ impl Interpreter {
                         number::shr_arith,
                         bigint::ops::shr,
                         feedback,
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_compare_regs(stack, context, top_idx, dst, lhs, rhs, op, feedback)?;
+                    (match self
+                        .run_compare_regs(stack, context, top_idx, dst, lhs, rhs, op, feedback)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::Ushr => {
                     let (dst, lhs, rhs) = instr.reg3();
-                    self.run_ushr_regs(stack, context, top_idx, dst, lhs, rhs, feedback)?;
+                    (match self.run_ushr_regs(stack, context, top_idx, dst, lhs, rhs, feedback) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::Neg => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_neg_regs(stack, context, top_idx, dst, src, feedback)?;
+                    (match self.run_neg_regs(stack, context, top_idx, dst, src, feedback) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::BitwiseNot => {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
-                    self.run_bitwise_not_regs(stack, context, top_idx, dst, src)?;
+                    (match self.run_bitwise_not_regs(stack, context, top_idx, dst, src) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual | Op::SameValue => {
@@ -2614,26 +3254,44 @@ impl Interpreter {
                             feedback,
                         )?,
                         Op::LooseEqual => {
-                            self.run_loose_equal_regs(
+                            (match self.run_loose_equal_regs(
                                 stack, context, top_idx, dst, lhs, rhs, false, feedback,
-                            )?;
+                            ) {
+                                Ok(value) => value,
+                                Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                                Err(CommittedValueError::Fatal(error)) => {
+                                    return Ok(DispatchOutcome::Fatal(error));
+                                }
+                            });
                         }
                         Op::LooseNotEqual => {
-                            self.run_loose_equal_regs(
+                            (match self.run_loose_equal_regs(
                                 stack, context, top_idx, dst, lhs, rhs, true, feedback,
-                            )?;
+                            ) {
+                                Ok(value) => value,
+                                Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                                Err(CommittedValueError::Fatal(error)) => {
+                                    return Ok(DispatchOutcome::Fatal(error));
+                                }
+                            });
                         }
                         Op::SameValue => {
                             let lhs = *read_register(&stack[top_idx], lhs)?;
                             let rhs = *read_register(&stack[top_idx], rhs)?;
-                            let result = self.scalar_value(
+                            let result = match self.scalar_value(
                                 stack,
                                 context,
                                 crate::ScalarValueOp::SameValue,
                                 lhs,
                                 rhs,
                                 Value::undefined(),
-                            )?;
+                            ) {
+                                Ok(value) => value,
+                                Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                                Err(CommittedValueError::Fatal(error)) => {
+                                    return Ok(DispatchOutcome::Fatal(error));
+                                }
+                            };
                             let frame = &mut stack[top_idx];
                             write_register(frame, dst, result)?;
                             frame.advance_pc_fast();
@@ -2646,14 +3304,20 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::ArrayLength,
                         source,
                         Value::undefined(),
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -2663,14 +3327,20 @@ impl Interpreter {
                     let dst = instr.reg(0);
                     let src = instr.reg(1);
                     let source = *read_register(&stack[top_idx], src)?;
-                    let result = self.scalar_value(
+                    let result = match self.scalar_value(
                         stack,
                         context,
                         crate::ScalarValueOp::IsArray,
                         source,
                         Value::undefined(),
                         Value::undefined(),
-                    )?;
+                    ) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.advance_pc()?;
@@ -2708,27 +3378,57 @@ impl Interpreter {
                 }
                 Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
                     let operands = function.operand_view(instr);
-                    self.run_array_static_operands(op, context, stack, operands)?;
+                    match self.run_array_static_operands(op, context, stack, operands) {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
                     continue;
                 }
                 Op::ForInKeys => {
                     let operands = function.operand_view(instr);
-                    self.run_for_in_keys_operands(context, stack, operands)?;
+                    (match self.run_for_in_keys_operands(context, stack, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::CopyDataProperties => {
                     let operands = function.operand_view(instr);
-                    self.run_copy_data_properties_operands(context, stack, operands)?;
+                    (match self.run_copy_data_properties_operands(context, stack, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::StarReexport => {
                     let operands = function.operand_view(instr);
-                    self.run_star_reexport_operands(context, stack, operands)?;
+                    (match self.run_star_reexport_operands(context, stack, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::DefineOwnProperty => {
                     let operands = function.operand_view(instr);
-                    self.run_define_own_property_operands(context, stack, operands)?;
+                    (match self.run_define_own_property_operands(context, stack, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::QueueMicrotask => {
@@ -2744,17 +3444,37 @@ impl Interpreter {
                 }
                 Op::PromiseCall => {
                     let operands = function.operand_view(instr);
-                    self.run_promise_call_operands(context, stack, operands)?;
+                    match self.run_promise_call_operands(context, stack, operands) {
+                        Ok(()) => {}
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    }
                     continue;
                 }
                 Op::ImportNamespaceDynamic => {
                     let operands = function.operand_view(instr);
-                    self.run_import_namespace_dynamic_operands(context, stack, top_idx, operands)?;
+                    (match self
+                        .run_import_namespace_dynamic_operands(context, stack, top_idx, operands)
+                    {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
                 Op::BindFunction => {
                     let operands = function.operand_view(instr);
-                    self.drive_bind_function(stack, context, operands)?;
+                    (match self.drive_bind_function(stack, context, operands) {
+                        Ok(value) => value,
+                        Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                        Err(CommittedValueError::Fatal(error)) => {
+                            return Ok(DispatchOutcome::Fatal(error));
+                        }
+                    });
                     continue;
                 }
             }

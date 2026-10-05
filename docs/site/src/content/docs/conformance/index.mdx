@@ -5,14 +5,19 @@ tableOfContents: false
 
 import ConformanceDashboard from '../../../components/ConformanceDashboard.astro';
 
-Otter tracks its ECMAScript conformance against the official
-[tc39/test262](https://github.com/tc39/test262) suite. The dashboard
-below renders the latest merged full-corpus baseline: drill into any
-group to see per-section pass rates and the failing tests with their
-reasons. Each failing test links to its source in the pinned test262
-commit.
+Otter tracks ECMAScript conformance against the official
+[tc39/test262](https://github.com/tc39/test262) suite. Published data must retain
+one canonical result for every path in the pinned full corpus, including passes
+and typed skip reasons. The runner validates the exact path set, derived counts,
+actual executable digest and effective execution policy before publication.
+
+The earlier aggregate-only dashboard is unpublished because it omitted passing
+and skipped identities. Its historical counts remain in `ES_CONFORMANCE.md`;
+they are not a complete current report. Until a full current-format run is
+captured, the dashboard below explicitly reports that no baseline is published.
 
 <ConformanceDashboard
+  corpus="test262"
   dataPath="/conformance/data.json"
   commitField="test262_commit"
   repo="tc39/test262"
@@ -24,11 +29,11 @@ commit.
 ## Regenerating
 
 ```sh
-# Run the full corpus in crash-safe batches; refreshes the merged
+# Run the full corpus in isolated batches; refreshes the merged
 # baseline and this page's data automatically.
 bash scripts/test262-full-run.sh
 
-# Re-render from an existing baseline only.
+# Re-render a complete current-format baseline with the same runner binary.
 just test262-site
 ```
 
@@ -36,3 +41,12 @@ See `ES_CONFORMANCE.md` at the repository root for the measured
 baseline history and per-fix deltas, and the [Node.js
 conformance](/conformance/nodejs/) dashboard for the runtime-level
 baseline against `nodejs/node`.
+
+The JSON's sole per-test list is `tests`, containing the complete `TestResult`
+(path, esid, features, outcome and elapsed milliseconds). `totals` and
+`by_section` are validated derived summaries. Missing rows never mean pass;
+shard overlap, a skipped-identity swap, or a changed execution policy cannot
+hide behind unchanged totals. Skip reasons identify the configured feature,
+flag, ignored or known-panic pattern, source-size limit, missing frontmatter,
+or absent strictness variant. The Node.js dashboard uses its separate corpus
+contract rather than a second Test262 report format.

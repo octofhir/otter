@@ -24,6 +24,8 @@
 //! - Completing against an existing property preserves omitted
 //!   `[[Enumerable]]` / `[[Configurable]]` attributes across data/accessor
 //!   kind changes.
+//! - Converting a full accessor descriptor preserves both field presences;
+//!   an absent stored getter or setter becomes an explicitly present `undefined`.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-property-descriptor-specification-type>
@@ -380,7 +382,9 @@ impl PartialPropertyDescriptor {
     }
 
     /// Build a partial descriptor that fully describes `desc` (every
-    /// field is present). Used when converting a stored
+    /// field of its descriptor kind is present). Absent stored accessor slots
+    /// become explicitly present `undefined`, so an update clears the old slot.
+    /// Used when converting a stored
     /// [`PropertyDescriptor`] back to the user-facing form.
     #[must_use]
     pub fn from_full(desc: &PropertyDescriptor) -> Self {
@@ -396,8 +400,8 @@ impl PartialPropertyDescriptor {
             DescriptorKind::Accessor { getter, setter } => Self {
                 value: None,
                 writable: None,
-                get: *getter,
-                set: *setter,
+                get: Some(getter.unwrap_or(Value::undefined())),
+                set: Some(setter.unwrap_or(Value::undefined())),
                 enumerable: Some(desc.flags.enumerable()),
                 configurable: Some(desc.flags.configurable()),
             },
@@ -422,3 +426,6 @@ impl crate::pelt::PeltField for PartialPropertyDescriptor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

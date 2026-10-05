@@ -110,6 +110,113 @@ fn returned(result: NativeResultPair) -> u64 {
 }
 
 #[test]
+fn captured_splices_report_exact_nested_source_owners_and_budget_bytes() {
+    use otter_vm::jit::{JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee};
+    use otter_vm::{
+        JitCompilerDiagnostic, JitFunctionCode, JitInlineCallee, JitInlineLoweringOutcome,
+    };
+    use std::sync::Arc;
+
+    fn give_id(view: &mut JitCompileSnapshot, fid: u32) {
+        Arc::get_mut(&mut view.code_block).unwrap().id = fid;
+    }
+
+    fn offer(caller: &mut JitCompileSnapshot, body: Arc<JitCompileSnapshot>) {
+        caller.instructions[0].call_attempted = true;
+        caller.direct_callees.insert(
+            0,
+            vec![JitDirectCallee {
+                plan: JitDirectCallPlan {
+                    function_id: body.code_block.id,
+                    code_object_id: 1,
+                    entry_cell: 0,
+                    tier: NativeFrameKind::Baseline,
+                    this_mode: JitDirectCallThisMode::StrictOrLexical,
+                    is_derived_constructor: false,
+                    call_flags: 0,
+                    callee_cell: 0,
+                },
+                receiver_allocation: None,
+            }],
+        );
+        caller.inline_callees.insert(0, JitInlineCallee { body });
+    }
+
+    // The innermost body has no exits of its own: source attribution must
+    // come from accepted graph origins rather than deopt frame recipes.
+    let mut leaf = snapshot(0, 1, vec![(Op::ReturnUndefined, vec![])]);
+    give_id(&mut leaf, 91);
+    let leaf = Arc::new(leaf);
+    let mut middle = snapshot(
+        1,
+        2,
+        vec![
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ],
+    );
+    give_id(&mut middle, 92);
+    offer(&mut middle, leaf.clone());
+    let middle = Arc::new(middle);
+    let mut root = snapshot(
+        2,
+        3,
+        vec![
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ],
+    );
+    offer(&mut root, middle.clone());
+    let transitions = TransitionTable::resolve();
+    let disabled = super::compile_optimized(&root, 7002, &transitions, None, None, false)
+        .expect("nested graph without events");
+    assert!(disabled.diagnostics.is_empty());
+    assert_eq!(disabled.code.spliced_functions(), &[91, 92]);
+
+    let captured = super::compile_optimized(&root, 7003, &transitions, None, None, true)
+        .expect("nested graph with events");
+    assert_eq!(captured.code.spliced_functions(), &[91, 92]);
+    assert_eq!(
+        captured.diagnostics.as_ref(),
+        &[
+            JitCompilerDiagnostic::InlineLowered {
+                parent_function_id: 90,
+                instruction_pc: 0,
+                byte_pc: 0,
+                callee_function_id: 92,
+                depth: 1,
+                cost: middle.code_block.bytecode_byte_len(),
+                outcome: JitInlineLoweringOutcome::Inlined,
+            },
+            JitCompilerDiagnostic::InlineLowered {
+                parent_function_id: 92,
+                instruction_pc: 0,
+                byte_pc: 0,
+                callee_function_id: 91,
+                depth: 2,
+                cost: leaf.code_block.bytecode_byte_len(),
+                outcome: JitInlineLoweringOutcome::Inlined,
+            },
+        ]
+    );
+}
+
+#[test]
 fn int32_add_returns_boxed_sum() {
     let mut view = snapshot(
         2,
@@ -388,3 +495,6 @@ fn nested_loops_carry_values_through_both_headers() {
         compiled.allocation.edges
     );
 }
+
+#[path = "osr_tests.rs"]
+mod osr_tests;

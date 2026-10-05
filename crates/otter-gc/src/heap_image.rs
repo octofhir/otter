@@ -85,6 +85,9 @@ pub enum ImageError {
     },
     /// The cage could not supply the pages the image needs.
     OutOfMemory(OutOfMemory),
+    /// Accounted retained metadata/code could not be admitted. The original
+    /// resource class, requested bytes, usage and limit are preserved.
+    Resource(otter_resource::ResourceError),
     /// A live body carries foreign-owned content the opaque image cannot
     /// safely duplicate.
     ForeignPayloadNotCapturable {
@@ -112,6 +115,7 @@ impl std::fmt::Display for ImageError {
                 write!(f, "image body has unregistered type tag {type_tag:#04x}")
             }
             Self::OutOfMemory(err) => write!(f, "heap could not admit the image: {err}"),
+            Self::Resource(err) => write!(f, "retained snapshot admission failed: {err}"),
             Self::ForeignPayloadNotCapturable { type_name } => {
                 write!(
                     f,
@@ -127,6 +131,12 @@ impl std::error::Error for ImageError {}
 impl From<OutOfMemory> for ImageError {
     fn from(value: OutOfMemory) -> Self {
         Self::OutOfMemory(value)
+    }
+}
+
+impl From<otter_resource::ResourceError> for ImageError {
+    fn from(value: otter_resource::ResourceError) -> Self {
+        Self::Resource(value)
     }
 }
 

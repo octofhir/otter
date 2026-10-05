@@ -14,7 +14,7 @@
 //! - [`SharedSource`] and [`SharedSourceBuilder`] keep retained UTF-8 source
 //!   text inseparable from its exact byte charge.
 //! - [`ResourceSnapshot`] reports deterministic current and historical usage.
-//! - [`ResourceError`] distinguishes limit exhaustion from integer overflow.
+//! - [`ResourceError`] retains quota, overflow and actual allocator failures.
 //!
 //! # Invariants
 //! - Every reservation is charged atomically before it is returned to its

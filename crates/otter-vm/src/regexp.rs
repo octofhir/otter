@@ -635,14 +635,22 @@ impl JsRegExp {
     }
 
     /// `RegExp` exotic `[[PreventExtensions]]`.
-    pub fn prevent_extensions(&self, heap: &mut otter_gc::GcHeap) {
-        let expando = heap.with_payload(self.inner, |body| {
-            body.extensible = false;
-            body.expando
-        });
-        if let Some(expando) = expando {
-            crate::object::prevent_extensions(expando, heap);
+    pub fn prevent_extensions(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let mut owner = self.inner;
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the old-space shell's stationary handle remains rooted until
+        // the expando preparation succeeds and shell extensibility is committed.
+        unsafe {
+            roots.add_raw_slot(std::ptr::addr_of_mut!(owner).cast::<otter_gc::raw::RawGc>());
         }
+        if let Some(mut expando) = heap.read_payload(owner, |body| body.expando) {
+            crate::object::prevent_extensions(&mut expando, heap)?;
+        }
+        heap.with_payload(owner, |body| body.extensible = false);
+        Ok(())
     }
 
     /// Parsed flag bits.

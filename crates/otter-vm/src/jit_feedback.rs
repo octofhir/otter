@@ -29,10 +29,15 @@
 //!   execution never touches these cells.
 //! - The vector's feedback epoch advances once per material state transition,
 //!   never for an already-recorded observation. Every ordinary-call target
-//!   population transition invalidates stale compiled caller plans.
+//!   population transition invalidates stale compiled caller plans. Constructor
+//!   families generalize once from unseen to monomorphic to terminal unprepared;
+//!   alternating actual constructors cannot keep advancing that epoch.
 //! - The isolate's VM thread is the sole property-program writer and hot-path
 //!   reader. Structural mutation, immutable snapshots, and GC root tracing are
 //!   serialized by the slot; probes never borrow interpreter-global state.
+//! - Property attempts precede receiver classification and observable effects.
+//!   A hot accessor, proxy or throwing site without a cache program is never
+//!   mistaken for an unexecuted branch.
 //! - Property slots may retain traced transition shapes. No `Value`, context,
 //!   closure, or `this` crosses the CodeBlock boundary. Method distributions remain isolate-owned behind
 //!   [`crate::interp::MethodFeedbackDirectory`].
@@ -82,6 +87,11 @@ const ELEMENT_TYPED_BASE: u8 = 4;
 const ELEMENT_DENSE_HOLEY_FLOAT64: u8 = 13;
 const ELEMENT_MASK: u8 = 0b0000_1111;
 
+// ConstructorLayoutBody's checked identity allocator never issues u64::MAX.
+// Keep the single feedback word monotonic: zero is unseen/provisional, a real
+// identity is monomorphic, and this sentinel permanently declines a fit plan.
+const CONSTRUCT_FAMILY_UNPREPARED: u64 = u64::MAX;
+
 const CALL_ATTEMPTED_SEEN: u8 = 1 << 4;
 const BRANCH_TAKEN_SEEN: u8 = 1 << 5;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 6;
@@ -127,6 +137,9 @@ pub(crate) enum OrdinaryCallTarget {
     /// `%Function.prototype.call%` invoked with this bytecode function as
     /// its receiver: the function the call actually ran.
     FunctionPrototypeCall(u32),
+    /// Any NativeFunction reached through its live Host native kernel.
+    /// Kind-only feedback carries no callback identity or moving handle.
+    Native,
 }
 
 /// One observed call target and its saturating execution count.
@@ -149,6 +162,7 @@ pub(crate) enum CallSiteDistribution {
 pub(crate) enum PropertyFeedbackState {
     #[default]
     Empty,
+    Uncacheable,
     MonomorphicOwnData {
         shape_id: crate::object::ShapeId,
         slot: u16,
@@ -238,12 +252,14 @@ const CALL_DISTRIBUTION_MEGAMORPHIC: u8 = 3;
 const CALL_TARGET_BYTECODE: u8 = 0;
 const CALL_TARGET_STATIC_NATIVE: u8 = 1;
 const CALL_TARGET_FUNCTION_PROTOTYPE_CALL: u8 = 2;
+const CALL_TARGET_NATIVE: u8 = 3;
 
 const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
     match target {
         OrdinaryCallTarget::Bytecode(_) => CALL_TARGET_BYTECODE,
         OrdinaryCallTarget::StaticNative(_) => CALL_TARGET_STATIC_NATIVE,
         OrdinaryCallTarget::FunctionPrototypeCall(_) => CALL_TARGET_FUNCTION_PROTOTYPE_CALL,
+        OrdinaryCallTarget::Native => CALL_TARGET_NATIVE,
     }
 }
 
@@ -252,6 +268,7 @@ const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
         OrdinaryCallTarget::Bytecode(fid) => fid,
         OrdinaryCallTarget::StaticNative(stub_id) => stub_id,
         OrdinaryCallTarget::FunctionPrototypeCall(fid) => fid,
+        OrdinaryCallTarget::Native => 0,
     }
 }
 
@@ -271,6 +288,13 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
             OrdinaryCallTarget::StaticNative(payload)
         }
         CALL_TARGET_FUNCTION_PROTOTYPE_CALL => OrdinaryCallTarget::FunctionPrototypeCall(payload),
+        CALL_TARGET_NATIVE => {
+            debug_assert_eq!(
+                payload, 0,
+                "kind-only native feedback has no identity payload"
+            );
+            OrdinaryCallTarget::Native
+        }
         _ => unreachable!("invalid atomic call target kind"),
     };
     CallTargetCount {
@@ -289,6 +313,9 @@ struct AtomicCallFeedback {
     count: AtomicU8,
     kinds: [AtomicU8; PROFILED_CALL_TARGET_CAPACITY],
     targets: [AtomicU64; PROFILED_CALL_TARGET_CAPACITY],
+    /// Unseen/provisional zero, one finalized family, or terminal unprepared.
+    /// Distinct closure families sharing a body never replace each other.
+    construct_family: AtomicU64,
 }
 
 impl Default for AtomicCallFeedback {
@@ -299,6 +326,7 @@ impl Default for AtomicCallFeedback {
             count: AtomicU8::new(0),
             kinds: std::array::from_fn(|_| AtomicU8::new(CALL_TARGET_BYTECODE)),
             targets: std::array::from_fn(|_| AtomicU64::new(0)),
+            construct_family: AtomicU64::new(0),
         }
     }
 }
@@ -461,6 +489,26 @@ pub(crate) struct PropertyFeedbackSlot<'a> {
 }
 
 impl PropertyFeedbackSlot<'_> {
+    /// Record the first property dispatch, including unsupported and throwing
+    /// receivers. Repeated attempts touch no lock and leave the epoch unchanged.
+    pub(crate) fn record_attempt(self) -> bool {
+        if self.feedback.entry().attempted() {
+            return false;
+        }
+        let changed = self
+            .feedback
+            .with_entry_mut(PropertyIcEntry::record_attempt);
+        if changed {
+            self.vector.bump_epoch();
+        }
+        changed
+    }
+
+    #[must_use]
+    pub(crate) fn attempted(self) -> bool {
+        self.feedback.snapshot(PropertyIcEntry::attempted)
+    }
+
     #[must_use]
     pub(crate) fn snapshot_state(self) -> crate::inspect::IcSiteState {
         self.feedback.snapshot(|entry| match self.feedback.kind {
@@ -473,6 +521,7 @@ impl PropertyFeedbackSlot<'_> {
     pub(crate) fn state(self) -> PropertyFeedbackState {
         self.feedback.snapshot(|entry| match entry {
             PropertyIcEntry::Empty => PropertyFeedbackState::Empty,
+            PropertyIcEntry::Uncacheable => PropertyFeedbackState::Uncacheable,
             PropertyIcEntry::Megamorphic => PropertyFeedbackState::Megamorphic,
             PropertyIcEntry::Polymorphic { entries, .. } => match entries.as_slice() {
                 [stub] => {
@@ -500,6 +549,18 @@ impl PropertyFeedbackSlot<'_> {
     #[must_use]
     pub(crate) fn is_megamorphic(self) -> bool {
         self.feedback.entry().is_megamorphic()
+    }
+
+    /// Receiver programs installed so far: the entry count, which only grows,
+    /// or one past the cache's capacity once the site is megamorphic.
+    #[must_use]
+    pub(crate) fn population(self) -> u32 {
+        let entry = self.feedback.entry();
+        if entry.is_megamorphic() {
+            crate::tier_policy::PROFILED_PROPERTY_PIC_CAPACITY as u32 + 1
+        } else {
+            entry.entry_count() as u32
+        }
     }
 
     pub(crate) fn probe_load(
@@ -598,8 +659,13 @@ impl PropertyFeedbackSlot<'_> {
     }
 
     /// Copy every installed CacheIR program into owned compile metadata.
-    /// Returning `None` rejects the complete site when any installed program
-    /// contains an unsupported op or an unresolved shape token.
+    ///
+    /// A program naming a shape code may not embed (one no longer
+    /// registered) describes receivers generated code never specializes on;
+    /// it is dropped, and such a
+    /// receiver misses every remaining guard like any unseen shape. Returning
+    /// `None` rejects the complete site when an installed program contains an
+    /// unsupported op, or when no program remains.
     pub(crate) fn jit_programs(
         self,
         mut resolve_shape: impl FnMut(crate::object::ShapeId) -> Option<u32>,
@@ -609,13 +675,24 @@ impl PropertyFeedbackSlot<'_> {
     ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
         self.feedback.snapshot(|entry| {
             let stubs = entry.entries();
-            if stubs.is_empty() {
-                return None;
+            let mut programs = Vec::with_capacity(stubs.len());
+            for stub in stubs {
+                let mut unbakeable_shape = false;
+                let program = stub.snapshot_for_jit(
+                    |id| {
+                        let shape = resolve_shape(id);
+                        unbakeable_shape |= shape.is_none_or(|shape| shape == 0);
+                        shape
+                    },
+                    &mut resolve_validity,
+                );
+                match program {
+                    Some(program) => programs.push(program),
+                    None if unbakeable_shape => {}
+                    None => return None,
+                }
             }
-            stubs
-                .iter()
-                .map(|stub| stub.snapshot_for_jit(&mut resolve_shape, &mut resolve_validity))
-                .collect()
+            (!programs.is_empty()).then_some(programs)
         })
     }
 }
@@ -634,6 +711,11 @@ impl CallFeedbackSlot<'_> {
     #[must_use]
     pub(crate) fn distribution(self) -> Option<CallSiteDistribution> {
         self.feedback.snapshot()
+    }
+
+    pub(crate) fn construct_family(self) -> Option<u64> {
+        let identity = self.feedback.construct_family.load(Ordering::Acquire);
+        (identity != 0 && identity != CONSTRUCT_FAMILY_UNPREPARED).then_some(identity)
     }
 }
 
@@ -992,20 +1074,54 @@ impl FeedbackVector {
 
     /// Allocate dense cells plus bytecode-kind-selected out-of-line payloads.
     #[must_use]
-    pub(crate) fn for_instruction_ops(ops: impl IntoIterator<Item = Op>) -> Self {
-        let typed_slots: Box<[_]> = ops
-            .into_iter()
-            .map(TypedFeedbackSlot::for_op)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            cells: (0..typed_slots.len())
-                .map(|_| InstructionFeedback::default())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            typed_slots,
+    pub(crate) fn for_instruction_ops<I>(
+        ops: I,
+        lease: &mut otter_resource::ResourceLease,
+    ) -> Result<Self, otter_resource::ResourceError>
+    where
+        I: IntoIterator<Item = Op>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let ops = ops.into_iter();
+        let mut typed_slots = crate::executable::allocation::try_vec(ops.len(), lease)?;
+        typed_slots.extend(ops.map(TypedFeedbackSlot::for_op));
+        let mut cells = crate::executable::allocation::try_vec(typed_slots.len(), lease)?;
+        cells.resize_with(typed_slots.len(), InstructionFeedback::default);
+        Ok(Self {
+            cells: cells.into_boxed_slice(),
+            typed_slots: typed_slots.into_boxed_slice(),
             epoch: AtomicU32::new(0),
-        }
+        })
+    }
+
+    /// Physical requested geometry of a fresh opcode-selected feedback vector.
+    pub(crate) fn allocation_bytes(ops: impl IntoIterator<Item = Op>) -> u64 {
+        ops.into_iter().fold(0u64, |bytes, op| {
+            let payload = match op {
+                Op::LoadProperty | Op::StoreProperty | Op::StorePropertyStrict => {
+                    std::mem::size_of::<CodeBlockPropertyFeedback>()
+                }
+                Op::CallMethodValue => {
+                    std::mem::size_of::<CodeBlockPropertyFeedback>()
+                        + std::mem::size_of::<AtomicCallFeedback>()
+                }
+                Op::Call
+                | Op::TailCall
+                | Op::CallWithThis
+                | Op::CallForwardArguments
+                | Op::CallSpread
+                | Op::New
+                | Op::NewSpread
+                | Op::SuperConstruct
+                | Op::SuperConstructSpread => std::mem::size_of::<AtomicCallFeedback>(),
+                _ => 0,
+            };
+            bytes.saturating_add(
+                (std::mem::size_of::<InstructionFeedback>()
+                    + std::mem::size_of::<TypedFeedbackSlot>()
+                    + payload) as u64,
+            )
+        })
     }
 
     /// Read one canonical instruction cell.
@@ -1078,6 +1194,41 @@ impl FeedbackVector {
             self.bump_epoch();
         }
         transition
+    }
+
+    /// Observe one finalized actual family without cycling between closures.
+    ///
+    /// Initial provisional observations retain the unseen state. A first
+    /// finalized identity enables a guarded receiver plan; a different family
+    /// or a later provisional family permanently declines that specialization.
+    /// Already baked plans remain safe through their exact live family/root and
+    /// prototype guards. Only these two material transitions advance the epoch.
+    /// The scalar never keeps the family or its base code live. The noalloc
+    /// observation is not invoked for an absent or terminal exact source cell.
+    pub(crate) fn record_construct_family(&self, index: usize, observe: impl FnOnce() -> u64) {
+        let Some(slot) = self.call_slot(index) else {
+            return;
+        };
+        let current = slot.feedback.construct_family.load(Ordering::Acquire);
+        if current == CONSTRUCT_FAMILY_UNPREPARED {
+            return;
+        }
+        // The observation is borrowed for this synchronous noalloc operation;
+        // terminal feedback never needs to reread a live family payload.
+        let family = observe();
+        debug_assert_ne!(family, CONSTRUCT_FAMILY_UNPREPARED);
+        let next = match current {
+            0 if family == 0 => return,
+            0 => family,
+            identity if identity == family => return,
+            _ => CONSTRUCT_FAMILY_UNPREPARED,
+        };
+        // Executable feedback has one VM-thread writer. Publish the complete
+        // scalar state before advancing its owning vector's transition epoch.
+        slot.feedback
+            .construct_family
+            .store(next, Ordering::Release);
+        self.bump_epoch();
     }
 
     /// Current monotonic epoch of material feedback transitions.
@@ -1220,6 +1371,17 @@ impl<'a> InstructionFeedbackRecorder<'a> {
 mod tests {
     use super::*;
 
+    fn feedback_for(ops: impl IntoIterator<Item = Op>) -> FeedbackVector {
+        let ops: Vec<_> = ops.into_iter().collect();
+        let mut lease = otter_resource::ResourceAccount::default()
+            .reserve_exact(
+                otter_resource::ResourceClass::SourceModuleBytes,
+                FeedbackVector::allocation_bytes(ops.iter().copied()),
+            )
+            .expect("admit feedback fixture geometry");
+        FeedbackVector::for_instruction_ops(ops, &mut lease).expect("prepare feedback fixture")
+    }
+
     #[test]
     fn an_optimized_exit_widens_an_int32_site_but_keeps_it_numeric() {
         let site = ArithFeedback::from_bits(ARITH_INT32);
@@ -1336,7 +1498,7 @@ mod tests {
 
     #[test]
     fn call_attempt_advances_vector_epoch_once() {
-        let vector = FeedbackVector::for_instruction_ops([Op::Call]);
+        let vector = feedback_for([Op::Call]);
         let feedback = vector.recorder(0).expect("call feedback cell");
         assert!(feedback.record_call_attempted());
         assert_eq!(vector.epoch(), 1);
@@ -1346,7 +1508,7 @@ mod tests {
 
     #[test]
     fn vector_epoch_advances_once_per_material_transition() {
-        let vector = FeedbackVector::for_instruction_ops([Op::Call]);
+        let vector = feedback_for([Op::Call]);
         let feedback = vector.recorder(0).unwrap();
         assert_eq!(vector.epoch(), 0);
 
@@ -1389,7 +1551,7 @@ mod tests {
 
     #[test]
     fn fixed_super_construct_owns_call_feedback() {
-        let vector = FeedbackVector::for_instruction_ops([Op::SuperConstruct]);
+        let vector = feedback_for([Op::SuperConstruct]);
 
         assert_eq!(
             vector.record_call(0, OrdinaryCallTarget::Bytecode(17)),
@@ -1405,8 +1567,60 @@ mod tests {
     }
 
     #[test]
+    fn constructor_family_feedback_saturates_without_losing_initial_finalization() {
+        for op in [
+            Op::New,
+            Op::NewSpread,
+            Op::SuperConstruct,
+            Op::SuperConstructSpread,
+        ] {
+            let vector = feedback_for([op]);
+            for _ in 0..7 {
+                vector.record_construct_family(0, || 0);
+                assert_eq!(vector.epoch(), 0, "{op:?}: provisional sampling");
+                assert_eq!(vector.call_slot(0).unwrap().construct_family(), None);
+            }
+            vector.record_construct_family(0, || u64::MAX - 1);
+            assert_eq!(vector.epoch(), 1);
+            assert_eq!(
+                vector.call_slot(0).unwrap().construct_family(),
+                Some(u64::MAX - 1)
+            );
+            vector.record_construct_family(0, || u64::MAX - 1);
+            assert_eq!(vector.epoch(), 1);
+            vector.record_construct_family(0, || 17);
+            assert_eq!(vector.epoch(), 2);
+            assert_eq!(vector.call_slot(0).unwrap().construct_family(), None);
+            for family in [0, 17, 19, u64::MAX - 1, 0, 17] {
+                vector.record_construct_family(0, || {
+                    panic!("{op:?}: terminal cell must not observe family {family}")
+                });
+                assert_eq!(vector.epoch(), 2, "{op:?}: terminal fallback");
+                assert_eq!(vector.call_slot(0).unwrap().construct_family(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_provisional_family_after_a_prepared_family_declines_once() {
+        let vector = feedback_for([Op::New]);
+        vector.record_construct_family(0, || 41);
+        assert_eq!(vector.epoch(), 1);
+        vector.record_construct_family(0, || 0);
+        assert_eq!(vector.epoch(), 2);
+        assert_eq!(vector.call_slot(0).unwrap().construct_family(), None);
+        for family in [41, 0, 43, 41] {
+            vector.record_construct_family(0, || {
+                panic!("terminal provisional cell must not observe family {family}")
+            });
+            assert_eq!(vector.epoch(), 2);
+            assert_eq!(vector.call_slot(0).unwrap().construct_family(), None);
+        }
+    }
+
+    #[test]
     fn method_call_owns_function_call_target_feedback() {
-        let vector = FeedbackVector::for_instruction_ops([Op::CallMethodValue]);
+        let vector = feedback_for([Op::CallMethodValue]);
         assert!(vector.is_method_slot(0));
         assert!(vector.property_slot(0, PropertyIcKind::Load).is_some());
         assert_eq!(
@@ -1430,7 +1644,7 @@ mod tests {
     #[test]
     fn spread_call_family_owns_typed_call_feedback() {
         for op in [Op::CallSpread, Op::NewSpread, Op::SuperConstructSpread] {
-            let vector = FeedbackVector::for_instruction_ops([op]);
+            let vector = feedback_for([op]);
             assert_eq!(
                 vector.record_call(0, OrdinaryCallTarget::Bytecode(23)),
                 CallTargetTransition::BecameMonomorphic,
@@ -1458,12 +1672,13 @@ mod tests {
         use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
-        let mut obj = object::alloc_object_old_for_fixture(&mut heap).expect("object");
-        object::set(&mut obj, &mut heap, "x", Value::number_i32(1));
+        let obj = object::alloc_object_old_for_fixture(&mut heap).expect("object");
         let key = AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_global(1)), "x");
+        object::append_shaped_data_for_fixture(obj, &mut heap, key, Value::number_i32(1));
+        assert!(!object::is_dictionary(obj, &heap));
         let resolved = crate::cache_ir::resolve_atom_data_slot(obj, &heap, key).expect("load stub");
         let stub = CacheStub::from_resolved_load(object::shape_id(obj, &heap), &resolved);
-        let vector = FeedbackVector::for_instruction_ops([Op::LoadProperty]);
+        let vector = feedback_for([Op::LoadProperty]);
         let slot = vector
             .property_slot(0, PropertyIcKind::Load)
             .expect("typed property slot");
@@ -1476,7 +1691,7 @@ mod tests {
 
     #[test]
     fn has_property_owns_no_typed_property_feedback_slot() {
-        let vector = FeedbackVector::for_instruction_ops([Op::HasProperty]);
+        let vector = feedback_for([Op::HasProperty]);
 
         assert!(vector.property_slot(0, PropertyIcKind::Load).is_none());
         assert!(vector.property_slot(0, PropertyIcKind::Store).is_none());
@@ -1484,7 +1699,7 @@ mod tests {
 
     #[test]
     fn method_slot_owns_its_property_program() {
-        let vector = FeedbackVector::for_instruction_ops([Op::CallMethodValue]);
+        let vector = feedback_for([Op::CallMethodValue]);
         let slot = vector
             .property_slot(0, PropertyIcKind::Load)
             .expect("method load IC");
@@ -1493,8 +1708,27 @@ mod tests {
     }
 
     #[test]
+    fn uncacheable_property_attempt_advances_epoch_once_and_inspects_as_executed() {
+        let vector = feedback_for([Op::LoadProperty, Op::StorePropertyStrict]);
+        for (index, kind) in [(0, PropertyIcKind::Load), (1, PropertyIcKind::Store)] {
+            let slot = vector.property_slot(index, kind).expect("property slot");
+            assert!(!slot.attempted());
+            assert!(slot.record_attempt());
+            assert_eq!(vector.epoch(), index as u32 + 1);
+            assert_eq!(slot.state(), PropertyFeedbackState::Uncacheable);
+            assert_eq!(
+                slot.snapshot_state(),
+                crate::inspect::IcSiteState::Uncacheable
+            );
+            assert_eq!(slot.population(), 0);
+            assert!(!slot.record_attempt());
+            assert_eq!(vector.epoch(), index as u32 + 1);
+        }
+    }
+
+    #[test]
     fn property_slot_owns_state_counters_and_epoch_until_codeblock_drop() {
-        let vector = FeedbackVector::for_instruction_ops([Op::LoadProperty]);
+        let vector = feedback_for([Op::LoadProperty]);
         let slot = vector
             .property_slot(0, PropertyIcKind::Load)
             .expect("load property IC");
@@ -1524,8 +1758,7 @@ mod tests {
 
     #[test]
     fn strict_store_and_method_ops_receive_schema_typed_property_slots() {
-        let vector =
-            FeedbackVector::for_instruction_ops([Op::StorePropertyStrict, Op::CallMethodValue]);
+        let vector = feedback_for([Op::StorePropertyStrict, Op::CallMethodValue]);
         assert!(vector.property_slot(0, PropertyIcKind::Store).is_some());
         assert!(vector.property_slot(0, PropertyIcKind::Load).is_none());
         assert!(vector.property_slot(1, PropertyIcKind::Load).is_some());

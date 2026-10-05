@@ -5,8 +5,7 @@ R=benchmarks/results/validate; mkdir -p $R
 tag=${1:-store}
 bash scripts/dev/jitset.sh aarch64 ${LEVELS_A:-unset 16 4 1}
 bash scripts/dev/jitset.sh x86 ${LEVELS_X:-unset 16 4 1}
-cargo test -q -p otter-jit --lib machine 2>&1 | grep -E "test result|FAILED|panicked" | head
-cargo test -q -p otter-jit --target x86_64-apple-darwin --lib machine 2>&1 | grep -E "test result|FAILED|panicked" | head
+cargo test -q -p otter-jit --lib graph 2>&1 | grep -E "test result|FAILED|panicked" | head
 cargo build --release -q -p otter-test262 2>&1 | grep -v future | head -2
 cargo build --release -q --target x86_64-apple-darwin -p otter-test262 2>&1 | grep -v future | head -2
 for arch in native x86; do
@@ -20,7 +19,7 @@ for arch in native x86; do
 import json,sys;d=json.load(open('$R/t262-$tag-$arch-$n.json'));t=d['totals']
 bad=t['failed']+t['crashed']+t['timed_out']
 print('$arch $s', t)
-[print('  FAIL',f if isinstance(f,str) else f.get('path',f)) for f in d['failing_tests'][:10]]
+[print('  FAIL',f['path'],f['outcome']) for f in [r for r in d['tests'] if r['outcome']['kind'] not in ('pass','skipped')][:10]]
 "
   done
 done

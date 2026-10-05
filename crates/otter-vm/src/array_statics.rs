@@ -32,7 +32,7 @@
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::{NativeCtx, NativeError, Value, VmError};
+use crate::{NativeCtx, NativeError, Value};
 
 /// Static methods installed on the `Array` constructor.
 pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
@@ -95,7 +95,7 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         })?;
     ctx.with_turn_parts(|interp, stack| {
         let result = interp.array_of_sync(stack, &exec, this_value, args);
-        result.map_err(|e| vm_to_native_array_static(interp, "Array.of", e))
+        result.map_err(|e| e.into_native(interp, "Array.of"))
     })
 }
 
@@ -114,7 +114,7 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
         })?;
     ctx.with_turn_parts(|interp, stack| {
         let result = interp.array_from_sync(stack, &exec, this_value, args);
-        result.map_err(|e| vm_to_native_array_static(interp, "Array.from", e))
+        result.map_err(|error| error.into_native(interp, "Array.from"))
     })
 }
 
@@ -123,47 +123,4 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 /// answering with the promise for it.
 fn native_from_async(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     crate::array_from_async::native_from_async(ctx, args)
-}
-
-fn vm_to_native_array_static(
-    interp: &crate::Interpreter,
-    name: &'static str,
-    err: VmError,
-) -> NativeError {
-    match err {
-        VmError::Uncaught => {
-            let value: Box<str> = match interp.error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(v)) => v,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name,
-                message: value.into(),
-            }
-        }
-        VmError::TypeError => {
-            let message: Box<str> = match interp.error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::TypeError {
-                name,
-                reason: message.into(),
-            }
-        }
-        VmError::RangeError => {
-            let message: Box<str> = match interp.error_detail() {
-                Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::RangeError {
-                name,
-                reason: message.into(),
-            }
-        }
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
 }

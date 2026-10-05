@@ -29,6 +29,7 @@
 //!   configuration and resource account.
 //! - [`InterruptHandle`] — cooperative cancellation.
 //! - [`embedding`] — preferred owned orchestration API.
+//! - Owned default-off collection-service records through [`Runtime::start_gc_pause_capture`].
 //!
 //! # Runtime Session
 //! [`Runtime`] is the active runtime session owner. [`RuntimeBuilder`] captures
@@ -56,6 +57,10 @@
 //! - Loader, module-graph, source-map, diagnostics, and package-manager DTO
 //!   state are owned by the `Runtime` session; no hidden global resolver state
 //!   is used by the active runtime path.
+//! - Fresh runtime construction completes trusted realm and extension
+//!   installers before installing its configured JIT compiler. Restored
+//!   runtimes retain their existing compiler installation boundary, and later
+//!   realm creation uses the ready runtime's compiler.
 //! - JIT diagnostics cross the async boundary as owned report data, including
 //!   partial reports from abrupt completion; they contain no VM/GC handles.
 //! - Every live runtime retains one atomic role-specific lease set from its
@@ -69,19 +74,26 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 mod admission;
+mod checkpoint;
 mod commonjs;
 mod completion_admission;
+mod entry_file;
+mod timer_delivery;
+mod uncaught;
 pub use commonjs::{SCHEME_ONLY_BUILTINS, require_commonjs_dependency, run_builtin_cjs_shim};
 mod compile_cache;
 pub mod compiled_program;
 pub mod data_modules;
 pub mod diagnostics;
+mod dynamic_import_error;
 pub mod embedding;
 pub mod error;
 mod event_loop;
+mod gc_observation;
 pub mod handle;
 mod heap_config;
 pub mod hooks;
+mod hosted_completion;
 pub mod ipc;
 pub mod module_graph;
 pub mod module_loader;
@@ -94,9 +106,13 @@ mod process_events;
 mod process_execve;
 mod process_flags;
 mod process_ipc;
+mod process_lifecycle;
 mod realm;
 mod runtime_activity;
 mod runtime_snapshot;
+mod script_source;
+mod static_bootstrap;
+pub use static_bootstrap::ExtensionJs;
 pub mod structured_clone;
 pub mod surface;
 pub mod web_fetch_host;
@@ -140,6 +156,9 @@ pub use compiled_program::CompiledProgram;
 pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
 pub use error::{ConfigError, IoErrorKind, OtterError, RealmError};
 pub use event_loop::{RuntimeLiveness, TokioRuntimeHost};
+pub use gc_observation::{
+    GcPauseCapture, GcPauseKind, GcPauseOutcome, GcPauseRecord, GcPauseTrigger,
+};
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use heap_config::{
     MANAGED_HEAP_PAGE_BYTES, configured_managed_heap_bytes, initialize_managed_heap,
@@ -160,8 +179,11 @@ pub use otter_resource::{
     ResourceLimitsBuilder, ResourceReservation, ResourceSnapshot, ResourceSnapshotEntry,
     SharedSource, SharedSourceBuilder, SharedSourceError,
 };
+/// Canonical intrinsic Error class selector for scoped native allocation.
+pub use otter_vm::ErrorKind as RuntimeErrorKind;
 pub use otter_vm::{CodeEvictionStats, CpuProfile};
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
+pub use otter_vm::{EmbeddedCommonJs, NativeCtx, NativeError, Value, marshal};
 pub use otter_vm::{
     ExecutionContext as RuntimeExecutionContext, PersistentRootId as RuntimePersistentRootId,
 };
@@ -171,13 +193,12 @@ pub use otter_vm::{
     JitDebugCompileOutcome, JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget,
     JitDebugTier, JitDirectCallKind, JitDirectCallLoweringOutcome,
     JitDirectCallLoweringRejectionReason, JitDirectCallPlanOutcome, JitInlineRejectionReason,
-    array, object,
+    JitInstallDeclineReason, array, object,
 };
 pub use otter_vm::{
     JitRuntimeStats, WorkBudget, WorkBudgetExceededAction, WorkBudgetStats, WorkBudgetTelemetry,
 };
-pub use otter_vm::{NativeCtx, NativeError, Value, marshal};
-pub use process::node_platform;
+pub use process::{define_stdio_natives, node_platform};
 pub use realm::{RuntimeExtensionContext, RuntimeGlobalValue, RuntimeRealmContext, RuntimeRealmId};
 pub use runtime_snapshot::{RuntimeSnapshot, RuntimeSnapshotDiagnostics, SnapshotRuntimeOptions};
 // Embedder-driven event loop. `Runtime::install_timer_scheduler`,
@@ -211,8 +232,8 @@ pub use surface::{
     runtime_accessor, runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements,
     runtime_class, runtime_constant, runtime_constructor, runtime_getter, runtime_method,
     runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
-    runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
-    runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
+    runtime_optional_arg_to_string, runtime_property, runtime_string_value, runtime_this_object,
+    runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
 };
 pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
@@ -487,20 +508,6 @@ enum GlobalClassInner {
     },
 }
 
-/// One JS source attached to an [`Extension`], with the global names
-/// it defines (`js_defines` in the declaration). The names feed the
-/// native lazy-accessor registration; a drift between `defines` and
-/// the source's actual definitions is caught by the extension's
-/// def-scan test.
-#[derive(Debug, Clone, Copy)]
-pub struct ExtensionJs {
-    /// The JS source, evaluated in global scope on first touch of any
-    /// defined name.
-    pub source: &'static str,
-    /// Global names the source defines.
-    pub defines: &'static [&'static str],
-}
-
 /// A declared extension: native classes plus the JS half, installed
 /// as one unit. Built by `romp!`; consumed by
 /// [`RuntimeBuilder::extension`].
@@ -512,15 +519,15 @@ pub struct Extension {
     /// order (a subclass resolves its parent off the global, so
     /// parents precede children).
     pub classes: &'static [GlobalClass],
-    /// JS sources with their defined names. All sources of an
-    /// extension form one lazy group: first touch of any defined name
-    /// evaluates every source, in declaration order.
-    pub js: &'static [ExtensionJs],
+    /// One build-produced classic script, executed eagerly after native installers.
+    /// Constituent files share its top-level scope; separate extensions retain
+    /// declaration order. `None` declares no JS half.
+    pub js: Option<ExtensionJs>,
 }
 
 impl Extension {
     /// Every global name the JS half defines, in declaration order.
-    pub fn lazy_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+    pub fn defined_names(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.js
             .iter()
             .flat_map(|entry| entry.defines.iter().copied())
@@ -1001,7 +1008,8 @@ pub struct RuntimeExecutionStats {
     pub max_turn_nanos: u64,
     /// Compiled closure-inline validation transitions.
     pub jit_runtime_calls: u64,
-    /// Compiler-generated stack-frame calls that entered native callee code.
+    /// Counted Template stack-frame calls into native callee code.
+    /// The Graph backend records cold exits but omits entry accounting.
     pub jit_generated_calls: u64,
     /// Compiler-generated calls resumed through cold callee deoptimization.
     pub jit_generated_call_deopts: u64,
@@ -1015,13 +1023,16 @@ pub struct RuntimeExecutionStats {
     pub jit_generated_template_returns: u64,
     /// Generated template-tier callees that cold-deoptimized.
     pub jit_generated_template_deopts: u64,
-    /// Generated optimizing-tier callee entries.
+    /// Generated optimizing-tier callee entries. The current Graph backend
+    /// omits this accounting, so it reports zero.
     pub jit_generated_optimizing_entries: u64,
-    /// Generated optimizing-tier callees that returned normally.
+    /// Generated optimizing-tier returns derived from recorded entries.
+    /// The current Graph backend omits entries, so it reports zero.
     pub jit_generated_optimizing_returns: u64,
     /// Generated optimizing-tier callees that cold-deoptimized.
     pub jit_generated_optimizing_deopts: u64,
-    /// Optimizing-tier function and OSR entries.
+    /// Materialized interpreter-to-optimizing entry and OSR transfers.
+    /// Ordinary calls that select the compiled call ABI bypass this counter.
     pub jit_optimized_entries: u64,
     /// Optimizing-tier entries materialized at a hot loop header.
     pub jit_optimized_osr_entries: u64,
@@ -1780,11 +1791,20 @@ pub(crate) enum CommonJsRouting {
     Script,
 }
 
-/// The one eval/`new Function` compile path every isolate shares.
-/// The closure is reusable across calls; each invocation builds a
-/// fresh `BytecodeModule`.
-fn standard_eval_hook() -> otter_vm::EvalHook {
-    std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
+/// The one eval/`new Function`/CommonJS-wrapper compile path every isolate
+/// shares. The closure is reusable across calls; each invocation builds a
+/// fresh `BytecodeModule`, or admits a builtin's build-produced one.
+///
+/// A configured compile hook wins over embedded builtin bytecode, exactly as
+/// it does for build-produced bootstrap scripts: it receives the identical
+/// wrapper text under the builtin's URL.
+fn standard_eval_hook(
+    compile_hook: Option<std::sync::Arc<dyn RuntimeCompileHook>>,
+) -> otter_vm::EvalHook {
+    std::sync::Arc::new(move |source: &str, options: EvalCompileOptions| {
+        if let Some(unit) = options.embedded {
+            return embedded_commonjs_module(unit, compile_hook.as_deref());
+        }
         // §16.1.6 ScriptEvaluation — host-requested script
         // execution ($262.evalScript) compiles under script
         // GDI semantics, not eval semantics.
@@ -1797,27 +1817,33 @@ fn standard_eval_hook() -> otter_vm::EvalHook {
             .map(otter_vm::CompiledEvalSource::Fresh)
             .map_err(compile_error_message);
         }
-        // A builtin module body is identical on every launch: serve its
-        // verified compile from the cache, and publish a fresh one there.
-        let cache = options.cache_specifier.as_deref().and_then(|specifier| {
-            compile_cache::CompileCache::user_default().map(|cache| {
-                (
-                    cache,
-                    compile_cache::cache_key(source, SourceKind::JavaScript, specifier),
-                )
-            })
-        });
-        if let Some((cache, key)) = &cache
-            && let Some(bytecode) = cache.load(key)
-        {
-            return Ok(otter_vm::CompiledEvalSource::Verified(bytecode));
-        }
         let module = compile_eval_with_options(source, &options).map_err(compile_error_message)?;
-        if let Some((cache, key)) = &cache {
-            cache.store(key, &module);
-        }
         Ok(otter_vm::CompiledEvalSource::Fresh(module))
     })
+}
+
+/// A builtin CommonJS wrapper the product build compiled: the configured
+/// compiler's output for its exact text when a compile hook is installed,
+/// otherwise the embedded module after full verification.
+fn embedded_commonjs_module(
+    unit: &'static EmbeddedCommonJs,
+    compile_hook: Option<&dyn RuntimeCompileHook>,
+) -> Result<otter_vm::CompiledEvalSource, String> {
+    if let Some(hook) = compile_hook {
+        let source = module_loader::ResolvedSource {
+            url: unit.url.to_owned(),
+            kind: SourceKind::JavaScript,
+            jsx: None,
+            text: otter_resource::SharedSource::from_static(unit.source),
+        };
+        return hook
+            .compile(RuntimeCompileRequest { source: &source })
+            .map(|compiled| otter_vm::CompiledEvalSource::Fresh(compiled.bytecode))
+            .map_err(|error| error.to_string());
+    }
+    otter_bytecode::binary::decode_module(unit.bytecode)
+        .map(otter_vm::CompiledEvalSource::Verified)
+        .map_err(|error| format!("invalid embedded bytecode for '{}': {error}", unit.url))
 }
 
 /// Compile eval-goal `source` the way the VM's compile requests ask for it.
@@ -1917,7 +1943,9 @@ pub(crate) struct RuntimeConfig {
     console_sink: ConsoleSinkHandle,
     promise_rejection_hook: Option<PromiseRejectionHookHandle>,
     hooks: RuntimeHooks,
-    process_argv: Vec<String>,
+    /// Explicit process arguments; the installer materializes its default from
+    /// the one process snapshot only when this input is absent.
+    process_argv: Option<Vec<String>>,
     process_exec_argv: Vec<String>,
     process_cwd: PathBuf,
     process_env_overlay: std::collections::BTreeMap<String, String>,
@@ -2218,7 +2246,7 @@ impl Default for RuntimeConfig {
             console_sink: otter_vm::console::default_console_sink(),
             promise_rejection_hook: None,
             hooks: RuntimeHooks::default(),
-            process_argv: process::default_argv(),
+            process_argv: None,
             process_exec_argv: Vec::new(),
             process_cwd: process::default_cwd(),
             warning_options: WarningOptions::default(),
@@ -2255,51 +2283,6 @@ fn string_oom_to_error(err: otter_gc::OutOfMemory) -> OtterError {
     OtterError::OutOfMemory {
         requested_bytes: err.requested_bytes(),
         heap_limit_bytes: err.heap_limit_bytes(),
-    }
-}
-
-/// Map a CommonJS loader error into the runtime error type, rendering the
-/// carried context once at this outermost boundary (a thrown JS value is
-/// preserved intact through nested `require`s and only stringified here).
-fn commonjs_native_to_error(err: otter_vm::NativeError) -> OtterError {
-    // A module that fails to compile is a syntax error in that file, not a
-    // loader failure: report it under the code the CLI renders as one.
-    if let otter_vm::NativeError::SyntaxError { reason, .. } = err {
-        return OtterError::Internal {
-            code: DiagnosticCode::SyntaxError.as_str().to_string(),
-            message: reason,
-        };
-    }
-    // A JS value thrown out of the entry module is an uncaught exception —
-    // Node fails such a process with exit code 1, not an internal loader
-    // error. Only non-JS infrastructure failures stay internal.
-    let (message, uncaught) = match err {
-        otter_vm::NativeError::Thrown { message, .. } => (message, true),
-        otter_vm::NativeError::TypeError { reason, .. }
-        | otter_vm::NativeError::RangeError { reason, .. }
-        | otter_vm::NativeError::ReferenceError { reason, .. }
-        | otter_vm::NativeError::URIError { reason, .. } => (reason, true),
-        other => (other.to_string(), false),
-    };
-    if uncaught {
-        return OtterError::Runtime {
-            diagnostic: Box::new(Diagnostic {
-                kind: DiagnosticKind::Type,
-                code: DiagnosticCode::Uncaught.as_str().to_string(),
-                message,
-                source_url: None,
-                range: None,
-                span: None,
-                help: None,
-                frames: Vec::new(),
-                cause: None,
-                aggregated_errors: Vec::new(),
-            }),
-        };
-    }
-    OtterError::Internal {
-        code: "COMMONJS_LOAD".to_string(),
-        message,
     }
 }
 
@@ -2503,9 +2486,8 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Register a declared extension: its native classes install
-    /// eagerly (with their attached JS glue), and its JS half
-    /// registers as one native lazy-global group.
+    /// Register a declared extension. Native classes install eagerly; its
+    /// complete JS bundle runs after native/global installers, before class glue.
     #[must_use]
     pub fn extension(mut self, extension: &'static Extension) -> Self {
         self.config.extensions.push(extension);
@@ -2637,7 +2619,7 @@ impl RuntimeBuilder {
     /// Set the `process.argv` snapshot installed into the runtime.
     #[must_use]
     pub fn process_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.config.process_argv = argv.into_iter().map(Into::into).collect();
+        self.config.process_argv = Some(argv.into_iter().map(Into::into).collect());
         self
     }
 
@@ -2922,24 +2904,28 @@ impl Runtime {
         );
         let package_manager =
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
-        let mut interp = Interpreter::from_isolate_snapshot_capped(snapshot, config.max_heap_bytes)
-            .map_err(|err| match err {
-                otter_gc::ImageError::OutOfMemory(oom) => string_oom_to_error(oom),
-                other => OtterError::Internal {
-                    code: DiagnosticCode::IsolateStart.as_str().to_string(),
-                    message: format!("snapshot restore failed: {other}"),
-                },
-            })?;
+        let mut interp = Interpreter::from_isolate_snapshot_capped(
+            snapshot,
+            config.max_heap_bytes,
+            &config.resource_account,
+        )
+        .map_err(|err| match err {
+            otter_gc::ImageError::OutOfMemory(oom) => string_oom_to_error(oom),
+            otter_gc::ImageError::Resource(error) => OtterError::Resource { error },
+            other => OtterError::Internal {
+                code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                message: format!("snapshot restore failed: {other}"),
+            },
+        })?;
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
-        interp.set_resource_account(config.resource_account.clone())?;
         interp.set_console_sink(config.console_sink.clone());
         // A restored isolate runs no bootstrap, so its configured per-turn
         // policy is in force from the first instruction it executes.
         interp.set_work_budget(config.work_budget);
         // §19.4.1 / §20.2.1.1 — the eval hook is host machinery, not
         // heap state, so a restored isolate wires it fresh.
-        interp.set_eval_hook(Some(standard_eval_hook()));
+        interp.set_eval_hook(Some(standard_eval_hook(config.hooks.shared_compile_hook())));
         if let Some(hook) = config.promise_rejection_hook.clone() {
             interp.set_promise_rejection_hook(hook);
         }
@@ -2986,7 +2972,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             runtime_task_spawner,
             pending_exit_code: None,
-            worker_child_context: None,
+            worker_child_ready: false,
             admission_leases: None,
         })
     }
@@ -3019,7 +3005,7 @@ impl Runtime {
             RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
         // The interpreter owns both per-isolate heaps; the string and GC
         // allocators honor the configured cap.
-        let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes);
+        let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes)?;
         // Everything this build allocates — globals, prototypes, the objects
         // the bootstrap sources create — lives as long as the runtime does.
         // Allocating it young makes the first scavenges copy the whole set and
@@ -3037,29 +3023,52 @@ impl Runtime {
         // Attached class glue and extension JS are deferred until the
         // runtime is fully assembled: the sources reference globals
         // installed later in this build, and evaluation needs the
-        // compile pipeline. Both are evaluated at a top-level frame so
-        // every value they build is reachable from a scanned register —
-        // a native-nested `eval` (the former lazy-global getter) strands
-        // objects allocated mid-evaluation under GC pressure.
-        let (pending_class_js, pending_extension_js) =
-            interp.with_runtime_roots(
-                |interp| -> Result<
-                    (Vec<(&'static str, &'static str)>, Vec<(String, String)>),
-                    OtterError,
-                > {
-                    let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
-                    let mut pending_extension_js: Vec<(String, String)> = Vec::new();
-                    for spec in &config.global_classes {
+        // compile pipeline. Both run in top-level activations whose scanned
+        // registers retain every constructed value through collecting calls.
+        let (pending_class_js, pending_extension_js) = interp.with_runtime_roots(
+            |interp| -> Result<
+                (
+                    Vec<(&'static str, &'static str)>,
+                    Vec<(&'static str, ExtensionJs)>,
+                ),
+                OtterError,
+            > {
+                let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
+                let mut pending_extension_js: Vec<(&'static str, ExtensionJs)> = Vec::new();
+                for spec in &config.global_classes {
+                    match spec.inner {
+                        GlobalClassInner::Spec(raw) => {
+                            interp.install_global_class(raw).map_err(OtterError::from)?;
+                        }
+                        GlobalClassInner::Intrinsic {
+                            install,
+                            install_well_knowns,
+                            js_glue,
+                            name,
+                        } => {
+                            if let Some(source) = js_glue {
+                                pending_class_js.push((name, source));
+                            }
+                            let global = *interp.global_this();
+                            install(interp.gc_heap_mut(), global).map_err(OtterError::from)?;
+                            // Second phase, mirroring the bootstrap registry walk:
+                            // symbol-keyed members (@@toStringTag) resolve against
+                            // the realm's already-materialized well-known table.
+                            interp
+                                .run_install_well_knowns(install_well_knowns, global)
+                                .map_err(OtterError::from)?;
+                        }
+                    }
+                }
+                // Declared extensions: native classes ride the identical
+                // install path (declaration order, parents before subclasses),
+                // then its one classic-script bundle runs after native installers.
+                let extensions = config.extensions.clone();
+                for extension in extensions {
+                    for spec in extension.classes {
                         match spec.inner {
                             GlobalClassInner::Spec(raw) => {
-                                interp.install_global_class(raw).map_err(|err| {
-                                    OtterError::Internal {
-                                        code: DiagnosticCode::GlobalClassBootstrap
-                                            .as_str()
-                                            .to_string(),
-                                        message: err.to_string(),
-                                    }
-                                })?;
+                                interp.install_global_class(raw).map_err(OtterError::from)?;
                             }
                             GlobalClassInner::Intrinsic {
                                 install,
@@ -3071,145 +3080,58 @@ impl Runtime {
                                     pending_class_js.push((name, source));
                                 }
                                 let global = *interp.global_this();
-                                install(interp.gc_heap_mut(), global).map_err(|err| {
-                                    OtterError::Internal {
-                                        code: DiagnosticCode::GlobalClassBootstrap
-                                            .as_str()
-                                            .to_string(),
-                                        message: err.to_string(),
-                                    }
-                                })?;
-                                // Second phase, mirroring the bootstrap registry walk:
-                                // symbol-keyed members (@@toStringTag) resolve against
-                                // the realm's already-materialized well-known table.
+                                install(interp.gc_heap_mut(), global).map_err(OtterError::from)?;
                                 interp
                                     .run_install_well_knowns(install_well_knowns, global)
-                                    .map_err(|err| OtterError::Internal {
-                                        code: DiagnosticCode::GlobalClassBootstrap
-                                            .as_str()
-                                            .to_string(),
-                                        message: err.to_string(),
-                                    })?;
+                                    .map_err(OtterError::from)?;
                             }
                         }
                     }
-                    // Declared extensions: native classes ride the identical
-                    // install path (declaration order, parents before subclasses),
-                    // then every JS source of the extension registers as one lazy
-                    // group under its declared names.
-                    let extensions = config.extensions.clone();
-                    for extension in extensions {
-                        for spec in extension.classes {
-                            match spec.inner {
-                                GlobalClassInner::Spec(raw) => {
-                                    interp.install_global_class(raw).map_err(|err| {
-                                        OtterError::Internal {
-                                            code: DiagnosticCode::GlobalClassBootstrap
-                                                .as_str()
-                                                .to_string(),
-                                            message: err.to_string(),
-                                        }
-                                    })?;
-                                }
-                                GlobalClassInner::Intrinsic {
-                                    install,
-                                    install_well_knowns,
-                                    js_glue,
-                                    name,
-                                } => {
-                                    if let Some(source) = js_glue {
-                                        pending_class_js.push((name, source));
-                                    }
-                                    let global = *interp.global_this();
-                                    install(interp.gc_heap_mut(), global).map_err(|err| {
-                                        OtterError::Internal {
-                                            code: DiagnosticCode::GlobalClassBootstrap
-                                                .as_str()
-                                                .to_string(),
-                                            message: err.to_string(),
-                                        }
-                                    })?;
-                                    interp
-                                        .run_install_well_knowns(install_well_knowns, global)
-                                        .map_err(|err| OtterError::Internal {
-                                            code: DiagnosticCode::GlobalClassBootstrap
-                                                .as_str()
-                                                .to_string(),
-                                            message: err.to_string(),
-                                        })?;
-                                }
-                            }
-                        }
-                        if !extension.js.is_empty() {
-                            let mut source = String::new();
-                            for entry in extension.js {
-                                source.push_str(entry.source);
-                                // Guard against a source omitting its own
-                                // statement terminator.
-                                source.push_str("\n;\n");
-                            }
-                            pending_extension_js.push((extension.name.to_string(), source));
-                        }
+                    if let Some(script) = extension.js {
+                        pending_extension_js.push((extension.name, script));
                     }
-                    if config.install_process_global {
-                        process::install_global(
-                            &mut *interp,
-                            &config.process_argv,
-                            &config.process_exec_argv,
-                            &config.process_cwd,
-                            &config.process_env_overlay,
-                            &config.capabilities,
-                            &config.hooks,
-                            &config.warning_options,
-                            config.process_title.as_deref(),
-                            runtime_task_spawner.as_ref(),
-                            &std::sync::Arc::new(crate::commonjs::CjsConfig {
-                                capabilities: config.capabilities.clone(),
-                                hosted: config.hosted_modules.clone(),
-                                runtime_task_spawner: runtime_task_spawner.clone(),
-                                addon_loader: config.commonjs_addon_loader,
-                                report_watch_dependencies:
-                                    crate::commonjs::watch_reporting_requested(),
-                            }),
-                        )?;
-                    }
-                    if config.expose_gc {
-                        install_expose_gc_global(&mut *interp)?;
-                    }
-                    // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
-                    // `new Function(...)` reach a real parse + compile path.
-                    interp.set_eval_hook(Some(standard_eval_hook()));
-                    // Functions start in the interpreter and tier up through the
-                    // explicitly configured compiler policy.
-                    interp.set_jit_debug_request(config.jit_debug);
-                    match config.jit_selection {
-                        JitSelection::ProductionTiered => {
-                            interp.set_jit_compiler(Some(std::sync::Arc::new(
-                                otter_jit::OtterJitCompiler::production_tiered(),
-                            )));
-                        }
-                        JitSelection::Template => {
-                            interp.set_jit_compiler(Some(std::sync::Arc::new(
-                                otter_jit::OtterJitCompiler::template_only(),
-                            )));
-                        }
-                        JitSelection::InterpreterOnly => {}
-                    }
-                    if let Some(factory) = &config.tracer_factory {
-                        interp.set_tracer(Some(factory.build()));
-                    }
-                    if let Some(interval) = config.cpu_profile_interval {
-                        interp.enable_cpu_profiler(interval);
-                    }
-                    interp.set_dynamic_import_loader(std::sync::Arc::new(
-                        LayerADynamicImportLoader {
-                            queue: layer_a_dynamic_imports.clone(),
-                            completion_pool: completion_pool.clone(),
-                        },
-                    ));
-                    Ok((pending_class_js, pending_extension_js))
-                },
-            )?;
+                }
+                if config.install_process_global {
+                    process::install_global(
+                        &mut *interp,
+                        config.process_argv.as_deref(),
+                        &config.process_exec_argv,
+                        &config.process_cwd,
+                        &config.process_env_overlay,
+                        &config.capabilities,
+                        &config.hooks,
+                        &config.warning_options,
+                        config.process_title.as_deref(),
+                        runtime_task_spawner.as_ref(),
+                        &std::sync::Arc::new(crate::commonjs::CjsConfig {
+                            capabilities: config.capabilities.clone(),
+                            hosted: config.hosted_modules.clone(),
+                            runtime_task_spawner: runtime_task_spawner.clone(),
+                            addon_loader: config.commonjs_addon_loader,
+                            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
+                        }),
+                    )?;
+                }
+                if config.expose_gc {
+                    install_expose_gc_global(&mut *interp)?;
+                }
+                // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
+                // `new Function(...)` reach a real parse + compile path.
+                interp.set_eval_hook(Some(standard_eval_hook(config.hooks.shared_compile_hook())));
+                interp.set_jit_debug_request(config.jit_debug);
+                if let Some(factory) = &config.tracer_factory {
+                    interp.set_tracer(Some(factory.build()));
+                }
+                if let Some(interval) = config.cpu_profile_interval {
+                    interp.enable_cpu_profiler(interval);
+                }
+                interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
+                    queue: layer_a_dynamic_imports.clone(),
+                    completion_pool: completion_pool.clone(),
+                }));
+                Ok((pending_class_js, pending_extension_js))
+            },
+        )?;
         let enforce_direct_timeout = runtime_task_spawner.is_none();
         let mut runtime = Runtime {
             interp,
@@ -3225,7 +3147,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             runtime_task_spawner,
             pending_exit_code: None,
-            worker_child_context: None,
+            worker_child_ready: false,
             restored_from_snapshot: false,
             admission_leases: None,
         };
@@ -3251,18 +3173,30 @@ impl Runtime {
         // globals. Each source is a self-contained installer IIFE that
         // attaches to `globalThis`; evaluating here — at a top-level
         // frame — keeps every object it allocates rooted through GC.
-        for (name, source) in pending_extension_js {
-            runtime
-                .run_bootstrap_script(&name, source)
-                .map_err(|err| OtterError::Internal {
-                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                    message: format!("extension `{name}` globals failed: {err}"),
-                })?;
+        for (name, script) in pending_extension_js {
+            let start = std::time::Instant::now();
+            let specifier = format!("<bootstrap:{name}>");
+            let installed = static_bootstrap::prepare(
+                &mut runtime.interp,
+                &runtime.config.hooks,
+                &script,
+                &specifier,
+            )
+            .and_then(|(context, metadata)| {
+                runtime.source_maps.record_compiled_metadata(&metadata);
+                runtime
+                    .run_linked_script_outcome(context, start)
+                    .map(|_| ())
+            });
+            installed.map_err(|err| OtterError::Internal {
+                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                message: format!("extension `{name}` globals failed: {err}"),
+            })?;
         }
         // Co-located class glue: the JS half of a declared class
         // installs in the same build as its native half, in class
         // declaration order, after every installer above — so the glue
-        // can reference any global (including lazy ones) safely.
+        // can reference every installed extension global safely.
         for (name, source) in pending_class_js {
             runtime
                 .run_bootstrap_script(name, source)
@@ -3270,6 +3204,23 @@ impl Runtime {
                     code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
                     message: format!("class `{name}` attached JS glue failed: {err}"),
                 })?;
+        }
+        // Fresh construction runs trusted installers before the user execution
+        // tier policy is installed. Bootstrap therefore avoids compiler tier
+        // decisions; calls made after the runtime is returned use the
+        // configured compiler.
+        match runtime.config.jit_selection {
+            JitSelection::ProductionTiered => {
+                runtime.interp.set_jit_compiler(Some(std::sync::Arc::new(
+                    otter_jit::OtterJitCompiler::production_tiered(),
+                )));
+            }
+            JitSelection::Template => {
+                runtime.interp.set_jit_compiler(Some(std::sync::Arc::new(
+                    otter_jit::OtterJitCompiler::template_only(),
+                )));
+            }
+            JitSelection::InterpreterOnly => {}
         }
         // Bootstrap is over; user allocations go back through the nursery,
         // where most of them die.
@@ -3349,12 +3300,10 @@ pub struct Runtime {
     /// in-flight run with the code, exactly as an exit during entry
     /// evaluation does.
     pending_exit_code: Option<u8>,
-    /// Dispatch context of a JavaScript worker isolate's entry module,
-    /// retained after entry evaluation so later message tasks can run the
-    /// global `onmessage` handler. Isolate-local: it never crosses a `Send`
-    /// boundary — worker tasks reacquire it from `&mut Runtime` on the
-    /// isolate thread.
-    pub(crate) worker_child_context: Option<ExecutionContext>,
+    /// A worker entry completed successfully. FIFO child tasks consult this
+    /// readiness state; each later callback resolves its own function/source
+    /// owner instead of retaining the entry's executable chunk.
+    pub(crate) worker_child_ready: bool,
     /// Exact role charge. This field is last so every VM and host-owned
     /// resource is destroyed before the shared ledger releases the isolate,
     /// worker slot, and native stack bytes together.
@@ -3647,8 +3596,15 @@ impl Runtime {
     /// the runtime's owning thread when that event arrives. The job must never
     /// run on an executor worker: it may allocate, resolve persistent roots,
     /// and settle JavaScript promises in this isolate.
-    pub fn run_host_completion(&mut self, job: otter_vm::host_completion::HostCompletionJob) {
-        job.run(&mut self.interp);
+    pub fn run_host_completion(
+        &mut self,
+        job: otter_vm::host_completion::HostCompletionJob,
+    ) -> Result<(), OtterError> {
+        match job.run(&mut self.interp) {
+            Ok(()) => Ok(()),
+            Err(error) if self.absorb_termination(&error) => Ok(()),
+            Err(error) => Err(map_vm_error(error)),
+        }
     }
 
     /// Suppress a host completion after process exit while releasing any
@@ -3718,7 +3674,7 @@ impl Runtime {
                             detail: None,
                         })
                     })?;
-                if let Err(err) = self.interp.drain_microtasks_with_default(Some(context))
+                if let Err(err) = self.interp.drain_microtasks(|_, _| Ok(false))
                     && !self.absorb_termination(&err)
                 {
                     return Err(enrich_runtime_diagnostic_with_cause(
@@ -3751,7 +3707,7 @@ impl Runtime {
                 // completion; their settlement reactions settle the
                 // import token, and the same drain delivers the
                 // import promise's own reactions.
-                if let Err(err) = self.interp.drain_microtasks_with_default(Some(context))
+                if let Err(err) = self.interp.drain_microtasks(|_, _| Ok(false))
                     && !self.absorb_termination(&err)
                 {
                     return Err(enrich_runtime_diagnostic_with_cause(
@@ -3764,6 +3720,7 @@ impl Runtime {
             Ok(DynamicModuleLoad::FetchHttps { target_url }) => {
                 Ok(DynamicImportBegin::FetchHttps { target_url })
             }
+            Err(DynLoadError::Fatal(error)) => Err(error),
             Err(DynLoadError::Diagnostic { kind, message }) => self
                 .alloc_dynamic_import_error(kind, message)
                 .and_then(|value| self.settle_dynamic_import_result(token, Err(value)))
@@ -3780,7 +3737,7 @@ impl Runtime {
         &mut self,
         token: u64,
         target_url: &str,
-        linked: Result<module_graph::LinkedProgram, String>,
+        linked: Result<module_graph::LinkedProgram, module_graph::GraphError>,
     ) -> Result<bool, OtterError> {
         let Some(realm_id) = self.interp.dynamic_import_realm_id(token) else {
             return Ok(false);
@@ -3789,7 +3746,7 @@ impl Runtime {
             return self.complete_dynamic_import_prepared_in_extra_realm(token, target_url, linked);
         }
         match linked
-            .map_err(DynLoadError::type_error)
+            .map_err(|error| DynLoadError::from_graph_error(&error, error.to_string()))
             .and_then(|linked| self.evaluate_dynamic_linked_module(target_url, linked))
         {
             Ok(DynamicModuleLoad::Loaded(namespace)) => {
@@ -3817,7 +3774,7 @@ impl Runtime {
                         })
                     })?;
                 self.interp
-                    .drain_microtasks_with_default(Some(context))
+                    .drain_microtasks(|_, _| Ok(false))
                     .map_err(|error| {
                         enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(error))
                     })?;
@@ -3843,7 +3800,7 @@ impl Runtime {
                         })
                     })?;
                 self.interp
-                    .drain_microtasks_with_default(Some(context))
+                    .drain_microtasks(|_, _| Ok(false))
                     .map_err(|error| {
                         enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(error))
                     })?;
@@ -3853,6 +3810,7 @@ impl Runtime {
                 code: "DYNAMIC_IMPORT_PREPARED_FETCH".to_string(),
                 message: "prepared dynamic module requested a second entry fetch".to_string(),
             }),
+            Err(DynLoadError::Fatal(error)) => Err(error),
             Err(DynLoadError::Diagnostic { kind, message }) => {
                 let value = self.alloc_dynamic_import_error(kind, message)?;
                 self.settle_dynamic_import_result(token, Err(value))
@@ -3894,19 +3852,32 @@ impl Runtime {
         let cached = self
             .interp
             .with_dynamic_import_realm(token, |interp| {
-                if let Some(thrown) = interp.module_evaluation_error(&target_url) {
-                    return Ok(Some(Err(thrown)));
-                }
-                Ok(interp
-                    .get_or_create_module_namespace(&target_url)
-                    .map(|namespace| Ok(otter_vm::Value::object(namespace))))
+                let cached = if let Some(thrown) = interp.module_evaluation_error(&target_url) {
+                    Ok(Some(Err(thrown)))
+                } else {
+                    interp
+                        .get_or_create_module_namespace(&target_url)
+                        .map(|namespace| {
+                            namespace.map(|namespace| Ok(otter_vm::Value::object(namespace)))
+                        })
+                        .map_err(|error| {
+                            hosted_completion::into_runtime(interp, NativeError::from(error))
+                        })
+                };
+                Ok(cached)
             })
             .map_err(realm::map_realm_vm_error)?
+            .transpose()?
             .flatten();
         if let Some(outcome) = cached {
             return self
                 .settle_extra_realm_dynamic_import(token, outcome)
                 .map(|_| DynamicImportBegin::Settled);
+        }
+        if loader.is_hosted_url(&target_url) {
+            let linked = hosted_completion::prepare_dynamic_graph(&loader, &target_url);
+            self.complete_dynamic_import_prepared_in_extra_realm(token, &target_url, linked)?;
+            return Ok(DynamicImportBegin::Settled);
         }
         if module_loader::is_http_url(&target_url) {
             return Ok(DynamicImportBegin::FetchHttps { target_url });
@@ -3930,26 +3901,36 @@ impl Runtime {
         &mut self,
         token: u64,
         target_url: &str,
-        linked: Result<module_graph::LinkedProgram, String>,
+        linked: Result<module_graph::LinkedProgram, module_graph::GraphError>,
     ) -> Result<bool, OtterError> {
         let linked = match linked {
             Ok(linked) => linked,
-            Err(message) => {
-                return self.settle_extra_realm_dynamic_error(
-                    token,
-                    otter_vm::ErrorKind::TypeError,
-                    message,
-                );
+            Err(error) => {
+                return match DynLoadError::from_graph_error(&error, error.to_string()) {
+                    DynLoadError::Fatal(error) => Err(error),
+                    DynLoadError::Diagnostic { kind, message } => {
+                        self.settle_extra_realm_dynamic_error(token, kind, message)
+                    }
+                    DynLoadError::Thrown(value) => {
+                        self.settle_extra_realm_dynamic_import(token, Err(value))
+                    }
+                };
             }
         };
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
         let target_url = target_url.to_string();
+        let records = &mut self.module_records;
+        let config = &self.config;
+        let task_spawner = self.runtime_task_spawner.clone();
         self.interp
             .with_dynamic_import_realm(token, move |interp| {
                 Ok(evaluate_and_settle_dynamic_linked_module_on(
                     interp,
+                    records,
+                    config,
+                    task_spawner,
                     token,
                     &target_url,
                     linked,
@@ -3993,8 +3974,8 @@ impl Runtime {
         reaction_outcome: Result<otter_vm::Value, otter_vm::Value>,
     ) -> Result<bool, OtterError> {
         let settled_context = self.interp.settle_dynamic_import(token, reaction_outcome);
-        if let Some(context) = settled_context {
-            if let Err(err) = self.interp.drain_microtasks_with_default(Some(context))
+        if let Some(_context) = settled_context {
+            if let Err(err) = self.interp.drain_microtasks(|_, _| Ok(false))
                 && !self.absorb_termination(&err)
             {
                 return Err(enrich_runtime_diagnostic_with_cause(
@@ -4012,24 +3993,7 @@ impl Runtime {
         kind: otter_vm::ErrorKind,
         message: String,
     ) -> Result<otter_vm::Value, OtterError> {
-        let proto = self.interp.error_classes_for_trace().prototype(kind);
-        let proto_root = otter_vm::Value::object(proto);
-        let mut obj = self
-            .interp
-            .alloc_host_object_with_roots(&[&proto_root], &[])?;
-        otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
-        let message_str = otter_vm::JsString::from_str(&message, self.interp.gc_heap_mut())
-            .map_err(|err| OtterError::Internal {
-                code: DiagnosticCode::StringAlloc.as_str().to_string(),
-                message: err.to_string(),
-            })?;
-        otter_vm::object::set(
-            &mut obj,
-            self.interp.gc_heap_mut(),
-            "message",
-            otter_vm::Value::string(message_str),
-        );
-        Ok(otter_vm::Value::object(obj))
+        dynamic_import_error::allocate(&mut self.interp, kind, &message)
     }
 
     fn load_dynamic_module(
@@ -4056,7 +4020,13 @@ impl Runtime {
         // module record.
         if let Some(kind) = attr_type {
             let synthetic_url = format!("otter-attr-dynamic:{kind}:{target_url}");
-            if let Some(namespace) = self.interp.get_or_create_module_namespace(&synthetic_url) {
+            if let Some(namespace) = self
+                .interp
+                .get_or_create_module_namespace(&synthetic_url)
+                .map_err(|error| {
+                    hosted_completion::into_dynamic(&mut self.interp, NativeError::from(error))
+                })?
+            {
                 return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
                     namespace,
                 )));
@@ -4084,7 +4054,13 @@ impl Runtime {
                 )
             })?;
             let loaded = self.evaluate_dynamic_linked_module(&synthetic_url, linked)?;
-            let Some(namespace) = self.interp.get_or_create_module_namespace(&synthetic_url) else {
+            let Some(namespace) = self
+                .interp
+                .get_or_create_module_namespace(&synthetic_url)
+                .map_err(|error| {
+                    hosted_completion::into_dynamic(&mut self.interp, NativeError::from(error))
+                })?
+            else {
                 return Ok(loaded);
             };
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
@@ -4106,7 +4082,13 @@ impl Runtime {
                 target_url: target_url.clone(),
             });
         }
-        if let Some(namespace) = self.interp.get_or_create_module_namespace(&target_url) {
+        if let Some(namespace) = self
+            .interp
+            .get_or_create_module_namespace(&target_url)
+            .map_err(|error| {
+                hosted_completion::into_dynamic(&mut self.interp, NativeError::from(error))
+            })?
+        {
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
                 namespace,
             )));
@@ -4124,31 +4106,21 @@ impl Runtime {
         // export — which is exactly what a static `import` of it answers, and
         // that namespace is what the import resolves to.
         if loader.is_hosted_url(&target_url) {
-            let synthetic_url = format!("otter-hosted-dynamic:{target_url}");
-            let specifier_literal =
-                serde_json::to_string(&target_url).unwrap_or_else(|_| "\"\"".to_string());
-            let text = format!(
-                "import * as __otterHosted from {specifier_literal};\n\
-                 export default __otterHosted;\n"
-            );
-            let text = module_loader::admit_source(loader.resource_account(), &synthetic_url, text)
-                .map_err(module_graph::GraphError::Loader)
-                .map_err(|e| DynLoadError::from_graph_error(&e, &synthetic_url))?;
-            let entry = module_loader::ResolvedSource {
-                url: synthetic_url.clone(),
-                kind: SourceKind::JavaScript,
-                jsx: None,
-                text,
-            };
-            let linked = module_graph::load_program_source(&loader, entry).map_err(|e| {
-                DynLoadError::from_graph_error(
-                    &e,
-                    format!("dynamic import: load failed for \"{target_url}\": {e:?}"),
-                )
-            })?;
-            let loaded = self.evaluate_dynamic_linked_module(&synthetic_url, linked)?;
-            let Some(namespace) = self.interp.get_or_create_module_namespace(&target_url) else {
-                return Ok(loaded);
+            let linked = hosted_completion::prepare_dynamic_graph(&loader, &target_url)
+                .map_err(|error| DynLoadError::from_graph_error(&error, error.to_string()))?;
+            let entry_url = linked.entry_url.clone();
+            self.evaluate_dynamic_linked_module(&entry_url, linked)?;
+            let Some(namespace) = self
+                .interp
+                .get_or_create_module_namespace(&target_url)
+                .map_err(|error| {
+                    hosted_completion::into_dynamic(&mut self.interp, NativeError::from(error))
+                })?
+            else {
+                return Err(hosted_completion::into_dynamic(
+                    &mut self.interp,
+                    NativeError::InvalidOperand,
+                ));
             };
             return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
                 namespace,
@@ -4196,32 +4168,30 @@ impl Runtime {
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
-        self.register_resolved_exports(&linked.metadata);
-        self.register_module_sources(&linked.module_sources);
+        let sources = otter_vm::source_registry::SourceRegistry::new(
+            linked.module_sources.clone(),
+            &self.config.resource_account,
+        );
+        let sources =
+            sources.map_err(|error| DynLoadError::Fatal(OtterError::Resource { error }))?;
         let context = self
             .interp
-            .link_evictable_module(linked.module)
-            .map_err(|error| {
-                DynLoadError::type_error(format!(
-                    "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
-                ))
-            })?;
+            .link_evictable_module(linked.module, sources)
+            .map_err(|error| DynLoadError::Fatal(OtterError::from(error)))?;
         // Hosted builtins in this batch get their real namespaces (running
         // their installers when needed); plain modules get fresh
         // environments — the same records pipeline the static loader uses.
         self.module_records
             .allocate_for_module_inits(
                 &mut self.interp,
-                context.module_inits(),
+                &context,
                 &self.config.hosted_modules,
                 &self.config.capabilities,
                 self.runtime_task_spawner.clone(),
             )
-            .map_err(|e| {
-                DynLoadError::type_error(format!("dynamic import: alloc env failed: {e}"))
-            })?;
-        self.module_records
-            .retain_linked_context(self.interp.active_host_realm_id(), &context);
+            .map_err(|error| hosted_completion::into_dynamic(&mut self.interp, error))?;
+        self.register_resolved_exports(&linked.metadata);
+        self.report_watch_imports(&linked.module_sources);
         // §13.3.10 step 7 — Evaluate(target): the records-backed
         // InnerModuleEvaluation walks the target's eager dependency
         // closure, parking on top-level await instead of blocking.
@@ -4240,7 +4210,14 @@ impl Runtime {
                 });
             }
             Ok(None) => {}
-            Err(err) => {
+            Err(failure) => {
+                // This module evaluation has completed. A terminal engine or
+                // escaping allocation failure leaves through the existing
+                // runtime mapper with its exact owned detail/source frames.
+                if failure.is_fatal() {
+                    return Err(DynLoadError::Fatal(map_vm_error(failure)));
+                }
+                let err = failure.error;
                 // §16.2.1.7 step 7.b.i — an evaluation throw maps
                 // to a promise rejection. Prefer the original
                 // thrown Value (preserved on
@@ -4262,10 +4239,11 @@ impl Runtime {
         let namespace = self
             .interp
             .get_or_create_module_namespace(target_url)
+            .map_err(|error| {
+                hosted_completion::into_dynamic(&mut self.interp, NativeError::from(error))
+            })?
             .ok_or_else(|| {
-                DynLoadError::type_error(format!(
-                    "dynamic import: namespace missing after load: \"{target_url}\""
-                ))
+                hosted_completion::into_dynamic(&mut self.interp, NativeError::InvalidOperand)
             })?;
         Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
             namespace,
@@ -4279,8 +4257,14 @@ impl Runtime {
     /// global. Embedders call this from the runner thread before re-entering
     /// script execution; async native results instead materialize through the
     /// typed host-completion protocol.
-    pub fn set_global(&mut self, name: &str, value: otter_vm::Value) {
-        self.interp.set_global(name, value);
+    pub fn set_global(&mut self, name: &str, value: otter_vm::Value) -> Result<(), OtterError> {
+        self.interp.set_global(name, value).map_err(|error| {
+            map_vm_error(otter_vm::RunError {
+                error,
+                frames: Vec::new(),
+                detail: None,
+            })
+        })
     }
 
     /// Define `value[Symbol.toStringTag]` as a non-enumerable host tag.
@@ -4293,29 +4277,9 @@ impl Runtime {
         value: otter_vm::Value,
         tag: &str,
     ) -> Result<(), OtterError> {
-        let Some(mut obj) = value.as_object() else {
-            return Ok(());
-        };
-        let tag_value = otter_vm::JsString::from_str(tag, self.interp.gc_heap_mut())
-            .map(otter_vm::Value::string)
-            .map_err(string_oom_to_error)?;
-        let tag_sym = self
-            .interp
-            .well_known_symbols()
-            .get(otter_vm::symbol::WellKnown::ToStringTag);
-        otter_vm::object::define_own_symbol_property_partial(
-            &mut obj,
-            self.interp.gc_heap_mut(),
-            tag_sym,
-            otter_vm::object::PartialPropertyDescriptor {
-                value: Some(tag_value),
-                writable: Some(false),
-                enumerable: Some(false),
-                configurable: Some(true),
-                ..Default::default()
-            },
-        );
-        Ok(())
+        self.interp
+            .define_to_string_tag(value, tag)
+            .map_err(OtterError::from)
     }
 
     pub(crate) fn global_this_value(&self) -> otter_vm::Value {
@@ -4358,7 +4322,7 @@ impl Runtime {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
-        self.interp.set_global(name, value);
+        self.set_global(name, value)?;
         Ok(())
     }
 
@@ -4386,7 +4350,7 @@ impl Runtime {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
-        self.interp.set_global(name, value);
+        self.set_global(name, value)?;
         Ok(())
     }
 
@@ -4403,13 +4367,12 @@ impl Runtime {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
-        self.interp.set_global(name, value);
+        self.set_global(name, value)?;
         Ok(())
     }
 
     pub(crate) fn dispatch_worker_message_event<F>(
         &mut self,
-        context: &ExecutionContext,
         materialize_data: F,
     ) -> Result<(), MessageEventDispatchError>
     where
@@ -4420,7 +4383,7 @@ impl Runtime {
         otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::call(global_value),
-            Some(context),
+            None,
             |ctx| {
                 let global = ctx
                     .this_value()
@@ -4472,24 +4435,32 @@ impl Runtime {
                         .set(event, "data", data)
                         .map_err(map_native_error)
                         .map_err(MessageEventDispatchError::Materialize)?;
-                    scope
-                        .call(handler, global, &[event])
-                        .map_err(map_native_error)
-                        .map_err(MessageEventDispatchError::Handler)?;
-                    Ok(())
+                    // Preserve the actual callback's typed result until the
+                    // scope releases its arena. The pending throw is already
+                    // rooted by the interpreter; projection below transfers
+                    // its defining-source frames and detail exactly once.
+                    Ok(scope.call(handler, global, &[event]).map(|_| ()))
                 });
 
                 ctx.persistent_root_remove(data_root);
                 ctx.persistent_root_remove(handler_root);
-                dispatch
+                match dispatch {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(MessageEventDispatchError::Handler(map_vm_error(
+                        ctx.take_native_error(error),
+                    ))),
+                    Err(error) => Err(error),
+                }
             },
         )?;
-        self.interp.drain_microtasks(context).map_err(|err| {
-            MessageEventDispatchError::Handler(enrich_runtime_diagnostic_with_cause(
-                &mut self.interp,
-                map_vm_error(err),
-            ))
-        })
+        self.interp
+            .drain_microtasks(|_, _| Ok(false))
+            .map_err(|err| {
+                MessageEventDispatchError::Handler(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(err),
+                ))
+            })
     }
 
     /// Run one host event on the isolate thread through a fresh native context.
@@ -4510,12 +4481,14 @@ impl Runtime {
         F: FnOnce(&mut otter_vm::NativeCtx<'_>) -> Result<otter_vm::Value, otter_vm::NativeError>,
     {
         let context = context.clone();
-        self.with_direct_timeout(move |runtime| runtime.run_native_event_unbounded(&context, run))
+        self.with_direct_timeout(move |runtime| {
+            runtime.run_native_event_unbounded(Some(&context), run)
+        })
     }
 
     fn run_native_event_unbounded<F>(
         &mut self,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         run: F,
     ) -> Result<(), OtterError>
     where
@@ -4526,15 +4499,21 @@ impl Runtime {
         let result_root = match otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::call(global_value),
-            Some(context),
+            context,
             |ctx| run(ctx).map(|value| ctx.persistent_root_insert(value)),
         ) {
             Ok(root) => Some(root),
-            Err(otter_vm::NativeError::Exit { code }) => {
-                // An exit requested inside the delivered callback is not an
-                // exception — record it for the runner and end the event.
-                self.pending_exit_code = Some(code);
+            Err(error) if error.exit_code().is_some() => {
+                // Both direct and imported VM exits retain their exact code
+                // after the callback's realm and scoped roots have restored.
+                self.pending_exit_code = error.exit_code();
                 return Ok(());
+            }
+            Err(error)
+                if error.is_fatal()
+                    || matches!(error, otter_vm::NativeError::OutOfMemory { .. }) =>
+            {
+                return Err(map_native_error(error));
             }
             Err(error) => {
                 // A native event delivery that throws is an uncaught error
@@ -4548,7 +4527,7 @@ impl Runtime {
                 }
             }
         };
-        let drain = match self.drain_microtasks_dispatching_uncaught(context) {
+        let drain = match self.drain_microtasks_dispatching_uncaught() {
             Ok(()) => Ok(()),
             Err(err) => {
                 if let otter_vm::VmError::Exit { code } = err.error {
@@ -4678,53 +4657,29 @@ impl Runtime {
         if !repeat && immediate {
             self.interp.timer_callbacks_mut().remove(token);
         }
-        let context = entry.context.clone();
-        // The callback runs in the context that scheduled it, and the ambient
-        // one is restored afterwards.
-        let ambient_async_context = self.interp.async_context();
-        self.interp.set_async_context(entry.async_context);
-        let mut args: smallvec::SmallVec<[otter_vm::Value; 8]> =
-            smallvec::SmallVec::with_capacity(entry.extra_args.len());
-        args.extend(entry.extra_args);
-        let called = self.interp.run_callable_sync(
-            &context,
-            &entry.callback,
-            otter_vm::Value::undefined(),
-            args,
-        );
+        // Entry values are rooted by timer_delivery before any callback or
+        // handler can collect. The existing realm swap encloses the entire
+        // callback/report extent and restores the caller realm on all outcomes.
+        let delivered = self.interp.with_host_realm_id(entry.realm_id, |interp| {
+            Ok(timer_delivery::invoke(interp, &entry))
+        });
         if !repeat && !immediate {
             self.interp.timer_callbacks_mut().remove(token);
         }
-        if let Err(error) = called {
-            // An exit requested inside the callback is not an exception —
-            // record it for the runner and end the fire cleanly.
-            if let otter_vm::VmError::Exit { code } = error {
-                self.interp.set_async_context(ambient_async_context);
-                self.pending_exit_code = Some(code);
-                return Ok(TimerFireOutcome::Fired { repeat });
+        match delivered {
+            Err(error) => return Err(map_vm_error(otter_vm::RunError::bare(error))),
+            Ok(Err(error)) => {
+                if let Some(code) = error.exit_code() {
+                    self.pending_exit_code = Some(code);
+                    return Ok(TimerFireOutcome::Fired { repeat });
+                }
+                return Err(map_native_error(error));
             }
-            // A timer callback that throws is an uncaught error like any
-            // other: `process` and any active domain get first refusal before
-            // it becomes the embedder's problem.
-            // The dispatch runs before the ambient context is restored: an
-            // active domain lives in the callback's own context, and it is the
-            // one that must see the error.
-            let handled = self.dispatch_uncaught_exception(&context);
-            self.interp.set_async_context(ambient_async_context);
-            if !handled? {
-                let detail = self.interp.take_error_detail();
-                return Err(map_vm_error(otter_vm::RunError {
-                    error,
-                    frames: Vec::new(),
-                    detail,
-                }));
-            }
-        } else {
-            self.interp.set_async_context(ambient_async_context);
+            Ok(Ok(())) => {}
         }
         // The drain offers an uncaught task throw to `process` and any active
         // domain exactly as the callback's own throw above was offered.
-        let outcome = self.drain_microtasks_dispatching_uncaught(&context);
+        let outcome = self.drain_microtasks_dispatching_uncaught();
         match outcome {
             Ok(()) => Ok(TimerFireOutcome::Fired { repeat }),
             Err(err) => {
@@ -5221,9 +5176,15 @@ impl Runtime {
     pub fn drive_pending_atomic_waits(&mut self, budget: Duration) -> Result<bool, OtterError> {
         let started = std::time::Instant::now();
         loop {
-            let (settled, pending) = self.interp.poll_async_atomic_waits();
+            let (settled, pending) = self.interp.poll_async_atomic_waits().map_err(|error| {
+                map_vm_error(otter_vm::RunError {
+                    error,
+                    frames: Vec::new(),
+                    detail: self.interp.take_error_detail(),
+                })
+            })?;
             if settled > 0 {
-                if let Err(err) = self.interp.drain_microtasks_with_default(None)
+                if let Err(err) = self.interp.drain_microtasks(|_, _| Ok(false))
                     && !self.absorb_termination(&err)
                 {
                     return Err(enrich_runtime_diagnostic_with_cause(
@@ -5307,37 +5268,18 @@ impl Runtime {
         specifier: &str,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let start = std::time::Instant::now();
-        let mut compiled = self.compile_source(&source, specifier)?;
-        // A classic script is its own single "module" as far as frames go.
-        // The module linker stamps each function with the URL it came from;
-        // a script has no linker, and a frame with no URL of its own reads
-        // as belonging to whichever module happens to be executing when the
-        // stack is captured. Stamp the specifier, and register the source
-        // under it so those frames resolve to a line and column at all.
-        for function in &mut compiled.bytecode.functions {
-            if function.module_url.is_empty() {
-                function.module_url = specifier.to_string();
-            }
-        }
-        if let Err(error) = self
-            .interp
-            .register_module_source_owned(specifier.to_string(), source.text.clone())
-        {
-            return Err(module_loader::LoaderError::Load {
-                url: specifier.to_string(),
-                message: format!("source admission failed: {error}"),
-            }
-            .into_otter_error());
-        }
-        self.run_compiled_script_with_context_since(compiled.bytecode, start)
+        let compiled = self.compile_source(&source, specifier)?;
+        let (module, sources) = self.prepare_script_source(compiled.bytecode, source, specifier)?;
+        self.run_compiled_script_with_context_since(module, sources, start)
     }
 
     fn run_compiled_script_with_context_since(
         &mut self,
         module: BytecodeModule,
+        sources: otter_vm::source_registry::SourceRegistry,
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let context = self.interp.link_module(module)?;
+        let context = self.interp.link_module(module, sources)?;
         self.run_linked_script_with_context_since(context, start)
     }
 
@@ -5355,11 +5297,12 @@ impl Runtime {
     fn run_bootstrap_module(
         &mut self,
         module: Result<otter_bytecode::VerifiedBytecodeModule, BytecodeModule>,
+        sources: otter_vm::source_registry::SourceRegistry,
         start: std::time::Instant,
     ) -> Result<ExecutionResult, OtterError> {
         let context = match module {
-            Ok(verified) => self.interp.link_verified_module(verified)?,
-            Err(module) => self.interp.link_module(module)?,
+            Ok(verified) => self.interp.link_verified_module(verified, sources)?,
+            Err(module) => self.interp.link_module(module, sources)?,
         };
         self.run_linked_script_outcome(context, start)
             .map(|(result, _context)| result)
@@ -5370,10 +5313,8 @@ impl Runtime {
         context: ExecutionContext,
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        // Run the script first; the script error wins if both the
-        // script and the drain fail. On script success we still
-        // drain so any `queueMicrotask` registered during script
-        // execution gets a chance to run before we report success.
+        // Catchable script failure still reaches the checkpoint. A structural
+        // or control failure returns unchanged without executing queued work.
         let script_outcome = self.interp.run(&context);
         // The checkpoint and the import pump both allocate in the moving young
         // generation, so the completion cannot wait in a plain local.
@@ -5381,7 +5322,9 @@ impl Runtime {
             .as_ref()
             .ok()
             .map(|value| self.interp.persistent_root_insert(*value));
-        let drain_outcome = self.drain_microtasks_dispatching_uncaught(&context);
+        let drain_outcome = checkpoint::after_script(&script_outcome, || {
+            self.drain_microtasks_dispatching_uncaught()
+        });
         let release_root = |interp: &mut otter_vm::Interpreter| {
             completion_root.and_then(|root| interp.persistent_root_remove(root))
         };
@@ -5419,7 +5362,7 @@ impl Runtime {
             }
             (Ok(_), Ok(())) => {}
         }
-        if let Err(error) = self.pump_layer_a_dynamic_imports(&context) {
+        if let Err(error) = self.pump_layer_a_dynamic_imports() {
             release_root(&mut self.interp);
             return Err(error);
         }
@@ -5435,12 +5378,10 @@ impl Runtime {
     /// queued `import()` request, load + evaluate it through
     /// [`Self::begin_dynamic_import`], then drain microtasks — whose
     /// reactions may queue further imports — until the queue is dry.
+    /// Each request and reaction owns its source and realm context.
     /// HTTPS targets need the isolate runner's fetcher and reject
     /// with a `TypeError` here.
-    fn pump_layer_a_dynamic_imports(
-        &mut self,
-        context: &ExecutionContext,
-    ) -> Result<(), OtterError> {
+    fn pump_layer_a_dynamic_imports(&mut self) -> Result<(), OtterError> {
         loop {
             let request = {
                 let mut queue = self
@@ -5500,9 +5441,7 @@ impl Runtime {
                 continue;
             }
 
-            if let Err(err) = self
-                .interp
-                .drain_microtasks_with_default(Some(context.clone()))
+            if let Err(err) = self.interp.drain_microtasks(|_, _| Ok(false))
                 && !self.absorb_termination(&err)
             {
                 self.cancel_layer_a_dynamic_imports_after_failure(0);
@@ -5562,13 +5501,7 @@ impl Runtime {
         // The host loop drains between turns, and a task that throws here is
         // as uncaught as one thrown during evaluation: it gets the same offer
         // to `process` and to any active domain.
-        let Some(context) = self.interp.realm_execution_context() else {
-            return self
-                .interp
-                .drain_microtasks_with_default(None)
-                .map_err(map_vm_error);
-        };
-        self.drain_microtasks_dispatching_uncaught(&context)
+        self.drain_microtasks_dispatching_uncaught()
             .map_err(map_vm_error)
     }
 
@@ -5614,7 +5547,8 @@ impl Runtime {
         with_value: impl FnOnce(&mut otter_vm::NativeCtx<'_>, otter_vm::Value) -> R,
     ) -> Result<R, OtterError> {
         let compiled = self.compile_source(&source, specifier)?;
-        let context = self.interp.link_module(compiled.bytecode)?;
+        let (module, sources) = self.prepare_script_source(compiled.bytecode, source, specifier)?;
+        let context = self.interp.link_module(module, sources)?;
         let value = match self.interp.run(&context) {
             Ok(value) => value,
             Err(err) => {
@@ -5629,8 +5563,8 @@ impl Runtime {
         // generation is a moving collector, so the completion cannot stay in
         // a plain local across them.
         let root = self.interp.persistent_root_insert(value);
-        let settled = match self.drain_microtasks_dispatching_uncaught(&context) {
-            Ok(()) => self.pump_layer_a_dynamic_imports(&context),
+        let settled = match self.drain_microtasks_dispatching_uncaught() {
+            Ok(()) => self.pump_layer_a_dynamic_imports(),
             Err(err) => {
                 let mapped = map_vm_error(err);
                 Err(enrich_runtime_diagnostic_with_cause(
@@ -5742,13 +5676,24 @@ impl Runtime {
             )
         {
             self.source_maps.record_compiled_metadata(&metadata);
-            return self.run_bootstrap_module(Ok(bytecode), start);
+            let text =
+                module_loader::admit_source(&self.config.resource_account, &specifier, source.text)
+                    .map_err(module_loader::LoaderError::into_otter_error)?;
+            let sources = script_source::script_sources(
+                bytecode.module(),
+                text,
+                &specifier,
+                &self.config.resource_account,
+            )?;
+            return self.run_bootstrap_module(Ok(bytecode), sources, start);
         }
         let compiled = self.compile_source(&source, &specifier)?;
         if let (Some(cache), Some(key)) = (&cache, &key) {
             cache.store(key, &compiled.bytecode);
         }
-        self.run_bootstrap_module(Err(compiled.bytecode), start)
+        let (module, sources) =
+            self.prepare_script_source(compiled.bytecode, source, &specifier)?;
+        self.run_bootstrap_module(Err(module), sources, start)
     }
 
     fn compile_source(
@@ -5956,22 +5901,6 @@ impl Runtime {
     /// so `Error.prototype.stack` and `util.getCallSites` can resolve a
     /// frame's byte span to a `(line, column)` position. Called once per
     /// graph load, before evaluation begins.
-    fn register_module_sources(
-        &mut self,
-        sources: &std::collections::BTreeMap<String, otter_resource::SharedSource>,
-    ) {
-        for (url, text) in sources {
-            self.interp
-                .register_module_source(url.clone(), text.clone());
-        }
-        self.report_watch_imports(sources);
-    }
-
-    /// Tell a watching parent which files this module batch pulled in.
-    ///
-    /// The graph is linked before any of it evaluates, so one message
-    /// carries the whole batch. Only real files are of interest: a builtin
-    /// cannot change on disk.
     fn report_watch_imports(
         &mut self,
         sources: &std::collections::BTreeMap<String, otter_resource::SharedSource>,
@@ -6044,66 +5973,54 @@ impl Runtime {
             self.source_maps.record_compiled_metadata(metadata);
         }
         let entry_url = linked.entry_url.clone();
-        self.module_records.allocate_for_module_inits(
-            &mut self.interp,
-            &module.module_inits,
-            &self.config.hosted_modules,
-            &self.config.capabilities,
-            self.runtime_task_spawner.clone(),
-        )?;
         let realm_id = self.interp.active_host_realm_id();
-        // Environment allocation happens first so metadata publication cannot
-        // expose a resolution table without its target environment.
-        self.register_resolved_exports(&linked.metadata);
-        self.register_module_sources(&linked.module_sources);
-        self.module_records
-            .for_each_record(realm_id, |url, _function_id| {
-                // Self-loop edge: <entry>'s referrer is the entry's URL
-                // (the synthesized <entry> function carries empty
-                // module_url, so the dispatcher uses an empty string;
-                // we add edges keyed on both shapes).
-                module
-                    .module_resolutions
-                    .push(otter_bytecode::ModuleResolution {
-                        referrer: entry_url.clone(),
-                        specifier: url.to_string(),
-                        attr_type: None,
-                        target: url.to_string(),
-                        deferred: false,
-                        dynamic: false,
-                        synthetic: true,
-                    });
-                module
-                    .module_resolutions
-                    .push(otter_bytecode::ModuleResolution {
-                        referrer: String::new(),
-                        specifier: url.to_string(),
-                        attr_type: None,
-                        target: url.to_string(),
-                        deferred: false,
-                        dynamic: false,
-                        synthetic: true,
-                    });
-            });
-
+        hosted_completion::prepare_entry_resolutions(
+            &self.module_records,
+            realm_id,
+            &mut module,
+            &entry_url,
+        );
+        let sources = otter_vm::source_registry::SourceRegistry::new(
+            linked.module_sources.clone(),
+            &self.config.resource_account,
+        );
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), runtime_link_started) {
             timings.link_time_ns = timings
                 .link_time_ns
                 .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         }
+        let sources = sources.map_err(OtterError::from)?;
         let codeblock_started = timings.is_some().then(std::time::Instant::now);
-        let context = self.interp.link_module(module)?;
-        self.module_records
-            .retain_linked_context(realm_id, &context);
-        self.module_records.mark_evaluating(realm_id);
+        let context = self.interp.link_module(module, sources)?;
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), codeblock_started) {
             timings.compile_time_ns = timings
                 .compile_time_ns
                 .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         }
+        let instantiate_started = timings.is_some().then(std::time::Instant::now);
+        self.module_records
+            .allocate_for_module_inits(
+                &mut self.interp,
+                &context,
+                &self.config.hosted_modules,
+                &self.config.capabilities,
+                self.runtime_task_spawner.clone(),
+            )
+            .map_err(|error| hosted_completion::into_runtime(&mut self.interp, error))?;
+        // Only real registered environments precede export-table publication.
+        self.register_resolved_exports(&linked.metadata);
+        self.report_watch_imports(&linked.module_sources);
+        self.module_records.mark_evaluating(realm_id);
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), instantiate_started) {
+            timings.link_time_ns = timings
+                .link_time_ns
+                .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
         let execute_started = timings.is_some().then(std::time::Instant::now);
         let script_outcome = self.interp.run(&context);
-        let drain_outcome = self.drain_microtasks_dispatching_uncaught(&context);
+        let drain_outcome = checkpoint::after_script(&script_outcome, || {
+            self.drain_microtasks_dispatching_uncaught()
+        });
         let value = match (script_outcome, drain_outcome) {
             (
                 Err(otter_vm::RunError {
@@ -6143,7 +6060,7 @@ impl Runtime {
             }
             (Ok(v), Ok(())) => v,
         };
-        self.pump_layer_a_dynamic_imports(&context)?;
+        self.pump_layer_a_dynamic_imports()?;
         if let (Some(timings), Some(started)) = (timings, execute_started) {
             timings.execute_time_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         }
@@ -6232,8 +6149,7 @@ impl Runtime {
     /// See [`OtterError`] variants.
     pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
         self.interp.begin_jit_debug_capture();
-        self.run_file_with_context(path)
-            .map(|(result, _)| result)
+        self.run_file_inner(path)
             .map(|result| self.attach_jit_debug_report(result))
     }
 
@@ -6243,99 +6159,13 @@ impl Runtime {
         self.finish_jit_debug_attempt(result)
     }
 
-    pub(crate) fn run_file_with_context(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let path = path.as_ref();
-        let source = SourceInput::from_path(path)?;
-        if source_path_has_module_extension(path) {
-            return self.run_module_with_context(path);
-        }
-        let package_type = {
-            let loader = self.module_loader_for_entry(path);
-            source_path_package_type(path, &loader)
-        };
-        if package_type == Some(module_loader::LoaderPackageType::Module) {
-            return self.run_module_with_context(path);
-        }
-        let specifier = path.to_string_lossy().to_string();
-        match self.commonjs_routing(path, &source, package_type)? {
-            CommonJsRouting::CommonJs => return self.run_commonjs_file(path, source),
-            CommonJsRouting::Module => return self.run_module_with_context(path),
-            CommonJsRouting::Script => {}
-        }
-        if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
-            return self.run_script_with_context(source, &specifier);
-        }
-        if !source_path_has_script_extension(path) {
-            let start = std::time::Instant::now();
-            let module = with_program(&source.text, source.kind, |program| {
-                if program_looks_like_module(program) {
-                    return Ok(None);
-                }
-                compile_script_program(program, source.kind, &specifier)
-                    .map(Some)
-                    .map_err(|err| map_compile_error(err, &specifier))
-            })
-            .map_err(|err| map_syntax_error(err, &specifier))??;
-            if let Some(mut module) = module {
-                for function in &mut module.functions {
-                    if function.module_url.is_empty() {
-                        function.module_url = specifier.clone();
-                    }
-                }
-                if let Err(error) = self
-                    .interp
-                    .register_module_source_owned(specifier.clone(), source.text.clone())
-                {
-                    return Err(module_loader::LoaderError::Load {
-                        url: specifier.clone(),
-                        message: format!("source admission failed: {error}"),
-                    }
-                    .into_otter_error());
-                }
-                return self.run_compiled_script_with_context_since(module, start);
-            }
-            return self.run_module_with_context(path);
-        }
-        let specifier = path.to_string_lossy().to_string();
-        self.run_script_with_context(source, &specifier)
-    }
-
-    /// Drain microtasks, offering a task's uncaught throw to `process` and any
-    /// active domain before it ends the drain. A handled throw does not end the
-    /// turn: the tasks queued behind the failing one still have to run.
-    fn drain_microtasks_dispatching_uncaught(
-        &mut self,
-        context: &ExecutionContext,
-    ) -> Result<(), otter_vm::RunError> {
-        loop {
-            match self.interp.drain_microtasks(context) {
-                Ok(()) => return Ok(()),
-                // A termination is not an exception: it is never offered to
-                // `uncaughtException`. A listener claiming it would resume
-                // the drain and the run would continue past the point that
-                // asked to stop — which is what an installed handler did to
-                // every `process.exit()` raised from a microtask.
-                Err(error) if error.error.is_termination() => return Err(error),
-                Err(error) => {
-                    // The failing task's context is still installed, which is
-                    // where an active domain lives.
-                    let ambient = self.interp.async_context();
-                    let handled = self.dispatch_uncaught_exception(context);
-                    self.interp.set_async_context(ambient);
-                    match handled {
-                        Ok(true) => continue,
-                        Ok(false) => return Err(error),
-                        // A handler that itself throws is reported as the
-                        // original failure; the handler's error has already
-                        // been surfaced through the diagnostic sink.
-                        Err(_) => return Err(error),
-                    }
-                }
-            }
-        }
+    /// Drain microtasks, offering catchable uncaught throws to `process` and
+    /// an active domain. A handled throw permits the remaining tasks to run.
+    /// Fatal or escaping OOM stops this checkpoint; queue-owned unexecuted jobs
+    /// remain available to a later deliberate direct Runtime turn.
+    fn drain_microtasks_dispatching_uncaught(&mut self) -> Result<(), otter_vm::RunError> {
+        self.interp
+            .drain_microtasks(|ctx, _error| uncaught::dispatch(ctx))
     }
 
     /// Offer the in-flight uncaught throw to `process`, the way Node does: the
@@ -6349,136 +6179,25 @@ impl Runtime {
     /// handler is not caught again.
     fn dispatch_uncaught_exception(
         &mut self,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
     ) -> Result<bool, OtterError> {
-        let Some(thrown) = self.interp.take_pending_uncaught_throw() else {
-            return Ok(false);
-        };
-        // Node names the origin of a throw that came out of reporting a
-        // rejected promise nobody handled, and a handler is given it.
-        let origin_name = if self.interp.take_uncaught_from_promise_rejection() {
-            "unhandledRejection"
-        } else {
-            "uncaughtException"
-        };
         let handled = otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::default_call(),
-            Some(context),
-            |ctx| -> Result<bool, otter_vm::NativeError> {
-                ctx.scope(|mut scope| {
-                    let thrown = scope.value(thrown);
-
-                    // A domain claims the error first: that is the whole point
-                    // of `domain.run`, and it must win over the process-wide
-                    // handlers below.
-                    if let Some(domain) = scope.global("__otterDomainModule") {
-                        let handler = scope.get(domain, "_handleUncaught")?;
-                        if scope.is_callable(handler) {
-                            let handled = scope.call(handler, domain, &[thrown])?;
-                            if scope.boolean_value(handled).unwrap_or(false) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-
-                    let Some(process) = scope.global("process") else {
-                        return Ok(false);
-                    };
-
-                    // A program may replace `process._fatalException`; a
-                    // non-function replacement is Node's "internal fatal
-                    // exception handler failure" (exit code 6).
-                    let fatal = scope.get(process, "_fatalException")?;
-                    if !scope.is_undefined(fatal) && !scope.is_callable(fatal) {
-                        return Err(otter_vm::NativeError::Coded {
-                            kind: otter_vm::ErrorKind::TypeError,
-                            code: "ERR_FATAL_HANDLER_INVALID",
-                            message: "process._fatalException is not a function".to_string(),
-                        });
-                    }
-                    if scope.is_undefined(fatal) {
-                        // `process` is a null-prototype object, so the probe
-                        // borrows `Object.prototype.hasOwnProperty`.
-                        let has_own = {
-                            let object_ctor = scope.global("Object");
-                            let probe = match object_ctor {
-                                Some(object_ctor) => {
-                                    let prototype = scope.get(object_ctor, "prototype")?;
-                                    Some(scope.get(prototype, "hasOwnProperty")?)
-                                }
-                                None => None,
-                            };
-                            match probe {
-                                Some(probe) if scope.is_callable(probe) => {
-                                    let key = scope.string("_fatalException")?;
-                                    let owned = scope.call(probe, process, &[key])?;
-                                    scope.boolean_value(owned).unwrap_or(false)
-                                }
-                                _ => false,
-                            }
-                        };
-                        if has_own {
-                            return Err(otter_vm::NativeError::Coded {
-                                kind: otter_vm::ErrorKind::TypeError,
-                                code: "ERR_FATAL_HANDLER_INVALID",
-                                message: "process._fatalException is not a function".to_string(),
-                            });
-                        }
-                    }
-
-                    // `uncaughtExceptionMonitor` observes every uncaught
-                    // exception before any handler — including the crash
-                    // path — and cannot mark it handled.
-                    {
-                        let emit = scope.get(process, "emit")?;
-                        if scope.is_callable(emit) {
-                            let event = scope.string("uncaughtExceptionMonitor")?;
-                            let origin = scope.string(origin_name)?;
-                            scope.call(emit, process, &[event, thrown, origin])?;
-                        }
-                    }
-
-                    let capture = scope.get(process, process_control::CAPTURE_SLOT)?;
-                    if scope.is_callable(capture) {
-                        scope.call(capture, process, &[thrown])?;
-                        return Ok(true);
-                    }
-
-                    let count = scope.get(process, "listenerCount")?;
-                    if !scope.is_callable(count) {
-                        return Ok(false);
-                    }
-                    let event = scope.string("uncaughtException")?;
-                    let listeners = scope.call(count, process, &[event])?;
-                    if scope.number_value(listeners).unwrap_or(0.0) < 1.0 {
-                        return Ok(false);
-                    }
-                    let emit = scope.get(process, "emit")?;
-                    if !scope.is_callable(emit) {
-                        return Ok(false);
-                    }
-                    let event = scope.string("uncaughtException")?;
-                    let origin = scope.string(origin_name)?;
-                    scope.call(emit, process, &[event, thrown, origin])?;
-                    Ok(true)
-                })
-            },
+            context,
+            uncaught::dispatch,
         );
         match handled {
             Ok(true) => Ok(true),
-            Ok(false) => {
-                // Nothing took it: restore the value so the escaping diagnostic
-                // still carries the original throw.
-                self.interp.set_pending_uncaught_throw(thrown);
-                Ok(false)
-            }
+            Ok(false) => Ok(false),
             // `process.exit` inside the handler is Node's documented way to
             // end the process from `uncaughtException` — a clean exit
             // request, not a handler failure.
-            Err(otter_vm::NativeError::Exit { code }) => {
-                self.pending_exit_code = Some(code);
-                Ok(true)
+            Err(error)
+                if error.is_fatal()
+                    || matches!(error, otter_vm::NativeError::OutOfMemory { .. }) =>
+            {
+                Err(map_native_error(error))
             }
             // A replaced, non-callable `process._fatalException` is Node's
             // "internal fatal exception handler failure" (exit code 6).
@@ -6500,15 +6219,6 @@ impl Runtime {
         }
     }
 
-    /// Execute a file as a CommonJS module: wrap it in
-    /// `(function (exports, require, module, __filename, __dirname) { ... })`,
-    /// invoke it with a per-module `require`, and run any microtasks it queued.
-    ///
-    /// Enabled by [`RuntimeBuilder::with_nodejs_modules`].
-    ///
-    /// # Errors
-    /// See [`OtterError`] variants — compile failures, capability denials, and
-    /// errors thrown while loading the module or its dependencies.
     /// Install the CommonJS scope a `-e`/`-p` snippet runs in: the `[eval]`
     /// module's own `require`/`module`/`exports` on the global object, and a
     /// lazy global per builtin module.
@@ -6561,82 +6271,6 @@ impl Runtime {
         } else {
             CommonJsRouting::CommonJs
         })
-    }
-
-    pub(crate) fn run_commonjs_file(
-        &mut self,
-        path: &Path,
-        source: SourceInput,
-    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let start = std::time::Instant::now();
-        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let cfg = std::sync::Arc::new(commonjs::CjsConfig {
-            capabilities: self.config.capabilities.clone(),
-            hosted: self.config.hosted_modules.clone(),
-            runtime_task_spawner: self.runtime_task_spawner.clone(),
-            addon_loader: self.config.commonjs_addon_loader,
-            report_watch_dependencies: crate::commonjs::watch_reporting_requested(),
-        });
-        // Entry execution context, linked into the interpreter code space so the
-        // wrapper closures resolve from any frame.
-        let empty = compile_script_source("", SourceKind::JavaScript, "<commonjs-root>")
-            .map_err(|err| map_compile_error(err, "<commonjs-root>"))?;
-        let context = self.interp.link_module(empty)?;
-        let load = otter_vm::NativeCtx::with_host_context(
-            &mut self.interp,
-            otter_vm::NativeCallInfo::default_call(),
-            Some(&context),
-            |ctx| -> Result<Option<u8>, OtterError> {
-                match commonjs::cjs_instantiate_file(ctx, &cfg, &abs, &source.text) {
-                    Ok(_) => Ok(None),
-                    Err(otter_vm::NativeError::Exit { code }) => Ok(Some(code)),
-                    Err(err) => Err(commonjs_native_to_error(err)),
-                }
-            },
-        );
-        match load {
-            Ok(Some(code)) => {
-                // `process.exit(code)` during module evaluation (e.g. `common.skip`)
-                // is a clean process termination, not a load failure — surface the
-                // exit code instead of wrapping it as a COMMONJS_LOAD error.
-                let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                return Ok((self.attach_execution_stats(result), context));
-            }
-            Err(err) => {
-                // The module threw. `process` gets first refusal: a capture
-                // callback, then `uncaughtException` listeners. Only an
-                // unhandled throw is a load failure.
-                if !self.dispatch_uncaught_exception(&context)? {
-                    return Err(err);
-                }
-            }
-            Ok(None) => {}
-        }
-        // Drain microtasks queued during module execution. A task that throws
-        // is an uncaught error: `process` and any active domain get first
-        // refusal, exactly as they do for the module body itself.
-        // A handled error does not end the turn: the tasks queued behind the
-        // failing one still have to run, which is why the drain resumes.
-        if let Err(err) = self.drain_microtasks_dispatching_uncaught(&context) {
-            // `process.exit(code)` from a queued task (e.g. `process.nextTick`)
-            // is a clean termination, exactly as it is from the module body.
-            if let otter_vm::VmError::Exit { code } = err.error {
-                let result = ExecutionResult::from_exit_code(code, start.elapsed());
-                return Ok((self.attach_execution_stats(result), context));
-            }
-            return Err(enrich_runtime_diagnostic_with_cause(
-                &mut self.interp,
-                map_vm_error(err),
-            ));
-        }
-        let result = ExecutionResult::from_vm_value(
-            otter_vm::Value::undefined(),
-            start.elapsed(),
-            self.interp.gc_heap_mut(),
-        )
-        .with_exit_code(process::exit_code(&self.interp));
-        let result = self.attach_execution_stats(result);
-        Ok((result, context))
     }
 }
 
@@ -7127,7 +6761,7 @@ impl OtterBuilder {
         self
     }
 
-    /// Register a declared extension (native classes + lazy JS half).
+    /// Register a declared extension (native classes + eager JS bundle).
     #[must_use]
     pub fn extension(mut self, extension: &'static Extension) -> Self {
         self.runtime = self.runtime.extension(extension);
@@ -7383,6 +7017,7 @@ fn source_path_package_type(
 pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
     match err {
         module_graph::GraphError::Interrupted => OtterError::Interrupted,
+        module_graph::GraphError::Loader(module_loader::LoaderError::Resource { error }) => OtterError::Resource { error },
         // Surface capability denials with their own error code so embedders
         // and CLI users can distinguish a missing permission from a genuinely
         // unresolvable specifier.
@@ -7561,19 +7196,31 @@ pub(crate) fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
 /// so the surrounding settle path can distinguish:
 ///
 /// - [`DynLoadError::Diagnostic`] — host-side resolve / load /
-///   compile / link / alloc failure. The settler synthesises a
+///   compile / link failure. The settler synthesises a
 ///   fresh JS error of the carried kind from the message.
+/// - [`DynLoadError::Fatal`] — a completed terminal engine or escaping OOM
+///   failure, mapped once with its original owned detail and source frames.
 /// - [`DynLoadError::Thrown`] — the dynamically-loaded module's
 ///   `<module-init>` threw a JS value. The settler uses that
 ///   value directly as the promise's rejection reason per
 ///   §16.2.1.7 step 7.b.i + §27.2.1.7.
 fn evaluate_and_settle_dynamic_linked_module_on(
     interp: &mut Interpreter,
+    records: &mut module_records::RuntimeModuleRecords,
+    config: &RuntimeConfig,
+    task_spawner: Option<RuntimeTaskSpawner>,
     token: u64,
     target_url: &str,
     linked: module_graph::LinkedProgram,
 ) -> Result<bool, OtterError> {
-    let outcome = evaluate_dynamic_linked_module_on(interp, target_url, linked);
+    let outcome = evaluate_dynamic_linked_module_on(
+        interp,
+        records,
+        config,
+        task_spawner,
+        target_url,
+        linked,
+    );
     match outcome {
         Ok(DynamicModuleLoad::Loaded(namespace)) => {
             settle_dynamic_import_result_on(interp, token, Ok(namespace))
@@ -7599,11 +7246,9 @@ fn evaluate_and_settle_dynamic_linked_module_on(
                         detail: None,
                     })
                 })?;
-            interp
-                .drain_microtasks_with_default(Some(context))
-                .map_err(|error| {
-                    enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error))
-                })?;
+            interp.drain_microtasks(|_, _| Ok(false)).map_err(|error| {
+                enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error))
+            })?;
             Ok(true)
         }
         Ok(DynamicModuleLoad::PendingAsyncEvaluation {
@@ -7625,17 +7270,16 @@ fn evaluate_and_settle_dynamic_linked_module_on(
                         detail: None,
                     })
                 })?;
-            interp
-                .drain_microtasks_with_default(Some(context))
-                .map_err(|error| {
-                    enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error))
-                })?;
+            interp.drain_microtasks(|_, _| Ok(false)).map_err(|error| {
+                enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error))
+            })?;
             Ok(true)
         }
         Ok(DynamicModuleLoad::FetchHttps { .. }) => Err(OtterError::Internal {
             code: "DYNAMIC_IMPORT_PREPARED_FETCH".to_string(),
             message: "prepared dynamic module requested a second entry fetch".to_string(),
         }),
+        Err(DynLoadError::Fatal(error)) => Err(error),
         Err(DynLoadError::Diagnostic { kind, message }) => {
             let value = alloc_dynamic_import_error_on(interp, kind, message)?;
             settle_dynamic_import_result_on(interp, token, Err(value))
@@ -7648,9 +7292,40 @@ fn evaluate_and_settle_dynamic_linked_module_on(
 
 fn evaluate_dynamic_linked_module_on(
     interp: &mut Interpreter,
+    records: &mut module_records::RuntimeModuleRecords,
+    config: &RuntimeConfig,
+    task_spawner: Option<RuntimeTaskSpawner>,
     target_url: &str,
     linked: module_graph::LinkedProgram,
 ) -> Result<DynamicModuleLoad, DynLoadError> {
+    // Hosted imports evaluate their real admitted wrapper, whose dependency
+    // owns the namespace returned below. Plain modules retain their target URL.
+    let evaluation_url = if config
+        .hosted_modules
+        .iter()
+        .any(|hosted| hosted.specifier() == target_url)
+    {
+        linked.entry_url.clone()
+    } else {
+        target_url.to_owned()
+    };
+    let sources = otter_vm::source_registry::SourceRegistry::new(
+        linked.module_sources,
+        &interp.resource_account(),
+    )
+    .map_err(|error| DynLoadError::Fatal(OtterError::from(error)))?;
+    let context = interp
+        .link_evictable_module(linked.module, sources)
+        .map_err(|error| DynLoadError::Fatal(OtterError::from(error)))?;
+    records
+        .allocate_for_module_inits(
+            interp,
+            &context,
+            &config.hosted_modules,
+            &config.capabilities,
+            task_spawner,
+        )
+        .map_err(|error| hosted_completion::into_dynamic(interp, error))?;
     for metadata in &linked.metadata {
         if metadata.source_url.is_empty() || metadata.resolved_exports.is_empty() {
             continue;
@@ -7673,32 +7348,11 @@ fn evaluate_dynamic_linked_module_on(
             table,
         );
     }
-    for (url, text) in &linked.module_sources {
-        interp.register_module_source(url.clone(), text.clone());
-    }
-    let context = interp
-        .link_evictable_module(linked.module)
-        .map_err(|error| {
-            DynLoadError::type_error(format!(
-                "dynamic import: bytecode admission failed for \"{target_url}\": {error}"
-            ))
-        })?;
-    for init in context.module_inits() {
-        if interp.module_env(&init.url).is_some() {
-            continue;
-        }
-        let env = interp
-            .alloc_host_object_with_roots(&[], &[])
-            .map_err(|error| {
-                DynLoadError::type_error(format!("dynamic import: alloc env failed: {error}"))
-            })?;
-        interp.register_module_env(std::sync::Arc::from(init.url.as_str()), env);
-    }
     let evaluation = NativeCtx::with_host_context(
         interp,
         NativeCallInfo::default_call(),
         Some(&context),
-        |ctx| ctx.evaluate_module(target_url),
+        |ctx| ctx.evaluate_module(&evaluation_url),
     );
     match evaluation {
         Ok(Some(promise)) => {
@@ -7709,7 +7363,13 @@ fn evaluate_dynamic_linked_module_on(
             });
         }
         Ok(None) => {}
-        Err(error) => {
+        Err(failure) => {
+            // Preserve the same completed failure boundary in the selected
+            // additional realm; no rejection materialization runs for it.
+            if failure.is_fatal() {
+                return Err(DynLoadError::Fatal(map_vm_error(failure)));
+            }
+            let error = failure.error;
             if matches!(error, otter_vm::VmError::Uncaught)
                 && let Some(thrown) = interp.take_pending_uncaught_throw()
             {
@@ -7722,11 +7382,8 @@ fn evaluate_dynamic_linked_module_on(
     }
     let namespace = interp
         .get_or_create_module_namespace(target_url)
-        .ok_or_else(|| {
-            DynLoadError::type_error(format!(
-                "dynamic import: namespace missing after load: \"{target_url}\""
-            ))
-        })?;
+        .map_err(|error| hosted_completion::into_dynamic(interp, NativeError::from(error)))?
+        .ok_or_else(|| hosted_completion::into_dynamic(interp, NativeError::InvalidOperand))?;
     Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
         namespace,
     )))
@@ -7738,9 +7395,9 @@ fn settle_dynamic_import_result_on(
     outcome: Result<otter_vm::Value, otter_vm::Value>,
 ) -> Result<bool, OtterError> {
     let settled_context = interp.settle_dynamic_import(token, outcome);
-    if let Some(context) = settled_context {
+    if let Some(_context) = settled_context {
         interp
-            .drain_microtasks_with_default(Some(context))
+            .drain_microtasks(|_, _| Ok(false))
             .map_err(|error| enrich_runtime_diagnostic_with_cause(interp, map_vm_error(error)))?;
         return Ok(true);
     }
@@ -7752,24 +7409,7 @@ fn alloc_dynamic_import_error_on(
     kind: otter_vm::ErrorKind,
     message: String,
 ) -> Result<otter_vm::Value, OtterError> {
-    let proto = interp.error_classes_for_trace().prototype(kind);
-    let proto_root = otter_vm::Value::object(proto);
-    let mut object = interp.alloc_host_object_with_roots(&[&proto_root], &[])?;
-    otter_vm::object::set_prototype(object, interp.gc_heap_mut(), Some(proto));
-    let message =
-        otter_vm::JsString::from_str(&message, interp.gc_heap_mut()).map_err(|error| {
-            OtterError::Internal {
-                code: DiagnosticCode::StringAlloc.as_str().to_string(),
-                message: error.to_string(),
-            }
-        })?;
-    otter_vm::object::set(
-        &mut object,
-        interp.gc_heap_mut(),
-        "message",
-        otter_vm::Value::string(message),
-    );
-    Ok(otter_vm::Value::object(object))
+    dynamic_import_error::allocate(interp, kind, &message)
 }
 
 enum DynLoadError {
@@ -7778,6 +7418,7 @@ enum DynLoadError {
         message: String,
     },
     Thrown(otter_vm::Value),
+    Fatal(OtterError),
 }
 
 impl DynLoadError {
@@ -7793,6 +7434,15 @@ impl DynLoadError {
     }
 
     fn from_graph_error(err: &module_graph::GraphError, message: impl Into<String>) -> Self {
+        match err {
+            module_graph::GraphError::Loader(module_loader::LoaderError::Resource { error }) => {
+                return Self::Fatal(OtterError::Resource {
+                    error: error.clone(),
+                });
+            }
+            module_graph::GraphError::Interrupted => return Self::Fatal(OtterError::Interrupted),
+            _ => {}
+        }
         let kind = match err {
             module_graph::GraphError::Interrupted => otter_vm::ErrorKind::TypeError,
             module_graph::GraphError::Parse { .. } => otter_vm::ErrorKind::SyntaxError,
@@ -7963,6 +7613,7 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             function: f.function_name,
             module: f.module,
             span: Some(f.span),
+            source_position: f.source_position,
         })
         .collect();
     let top_span = stack_frames.first().and_then(|f| f.span);
@@ -7983,6 +7634,13 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             }),
         };
     match error {
+        VmError::ResourceLimit => match detail {
+            Some(ErrorDetail::Resource(error)) => OtterError::Resource { error },
+            _ => OtterError::Internal {
+                code: DiagnosticCode::VmBytecodeInvariant.as_str().to_owned(),
+                message: "ResourceLimit is missing its exact resource detail".to_owned(),
+            },
+        },
         VmError::Interrupted => OtterError::Interrupted,
         VmError::OutOfMemory {
             requested_bytes,
@@ -8070,6 +7728,33 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
 
 fn map_native_error(err: otter_vm::NativeError) -> OtterError {
     match err {
+        otter_vm::NativeError::Resource { error } => OtterError::Resource { error },
+        otter_vm::NativeError::ExecutionFailure(failure) => {
+            if failure.is_fatal() {
+                map_vm_error(failure)
+            } else {
+                map_vm_error(otter_vm::RunError::bare(otter_vm::VmError::InvalidOperand))
+            }
+        }
+        otter_vm::NativeError::MissingReturn => {
+            map_vm_error(otter_vm::RunError::bare(otter_vm::VmError::MissingReturn))
+        }
+        otter_vm::NativeError::InvalidOperand => {
+            map_vm_error(otter_vm::RunError::bare(otter_vm::VmError::InvalidOperand))
+        }
+        otter_vm::NativeError::BudgetExceeded { reason } => map_vm_error(otter_vm::RunError {
+            error: otter_vm::VmError::BudgetExceeded,
+            frames: Vec::new(),
+            detail: Some(otter_vm::ErrorDetail::Message(reason.into())),
+        }),
+        otter_vm::NativeError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+            ..
+        } => OtterError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
         otter_vm::NativeError::Interrupted => OtterError::Interrupted,
         otter_vm::NativeError::Exit { code } => OtterError::Runtime {
             diagnostic: Box::new(Diagnostic {

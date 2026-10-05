@@ -1,34 +1,25 @@
-//! Cycle reclamation regression — verifies that mutually
-//! prototype-linked objects are reaped by a forced full GC
-//! once every host-side handle is dropped.
+//! Reclaim an unreachable cycle of ordinary prototype and data-property edges.
 //!
-//! Mark-sweep handles cycles natively (unlike refcounting), so
-//! the contract here is: an `a → b → a` prototype loop with no
-//! external root collapses to baseline after `force_gc`.
+//! # Contents
+//! - A real mixed-edge cycle that survives full GC while rooted and is reaped
+//!   after its canonical scope ends.
 //!
-//! # Spec
-//!
-//! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-getprototypeof>
-//!   (§10.1.7 [[GetPrototypeOf]])
-//! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-setprototypeof>
-//!   (§10.4.7 [[SetPrototypeOf]])
+//! # Invariants
+//! - Ordinary [[SetPrototypeOf]] rejects a cyclic prototype chain.
+//! - The permitted data-property back edge still forms a collector cycle.
+//! - Every allocating transition uses handles; no stale raw receiver is reused.
 //!
 //! # See also
-//!
-//! - GC architecture plan §4.1 (cycle handling).
-//! - Companion: `root_enumeration::globals_keep_object_alive` for the
-//!   survival side of the same root walker.
+//! - `root_enumeration::globals_keep_object_alive` checks rooted survival.
 
 use crate::Interpreter;
 use crate::object::OBJECT_BODY_TYPE_TAG;
 
-/// `let a = {}; let b = {}; b.__proto__ = a; a.__proto__ = b; drop a, b;`
-/// — after a forced full GC, the per-tag `live_bytes` row for
-/// `ObjectBody` returns to the baseline measured before the
-/// cycle was constructed.
+/// A rooted `b.[[Prototype]] = a; a.link = b` cycle is reclaimed after
+/// the scope releases both objects. A prototype-only cycle is rejected.
 #[test]
 fn proto_cycle_reaped() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     // Baseline AFTER intrinsics + globalThis are wired by
     // `Interpreter::new`. Anything reachable from globalThis
@@ -38,33 +29,29 @@ fn proto_cycle_reaped() {
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
 
-    // Construct the cycle. Both objects route through
-    // `alloc_object` → `alloc_old`, so they live in old-space
-    // and stay pinned across collections; sweep is what reaps
-    // them once they are unmarked.
-    let a = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc a");
-    let b = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc b");
-    crate::object::set_prototype(b, interp.gc_heap_mut(), Some(a));
-    crate::object::set_prototype(a, interp.gc_heap_mut(), Some(b));
+    interp.with_handle_scope(|interp, scope| {
+        let a = interp.scoped_object_bare(scope).expect("alloc a");
+        let b = interp.scoped_object_bare(scope).expect("alloc b");
+        interp.scoped_set_prototype(scope, b, Some(a)).expect("acyclic prototype edge");
+        assert!(matches!(interp.scoped_set_prototype(scope, a, Some(b)), Err(crate::VmError::TypeMismatch)),
+            "ordinary prototype cycles must be rejected");
+        interp.scoped_define_data(scope, a, "link", b,
+            crate::object::PropertyFlags::data_default()).expect("data back edge");
+        interp.force_gc().expect("rooted full GC");
+        let rooted_a = interp.escape_scoped(a).as_object().expect("rooted a");
+        let rooted_b = interp.escape_scoped(b).as_object().expect("rooted b");
+        assert_eq!(crate::object::prototype(rooted_b, interp.gc_heap()), Some(rooted_a));
+        assert_eq!(crate::object::get_own(rooted_a, interp.gc_heap(), "link"), Some(crate::Value::object(rooted_b)));
+        let with_cycle = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+        assert!(with_cycle > baseline,
+            "rooted cycle must survive actual full GC (baseline={baseline}, with_cycle={with_cycle})");
+    });
 
-    let with_cycle =
-        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    assert!(
-        with_cycle > baseline,
-        "cycle construction must bump live_bytes (baseline={baseline}, with_cycle={with_cycle})"
-    );
-
-    // Drop the local handles. `JsObject` is `Copy` (compressed
-    // offset); `let _ = ...` documents intent — neither is
-    // reachable from any root the walker enumerates.
-    let _ = a;
-    let _ = b;
-
-    // Mark-sweep handles cycles natively: even though `a` and
-    // `b` reference each other through their `[[Prototype]]`
-    // slots, neither is white-anchored to a root, so the
-    // marker leaves them white and the sweep reclaims them.
-    interp.force_gc().expect("force GC");
+    // End the fixture's implicit runtime turn, just as the activation-stack
+    // owner does. Its shape pins deliberately retain source/prototype edges
+    // until this boundary; the mixed cycle then has no strong root.
+    interp.shape_runtime.unpin_turn_shapes();
+    interp.force_gc().expect("unrooted full GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     assert!(
         after <= baseline,

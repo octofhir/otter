@@ -11,8 +11,9 @@
 //! # Invariants
 //! - Call guard/setup failure is effect-free and deoptimizes at the original
 //!   opcode; accepted inline misses never replay it.
-//! - A generated call owns a rooted stack register window and enters the baked
-//!   stable code-entry generation directly.
+//! - A caller pushes only actual arguments and loads the current generation
+//!   from its stable function-entry cell. The entered callee owns and initializes
+//!   its rooted register window, including every missing formal.
 //! - A callee throw caught by the compiled caller publishes the selected
 //!   catch/finally PC and exits through the shared bailout epilogue.
 //! - A generated method chain re-reads each receiver/prototype/slot identity in
@@ -34,7 +35,7 @@
 //! - [`crate::arm64`] — shared generated call and method-guard emission.
 //! - [`super::transitions`] — descriptor-resolved entries used here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::value_packet::{PacketWord, emit_value_packet_transition};
 
@@ -49,8 +50,8 @@ use super::ic_probe::{
 };
 use super::transitions::TransitionTable;
 use super::values::{
-    emit_box_double, emit_box_int32, emit_box_number, emit_load_reg, emit_load_u64,
-    emit_num_to_double, emit_slab_base, emit_store_reg,
+    emit_box_double, emit_box_int32, emit_box_number, emit_field_base, emit_load_reg,
+    emit_load_u64, emit_num_to_double, emit_store_reg,
 };
 use crate::arm64::{MethodGuardSite, emit_method_guard};
 use crate::artifact::relocation::RelocationCapture;
@@ -298,13 +299,22 @@ fn emit_inline_negate(
 fn emit_inline_receiver_property(
     ops: &mut Assembler,
     dst: InlineScratchSlot,
-    value_byte: u32,
+    field: otter_vm::object::FieldLocation,
+    view: &JitCompileSnapshot,
+    relocations: &mut RelocationCapture,
 ) -> Result<(), Unsupported> {
-    // `x17` holds the receiver's slab base, derived once from the exact
-    // receiver body after its type/shape guard. Eligible inline bodies cannot
-    // call, allocate, branch, or mutate, so neither the receiver nor its slab
-    // can move or change before this load.
-    dynasm!(ops ; .arch aarch64 ; ldr x9, [x17, value_byte]);
+    // `x17` keeps the shape-proven receiver header. This field chooses its
+    // immutable bank; overflow does not relocate the inline prefix. Eligible
+    // inline bodies cannot collect or mutate the receiver before this load.
+    dynasm!(ops ; .arch aarch64 ; mov x13, x17);
+    emit_field_base(ops, relocations, view, 13, 14, field);
+    let byte = field.byte_offset();
+    if byte <= 32760 {
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, byte]);
+    } else {
+        emit_load_u64(ops, 9, u64::from(byte));
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, x9]);
+    }
     emit_store_inline_slot(ops, 9, dst);
     Ok(())
 }
@@ -332,6 +342,7 @@ struct InlineBodySpec<'a> {
 #[allow(clippy::too_many_arguments)]
 fn emit_inline_leaf_body(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     plan: &InlineLeafPlan<'_>,
     spec: InlineBodySpec<'_>,
     dst: u16,
@@ -442,11 +453,11 @@ fn emit_inline_leaf_body(
                 let dst = plan
                     .register_slot(dst)
                     .ok_or(Unsupported::OperandShape("inline scratch destination"))?;
-                let value_byte = *method
-                    .prop_offsets
+                let field = *method
+                    .prop_fields
                     .get(&instruction.byte_pc)
                     .ok_or(Unsupported::OperandShape("inline method property offset"))?;
-                emit_inline_receiver_property(ops, dst, value_byte)?;
+                emit_inline_receiver_property(ops, dst, field, &method.body, relocations)?;
             }
             TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
                 let dst = plan
@@ -661,16 +672,9 @@ fn try_emit_inline_numeric_method(
         guard_miss,
     )?;
     if plan.has_receiver_property() {
-        // Receiver-property offsets were baked from `recv_shape`, whose guard
-        // already succeeded above. Materialize its slab once for every sealed
-        // receiver-property load in the straight-line inline body.
-        dynasm!(ops ; .arch aarch64 ; mov x13, x16);
-        emit_slab_base(ops, relocations, view, 13, 14);
-        dynasm!(ops
-            ; .arch aarch64
-            ; cbz x13, =>guard_miss
-            ; mov x17, x13
-        );
+        // The receiver header remains stable throughout the call-free body;
+        // each sealed field selects its own immutable prefix/suffix bank.
+        dynasm!(ops ; .arch aarch64 ; mov x17, x16);
     }
 
     let guard_end = ops.offset().0;
@@ -686,6 +690,7 @@ fn try_emit_inline_numeric_method(
 
     emit_inline_leaf_body(
         ops,
+        relocations,
         &plan,
         InlineBodySpec {
             function_id: method.guard.method_fid,
@@ -729,6 +734,7 @@ fn inline_argument_registers(argc: u16, argument_registers: &[u16]) -> Option<[O
 #[allow(clippy::too_many_arguments)]
 fn try_emit_inline_numeric_callee(
     ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     callee: &JitInlineCallee,
     dst: u16,
@@ -796,6 +802,7 @@ fn try_emit_inline_numeric_callee(
 
     emit_inline_leaf_body(
         ops,
+        relocations,
         &plan,
         InlineBodySpec {
             function_id: callee.function_id(),
@@ -830,7 +837,9 @@ pub(super) fn emit_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
+    spliced_functions: &mut BTreeSet<u32>,
     direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<&mut CodeMapCapture>,
     dst: u16,
@@ -847,7 +856,9 @@ pub(super) fn emit_call(
         ops,
         relocations,
         table,
+        return_sites,
         view,
+        spliced_functions,
         direct_call_events,
         code_map,
         dst,
@@ -872,7 +883,9 @@ pub(super) fn emit_call_with_receiver(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
+    spliced_functions: &mut BTreeSet<u32>,
     mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
@@ -888,7 +901,10 @@ pub(super) fn emit_call_with_receiver(
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
     if let Some(receiver) = receiver
-        && let Some(target) = view.static_native_calls.get(&byte_pc)
+        && let Some(target) = view
+            .native_calls
+            .get(&byte_pc)
+            .and_then(|target| target.leaf())
         && let Some(declaration) =
             otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)
         && view.native_call_layout.identity_byte != 0
@@ -934,6 +950,7 @@ pub(super) fn emit_call_with_receiver(
             ops,
             relocations,
             table,
+            return_sites,
             view,
             None,
             view.code_block.id,
@@ -975,8 +992,9 @@ pub(super) fn emit_call_with_receiver(
         return Ok(());
     }
     if let Some(target) = view
-        .static_native_calls
+        .native_calls
         .get(&byte_pc)
+        .and_then(|target| target.leaf())
         .filter(|_| receiver.is_none())
     {
         let stub_id = target.leaf_stub_id;
@@ -1045,6 +1063,7 @@ pub(super) fn emit_call_with_receiver(
             ops,
             relocations,
             table,
+            return_sites,
             view,
             code_map,
             view.code_block.id,
@@ -1070,6 +1089,7 @@ pub(super) fn emit_call_with_receiver(
         .filter(|_| receiver.is_none())
         && try_emit_inline_numeric_callee(
             ops,
+            relocations,
             view,
             candidate,
             dst,
@@ -1083,6 +1103,7 @@ pub(super) fn emit_call_with_receiver(
             bail,
         )?
     {
+        spliced_functions.insert(candidate.function_id());
         if let (Some(events), Some(target)) = (direct_call_events, direct_target) {
             events.insert(
                 (byte_pc, 0),
@@ -1101,10 +1122,16 @@ pub(super) fn emit_call_with_receiver(
         return Ok(());
     }
 
+    let generated_target = direct_target.filter(|_| {
+        view.direct_callees
+            .get(&byte_pc)
+            .is_some_and(|targets| targets.len() == 1)
+    });
     emit_trampoline_call(
         ops,
         relocations,
         table,
+        return_sites,
         view,
         code_map,
         view.code_block.id,
@@ -1114,17 +1141,23 @@ pub(super) fn emit_call_with_receiver(
         receiver,
         CallNewTarget::None,
         CallActuals::Fixed(argument_registers),
-        direct_target
-            .filter(|_| {
-                view.direct_callees
-                    .get(&byte_pc)
-                    .is_some_and(|targets| targets.len() == 1)
-            })
-            .map(|target| target.plan),
+        generated_target.map(|target| target.plan),
         dst,
         throw_value,
         threw,
-    )
+    )?;
+    if let Some(target) = generated_target {
+        super::super::record_generated_direct_call(
+            direct_call_events,
+            otter_vm::JitDirectCallKind::Plain,
+            logical_pc,
+            byte_pc,
+            target,
+            0,
+            1,
+        );
+    }
+    Ok(())
 }
 
 /// Emit `return callee(args…)` from a strict tail position (§15.10.3).
@@ -1146,7 +1179,9 @@ pub(super) fn emit_tail_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
+    spliced_functions: &mut BTreeSet<u32>,
     direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     code_map: Option<&mut CodeMapCapture>,
     dst: u16,
@@ -1165,9 +1200,7 @@ pub(super) fn emit_tail_call(
     let start = ops.offset().0;
     let ordinary = ops.new_dynamic_label();
     let outgrown = ops.new_dynamic_label();
-    let params = view.code_block.param_count;
     crate::arm64::frame::emit_tail_admission(ops, leave, ordinary);
-    let count = usize::from(argc);
     let known = view
         .direct_callees
         .get(&byte_pc)
@@ -1189,10 +1222,8 @@ pub(super) fn emit_tail_call(
             ops,
             relocations,
             table,
-            params,
             callee,
             argument_registers,
-            count.max(usize::from(plan.param_count)),
             CallTarget::Known {
                 entry_cell: plan.entry_cell,
                 function_id: plan.function_id,
@@ -1201,20 +1232,37 @@ pub(super) fn emit_tail_call(
         )?;
         dynasm!(ops ; .arch aarch64 ; =>generic);
     }
+    if matches!(
+        view.native_calls.get(&byte_pc),
+        Some(otter_vm::JitNativeCall::Native)
+    ) {
+        let generic = ops.new_dynamic_label();
+        emit_load_reg(ops, 9, callee)?;
+        crate::arm64::js_call::emit_native_kind_guard(ops, 9, generic);
+        emit_tail_path(
+            ops,
+            relocations,
+            table,
+            callee,
+            argument_registers,
+            CallTarget::Native,
+            outgrown,
+        )?;
+        dynasm!(ops ; .arch aarch64 ; =>generic);
+    }
     emit_tail_path(
         ops,
         relocations,
         table,
-        params,
         callee,
         argument_registers,
-        count,
         CallTarget::Generic,
         outgrown,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>outgrown);
     let mut words = vec![PacketWord::Register(callee)];
     words.extend(argument_registers.iter().copied().map(PacketWord::Register));
+    super::emit_cold_call_source(ops, return_sites.logical_pc, return_sites.safepoint_id);
     emit_value_packet_transition(
         ops,
         relocations,
@@ -1242,7 +1290,9 @@ pub(super) fn emit_tail_call(
         ops,
         relocations,
         table,
+        return_sites,
         view,
+        spliced_functions,
         direct_call_events,
         None,
         dst,
@@ -1257,31 +1307,29 @@ pub(super) fn emit_tail_call(
     )
 }
 
-/// One target of [`emit_tail_call`]: check that `pushed` actuals fit the
-/// record's span, push them (`undefined` past the call's own), and hand the
+/// One target of [`emit_tail_call`]: check that the actuals fit the
+/// record's span, push them, and hand the
 /// record to `target`; actuals that outgrow the span reach `outgrown`.
-/// `params` is this function's formal count.
 #[allow(clippy::too_many_arguments)]
 fn emit_tail_path(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    params: u16,
     callee: u16,
     argument_registers: &[u16],
-    pushed: usize,
     target: crate::arm64::js_call::CallTarget,
     outgrown: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    let bytes = crate::call_linkage::pushed_argument_bytes(pushed)?;
-    crate::arm64::frame::emit_tail_span_check(ops, params, bytes / 8, outgrown);
-    crate::arm64::js_call::emit_push_arguments(ops, pushed, |ops, index, register, _| {
-        match argument_registers.get(index) {
-            Some(&source) => emit_load_reg(ops, register, source)?,
-            None => emit_load_u64(ops, register, VALUE_UNDEFINED),
-        }
-        Ok(register)
-    })?;
+    let bytes = crate::call_linkage::pushed_argument_bytes(argument_registers.len())?;
+    crate::arm64::frame::emit_tail_span_check(ops, bytes / 8, outgrown);
+    crate::arm64::js_call::emit_push_arguments(
+        ops,
+        argument_registers.len(),
+        |ops, index, register, _| {
+            emit_load_reg(ops, register, argument_registers[index])?;
+            Ok(register)
+        },
+    )?;
     emit_load_reg(ops, 13, callee)?;
     let count = u32::try_from(argument_registers.len())
         .map_err(|_| Unsupported::OperandShape("tail call actual count"))?;
@@ -1297,6 +1345,7 @@ pub(super) fn emit_call_completion(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     dst: u16,
     throw_value: DynamicLabel,
     threw: DynamicLabel,
@@ -1316,11 +1365,20 @@ pub(super) fn emit_call_completion(
     );
     // The callee retired itself for a tail call it staged: enter that call
     // in its place.
-    crate::arm64::js_call::emit_enter_staged(ops, relocations, table, 20);
+    return_sites.record(crate::arm64::js_call::emit_enter_staged(
+        ops,
+        relocations,
+        table,
+        20,
+    ))?;
     dynasm!(ops
         ; .arch aarch64
         ; b =>completion
         ; =>error
+    );
+    super::emit_cold_call_source(ops, return_sites.logical_pc, return_sites.safepoint_id);
+    dynasm!(ops
+        ; .arch aarch64
         ; cmp x1, abi::NativeResultStatus::Throw as u32
         ; b.eq =>throw_value
         ; b =>threw
@@ -1373,6 +1431,7 @@ pub(super) fn emit_trampoline_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
     code_map: Option<&mut CodeMapCapture>,
     caller_function_id: u32,
@@ -1397,38 +1456,57 @@ pub(super) fn emit_trampoline_call(
     let known = known.filter(|plan| {
         new_target == CallNewTarget::None || plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0
     });
-    if let (Some(plan), CallActuals::Fixed(arguments)) = (known, actuals) {
+    let native = matches!(
+        view.native_calls.get(&byte_pc),
+        Some(otter_vm::JitNativeCall::Native)
+    );
+    for (plan, target) in known
+        .map(|plan| {
+            (
+                Some(plan),
+                CallTarget::Known {
+                    entry_cell: plan.entry_cell,
+                    function_id: plan.function_id,
+                },
+            )
+        })
+        .into_iter()
+        .chain(native.then_some((None, CallTarget::Native)))
+    {
+        let CallActuals::Fixed(arguments) = actuals else {
+            break;
+        };
         let generic = ops.new_dynamic_label();
         match callee {
             CallCallee::Register(callee) => emit_load_reg(ops, 9, callee)?,
             CallCallee::GuardedMethod => dynasm!(ops ; .arch aarch64 ; mov x9, x17),
             CallCallee::ResolvedMethod => dynasm!(ops ; .arch aarch64 ; mov x9, x0),
         }
-        crate::arm64::inline_guard::emit_cached_identity(
-            ops,
-            relocations,
-            view,
-            plan,
-            logical_pc,
-            generic,
-        );
+        if let Some(plan) = plan {
+            crate::arm64::inline_guard::emit_cached_identity(
+                ops,
+                relocations,
+                view,
+                plan,
+                logical_pc,
+                generic,
+            );
+        } else {
+            crate::arm64::js_call::emit_native_kind_guard(ops, 9, generic);
+        }
         // The proven method callable stays in `x12` through the span push.
         if !matches!(callee, CallCallee::Register(_)) {
             dynasm!(ops ; .arch aarch64 ; mov x12, x9);
         }
         let count = arguments.len();
-        let pushed = count.max(usize::from(plan.param_count));
-        let bytes = emit_push_arguments(ops, pushed, |ops, index, register, _| {
-            match arguments.get(index) {
-                Some(&source) => emit_load_reg(ops, register, source)?,
-                None => emit_load_u64(ops, register, VALUE_UNDEFINED),
-            }
+        let bytes = emit_push_arguments(ops, count, |ops, index, register, _| {
+            emit_load_reg(ops, register, arguments[index])?;
             Ok(register)
         })?;
         emit_trampoline_operands(ops, callee, receiver, new_target)?;
         let count =
             u32::try_from(count).map_err(|_| Unsupported::OperandShape("call actual count"))?;
-        emit_call(
+        return_sites.record(emit_call(
             ops,
             relocations,
             table,
@@ -1436,14 +1514,19 @@ pub(super) fn emit_trampoline_call(
             12,
             receiver.map(|_| 13),
             (new_target != CallNewTarget::None).then_some(14),
-            count,
-            CallTarget::Known {
-                entry_cell: plan.entry_cell,
-                function_id: plan.function_id,
-            },
-        );
+            Some(count),
+            target,
+        ))?;
         emit_pop_arguments(ops, bytes);
-        emit_call_completion(ops, relocations, table, dst, throw_value, threw)?;
+        emit_call_completion(
+            ops,
+            relocations,
+            table,
+            return_sites,
+            dst,
+            throw_value,
+            threw,
+        )?;
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>generic);
     }
     // The method callable survives the span push: it clobbers only x15/x16.
@@ -1461,7 +1544,7 @@ pub(super) fn emit_trampoline_call(
             let count = u32::try_from(arguments.len())
                 .map_err(|_| Unsupported::OperandShape("call actual count"))?;
             emit_trampoline_operands(ops, callee, receiver, new_target)?;
-            emit_call(
+            return_sites.record(emit_call(
                 ops,
                 relocations,
                 table,
@@ -1469,14 +1552,14 @@ pub(super) fn emit_trampoline_call(
                 12,
                 receiver.map(|_| 13),
                 (new_target != CallNewTarget::None).then_some(14),
-                count,
+                Some(count),
                 CallTarget::Generic,
-            );
+            ))?;
             emit_pop_arguments(ops, bytes);
         }
         CallActuals::Staged => {
             emit_trampoline_operands(ops, callee, receiver, new_target)?;
-            emit_staged_call(
+            return_sites.record(emit_staged_call(
                 ops,
                 relocations,
                 table,
@@ -1484,10 +1567,18 @@ pub(super) fn emit_trampoline_call(
                 12,
                 receiver.map(|_| 13),
                 (new_target != CallNewTarget::None).then_some(14),
-            );
+            ))?;
         }
     }
-    emit_call_completion(ops, relocations, table, dst, throw_value, threw)?;
+    emit_call_completion(
+        ops,
+        relocations,
+        table,
+        return_sites,
+        dst,
+        throw_value,
+        threw,
+    )?;
     dynasm!(ops ; .arch aarch64 ; =>done);
     if let Some(code_map) = code_map {
         code_map.record(CodeRegion::call_structural(
@@ -1516,6 +1607,15 @@ fn emit_trampoline_operands(
     }
     if let Some(receiver) = receiver {
         emit_load_reg(ops, 13, receiver)?;
+    }
+    // Only this verified Super operation may create a synchronous origin.
+    // Every ordinary/new path overwrites the mailbox, including guard misses.
+    match new_target {
+        CallNewTarget::Super => dynasm!(ops ; .arch aarch64
+            ; str x21, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]),
+        CallNewTarget::Callee => dynasm!(ops ; .arch aarch64
+            ; str xzr, [x20, crate::entry::PENDING_CALL_OFFSET + abi::REQUEST_SUPER_ORIGIN_OFFSET]),
+        CallNewTarget::None => {}
     }
     match new_target {
         CallNewTarget::None => {}
@@ -1564,7 +1664,9 @@ pub(super) fn emit_construct(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
+    direct_call_events: Option<&mut crate::template::DirectCallEvents>,
     code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     callee: u16,
@@ -1579,6 +1681,7 @@ pub(super) fn emit_construct(
         ops,
         relocations,
         table,
+        return_sites,
         view,
         code_map,
         view.code_block.id,
@@ -1598,7 +1701,26 @@ pub(super) fn emit_construct(
         dst,
         throw_value,
         threw,
-    )
+    )?;
+    if let Some(target) = view
+        .direct_constructs
+        .get(&byte_pc)
+        .filter(|target| target.plan.call_flags & abi::FUNCTION_CALL_CONSTRUCTIBLE != 0)
+    {
+        crate::template::record_generated_direct_call(
+            direct_call_events,
+            crate::template::construct_call_kind(
+                super_construct,
+                target.plan.is_derived_constructor,
+            ),
+            logical_pc,
+            byte_pc,
+            target,
+            0,
+            1,
+        );
+    }
+    Ok(())
 }
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
@@ -1614,8 +1736,11 @@ pub(super) fn emit_method_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
+    return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
+    shared_probes: &mut super::shared_property::SharedPropertyProbes,
     view: &JitCompileSnapshot,
-    direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
+    spliced_functions: &mut BTreeSet<u32>,
+    mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
     mut code_map: Option<&mut CodeMapCapture>,
     dst: u16,
     receiver: u16,
@@ -1693,8 +1818,9 @@ pub(super) fn emit_method_call(
             inline_miss,
             bail,
         )? {
+            spliced_functions.insert(method.guard.method_fid);
             if let (Some(events), Some(target)) = (
-                direct_call_events,
+                direct_call_events.as_deref_mut(),
                 planned_methods.and_then(|methods| methods.first()),
             ) {
                 events.insert(
@@ -1737,6 +1863,27 @@ pub(super) fn emit_method_call(
             next_candidate,
             bail,
         )? {
+            spliced_functions.insert(method.guard.method_fid);
+            if let (Some(events), Some(target)) = (
+                direct_call_events.as_deref_mut(),
+                planned_methods
+                    .into_iter()
+                    .flatten()
+                    .find(|target| target.guard == method.guard),
+            ) {
+                events.insert(
+                    (byte_pc, target.target_index),
+                    direct_call_lowering_event(
+                        otter_vm::JitDirectCallKind::Method,
+                        logical_pc,
+                        byte_pc,
+                        &target.callee,
+                        target.target_index,
+                        target.target_count,
+                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
+                    ),
+                );
+            }
             dynasm!(ops ; .arch aarch64 ; =>next_candidate);
         }
     }
@@ -1773,6 +1920,7 @@ pub(super) fn emit_method_call(
             ops,
             relocations,
             table,
+            return_sites,
             view,
             code_map.as_deref_mut(),
             view.code_block.id,
@@ -1787,9 +1935,38 @@ pub(super) fn emit_method_call(
             throw_value,
             threw,
         )?;
+        super::super::record_generated_direct_call(
+            direct_call_events.as_deref_mut(),
+            otter_vm::JitDirectCallKind::Method,
+            logical_pc,
+            byte_pc,
+            &method.callee,
+            method.target_index,
+            method.target_count,
+        );
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>next_target);
     }
-    // Every other receiver resolves its method through the shared caches.
+    // Every other receiver first probes the isolate's shared property-action
+    // table, as a V8 megamorphic call site probes its stub cache; a callable
+    // hit is called generically. A miss resolves through the committed
+    // method resolution, which also records the site's call feedback.
+    let resolved = ops.new_dynamic_label();
+    let access = view
+        .property_accesses
+        .get(&byte_pc)
+        .filter(|_| view.cage_base != 0);
+    if let Some(access) = access {
+        use super::shared_property::{METHOD_ATOM, METHOD_RECEIVER};
+        let probe = shared_probes.method_label(ops);
+        let resolve = ops.new_dynamic_label();
+        emit_load_reg(ops, METHOD_RECEIVER, receiver)?;
+        super::values::emit_load_u64(ops, METHOD_ATOM, u64::from(access.atom));
+        dynasm!(ops ; .arch aarch64
+            ; bl =>probe
+            ; cbz x1, =>resolved
+            ; =>resolve);
+    }
+    super::emit_cold_call_source(ops, return_sites.logical_pc, return_sites.safepoint_id);
     emit_value_packet_transition(
         ops,
         relocations,
@@ -1800,10 +1977,12 @@ pub(super) fn emit_method_call(
         throw_value,
         fatal,
     )?;
+    dynasm!(ops ; .arch aarch64 ; =>resolved);
     emit_trampoline_call(
         ops,
         relocations,
         table,
+        return_sites,
         view,
         code_map,
         view.code_block.id,

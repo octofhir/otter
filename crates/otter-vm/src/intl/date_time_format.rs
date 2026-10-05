@@ -790,8 +790,8 @@ fn require_date_time(
         name,
         reason: "intrinsic called on a non-Intl.DateTimeFormat receiver".to_string(),
     };
-    let intl =
-        crate::intl::helpers::unwrap_legacy_receiver(ctx, *ctx.this_value()).ok_or_else(bad)?;
+    let intl = crate::intl::helpers::unwrap_legacy_receiver(ctx, *ctx.this_value(), name)?
+        .ok_or_else(bad)?;
     match intl.payload_clone(ctx.heap()) {
         IntlPayload::DateTimeFormat(d) => Ok(d),
         _ => Err(bad()),
@@ -1062,9 +1062,7 @@ fn coerce_to_number(
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, value)
     });
-    let n = number.map_err(|error| {
-        crate::native_function::vm_to_native_error(ctx.interp_mut(), error, name)
-    })?;
+    let n = number.map_err(|error| error.into_native(ctx.interp_mut(), name))?;
     Ok(n.as_f64())
 }
 
@@ -1269,7 +1267,7 @@ fn range_formattable(
         }
         let number = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_number_or_throw(interp, stack, &exec, value)
-                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))
+                .map_err(|e| e.into_native(interp, name))
         })?;
         Ok(Value::number(number))
     };

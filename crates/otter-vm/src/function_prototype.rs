@@ -76,10 +76,10 @@ pub(crate) fn install_symbol_has_instance(
             NativeCall::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance),
             &mut external_visit,
         )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        .map_err(JsSurfaceError::from)?,
     );
     let descriptor = PropertyDescriptor::data(value_root, false, false, false);
-    if !object::define_own_symbol_property(prototype, heap, well_known_has_instance, descriptor) {
+    if !object::define_own_symbol_property(prototype, heap, well_known_has_instance, descriptor)? {
         return Err(JsSurfaceError::DefinePropertyFailed("[Symbol.hasInstance]"));
     }
     Ok(())
@@ -130,7 +130,7 @@ pub(crate) fn install_restricted_accessors(
     )?);
     for name in ["caller", "arguments"] {
         let descriptor = PropertyDescriptor::accessor(Some(thrower), Some(thrower), false, true);
-        if !object::define_own_property_in_place(&mut prototype, heap, name, descriptor) {
+        if !object::define_own_property_in_place(&mut prototype, heap, name, descriptor)? {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
     }

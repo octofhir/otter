@@ -266,14 +266,14 @@ pub(crate) enum TemplateOp {
     },
     /// Exact derived-constructor superclass lookup from its class wrapper.
     ClassSuperConstructor { dst: u16, class: u16 },
-    /// `r<dst>` = materialized function object for `constants[constant]`.
-    MakeFunction { dst: u16, constant: u32 },
-    /// `r<dst>` = closure over `function` closing over the context held in
+    /// Fresh function from this instruction's source constant, with allocation roots.
+    MakeFunction { dst: u16, safepoint: SafepointId },
+    /// Fresh closure from this instruction's source constant and the context held in
     /// register `context`.
     MakeClosure {
         dst: u16,
-        function: u32,
         context: u16,
+        safepoint: SafepointId,
     },
     /// Materialize a regex literal from the constant pool.
     LoadRegExp { dst: u16, constant: u32 },
@@ -749,7 +749,7 @@ impl TemplatePlan {
 
     /// The plan with one operation sequence per instruction: no fused
     /// numeric chains span several instructions.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     pub(crate) fn build_unfused(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
         Self::build_with_fusion(view, false)
     }
@@ -1017,7 +1017,7 @@ impl TemplatePlan {
                         parent: operands.parent,
                         scope: operands.scope,
                         safepoint: lowering
-                            .context_alloc_safepoints
+                            .lexical_alloc_safepoints
                             .get(&lowered.byte_pc)
                             .copied()
                             .ok_or(Unsupported::OperandShape(
@@ -1031,7 +1031,7 @@ impl TemplatePlan {
                         dst: operands.dst,
                         src: operands.src,
                         safepoint: lowering
-                            .context_alloc_safepoints
+                            .lexical_alloc_safepoints
                             .get(&lowered.byte_pc)
                             .copied()
                             .ok_or(Unsupported::OperandShape("CopyContext without a safepoint"))?,
@@ -1041,15 +1041,23 @@ impl TemplatePlan {
                     let operands = lowered.constant_operands()?;
                     TemplateOp::MakeFunction {
                         dst: operands.dst,
-                        constant: operands.constant,
+                        safepoint: *lowering
+                            .lexical_alloc_safepoints
+                            .get(&lowered.byte_pc)
+                            .ok_or(Unsupported::OperandShape(
+                                "MakeFunction without a safepoint",
+                            ))?,
                     }
                 }
                 Op::MakeClosure => {
                     let operands = lowered.make_closure_operands()?;
                     TemplateOp::MakeClosure {
                         dst: operands.dst,
-                        function: operands.function,
                         context: operands.context,
+                        safepoint: *lowering
+                            .lexical_alloc_safepoints
+                            .get(&lowered.byte_pc)
+                            .ok_or(Unsupported::OperandShape("MakeClosure without a safepoint"))?,
                     }
                 }
                 Op::LoadThis => TemplateOp::LoadThis {
@@ -1967,7 +1975,8 @@ fn fuse_numeric_chains(
     }
     // Instruction PCs that some branch reaches; a chain cannot fuse across a
     // join into its interior (the first operation may still be a target).
-    let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
+    let mut branch_targets: BTreeSet<u32> =
+        view.code_block.block_starts().iter().copied().collect();
     for instruction in &instructions {
         match instruction.op {
             TemplateOp::Jump { target, .. }
@@ -2368,13 +2377,20 @@ mod tests {
         for id in [create_safepoint, copy_safepoint] {
             assert!(plan.safepoint_records.iter().any(|record| record.id == id));
         }
-        assert_eq!(
-            ops[7],
-            TemplateOp::MakeClosure {
-                dst: 5,
-                function: 0,
-                context: 4,
-            }
+        let TemplateOp::MakeClosure {
+            dst: 5,
+            context: 4,
+            safepoint: closure_safepoint,
+        } = ops[7]
+        else {
+            panic!("expected typed closure allocation");
+        };
+        assert_ne!(closure_safepoint, create_safepoint);
+        assert_ne!(closure_safepoint, copy_safepoint);
+        assert!(
+            plan.safepoint_records
+                .iter()
+                .any(|record| record.id == closure_safepoint)
         );
         assert_eq!(ops[8], TemplateOp::LoadSelfClosure { dst: 6 });
         assert_eq!(
@@ -2386,6 +2402,70 @@ mod tests {
                 slot: 2,
             }
         );
+    }
+
+    #[test]
+    fn all_lexical_allocation_operations_have_distinct_full_window_safepoints() {
+        let source = view(&[
+            (
+                Op::CreateContext,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::Imm32(0),
+                ],
+            ),
+            (
+                Op::CopyContext,
+                vec![Operand::Register(2), Operand::Register(1)],
+            ),
+            (
+                Op::MakeFunction,
+                vec![Operand::Register(3), Operand::ConstIndex(0)],
+            ),
+            (
+                Op::MakeClosure,
+                vec![
+                    Operand::Register(4),
+                    Operand::ConstIndex(0),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(4)]),
+        ]);
+        let plan = TemplatePlan::build(&source).expect("current typed lexical plan");
+        let ids: Vec<_> = plan
+            .instructions
+            .iter()
+            .filter_map(|instruction| match instruction.op {
+                TemplateOp::CreateContext { safepoint, .. }
+                | TemplateOp::CopyContext { safepoint, .. }
+                | TemplateOp::MakeFunction { safepoint, .. }
+                | TemplateOp::MakeClosure { safepoint, .. } => Some((instruction.pc, safepoint)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(
+            ids.iter()
+                .map(|(_, id)| *id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        for (pc, id) in ids {
+            assert_ne!(id, otter_vm::native_abi::NO_SAFEPOINT);
+            let record = plan
+                .safepoint_records
+                .iter()
+                .find(|record| record.id == id)
+                .unwrap();
+            assert!(record.inline_frames.is_empty());
+            assert!(
+                record.spill_roots.is_empty(),
+                "the collector traces the window itself; source pc={pc}"
+            );
+        }
     }
 
     /// A `Sub`/`Mul` run whose intermediate is dead fuses; the intermediate's
@@ -2504,6 +2584,80 @@ mod tests {
             plan.instructions[0].op,
             TemplateOp::FusedNumericChain { .. }
         ));
+    }
+
+    /// A verified handler target or branch target inside a numeric run is an
+    /// independent entry, so the run never fuses across it.
+    #[test]
+    fn fusion_respects_verified_handler_and_branch_entries() {
+        fn numeric_view(
+            ops: &[(Op, Vec<Operand>)],
+            handlers: &[otter_bytecode::ExceptionHandler],
+        ) -> JitCompileSnapshot {
+            let instructions = ops
+                .iter()
+                .enumerate()
+                .map(|(pc, (op, operands))| {
+                    JitTestInstruction::new(*op, pc as u32, pc as u32 * 32, operands.clone())
+                })
+                .collect();
+            let mut view =
+                JitCompileSnapshot::without_feedback_with_handlers(7, 2, 8, instructions, handlers);
+            for (pc, (op, _)) in ops.iter().enumerate() {
+                if matches!(op, Op::Sub | Op::SubImm | Op::Mul) {
+                    view.seed_arith_feedback_for_test(
+                        pc as u32,
+                        ArithFeedback::from_bits(ARITH_INT32 | ARITH_FLOAT64),
+                    );
+                }
+            }
+            view
+        }
+
+        let arithmetic = [
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::Mul,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+        ];
+        let handler = otter_bytecode::ExceptionHandler {
+            start: 0,
+            end: 1,
+            target: 1,
+            exception: 7,
+        };
+        let handler_view = numeric_view(&arithmetic, &[handler]);
+        assert!(handler_view.code_block.block_starts().contains(&1));
+        let mut branch = vec![(
+            Op::JumpIfFalse,
+            vec![Operand::Imm32(1), Operand::Register(0)],
+        )];
+        branch.extend(arithmetic);
+        let branch_view = numeric_view(&branch, &[]);
+        assert!(branch_view.code_block.block_starts().contains(&2));
+        for view in [handler_view, branch_view] {
+            let plan = TemplatePlan::build(&view).unwrap();
+            assert!(
+                !plan.instructions.iter().any(|instruction| matches!(
+                    instruction.op,
+                    TemplateOp::FusedNumericChain { .. }
+                )),
+                "an independently entered interior cannot share fused execution"
+            );
+        }
     }
 
     #[test]

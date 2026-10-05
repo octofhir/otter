@@ -94,19 +94,8 @@ fn dynamic_function_ctor_call(
         let result = scope.with_turn_parts(|interp, stack| {
             interp.build_dynamic_function(stack, &context, args, kind)
         });
-        let result = result.map_err(|err| {
-            let reason = format!("{err}");
-            match err {
-                crate::VmError::SyntaxError => NativeError::SyntaxError {
-                    name: "Function",
-                    reason,
-                },
-                _ => NativeError::TypeError {
-                    name: "Function",
-                    reason,
-                },
-            }
-        })?;
+        let result =
+            result.map_err(|error| error.into_native(scope.context().interp_mut(), "Function"))?;
         let result_handle = scope.value(result);
         let new_target_proto =
             crate::bootstrap::native_new_target_prototype(scope.context(), "Function")?;
@@ -140,7 +129,7 @@ fn install_function_prototype_callable_and_accessors(
 ) -> Result<(), JsSurfaceError> {
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
@@ -159,7 +148,7 @@ fn install_function_prototype_callable_and_accessors(
         function_prototype_call,
         &[&global_root, &prototype_root, &ctor_root],
     )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    .map_err(JsSurfaceError::from)?;
     // `native_static_with_value_roots` may move every rooted bootstrap object.
     // Reload the receiver from its rewritten root slot; the raw `prototype`
     // captured before the allocation is no longer valid.
@@ -169,7 +158,9 @@ fn install_function_prototype_callable_and_accessors(
     object::set_call_native(&mut prototype, heap, Value::native_function(prototype_call));
 
     let prototype_length = PropertyDescriptor::data(Value::number_i32(0), false, false, true);
-    object::define_own_property_in_place(&mut prototype, heap, "length", prototype_length);
+    if !object::define_own_property_in_place(&mut prototype, heap, "length", prototype_length)? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
 
     // String allocation is another moving-GC boundary. Publish the updated
     // receiver and reload it before the next property write.
@@ -181,13 +172,15 @@ fn install_function_prototype_callable_and_accessors(
     };
     let prototype_name_value = Value::string(
         crate::string::JsString::from_str_with_roots("", heap, &mut external_visit)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+            .map_err(JsSurfaceError::from)?,
     );
     let mut prototype = prototype_root
         .as_object()
         .expect("Function.prototype root must remain an object");
     let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
-    object::define_own_property_in_place(&mut prototype, heap, "name", prototype_name);
+    if !object::define_own_property_in_place(&mut prototype, heap, "name", prototype_name)? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
+    };
 
     function_prototype::install_restricted_accessors(heap, prototype, &[&global_root, &ctor_root])
 }

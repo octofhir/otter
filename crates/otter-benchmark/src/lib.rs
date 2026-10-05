@@ -22,6 +22,15 @@ use serde::{Deserialize, Serialize};
 
 pub mod process;
 
+#[cfg(feature = "engine")]
+pub mod gc_resources;
+
+#[cfg(feature = "warm-harness")]
+pub mod warm_harness;
+
+#[cfg(feature = "warm-harness")]
+pub mod startup_harness;
+
 /// Direct target calls used to seed arithmetic feedback before an engine
 /// compile benchmark snapshots the function.
 pub const ENGINE_COMPILE_FEEDBACK_SEED_CALLS: u32 = 8;

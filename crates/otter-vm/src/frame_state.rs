@@ -19,7 +19,8 @@
 //!   function value) being executed. There is no default; context-reading
 //!   bytecode (`LoadClosureContext`, `LoadSelf`) reads it directly.
 //! - Frames hold no binding storage: captured and eval-visible bindings live
-//!   in contexts, which reach the frame only through its registers and SELF.
+//!   in contexts. A nullable own DerivedThis identity root proves terminal
+//!   ownership without copying or caching a binding value.
 //!
 //! # Frame execution layout
 //!
@@ -96,6 +97,9 @@ pub struct ParkedFrameState {
     pub this_value: Value,
     pub new_target_value: Value,
     pub arguments_object: crate::JsObject,
+    pub(crate) construct_layout: crate::constructor_layout::ConstructorLayout,
+    pub(crate) derived_this_context: crate::context::ContextHandle,
+    pub(crate) construct_receiver: Value,
     pub return_register: Option<u16>,
 }
 
@@ -312,7 +316,7 @@ impl ParkedFrameState {
                     .expect("published argument bounds")
             })
             .collect();
-        Self::from_inputs(
+        let mut parked = Self::from_inputs(
             frame.header,
             SmallVec::from_slice(&frame.registers),
             arguments,
@@ -322,7 +326,11 @@ impl ParkedFrameState {
             frame.new_target(),
             frame.arguments_object,
             frame.return_register(),
-        )
+        );
+        parked.construct_layout = frame.construct_layout;
+        parked.derived_this_context = frame.derived_this_context;
+        parked.construct_receiver = frame.construct_receiver;
+        parked
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -346,6 +354,9 @@ impl ParkedFrameState {
             this_value,
             new_target_value,
             arguments_object,
+            construct_layout: crate::constructor_layout::ConstructorLayout::null(),
+            derived_this_context: crate::context::ContextHandle::null(),
+            construct_receiver: Value::UNDEFINED,
             return_register,
         }
     }
@@ -358,6 +369,9 @@ impl ParkedFrameState {
             this_value: self.this_value,
             new_target_value: self.new_target_value,
             arguments_object: self.arguments_object,
+            construct_layout: self.construct_layout,
+            derived_this_context: self.derived_this_context,
+            construct_receiver: self.construct_receiver,
             return_register: self.return_register,
             cold: None,
             parameter_count: self.parameter_count,
@@ -376,6 +390,17 @@ impl ParkedFrameState {
         self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
         self.new_target_value.trace_value_slots(visitor);
+        self.construct_receiver.trace_value_slots(visitor);
+        if !self.derived_this_context.is_null() {
+            visitor(
+                std::ptr::addr_of!(self.derived_this_context)
+                    .cast_mut()
+                    .cast(),
+            );
+        }
+        if !self.construct_layout.is_null() {
+            visitor(std::ptr::addr_of!(self.construct_layout).cast_mut().cast());
+        }
         if !self.arguments_object.is_null() {
             visitor(
                 std::ptr::addr_of!(self.arguments_object)
@@ -394,6 +419,9 @@ impl ParkedFrameState {
         crate::code_liveness::visit_value(&self.self_value, visitor);
         crate::code_liveness::visit_value(&self.this_value, visitor);
         crate::code_liveness::visit_value(&self.new_target_value, visitor);
+        crate::code_liveness::visit_value(&self.construct_receiver, visitor);
+        // The active source and real SELF above are semantic code roots.
+        // construct_layout.base_function_id is deliberately not visited.
     }
 
     #[cfg(test)]

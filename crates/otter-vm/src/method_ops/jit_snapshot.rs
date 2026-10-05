@@ -23,10 +23,6 @@ use crate::jit::{
     JitMethodHolder,
 };
 
-fn value_slot_byte(slot: u16) -> u32 {
-    u32::from(slot) * std::mem::size_of::<crate::Value>() as u32
-}
-
 /// The 32-bit no-expando/no-override word every `Map` and `Set` body carries.
 pub(crate) fn collection_guard() -> JitBodyGuard {
     JitBodyGuard::clear(
@@ -99,7 +95,11 @@ impl Interpreter {
                 active_realm: None,
             }),
             holder: self.jit_method_holder(proto)?,
-            method_value_byte: value_slot_byte(ic.proto_slot),
+            method_field: crate::object::field_location_at(
+                proto,
+                &self.gc_heap,
+                u32::from(ic.proto_slot),
+            ),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,
@@ -157,7 +157,11 @@ impl Interpreter {
                 active_realm: None,
             }),
             holder: self.jit_method_holder(proto)?,
-            method_value_byte: value_slot_byte(hit.slot),
+            method_field: crate::object::field_location_at(
+                proto,
+                &self.gc_heap,
+                u32::from(hit.slot),
+            ),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id: NO_SAFEPOINT,
@@ -233,8 +237,12 @@ impl Interpreter {
                 proto_offset: proto.offset(),
                 active_realm: None,
             }),
-            holder: JitMethodHolder::Shape(self.bake_shape(holder_shape)),
-            method_value_byte: value_slot_byte(hit.slot),
+            holder: JitMethodHolder::Shape(self.bake_shape(holder_shape)?),
+            method_field: crate::object::field_location_at(
+                proto,
+                &self.gc_heap,
+                u32::from(hit.slot),
+            ),
             builtin_native_ref,
             entry_stub_id: stub_id,
             safepoint_id,

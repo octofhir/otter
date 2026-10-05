@@ -4,6 +4,15 @@
 //! constructed lazily inside [`collator_compare`] from the resolved
 //! options cached on the [`crate::intl::payload::CollatorPayload`].
 //!
+//! # Contents
+//! - Locale and option resolution and ICU comparison.
+//! - Scoped ordinary records for `resolvedOptions`.
+//!
+//! # Invariants
+//! - Every result record and string stays in the native traced handle arena.
+//! - Record fields use ordinary writable, enumerable, configurable data descriptors.
+//! - Allocation failure retains its actual native OutOfMemory cause.
+//!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-collator-objects>
 
@@ -16,7 +25,6 @@ use icu_locale::Locale;
 
 use crate::intl::helpers::DEFAULT_LOCALE;
 use crate::intl::payload::{CollatorPayload, IntlPayload};
-use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Collator";
@@ -323,40 +331,29 @@ pub(crate) fn collator_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_collator(ctx, "resolvedOptions")?;
-    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
-    let usage = Value::string(JsString::from_str(&payload.usage, ctx.heap_mut())?);
-    let sensitivity = Value::string(JsString::from_str(&payload.sensitivity, ctx.heap_mut())?);
-    let case_first = Value::string(JsString::from_str(&payload.case_first, ctx.heap_mut())?);
-    let collation = Value::string(JsString::from_str(&payload.collation, ctx.heap_mut())?);
-    let ignore_punctuation = payload.ignore_punctuation;
-    let numeric = payload.numeric;
-    let include_numeric = numeric;
-    let include_case_first = payload.case_first != "false";
-    let mut obj = ctx.alloc_object_with_roots(
-        &[&locale, &usage, &sensitivity, &case_first, &collation],
-        &[],
-    )?;
-    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-    }
-    let heap = ctx.heap_mut();
-    crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "usage", usage);
-    crate::object::set(&mut obj, heap, "sensitivity", sensitivity);
-    crate::object::set(
-        &mut obj,
-        heap,
-        "ignorePunctuation",
-        Value::boolean(ignore_punctuation),
-    );
-    crate::object::set(&mut obj, heap, "collation", collation);
-    if include_numeric {
-        crate::object::set(&mut obj, heap, "numeric", Value::boolean(numeric));
-    }
-    if include_case_first {
-        crate::object::set(&mut obj, heap, "caseFirst", case_first);
-    }
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+        let flags = crate::object::PropertyFlags::data_default();
+        let locale = scope.string(&payload.locale)?;
+        scope.define(result, "locale", locale, flags)?;
+        let usage = scope.string(&payload.usage)?;
+        scope.define(result, "usage", usage, flags)?;
+        let sensitivity = scope.string(&payload.sensitivity)?;
+        scope.define(result, "sensitivity", sensitivity, flags)?;
+        let ignore_punctuation = scope.boolean(payload.ignore_punctuation);
+        scope.define(result, "ignorePunctuation", ignore_punctuation, flags)?;
+        let collation = scope.string(&payload.collation)?;
+        scope.define(result, "collation", collation, flags)?;
+        if payload.numeric {
+            let numeric = scope.boolean(payload.numeric);
+            scope.define(result, "numeric", numeric, flags)?;
+        }
+        if payload.case_first != "false" {
+            let case_first = scope.string(&payload.case_first)?;
+            scope.define(result, "caseFirst", case_first, flags)?;
+        }
+        Ok(scope.finish(result))
+    })
 }
 
 /// Run an ICU comparison with the resolved options. Falls back to

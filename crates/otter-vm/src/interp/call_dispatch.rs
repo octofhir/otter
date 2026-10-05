@@ -11,6 +11,9 @@
 //! before allocation. The native frame chain stays published throughout error
 //! conversion and suspension cleanup. An activation waiting on a call it
 //! staged stands at the staging instruction until the call completes.
+//! A completed Fatal pair propagates without another Error allocation. Raw
+//! prepublication StackOverflow is normalized once by the published interpreter
+//! caller, because admission failed before the child had an execution extent.
 //!
 //! # See also
 //! - [`super::dispatch`] for bytecode execution.
@@ -28,6 +31,9 @@ pub(crate) enum DispatchOutcome {
     Returned(Value),
     Call,
     Tier(usize),
+    /// An operation already completed with a terminal failure. Detail and
+    /// frames stay in the canonical interpreter owner; no Error is rebuilt.
+    Fatal(VmError),
 }
 
 pub(crate) extern "C" fn interpreter_entry(ctx: *mut JitCtx) -> NativeResultPair {
@@ -53,13 +59,19 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     let Some(activation) = ctx.checked_activation().copied() else {
         return NativeResultPair::fatal_internal();
     };
+    let frame = ctx.native_frame;
+    if frame.is_null() {
+        return NativeResultPair::fatal_internal();
+    }
+    // Resolve the actual published bytecode owner before borrowing the mutator.
+    let Some(context) = (unsafe { activation.owner_context((*frame).header.function_id) }) else {
+        return NativeResultPair::fatal_internal();
+    };
+    let context = &context;
     let Some(vm) = (unsafe { activation.vm.as_mut() }) else {
         return NativeResultPair::fatal_internal();
     };
     let Some(stack) = (unsafe { activation.stack.as_mut() }) else {
-        return NativeResultPair::fatal_internal();
-    };
-    let Some(context) = (unsafe { activation.context.as_ref() }) else {
         return NativeResultPair::fatal_internal();
     };
     let fresh_entry = entering;
@@ -105,6 +117,21 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
         } else {
             NativeResultPair::fatal_internal()
         };
+    }
+    // A completed callee Fatal already passed its allocating throw boundary.
+    // Preserving it prevents a failed Error allocation from being projected a
+    // second time into a smaller RangeError. Prepublication stack admission is
+    // the one raw-trampoline exception: its StackOverflow has no child extent
+    // and still belongs to this published caller's ordinary catch semantics.
+    if completion.validate(NativeResultDomain::Execution) == Some(NativeResultStatus::Fatal) {
+        let error = unsafe { ctx.error.as_ref() }
+            .and_then(Option::as_ref)
+            .copied();
+        if !matches!(error, Some(VmError::StackOverflow { .. })) {
+            vm.pending_uncaught_throw = None;
+            vm.frame_release_cold(unsafe { &mut *frame });
+            return completion;
+        }
     }
     // A call this activation staged has completed. The activation stands
     // at the staging instruction; a call instruction moves past it on a
@@ -186,6 +213,9 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     {
         resume_error = Some(error);
     }
+    if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
+        vm.begin_interpreted_retraining_activation(unsafe { &mut *frame });
+    }
     if fresh_entry && resume_error.is_none() && !stack.has_prepared_call() && vm.jit_hook.is_some()
     {
         match vm.prepare_compiled_entry(stack, context) {
@@ -210,7 +240,7 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
             Some(exception) => NativeResultPair::throw_value(exception),
             None => NativeResultPair::fatal_internal(),
         },
-        Err(error) => {
+        Ok(DispatchOutcome::Fatal(error)) | Err(error) => {
             vm.pending_uncaught_throw = None;
             vm.frame_release_cold(unsafe { &mut *frame });
             if let Some(slot) = unsafe { ctx.error.as_mut() } {
@@ -224,7 +254,7 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
 impl Interpreter {
     pub(crate) fn execute_prepared_call(
         &mut self,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         stack: &mut ActivationStack,
     ) -> Result<Value, VmError> {
         if !stack.is_runtime_rooted_by(self) {
@@ -265,15 +295,13 @@ impl Interpreter {
             completion_generation: 0,
         };
         unsafe { (*ctx.thread).frame_cell = std::ptr::from_mut(&mut ctx.native_frame) as u64 };
-        let enclosing = self
-            .jit_frame_cell
-            .replace(std::ptr::NonNull::from(&mut ctx.native_frame).cast());
+        let enclosing = self.jit_context.replace(std::ptr::NonNull::from(&mut ctx));
         let previous = unsafe { stack.bind_context(&mut ctx) };
         self.begin_work_budget_turn();
         let result = unsafe { call_trampoline(&mut ctx) };
         self.finish_work_budget_turn();
         stack.restore_context(previous);
-        self.jit_frame_cell = enclosing;
+        self.jit_context = enclosing;
         if let Some(call) = stack.take_pending() {
             self.release_prepared_inputs(call);
         }

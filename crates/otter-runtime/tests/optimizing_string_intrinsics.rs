@@ -6,14 +6,10 @@
 //! - Canonical fallbacks for ropes, slices, coercion, long search, and method
 //!   replacement after tier-up.
 //! - Address-stable literal cells surviving cache growth and moving GC.
-//! - Artifact proof that a guarded `indexOf` site calls its declared
-//!   no-allocation leaf behind the `%String.prototype%` dictionary-layout
-//!   proof instead of the general method boundary.
 //!
 //! # Invariants
 //! - Optimizing results match the interpreter oracle exactly.
 //! - Speculative checks run before effects and a miss remains reusable.
-//! - A leaf hit publishes no safepoint; its miss enters one committed call.
 //! - Literal relocations name traced cells, never moving string handles.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
@@ -209,8 +205,8 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
                   for (let index = 0; index < limit; index++) checksum += index;
                   return result;
                 }
-                function machineLiteralTarget() {
-                  return "machine-direct-literal";
+                function directLiteralTarget() {
+                  return "direct-target-literal";
                 }
 
                 // The first caller reaches OSR after one target observation.
@@ -221,12 +217,12 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
                 const first = nestedLiteralCaller(false, 64);
                 for (let warm = 0; warm < 4010; warm++) {
                   nestedLiteralCaller(false, 1);
-                  machineLiteralTarget();
+                  directLiteralTarget();
                 }
                 JSON.stringify([
                   first,
                   nestedLiteralCaller(false, 1),
-                  machineLiteralTarget()
+                  directLiteralTarget()
                 ]);
                 "#,
             ),
@@ -235,15 +231,16 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
         .expect("compile caller and nested literal target");
     assert_eq!(
         setup.completion_string(),
-        r#"[7,7,"machine-direct-literal"]"#
+        r#"[7,7,"direct-target-literal"]"#
     );
     assert!(
         runtime.execution_stats().jit_optimized_entries > 0,
         "fixture must execute optimized code"
     );
 
-    let artifacts = setup.jit_artifacts().expect("literal artifacts");
-    let relocations = artifacts
+    let relocations = setup
+        .jit_artifacts()
+        .expect("literal artifacts")
         .bundles()
         .iter()
         .filter_map(|bundle| bundle.file(JitArtifactFileName::Relocations))
@@ -254,17 +251,6 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
         relocations.contains("stringConstantCell"),
         "nested literal must use a symbolic traced-cell relocation: {relocations}"
     );
-    let code_maps = artifacts
-        .bundles()
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
-        .map(|file| std::str::from_utf8(file.contents()).expect("code maps are UTF-8"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        code_maps.contains("machineStringConstantLoad"),
-        "prepared LoadString must stay inside Machine IR: {code_maps}"
-    );
     drop(setup);
 
     runtime
@@ -273,80 +259,13 @@ fn nested_target_eager_literal_prewarm_survives_snapshot_gc_and_executes() {
     let cold = runtime
         .run_script(
             SourceInput::from_javascript(
-                "JSON.stringify([nestedLiteralCaller(true, 1), machineLiteralTarget()])",
+                "JSON.stringify([nestedLiteralCaller(true, 1), directLiteralTarget()])",
             ),
             "nested-eager-literal-after-gc.js",
         )
         .expect("execute cold literal through retained generated code");
     assert_eq!(
         cold.completion_string(),
-        r#"["nested-eager-literal","machine-direct-literal"]"#
-    );
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn optimizing_string_methods_call_declared_leaves_behind_layout_proofs() {
-    use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier};
-
-    let mut runtime = Runtime::builder()
-        .jit_selection(JitSelection::ProductionTiered)
-        .jit_debug(JitDebugRequest::artifacts())
-        .build()
-        .expect("string artifact runtime");
-    let result = runtime
-        .run_script(
-            SourceInput::from_javascript(STRING_MATRIX),
-            "optimizing-string-artifacts.js",
-        )
-        .expect("string artifact matrix");
-    let artifacts = result.jit_artifacts().expect("enabled artifact batch");
-    let optimizing: Vec<_> = artifacts
-        .bundles()
-        .iter()
-        .filter(|bundle| bundle.manifest().tier() == JitDebugTier::Optimizing)
-        .collect();
-
-    assert!(
-        optimizing.len() >= 2,
-        "both parameter string callers must optimize"
-    );
-    let optimizing_relocations = optimizing
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::Relocations))
-        .map(|file| std::str::from_utf8(file.contents()).expect("relocations are UTF-8"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        optimizing_relocations.contains("string_index_of_leaf"),
-        "indexOf must call its declared no-allocation leaf: {optimizing_relocations}"
-    );
-    let code_maps = optimizing
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::CodeMap))
-        .map(|file| std::str::from_utf8(file.contents()).expect("code maps are UTF-8"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for region in [
-        "machineCacheIrLoadIntrinsicPrototype",
-        "machineCacheIrGuardDictionaryLayout",
-        "machineNativeLeafIdentity",
-        "machineNativeLeafProbe",
-    ] {
-        assert!(
-            code_maps.contains(region),
-            "guarded String method hit must contain {region}: {code_maps}"
-        );
-    }
-    let all_relocations = artifacts
-        .bundles()
-        .iter()
-        .filter_map(|bundle| bundle.file(JitArtifactFileName::Relocations))
-        .map(|file| std::str::from_utf8(file.contents()).expect("relocations are UTF-8"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        all_relocations.contains("stringConstantCell"),
-        "compiled string literals must load from typed traced cells: {all_relocations}"
+        r#"["nested-eager-literal","direct-target-literal"]"#
     );
 }

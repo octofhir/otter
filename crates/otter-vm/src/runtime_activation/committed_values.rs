@@ -1,6 +1,8 @@
-//! Fixed boxed-value semantic completions for compiled activations.
+//! Committed semantic completions and boxed-value kernels.
 //!
 //! # Contents
+//! - Existing source/terminal error disposition shared by direct semantic
+//!   opcodes and compiled callers.
 //! - Typed operation families for object-protocol and scalar bytecodes,
 //!   including error allocation, throw origins and derived-`this` binding.
 //! - Generic binary arithmetic and relational operators for compiled sites
@@ -18,7 +20,8 @@
 //! - Function/PC identity is authoritative for the semantic operation; the
 //!   native ABI never receives an opcode, destination, or register index.
 //! - Once a kernel begins it returns only a normal value or an error. Compiled
-//!   entries turn catchable errors into rooted JavaScript exception values;
+//!   entries turn source errors into rooted JavaScript exception values and
+//!   retain an already completed terminal native/allocator/control failure;
 //!   there is no miss, deopt, materialization fallback, or replay outcome.
 //! - No native-frame or register-window borrow survives JavaScript reentry.
 //!
@@ -38,16 +41,72 @@ use super::RuntimeCall;
 
 /// Failure domain for a fixed committed value entry.
 ///
-/// Site decoding and activation validation happen before JavaScript semantics
-/// begin and therefore cannot be caught by JavaScript. Once the typed operation
-/// has been selected, semantic failures may be materialized as a pure throw
-/// value by the native entry.
+/// Site decoding and activation validation cannot be caught by JavaScript.
+/// Source semantic failures retain ordinary throwable materialization. A
+/// completed native execution failure, or refusal while materializing its
+/// exception, is terminal even after operation entry and is never projected
+/// again. The existing pending detail/frames remain owned by the interpreter.
 #[derive(Debug)]
 pub enum CommittedValueError {
     /// Catchable failure produced after entering the typed JS operation.
     JavaScript(VmError),
-    /// Invalid activation, PC, opcode family, or other pre-entry structure.
+    /// Invalid structure, or an actual terminal native/control/allocator
+    /// completion after entry. Its pending detail/frames remain authoritative.
     Fatal(VmError),
+}
+
+impl CommittedValueError {
+    /// Preserve the disposition of a child callable that has completed its
+    /// trampoline/error projection. This uses the existing completed-run
+    /// policy; direct errors of the current source operation do not enter here.
+    pub(crate) fn completed_call(error: VmError) -> Self {
+        if crate::RunError::bare(error).is_fatal() {
+            Self::Fatal(error)
+        } else {
+            Self::JavaScript(error)
+        }
+    }
+
+    /// Transfer an actual async-job completion into the existing owned run
+    /// result before its published activation extent is released. This is the
+    /// final job boundary: an escaping allocation failure has completed the job
+    /// and follows `RunError` policy, without another JavaScript projection.
+    pub(crate) fn into_run_error(self, interp: &mut Interpreter) -> crate::RunError {
+        let error = match self {
+            Self::JavaScript(error) | Self::Fatal(error) => error,
+        };
+        crate::RunError {
+            error,
+            frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+            detail: interp.take_error_detail(),
+        }
+    }
+
+    /// Complete at the native boundary while the canonical error detail and
+    /// source frames are still owned by the interpreter. A local JavaScript
+    /// allocation refusal enters the existing authored native OOM domain and
+    /// may materialize RangeError once. A terminal completion keeps the owned
+    /// execution-failure mapper. Source and compiled dispatch instead consume
+    /// the variants without another projection.
+    pub(crate) fn into_native(
+        self,
+        interp: &mut Interpreter,
+        name: &'static str,
+    ) -> crate::NativeError {
+        match self {
+            Self::JavaScript(VmError::OutOfMemory {
+                requested_bytes,
+                heap_limit_bytes,
+            }) => crate::NativeError::OutOfMemory {
+                name,
+                requested_bytes,
+                heap_limit_bytes,
+            },
+            Self::JavaScript(error) | Self::Fatal(error) => {
+                crate::native_function::vm_to_native_error(interp, error, name)
+            }
+        }
+    }
 }
 
 /// Object-protocol semantics selected by one published bytecode site.
@@ -183,10 +242,6 @@ pub enum ScalarValueOp {
     NewBuiltinError,
     /// Bind the completed `super()` result as derived-constructor `this`.
     BindThisValue,
-    /// Create the site's closure over its boxed context input.
-    MakeClosure,
-    /// Create the site's function over no context.
-    MakeFunction,
     /// Materialize the site's fresh RegExp literal.
     LoadRegExp,
 }
@@ -208,8 +263,6 @@ impl ScalarValueOp {
             Op::NewError => Ok(Self::NewError),
             Op::NewBuiltinError => Ok(Self::NewBuiltinError),
             Op::BindThisValue => Ok(Self::BindThisValue),
-            Op::MakeClosure => Ok(Self::MakeClosure),
-            Op::MakeFunction => Ok(Self::MakeFunction),
             Op::LoadRegExp => Ok(Self::LoadRegExp),
             _ => Err(VmError::InvalidOperand),
         }
@@ -225,7 +278,7 @@ impl Interpreter {
         operation: ObjectProtocolValueOp,
         mut value0: Value,
         mut value1: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // The binary kernels are the interpreter's own: they root both
         // operands in a handle scope before their first coercion, so they need
         // no second root frame here.
@@ -255,7 +308,7 @@ impl Interpreter {
             ObjectProtocolValueOp::Binary(_) => unreachable!("binary operators return above"),
             ObjectProtocolValueOp::HasProperty => {
                 if !value1.is_object_type() {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
                 result = self.coerce_property_key_value(stack, context, value0)?;
                 if let (Some(proxy), Some(symbol)) =
@@ -271,18 +324,23 @@ impl Interpreter {
                     } else if let Some(number) = result.as_number() {
                         VmPropertyKey::OwnedString(number.to_display_string())
                     } else {
-                        return Err(VmError::InvalidOperand);
+                        return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
                     };
-                    Value::boolean(
-                        self.ordinary_has_property_value(stack, context, value1, &key, 0)?,
-                    )
+                    Value::boolean(self.ordinary_has_property_value(
+                        stack,
+                        Some(context),
+                        value1,
+                        &key,
+                        0,
+                    )?)
                 }
             }
             ObjectProtocolValueOp::GetPrototype => {
                 if value0.is_proxy() {
                     self.ordinary_get_prototype_value(stack, context, value0, 0)?
                 } else {
-                    self.get_prototype_for_op(&value0)?
+                    self.get_prototype_for_op(&value0)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
             }
             ObjectProtocolValueOp::SetPrototype => {
@@ -296,7 +354,7 @@ impl Interpreter {
                     } else if let Some(class) = value1.as_class_constructor() {
                         Value::object(class.statics(&self.gc_heap))
                     } else {
-                        return Err(VmError::TypeMismatch);
+                        return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                     }
                 } else if value1.is_object()
                     || value1.is_proxy()
@@ -311,14 +369,14 @@ impl Interpreter {
                 } else if let Some(class) = value1.as_class_constructor() {
                     Value::object(class.statics(&self.gc_heap))
                 } else {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
 
                 if value0.is_proxy() || value0.is_object() {
                     if !self.set_prototype_value_proxy_aware(stack, context, &value0, &value1)? {
-                        return Err(
-                            self.err_type(("Object.setPrototypeOf failed".to_string()).into())
-                        );
+                        return Err(CommittedValueError::JavaScript(
+                            self.err_type(("Object.setPrototypeOf failed".to_string()).into()),
+                        ));
                     }
                 } else if value0.is_function()
                     || value0.is_closure()
@@ -334,7 +392,7 @@ impl Interpreter {
                     // prototypes are intentionally unaffected by this
                     // internal bytecode operation.
                 } else {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
                 Value::undefined()
             }
@@ -351,7 +409,7 @@ impl Interpreter {
         mut value0: Value,
         mut value1: Value,
         mut new_target: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: the input, activation binding, and result locals all precede
@@ -370,32 +428,33 @@ impl Interpreter {
             | ScalarValueOp::NewError
             | ScalarValueOp::NewBuiltinError
             | ScalarValueOp::PrepareThrow
-            | ScalarValueOp::MakeClosure
-            | ScalarValueOp::MakeFunction
             | ScalarValueOp::LoadRegExp => {
                 // This operation consumes activation metadata and is completed
                 // by `RuntimeCall::scalar_values`.
-                return Err(VmError::InvalidOperand);
+                return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
             }
             ScalarValueOp::ToObject => {
                 if value0.is_nullish() {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
-                self.box_sloppy_this_primitive_runtime_rooted(value0, &[])?
+                self.box_sloppy_this_primitive_runtime_rooted(value0, &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             }
             ScalarValueOp::ToPropertyKey => {
                 self.coerce_property_key_value(stack, context, value0)?
             }
             ScalarValueOp::TypeOf => {
                 let kind = value0.typeof_kind_with_heap(&self.gc_heap);
-                self.typeof_string_value(kind)?
+                self.typeof_string_value(kind)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             }
             ScalarValueOp::LoadNewTarget => new_target,
             ScalarValueOp::SameValue => {
                 Value::boolean(abstract_ops::same_value(&value0, &value1, &self.gc_heap))
             }
             ScalarValueOp::IsArray => {
-                let mut is_array = abstract_ops::is_array(&self.gc_heap, &value0)?;
+                let mut is_array = abstract_ops::is_array(&self.gc_heap, &value0)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 if !is_array
                     && let Some(object) = value0.as_object()
                     && self
@@ -408,7 +467,10 @@ impl Interpreter {
                 Value::boolean(is_array)
             }
             ScalarValueOp::ArrayLength => {
-                let array = value0.as_array().ok_or(VmError::TypeMismatch)?;
+                let array = value0
+                    .as_array()
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Value::number(NumberValue::from_f64(
                     crate::array::len(array, &self.gc_heap) as f64,
                 ))
@@ -416,7 +478,8 @@ impl Interpreter {
             ScalarValueOp::LoadLength => {
                 let string = value0
                     .as_string(&self.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
+                    .ok_or(VmError::TypeMismatch)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 Value::number_u32(string.len())
             }
         };
@@ -444,7 +507,6 @@ impl RuntimeCall<'_> {
             value0,
             value1,
         )
-        .map_err(CommittedValueError::JavaScript)
     }
 
     /// Complete the exact published scalar site over boxed values.
@@ -461,21 +523,13 @@ impl RuntimeCall<'_> {
             operation,
             ScalarValueOp::LoadArgumentsLength | ScalarValueOp::LoadArgumentsElement
         ) {
-            return self
-                .arguments_value(
-                    (operation == ScalarValueOp::LoadArgumentsElement).then_some(value0),
-                )
-                .map_err(CommittedValueError::JavaScript);
+            return self.arguments_value(
+                (operation == ScalarValueOp::LoadArgumentsElement).then_some(value0),
+            );
         }
         if operation == ScalarValueOp::BindThisValue {
             self.bind_derived_this_value(value0)?;
             return Ok(value0);
-        }
-        if operation == ScalarValueOp::MakeClosure {
-            return self.make_closure_value(value0);
-        }
-        if operation == ScalarValueOp::MakeFunction {
-            return self.make_function_value();
         }
         if operation == ScalarValueOp::LoadRegExp {
             let index = self
@@ -519,9 +573,7 @@ impl RuntimeCall<'_> {
             };
             let vm = unsafe { &mut *self.vm.as_ptr() };
             vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-            return vm
-                .new_error_value(context, unsafe { &mut *self.stack.as_ptr() }, kind, value0)
-                .map_err(CommittedValueError::JavaScript);
+            return vm.new_error_value(context, unsafe { &mut *self.stack.as_ptr() }, kind, value0);
         }
         let new_target = if operation == ScalarValueOp::LoadNewTarget {
             self.with_frame(|frame| Ok(frame.new_target_value()))
@@ -539,53 +591,6 @@ impl RuntimeCall<'_> {
             value1,
             new_target,
         )
-        .map_err(CommittedValueError::JavaScript)
-    }
-
-    /// Create the published `MakeClosure` site's closure over the boxed
-    /// context input (`value0`, the site's `ctx` register), exactly as the
-    /// interpreter does.
-    fn make_closure_value(&mut self, closure_context: Value) -> Result<Value, CommittedValueError> {
-        let function_index = self
-            .published_const_index(1)
-            .map_err(CommittedValueError::Fatal)?;
-        let resolved = self
-            .context
-            .for_function(self.function_id())
-            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
-        // SAFETY: construction validated the frame and owns it exclusively.
-        let mut frame = unsafe { crate::ActiveFrameMut::from_ptr(self.frame.as_ptr()) }
-            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        // §10.2.1.1 — an arrow closes over the enclosing activation's
-        // `new.target`; undefined is the unbound state.
-        let new_target = frame.new_target_value();
-        let lexical_new_target = (!new_target.is_undefined()).then_some(new_target);
-        vm.make_closure_value(
-            &resolved,
-            &mut frame,
-            function_index,
-            closure_context,
-            lexical_new_target,
-        )
-        .map_err(CommittedValueError::JavaScript)
-    }
-
-    /// Create the published `MakeFunction` site's function value, exactly as
-    /// the interpreter does.
-    fn make_function_value(&mut self) -> Result<Value, CommittedValueError> {
-        let function_index = self
-            .published_const_index(1)
-            .map_err(CommittedValueError::Fatal)?;
-        let resolved = self
-            .context
-            .for_function(self.function_id())
-            .map_err(|_| CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        let vm = unsafe { &mut *self.vm.as_ptr() };
-        vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Alloc);
-        vm.make_function_value(&resolved, function_index)
-            .map_err(CommittedValueError::JavaScript)
     }
 
     /// Convert one catchable VM failure into a JavaScript exception value.
@@ -596,7 +601,7 @@ impl RuntimeCall<'_> {
     /// therefore cannot erase the original nested getter/Proxy/call stack.
     /// A nested JavaScript throw is consumed from `pending_uncaught_throw`; an
     /// engine error is materialized directly. The caller owns the returned
-    /// value and must either take a Machine landing or invoke the typed throw
+    /// value and must either take a compiled landing or invoke the typed throw
     /// router. Structural host failures remain `Err`.
     pub fn take_js_throw(&mut self, err: VmError) -> Result<Value, VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
@@ -611,10 +616,8 @@ impl RuntimeCall<'_> {
             Some(&self.context),
             unsafe { self.stack.as_ref() },
             &err,
-        );
-        if exception.is_some() {
-            let _ = vm.take_error_detail();
-        }
-        exception.ok_or(err)
+        )?;
+        let _ = vm.take_error_detail();
+        Ok(exception)
     }
 }

@@ -4,19 +4,20 @@
 //! - [`AllocationFixture`] selects fixed or spread construction.
 //! - [`AllocationFixture::source`] preserves the retained-object workload while
 //!   varying only the getter's allocation count.
+//! - A separate observed setup brackets the same allocation loop for native
+//!   root/source proofs without changing benchmark source or kernel bytes.
 //! - Explicit setup/probe phases let correctness tests exclude warmup GC while
 //!   the diagnostic probe executes their unchanged concatenation.
 //! - Kernel emission wraps the same source for the existing engine benchmark.
 //!
 //! # Invariants
-//! - Each fixture warms its constructor 5,000 times before one observable
-//!   prototype getter retains the requested number of objects and strings.
+//! - Each fixture warms its constructor 5,000 times before a proxy's observable
+//!   prototype read retains the requested number of objects and strings.
 //! - The final completion verifies the argument, receiver prototype, and exact
 //!   retained-object count. Scaling never removes those checks.
 //!
 //! # See also
 //! - `crates/otter-benchmark/src/bin/allocation_probe.rs` measures each fixture/tier.
-//! - `crates/otter-runtime/tests/jit_machine_direct_call.rs` owns generated-linkage assertions.
 
 /// Observable constructor preparation with fixed or spread arguments.
 #[derive(Clone, Copy)]
@@ -65,8 +66,32 @@ impl AllocationFixture {
 
     /// Declare the fixture and warm generated constructor linkage.
     pub fn setup(self, allocations: usize) -> String {
-        // These are source templates, not text-based JavaScript parsing. Only
-        // the decimal loop bound changes relative to the correctness fixture.
+        self.setup_template(allocations, false)
+    }
+
+    /// Add scalar observations around the getter's original allocation loop.
+    ///
+    /// The runtime regression installs `constructorGcObserve`; the benchmark
+    /// continues to use `setup`, whose emitted bytes are unchanged.
+    #[allow(dead_code, reason = "only the runtime proof installs an observer")]
+    pub fn setup_observed(self, allocations: usize) -> String {
+        self.setup_template(allocations, true)
+    }
+
+    fn setup_template(self, allocations: usize, observed: bool) -> String {
+        let before = if observed {
+            "      constructorGcObserve(0);\n"
+        } else {
+            ""
+        };
+        let after = if observed {
+            "      constructorGcObserve(1);\n"
+        } else {
+            ""
+        };
+        // These are source templates, not text-based JavaScript parsing. The
+        // benchmark varies only its decimal bound; the separate observed
+        // variant adds scalar hooks around the same allocation loop.
         match self {
             Self::Fixed => format!(
                 r#"
@@ -74,18 +99,18 @@ let constructGcProbe = false;
 const constructGcPrototype = {{ marker: "prototype" }};
 globalThis.__machineConstructGcSink = [];
 
-function GcBase(marker) {{
+function GcBaseTarget(marker) {{
   this.marker = marker;
 }}
 
-Object.defineProperty(GcBase, "prototype", {{
-  configurable: true,
-  get() {{
+const GcBase = new Proxy(GcBaseTarget, {{
+  get(target, key, receiver) {{
+    if (key !== "prototype") return Reflect.get(target, key, receiver);
     if (constructGcProbe) {{
-      for (let i = 0; i < {allocations}; i++) {{
+{before}      for (let i = 0; i < {allocations}; i++) {{
         globalThis.__machineConstructGcSink.push({{ i, padding: "construct-gc-" + i }});
       }}
-    }}
+{after}    }}
     return constructGcPrototype;
   }}
 }});
@@ -103,18 +128,18 @@ let spreadGcProbe = false;
 const spreadGcPrototype = {{ marker: "spread-gc-prototype" }};
 globalThis.__spreadGcSink = [];
 
-function SpreadGcBase(marker) {{
+function SpreadGcBaseTarget(marker) {{
   this.marker = marker;
 }}
 
-Object.defineProperty(SpreadGcBase, "prototype", {{
-  configurable: true,
-  get() {{
+const SpreadGcBase = new Proxy(SpreadGcBaseTarget, {{
+  get(target, key, receiver) {{
+    if (key !== "prototype") return Reflect.get(target, key, receiver);
     if (spreadGcProbe) {{
-      for (let i = 0; i < {allocations}; i++) {{
+{before}      for (let i = 0; i < {allocations}; i++) {{
         globalThis.__spreadGcSink.push({{ i, padding: "spread-gc-" + i }});
       }}
-    }}
+{after}    }}
     return spreadGcPrototype;
   }}
 }});

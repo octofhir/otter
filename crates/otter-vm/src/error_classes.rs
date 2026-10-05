@@ -1,12 +1,11 @@
 //! ECMA-262 §19.3 / §20.5 Error class hierarchy.
 //!
 //! Each interpreter holds one [`ErrorClassRegistry`] populated at
-//! construction. The registry stores the seven canonical error
-//! classes — `Error` and its six native subclasses (`TypeError`,
-//! `RangeError`, `SyntaxError`, `ReferenceError`, `URIError`,
-//! `EvalError`) — as constructor [`JsObject`]s with a proper
-//! prototype chain so spec-faithful patterns work without bespoke
-//! handling at every call site:
+//! construction. The registry stores the eight ECMAScript error classes
+//! and the three WebAssembly error classes as constructor/prototype pairs.
+//! Only the ECMAScript classes become globals; WebAssembly exposes its
+//! original constructors through namespace bootstrap. Their common prototype
+//! chains make spec-faithful patterns work at every call site:
 //!
 //! - `e instanceof TypeError` and `e instanceof Error` both hold on
 //!   any instance produced through the registry, because each
@@ -19,7 +18,7 @@
 //!   compare against the candidate's `[[Prototype]]` chain.
 //!
 //! # Contents
-//! - [`ErrorKind`] — the seven canonical kinds.
+//! - [`ErrorKind`] — ECMAScript and WebAssembly intrinsic class selectors.
 //! - [`ErrorClassRegistry`] — Interpreter-owned table of constructor
 //!   + prototype objects keyed by [`ErrorKind`].
 //!
@@ -29,6 +28,10 @@
 //!   resolves to `Error.prototype`, and every constructor's
 //!   `prototype` own property points to the matching prototype
 //!   object.
+//! - WebAssembly constructors and prototypes share this same realm root owner.
+//!   They are created before user code, traced/restored in the registry's one
+//!   order, and exposed only by the WebAssembly namespace installation. Engine
+//!   failures never read or invoke a mutable global/namespace constructor.
 //! - The registry never re-allocates its prototype/constructor table after
 //!   construction. Active native constructor paths allocate instances through
 //!   one `NativeScope`: the selected prototype, instance, message, cause,
@@ -47,6 +50,7 @@
 //! - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
 use crate::gc_trace::GcRootVisitor;
+use crate::native_abi::CommittedValueError;
 use crate::native_function::NativeFunction;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
@@ -56,9 +60,9 @@ use crate::{ExecutionContext, Local, NativeScope, Value};
 use crate::{NativeCtx, NativeError};
 use otter_gc::raw::RawGc;
 
-/// One of the seven canonical native error classes.
+/// A canonical ECMAScript or WebAssembly native error class.
 ///
-/// `Error` is the base; the other six derive from it both
+/// `Error` is the base; every other intrinsic class derives from it both
 /// structurally (their prototype chains pass through
 /// `Error.prototype`) and behaviourally (they all share
 /// `Error.prototype.toString`).
@@ -97,6 +101,12 @@ pub enum ErrorKind {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-aggregate-error-objects>
     AggregateError,
+    /// `WebAssembly.CompileError` — module validation or compilation failure.
+    WasmCompileError,
+    /// `WebAssembly.LinkError` — import or instantiation linking failure.
+    WasmLinkError,
+    /// `WebAssembly.RuntimeError` — an actual WebAssembly runtime trap.
+    WasmRuntimeError,
 }
 
 impl ErrorKind {
@@ -115,6 +125,9 @@ impl ErrorKind {
             Self::URIError => "URIError",
             Self::EvalError => "EvalError",
             Self::AggregateError => "AggregateError",
+            Self::WasmCompileError => "CompileError",
+            Self::WasmLinkError => "LinkError",
+            Self::WasmRuntimeError => "RuntimeError",
         }
     }
 
@@ -151,6 +164,9 @@ impl ErrorKind {
             Self::URIError,
             Self::EvalError,
             Self::AggregateError,
+            Self::WasmCompileError,
+            Self::WasmLinkError,
+            Self::WasmRuntimeError,
         ]
     }
 }
@@ -187,13 +203,6 @@ unsafe fn trace_class_entries(slot: *mut (), visitor: &mut dyn FnMut(*mut RawGc)
     }
 }
 
-fn oom() -> otter_gc::OutOfMemory {
-    otter_gc::OutOfMemory::HeapCapExceeded {
-        requested_bytes: 0,
-        heap_limit_bytes: 0,
-    }
-}
-
 fn trace_value_roots(roots: &[&Value], visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
     for value in roots {
         value.trace_value_slots(visitor);
@@ -208,7 +217,6 @@ fn alloc_registry_object(
         trace_value_roots(roots, visitor);
     };
     crate::object::alloc_dictionary_object_with_roots(gc_heap, &mut external_visit)
-        .map_err(|_| oom())
 }
 
 /// Allocate a `JsString` while keeping `roots` live across the allocation.
@@ -239,7 +247,6 @@ fn native_static_with_roots(
         trace_value_roots(roots, visitor);
     };
     NativeFunction::new_static_with_roots(gc_heap, name, length, call, &mut external_visit)
-        .map_err(|_| oom())
 }
 
 fn native_constructor_static_with_roots(
@@ -259,10 +266,9 @@ fn native_constructor_static_with_roots(
         call,
         &mut external_visit,
     )
-    .map_err(|_| oom())
 }
 
-/// Per-interpreter registry of the seven canonical error classes.
+/// Per-realm registry of canonical ECMAScript and WebAssembly error classes.
 ///
 /// Constructed once at interpreter startup and threaded through
 /// the dispatch loop so [`Op::NewBuiltinError`] /
@@ -278,6 +284,9 @@ pub struct ErrorClassRegistry {
     uri_error: ClassEntry,
     eval_error: ClassEntry,
     aggregate_error: ClassEntry,
+    wasm_compile_error: ClassEntry,
+    wasm_link_error: ClassEntry,
+    wasm_runtime_error: ClassEntry,
 }
 
 /// §20.5.3.4 Error.prototype.toString — single source of truth for
@@ -314,7 +323,7 @@ pub(crate) fn render_error_to_string_spec(
     stack: &mut crate::ActivationStack,
     context: &crate::ExecutionContext,
     receiver: &Value,
-) -> Result<String, crate::VmError> {
+) -> Result<String, CommittedValueError> {
     fn coerce(
         interp: &mut crate::Interpreter,
         stack: &mut crate::ActivationStack,
@@ -322,12 +331,12 @@ pub(crate) fn render_error_to_string_spec(
         receiver: crate::Local<'_>,
         key: &'static str,
         default: &str,
-    ) -> Result<String, crate::VmError> {
+    ) -> Result<String, CommittedValueError> {
         let receiver_value = interp.escape_scoped(receiver);
         let vm_key = crate::VmPropertyKey::String(key);
         let outcome = interp.ordinary_get_value(
             stack,
-            context,
+            Some(context),
             receiver_value,
             receiver_value,
             &vm_key,
@@ -338,16 +347,18 @@ pub(crate) fn render_error_to_string_spec(
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
                 let receiver_value = interp.escape_scoped(receiver);
-                interp.run_callable_sync_rooted(stack, context, &getter, receiver_value, args)?
+                interp
+                    .run_callable_sync_rooted(stack, Some(context), &getter, receiver_value, args)
+                    .map_err(CommittedValueError::completed_call)?
             }
         };
         if value.is_undefined() {
             return Ok(default.to_string());
         }
         if value.is_symbol() {
-            return Err(interp.err_type(
+            return Err(CommittedValueError::JavaScript(interp.err_type(
                 (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
-            ));
+            )));
         }
         if let Some(s) = value.as_string(interp.gc_heap()) {
             return Ok(s.to_lossy_string(interp.gc_heap()));
@@ -362,9 +373,9 @@ pub(crate) fn render_error_to_string_spec(
             crate::abstract_ops::ToPrimitiveHint::String,
         )?;
         if primitive.is_symbol() {
-            return Err(interp.err_type(
+            return Err(CommittedValueError::JavaScript(interp.err_type(
                 (format!("Cannot convert a Symbol value to a string ('{key}')")).into(),
-            ));
+            )));
         }
         if let Some(s) = primitive.as_string(interp.gc_heap()) {
             Ok(s.to_lossy_string(interp.gc_heap()))
@@ -454,25 +465,42 @@ fn is_anonymous_frame_name(name: &str) -> bool {
 
 /// Append V8-style frame lines to an error's stack string. Each line is
 /// `    at <fn> (<module>:<line>:<col>)`, or `    at <module>:<line>:<col>`
-/// for anonymous/top-level frames. Line/column come from the registered
-/// module source (1-based, UTF-16 columns); when the source is unknown
+/// for anonymous/top-level frames. Line/column come from the exact captured
+/// defining source (1-based, UTF-16 columns); when the source is unknown
 /// the module URL is emitted without a position.
 pub(crate) fn append_stack_frames(
     out: &mut String,
     frames: &[crate::run_control::StackFrameSnapshot],
-    interp: &crate::Interpreter,
+) {
+    for frame in frames {
+        append_stack_frame(
+            out,
+            &frame.function_name,
+            &frame.module,
+            frame
+                .source_position
+                .as_ref()
+                .map(|position| (position.line_number, position.start_column)),
+        );
+    }
+}
+
+/// Render one captured frame without copying or admitting its source text.
+pub(crate) fn append_stack_frame(
+    out: &mut String,
+    name: &str,
+    module: &str,
+    position: Option<(u32, u32)>,
 ) {
     use std::fmt::Write as _;
-    for frame in frames {
-        let location = match interp.source_line_col(&frame.module, frame.span.0) {
-            Some((line, col)) => format!("{}:{}:{}", frame.module, line, col),
-            None => frame.module.clone(),
-        };
-        if is_anonymous_frame_name(&frame.function_name) {
-            let _ = write!(out, "\n    at {location}");
-        } else {
-            let _ = write!(out, "\n    at {} ({location})", frame.function_name);
-        }
+    let location = match position {
+        Some((line, column)) => format!("{module}:{line}:{}", column + 1),
+        None => module.to_owned(),
+    };
+    if is_anonymous_frame_name(name) {
+        let _ = write!(out, "\n    at {location}");
+    } else {
+        let _ = write!(out, "\n    at {name} ({location})");
     }
 }
 
@@ -495,6 +523,9 @@ impl ErrorClassRegistry {
             uri_error: entry(),
             eval_error: entry(),
             aggregate_error: entry(),
+            wasm_compile_error: entry(),
+            wasm_link_error: entry(),
+            wasm_runtime_error: entry(),
         }
     }
 
@@ -514,37 +545,38 @@ impl ErrorClassRegistry {
             &self.uri_error,
             &self.eval_error,
             &self.aggregate_error,
+            &self.wasm_compile_error,
+            &self.wasm_link_error,
+            &self.wasm_runtime_error,
         ] {
             entry.trace_roots(visitor);
         }
     }
 
-    /// Build the seven prototypes + constructors and link the
+    /// Build the intrinsic prototypes + constructors and link the
     /// inheritance chains.
     ///
     /// # Algorithm
     /// 1. Allocate `Error.prototype` and stamp `name = "Error"` and
     ///    `message = ""` (§20.5.3.4 / §20.5.3.5).
-    /// 2. For each of the six native subclasses, allocate a fresh
+    /// 2. For every native subclass, allocate a fresh
     ///    `prototype` object and link its `[[Prototype]]` to
     ///    `Error.prototype`. Stamp its own `name` to the class
     ///    name.
     /// 3. Allocate a constructor `JsObject` per class with a
     ///    `prototype` own property pointing to the matching
-    ///    prototype. The constructor itself isn't callable
-    ///    (foundation slice — `new TypeError(...)` lowers to a
-    ///    dedicated opcode); the constructor's only role is to
-    ///    surface as the right-hand side of `instanceof`.
+    ///    prototype. Attach its static native call/construct entry and
+    ///    metadata; all instance construction uses the same scoped kernel.
     ///
     /// # Errors
-    /// Returns [`StringError::OutOfMemory`] if `heap` cannot
-    /// accommodate the per-class `name` / `message` strings.
+    /// Returns the actual [`crate::js_surface::JsSurfaceError`] if a
+    /// constructor, prototype, descriptor or metadata allocation fails.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
     #[allow(unused_assignments)] // RootScope observes canonical slots through raw pointers.
-    pub fn new(gc_heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
+    pub fn new(gc_heap: &mut otter_gc::GcHeap) -> Result<Self, crate::js_surface::JsSurfaceError> {
         // Bootstrap allocations run under GC stress from the first allocation.
         // Keep exactly one mutable slot for each value that can cross an
         // allocation; the collector rewrites those slots in place. Completed
@@ -561,7 +593,8 @@ impl ErrorClassRegistry {
         let mut class_name_root = Value::undefined();
         let mut ctor_root = Value::undefined();
         let mut native_root = Value::undefined();
-        let mut entries: Box<Vec<(ErrorKind, ClassEntry)>> = Box::new(Vec::with_capacity(8));
+        let mut entries: Box<Vec<(ErrorKind, ClassEntry)>> =
+            Box::new(Vec::with_capacity(ErrorKind::all().len()));
         let mut roots = otter_gc::RootScope::new(gc_heap);
         // SAFETY: every slot above is declared before `roots`, so it outlives
         // the scope and remains at a stable stack address until construction
@@ -608,14 +641,14 @@ impl ErrorClassRegistry {
             gc_heap,
             "name",
             PropertyDescriptor::data(error_name_root, true, false, true),
-        );
+        )?;
         error_proto_root = Value::object(error_proto);
         let _ = object::define_own_property_in_place(
             &mut error_proto,
             gc_heap,
             "message",
             PropertyDescriptor::data(empty_root, true, false, true),
-        );
+        )?;
         error_proto_root = Value::object(error_proto);
 
         // §20.5.3.4 Error.prototype.toString — install as a real
@@ -646,31 +679,10 @@ impl ErrorClassRegistry {
                         reason: "missing execution context".to_string(),
                     })?;
             let display = ctx.with_turn_parts(|interp, stack| {
-                render_error_to_string_spec(interp, stack, &context, &receiver).map_err(|err| {
-                    match err {
-                        crate::VmError::Uncaught => {
-                            let value = match interp.take_error_detail() {
-                                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                                _ => Default::default(),
-                            };
-                            NativeError::Thrown {
-                                name: "Error.prototype.toString",
-                                message: value.into(),
-                            }
-                        }
-                        other => NativeError::TypeError {
-                            name: "Error.prototype.toString",
-                            reason: other.to_string(),
-                        },
-                    }
-                })
+                render_error_to_string_spec(interp, stack, &context, &receiver)
+                    .map_err(|error| error.into_native(interp, "Error.prototype.toString"))
             })?;
-            let s = JsString::from_str(&display, ctx.heap_mut()).map_err(|err| {
-                NativeError::TypeError {
-                    name: "Error.prototype.toString",
-                    reason: err.to_string(),
-                }
-            })?;
+            let s = JsString::from_str(&display, ctx.heap_mut()).map_err(NativeError::from)?;
             Ok(Value::string(s))
         }
         to_string_root = Value::native_function(native_static_with_roots(
@@ -688,7 +700,7 @@ impl ErrorClassRegistry {
             gc_heap,
             "toString",
             PropertyDescriptor::data(to_string_root, true, false, true),
-        );
+        )?;
         error_proto_root = Value::object(error_proto);
         // `get`/`set Error.prototype.stack` — the Error Stacks proposal
         // (`sec-get-error.prototype.stack`). `stack` is an accessor on
@@ -723,17 +735,16 @@ impl ErrorClassRegistry {
             // construction captured a call stack, append V8-style frame
             // lines `    at <fn> (<module>:<line>:<col>)`.
             let mut rendered = render_error_to_string(&receiver, ctx.heap());
-            if let Some(obj) = receiver.as_object()
-                && let Some(frames) = crate::object::error_stack_frames(obj, ctx.heap())
-            {
-                append_stack_frames(&mut rendered, &frames, ctx.interp_mut());
+            if let Some(obj) = receiver.as_object() {
+                crate::object::visit_error_stack_frames(
+                    obj,
+                    ctx.heap(),
+                    |name, module, position| {
+                        append_stack_frame(&mut rendered, name, module, position);
+                    },
+                );
             }
-            let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(|err| {
-                NativeError::TypeError {
-                    name: "get Error.prototype.stack",
-                    reason: err.to_string(),
-                }
-            })?;
+            let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(NativeError::from)?;
             Ok(Value::string(s))
         }
         fn error_stack_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -786,18 +797,12 @@ impl ErrorClassRegistry {
                     interp
                         .ordinary_get_own_property_descriptor_value(
                             stack,
-                            &context,
+                            Some(&context),
                             receiver_value,
                             &crate::VmPropertyKey::String("stack"),
                             0,
                         )
-                        .map_err(|error| {
-                            crate::native_function::vm_to_native_error(
-                                interp,
-                                error,
-                                "set Error.prototype.stack",
-                            )
-                        })
+                        .map_err(|error| error.into_native(interp, "set Error.prototype.stack"))
                 })?;
                 let receiver_value = scope.raw(receiver);
                 let value = scope.raw(value);
@@ -814,11 +819,7 @@ impl ErrorClassRegistry {
                                     value,
                                 )
                                 .map_err(|error| {
-                                    crate::native_function::vm_to_native_error(
-                                        interp,
-                                        error,
-                                        "set Error.prototype.stack",
-                                    )
+                                    error.into_native(interp, "set Error.prototype.stack")
                                 })
                         })?;
                     }
@@ -834,11 +835,7 @@ impl ErrorClassRegistry {
                                     value,
                                 )
                                 .map_err(|error| {
-                                    crate::native_function::vm_to_native_error(
-                                        interp,
-                                        error,
-                                        "set Error.prototype.stack",
-                                    )
+                                    error.into_native(interp, "set Error.prototype.stack")
                                 })
                         })?;
                     }
@@ -868,7 +865,7 @@ impl ErrorClassRegistry {
             gc_heap,
             "stack",
             PropertyDescriptor::accessor(Some(stack_get_root), Some(stack_set_root), false, true),
-        );
+        )?;
         error_proto_root = Value::object(error_proto);
 
         // §20.5.3.4 Error.prototype.toString is intercepted by
@@ -912,7 +909,7 @@ impl ErrorClassRegistry {
                 gc_heap,
                 "name",
                 PropertyDescriptor::data(name_root, false, false, true),
-            );
+            )?;
             let _ = object::define_own_property_in_place(
                 ctor,
                 gc_heap,
@@ -923,7 +920,7 @@ impl ErrorClassRegistry {
                     false,
                     true,
                 ),
-            );
+            )?;
             Ok(())
         }
 
@@ -932,7 +929,7 @@ impl ErrorClassRegistry {
         // construct receiver or allocating a fresh ordinary-call shell), stamps
         // `message` when provided, then performs
         // [`InstallErrorCause`] when `options` is an object with
-        // an own `cause` property. The seven static dispatchers
+        // an own `cause` property. The static ordinary-error dispatchers
         // below close over their `ErrorKind` so the shared
         // [`make_instance_native`] body can look up the realm
         // registry from the live `NativeCtx`.
@@ -973,11 +970,9 @@ impl ErrorClassRegistry {
                     let coerced = match coerced {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(crate::native_function::vm_to_native_error(
-                                scope.context().interp_mut(),
-                                error,
-                                kind.class_name(),
-                            ));
+                            return Err(
+                                error.into_native(scope.context().interp_mut(), kind.class_name())
+                            );
                         }
                     };
                     ErrorClassRegistry::define_error_message_native_scoped(
@@ -990,11 +985,9 @@ impl ErrorClassRegistry {
                 let cause = match read_options_cause_scoped(&mut scope, &context, options) {
                     Ok(value) => value,
                     Err(error) => {
-                        return Err(crate::native_function::vm_to_native_error(
-                            scope.context().interp_mut(),
-                            error,
-                            kind.class_name(),
-                        ));
+                        return Err(
+                            error.into_native(scope.context().interp_mut(), kind.class_name())
+                        );
                     }
                 };
                 if let Some(cause) = cause {
@@ -1017,11 +1010,15 @@ impl ErrorClassRegistry {
                         frames.truncate(limit);
                     }
                     if !frames.is_empty() {
-                        let object = scope
+                        let mut object = scope
                             .raw(instance)
                             .as_object()
                             .expect("scoped Error instance remains an object");
-                        object::set_error_stack_frames(object, scope.context().heap_mut(), frames);
+                        object::set_error_stack_frames(
+                            &mut object,
+                            scope.context().heap_mut(),
+                            frames,
+                        )?;
                     }
                 }
                 Ok(scope.finish(instance))
@@ -1036,7 +1033,7 @@ impl ErrorClassRegistry {
             scope: &mut NativeScope<'scope, '_>,
             context: &ExecutionContext,
             options: Option<Local<'scope>>,
-        ) -> Result<Option<Local<'scope>>, crate::VmError> {
+        ) -> Result<Option<Local<'scope>>, CommittedValueError> {
             let Some(options) = options else {
                 return Ok(None);
             };
@@ -1046,20 +1043,30 @@ impl ErrorClassRegistry {
             let key = crate::VmPropertyKey::String("cause");
             let options_value = scope.raw(options);
             let present = scope.with_turn_parts(|interp, stack| {
-                interp.ordinary_has_property_value(stack, context, options_value, &key, 0)
+                interp.ordinary_has_property_value(stack, Some(context), options_value, &key, 0)
             })?;
             if !present {
                 return Ok(None);
             }
             let options_value = scope.raw(options);
             let outcome = scope.with_turn_parts(|interp, stack| {
-                interp.ordinary_get_value(stack, context, options_value, options_value, &key, 0)
+                interp.ordinary_get_value(
+                    stack,
+                    Some(context),
+                    options_value,
+                    options_value,
+                    &key,
+                    0,
+                )
             })?;
             match outcome {
                 crate::VmGetOutcome::Value(value) => Ok(Some(scope.value(value))),
                 crate::VmGetOutcome::InvokeGetter { getter } => {
                     let getter = scope.value(getter);
-                    scope.call_vm(getter, options, &[]).map(Some)
+                    scope
+                        .call_vm(getter, options, &[])
+                        .map(Some)
+                        .map_err(CommittedValueError::completed_call)
                 }
             }
         }
@@ -1084,6 +1091,15 @@ impl ErrorClassRegistry {
         }
         fn ctor_eval(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::EvalError, a)
+        }
+        fn ctor_wasm_compile(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::WasmCompileError, a)
+        }
+        fn ctor_wasm_link(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::WasmLinkError, a)
+        }
+        fn ctor_wasm_runtime(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::WasmRuntimeError, a)
         }
         /// §20.5.7.1 AggregateError(errors, message [, options]).
         /// Differs from the regular native-error constructors:
@@ -1127,11 +1143,9 @@ impl ErrorClassRegistry {
                     let coerced = match coerced {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(crate::native_function::vm_to_native_error(
-                                scope.context().interp_mut(),
-                                error,
-                                "AggregateError",
-                            ));
+                            return Err(
+                                error.into_native(scope.context().interp_mut(), "AggregateError")
+                            );
                         }
                     };
                     ErrorClassRegistry::define_error_message_native_scoped(
@@ -1144,11 +1158,9 @@ impl ErrorClassRegistry {
                 let cause = match read_options_cause_scoped(&mut scope, &context, options) {
                     Ok(value) => value,
                     Err(error) => {
-                        return Err(crate::native_function::vm_to_native_error(
-                            scope.context().interp_mut(),
-                            error,
-                            "AggregateError",
-                        ));
+                        return Err(
+                            error.into_native(scope.context().interp_mut(), "AggregateError")
+                        );
                     }
                 };
                 if let Some(cause) = cause {
@@ -1196,11 +1208,7 @@ impl ErrorClassRegistry {
             let (iterator, next_method) = match iterator_result {
                 Ok(handles) => handles,
                 Err(error) => {
-                    return Err(crate::native_function::vm_to_native_error(
-                        scope.context().interp_mut(),
-                        error,
-                        "AggregateError",
-                    ));
+                    return Err(error.into_native(scope.context().interp_mut(), "AggregateError"));
                 }
             };
             let iterator = scope.value(iterator);
@@ -1223,11 +1231,9 @@ impl ErrorClassRegistry {
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        return Err(crate::native_function::vm_to_native_error(
-                            scope.context().interp_mut(),
-                            error,
-                            "AggregateError",
-                        ));
+                        return Err(
+                            error.into_native(scope.context().interp_mut(), "AggregateError")
+                        );
                     }
                 }
             }
@@ -1257,7 +1263,7 @@ impl ErrorClassRegistry {
             gc_heap,
             "prototype",
             PropertyDescriptor::data(Value::object(error_proto), false, false, false),
-        );
+        )?;
         error_ctor_root = Value::object(error_ctor);
         let mut error_proto = error_proto_root
             .as_object()
@@ -1267,7 +1273,7 @@ impl ErrorClassRegistry {
             gc_heap,
             "constructor",
             PropertyDescriptor::data(Value::object(error_ctor), true, false, true),
-        );
+        )?;
         error_proto_root = Value::object(error_proto);
         native_root = Value::native_function(native_constructor_static_with_roots(
             gc_heap,
@@ -1308,7 +1314,7 @@ impl ErrorClassRegistry {
             gc_heap,
             "isError",
             PropertyDescriptor::data(native_root, true, false, true),
-        );
+        )?;
         error_ctor_root = Value::object(error_ctor);
         // V8 extension `Error.captureStackTrace(target[, constructorOpt])`:
         // record the current call stack onto `target.stack`. When
@@ -1331,7 +1337,7 @@ impl ErrorClassRegistry {
             args: &[Value],
         ) -> Result<Value, NativeError> {
             let target = args.first().copied().unwrap_or_else(Value::undefined);
-            let Some(target_obj) = target.as_object() else {
+            let Some(mut target_obj) = target.as_object() else {
                 return Err(NativeError::TypeError {
                     name: "Error.captureStackTrace",
                     reason: "target must be an object".to_string(),
@@ -1365,19 +1371,14 @@ impl ErrorClassRegistry {
             if crate::object::has_error_data(target_obj, ctx.heap()) {
                 // Target inherits the `Error.prototype.stack` getter:
                 // store frames and let it format lazily (V8 model).
-                crate::object::set_error_stack_frames(target_obj, ctx.heap_mut(), frames);
+                crate::object::set_error_stack_frames(&mut target_obj, ctx.heap_mut(), frames)?;
             } else {
                 // Plain object: install an own formatted `stack` data
                 // property (the JSC-style eager shape, acceptable per the
                 // TC39 capture-stack-trace proposal).
                 let mut rendered = render_error_to_string(&target, ctx.heap());
-                append_stack_frames(&mut rendered, &frames, ctx.interp_mut());
-                let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(|err| {
-                    NativeError::TypeError {
-                        name: "Error.captureStackTrace",
-                        reason: err.to_string(),
-                    }
-                })?;
+                append_stack_frames(&mut rendered, &frames);
+                let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(NativeError::from)?;
                 // The string allocation may have moved the target; the
                 // rooted argument slot is the live handle.
                 let target_obj = args
@@ -1389,17 +1390,17 @@ impl ErrorClassRegistry {
                     ctx.heap_mut(),
                     "stack",
                     PropertyDescriptor::data(Value::string(s), true, false, true),
-                );
+                )?;
                 // Keep the structured frames as well. A plain object is a
                 // capture target precisely because it is cheap, and callers
                 // that want the position rather than the rendered text ask
                 // for the frames — the rendering above must not be the only
                 // record of where the capture happened.
-                let target_obj = args
+                let mut target_obj = args
                     .first()
                     .and_then(|value| value.as_object())
                     .unwrap_or(target_obj);
-                crate::object::set_error_stack_frames(target_obj, ctx.heap_mut(), frames);
+                crate::object::set_error_stack_frames(&mut target_obj, ctx.heap_mut(), frames)?;
             }
             Ok(Value::undefined())
         }
@@ -1418,7 +1419,7 @@ impl ErrorClassRegistry {
             gc_heap,
             "captureStackTrace",
             PropertyDescriptor::data(native_root, true, false, true),
-        );
+        )?;
         error_ctor_root = Value::object(error_ctor);
         // V8 extension `Error.stackTraceLimit` (default 10): the maximum
         // number of frames captured for `Error.prototype.stack`. Writable
@@ -1433,7 +1434,7 @@ impl ErrorClassRegistry {
                 false,
                 true,
             ),
-        );
+        )?;
         error_ctor_root = Value::object(error_ctor);
         entries.push((
             ErrorKind::Error,
@@ -1458,6 +1459,9 @@ impl ErrorClassRegistry {
             ErrorKind::URIError,
             ErrorKind::EvalError,
             ErrorKind::AggregateError,
+            ErrorKind::WasmCompileError,
+            ErrorKind::WasmLinkError,
+            ErrorKind::WasmRuntimeError,
         ] {
             proto_root = Value::object(alloc_registry_object(gc_heap, &[])?);
             let mut proto = proto_root
@@ -1466,7 +1470,12 @@ impl ErrorClassRegistry {
             let error_proto = error_proto_root
                 .as_object()
                 .expect("error prototype is an object");
-            object::set_prototype(proto, gc_heap, Some(error_proto));
+            if !object::set_prototype(&mut proto, gc_heap, Some(error_proto))? {
+                return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                    "NativeError.prototype.[[Prototype]]",
+                ));
+            }
+            proto_root = Value::object(proto);
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
             class_name_root =
@@ -1486,14 +1495,14 @@ impl ErrorClassRegistry {
                 gc_heap,
                 "name",
                 PropertyDescriptor::data(class_name_root, true, false, true),
-            );
+            )?;
             proto_root = Value::object(proto);
             let _ = object::define_own_property_in_place(
                 &mut proto,
                 gc_heap,
                 "message",
                 PropertyDescriptor::data(empty_root, true, false, true),
-            );
+            )?;
             proto_root = Value::object(proto);
             ctor_root = Value::object(alloc_registry_object(gc_heap, &[])?);
             // §20.5.6.{2,3} — same prototype/constructor shape.
@@ -1508,14 +1517,14 @@ impl ErrorClassRegistry {
                 gc_heap,
                 "prototype",
                 PropertyDescriptor::data(Value::object(proto), false, false, false),
-            );
+            )?;
             ctor_root = Value::object(ctor);
             let _ = object::define_own_property_in_place(
                 &mut proto,
                 gc_heap,
                 "constructor",
                 PropertyDescriptor::data(Value::object(ctor), true, false, true),
-            );
+            )?;
             proto_root = Value::object(proto);
             // §20.5.7.2 — `AggregateError(errors, message?)` has
             // `length` 2; every other native error has `length` 1.
@@ -1533,6 +1542,9 @@ impl ErrorClassRegistry {
                 ErrorKind::URIError => ctor_uri,
                 ErrorKind::EvalError => ctor_eval,
                 ErrorKind::AggregateError => ctor_aggregate,
+                ErrorKind::WasmCompileError => ctor_wasm_compile,
+                ErrorKind::WasmLinkError => ctor_wasm_link,
+                ErrorKind::WasmRuntimeError => ctor_wasm_runtime,
             };
             native_root = Value::native_function(native_constructor_static_with_roots(
                 gc_heap,
@@ -1576,6 +1588,9 @@ impl ErrorClassRegistry {
             uri_error: take(ErrorKind::URIError),
             eval_error: take(ErrorKind::EvalError),
             aggregate_error: take(ErrorKind::AggregateError),
+            wasm_compile_error: take(ErrorKind::WasmCompileError),
+            wasm_link_error: take(ErrorKind::WasmLinkError),
+            wasm_runtime_error: take(ErrorKind::WasmRuntimeError),
         })
     }
 
@@ -1589,13 +1604,17 @@ impl ErrorClassRegistry {
             ErrorKind::URIError => &self.uri_error,
             ErrorKind::EvalError => &self.eval_error,
             ErrorKind::AggregateError => &self.aggregate_error,
+            ErrorKind::WasmCompileError => &self.wasm_compile_error,
+            ErrorKind::WasmLinkError => &self.wasm_link_error,
+            ErrorKind::WasmRuntimeError => &self.wasm_runtime_error,
         }
     }
 
     /// Wire the realm-level prototype chain that requires
     /// `%Function.prototype%` and `%Object.prototype%` (which only
-    /// exist after bootstrap), and register every native error
-    /// constructor as an own data property of `globalThis`.
+    /// exist after bootstrap), and register the eight ECMAScript constructors
+    /// as own data properties of `globalThis`. The WebAssembly namespace later
+    /// installs its three original constructors from this same registry.
     ///
     /// # Algorithm
     /// Per ECMA-262 §20.5.6:
@@ -1608,60 +1627,86 @@ impl ErrorClassRegistry {
     /// Constructors land on `globalThis` as `{ writable: true,
     /// enumerable: false, configurable: true }` per §17.
     pub(crate) fn finalize_after_bootstrap(
-        &self,
+        &mut self,
         gc_heap: &mut otter_gc::GcHeap,
-        function_prototype: JsObject,
-        object_prototype: JsObject,
-        global_this: JsObject,
-    ) {
-        // Link Error -> Function.prototype.
-        object::set_prototype(self.error.constructor, gc_heap, Some(function_prototype));
-        // Link Error.prototype -> Object.prototype.
-        object::set_prototype(self.error.prototype, gc_heap, Some(object_prototype));
-        // Link each subclass constructor -> Error.
-        for entry in [
-            &self.type_error,
-            &self.range_error,
-            &self.syntax_error,
-            &self.reference_error,
-            &self.uri_error,
-            &self.eval_error,
-            &self.aggregate_error,
-        ] {
-            object::set_prototype(entry.constructor, gc_heap, Some(self.error.constructor));
+        mut function_prototype: JsObject,
+        mut object_prototype: JsObject,
+        mut global_this: JsObject,
+    ) -> Result<(), crate::js_surface::JsSurfaceError> {
+        use crate::rooting::RootScopeExt;
+        unsafe fn trace_registry(
+            slot: *mut (),
+            visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+        ) {
+            // SAFETY: registered only for the stationary registry borrowed below.
+            unsafe { (&*slot.cast::<ErrorClassRegistry>()).trace_gc_roots(visitor) };
         }
-        // Cache each prototype's instance root now, so an out-of-memory
-        // `RangeError` finds its root without allocating.
-        for entry in [
-            &self.error,
-            &self.type_error,
-            &self.range_error,
-            &self.syntax_error,
-            &self.reference_error,
-            &self.uri_error,
-            &self.eval_error,
-            &self.aggregate_error,
-        ] {
-            let _ = object::root_for_prototype(gc_heap, Some(entry.prototype));
+        let mut roots = otter_gc::RootScope::new(gc_heap);
+        // SAFETY: the registry and parameters remain stationary throughout this
+        // method, including root preparation and descriptor allocation.
+        unsafe {
+            roots.add_erased((self as *mut Self).cast(), trace_registry);
+            roots.add_object(&mut function_prototype);
+            roots.add_object(&mut object_prototype);
+            roots.add_object(&mut global_this);
         }
-        // Register globals.
-        for (name, entry) in [
-            ("Error", &self.error),
-            ("TypeError", &self.type_error),
-            ("RangeError", &self.range_error),
-            ("SyntaxError", &self.syntax_error),
-            ("ReferenceError", &self.reference_error),
-            ("URIError", &self.uri_error),
-            ("EvalError", &self.eval_error),
-            ("AggregateError", &self.aggregate_error),
-        ] {
-            let _ = object::define_own_property(
-                global_this,
+        let mut constructor = self.error.constructor;
+        if !object::set_prototype(&mut constructor, gc_heap, Some(function_prototype))? {
+            return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                "Error.[[Prototype]]",
+            ));
+        }
+        let mut prototype = self.error.prototype;
+        if !object::set_prototype(&mut prototype, gc_heap, Some(object_prototype))? {
+            return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                "Error.prototype.[[Prototype]]",
+            ));
+        }
+        // All intrinsic classes share this one pinned registry and trace order.
+        // Only the ECMAScript classes below become globals. WebAssembly exposes
+        // its original constructors through its static namespace bootstrap.
+        let kinds = ErrorKind::all();
+        for kind in &kinds[1..] {
+            let mut constructor = self.entry(*kind).constructor;
+            if !object::set_prototype(&mut constructor, gc_heap, Some(self.error.constructor))? {
+                return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                    "native Error.[[Prototype]]",
+                ));
+            }
+        }
+        // Cache each instance root before cap enforcement can require an
+        // emergency error. Canonical registry slots are reloaded every time.
+        for &kind in kinds {
+            object::root_for_prototype(
                 gc_heap,
-                name,
-                PropertyDescriptor::data(Value::object(entry.constructor), true, false, true),
-            );
+                Some(self.entry(kind).prototype),
+                object::ShapeState::ORDINARY,
+                &mut |_| {},
+            )?;
         }
+        for (name, kind) in [
+            ("Error", ErrorKind::Error),
+            ("TypeError", ErrorKind::TypeError),
+            ("RangeError", ErrorKind::RangeError),
+            ("SyntaxError", ErrorKind::SyntaxError),
+            ("ReferenceError", ErrorKind::ReferenceError),
+            ("URIError", ErrorKind::URIError),
+            ("EvalError", ErrorKind::EvalError),
+            ("AggregateError", ErrorKind::AggregateError),
+        ] {
+            let descriptor = PropertyDescriptor::data(
+                Value::object(self.entry(kind).constructor),
+                true,
+                false,
+                true,
+            );
+            if !object::define_own_property_in_place(&mut global_this, gc_heap, name, descriptor)? {
+                return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                    name,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Borrow the constructor `JsObject` for `kind`. Used to back
@@ -1698,8 +1743,8 @@ impl ErrorClassRegistry {
         instance: Local<'_>,
     ) -> Result<(), NativeError> {
         // §20.5.* — the instance carries the [[ErrorData]] internal slot.
-        // This is non-allocating and reloads the receiver from its canonical
-        // Local immediately before the internal write.
+        // The sidecar owner may allocate. The actual receiver lives in the
+        // canonical Local and the typed allocation failure is propagated.
         let mut object = scope
             .raw(instance)
             .as_object()
@@ -1707,7 +1752,7 @@ impl ErrorClassRegistry {
                 name: "Error",
                 reason: "construct receiver is not an ordinary object".to_string(),
             })?;
-        crate::object::set_error_data(&mut object, scope.context().heap_mut());
+        crate::object::set_error_data(&mut object, scope.context().heap_mut())?;
         Ok(())
     }
 
@@ -1750,3 +1795,6 @@ impl ErrorClassRegistry {
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

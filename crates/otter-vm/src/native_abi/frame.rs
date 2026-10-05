@@ -16,7 +16,8 @@
 //! - VM and JIT are built together and consume one current layout; there is no
 //!   compatibility/version protocol inside the process.
 //! - A frame carries no binding storage. Captured bindings live in contexts
-//!   reached through registers; the incoming context is `SELF`'s closure
+//!   reached through registers. The nullable DerivedThis identity root names
+//!   the actual own context; its slot remains the sole binding storage. The incoming context is `SELF`'s closure
 //!   context, so SELF is always the exact closure being executed.
 //! - The nullable arguments cache is initialized before publication and traced
 //!   in place; exact deopt preserves its identity in the interpreter frame.
@@ -26,9 +27,11 @@
 //!   The innermost frame of the live compiled entry is the entry's
 //!   `JitCtx::native_frame`; [`VmThread::frame_cell`] names that cell.
 //! - Tagged values are frame-homed at safepoints; derived movable pointers are
-//!   recomputed after any allocating or reentrant call. An optimized frame
-//!   names its in-progress call's safepoint in its own record; nothing else
-//!   publishes its roots.
+//!   recomputed after any allocating or reentrant call. Suspended compiled
+//!   callers resolve the exact return address owned by their immediate child
+//!   or the canonical pending request before publication. Active C helpers
+//!   retain explicit root/PC stamps. Pending anchors transfer once into Frame
+//!   and never enter parked activation state.
 //!
 //! # See also
 //! - [`super::safepoints`] for precise root maps.
@@ -300,18 +303,38 @@ pub struct Frame {
     /// included. The logical JavaScript depth of generated frames; linkage
     /// computes it from the caller's value.
     pub depth: u32,
-    /// Safepoint of the optimized call this frame is making, or
-    /// [`super::NO_SAFEPOINT`]. Optimized code names it before every
-    /// collecting call; the collector resolves `(code_object_id, call_site)`
-    /// to the tagged root homes at [`Self::machine_roots`].
+    /// Root recipe of an active collecting C helper, or [`super::NO_SAFEPOINT`].
+    /// Suspended JS calls resolve their actual child/request return address
+    /// instead. A retained Template window recipe never overrides the current
+    /// active helper's semantic header PC.
     pub call_site: super::SafepointId,
     /// Base of the optimized frame's tagged root homes, written once by its
-    /// prologue. Read only while `call_site` names a safepoint.
+    /// prologue. Read through the active helper or suspended-return root recipe.
     pub machine_roots: u64,
     /// Destination in an interpreted caller, or `u32::MAX` for ABI return.
     pub return_destination: u32,
     /// Frame-local semantic state. Zero denotes an unallocated cold record.
     pub cold: Option<ColdFrameIdx>,
+    /// Exact allocating family, consumed before terminal construction unlink.
+    /// Non-owning base/source metadata stays inside this traced GC layout.
+    pub(crate) construct_layout: crate::constructor_layout::ConstructorLayout,
+    /// Exact own DerivedThis context, published by this activation's CreateContext.
+    /// This traced identity root contains no copied binding value. The descriptor's
+    /// slot remains authoritative, including lexical arrow/eval super bindings.
+    pub(crate) derived_this_context: crate::context::ContextHandle,
+    /// Original allocated receiver, distinct from a derived this replacement.
+    pub(crate) construct_receiver: Value,
+    /// Exact published JS frame that issued this synchronous Super call.
+    /// The source remains live until this non-suspendable construction returns;
+    /// transparent Proxy/Bound forwarding preserves it. It is not a GC address
+    /// or a parked-state field. Terminal ownership validates current-chain
+    /// membership before dereferencing it, then proves the exact Super opcode.
+    pub(crate) super_origin: u64,
+    /// Genuine machine return address in this frame's immediate physical caller.
+    /// The caller's exact code-object id owns its return-site table. Zero means
+    /// that caller is interpreter/host-owned. Initialized before publication;
+    /// tier changes preserve it, and parked invocations never retain it.
+    pub caller_return_pc: u64,
 }
 
 impl Frame {
@@ -329,13 +352,36 @@ impl Frame {
                 std::ptr::addr_of_mut!((*frame).self_value),
                 std::ptr::addr_of_mut!((*frame).this_value),
                 std::ptr::addr_of_mut!((*frame).new_target_value),
+                std::ptr::addr_of_mut!((*frame).construct_receiver),
             ]
         } {
             unsafe { (&mut *slot).trace_value_slot_mut(visitor) };
         }
+        let binding = unsafe { std::ptr::addr_of_mut!((*frame).derived_this_context) };
+        if !unsafe { (*binding).is_null() } {
+            visitor(binding.cast::<RawGc>());
+        }
+        let layout = unsafe { std::ptr::addr_of_mut!((*frame).construct_layout) };
+        if !unsafe { (*layout).is_null() } {
+            visitor(layout.cast::<RawGc>());
+        }
         let arguments = unsafe { std::ptr::addr_of_mut!((*frame).arguments_object) };
         if !unsafe { (*arguments).is_null() } {
             visitor(arguments.cast::<RawGc>());
+        }
+    }
+
+    /// Publish only the initialized own DerivedThis cell. Source identity
+    /// and the descriptor are proved by the actual CreateContext owner before
+    /// this noallocation store; inline or unrelated loop contexts cannot replace it.
+    pub(crate) fn publish_derived_this_context(
+        &mut self,
+        source_function_id: u32,
+        context: crate::context::ContextHandle,
+    ) {
+        if self.is_derived_constructor() && self.header.function_id == source_function_id {
+            debug_assert!(!context.is_null());
+            self.derived_this_context = context;
         }
     }
 
@@ -384,6 +430,11 @@ impl Frame {
             machine_roots: 0,
             return_destination: u32::MAX,
             cold: None,
+            construct_layout: crate::constructor_layout::ConstructorLayout::null(),
+            derived_this_context: crate::context::ContextHandle::null(),
+            construct_receiver: Value::UNDEFINED,
+            super_origin: 0,
+            caller_return_pc: 0,
         }
     }
 
@@ -515,7 +566,7 @@ impl Frame {
 const _: [(); 96] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
-const _: [(); 104] = [(); std::mem::size_of::<Frame>()];
+const _: [(); 136] = [(); std::mem::size_of::<Frame>()];
 const _: [(); 8] = [(); std::mem::align_of::<Frame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, frame_cell)];
 const _: [(); 32] = [(); std::mem::offset_of!(VmThread, gc_heap)];
@@ -555,6 +606,10 @@ pub const NATIVE_FRAME_CALL_SITE_OFFSET: u32 = std::mem::offset_of!(Frame, call_
 /// Byte offset of [`Frame::machine_roots`].
 pub const NATIVE_FRAME_MACHINE_ROOTS_OFFSET: u32 =
     std::mem::offset_of!(Frame, machine_roots) as u32;
+
+/// Byte offset of the header's admitted bytecode function identity.
+pub const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 =
+    (std::mem::offset_of!(Frame, header) + std::mem::offset_of!(VmFrameHeader, function_id)) as u32;
 
 /// Byte offset of the header's initialized register count.
 pub const NATIVE_FRAME_REGISTER_COUNT_OFFSET: u32 = (std::mem::offset_of!(Frame, header)
@@ -675,7 +730,7 @@ mod tests {
     #[test]
     fn native_frame_layout_holds_no_binding_storage() {
         assert_eq!(std::mem::size_of::<VmFrameHeader>(), 12);
-        assert_eq!(std::mem::size_of::<Frame>(), 104);
+        assert_eq!(std::mem::size_of::<Frame>(), 136);
         assert_eq!(NATIVE_FRAME_REGISTER_BASE_OFFSET, 16);
         assert_eq!(NATIVE_FRAME_THIS_OFFSET, 32);
         assert_eq!(NATIVE_FRAME_NEW_TARGET_OFFSET, 40);
@@ -689,3 +744,25 @@ mod tests {
         assert_eq!(NATIVE_FRAME_MACHINE_ROOTS_OFFSET, 88);
     }
 }
+
+/// Byte offset of the sole traced construction layout ticket.
+pub const NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET: u32 =
+    std::mem::offset_of!(Frame, construct_layout) as u32;
+/// Byte offset of the original allocated construction receiver root.
+pub const NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET: u32 =
+    std::mem::offset_of!(Frame, construct_receiver) as u32;
+
+/// Private compiled-engine offset of the own DerivedThis context identity root.
+pub const NATIVE_FRAME_DERIVED_THIS_CONTEXT_OFFSET: u32 =
+    std::mem::offset_of!(Frame, derived_this_context) as u32;
+const _: [(); 108] = [(); std::mem::offset_of!(Frame, derived_this_context)];
+
+/// Private offset of the synchronous Super source; never a collector root.
+#[doc(hidden)]
+pub const NATIVE_FRAME_SUPER_ORIGIN_OFFSET: u32 = std::mem::offset_of!(Frame, super_origin) as u32;
+const _: [(); 120] = [(); std::mem::offset_of!(Frame, super_origin)];
+
+/// Genuine return address in the immediate physical caller.
+pub const NATIVE_FRAME_CALLER_RETURN_PC_OFFSET: u32 =
+    std::mem::offset_of!(Frame, caller_return_pc) as u32;
+const _: [(); 128] = [(); std::mem::offset_of!(Frame, caller_return_pc)];

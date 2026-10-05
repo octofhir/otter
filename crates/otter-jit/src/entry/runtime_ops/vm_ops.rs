@@ -25,10 +25,10 @@
 //! - `otter_vm::jit_runtime_ops` — safe VM-side implementations.
 
 use super::super::JitCtx;
-use super::{committed_vm_result, park_jit_error};
+use super::{committed_value_result, committed_vm_result, park_jit_error};
 use otter_vm::{
     Value, VmError,
-    native_abi::{NativeResultPair, NativeResultStatus},
+    native_abi::{CommittedValueError, NativeResultPair, NativeResultStatus},
 };
 
 /// Immutable source identity for one compiled named-property site.
@@ -63,19 +63,12 @@ pub(crate) extern "C" fn jit_load_property_stub(
     // an invalid boundary invocation. Copy the source before possible reentry.
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
-        let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
-        // The site's own function and PC name the operation; inline parents
-        // stay in the call site's recipe, which stack walks read.
-        let mut call = ctx.runtime_call()?;
-        match call.load_property_value(function_id, pc, Value::from_bits(receiver_bits)) {
-            Ok(value) => Ok(NativeResultPair::success(value)),
-            Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
-        }
+        let (function_id, pc) =
+            source.ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let mut call = ctx.runtime_call().map_err(CommittedValueError::Fatal)?;
+        call.load_property_value(function_id, pc, Value::from_bits(receiver_bits))
     })();
-    match result {
-        Ok(pair) => pair,
-        Err(err) => committed_vm_result(ctx, Err(err)),
-    }
+    committed_value_result(ctx, result)
 }
 
 /// Complete the exact published `StoreProperty` from boxed receiver/value
@@ -94,22 +87,18 @@ pub(crate) extern "C" fn jit_store_property_stub(
     // SAFETY: the same stable code-owned cell contract as the load boundary.
     let source = unsafe { cell.as_ref() }.and_then(|cell| cell.source);
     let result = (|| {
-        let (function_id, pc) = source.ok_or(VmError::InvalidOperand)?;
-        let mut call = ctx.runtime_call()?;
-        match call.store_property_value(
+        let (function_id, pc) =
+            source.ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+        let mut call = ctx.runtime_call().map_err(CommittedValueError::Fatal)?;
+        call.store_property_value(
             function_id,
             pc,
             Value::from_bits(receiver_bits),
             Value::from_bits(value_bits),
-        ) {
-            Ok(()) => Ok(NativeResultPair::success(Value::undefined())),
-            Err(error) => call.take_js_throw(error).map(NativeResultPair::throw_value),
-        }
+        )
+        .map(|()| Value::undefined())
     })();
-    match result {
-        Ok(pair) => pair,
-        Err(err) => committed_vm_result(ctx, Err(err)),
-    }
+    committed_value_result(ctx, result)
 }
 
 /// Resolve the callable of the published `CallMethodValue` from `[receiver]`.
@@ -125,7 +114,7 @@ pub(crate) extern "C" fn jit_resolve_method_stub(
         || packet.is_null()
         || !(packet as usize).is_multiple_of(std::mem::align_of::<Value>())
     {
-        Err(VmError::InvalidOperand)
+        Err(CommittedValueError::Fatal(VmError::InvalidOperand))
     } else {
         // SAFETY: generated code passes one live, aligned receiver word, read
         // before any runtime operation begins.
@@ -135,9 +124,10 @@ pub(crate) extern "C" fn jit_resolve_method_stub(
     let ctx = unsafe { &mut *ctx };
     let result = receiver.and_then(|receiver| {
         ctx.runtime_call()
+            .map_err(CommittedValueError::Fatal)
             .and_then(|mut runtime| runtime.resolve_method_values(&[receiver]))
     });
-    committed_vm_result(ctx, result)
+    committed_value_result(ctx, result)
 }
 
 /// Stage a dense spread array's elements as the pending request's actuals.
@@ -189,10 +179,13 @@ pub(crate) extern "C" fn jit_load_element_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx.runtime_call().and_then(|mut runtime| {
-        runtime.load_element_value(Value::from_bits(receiver_bits), Value::from_bits(key_bits))
-    });
-    committed_vm_result(ctx, result)
+    let result = ctx
+        .runtime_call()
+        .map_err(CommittedValueError::Fatal)
+        .and_then(|mut runtime| {
+            runtime.load_element_value(Value::from_bits(receiver_bits), Value::from_bits(key_bits))
+        });
+    committed_value_result(ctx, result)
 }
 
 /// Runtime stub: build the activation's `arguments` object for
@@ -249,14 +242,19 @@ pub(crate) extern "C" fn jit_store_element_stub(
 ) -> NativeResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let result = ctx.runtime_call().and_then(|mut runtime| {
-        runtime.store_element_value(
-            Value::from_bits(receiver_bits),
-            Value::from_bits(key_bits),
-            Value::from_bits(value_bits),
-        )
-    });
-    committed_vm_result(ctx, result.map(|()| Value::undefined()))
+    let result = ctx
+        .runtime_call()
+        .map_err(CommittedValueError::Fatal)
+        .and_then(|mut runtime| {
+            runtime
+                .store_element_value(
+                    Value::from_bits(receiver_bits),
+                    Value::from_bits(key_bits),
+                    Value::from_bits(value_bits),
+                )
+                .map(|()| Value::undefined())
+        });
+    committed_value_result(ctx, result)
 }
 
 #[cfg(test)]

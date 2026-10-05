@@ -113,16 +113,20 @@ impl NewSpace {
     /// address and the tail's `[start, end)` absolute addresses. The page's
     /// own cursor stays at `start`: the buffer owner publishes its top into
     /// the page, and no other allocation may bump the page meanwhile.
+    /// A failed search leaves the prior active cursor unchanged so a
+    /// smaller source allocation can still consume its existing tail.
     pub(crate) fn take_tail(&mut self, min_bytes: usize) -> Option<(usize, usize, usize)> {
+        let mut active = self.active;
         loop {
-            if self.active < self.from.len() {
-                let page = &self.from[self.active];
+            if active < self.from.len() {
+                let page = &self.from[active];
                 let header = page.header();
                 if header.bump_remaining() >= min_bytes {
+                    self.active = active;
                     let base = page.base_ptr() as usize;
                     return Some((base, base + header.bump_cursor, base + header.span_bytes()));
                 }
-                self.active += 1;
+                active += 1;
                 continue;
             }
             if self.from.len() < self.max_pages {

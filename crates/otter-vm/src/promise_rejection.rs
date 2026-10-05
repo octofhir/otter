@@ -90,25 +90,38 @@ const REPORTER_GLOBAL: &str = "__otterFirePromiseRejection";
 
 /// The HTML "about-to-be-notified rejected promises" and
 /// "outstanding rejected promises" sets, kept per realm.
+/// One notification's admitted Promise operation extent. The realm is owned
+/// by this tracker; source and async context are captured at actual rejection.
+#[derive(Debug, Clone)]
+struct TrackedRejection {
+    promise: crate::promise::JsPromiseHandle,
+    context: Option<ExecutionContext>,
+    async_context: Value,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RejectionTracker {
     /// Rejected while unhandled, awaiting the next checkpoint. Spec: the
     /// about-to-be-notified list.
-    pending: Vec<crate::promise::JsPromiseHandle>,
+    pending: Vec<TrackedRejection>,
     /// Reported as `unhandledrejection`, retained so a later handler fires
     /// `rejectionhandled`. Spec: the outstanding-rejected set.
-    notified: Vec<crate::promise::JsPromiseHandle>,
+    notified: Vec<TrackedRejection>,
 }
 
 impl RejectionTracker {
     /// Record a promise whose rejection had no reaction attached.
-    pub(crate) fn note_rejected(&mut self, promise: crate::promise::JsPromiseHandle) {
-        self.pending.push(promise);
-    }
-
-    /// Whether either list holds work for the checkpoint to process.
-    pub(crate) fn has_work(&self) -> bool {
-        !self.pending.is_empty() || !self.notified.is_empty()
+    pub(crate) fn note_rejected(
+        &mut self,
+        promise: crate::promise::JsPromiseHandle,
+        context: Option<ExecutionContext>,
+        async_context: Value,
+    ) {
+        self.pending.push(TrackedRejection {
+            promise,
+            context,
+            async_context,
+        });
     }
 
     /// Drop all tracked handles (bare realm with no reporter, or realm teardown).
@@ -117,14 +130,22 @@ impl RejectionTracker {
         self.notified.clear();
     }
 
+    pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
+        for record in self.pending.iter().chain(&self.notified) {
+            crate::code_liveness::visit_value(&record.async_context, visitor);
+        }
+    }
+
     /// Trace both handle lists as GC roots; a moving collection rewrites each
     /// slot in place.
     pub(crate) fn trace(&self, visitor: &mut SlotVisitor<'_>) {
         for promise in &self.pending {
-            promise.trace_value_slots(visitor);
+            promise.promise.trace_value_slots(visitor);
+            promise.async_context.trace_value_slots(visitor);
         }
         for promise in &self.notified {
-            promise.trace_value_slots(visitor);
+            promise.promise.trace_value_slots(visitor);
+            promise.async_context.trace_value_slots(visitor);
         }
     }
 }
@@ -132,9 +153,15 @@ impl RejectionTracker {
 impl Interpreter {
     /// Feed a settle result's unhandled-rejection notification into the tracker.
     /// Called at every reject site right beside the job enqueue.
-    pub(crate) fn note_settle_rejection(&mut self, jobs: &crate::promise::PromiseSettleJobs) {
+    pub(crate) fn note_settle_rejection(
+        &mut self,
+        jobs: &crate::promise::PromiseSettleJobs,
+        context: Option<&ExecutionContext>,
+    ) {
         if let Some(promise) = jobs.unhandled_rejection {
-            self.rejection_tracker.note_rejected(promise);
+            let async_context = self.async_context();
+            self.rejection_tracker
+                .note_rejected(promise, context.cloned(), async_context);
         }
     }
 
@@ -142,18 +169,48 @@ impl Interpreter {
     /// builders). Such a promise starts with `[[PromiseIsHandled]]` false, so it
     /// is always a candidate until a later reaction attaches — the checkpoint's
     /// live re-read suppresses it if one does.
-    pub(crate) fn note_born_rejection(&mut self, promise: crate::promise::JsPromiseHandle) {
-        self.rejection_tracker.note_rejected(promise);
+    pub(crate) fn note_born_rejection(
+        &mut self,
+        promise: crate::promise::JsPromiseHandle,
+        context: Option<&ExecutionContext>,
+    ) {
+        let async_context = self.async_context();
+        self.rejection_tracker
+            .note_rejected(promise, context.cloned(), async_context);
     }
 
-    /// `true` while the tracker still has promises to classify.
-    pub(crate) fn promise_rejections_need_checkpoint(&self) -> bool {
-        self.rejection_tracker.has_work()
-    }
-
-    /// Discard all tracked rejections without firing (no reporter / no realm).
-    pub(crate) fn clear_promise_rejection_tracking(&mut self) {
-        self.rejection_tracker.clear();
+    /// Whole-queue checkpoint visits every existing live realm in stable ID
+    /// order. Reporters may enqueue follow-up jobs; an escaping fatal stops
+    /// before any later realm reporter is invoked.
+    pub(crate) fn run_all_promise_rejection_checkpoints(
+        &mut self,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
+    ) -> Result<(), RunError> {
+        let mut realms = self
+            .extra_realms
+            .iter()
+            .map(|realm| realm.id)
+            .collect::<Vec<_>>();
+        realms.push(self.active_realm_id);
+        realms.sort_unstable();
+        for realm in realms {
+            if !self.job_realm_is_live(realm) {
+                continue;
+            }
+            let outcome = self
+                .with_host_realm_id(realm, |vm| Ok(vm.run_promise_rejection_checkpoint(report)));
+            match outcome {
+                Ok(outcome) => outcome?,
+                Err(error) => {
+                    return Err(RunError {
+                        error,
+                        frames: Vec::new(),
+                        detail: self.take_error_detail(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// HTML "notify about rejected promises": run once the microtask queue is
@@ -161,7 +218,7 @@ impl Interpreter {
     /// reported promises that have since been handled fire `rejectionhandled`.
     pub(crate) fn run_promise_rejection_checkpoint(
         &mut self,
-        context: &ExecutionContext,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
     ) -> Result<(), RunError> {
         // A Rust hook takes precedence over the compatibility JS reporter.
         // With neither installed there is no host to deliver to, so drop the
@@ -177,25 +234,27 @@ impl Interpreter {
         // the rejection suppresses the notification.
         let idx = 0;
         while idx < self.rejection_tracker.pending.len() {
-            let promise = self.rejection_tracker.pending[idx];
+            let record = self.rejection_tracker.pending[idx].clone();
+            let promise = record.promise;
             if promise.is_handled(&self.gc_heap) {
-                self.rejection_tracker.pending.swap_remove(idx);
+                self.rejection_tracker.pending.remove(idx);
                 continue;
             }
-            self.rejection_tracker.pending.swap_remove(idx);
+            self.rejection_tracker.pending.remove(idx);
             // Retain in `notified` (a GC root) before firing so the handle
             // survives any collection the reporter triggers.
-            self.rejection_tracker.notified.push(promise);
-            self.fire_promise_rejection(context, promise, false)?;
+            self.rejection_tracker.notified.push(record.clone());
+            self.fire_promise_rejection(record, false, report)?;
         }
 
         // Notified → handled. A late `.then`/`.catch` flips the live flag.
         let mut jdx = 0;
         while jdx < self.rejection_tracker.notified.len() {
-            let promise = self.rejection_tracker.notified[jdx];
+            let record = self.rejection_tracker.notified[jdx].clone();
+            let promise = record.promise;
             if promise.is_handled(&self.gc_heap) {
-                self.rejection_tracker.notified.swap_remove(jdx);
-                self.fire_promise_rejection(context, promise, true)?;
+                self.rejection_tracker.notified.remove(jdx);
+                self.fire_promise_rejection(record, true, report)?;
                 continue;
             }
             jdx += 1;
@@ -212,10 +271,44 @@ impl Interpreter {
     /// coming from a rejection so the host can name that origin.
     fn fire_promise_rejection(
         &mut self,
-        context: &ExecutionContext,
-        promise: crate::promise::JsPromiseHandle,
+        record: TrackedRejection,
         handled: bool,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
     ) -> Result<(), RunError> {
+        self.with_handle_scope(|vm, scope| {
+            let ambient = vm.async_context();
+            let ambient = vm.scoped_value(scope, ambient);
+            let promise = vm.scoped_value(scope, Value::promise(record.promise));
+            let async_context = vm.scoped_value(scope, record.async_context);
+            vm.set_async_context(vm.escape_scoped(async_context));
+            let promise = vm
+                .escape_scoped(promise)
+                .as_promise()
+                .expect("tracked promise");
+            let outcome = vm.fire_promise_rejection_in_extent(
+                promise,
+                record.context.as_ref(),
+                handled,
+                report,
+            );
+            vm.set_async_context(vm.escape_scoped(ambient));
+            outcome
+        })
+    }
+
+    fn fire_promise_rejection_in_extent(
+        &mut self,
+        promise: crate::promise::JsPromiseHandle,
+        admitted: Option<&ExecutionContext>,
+        handled: bool,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
+    ) -> Result<(), RunError> {
+        // A notification is a fresh synchronous callback extent. Previously
+        // handled job diagnostics must not become this hook's completion.
+        let _ = self.take_pending_uncaught_throw();
+        let _ = self.take_error_detail();
+        self.pending_uncaught_frames = None;
+        self.uncaught_from_promise_rejection = false;
         let reason = match promise.state(&self.gc_heap) {
             crate::promise::PromiseState::Rejected(reason) => reason,
             // Only rejected promises are tracked; a settled-elsewhere handle is
@@ -224,13 +317,24 @@ impl Interpreter {
         };
         let promise_value = Value::promise(promise);
         if let Some(hook) = self.promise_rejection_hook() {
-            let _ = NativeCtx::with_host_context(
+            let outcome = NativeCtx::with_host_context(
                 self,
                 NativeCallInfo::default_call(),
-                Some(context),
+                admitted,
                 |ctx| hook.notify(ctx, promise_value, reason, handled),
             );
-            return Ok(());
+            let outcome = outcome.map_err(|error| {
+                let error = crate::native_to_vm_error(self, error);
+                RunError {
+                    error,
+                    frames: self.pending_uncaught_frames.take().unwrap_or_default(),
+                    detail: self.take_error_detail(),
+                }
+            });
+            return match outcome {
+                Ok(()) => Ok(()),
+                Err(error) => self.report_microtask_failure(admitted, error, report),
+            };
         }
 
         // Re-fetch per call: the reporter Value is not rooted across the
@@ -245,16 +349,25 @@ impl Interpreter {
         let this = Value::object(self.global_this);
         let args: smallvec::SmallVec<[Value; 8]> =
             smallvec::smallvec![promise_value, reason, Value::boolean(handled)];
-        match self.run_callable_sync(context, &reporter, this, args) {
+        let context = self
+            .callable_context(admitted, reporter)
+            .map_err(RunError::bare)?;
+        let mut stack = ActivationStack::new();
+        let outcome = self.with_runtime_turn(&mut stack, |turn| {
+            let (interp, stack) = turn.into_parts();
+            interp.run_callable_sync_rooted(stack, context.as_ref(), &reporter, this, args)
+        });
+        match outcome {
             Ok(_) => Ok(()),
             Err(error) => {
                 self.uncaught_from_promise_rejection = true;
                 let detail = self.take_error_detail();
-                Err(RunError {
+                let error = RunError {
                     error,
-                    frames: Vec::new(),
+                    frames: self.pending_uncaught_frames.take().unwrap_or_default(),
                     detail,
-                })
+                };
+                self.report_microtask_failure(context.as_ref(), error, report)
             }
         }
     }

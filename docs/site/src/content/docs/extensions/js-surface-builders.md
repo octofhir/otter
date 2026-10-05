@@ -109,6 +109,19 @@ duplicate-name validation, feature/capability gating, and any lazy/tiered
 installation choices. Do not scatter ad-hoc global mutation across builtin
 modules.
 
+Installation is fallible. The VM constructor returns the one current
+`JsSurfaceError`; an allocation failure retains its actual cause, while a
+rejected descriptor remains a descriptor error. Runtime builders propagate
+that error through `OtterError`. Tests may require successful setup explicitly;
+production callers propagate it.
+
+Builders and generated namespace/class tags root the receiver, symbol,
+string and pending descriptor fields before a collecting allocation. Use
+`NativeScope`/`MarshalCx` handles for native value construction and prototype
+changes. `MarshalCx::set_prototype` keeps both the receiver and prototype
+handles current throughout the canonical transition. A descriptor's `false`
+result means rejection; it must not hide an allocation error.
+
 ## Native Calls
 
 Native call storage is split into a static fast path and a dynamic path:

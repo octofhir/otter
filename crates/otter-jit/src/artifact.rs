@@ -6,7 +6,7 @@
 //! - [`NativeCompileOutput`] — finalized code plus an optional sidecar.
 //! - [`CodeMapCapture`] and [`CodeRegion`] — emission-order native offset
 //!   correlation, including template inline subregions, generated direct-call
-//!   targets, and compact scratch layouts.
+//!   targets, compact scratch layouts and actual callable-entry offsets.
 //! - [`relocation`] — typed address sites and portable semantic code.
 //! - [`assembly`] — deterministic annotated target disassembly.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
@@ -41,6 +41,7 @@ mod assembly;
 #[path = "artifact/assembly_x86_64.rs"]
 mod assembly;
 pub(crate) mod relocation;
+mod return_sites;
 
 use std::fmt::Write as _;
 
@@ -48,7 +49,7 @@ use otter_vm::{
     JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactIdentity,
     JitArtifactMetadata, JitCompileSnapshot, JitDebugTarget, JitDebugTier,
     deopt::{DeoptLocation, DeoptRepr, DeoptRuntime},
-    native_abi::{SafepointRecord, TaggedLocationKind},
+    native_abi::{SafepointEntry, SafepointRecord},
 };
 use serde::Serialize;
 
@@ -107,7 +108,7 @@ pub(crate) struct MethodGuardArtifact {
     pub(crate) receiver_shape: u32,
     pub(crate) prototype_validity: Option<u64>,
     pub(crate) holder_root: u32,
-    pub(crate) method_value_byte: u32,
+    pub(crate) method_field: otter_vm::object::FieldLocation,
 }
 
 /// One live-in value materialized by an inline scratch setup.
@@ -190,6 +191,7 @@ impl CodeRegion {
         }
     }
 
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn structural_at_byte_pc(
         kind: &'static str,
         start: usize,
@@ -301,7 +303,7 @@ impl CodeRegion {
             receiver_shape: guard.recv_shape,
             prototype_validity: guard.prototype_validity.map(|cell| cell.identity),
             holder_root: guard.holder_root,
-            method_value_byte: guard.method_value_byte,
+            method_field: guard.method_field,
         });
         region
     }
@@ -376,9 +378,24 @@ pub(crate) struct OsrCodeEntry {
 pub(crate) struct CodeMapCapture {
     regions: Vec<CodeRegion>,
     osr_entries: Vec<OsrCodeEntry>,
+    call_entry_offset: Option<usize>,
 }
 
 impl CodeMapCapture {
+    /// Record the actual offset returned by the canonical frame emitter once.
+    /// This is emission capability, independent of the request's compile trigger.
+    pub(crate) fn record_call_entry(&mut self, offset: usize) {
+        assert!(self.call_entry_offset.replace(offset).is_none());
+    }
+
+    fn validate_call_entry(&self, code_bytes: usize) {
+        assert!(
+            self.call_entry_offset
+                .is_none_or(|offset| offset < code_bytes),
+            "call entry must name an instruction inside the finalized code mapping"
+        );
+    }
+
     pub(crate) fn record(&mut self, region: CodeRegion) {
         self.regions.push(region);
     }
@@ -404,6 +421,7 @@ impl CodeMapCapture {
         #[serde(rename_all = "camelCase")]
         struct Document {
             entry_offset: u64,
+            call_entry_offset: Option<u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             runtime_address_range: Option<RuntimeAddressRange>,
             regions: Vec<CodeRegion>,
@@ -418,6 +436,9 @@ impl CodeMapCapture {
             });
         let document = Document {
             entry_offset: entry_offset as u64,
+            call_entry_offset: self.call_entry_offset.map(|offset| {
+                u64::try_from(offset).expect("native mapping offsets fit the artifact integer")
+            }),
             runtime_address_range,
             regions: self.regions,
             osr_entries: self.osr_entries,
@@ -442,7 +463,9 @@ pub(crate) fn build_bundle(
     relocations: RelocationCapture,
     deopt_runtime: Option<&DeoptRuntime>,
     safepoints: &[SafepointRecord],
+    return_sites: &[SafepointEntry],
 ) -> Box<JitArtifactBundle> {
+    code_map.validate_call_entry(code.len());
     let rendered_relocations = relocations
         .render(code.bytes())
         .unwrap_or_else(|error| panic!("compiler built invalid JIT relocations: {error}"));
@@ -467,6 +490,7 @@ pub(crate) fn build_bundle(
         &rendered_relocations.validated,
         deopt_runtime.map(|runtime| &runtime.table),
         safepoints,
+        return_sites,
     );
     let mut files = vec![
         JitArtifactFile::text(JitArtifactFileName::Bytecode, render_bytecode(view)),
@@ -489,7 +513,7 @@ pub(crate) fn build_bundle(
         JitArtifactFile::text(JitArtifactFileName::Relocations, rendered_relocations.json),
         JitArtifactFile::text(
             JitArtifactFileName::Safepoints,
-            render_safepoints(safepoints),
+            render_safepoints(safepoints, return_sites),
         ),
     ];
     files.push(JitArtifactFile::text(
@@ -533,7 +557,7 @@ fn render_bytecode(view: &JitCompileSnapshot) -> String {
     out
 }
 
-fn render_safepoints(records: &[SafepointRecord]) -> String {
+fn render_safepoints(records: &[SafepointRecord], return_sites: &[SafepointEntry]) -> String {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Location {
@@ -546,7 +570,6 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
     struct Point<'a> {
         id: u32,
         frame_state: u32,
-        native_return_offset: Option<u64>,
         tagged_locations: Vec<Location>,
         inline_frames: &'a [otter_vm::deopt::DeoptFrame<Option<u16>>],
         call_pc: Option<u32>,
@@ -554,8 +577,16 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
+    struct ReturnSite {
+        native_return_offset: u32,
+        safepoint_id: u32,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
     struct Document<'a> {
-        safepoints: Vec<Point<'a>>,
+        records: Vec<Point<'a>>,
+        return_sites: Vec<ReturnSite>,
     }
 
     let safepoints = records
@@ -565,25 +596,27 @@ fn render_safepoints(records: &[SafepointRecord]) -> String {
             call_pc: (record.call_pc != otter_vm::native_abi::NO_CALL_PC).then_some(record.call_pc),
             id: record.id,
             frame_state: record.frame_state,
-            // Native correlation is added by the relocation/safepoint-site
-            // follow-up. Null is explicit and never fabricates an offset.
-            native_return_offset: None,
             tagged_locations: record
-                .tagged_locations
+                .spill_roots
                 .iter()
-                .map(|location| Location {
-                    kind: match location.kind {
-                        TaggedLocationKind::FrameSlot => "frameSlot",
-                        TaggedLocationKind::MachineRegister => "machineRegister",
-                        TaggedLocationKind::SpillSlot => "spillSlot",
-                    },
-                    index: location.index,
+                .map(|index| Location {
+                    kind: "spillSlot",
+                    index,
                 })
                 .collect(),
         })
         .collect();
-    let mut rendered = serde_json::to_string_pretty(&Document { safepoints })
-        .expect("safepoint DTO always serializes");
+    let mut rendered = serde_json::to_string_pretty(&Document {
+        records: safepoints,
+        return_sites: return_sites
+            .iter()
+            .map(|site| ReturnSite {
+                native_return_offset: site.native_return_offset,
+                safepoint_id: site.safepoint_id,
+            })
+            .collect(),
+    })
+    .expect("safepoint DTO always serializes");
     rendered.push('\n');
     rendered
 }
@@ -606,7 +639,6 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
             },
             location => {
                 let (location_kind, location_value) = match location {
-                    DeoptLocation::Register(register) => ("register", register.to_string()),
                     DeoptLocation::StackSlot(offset) => ("stackSlot", offset.to_string()),
                     DeoptLocation::Literal(raw) => ("literal", format!("0x{raw:016x}")),
                     DeoptLocation::VirtualObject(_) => unreachable!(),
@@ -671,7 +703,12 @@ fn render_deopt(runtime: &DeoptRuntime) -> String {
                             closure: render_slot(&entry.closure),
                             new_target: render_slot(&entry.new_target),
                         }),
-                    slots: frame.slots.iter().map(render_slot).collect(),
+                    register_count: frame.register_count,
+                    slots: frame
+                        .slots
+                        .iter()
+                        .map(|(register, slot)| (*register, render_slot(slot)))
+                        .collect(),
                 })
                 .collect(),
             virtual_objects: state
@@ -716,21 +753,16 @@ mod tests {
             VirtualObjectKind,
         };
         let slot = DeoptSlot {
-            location: DeoptLocation::Register(3),
+            location: DeoptLocation::StackSlot(24),
             repr: DeoptRepr::Tagged,
         };
         let table = DeoptTable::from_states(vec![FrameState {
             frames: Box::new([
-                DeoptFrame {
-                    function_id: 1,
-                    byte_pc: 16,
-                    entry: None,
-                    slots: Box::new([slot]),
-                },
-                DeoptFrame {
-                    function_id: 2,
-                    byte_pc: 8,
-                    entry: Some(DeoptFrameEntry {
+                DeoptFrame::with_window(1, 16, None, [slot]),
+                DeoptFrame::with_window(
+                    2,
+                    8,
+                    Some(DeoptFrameEntry {
                         new_target: DeoptSlot {
                             location: DeoptLocation::Literal(
                                 otter_vm::Value::function(99).to_bits(),
@@ -744,8 +776,8 @@ mod tests {
                             repr: DeoptRepr::Tagged,
                         },
                     }),
-                    slots: Box::new([DeoptSlot::virtual_object(VirtualObjectId(0))]),
-                },
+                    [DeoptSlot::virtual_object(VirtualObjectId(0))],
+                ),
             ]),
             virtual_objects: Box::new([VirtualObject {
                 id: VirtualObjectId(0),
@@ -760,19 +792,22 @@ mod tests {
                 reason: otter_vm::native_abi::ExitReason::ShapeGuard,
                 action: otter_vm::native_abi::ExitAction::Recompile,
                 resume_pcs: vec![16, 8].into_boxed_slice(),
+                safepoint: otter_vm::native_abi::NO_SAFEPOINT,
             }]
             .into_boxed_slice(),
-            gpr_budget: 16,
         };
         let json: serde_json::Value = serde_json::from_str(&super::render_deopt(&runtime)).unwrap();
         let frames = &json["frameStates"][0]["frames"];
         assert!(frames[0]["entry"].is_null());
         assert_eq!(frames[1]["entry"]["returnRegister"], 0);
-        assert_eq!(frames[1]["entry"]["this"]["locationValue"], "3");
+        assert_eq!(frames[1]["entry"]["this"]["locationKind"], "stackSlot");
+        assert_eq!(frames[1]["entry"]["this"]["locationValue"], "24");
         assert_eq!(frames[1]["entry"]["closure"]["locationKind"], "stackSlot");
         assert_eq!(frames[1]["entry"]["closure"]["locationValue"], "32");
         assert_eq!(frames[1]["entry"]["newTarget"]["locationKind"], "literal");
-        assert_eq!(frames[1]["slots"][0]["locationKind"], "virtualObject");
+        // Sparse frames render `[register, slot]` pairs.
+        assert_eq!(frames[1]["slots"][0][0], 0);
+        assert_eq!(frames[1]["slots"][0][1]["locationKind"], "virtualObject");
         assert_eq!(
             json["frameStates"][0]["virtualObjects"][0]["kind"],
             "fixedArray"
@@ -825,15 +860,35 @@ mod tests {
             "Move { dst: 1, src: 0 }".to_string(),
         ));
         map.record_osr(2, 20, 32);
+        map.record_call_entry(8);
+        map.validate_call_entry(64);
         let value: serde_json::Value = serde_json::from_str(&map.render(4, Some((0x1000, 0x1040))))
             .expect("valid code-map JSON");
         assert_eq!(value["entryOffset"], 4);
+        assert_eq!(value["callEntryOffset"], 8);
         assert_eq!(value["runtimeAddressRange"]["start"], "0x1000");
         assert_eq!(value["runtimeAddressRange"]["endExclusive"], "0x1040");
         assert_eq!(value["runtimeAddressRange"]["entry"], "0x1004");
         assert_eq!(value["regions"][0]["startOffset"], 4);
         assert_eq!(value["regions"][0]["bytePc"], 19);
         assert_eq!(value["osrEntries"][0]["logicalPc"], 2);
+    }
+
+    #[test]
+    fn code_map_without_call_entry_has_explicit_null_capability() {
+        let map = CodeMapCapture::default();
+        map.validate_call_entry(64);
+        let value: serde_json::Value = serde_json::from_str(&map.render(0, None)).unwrap();
+        assert!(value.as_object().unwrap().contains_key("callEntryOffset"));
+        assert!(value["callEntryOffset"].is_null());
+    }
+
+    #[test]
+    #[should_panic(expected = "call entry must name an instruction")]
+    fn code_map_refuses_one_past_end_call_entry() {
+        let mut map = CodeMapCapture::default();
+        map.record_call_entry(64);
+        map.validate_call_entry(64);
     }
 
     #[test]
@@ -933,5 +988,46 @@ mod tests {
         assert_eq!(entries[2]["register"], 2);
         assert_eq!(entries[2]["slot"], 1);
         assert!(entries[2].get("argument").is_none());
+    }
+}
+
+#[cfg(test)]
+mod return_site_schema_tests {
+    #[test]
+    fn returns_reference_source_records_in_the_one_current_format() {
+        use otter_vm::native_abi::{NO_FRAME_STATE, SafepointEntry, SafepointRecord};
+        let mut record = SafepointRecord::window(17, NO_FRAME_STATE);
+        record.call_pc = 7;
+        let rendered = super::render_safepoints(
+            &[record],
+            &[
+                SafepointEntry {
+                    native_return_offset: 12,
+                    safepoint_id: 17,
+                },
+                SafepointEntry {
+                    native_return_offset: 28,
+                    safepoint_id: 17,
+                },
+            ],
+        );
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert_eq!(value["records"][0]["id"], 17);
+        assert_eq!(value["records"][0]["callPc"], 7);
+        assert!(
+            value["records"][0]["taggedLocations"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a window record names no slot beyond the traced window"
+        );
+        assert_eq!(
+            value["returnSites"],
+            serde_json::json!([
+                {"nativeReturnOffset":12,"safepointId":17},
+                {"nativeReturnOffset":28,"safepointId":17},
+            ])
+        );
     }
 }

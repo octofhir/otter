@@ -16,11 +16,13 @@ const {
   MapPrototypeValues,
   ObjectDefineProperties,
   ObjectDefineProperty,
+  ObjectGetOwnPropertyDescriptor,
   ObjectKeys,
   ObjectPrototypeHasOwnProperty,
   ObjectValues,
   ReflectApply,
   ReflectConstruct,
+  ReflectGetOwnPropertyDescriptor,
   ReflectOwnKeys,
   RegExpPrototypeSymbolReplace,
   SafeArrayIterator,
@@ -32,33 +34,50 @@ const {
   StringPrototypeSlice,
   Symbol,
   SymbolHasInstance,
+  SymbolPrototypeGetDescription,
   SymbolToStringTag,
 } = primordials;
 
 const { trace } = internalBinding('trace_events');
-const {
-  codes: {
-    ERR_CONSOLE_WRITABLE_STREAM,
-    ERR_INCOMPATIBLE_OPTION_PAIR,
-  },
-  isStackOverflowError,
-} = require('internal/errors');
-const {
-  validateArray,
-  validateInteger,
-  validateObject,
-  validateOneOf,
-} = require('internal/validators');
+// Otter: `internal/errors`, `internal/validators`, `buffer`,
+// `internal/util/inspect` and `internal/util/types` load where first used,
+// so a line of plain text loads none of them; `assignFunctionName` is
+// `internal/util`'s own, kept here because that module loads the others.
+let errorsModule;
+function lazyErrors() {
+  return errorsModule ??= require('internal/errors');
+}
+let validatorsModule;
+function lazyValidators() {
+  return validatorsModule ??= require('internal/validators');
+}
+let inspectModule;
+function lazyInspect() {
+  return inspectModule ??= require('internal/util/inspect');
+}
+let typesModule;
+function lazyTypes() {
+  return typesModule ??= require('internal/util/types');
+}
+let isBuffer;
+function assignFunctionName(name, fn) {
+  if (typeof name !== 'string') {
+    const symbolDescription = SymbolPrototypeGetDescription(name);
+    if (symbolDescription === undefined) {
+      require('internal/assert')(false, 'Attempted to name function after descriptionless Symbol');
+    }
+    name = `[${symbolDescription}]`;
+  }
+  return ObjectDefineProperty(fn, 'name', {
+    __proto__: null,
+    writable: false,
+    enumerable: false,
+    configurable: true,
+    ...ObjectGetOwnPropertyDescriptor(fn, 'name'),
+    value: name,
+  });
+}
 const { previewEntries } = internalBinding('util');
-const { Buffer: { isBuffer } } = require('buffer');
-const { assignFunctionName } = require('internal/util');
-const {
-  inspect,
-  formatWithOptions,
-} = require('internal/util/inspect');
-const {
-  isTypedArray, isSet, isMap, isSetIterator, isMapIterator,
-} = require('internal/util/types');
 const {
   CHAR_UPPERCASE_C: kTraceCount,
 } = require('internal/constants');
@@ -99,6 +118,43 @@ const kBindStreamsLazy = Symbol('kBindStreamsLazy');
 const kUseStdout = Symbol('kUseStdout');
 const kUseStderr = Symbol('kUseStderr');
 
+// Otter: the global console builds its streams only once something could
+// tell. Its first line takes whatever `process.stdout`/`process.stderr` hold;
+// when that is still unset it claims the default stream instead, and until
+// something builds that stream (reading `process.stdout`, or this console's
+// `_stdout`), each line goes straight to the descriptor, synchronously, as
+// the stream would write it, with colors decided from the traits the stream
+// would carry. Replacing `_stdout`/`_stderr` on the console ends it.
+const kStdioUnseen = 0;
+const kStdioDefault = 1;
+const kStdioSeen = 2;
+const unbuiltStdio = new SafeWeakMap();
+let otterStdio;
+function unbuiltOutput(console, useStdout) {
+  const state = unbuiltStdio.get(console);
+  if (state === undefined) return undefined;
+  const mode = useStdout ? state.stdout : state.stderr;
+  if (mode === kStdioSeen) return undefined;
+  otterStdio ??= require('internal/otter/stdio');
+  const fd = useStdout ? 1 : 2;
+  if (!otterStdio.holdsAccessor(console, useStdout ? '_stdout' : '_stderr',
+                                useStdout ? state.getStdout : state.getStderr)) {
+    return undefined;
+  }
+  if (mode === kStdioUnseen) {
+    if (!otterStdio.streamUnset(state.object, fd)) return undefined;
+    if (useStdout) state.stdout = kStdioDefault;
+    else state.stderr = kStdioDefault;
+  }
+  if (otterStdio.builtOutput(fd) !== undefined) return undefined;
+  if (useStdout) {
+    return state.stdoutTraits ??=
+      otterStdio.describeOutput(fd, otterStdio.isatty(fd));
+  }
+  return state.stderrTraits ??=
+    otterStdio.describeOutput(fd, otterStdio.isatty(fd));
+}
+
 const optionsMap = new SafeWeakMap();
 function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
   // We have to test new.target here to see if this function is called
@@ -126,11 +182,12 @@ function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
   } = options;
 
   if (!stdout || typeof stdout.write !== 'function') {
-    throw new ERR_CONSOLE_WRITABLE_STREAM('stdout');
+    throw new (lazyErrors().codes.ERR_CONSOLE_WRITABLE_STREAM)('stdout');
   }
   if (!stderr || typeof stderr.write !== 'function') {
-    throw new ERR_CONSOLE_WRITABLE_STREAM('stderr');
+    throw new (lazyErrors().codes.ERR_CONSOLE_WRITABLE_STREAM)('stderr');
   }
+  const { validateInteger, validateObject, validateOneOf } = lazyValidators();
 
   validateOneOf(colorMode, 'colorMode', ['auto', true, false]);
 
@@ -142,7 +199,7 @@ function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
   if (inspectOptions !== undefined) {
     validateObject(inspectOptions, 'options.inspectOptions');
 
-    const inspectOptionsMap = isMap(inspectOptions) ?
+    const inspectOptionsMap = lazyTypes().isMap(inspectOptions) ?
       inspectOptions : new SafeMap([
         [stdout, inspectOptions],
         [stderr, inspectOptions],
@@ -151,7 +208,7 @@ function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
     for (const inspectOptions of MapPrototypeValues(inspectOptionsMap)) {
       if (inspectOptions.colors !== undefined &&
           options.colorMode !== undefined) {
-        throw new ERR_INCOMPATIBLE_OPTION_PAIR(
+        throw new (lazyErrors().codes.ERR_INCOMPATIBLE_OPTION_PAIR)(
           'options.inspectOptions.color', 'colorMode');
       }
     }
@@ -213,26 +270,45 @@ ObjectDefineProperties(Console.prototype, {
     value: assignFunctionName(kBindStreamsLazy, function(object) {
       let stdout;
       let stderr;
+      // Otter: a claimed default stream is the one the console has been
+      // writing to; reading or assigning marks a stream seen (`unbuiltOutput`).
+      const state = {
+        __proto__: null,
+        object,
+        stdout: kStdioUnseen,
+        stderr: kStdioUnseen,
+      };
       ObjectDefineProperties(this, {
         '_stdout': {
           __proto__: null,
           enumerable: false,
           configurable: true,
           get() {
+            if (state.stdout === kStdioDefault) {
+              stdout ||= otterStdio.defaultOutput(1);
+            }
+            state.stdout = kStdioSeen;
             return stdout ||= object.stdout;
           },
-          set(value) { stdout = value; },
+          set(value) { state.stdout = kStdioSeen; stdout = value; },
         },
         '_stderr': {
           __proto__: null,
           enumerable: false,
           configurable: true,
           get() {
+            if (state.stderr === kStdioDefault) {
+              stderr ||= otterStdio.defaultOutput(2);
+            }
+            state.stderr = kStdioSeen;
             return stderr ||= object.stderr;
           },
-          set(value) { stderr = value; },
+          set(value) { state.stderr = kStdioSeen; stderr = value; },
         },
       });
+      state.getStdout = ReflectGetOwnPropertyDescriptor(this, '_stdout').get;
+      state.getStderr = ReflectGetOwnPropertyDescriptor(this, '_stderr').get;
+      unbuiltStdio.set(this, state);
     }),
   },
   [kBindProperties]: {
@@ -288,7 +364,6 @@ ObjectDefineProperties(Console.prototype, {
       const groupIndent = this[kGroupIndentationString];
 
       const useStdout = streamSymbol === kUseStdout;
-      const stream = useStdout ? this._stdout : this._stderr;
       const errorHandler = useStdout ?
         this._stdoutErrorHandler : this._stderrErrorHandler;
 
@@ -299,6 +374,15 @@ ObjectDefineProperties(Console.prototype, {
         string = groupIndent + string;
       }
       string += '\n';
+
+      // Otter: with no stream built and nothing to tell, the line goes to
+      // the descriptor (`unbuiltOutput`); otherwise the stream is read here.
+      const unbuilt = unbuiltOutput(this, useStdout);
+      if (unbuilt !== undefined) {
+        otterStdio.write(unbuilt.fd, string);
+        return;
+      }
+      const stream = useStdout ? this._stdout : this._stderr;
 
       if (ignoreErrors === false) return stream.write(string);
 
@@ -315,7 +399,7 @@ ObjectDefineProperties(Console.prototype, {
       } catch (e) {
         // Console is a debugging utility, so it swallowing errors is not
         // desirable even in edge cases such as low stack space.
-        if (isStackOverflowError(e))
+        if (lazyErrors().isStackOverflowError(e))
           throw e;
         // Sorry, there's no proper way to pass along the error here.
       } finally {
@@ -356,9 +440,11 @@ ObjectDefineProperties(Console.prototype, {
           return a0;
         }
       }
-      const opts = this[kGetInspectOptions](this._stdout);
+      // Otter: an unbuilt stream's colors come from its traits.
+      const opts = this[kGetInspectOptions](
+        unbuiltOutput(this, true) ?? this._stdout);
       ArrayPrototypeUnshift(args, opts);
-      return ReflectApply(formatWithOptions, null, args);
+      return ReflectApply(lazyInspect().formatWithOptions, null, args);
     }),
   },
   [kFormatForStderr]: {
@@ -373,9 +459,11 @@ ObjectDefineProperties(Console.prototype, {
           return a0;
         }
       }
-      const opts = this[kGetInspectOptions](this._stderr);
+      // Otter: an unbuilt stream's colors come from its traits.
+      const opts = this[kGetInspectOptions](
+        unbuiltOutput(this, false) ?? this._stderr);
       ArrayPrototypeUnshift(args, opts);
-      return ReflectApply(formatWithOptions, null, args);
+      return ReflectApply(lazyInspect().formatWithOptions, null, args);
     }),
   },
 });
@@ -446,6 +534,7 @@ const consoleMethods = {
   },
 
   dir(object, options) {
+    const { inspect } = lazyInspect();
     this[kWriteToConsole](kUseStdout, inspect(object, {
       customInspect: false,
       ...this[kGetInspectOptions](this._stdout),
@@ -554,12 +643,14 @@ const consoleMethods = {
   // https://console.spec.whatwg.org/#table
   table(tabularData, properties) {
     if (properties !== undefined)
-      validateArray(properties, 'properties');
+      lazyValidators().validateArray(properties, 'properties');
 
     if (tabularData === null || typeof tabularData !== 'object')
       return this.log(tabularData);
 
     cliTable ??= require('internal/cli_table');
+    const { inspect } = lazyInspect();
+    const { isMap, isMapIterator, isSet, isSetIterator } = lazyTypes();
     const final = (k, v) => this.log(cliTable(k, v));
 
     const _inspect = (v) => {
@@ -671,7 +762,8 @@ const valuesKey = 'Values';
 const indexKey = '(index)';
 const iterKey = '(iteration index)';
 
-const isArray = (v) => ArrayIsArray(v) || isTypedArray(v) || isBuffer(v);
+const isArray = (v) => ArrayIsArray(v) || lazyTypes().isTypedArray(v) ||
+  (isBuffer ??= require('buffer').Buffer.isBuffer)(v);
 
 function noop() {}
 

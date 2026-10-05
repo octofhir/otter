@@ -5,13 +5,15 @@
 //! - A float-array read-modify-write loop with unboxed arithmetic between
 //!   element load/store transitions.
 //! - Dense growth past the current length and a null-receiver throw.
-//! - Interpreter-oracle comparison plus per-call optimized-entry evidence.
+//! - Interpreter-oracle comparison plus per-call optimized-execution evidence.
 //!
 //! # Invariants
 //! - Interpreter and tiered runs execute identical source and warmup programs.
 //! - Final store, read-modify-write, growth, and throw calls all enter already
-//!   optimized functions in the tiered run.
-//! - Proven in-bounds primitive overwrites remain in generated Machine code.
+//!   optimized functions in the tiered run. Optimizing generations count no
+//!   entries, so a call proves it by entering no Template generation and
+//!   charging fewer interpreter work units than the same call interpreted.
+//! - Proven in-bounds primitive overwrites remain in optimized code.
 //!   Growth and invalid receivers leave through one exact pre-effect deopt and
 //!   resume the canonical interpreter operation without replay.
 //!
@@ -20,6 +22,15 @@
 //!   read-modify-write shape across the moving-GC stride matrix.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
+
+/// Counter deltas of one final call.
+#[derive(Clone, Copy, Debug)]
+struct CallDelta {
+    work_units: u64,
+    template_entries: u64,
+    optimized_deopts: u64,
+    code_generations: u64,
+}
 
 const SETUP: &str = r#"
     function hotStoreZero(values, value) {
@@ -47,13 +58,17 @@ const SETUP: &str = r#"
 
     // A compiled hot caller reaches each callee through generated linkage;
     // interpreted straight-line calls never repay a native entry transition
-    // for bodies this small.
+    // for bodies this small. The optimizing tier does not inline calls inside
+    // a try region, so each callee is promoted to its own optimized
+    // generation instead of only running inside this caller.
     function warmStores() {
       for (let warm = 0; warm < 4010; warm++) {
-        hotStoreZero(storeInts, 7);
-        hotStoreZero(storeFloats, 1.25);
-        hotFloatRmw(rmwA, rmwB, 0.5);
-        hotGrowEight(growWarm, 9.5);
+        try {
+          hotStoreZero(storeInts, 7);
+          hotStoreZero(storeFloats, 1.25);
+          hotFloatRmw(rmwA, rmwB, 0.5);
+          hotGrowEight(growWarm, 9.5);
+        } finally {}
       }
     }
     warmStores();
@@ -99,7 +114,7 @@ const OBSERVE: &str = r#"
     });
 "#;
 
-fn run(selection: JitSelection) -> (String, Vec<(u64, u64)>) {
+fn run(selection: JitSelection) -> (String, Vec<CallDelta>) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
         .build()
@@ -117,10 +132,13 @@ fn run(selection: JitSelection) -> (String, Vec<(u64, u64)>) {
             .run_script(SourceInput::from_javascript(source), url)
             .expect("final store call");
         let after = runtime.execution_stats();
-        deltas.push((
-            after.jit_optimized_entries - before.jit_optimized_entries,
-            after.jit_optimized_deopts - before.jit_optimized_deopts,
-        ));
+        deltas.push(CallDelta {
+            work_units: after.work_units_executed - before.work_units_executed,
+            template_entries: after.jit_generated_template_entries
+                - before.jit_generated_template_entries,
+            optimized_deopts: after.jit_optimized_deopts - before.jit_optimized_deopts,
+            code_generations: after.jit_code_generations - before.jit_code_generations,
+        });
     }
     let completion = runtime
         .run_script(
@@ -135,7 +153,7 @@ fn run(selection: JitSelection) -> (String, Vec<(u64, u64)>) {
 
 #[test]
 fn optimized_element_stores_match_interpreter() {
-    let (oracle, _) = run(JitSelection::InterpreterOnly);
+    let (oracle, interpreted) = run(JitSelection::InterpreterOnly);
     let (tiered, deltas) = run(JitSelection::ProductionTiered);
 
     assert_eq!(tiered, oracle);
@@ -144,7 +162,7 @@ fn optimized_element_stores_match_interpreter() {
         r#"{"intResult":17,"intContents":17,"floatResult":2.75,"floatContents":2.75,"rmwResult":10,"rmwContents":[1,2,3,4],"growResult":42.5,"growLength":9,"growFirstPresent":false,"growStoredPresent":true,"throwName":"TypeError"}"#
     );
     assert_eq!(deltas.len(), 5);
-    for ((operation, expected_deopts), (optimized_entries, optimized_deopts)) in [
+    for ((operation, expected_deopts), (delta, interpreted)) in [
         ("int", 0),
         ("float", 0),
         ("read-modify-write", 0),
@@ -156,15 +174,18 @@ fn optimized_element_stores_match_interpreter() {
         ("throw", 1),
     ]
     .into_iter()
-    .zip(deltas)
+    .zip(deltas.into_iter().zip(interpreted))
     {
         assert!(
-            optimized_entries >= 1,
-            "{operation} store must enter optimized code: entries={optimized_entries}, deopts={optimized_deopts}"
+            delta.template_entries == 0 && delta.work_units < interpreted.work_units,
+            "{operation} store must enter optimized code: {delta:?}, interpreted {interpreted:?}"
         );
         assert_eq!(
-            optimized_deopts, expected_deopts,
-            "{operation} store must follow its exact generated/deopt contract"
+            delta.optimized_deopts, expected_deopts,
+            "{operation} store must follow its exact generated/deopt contract: {delta:?}"
         );
+        if expected_deopts == 0 {
+            assert_eq!(delta.code_generations, 0, "{operation}: {delta:?}");
+        }
     }
 }

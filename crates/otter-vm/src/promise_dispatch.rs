@@ -1,6 +1,6 @@
 //! `Promise` constructor + statics + prototype dispatch.
 //!
-//! Slice 34. Connects three layers:
+//! Connects source-admitted capability construction, settlement and jobs:
 //!
 //! - The bytecode-side opcodes ([`otter_bytecode::Op::PromiseNew`],
 //!   [`otter_bytecode::Op::PromiseCall`]) and the universal
@@ -20,10 +20,13 @@
 //!   (§27.2.1.5).
 //!
 //! # Invariants
-//! - Native `resolve` / `reject` closures capture the promise via
-//!   `JsPromiseHandle::clone()` (shared body). They are
-//!   idempotent — once a promise settles, subsequent resolve /
-//!   reject calls are no-ops per spec §27.2.1.4 / §27.2.1.7.
+//! - Native `resolve` / `reject` closures retain the promise and their
+//!   shared AlreadyResolved cell in collector-traced captures. They read
+//!   the current promise after every collecting allocation and settle
+//!   at most once per spec §27.2.1.4 / §27.2.1.7.
+//! - A reaction records its admitted source Option and callable-owned
+//!   realm before queue publication. Native-only work keeps source None;
+//!   bytecode callbacks resolve their exact defining function owner.
 //! - Settlement enqueues all pending reactions onto
 //!   `Interpreter::microtasks` so the surrounding drain picks
 //!   them up on the next generation.
@@ -38,8 +41,8 @@ use crate::execution_context::ExecutionContext;
 use crate::native_function::{NativeError, local_native_value_with_length};
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
-    PromiseThenOutcome,
 };
+use crate::runtime_activation::CommittedValueError;
 use crate::{Interpreter, Local, NativeCtx, Value};
 use otter_gc::raw::RawGc;
 use smallvec::{SmallVec, smallvec};
@@ -189,7 +192,7 @@ fn reserve_slot_scoped(
         Value::hole(),
         &mut no_extra_roots,
     )
-    .map_err(|_| oom_native("Promise combinator"))?;
+    .map_err(NativeError::from)?;
     slots.add_pending();
     Ok(len - 1)
 }
@@ -210,14 +213,14 @@ fn reserve_keyed_slot_scoped(
         key,
         &mut no_extra_roots,
     )
-    .map_err(|_| oom_native("Promise keyed combinator"))?;
+    .map_err(NativeError::from)?;
     let len = crate::array::push_with_roots(
         capture_array(interp.escape_scoped(values)),
         interp.gc_heap_mut(),
         Value::hole(),
         &mut no_extra_roots,
     )
-    .map_err(|_| oom_native("Promise keyed combinator"))?;
+    .map_err(NativeError::from)?;
     slots.add_pending();
     Ok(len - 1)
 }
@@ -238,11 +241,11 @@ fn materialize_array_scoped<'scope>(
     .collect::<Vec<_>>();
     let result = interp
         .scoped_array(scope, elements.len())
-        .map_err(|_| oom_native(name))?;
+        .map_err(|error| CommittedValueError::JavaScript(error).into_native(interp, name))?;
     for (index, value) in elements.into_iter().enumerate() {
         interp
             .scoped_set_index(scope, result, index, value)
-            .map_err(|_| oom_native(name))?;
+            .map_err(|error| CommittedValueError::JavaScript(error).into_native(interp, name))?;
     }
     Ok(result)
 }
@@ -291,8 +294,8 @@ fn collect_keys(heap: &otter_gc::GcHeap, keys: crate::array::JsArray) -> Vec<Val
 }
 
 /// Root-aware helper for constructing ECMA-262 §27.2.1.5
-/// `NewPromiseCapability` records with an explicit VM execution
-/// context. Each method routes through the appropriate root walker
+/// `NewPromiseCapability` records with an explicit optional source.
+/// Each method routes through the appropriate root walker
 /// (runtime / stack / native) so heap allocations remain visible to
 /// GC during the construction sequence.
 #[derive(Debug, Clone, Default)]
@@ -307,18 +310,10 @@ impl PromiseBuilder {
         Self { context: None }
     }
 
-    /// Create a builder whose capabilities retain `context` for
-    /// later VM-dispatched settlement work.
+    /// Retain the admitted source for later settlement, or None for genuine
+    /// native-only work. Bytecode children resolve their own exact FunctionID.
     #[must_use]
-    pub fn with_context(context: ExecutionContext) -> Self {
-        Self {
-            context: Some(context),
-        }
-    }
-
-    /// Create a builder from an optional context.
-    #[must_use]
-    pub fn with_optional_context(context: Option<ExecutionContext>) -> Self {
+    pub fn with_context(context: Option<ExecutionContext>) -> Self {
         Self { context }
     }
 
@@ -381,7 +376,7 @@ impl PromiseBuilder {
             reason,
             &mut external_visit,
         )?;
-        interp.note_born_rejection(promise);
+        interp.note_born_rejection(promise, self.context.as_ref());
         Ok(promise)
     }
 
@@ -401,7 +396,7 @@ impl PromiseBuilder {
             reason,
             &mut external_visit,
         )?;
-        interp.note_born_rejection(promise);
+        interp.note_born_rejection(promise, self.context.as_ref());
         Ok(promise)
     }
 
@@ -622,26 +617,37 @@ impl Interpreter {
     fn promise_resolve_constructor_of(
         &mut self,
         stack: &mut crate::activation_stack::ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         value: Value,
-    ) -> Result<Value, crate::VmError> {
-        match self.ordinary_get_value(
-            stack,
-            context,
-            value,
-            value,
-            &crate::VmPropertyKey::String("constructor"),
-            0,
-        )? {
-            crate::VmGetOutcome::Value(found) => Ok(found),
-            crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync_rooted(
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, value);
+            let value = interp.escape_scoped(receiver);
+            match interp.ordinary_get_value(
                 stack,
                 context,
-                &getter,
                 value,
-                smallvec::SmallVec::new(),
-            ),
-        }
+                value,
+                &crate::VmPropertyKey::String("constructor"),
+                0,
+            )? {
+                crate::VmGetOutcome::Value(found) => Ok(found),
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    // Proxy GetMethod can collect before exposing the target's
+                    // accessor. Its receiver must come from the current root.
+                    let getter = interp.scoped_value(scope, getter);
+                    interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &interp.escape_scoped(getter),
+                            interp.escape_scoped(receiver),
+                            smallvec::SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)
+                }
+            }
+        })
     }
 
     /// §27.2.4.7 `PromiseResolve(%Promise%, value)` — the promise a value
@@ -656,39 +662,44 @@ impl Interpreter {
     pub(crate) fn promise_resolve_value(
         &mut self,
         stack: &mut crate::activation_stack::ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         value: Value,
-    ) -> Result<Value, crate::VmError> {
-        // §27.2.4.7 steps 1-2 — a promise whose `constructor` is this
-        // realm's `%Promise%` is already the promise it stands for. The
-        // lookup is observable and the shortcut saves the two ticks a
-        // fresh capability would cost.
-        if value.is_promise() {
-            let constructor = self.promise_resolve_constructor_of(stack, context, value)?;
-            let promise_constructor =
-                crate::object::get(self.global_this, &self.gc_heap, "Promise")
-                    .unwrap_or_else(Value::undefined);
-            if crate::abstract_ops::same_value(&constructor, &promise_constructor, &self.gc_heap) {
-                return Ok(value);
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let value = interp.scoped_value(scope, value);
+            if interp.escape_scoped(value).is_promise() {
+                let constructor = interp.promise_resolve_constructor_of(
+                    stack,
+                    context,
+                    interp.escape_scoped(value),
+                )?;
+                let promise_constructor =
+                    crate::object::get(interp.global_this, &interp.gc_heap, "Promise")
+                        .unwrap_or_else(Value::undefined);
+                if crate::abstract_ops::same_value(
+                    &constructor,
+                    &promise_constructor,
+                    &interp.gc_heap,
+                ) {
+                    return Ok(interp.escape_scoped(value));
+                }
             }
-        }
-        let capability = PromiseBuilder::with_context(context.clone()).capability_stack_rooted(
-            self,
-            stack,
-            &[&value],
-            &[],
-        )?;
-        let promise = capability.promise;
-        let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        args.push(value);
-        self.run_callable_sync_rooted(
-            stack,
-            context,
-            &capability.resolve,
-            Value::undefined(),
-            args,
-        )?;
-        Ok(promise)
+            let capability = PromiseBuilder::with_context(context.cloned())
+                .capability_stack_rooted(interp, stack, &[], &[])
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let promise = interp.scoped_value(scope, capability.promise);
+            let resolve = interp.scoped_value(scope, capability.resolve);
+            interp
+                .run_callable_sync_rooted(
+                    stack,
+                    context,
+                    &interp.escape_scoped(resolve),
+                    Value::undefined(),
+                    smallvec![interp.escape_scoped(value)],
+                )
+                .map_err(CommittedValueError::completed_call)?;
+            Ok(interp.escape_scoped(promise))
+        })
     }
 }
 
@@ -737,14 +748,15 @@ where
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         name,
         length,
         captures,
         &mut external_visit,
         call,
-    )
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 fn promise_native_stack<F>(
@@ -764,14 +776,15 @@ where
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         name,
         length,
         captures,
         &mut external_visit,
         call,
-    )
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 fn promise_native_ctx<F>(
@@ -799,14 +812,15 @@ where
             slice_roots,
         );
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         ctx.heap_mut(),
         name,
         length,
         captures,
         &mut external_visit,
         call,
-    )
+    )?;
+    Ok(ctx.interp_mut().stamp_native_creation_realm(value))
 }
 
 /// Rebuild an element function's capability from its LIVE captures.
@@ -847,14 +861,15 @@ where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
     let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         name,
         length,
         captures,
         &mut no_extra_roots,
         call,
-    )
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 /// Dispatch a `Promise.<method>(args...)` static call. Routes
@@ -902,7 +917,7 @@ pub fn statics_call(
     }
     match method {
         M::Resolve => static_resolve(interp, stack, context, constructor, args),
-        M::Reject => Ok(Value::promise(static_reject(interp, args)?)),
+        M::Reject => Ok(Value::promise(static_reject(interp, context, args)?)),
         M::All => static_all_generic(interp, stack, context, constructor, args),
         M::Race => static_race_generic(interp, stack, context, constructor, args),
         M::AllSettled => static_all_settled_generic(interp, stack, context, constructor, args),
@@ -936,7 +951,7 @@ pub fn prototype_call(
 ) -> Result<Value, NativeError> {
     match name {
         "then" => method_then(interp, stack, context, promise, args),
-        "catch" => Ok(method_catch(interp, context, promise, args)),
+        "catch" => method_catch(interp, context, promise, args),
         "finally" => method_finally_value(
             interp,
             stack,
@@ -967,13 +982,7 @@ pub fn invoke_then(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.prototype";
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: NAME,
-            reason: "missing execution context".to_string(),
-        })?;
+    let exec = ctx.execution_context().cloned();
     ctx.scope(|mut scope| {
         let receiver = scope.value(receiver);
         let args: SmallVec<[_; 2]> = args.iter().map(|arg| scope.value(*arg)).collect();
@@ -987,15 +996,22 @@ pub fn invoke_then(
                     .map(|arg| interp.scoped_value(scope, *arg))
                     .collect();
                 let receiver_raw = interp.escape_scoped(receiver);
-                let then = get_callable_property(interp, stack, &exec, receiver_raw, "then", NAME)?;
+                let then = get_callable_property(
+                    interp,
+                    stack,
+                    exec.as_ref(),
+                    receiver_raw,
+                    "then",
+                    NAME,
+                )?;
                 let then = interp.scoped_value(scope, then);
                 let then = interp.escape_scoped(then);
                 let receiver = interp.escape_scoped(receiver);
                 let args: SmallVec<[Value; 8]> =
                     args.iter().map(|arg| interp.escape_scoped(*arg)).collect();
                 interp
-                    .run_callable_sync_rooted(stack, &exec, &then, receiver, args)
-                    .map_err(|err| promise_vm_error(interp, NAME, err))
+                    .run_callable_sync_rooted(stack, exec.as_ref(), &then, receiver, args)
+                    .map_err(|err| crate::native_function::vm_to_native_error(interp, err, NAME))
             })
         })?;
         let result = scope.value(result);
@@ -1006,7 +1022,7 @@ pub fn invoke_then(
 fn invoke_then_interp(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    exec: &ExecutionContext,
+    exec: Option<&ExecutionContext>,
     receiver: Value,
     on_fulfilled: Value,
     on_rejected: Value,
@@ -1031,7 +1047,7 @@ fn invoke_then_interp(
                 receiver,
                 smallvec![on_fulfilled, on_rejected],
             )
-            .map_err(|err| promise_vm_error(interp, NAME, err))
+            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, NAME))
     })
 }
 
@@ -1091,10 +1107,7 @@ fn method_finally_value(
             reason: "`this` is not an Object".to_string(),
         });
     }
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: NAME,
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone();
     let default_ctor = builtin_promise_constructor(interp)?;
     interp.with_handle_scope(|interp, scope| {
         let receiver = interp.scoped_value(scope, receiver);
@@ -1103,14 +1116,21 @@ fn method_finally_value(
         if !crate::is_callable_value(&interp.escape_scoped(on_finally)) {
             let receiver = interp.escape_scoped(receiver);
             let on_finally = interp.escape_scoped(on_finally);
-            return invoke_then_interp(interp, stack, &exec, receiver, on_finally, on_finally);
+            return invoke_then_interp(
+                interp,
+                stack,
+                exec.as_ref(),
+                receiver,
+                on_finally,
+                on_finally,
+            );
         }
         let receiver_raw = interp.escape_scoped(receiver);
         let default_ctor_raw = interp.escape_scoped(default_ctor);
         let constructor = species_constructor_runtime(
             interp,
             stack,
-            &exec,
+            exec.as_ref(),
             &receiver_raw,
             &default_ctor_raw,
             NAME,
@@ -1118,14 +1138,14 @@ fn method_finally_value(
         let constructor = interp.scoped_value(scope, constructor);
         let then_finally = make_then_finally(
             interp,
-            &exec,
+            exec.as_ref(),
             interp.escape_scoped(constructor),
             interp.escape_scoped(on_finally),
         )?;
         let then_finally = interp.scoped_value(scope, then_finally);
         let catch_finally = make_catch_finally(
             interp,
-            &exec,
+            exec.as_ref(),
             interp.escape_scoped(constructor),
             interp.escape_scoped(on_finally),
         )?;
@@ -1133,7 +1153,7 @@ fn method_finally_value(
         invoke_then_interp(
             interp,
             stack,
-            &exec,
+            exec.as_ref(),
             interp.escape_scoped(receiver),
             interp.escape_scoped(then_finally),
             interp.escape_scoped(catch_finally),
@@ -1143,12 +1163,12 @@ fn method_finally_value(
 
 fn make_then_finally(
     interp: &mut Interpreter,
-    exec: &ExecutionContext,
+    exec: Option<&ExecutionContext>,
     constructor: Value,
     on_finally: Value,
 ) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
-    let exec_for_call = exec.clone();
+    let exec_for_call = exec.cloned();
     let constructor_root = constructor;
     let on_finally_root = on_finally;
     let runtime_roots = interp.collect_runtime_roots();
@@ -1156,7 +1176,7 @@ fn make_then_finally(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         1,
@@ -1171,7 +1191,7 @@ fn make_then_finally(
                 let result = scope.call(on_finally, undefined, &[])?;
                 let c_raw = scope.raw(c);
                 let resolve_fn = scope.with_turn_parts(|interp, stack| {
-                    get_promise_resolve(interp, stack, &exec_for_call, &c_raw)
+                    get_promise_resolve(interp, stack, exec_for_call.as_ref(), &c_raw)
                 })?;
                 let resolve_fn = scope.value(resolve_fn);
                 let resolved = scope.call(resolve_fn, c, &[result])?;
@@ -1185,18 +1205,18 @@ fn make_then_finally(
                 Ok(scope.finish(result))
             })
         },
-    )
-    .map_err(|_| oom_native("Promise.prototype.finally"))
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 fn make_catch_finally(
     interp: &mut Interpreter,
-    exec: &ExecutionContext,
+    exec: Option<&ExecutionContext>,
     constructor: Value,
     on_finally: Value,
 ) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
-    let exec_for_call = exec.clone();
+    let exec_for_call = exec.cloned();
     let constructor_root = constructor;
     let on_finally_root = on_finally;
     let runtime_roots = interp.collect_runtime_roots();
@@ -1204,7 +1224,7 @@ fn make_catch_finally(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         1,
@@ -1219,7 +1239,7 @@ fn make_catch_finally(
                 let result = scope.call(on_finally, undefined, &[])?;
                 let c_raw = scope.raw(c);
                 let resolve_fn = scope.with_turn_parts(|interp, stack| {
-                    get_promise_resolve(interp, stack, &exec_for_call, &c_raw)
+                    get_promise_resolve(interp, stack, exec_for_call.as_ref(), &c_raw)
                 })?;
                 let resolve_fn = scope.value(resolve_fn);
                 let resolved = scope.call(resolve_fn, c, &[result])?;
@@ -1233,8 +1253,8 @@ fn make_catch_finally(
                 Ok(scope.finish(result))
             })
         },
-    )
-    .map_err(|_| oom_native("Promise.prototype.finally"))
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
@@ -1246,15 +1266,15 @@ fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, Nati
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         0,
         captures,
         &mut external_visit,
         move |_ctx, _args, captures| Ok(captures[0]),
-    )
-    .map_err(|_| oom_native("Promise.prototype.finally"))
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeError> {
@@ -1266,7 +1286,7 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
     };
-    local_native_value_with_length(
+    let value = local_native_value_with_length(
         interp.gc_heap_mut(),
         "",
         0,
@@ -1284,8 +1304,8 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
                 message: String::new(),
             })
         },
-    )
-    .map_err(|_| oom_native("Promise.prototype.finally"))
+    )?;
+    Ok(interp.stamp_native_creation_realm(value))
 }
 
 // -- statics --------------------------------------------------------
@@ -1303,29 +1323,6 @@ fn builtin_promise_constructor(interp: &Interpreter) -> Result<Value, NativeErro
             reason: "Promise constructor is not installed".to_string(),
         }
     })
-}
-
-fn promise_vm_error(
-    interp: &crate::Interpreter,
-    name: &'static str,
-    err: crate::VmError,
-) -> NativeError {
-    match err {
-        crate::VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name,
-                message: value.into(),
-            }
-        }
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
 }
 
 /// §27.2.1.5 `NewPromiseCapability(C)` for non-intrinsic
@@ -1346,10 +1343,7 @@ fn new_generic_promise_capability(
     context: Option<ExecutionContext>,
     constructor: &mut Value,
 ) -> Result<PromiseCapability, NativeError> {
-    let exec = context.ok_or_else(|| NativeError::TypeError {
-        name: "Promise",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.ok_or(NativeError::InvalidOperand)?;
     if !crate::is_constructor_runtime(constructor, &exec, interp.gc_heap()) {
         return Err(NativeError::TypeError {
             name: "Promise",
@@ -1378,6 +1372,7 @@ fn new_generic_promise_capability(
             &mut no_extra_roots,
             capability_executor_state::call,
         )?;
+        let executor = interp.stamp_native_creation_realm(executor);
         let executor = interp.scoped_value(scope, executor);
         let constructor_raw = interp.escape_scoped(constructor_handle);
         let executor_raw = interp.escape_scoped(executor);
@@ -1388,8 +1383,9 @@ fn new_generic_promise_capability(
                 &constructor_raw,
                 constructor_raw,
                 smallvec![executor_raw],
+                0,
             )
-            .map_err(|err| promise_vm_error(interp, "Promise", err))?;
+            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, "Promise"))?;
         let promise = interp.scoped_value(scope, promise);
         *constructor = interp.escape_scoped(constructor_handle);
         let state = interp
@@ -1429,10 +1425,7 @@ fn call_capability_function(
     use_reject: bool,
     value: Value,
 ) -> Result<(), NativeError> {
-    let exec = cap.context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = cap.context.clone();
     interp.with_handle_scope(|interp, scope| {
         let handles = CapabilityHandles::park(interp, scope, cap);
         let value = interp.scoped_value(scope, value);
@@ -1446,12 +1439,12 @@ fn call_capability_function(
         let result = interp
             .run_callable_sync_rooted(
                 stack,
-                &exec,
+                exec.as_ref(),
                 &function,
                 Value::undefined(),
                 smallvec![value],
             )
-            .map_err(|err| promise_vm_error(interp, "Promise", err));
+            .map_err(|err| crate::native_function::vm_to_native_error(interp, err, "Promise"));
         handles.refresh(interp, cap);
         result.map(|_| ())
     })
@@ -1521,47 +1514,15 @@ fn call_capability_reject_native(
     })
 }
 
-fn native_error_rejection_value(interp: &mut Interpreter, err: NativeError) -> Value {
-    if let NativeError::Thrown { message, .. } = err {
-        let heap = interp.gc_heap_mut();
-        return Value::string(
-            crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
-                crate::JsString::from_str("", heap).expect("empty string allocates")
-            }),
-        );
-    }
-    let vm_error = crate::native_to_vm_error(interp, err);
-    // Building the VM error already made the instance the failure stands
-    // for and parked it as the pending throw; that object is the reason,
-    // not a rendering of it.
-    if let Some(value) = interp.take_pending_uncaught_throw() {
-        return value;
-    }
-    rejection_value_for(interp, &vm_error)
-}
-
-/// The value a promise rejects with when the failure is the engine's own.
-///
-/// A caller writes `err instanceof TypeError`, so the reason has to be the
-/// error object the failure stands for; the rendered message is only a
-/// last resort for a failure that has no class.
-pub(crate) fn rejection_value_for(interp: &mut Interpreter, err: &crate::VmError) -> Value {
-    let empty = ActivationStack::new();
-    interp
-        .vm_error_to_throwable_with_stack_roots(None, &empty, err)
-        .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, err))
-}
-
-fn native_error_rejection_value_preserving_throw(
+/// Materialize a native abrupt completion with the current rooted turn.
+/// Existing thrown values are consumed by the one VM throwable owner.
+fn native_error_rejection_value(
     interp: &mut Interpreter,
+    stack: &ActivationStack,
     err: NativeError,
-) -> Value {
-    if matches!(err, NativeError::Thrown { .. })
-        && let Some(value) = interp.take_pending_uncaught_throw()
-    {
-        return value;
-    }
-    native_error_rejection_value(interp, err)
+) -> Result<Value, NativeError> {
+    crate::error_ops::native_error_to_throwable_with_stack(interp, stack, None, err)
+        .map_err(|error| crate::native_function::vm_to_native_error(interp, error, "Promise"))
 }
 
 fn reject_capability_error(
@@ -1574,10 +1535,10 @@ fn reject_capability_error(
     // across it so a moved reject function is re-read before the call.
     let reason = interp.with_handle_scope(|interp, scope| {
         let handles = CapabilityHandles::park(interp, scope, cap);
-        let reason = native_error_rejection_value_preserving_throw(interp, err);
+        let reason = native_error_rejection_value(interp, stack, err);
         handles.refresh(interp, cap);
         reason
-    });
+    })?;
     call_capability_reject(interp, stack, cap, reason)?;
     Ok(cap.promise)
 }
@@ -1588,7 +1549,7 @@ fn reject_capability_error(
 fn get_property_runtime(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     receiver: Value,
     key: &'static str,
     name: &'static str,
@@ -1599,7 +1560,7 @@ fn get_property_runtime(
         let property_key = crate::VmPropertyKey::String(key);
         match interp
             .ordinary_get_value(stack, context, receiver_raw, receiver_raw, &property_key, 0)
-            .map_err(|err| promise_vm_error(interp, name, err))?
+            .map_err(|err| err.into_native(interp, name))?
         {
             crate::VmGetOutcome::Value(value) => Ok(value),
             crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1608,7 +1569,7 @@ fn get_property_runtime(
                 let receiver = interp.escape_scoped(receiver);
                 interp
                     .run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())
-                    .map_err(|err| promise_vm_error(interp, name, err))
+                    .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
             }
         }
     })
@@ -1618,7 +1579,7 @@ fn get_property_runtime(
 fn get_symbol_property_runtime(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     receiver: Value,
     sym: crate::symbol::JsSymbol,
     name: &'static str,
@@ -1629,7 +1590,7 @@ fn get_symbol_property_runtime(
         let property_key = crate::VmPropertyKey::Symbol(sym);
         match interp
             .ordinary_get_value(stack, context, receiver_raw, receiver_raw, &property_key, 0)
-            .map_err(|err| promise_vm_error(interp, name, err))?
+            .map_err(|err| err.into_native(interp, name))?
         {
             crate::VmGetOutcome::Value(value) => Ok(value),
             crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1638,7 +1599,7 @@ fn get_symbol_property_runtime(
                 let receiver = interp.escape_scoped(receiver);
                 interp
                     .run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())
-                    .map_err(|err| promise_vm_error(interp, name, err))
+                    .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
             }
         }
     })
@@ -1648,7 +1609,7 @@ fn get_symbol_property_runtime(
 /// constructor to use when an algorithm needs a fresh instance derived
 /// from `O`. Returns `defaultConstructor` when `O.constructor` is
 /// `undefined`, throws `TypeError` if `constructor` is a non-object,
-/// returns `C` when `C[@@species]` is `null`/`undefined`, and otherwise
+/// returns `defaultConstructor` when `C[@@species]` is `null`/`undefined`, and otherwise
 /// returns `C[@@species]` after validating it is a constructor.
 ///
 /// # See also
@@ -1656,7 +1617,7 @@ fn get_symbol_property_runtime(
 fn species_constructor_runtime(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     obj: &Value,
     default_ctor: &Value,
     name: &'static str,
@@ -1684,9 +1645,16 @@ fn species_constructor_runtime(
         let s = interp.scoped_value(scope, s);
         let s_raw = interp.escape_scoped(s);
         if s_raw.is_undefined() || s_raw.is_null() {
-            return Ok(interp.escape_scoped(c));
+            return Ok(interp.escape_scoped(default_ctor));
         }
-        if crate::is_constructor_runtime(&s_raw, context, interp.gc_heap()) {
+        if is_builtin_promise_constructor(interp, &s_raw) {
+            return Ok(s_raw);
+        }
+        let source = interp
+            .callable_context(context, s_raw)
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))?;
+        let source = source.ok_or(NativeError::InvalidOperand)?;
+        if crate::is_constructor_runtime(&s_raw, &source, interp.gc_heap()) {
             return Ok(s_raw);
         }
         Err(NativeError::TypeError {
@@ -1699,7 +1667,7 @@ fn species_constructor_runtime(
 fn get_callable_property(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     receiver: Value,
     key: &'static str,
     name: &'static str,
@@ -1717,7 +1685,7 @@ fn get_callable_property(
 fn get_promise_resolve(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     constructor: &Value,
 ) -> Result<Value, NativeError> {
     get_callable_property(
@@ -1733,7 +1701,7 @@ fn get_promise_resolve(
 fn call_promise_resolve(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     resolve_fn: &Value,
     constructor: &Value,
     value: Value,
@@ -1747,7 +1715,9 @@ fn call_promise_resolve(
         let value = interp.escape_scoped(value);
         interp
             .run_callable_sync_rooted(stack, context, &resolve_fn, constructor, smallvec![value])
-            .map_err(|err| promise_vm_error(interp, "Promise.resolve", err))
+            .map_err(|err| {
+                crate::native_function::vm_to_native_error(interp, err, "Promise.resolve")
+            })
     })
 }
 
@@ -1763,33 +1733,32 @@ fn static_resolve(
         let value = interp.scoped_value(scope, value);
         let constructor = interp.scoped_value(scope, constructor);
         if interp.escape_scoped(value).is_promise() {
-            if let Some(exec) = context.as_ref() {
-                let value_raw = interp.escape_scoped(value);
-                let value_constructor = get_property_runtime(
-                    interp,
-                    stack,
-                    exec,
-                    value_raw,
-                    "constructor",
-                    "Promise.resolve",
-                )?;
-                let value_constructor = interp.scoped_value(scope, value_constructor);
-                if crate::abstract_ops::same_value(
-                    &interp.escape_scoped(value_constructor),
-                    &interp.escape_scoped(constructor),
-                    interp.gc_heap(),
-                ) {
-                    return Ok(interp.escape_scoped(value));
-                }
-            } else {
+            let value_raw = interp.escape_scoped(value);
+            let value_constructor = get_property_runtime(
+                interp,
+                stack,
+                context.as_ref(),
+                value_raw,
+                "constructor",
+                "Promise.resolve",
+            )?;
+            let value_constructor = interp.scoped_value(scope, value_constructor);
+            if crate::abstract_ops::same_value(
+                &interp.escape_scoped(value_constructor),
+                &interp.escape_scoped(constructor),
+                interp.gc_heap(),
+            ) {
                 return Ok(interp.escape_scoped(value));
             }
         }
         // §27.2.4.7 PromiseResolve — settle a fresh promise through its
         // resolve function rather than fulfilling directly, so a thenable
         // value is adopted instead of becoming the fulfillment value verbatim.
-        let cap = PromiseBuilder::with_optional_context(context.clone())
-            .capability_runtime_rooted(interp, &[], &[])?;
+        let cap = PromiseBuilder::with_context(context.clone()).capability_runtime_rooted(
+            interp,
+            &[],
+            &[],
+        )?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
         let value = interp.escape_scoped(value);
         let mut cap = cap_handles.current(interp, context.clone());
@@ -1798,9 +1767,20 @@ fn static_resolve(
     })
 }
 
-fn static_reject(interp: &mut Interpreter, args: &[Value]) -> Result<JsPromiseHandle, NativeError> {
+fn static_reject(
+    interp: &mut Interpreter,
+    context: Option<ExecutionContext>,
+    args: &[Value],
+) -> Result<JsPromiseHandle, NativeError> {
     let reason = args.first().cloned().unwrap_or(Value::undefined());
-    Ok(PromiseBuilder::new().rejected_runtime_rooted(interp, reason, &[], &[args])?)
+    Ok(
+        PromiseBuilder::with_context(context).rejected_runtime_rooted(
+            interp,
+            reason,
+            &[],
+            &[args],
+        )?,
+    )
 }
 
 fn static_resolve_generic(
@@ -1825,14 +1805,12 @@ fn static_resolve_generic(
         // §27.2.4.7 PromiseResolve step 2 — a promise whose `constructor`
         // is C passes through unchanged: no fresh capability, no extra
         // `then` tick.
-        if interp.escape_scoped(value).is_promise()
-            && let Some(exec) = context.as_ref()
-        {
+        if interp.escape_scoped(value).is_promise() {
             let value_raw = interp.escape_scoped(value);
             let value_constructor = get_property_runtime(
                 interp,
                 stack,
-                exec,
+                context.as_ref(),
                 value_raw,
                 "constructor",
                 "Promise.resolve",
@@ -1904,10 +1882,7 @@ fn static_try_generic(
             reason: "Promise.try `this` is not an Object".to_string(),
         });
     }
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: NAME,
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     interp.with_handle_scope(|interp, scope| {
         let constructor_handle = interp.scoped_value(scope, constructor);
         let callback = interp.scoped_value(
@@ -1929,25 +1904,32 @@ fn static_try_generic(
             .into_iter()
             .map(|value| interp.escape_scoped(value))
             .collect();
-        let call_result =
-            interp.run_callable_sync_rooted(stack, &exec, &callback, Value::undefined(), forwarded);
+        let call_result = interp.run_callable_sync_rooted(
+            stack,
+            Some(&exec),
+            &callback,
+            Value::undefined(),
+            forwarded,
+        );
         let mut cap = cap_handles.current(interp, Some(exec.clone()));
         match call_result {
             Ok(value) => call_capability_resolve(interp, stack, &mut cap, value)?,
-            // A termination is not a value the capability can carry: it ends
-            // the run wherever it was raised.
-            Err(crate::VmError::Exit { code }) => {
-                return Err(crate::NativeError::Exit { code });
-            }
-            Err(crate::VmError::Interrupted) => return Err(crate::NativeError::Interrupted),
-            // §27.2.4.6 step 5 — the capability carries the ORIGINAL thrown
-            // value; a caught user `throw` parks it on
-            // `pending_uncaught_throw`, so prefer that over a re-rendered
-            // error object.
             Err(other) => {
+                // Call has already exhausted the callback's source handlers.
+                // A completed engine/control failure cannot start rejection
+                // work or be projected as a direct-source catchable OOM.
+                if other.is_fatal() || matches!(other, crate::VmError::OutOfMemory { .. }) {
+                    return Err(crate::native_function::vm_to_native_error(
+                        interp,
+                        other,
+                        "Promise.try",
+                    ));
+                }
                 let reason = interp
-                    .take_pending_uncaught_throw()
-                    .unwrap_or_else(|| rejection_value_for(interp, &other));
+                    .vm_error_to_throwable_with_stack_roots(Some(&exec), stack, &other)
+                    .map_err(|error| {
+                        crate::native_function::vm_to_native_error(interp, error, "Promise.try")
+                    })?;
                 // Rendering the reason allocates; re-read the capability.
                 let mut cap = cap_handles.current(interp, Some(exec.clone()));
                 call_capability_reject(interp, stack, &mut cap, reason)?;
@@ -1981,10 +1963,7 @@ fn static_all_keyed_generic(
     variant: KeyedVariant,
 ) -> Result<Value, NativeError> {
     let name = variant.name();
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let promises = args.first().cloned().unwrap_or(Value::undefined());
     interp.with_handle_scope(|interp, scope| {
         let constructor = interp.scoped_value(scope, constructor);
@@ -2010,13 +1989,14 @@ fn static_all_keyed_generic(
             );
         }
         let constructor_raw = interp.escape_scoped(constructor);
-        let promise_resolve = match get_promise_resolve(interp, stack, &exec, &constructor_raw) {
-            Ok(value) => interp.scoped_value(scope, value),
-            Err(err) => {
-                let mut cap = cap_handles.current(interp, context.clone());
-                return reject_capability_error(interp, stack, &mut cap, err);
-            }
-        };
+        let promise_resolve =
+            match get_promise_resolve(interp, stack, Some(&exec), &constructor_raw) {
+                Ok(value) => interp.scoped_value(scope, value),
+                Err(err) => {
+                    let mut cap = cap_handles.current(interp, context.clone());
+                    return reject_capability_error(interp, stack, &mut cap, err);
+                }
+            };
         let promises_raw = interp.escape_scoped(promises);
         let all_keys = match interp.own_property_keys_value(stack, &exec, &promises_raw) {
             Ok(keys) => keys
@@ -2024,18 +2004,18 @@ fn static_all_keyed_generic(
                 .map(|key| interp.scoped_value(scope, key))
                 .collect::<Vec<_>>(),
             Err(err) => {
-                let native = promise_vm_error(interp, name, err);
+                let native = err.into_native(interp, name);
                 let mut cap = cap_handles.current(interp, context.clone());
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
         let slots = PromiseSlots::new();
-        let slots_handle = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise keyed combinator"))?;
-        let keys_handle = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise keyed combinator"))?;
+        let slots_handle = interp.scoped_array(scope, 0).map_err(|error| {
+            CommittedValueError::JavaScript(error).into_native(interp, "Promise keyed combinator")
+        })?;
+        let keys_handle = interp.scoped_array(scope, 0).map_err(|error| {
+            CommittedValueError::JavaScript(error).into_native(interp, "Promise keyed combinator")
+        })?;
 
         for key in all_keys {
             let key_raw = interp.escape_scoped(key);
@@ -2045,14 +2025,14 @@ fn static_all_keyed_generic(
             let promises_raw = interp.escape_scoped(promises);
             let desc = match interp.ordinary_get_own_property_descriptor_value(
                 stack,
-                &exec,
+                Some(&exec),
                 promises_raw,
                 &vm_key,
                 0,
             ) {
                 Ok(desc) => desc,
                 Err(err) => {
-                    let native = promise_vm_error(interp, name, err);
+                    let native = err.into_native(interp, name);
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, native);
                 }
@@ -2061,13 +2041,14 @@ fn static_all_keyed_generic(
                 continue;
             }
             let promises_raw = interp.escape_scoped(promises);
-            let next_value = match keyed_get(interp, stack, &exec, promises_raw, &vm_key, name) {
-                Ok(value) => interp.scoped_value(scope, value),
-                Err(err) => {
-                    let mut cap = cap_handles.current(interp, context.clone());
-                    return reject_capability_error(interp, stack, &mut cap, err);
-                }
-            };
+            let next_value =
+                match keyed_get(interp, stack, Some(&exec), promises_raw, &vm_key, name) {
+                    Ok(value) => interp.scoped_value(scope, value),
+                    Err(err) => {
+                        let mut cap = cap_handles.current(interp, context.clone());
+                        return reject_capability_error(interp, stack, &mut cap, err);
+                    }
+                };
             let i = reserve_keyed_slot_scoped(&slots, interp, slots_handle, keys_handle, key)?;
             let promise_resolve_raw = interp.escape_scoped(promise_resolve);
             let constructor_raw = interp.escape_scoped(constructor);
@@ -2075,7 +2056,7 @@ fn static_all_keyed_generic(
             let entry_promise = match call_promise_resolve(
                 interp,
                 stack,
-                &exec,
+                Some(&exec),
                 &promise_resolve_raw,
                 &constructor_raw,
                 next_value_raw,
@@ -2127,7 +2108,7 @@ fn static_all_keyed_generic(
             if let Err(err) = attach_then_value(
                 interp,
                 stack,
-                &exec,
+                Some(&exec),
                 entry_promise_raw,
                 on_fulfill_raw,
                 on_reject_raw,
@@ -2170,7 +2151,7 @@ fn vm_property_key_from_value(
 fn keyed_get(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     receiver: Value,
     key: &crate::VmPropertyKey<'_>,
     name: &'static str,
@@ -2180,7 +2161,7 @@ fn keyed_get(
         let receiver_raw = interp.escape_scoped(receiver);
         match interp
             .ordinary_get_value(stack, context, receiver_raw, receiver_raw, key, 0)
-            .map_err(|err| promise_vm_error(interp, name, err))?
+            .map_err(|err| err.into_native(interp, name))?
         {
             crate::VmGetOutcome::Value(value) => Ok(value),
             crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -2189,7 +2170,7 @@ fn keyed_get(
                 let receiver = interp.escape_scoped(receiver);
                 interp
                     .run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())
-                    .map_err(|err| promise_vm_error(interp, name, err))
+                    .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))
             }
         }
     })
@@ -2234,7 +2215,7 @@ fn keyed_element_function(
             Ok(Value::undefined())
         },
     )
-    .map_err(|_| oom_native(name))
+    .map_err(NativeError::from)
 }
 
 fn settled_element_function(
@@ -2273,7 +2254,7 @@ fn settled_element_function(
             Ok(Value::undefined())
         },
     )
-    .map_err(|_| oom_native("Promise.allSettled"))
+    .map_err(NativeError::from)
 }
 
 fn resolve_keyed_slots_runtime(
@@ -2318,12 +2299,19 @@ fn create_keyed_result(
                 )
             })
             .collect();
-        let object = interp.scoped_object(scope).map_err(|_| oom_native(name))?;
-        let raw = interp
+        let object = interp
+            .scoped_object(scope)
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))?;
+        let mut raw = interp
             .escape_scoped(object)
             .as_object()
             .expect("keyed result is an object");
-        crate::object::set_prototype(raw, interp.gc_heap_mut(), None);
+        if !crate::object::set_prototype(&mut raw, interp.gc_heap_mut(), None)? {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "result prototype rejected".to_owned(),
+            });
+        }
         for (key, value) in pairs {
             let key = interp.escape_scoped(key);
             let value = interp.escape_scoped(value);
@@ -2335,9 +2323,9 @@ fn create_keyed_result(
             let desc = crate::object::PropertyDescriptor::data(value, true, true, true);
             let ok = if let Some(s) = key.as_string(heap) {
                 let key = s.to_lossy_string(heap);
-                crate::object::define_own_property(raw, heap, &key, desc)
+                crate::object::define_own_property(raw, heap, &key, desc)?
             } else if let Some(sym) = key.as_symbol(heap) {
-                crate::object::define_own_symbol_property(raw, heap, sym, desc)
+                crate::object::define_own_symbol_property(raw, heap, sym, desc)?
             } else {
                 true
             };
@@ -2359,10 +2347,7 @@ fn static_all_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.all",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
     interp.with_handle_scope(|interp, scope| {
         let constructor = interp.scoped_value(scope, constructor);
@@ -2376,13 +2361,14 @@ fn static_all_generic(
         )?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
         let constructor_raw = interp.escape_scoped(constructor);
-        let promise_resolve = match get_promise_resolve(interp, stack, &exec, &constructor_raw) {
-            Ok(value) => interp.scoped_value(scope, value),
-            Err(err) => {
-                let mut cap = cap_handles.current(interp, context.clone());
-                return reject_capability_error(interp, stack, &mut cap, err);
-            }
-        };
+        let promise_resolve =
+            match get_promise_resolve(interp, stack, Some(&exec), &constructor_raw) {
+                Ok(value) => interp.scoped_value(scope, value),
+                Err(err) => {
+                    let mut cap = cap_handles.current(interp, context.clone());
+                    return reject_capability_error(interp, stack, &mut cap, err);
+                }
+            };
         let iterable_raw = interp.escape_scoped(iterable);
         let (iterator, next_method) = match interp.get_iterator_sync(stack, &exec, &iterable_raw) {
             Ok((iterator, next)) => (
@@ -2390,15 +2376,15 @@ fn static_all_generic(
                 interp.scoped_value(scope, next),
             ),
             Err(err) => {
-                let native = promise_vm_error(interp, "Promise.all", err);
+                let native = err.into_native(interp, "Promise.all");
                 let mut cap = cap_handles.current(interp, context.clone());
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
         let slots = PromiseSlots::new();
-        let slots_handle = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise combinator"))?;
+        let slots_handle = interp.scoped_array(scope, 0).map_err(|error| {
+            CommittedValueError::JavaScript(error).into_native(interp, "Promise combinator")
+        })?;
         loop {
             let iterator_raw = interp.escape_scoped(iterator);
             let next_method_raw = interp.escape_scoped(next_method);
@@ -2407,7 +2393,7 @@ fn static_all_generic(
                     Ok(Some(value)) => value,
                     Ok(None) => break,
                     Err(err) => {
-                        let native = promise_vm_error(interp, "Promise.all", err);
+                        let native = err.into_native(interp, "Promise.all");
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
@@ -2424,7 +2410,7 @@ fn static_all_generic(
                 let entry_promise = match call_promise_resolve(
                     interp,
                     stack,
-                    &exec,
+                    Some(&exec),
                     &promise_resolve_raw,
                     &constructor_raw,
                     next_value_raw,
@@ -2432,7 +2418,12 @@ fn static_all_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                        if err.is_fatal() {
+                            return Err(err);
+                        }
+                        interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                            .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -2473,11 +2464,21 @@ fn static_all_generic(
                 let entry_promise = interp.escape_scoped(entry_promise);
                 let on_fulfill = interp.escape_scoped(on_fulfill);
                 let on_reject = interp.escape_scoped(cap_handles.reject);
-                if let Err(err) =
-                    attach_then_value(interp, stack, &exec, entry_promise, on_fulfill, on_reject)
-                {
+                if let Err(err) = attach_then_value(
+                    interp,
+                    stack,
+                    Some(&exec),
+                    entry_promise,
+                    on_fulfill,
+                    on_reject,
+                ) {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                    if err.is_fatal() {
+                        return Err(err);
+                    }
+                    interp
+                        .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                        .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -2505,10 +2506,7 @@ fn static_race_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.race",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
     interp.with_handle_scope(|interp, scope| {
         let constructor = interp.scoped_value(scope, constructor);
@@ -2522,13 +2520,14 @@ fn static_race_generic(
         )?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
         let constructor_raw = interp.escape_scoped(constructor);
-        let promise_resolve = match get_promise_resolve(interp, stack, &exec, &constructor_raw) {
-            Ok(value) => interp.scoped_value(scope, value),
-            Err(err) => {
-                let mut cap = cap_handles.current(interp, context.clone());
-                return reject_capability_error(interp, stack, &mut cap, err);
-            }
-        };
+        let promise_resolve =
+            match get_promise_resolve(interp, stack, Some(&exec), &constructor_raw) {
+                Ok(value) => interp.scoped_value(scope, value),
+                Err(err) => {
+                    let mut cap = cap_handles.current(interp, context.clone());
+                    return reject_capability_error(interp, stack, &mut cap, err);
+                }
+            };
         let iterable_raw = interp.escape_scoped(iterable);
         let (iterator, next_method) = match interp.get_iterator_sync(stack, &exec, &iterable_raw) {
             Ok((iterator, next)) => (
@@ -2536,7 +2535,7 @@ fn static_race_generic(
                 interp.scoped_value(scope, next),
             ),
             Err(err) => {
-                let native = promise_vm_error(interp, "Promise.race", err);
+                let native = err.into_native(interp, "Promise.race");
                 let mut cap = cap_handles.current(interp, context.clone());
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
@@ -2549,7 +2548,7 @@ fn static_race_generic(
                     Ok(Some(value)) => value,
                     Ok(None) => break,
                     Err(err) => {
-                        let native = promise_vm_error(interp, "Promise.race", err);
+                        let native = err.into_native(interp, "Promise.race");
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
@@ -2565,7 +2564,7 @@ fn static_race_generic(
                 let entry_promise = match call_promise_resolve(
                     interp,
                     stack,
-                    &exec,
+                    Some(&exec),
                     &promise_resolve_raw,
                     &constructor_raw,
                     next_value_raw,
@@ -2573,7 +2572,12 @@ fn static_race_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                        if err.is_fatal() {
+                            return Err(err);
+                        }
+                        interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                            .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -2584,13 +2588,18 @@ fn static_race_generic(
                 if let Err(err) = attach_then_value(
                     interp,
                     stack,
-                    &exec,
+                    Some(&exec),
                     entry_promise,
                     on_fulfilled,
                     on_rejected,
                 ) {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                    if err.is_fatal() {
+                        return Err(err);
+                    }
+                    interp
+                        .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                        .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -2610,10 +2619,7 @@ fn static_all_settled_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.allSettled",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
     interp.with_handle_scope(|interp, scope| {
         let constructor = interp.scoped_value(scope, constructor);
@@ -2627,13 +2633,14 @@ fn static_all_settled_generic(
         )?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
         let constructor_raw = interp.escape_scoped(constructor);
-        let promise_resolve = match get_promise_resolve(interp, stack, &exec, &constructor_raw) {
-            Ok(value) => interp.scoped_value(scope, value),
-            Err(err) => {
-                let mut cap = cap_handles.current(interp, context.clone());
-                return reject_capability_error(interp, stack, &mut cap, err);
-            }
-        };
+        let promise_resolve =
+            match get_promise_resolve(interp, stack, Some(&exec), &constructor_raw) {
+                Ok(value) => interp.scoped_value(scope, value),
+                Err(err) => {
+                    let mut cap = cap_handles.current(interp, context.clone());
+                    return reject_capability_error(interp, stack, &mut cap, err);
+                }
+            };
         let iterable_raw = interp.escape_scoped(iterable);
         let (iterator, next_method) = match interp.get_iterator_sync(stack, &exec, &iterable_raw) {
             Ok((iterator, next)) => (
@@ -2641,15 +2648,15 @@ fn static_all_settled_generic(
                 interp.scoped_value(scope, next),
             ),
             Err(err) => {
-                let native = promise_vm_error(interp, "Promise.allSettled", err);
+                let native = err.into_native(interp, "Promise.allSettled");
                 let mut cap = cap_handles.current(interp, context.clone());
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
         let slots = PromiseSlots::new();
-        let slots_handle = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise combinator"))?;
+        let slots_handle = interp.scoped_array(scope, 0).map_err(|error| {
+            CommittedValueError::JavaScript(error).into_native(interp, "Promise combinator")
+        })?;
         loop {
             let iterator_raw = interp.escape_scoped(iterator);
             let next_method_raw = interp.escape_scoped(next_method);
@@ -2658,7 +2665,7 @@ fn static_all_settled_generic(
                     Ok(Some(value)) => value,
                     Ok(None) => break,
                     Err(err) => {
-                        let native = promise_vm_error(interp, "Promise.allSettled", err);
+                        let native = err.into_native(interp, "Promise.allSettled");
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
@@ -2675,7 +2682,7 @@ fn static_all_settled_generic(
                 let entry_promise = match call_promise_resolve(
                     interp,
                     stack,
-                    &exec,
+                    Some(&exec),
                     &promise_resolve_raw,
                     &constructor_raw,
                     next_value_raw,
@@ -2683,7 +2690,12 @@ fn static_all_settled_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                        if err.is_fatal() {
+                            return Err(err);
+                        }
+                        interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                            .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -2713,11 +2725,21 @@ fn static_all_settled_generic(
                 let entry_promise = interp.escape_scoped(entry_promise);
                 let on_fulfill = interp.escape_scoped(on_fulfill);
                 let on_reject = interp.escape_scoped(on_reject);
-                if let Err(err) =
-                    attach_then_value(interp, stack, &exec, entry_promise, on_fulfill, on_reject)
-                {
+                if let Err(err) = attach_then_value(
+                    interp,
+                    stack,
+                    Some(&exec),
+                    entry_promise,
+                    on_fulfill,
+                    on_reject,
+                ) {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                    if err.is_fatal() {
+                        return Err(err);
+                    }
+                    interp
+                        .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                        .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -2772,35 +2794,36 @@ fn make_aggregate_error_runtime_rooted(
         );
         let message = interp
             .scoped_string(scope, "All promises were rejected")
-            .map_err(|_| oom_native("Promise.any"))?;
-        let object = interp
-            .scoped_object(scope)
-            .map_err(|_| oom_native("Promise.any"))?;
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise.any")
+            })?;
+        let object = interp.scoped_object(scope).map_err(|error| {
+            crate::native_function::vm_to_native_error(interp, error, "Promise.any")
+        })?;
         interp
             .scoped_set_prototype(scope, object, Some(prototype))
-            .map_err(|err| NativeError::TypeError {
-                name: "Promise.any",
-                reason: err.to_string(),
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise.any")
             })?;
         interp
             .scoped_set(scope, object, "message", message)
-            .map_err(|err| NativeError::TypeError {
-                name: "Promise.any",
-                reason: err.to_string(),
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise.any")
             })?;
-        let errors_array = interp
-            .scoped_array(scope, errors.len())
-            .map_err(|_| oom_native("Promise.any"))?;
+        let errors_array = interp.scoped_array(scope, errors.len()).map_err(|error| {
+            CommittedValueError::JavaScript(error).into_native(interp, "Promise.any")
+        })?;
         for (index, error) in errors.into_iter().enumerate() {
             interp
                 .scoped_set_index(scope, errors_array, index, error)
-                .map_err(|_| oom_native("Promise.any"))?;
+                .map_err(|error| {
+                    CommittedValueError::JavaScript(error).into_native(interp, "Promise.any")
+                })?;
         }
         interp
             .scoped_set(scope, object, "errors", errors_array)
-            .map_err(|err| NativeError::TypeError {
-                name: "Promise.any",
-                reason: err.to_string(),
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise.any")
             })?;
         Ok(interp.escape_scoped(object))
     })
@@ -2839,8 +2862,14 @@ fn make_aggregate_error_native_rooted(
         {
             let raw_instance = cx.escape(instance);
             let raw_proto = cx.escape(proto);
-            if let (Some(object), Some(proto)) = (raw_instance.as_object(), raw_proto.as_object()) {
-                crate::object::set_prototype(object, cx.heap_mut(), Some(proto));
+            if let (Some(mut object), Some(proto)) =
+                (raw_instance.as_object(), raw_proto.as_object())
+                && !crate::object::set_prototype(&mut object, cx.heap_mut(), Some(proto))?
+            {
+                return Err(NativeError::TypeError {
+                    name: "Promise.any",
+                    reason: "error prototype rejected".to_owned(),
+                });
             }
         }
         cx.set(instance, "message", message)
@@ -2851,13 +2880,6 @@ fn make_aggregate_error_native_rooted(
     })
 }
 
-fn oom_native(name: &'static str) -> NativeError {
-    NativeError::TypeError {
-        name,
-        reason: "out of memory".to_string(),
-    }
-}
-
 fn capability_record_scoped(
     interp: &mut Interpreter,
     cap: &PromiseCapability,
@@ -2865,25 +2887,18 @@ fn capability_record_scoped(
 ) -> Result<Value, NativeError> {
     interp.with_handle_scope(|interp, scope| {
         let cap = CapabilityHandles::park(interp, scope, cap);
-        let object = interp.scoped_object(scope).map_err(|_| oom_native(name))?;
+        let object = interp
+            .scoped_object(scope)
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))?;
         interp
             .scoped_set(scope, object, "promise", cap.promise)
-            .map_err(|err| NativeError::TypeError {
-                name,
-                reason: err.to_string(),
-            })?;
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))?;
         interp
             .scoped_set(scope, object, "resolve", cap.resolve)
-            .map_err(|err| NativeError::TypeError {
-                name,
-                reason: err.to_string(),
-            })?;
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))?;
         interp
             .scoped_set(scope, object, "reject", cap.reject)
-            .map_err(|err| NativeError::TypeError {
-                name,
-                reason: err.to_string(),
-            })?;
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))?;
         Ok(interp.escape_scoped(object))
     })
 }
@@ -2895,10 +2910,7 @@ fn static_any_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.any",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
     let registry = interp.error_classes_clone();
     interp.with_handle_scope(|interp, scope| {
@@ -2913,13 +2925,14 @@ fn static_any_generic(
         )?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
         let constructor_raw = interp.escape_scoped(constructor);
-        let promise_resolve = match get_promise_resolve(interp, stack, &exec, &constructor_raw) {
-            Ok(value) => interp.scoped_value(scope, value),
-            Err(err) => {
-                let mut cap = cap_handles.current(interp, context.clone());
-                return reject_capability_error(interp, stack, &mut cap, err);
-            }
-        };
+        let promise_resolve =
+            match get_promise_resolve(interp, stack, Some(&exec), &constructor_raw) {
+                Ok(value) => interp.scoped_value(scope, value),
+                Err(err) => {
+                    let mut cap = cap_handles.current(interp, context.clone());
+                    return reject_capability_error(interp, stack, &mut cap, err);
+                }
+            };
         let iterable_raw = interp.escape_scoped(iterable);
         let (iterator, next_method) = match interp.get_iterator_sync(stack, &exec, &iterable_raw) {
             Ok((iterator, next)) => (
@@ -2927,15 +2940,15 @@ fn static_any_generic(
                 interp.scoped_value(scope, next),
             ),
             Err(err) => {
-                let native = promise_vm_error(interp, "Promise.any", err);
+                let native = err.into_native(interp, "Promise.any");
                 let mut cap = cap_handles.current(interp, context.clone());
                 return reject_capability_error(interp, stack, &mut cap, native);
             }
         };
         let errors = PromiseSlots::new();
-        let errors_handle = interp
-            .scoped_array(scope, 0)
-            .map_err(|_| oom_native("Promise combinator"))?;
+        let errors_handle = interp.scoped_array(scope, 0).map_err(|error| {
+            CommittedValueError::JavaScript(error).into_native(interp, "Promise combinator")
+        })?;
         loop {
             let iterator_raw = interp.escape_scoped(iterator);
             let next_method_raw = interp.escape_scoped(next_method);
@@ -2944,7 +2957,7 @@ fn static_any_generic(
                     Ok(Some(value)) => value,
                     Ok(None) => break,
                     Err(err) => {
-                        let native = promise_vm_error(interp, "Promise.any", err);
+                        let native = err.into_native(interp, "Promise.any");
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, native);
                     }
@@ -2961,7 +2974,7 @@ fn static_any_generic(
                 let entry_promise = match call_promise_resolve(
                     interp,
                     stack,
-                    &exec,
+                    Some(&exec),
                     &promise_resolve_raw,
                     &constructor_raw,
                     next_value_raw,
@@ -2969,7 +2982,12 @@ fn static_any_generic(
                     Ok(value) => interp.scoped_value(iteration_scope, value),
                     Err(err) => {
                         let iterator_raw = interp.escape_scoped(iterator);
-                        interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                        if err.is_fatal() {
+                            return Err(err);
+                        }
+                        interp
+                            .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                            .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                         let mut cap = cap_handles.current(interp, context.clone());
                         return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                     }
@@ -3011,11 +3029,21 @@ fn static_any_generic(
                 let entry_promise = interp.escape_scoped(entry_promise);
                 let on_fulfilled = interp.escape_scoped(cap_handles.resolve);
                 let on_reject = interp.escape_scoped(on_reject);
-                if let Err(err) =
-                    attach_then_value(interp, stack, &exec, entry_promise, on_fulfilled, on_reject)
-                {
+                if let Err(err) = attach_then_value(
+                    interp,
+                    stack,
+                    Some(&exec),
+                    entry_promise,
+                    on_fulfilled,
+                    on_reject,
+                ) {
                     let iterator_raw = interp.escape_scoped(iterator);
-                    interp.iterator_close_discarding_completion(stack, &exec, &iterator_raw);
+                    if err.is_fatal() {
+                        return Err(err);
+                    }
+                    interp
+                        .iterator_close_discarding_completion(stack, Some(&exec), &iterator_raw)
+                        .map_err(|error| error.into_native(interp, "Promise combinator"))?;
                     let mut cap = cap_handles.current(interp, context.clone());
                     return reject_capability_error(interp, stack, &mut cap, err).map(Some);
                 }
@@ -3046,11 +3074,7 @@ fn static_with_resolvers(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
 ) -> Result<Value, NativeError> {
-    let cap = PromiseBuilder::with_optional_context(context).capability_runtime_rooted(
-        interp,
-        &[],
-        &[],
-    )?;
+    let cap = PromiseBuilder::with_context(context).capability_runtime_rooted(interp, &[], &[])?;
     capability_record_scoped(interp, &cap, "Promise.withResolvers")
 }
 
@@ -3085,10 +3109,7 @@ fn method_then(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.prototype.then";
-    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: NAME,
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = context.clone();
     let promise = Value::promise(*promise);
     let default_ctor = builtin_promise_constructor(interp)?;
     interp.with_handle_scope(|interp, scope| {
@@ -3109,7 +3130,7 @@ fn method_then(
         let c = species_constructor_runtime(
             interp,
             stack,
-            &exec,
+            exec.as_ref(),
             &promise_raw,
             &default_ctor_raw,
             NAME,
@@ -3117,9 +3138,9 @@ fn method_then(
         let c = interp.scoped_value(scope, c);
         let c_raw = interp.escape_scoped(c);
         let capability = if is_builtin_promise_constructor(interp, &c_raw) {
-            PromiseBuilder::with_optional_context(context.clone())
+            PromiseBuilder::with_context(context.clone())
                 .capability_runtime_rooted(interp, &[], &[])
-                .map_err(|_| oom_native(NAME))?
+                .map_err(NativeError::from)?
         } else {
             let mut constructor = c_raw;
             new_generic_promise_capability(interp, stack, context.clone(), &mut constructor)?
@@ -3132,15 +3153,17 @@ fn method_then(
         let on_fulfilled = on_fulfilled.map(|value| interp.escape_scoped(value));
         let on_rejected = on_rejected.map(|value| interp.escape_scoped(value));
         let capability = capability_handles.current(interp, context.clone());
-        let async_context = interp.async_context();
-        let outcome = promise.perform_then_with_context(
-            interp.gc_heap_mut(),
-            on_fulfilled,
-            on_rejected,
-            capability,
-            context.clone(),
-            async_context,
-        );
+        let outcome = interp
+            .register_promise_reactions(
+                promise,
+                on_fulfilled,
+                on_rejected,
+                capability,
+                context.clone(),
+            )
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise.prototype")
+            })?;
         if let Some(job) = outcome.immediate_job {
             interp.microtasks_mut().enqueue(job);
         }
@@ -3153,7 +3176,7 @@ fn method_catch(
     context: Option<ExecutionContext>,
     promise: &JsPromiseHandle,
     args: &[Value],
-) -> Value {
+) -> Result<Value, NativeError> {
     let on_rejected = match args.first() {
         Some(v) if crate::is_callable_value(v) => Some(*v),
         _ => None,
@@ -3169,17 +3192,16 @@ fn perform_then_with_handlers(
     promise: &JsPromiseHandle,
     on_fulfilled: Option<Value>,
     on_rejected: Option<Value>,
-) -> Value {
+) -> Result<Value, NativeError> {
     interp.with_handle_scope(|interp, scope| {
         let promise = interp.scoped_value(scope, Value::promise(*promise));
         let on_fulfilled = on_fulfilled.map(|value| interp.scoped_value(scope, value));
         let on_rejected = on_rejected.map(|value| interp.scoped_value(scope, value));
-        let capability = match PromiseBuilder::with_optional_context(context.clone())
-            .capability_runtime_rooted(interp, &[], &[])
-        {
-            Ok(capability) => capability,
-            Err(_) => return Value::undefined(),
-        };
+        let capability = PromiseBuilder::with_context(context.clone()).capability_runtime_rooted(
+            interp,
+            &[],
+            &[],
+        )?;
         let capability_handles = CapabilityHandles::park(interp, scope, &capability);
         let promise = interp
             .escape_scoped(promise)
@@ -3188,26 +3210,28 @@ fn perform_then_with_handlers(
         let on_fulfilled = on_fulfilled.map(|value| interp.escape_scoped(value));
         let on_rejected = on_rejected.map(|value| interp.escape_scoped(value));
         let capability = capability_handles.current(interp, context.clone());
-        let async_context = interp.async_context();
-        let outcome: PromiseThenOutcome = promise.perform_then_with_context(
-            interp.gc_heap_mut(),
-            on_fulfilled,
-            on_rejected,
-            capability,
-            context.clone(),
-            async_context,
-        );
+        let outcome = interp
+            .register_promise_reactions(
+                promise,
+                on_fulfilled,
+                on_rejected,
+                capability,
+                context.clone(),
+            )
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise.prototype")
+            })?;
         if let Some(job) = outcome.immediate_job {
             interp.microtasks_mut().enqueue(job);
         }
-        capability_handles.current(interp, context).promise
+        Ok(capability_handles.current(interp, context).promise)
     })
 }
 
 fn attach_then_value(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     promise: Value,
     on_fulfilled: Value,
     on_rejected: Value,
@@ -3238,7 +3262,9 @@ fn attach_then_value(
                 promise,
                 smallvec![on_fulfilled, on_rejected],
             )
-            .map_err(|err| promise_vm_error(interp, "Promise combinator", err))?;
+            .map_err(|err| {
+                crate::native_function::vm_to_native_error(interp, err, "Promise combinator")
+            })?;
         Ok(())
     })
 }
@@ -3389,23 +3415,32 @@ fn resolve_native_body(
         // §27.2.1.3.2 step 6 — resolving a promise with itself is a
         // TypeError, not a wait for something that can never arrive.
         if scope.raw(value) == scope.raw(promise) {
+            let reason = scope
+                .with_turn_parts(|interp, stack| {
+                    interp
+                        .make_error_instance_with_stack_roots(
+                            stack,
+                            crate::error_classes::ErrorKind::TypeError,
+                            Some("Chaining cycle detected for promise".to_string()),
+                            &Value::undefined(),
+                        )
+                        .map(Value::object)
+                })
+                .map_err(|error| {
+                    crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        "Promise resolve",
+                    )
+                })?;
+            // Materializing the cycle error may move the captured promise.
             let promise_handle = scope
                 .raw(promise)
                 .as_promise()
-                .expect("resolver promise remains rooted");
-            let reason = scope.with_turn_parts(|interp, stack| {
-                interp
-                    .make_error_instance_with_stack_roots(
-                        stack,
-                        crate::error_classes::ErrorKind::TypeError,
-                        Some("Chaining cycle detected for promise".to_string()),
-                        &Value::undefined(),
-                    )
-                    .map_or_else(|_| Value::undefined(), Value::object)
-            });
+                .expect("resolver promise remains rooted after error allocation");
             let interp = scope.context().interp_mut();
             let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
-            drain_jobs(interp, jobs);
+            drain_jobs(interp, jobs, context.as_ref());
             return Ok(Value::undefined());
         }
 
@@ -3415,31 +3450,50 @@ fn resolve_native_body(
         // native promise takes the same observable path: the `then` read and
         // the job tick are both required (a custom `then` on the instance,
         // its class, or a patched %Promise.prototype.then% must win).
-        if scope.raw(value).is_object_type()
-            && let Some(exec) = context.clone()
-        {
+        if scope.raw(value).is_object_type() {
             let value_raw = scope.raw(value);
             let then = scope.with_turn_parts(|interp, stack| {
-                get_property_runtime(interp, stack, &exec, value_raw, "then", "Promise resolve")
+                get_property_runtime(
+                    interp,
+                    stack,
+                    context.as_ref(),
+                    value_raw,
+                    "then",
+                    "Promise resolve",
+                )
             });
             let then = match then {
                 Ok(then) => scope.value(then),
                 Err(err) => {
-                    let reason = native_error_rejection_value_preserving_throw(
-                        scope.context().interp_mut(),
-                        err,
-                    );
+                    let reason = scope.with_turn_parts(|interp, stack| {
+                        native_error_rejection_value(interp, stack, err)
+                    })?;
                     let promise = scope
                         .raw(promise)
                         .as_promise()
                         .expect("resolver promise remains rooted on getter throw");
                     let interp = scope.context().interp_mut();
                     let jobs = promise.reject(interp.gc_heap_mut(), reason);
-                    drain_jobs(interp, jobs);
+                    drain_jobs(interp, jobs, context.as_ref());
                     return Ok(Value::undefined());
                 }
             };
             if scope.is_callable(then) {
+                let then_raw = scope.raw(then);
+                let (job_context, realm_id) = scope
+                    .with_turn_parts(|interp, _| {
+                        let source = interp.callable_context(context.as_ref(), then_raw)?;
+                        let realm =
+                            interp.reaction_realm(Some(then_raw), interp.active_realm_id)?;
+                        Ok::<_, crate::VmError>((source, realm))
+                    })
+                    .map_err(|error| {
+                        crate::native_function::vm_to_native_error(
+                            scope.context().interp_mut(),
+                            error,
+                            "Promise thenable",
+                        )
+                    })?;
                 // §27.2.1.3.2 PromiseResolveThenableJob runs
                 // CreateResolvingFunctions afresh: the handlers are FULL
                 // resolve/reject functions with their own flag, so a
@@ -3457,7 +3511,7 @@ fn resolve_native_body(
                     scope.context(),
                     promise_handle,
                     already_resolved_raw,
-                    Some(exec.clone()),
+                    context.clone(),
                     &[],
                     &[],
                 )?;
@@ -3485,7 +3539,7 @@ fn resolve_native_body(
                     then_raw,
                     on_fulfill_raw,
                     on_reject_raw,
-                    exec.clone(),
+                    job_context.clone(),
                 )?;
                 let job = scope.value(job);
                 let job = scope.raw(job);
@@ -3498,7 +3552,8 @@ fn resolve_native_body(
                         callee: job,
                         this_value: Value::undefined(),
                         args: SmallVec::new(),
-                        context: Some(exec),
+                        context: job_context,
+                        realm_id,
                         result_capability: None,
                         kind: crate::microtask::MicrotaskKind::Call,
                         async_context,
@@ -3514,7 +3569,7 @@ fn resolve_native_body(
         let value = scope.raw(value);
         let interp = scope.context().interp_mut();
         let jobs = promise.fulfill(interp.gc_heap_mut(), value);
-        drain_jobs(interp, jobs);
+        drain_jobs(interp, jobs, context.as_ref());
         Ok(Value::undefined())
     })
 }
@@ -3547,10 +3602,6 @@ pub(crate) fn resolve_promise_from_interpreter(
         // §27.2.1.3.2 step 6 — resolving a promise with itself is a
         // TypeError, not a wait for something that can never arrive.
         if interp.escape_scoped(value) == interp.escape_scoped(promise) {
-            let promise_handle = interp
-                .escape_scoped(promise)
-                .as_promise()
-                .expect("async resolver promise remains rooted");
             let empty = ActivationStack::new();
             let reason = interp
                 .make_error_instance_with_stack_roots(
@@ -3559,10 +3610,14 @@ pub(crate) fn resolve_promise_from_interpreter(
                     Some("Chaining cycle detected for promise".to_string()),
                     &Value::undefined(),
                 )
-                .map(Value::object)
-                .unwrap_or_else(|_| Value::undefined());
+                .map(Value::object)?;
+            // Read the rooted promise only after the collecting error build.
+            let promise_handle = interp
+                .escape_scoped(promise)
+                .as_promise()
+                .expect("async resolver promise remains rooted after error allocation");
             let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
-            drain_jobs(interp, jobs);
+            drain_jobs(interp, jobs, context.as_ref());
             return Ok(());
         }
 
@@ -3570,19 +3625,15 @@ pub(crate) fn resolve_promise_from_interpreter(
         // `then` is a thenable and is adopted through the job queue, not
         // fulfilled as itself. An async function returning one must settle
         // on what that thenable resolves to.
-        // The caller may have no context of its own (an async frame
-        // completing), and the thenable's `then` still has to run: fall back
-        // to the realm's.
-        let exec = context.clone().or_else(|| interp.realm_execution_context());
-        if interp.escape_scoped(value).is_object_type()
-            && let Some(exec) = exec
-        {
+        // Native-only source stays None; a bytecode getter/then resolves
+        // its exact defining chunk through the canonical call owner.
+        if interp.escape_scoped(value).is_object_type() {
             let raw_value = interp.escape_scoped(value);
             let mut probe = ActivationStack::new();
             let then = get_property_runtime(
                 interp,
                 &mut probe,
-                &exec,
+                context.as_ref(),
                 raw_value,
                 "then",
                 "Promise resolve",
@@ -3590,22 +3641,22 @@ pub(crate) fn resolve_promise_from_interpreter(
             let then = match then {
                 Ok(then) => then,
                 Err(err) => {
-                    let reason = native_error_rejection_value_preserving_throw(interp, err);
+                    let reason = native_error_rejection_value(interp, &probe, err)
+                        .map_err(|error| crate::native_to_vm_error(interp, error))?;
                     let promise_handle = interp
                         .escape_scoped(promise)
                         .as_promise()
                         .expect("async resolver promise remains rooted");
                     let jobs = promise_handle.reject(interp.gc_heap_mut(), reason);
-                    drain_jobs(interp, jobs);
+                    drain_jobs(interp, jobs, context.as_ref());
                     return Ok(());
                 }
             };
             let then = interp.scoped_value(scope, then);
             if interp.is_callable_runtime(&interp.escape_scoped(then)) {
-                let promise_handle = interp
-                    .escape_scoped(promise)
-                    .as_promise()
-                    .expect("async resolver promise remains rooted");
+                let then_raw = interp.escape_scoped(then);
+                let job_context = interp.callable_context(context.as_ref(), then_raw)?;
+                let realm_id = interp.reaction_realm(Some(then_raw), interp.active_realm_id)?;
                 // §27.2.1.3.2 PromiseResolveThenableJob runs
                 // CreateResolvingFunctions afresh: the handlers are FULL
                 // resolve/reject functions with their own flag, so nested
@@ -3613,12 +3664,16 @@ pub(crate) fn resolve_promise_from_interpreter(
                 let already_resolved =
                     alloc_already_resolved_cell(interp.gc_heap_mut()).map_err(crate::oom_to_vm)?;
                 let already_resolved = interp.scoped_value(scope, already_resolved);
+                let promise_handle = interp
+                    .escape_scoped(promise)
+                    .as_promise()
+                    .expect("async resolver promise remains rooted after flag allocation");
                 let already_resolved_raw = interp.escape_scoped(already_resolved);
                 let on_fulfill = make_resolve_native_runtime_rooted(
                     interp,
                     promise_handle,
                     already_resolved_raw,
-                    Some(exec.clone()),
+                    context.clone(),
                     &[],
                     &[],
                 )
@@ -3644,14 +3699,15 @@ pub(crate) fn resolve_promise_from_interpreter(
                     interp.escape_scoped(then),
                     interp.escape_scoped(on_fulfill),
                     interp.escape_scoped(on_reject),
-                    exec.clone(),
+                    job_context.clone(),
                 )?;
                 let async_context = interp.async_context();
                 interp.microtasks.enqueue(crate::microtask::Microtask {
                     callee: job,
                     this_value: Value::undefined(),
                     args: smallvec::SmallVec::new(),
-                    context: Some(exec),
+                    context: job_context,
+                    realm_id,
                     result_capability: None,
                     kind: crate::microtask::MicrotaskKind::Call,
                     async_context,
@@ -3666,7 +3722,7 @@ pub(crate) fn resolve_promise_from_interpreter(
             .expect("async resolver promise remains rooted before fulfillment");
         let value = interp.escape_scoped(value);
         let jobs = promise.fulfill(interp.gc_heap_mut(), value);
-        drain_jobs(interp, jobs);
+        drain_jobs(interp, jobs, context.as_ref());
         Ok(())
     })
 }
@@ -3682,61 +3738,90 @@ fn make_resolve_thenable_job(
     then: Value,
     on_fulfill: Value,
     on_reject: Value,
-    exec: ExecutionContext,
+    exec: Option<ExecutionContext>,
 ) -> Result<Value, NativeError> {
-    let captures: SmallVec<[Value; 4]> = smallvec![thenable, then, on_fulfill, on_reject];
+    let captures = smallvec![thenable, then, on_fulfill, on_reject];
     ctx.native_value(
         "PromiseResolveThenableJob",
         captures,
-        move |ctx, _args, captures| {
-            ctx.scope(|mut scope| {
-                let thenable = scope.value(captures[0]);
-                let then = scope.value(captures[1]);
-                let on_fulfill = scope.value(captures[2]);
-                let on_reject = scope.value(captures[3]);
-                let thenable_raw = scope.raw(thenable);
-                let then_raw = scope.raw(then);
-                let on_fulfill_raw = scope.raw(on_fulfill);
-                let on_reject_raw = scope.raw(on_reject);
-                let call_result = scope.with_turn_parts(|interp, stack| {
-                    interp.run_callable_sync_rooted(
-                        stack,
-                        &exec,
-                        &then_raw,
-                        thenable_raw,
-                        smallvec![on_fulfill_raw, on_reject_raw],
-                    )
-                });
-                match call_result {
-                    Ok(_) => Ok(Value::undefined()),
-                    Err(err) => {
-                        // §27.2.1.3.2 — an abrupt `then` call rejects the
-                        // promise with the thrown value, preserving its
-                        // identity (a user `throw obj` keeps `obj`).
-                        let reason = scope.with_turn_parts(|interp, _| {
-                            interp
-                                .take_pending_uncaught_throw()
-                                .unwrap_or_else(|| rejection_value_for(interp, &err))
-                        });
-                        let reason = scope.value(reason);
-                        let on_reject = scope.raw(on_reject);
-                        let reason = scope.raw(reason);
-                        let _ = scope.with_turn_parts(|interp, stack| {
-                            interp.run_callable_sync_rooted(
-                                stack,
-                                &exec,
-                                &on_reject,
-                                Value::undefined(),
-                                smallvec![reason],
-                            )
-                        });
-                        Ok(Value::undefined())
-                    }
-                }
-            })
-        },
+        move |ctx, _args, captures| resolve_thenable_job_body(ctx, captures, exec.as_ref()),
     )
-    .map_err(|_| oom_native("PromiseResolveThenableJob"))
+    .map_err(NativeError::from)
+}
+
+/// Run one queued thenable invocation inside the job's installed source/realm.
+/// Every capture and the original rejection are scoped across collecting calls.
+fn resolve_thenable_job_body(
+    ctx: &mut NativeCtx<'_>,
+    captures: &[Value],
+    exec: Option<&ExecutionContext>,
+) -> Result<Value, NativeError> {
+    ctx.scope(|mut scope| {
+        let thenable = scope.value(captures[0]);
+        let then = scope.value(captures[1]);
+        let on_fulfill = scope.value(captures[2]);
+        let on_reject = scope.value(captures[3]);
+        let thenable_raw = scope.raw(thenable);
+        let then_raw = scope.raw(then);
+        let on_fulfill_raw = scope.raw(on_fulfill);
+        let on_reject_raw = scope.raw(on_reject);
+        let call_result = scope.with_turn_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(
+                stack,
+                exec,
+                &then_raw,
+                thenable_raw,
+                smallvec![on_fulfill_raw, on_reject_raw],
+            )
+        });
+        match call_result {
+            Ok(_) => Ok(Value::undefined()),
+            Err(err) => {
+                // §27.2.1.3.2 — an abrupt `then` call rejects the
+                // promise with the thrown value, preserving its
+                // identity (a user `throw obj` keeps `obj`).
+                if err.is_fatal() || matches!(err, crate::VmError::OutOfMemory { .. }) {
+                    return Err(crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        err,
+                        "Promise thenable",
+                    ));
+                }
+                let reason = scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .vm_error_to_throwable_with_stack_roots(exec, stack, &err)
+                        .map_err(|error| {
+                            crate::native_function::vm_to_native_error(
+                                interp,
+                                error,
+                                "Promise thenable",
+                            )
+                        })
+                })?;
+                let reason = scope.value(reason);
+                let on_reject = scope.raw(on_reject);
+                let reason = scope.raw(reason);
+                scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            exec,
+                            &on_reject,
+                            Value::undefined(),
+                            smallvec![reason],
+                        )
+                        .map_err(|error| {
+                            crate::native_function::vm_to_native_error(
+                                interp,
+                                error,
+                                "Promise thenable",
+                            )
+                        })
+                })?;
+                Ok(Value::undefined())
+            }
+        }
+    })
 }
 
 /// §27.2.1.3.2 PromiseResolveThenableJob, built from the interpreter
@@ -3747,56 +3832,18 @@ fn make_resolve_thenable_job_runtime_rooted(
     then: Value,
     on_fulfill: Value,
     on_reject: Value,
-    exec: ExecutionContext,
+    exec: Option<ExecutionContext>,
 ) -> Result<Value, crate::VmError> {
-    let captures: SmallVec<[Value; 4]> = smallvec![thenable, then, on_fulfill, on_reject];
-    crate::native_function::native_value_with_captures_unchecked_with_roots(
-        interp.gc_heap_mut(),
+    promise_native_runtime(
+        interp,
         "PromiseResolveThenableJob",
-        captures,
-        &mut |_visitor| {},
-        move |ctx, _args, captures| {
-            let thenable = captures[0];
-            let then = captures[1];
-            let on_fulfill = captures[2];
-            let on_reject = captures[3];
-            let call_result = ctx.with_turn_parts(|interp, stack| {
-                interp.run_callable_sync_rooted(
-                    stack,
-                    &exec,
-                    &then,
-                    thenable,
-                    smallvec![on_fulfill, on_reject],
-                )
-            });
-            if let Err(err) = call_result {
-                // An abrupt `then` call rejects the promise with the thrown
-                // value, keeping its identity.
-                let reason = ctx.with_turn_parts(|interp, _| {
-                    interp
-                        .take_pending_uncaught_throw()
-                        .unwrap_or_else(|| rejection_value_for(interp, &err))
-                });
-                // The call and the reason both allocate; the traced captures
-                // slab holds the moved reject function.
-                // SAFETY: `captures` is the live slab the collector rewrites
-                // in place; the volatile read keeps the pre-call load from
-                // being reused.
-                let on_reject = unsafe { std::ptr::read_volatile(&captures[3]) };
-                let _ = ctx.with_turn_parts(|interp, stack| {
-                    interp.run_callable_sync_rooted(
-                        stack,
-                        &exec,
-                        &on_reject,
-                        Value::undefined(),
-                        smallvec![reason],
-                    )
-                });
-            }
-            Ok(Value::undefined())
-        },
+        0,
+        smallvec![thenable, then, on_fulfill, on_reject],
+        &[],
+        &[],
+        move |ctx, _args, captures| resolve_thenable_job_body(ctx, captures, exec.as_ref()),
     )
-    .map_err(crate::oom_to_vm)
+    .map_err(crate::VmError::from)
 }
 
 fn make_reject_native_runtime_rooted(
@@ -3858,6 +3905,7 @@ fn make_reject_native_native_rooted(
 /// §27.2.1.3.1 Promise Reject Functions — consume the pair's
 /// `[[AlreadyResolved]]` flag, then reject the captured promise.
 fn reject_native_body(ctx: &mut NativeCtx<'_>, args: &[Value], captures: &[Value]) -> Value {
+    let context = ctx.execution_context().cloned();
     let promise = settle_native_promise(captures);
     if !consume_already_resolved(ctx.interp_mut(), captures) {
         return Value::undefined();
@@ -3866,17 +3914,25 @@ fn reject_native_body(ctx: &mut NativeCtx<'_>, args: &[Value], captures: &[Value
     if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
         let reason = args.first().cloned().unwrap_or(Value::undefined());
         let jobs = promise.reject(interp.gc_heap_mut(), reason);
-        drain_jobs(interp, jobs);
+        drain_jobs(interp, jobs, context.as_ref());
     }
     Value::undefined()
 }
 
-fn drain_jobs(interp: &mut Interpreter, jobs: PromiseSettleJobs) {
-    interp.note_settle_rejection(&jobs);
+fn drain_jobs(
+    interp: &mut Interpreter,
+    jobs: PromiseSettleJobs,
+    context: Option<&ExecutionContext>,
+) {
+    interp.note_settle_rejection(&jobs, context);
     for j in jobs.jobs {
         interp.microtasks_mut().enqueue(j);
     }
 }
+
+#[cfg(test)]
+#[path = "promise_dispatch/completed_tests.rs"]
+mod completed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3884,20 +3940,19 @@ mod tests {
     use crate::NumberValue;
     use crate::runtime_cx::NativeCallInfo;
 
-    /// Minimal execution context for paths that invoke a capability's
-    /// native resolve/reject closure — `call_capability_function` runs
-    /// it through `run_callable_sync`, which requires a `Some(context)`
-    /// even when the body needs no module functions.
+    /// Explicit verifier-valid source fixture for tests that exercise admitted
+    /// settlement. Native-only capabilities use None through the same owner.
     fn empty_context() -> ExecutionContext {
-        ExecutionContext::from_module(crate::test_support::minimal_bytecode_module(
-            "promise-dispatch-test",
-        ))
+        ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("promise-dispatch-test"),
+            crate::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture")
     }
 
     #[test]
     fn aggregate_error_runtime_builder_uses_rooted_young_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let registry = interp.error_classes_clone();
         let errors = vec![Value::number_i32(1)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
@@ -3920,7 +3975,7 @@ mod tests {
 
     #[test]
     fn aggregate_error_native_builder_uses_rooted_young_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let registry = interp.error_classes_clone();
         let errors = vec![Value::number_i32(2)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
@@ -3949,7 +4004,7 @@ mod tests {
 
     #[test]
     fn promise_static_resolve_uses_runtime_rooted_young_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let args = [Value::number_i32(7)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
@@ -3982,7 +4037,7 @@ mod tests {
 
     #[test]
     fn promise_capability_uses_runtime_rooted_young_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let cap = PromiseBuilder::new()
@@ -4007,7 +4062,7 @@ mod tests {
 
     #[test]
     fn promise_constructor_builder_uses_native_rooted_young_allocation() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = interp.gc_heap().stats().new_allocated_bytes;
         let executor = Value::number_i32(17);
         let args = vec![executor];

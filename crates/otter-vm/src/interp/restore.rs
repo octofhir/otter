@@ -22,11 +22,14 @@
 //!   shared by `Arc`, and dynamic closures are Arc-clones at their
 //!   captured host-ref indices. No byte decoder or cross-process restore
 //!   path exists.
+//! - Supplied account admission precedes page restoration and shape-floor publication.
 //! - Each restored code directory owns fresh feedback and atom tables.
 //!   IC shapes and validity cells never refer to the donor's heap.
 //! - The fixed root walk must consume exactly the captured sequence;
 //!   a length mismatch is a layout drift between capture and restore
 //!   builds and panics rather than mis-rooting.
+//! - Array own-element eligibility is refreshed after sidecar descriptors are
+//!   reconstructed, after the earlier page relocation has refreshed slab bases.
 //!
 //! # See also
 //!
@@ -62,9 +65,13 @@ impl Interpreter {
     /// bootstrap.
     ///
     /// # Errors
-    /// Propagates [`otter_gc::ImageError`] from the page restore.
-    pub fn from_isolate_snapshot(snapshot: &IsolateSnapshot) -> Result<Self, otter_gc::ImageError> {
-        Self::from_isolate_snapshot_capped(snapshot, 0)
+    /// Propagates page, heap and resource admission errors. The supplied account
+    /// owns every fresh restored execution table and directory allocation.
+    pub fn from_isolate_snapshot(
+        snapshot: &IsolateSnapshot,
+        account: &otter_resource::ResourceAccount,
+    ) -> Result<Self, otter_gc::ImageError> {
+        Self::from_isolate_snapshot_capped(snapshot, 0, account)
     }
 
     /// [`Self::from_isolate_snapshot`] with a heap cap (`0` =
@@ -76,9 +83,22 @@ impl Interpreter {
     pub fn from_isolate_snapshot_capped(
         snapshot: &IsolateSnapshot,
         max_heap_bytes: u64,
+        account: &otter_resource::ResourceAccount,
     ) -> Result<Self, otter_gc::ImageError> {
-        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)
-            .expect("GcHeap construction never fails on the default cage");
+        // Admit code before touching heap pages or the process-wide shape floor.
+        // No externally visible owner is published if any fresh table refuses.
+        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
+        for (expected, name) in snapshot.atom_names.iter().enumerate() {
+            let minted = names.intern(name);
+            debug_assert_eq!(
+                minted.raw() as usize,
+                expected,
+                "atom replay must re-mint identical ids"
+            );
+        }
+        let code_space = snapshot.code_space.restore(&names, account)?;
+        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)?;
+        gc_heap.set_external_bytes_account(account)?;
         object::register_gc_traceables(&mut gc_heap);
         // SAFETY: `IsolateSnapshot` has no public constructor or mutable raw
         // fields and is produced only by this VM's same-process capture path.
@@ -100,16 +120,7 @@ impl Interpreter {
         // identical indices without translating them.
         gc_heap.restore_external_refs(snapshot.external_ref_addrs.iter().copied());
 
-        // Keyed side state that other shells depend on.
-        let names = std::sync::Arc::new(crate::property_atom::NameInterner::default());
-        for (expected, name) in snapshot.atom_names.iter().enumerate() {
-            let minted = names.intern(name);
-            debug_assert_eq!(
-                minted.raw() as usize,
-                expected,
-                "atom replay must re-mint identical ids"
-            );
-        }
+        // Keyed side state uses the admitted directory's atom replay.
         let shape_runtime = object::ShapeRuntime::restored_shell(std::sync::Arc::clone(&names));
 
         let mut interp = Self {
@@ -133,23 +144,19 @@ impl Interpreter {
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             jit_backedge_fuel_window: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
-            code_space: snapshot.code_space.restore(&names),
+            code_space,
             code_eviction_high_water_bytes: Self::DEFAULT_CODE_EVICTION_HIGH_WATER_BYTES,
             code_eviction_stats: crate::CodeEvictionStats::default(),
             names,
-            property_cache: crate::property_cache::PropertyLookupCache::default(),
-            store_transition_cache: crate::property_cache::StoreTransitionCache::default(),
+            property_cache: crate::property_cache::PropertyActionCache::default(),
             realm_context: None,
             shape_runtime,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_absence: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             object_literal_layouts: rustc_hash::FxHashMap::default(),
-            constructor_field_transition_cache: rustc_hash::FxHashMap::default(),
-            constructor_field_capacity_cache: rustc_hash::FxHashMap::default(),
-            constructor_instance_profiles: rustc_hash::FxHashMap::default(),
-            pending_constructor_samples: std::cell::RefCell::new(Vec::new()),
-            constructor_prototype_validity_cache: rustc_hash::FxHashMap::default(),
+            function_constructor_layouts: rustc_hash::FxHashMap::default(),
+            constructor_families: Default::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
@@ -175,12 +182,9 @@ impl Interpreter {
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
             jit_artifacts: crate::jit_artifact::JitArtifactState::default(),
-            jit_call_counts: rustc_hash::FxHashMap::default(),
             optimizing_tier_policy: crate::tier_policy::TierPolicy::default(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
-            jit_osr_counts: rustc_hash::FxHashMap::default(),
-            jit_osr_trigger: None,
             jit_code: rustc_hash::FxHashMap::default(),
             jit_template_osr_fids: rustc_hash::FxHashSet::default(),
             jit_template_compiling: rustc_hash::FxHashSet::default(),
@@ -197,7 +201,7 @@ impl Interpreter {
             runtime_turn_depth: 0,
             jit_generated_feedback_pending: false,
             jit_next_code_object_id: 1,
-            jit_frame_cell: None,
+            jit_context: None,
             jit_detached_frame: 0,
             work_budget: crate::WorkBudget::default(),
             work_budget_stats: crate::WorkBudgetStats::default(),
@@ -221,7 +225,7 @@ impl Interpreter {
             async_context: crate::Value::undefined(),
             iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,
-            module_sources: crate::source_registry::SourceRegistry::default(),
+            resource_account: account.clone(),
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),
             function_prototype_slots: std::collections::HashMap::new(),
@@ -263,6 +267,7 @@ impl Interpreter {
             cpu_profiler: None,
         };
 
+        interp.jit_code_registry.set_account(account.clone());
         interp
             .code_space
             .visit_live_functions(|function| interp.jit_code_registry.link_function(function, 0));
@@ -354,6 +359,9 @@ impl Interpreter {
                     (*body).restore_property_flags(records);
                 }
             }
+            heap.for_each_live_payload::<crate::array::ArrayBody, _>(|_space, body| {
+                body.refresh_dense_own_guard();
+            });
         }
 
         // Re-register every restored shape body under its id; the other
@@ -377,6 +385,8 @@ impl Interpreter {
         for (id, handle) in restored_shapes {
             interp.shape_runtime.register_restored_shape(id, handle);
         }
+        interp.constructor_families =
+            crate::constructor_layout::ConstructorFamilies::restored(&interp.gc_heap);
 
         interp.gc_heap.set_tenure_all(false);
         Ok(interp)
@@ -389,14 +399,18 @@ mod tests {
 
     #[test]
     fn exact_image_cap_restore_does_not_allocate_or_panic() {
-        let source = Interpreter::new();
+        let source = Interpreter::new().expect("fixture interpreter bootstrap");
         let snapshot = source
             .capture_isolate_snapshot()
             .expect("fresh isolate must be capturable");
         let exact_cap = snapshot.image.live_bytes();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Interpreter::from_isolate_snapshot_capped(&snapshot, exact_cap)
+            Interpreter::from_isolate_snapshot_capped(
+                &snapshot,
+                exact_cap,
+                &otter_resource::ResourceAccount::default(),
+            )
         }));
         let restored = result
             .expect("restore at the exact image cap must not panic")

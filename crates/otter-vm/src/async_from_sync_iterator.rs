@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 
 use crate::activation_stack::ActivationStack;
 use crate::execution_context::ExecutionContext;
-use crate::promise::JsPromise;
+use crate::runtime_activation::CommittedValueError;
 use crate::runtime_cx::NativeCtx;
 use crate::{Interpreter, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
 
@@ -41,7 +41,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         sync_iterator: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // §27.1.4.1 / GetIteratorDirect — the sync record caches its `next`
         // method once at adapter creation; every later step calls the
         // cached function instead of re-reading the property.
@@ -52,7 +52,7 @@ impl Interpreter {
         // shared reference is not a root the optimizer has to honor.
         // Reading `next` runs a getter, so the iterator is parked before it.
         let base = self.json_root_push(sync_iterator);
-        let next_method = match self.iterator_member(stack, context, sync_iterator, "next") {
+        let next_method = match self.iterator_member(stack, Some(context), sync_iterator, "next") {
             Ok(next_method) => next_method,
             Err(error) => {
                 self.json_root_pop_to(base);
@@ -63,8 +63,9 @@ impl Interpreter {
         let result = (|| {
             let sync_iterator = self.json_root_get(base);
             let next_method = self.json_root_get(next_root);
-            let wrapper =
-                self.alloc_runtime_rooted_object_with_roots(&[&sync_iterator, &next_method], &[])?;
+            let wrapper = self
+                .alloc_runtime_rooted_object_with_roots(&[&sync_iterator, &next_method], &[])
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let wrapper_root = self.json_root_push(Value::object(wrapper));
             for (name, call, caches_next) in [
                 ("next", step_next as StepFn, true),
@@ -73,11 +74,14 @@ impl Interpreter {
             ] {
                 let sync_iterator = self.json_root_get(base);
                 let cached = caches_next.then(|| self.json_root_get(next_root));
-                let method = self.async_from_sync_step(name, call, sync_iterator, cached)?;
+                let method = self
+                    .async_from_sync_step(name, call, sync_iterator, cached)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let Some(mut wrapper) = self.json_root_get(wrapper_root).as_object() else {
-                    return Err(VmError::InvalidOperand);
+                    return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
                 };
-                crate::object::set(&mut wrapper, &mut self.gc_heap, name, method);
+                self.create_data_property(&mut wrapper, name, method)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             Ok(self.json_root_get(wrapper_root))
         })();
@@ -98,7 +102,7 @@ impl Interpreter {
         if let Some(method) = cached_method {
             captures.push(method);
         }
-        crate::native_function::native_value_with_captures_unchecked_with_roots(
+        let value = crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             name,
             captures,
@@ -110,7 +114,8 @@ impl Interpreter {
                 call(ctx, sync_iterator, cached_method, argument)
             },
         )
-        .map_err(VmError::from)
+        .map_err(VmError::from)?;
+        Ok(self.stamp_native_creation_realm(value))
     }
 
     /// Read one property off a value the way an ordinary `[[Get]]` would,
@@ -118,23 +123,33 @@ impl Interpreter {
     fn iterator_member(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         target: Value,
         name: &str,
-    ) -> Result<Value, VmError> {
-        match self.ordinary_get_value(
-            stack,
-            context,
-            target,
-            target,
-            &VmPropertyKey::String(name),
-            0,
-        )? {
-            VmGetOutcome::Value(value) => Ok(value),
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, target, SmallVec::new())
+    ) -> Result<Value, CommittedValueError> {
+        self.with_handle_scope(|interp, scope| {
+            let target_root = interp.scoped_value(scope, target);
+
+            match interp.ordinary_get_value(
+                stack,
+                context,
+                target,
+                target,
+                &VmPropertyKey::String(name),
+                0,
+            )? {
+                VmGetOutcome::Value(value) => Ok(value),
+                VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        interp.escape_scoped(target_root),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call),
             }
-        }
+        })
     }
 
     /// §27.1.4.4 AsyncFromSyncIteratorContinuation — settle on the step's
@@ -146,11 +161,11 @@ impl Interpreter {
     fn async_from_sync_continuation(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         result: Value,
         sync_iterator: Value,
         close_on_rejection: bool,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // The `done` and `value` reads run getters and PromiseResolve runs
         // `then` lookups: the result and the iterator are parked for them.
         let entry = self.json_root_push(result);
@@ -164,10 +179,10 @@ impl Interpreter {
     fn async_from_sync_continuation_parked(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         entry: usize,
         close_on_rejection: bool,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let done = self.iterator_member(stack, context, self.json_root_get(entry), "done")?;
         let done = done.to_boolean(&self.gc_heap);
         let value = self.iterator_member(stack, context, self.json_root_get(entry), "value")?;
@@ -187,13 +202,14 @@ impl Interpreter {
         let inner_value = match self.promise_resolve_value(stack, context, value) {
             Ok(inner) => inner,
             Err(error) => {
+                // An escaping engine/control failure never starts observable
+                // IteratorClose or becomes a rejected promise completion.
+                if matches!(&error, CommittedValueError::Fatal(_)) {
+                    return Err(error);
+                }
                 if close_on_rejection && !done {
-                    let thrown = self.take_pending_uncaught_throw();
                     let sync_iterator = self.json_root_get(entry + 1);
-                    self.iterator_close_discarding_completion(stack, context, &sync_iterator);
-                    if let Some(thrown) = thrown {
-                        self.set_pending_uncaught_throw(thrown);
-                    }
+                    self.iterator_close_discarding_completion(stack, context, &sync_iterator)?;
                 }
                 return Err(error);
             }
@@ -216,7 +232,9 @@ impl Interpreter {
                         iter_result_object(ctx, value, done)
                     },
                 )
-                .map_err(VmError::from)?;
+                .map_err(VmError::from)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            let on_fulfilled = self.stamp_native_creation_realm(on_fulfilled);
             let fulfilled_root = self.json_root_push(on_fulfilled);
 
             let rejected_root = if close_on_rejection && !done {
@@ -228,51 +246,69 @@ impl Interpreter {
                         SmallVec::from_slice(&[sync_iterator]),
                         &mut |_visitor| {},
                         move |ctx, args, captures| {
-                            let sync_iterator =
-                                captures.first().copied().unwrap_or_else(Value::undefined);
-                            let reason = args.first().copied().unwrap_or_else(Value::undefined);
-                            ctx.with_turn_parts(|interp, stack| {
-                                let Some(context) = interp.realm_execution_context() else {
-                                    return;
-                                };
-                                interp.iterator_close_discarding_completion(
-                                    stack,
-                                    &context,
-                                    &sync_iterator,
+                            let context = ctx.execution_context().cloned();
+                            ctx.scope(|mut scope| {
+                                let iterator = scope.value(
+                                    captures.first().copied().unwrap_or_else(Value::undefined),
                                 );
-                            });
-                            ctx.interp_mut().set_pending_uncaught_throw(reason);
-                            Err(NativeError::Thrown {
-                                name: "AsyncFromSyncIteratorRejected",
-                                message: String::new(),
+                                let reason = scope
+                                    .value(args.first().copied().unwrap_or_else(Value::undefined));
+                                let value = scope.raw(reason);
+                                scope
+                                    .context()
+                                    .interp_mut()
+                                    .set_pending_uncaught_throw(value);
+                                let iterator = scope.raw(iterator);
+                                scope.with_turn_parts(|interp, stack| {
+                                    interp
+                                        .iterator_close_discarding_completion(
+                                            stack,
+                                            context.as_ref(),
+                                            &iterator,
+                                        )
+                                        .map_err(|error| {
+                                            error.into_native(
+                                                interp,
+                                                "AsyncFromSyncIteratorRejected",
+                                            )
+                                        })
+                                })?;
+                                let reason = scope.raw(reason);
+                                Err(scope
+                                    .context()
+                                    .throw_value("AsyncFromSyncIteratorRejected", reason))
                             })
                         },
                     )
-                    .map_err(VmError::from)?;
+                    .map_err(VmError::from)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                let on_rejected = self.stamp_native_creation_realm(on_rejected);
                 Some(self.json_root_push(on_rejected))
             } else {
                 None
             };
 
-            let capability = crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .capability_stack_rooted(self, stack, &[], &[])?;
+            let capability =
+                crate::promise_dispatch::PromiseBuilder::with_context(context.cloned())
+                    .capability_stack_rooted(self, stack, &[], &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let promise_root = self.json_root_push(capability.promise);
             let inner = self
                 .json_root_get(base)
                 .as_promise()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let on_fulfilled = self.json_root_get(fulfilled_root);
             let on_rejected = rejected_root.map(|root| self.json_root_get(root));
-            let async_context = self.async_context();
-            let outcome = JsPromise::perform_then_with_context(
-                &inner,
-                &mut self.gc_heap,
-                Some(on_fulfilled),
-                on_rejected,
-                capability,
-                Some(context.clone()),
-                async_context,
-            );
+            let outcome = self
+                .register_promise_reactions(
+                    inner,
+                    Some(on_fulfilled),
+                    on_rejected,
+                    capability,
+                    context.cloned(),
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             if let Some(job) = outcome.immediate_job {
                 self.microtasks.enqueue(job);
             }
@@ -284,43 +320,47 @@ impl Interpreter {
 }
 
 /// IfAbruptRejectPromise — every one of the adapter's methods answers with
-/// a promise, so a failure becomes a rejection rather than a throw.
+/// a promise. Catchable source failures become rejections; completed terminal
+/// failures leave before rejection materialization.
 fn rejected_promise(
     ctx: &mut NativeCtx<'_>,
-    context: &ExecutionContext,
-    err: VmError,
+    context: Option<&ExecutionContext>,
+    error: CommittedValueError,
     name: &'static str,
 ) -> Result<Value, NativeError> {
+    let err = match error {
+        CommittedValueError::Fatal(error) => {
+            return Err(CommittedValueError::Fatal(error).into_native(ctx.interp_mut(), name));
+        }
+        CommittedValueError::JavaScript(error) => error,
+    };
     let reason = ctx.with_turn_parts(|interp, stack| {
-        interp.take_pending_uncaught_throw().unwrap_or_else(|| {
-            interp
-                .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
-                .unwrap_or_else(|| crate::error_ops::vm_err_to_value(interp, &err))
-        })
-    });
+        interp
+            .vm_error_to_throwable_with_stack_roots(context, stack, &err)
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name))
+    })?;
     reject_with(ctx, context, reason, name)
 }
 
 /// A promise already rejected with `reason`.
 fn reject_with(
     ctx: &mut NativeCtx<'_>,
-    context: &ExecutionContext,
+    context: Option<&ExecutionContext>,
     reason: Value,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     ctx.with_turn_parts(|interp, stack| {
-        crate::promise_dispatch::PromiseBuilder::with_context(context.clone())
+        crate::promise_dispatch::PromiseBuilder::with_context(context.cloned())
             .rejected_stack_rooted(interp, stack, reason, &[&reason], &[])
             .map(Value::promise)
-            .map_err(|_| NativeError::TypeError {
-                name,
-                reason: "rejection allocation failed".to_string(),
+            .map_err(|error| {
+                CommittedValueError::JavaScript(VmError::from(error)).into_native(interp, name)
             })
     })
 }
 
 /// A `TypeError` instance, as a value.
-fn type_error_value(ctx: &mut NativeCtx<'_>, message: &str) -> Value {
+fn type_error_value(ctx: &mut NativeCtx<'_>, message: &str) -> Result<Value, NativeError> {
     let message = message.to_string();
     ctx.with_turn_parts(|interp, stack| {
         interp
@@ -330,7 +370,10 @@ fn type_error_value(ctx: &mut NativeCtx<'_>, message: &str) -> Value {
                 Some(message),
                 &Value::undefined(),
             )
-            .map_or_else(|_| Value::undefined(), Value::object)
+            .map(Value::object)
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "AsyncFromSyncIterator")
+            })
     })
 }
 
@@ -346,8 +389,8 @@ fn iter_result_object(
     done: bool,
 ) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
-        let result = scope.object()?;
         let value = scope.value(value);
+        let result = scope.object()?;
         scope.set(result, "value", value)?;
         let done = scope.boolean(done);
         scope.set(result, "done", done)?;
@@ -393,7 +436,7 @@ fn step_return(
         |ctx, arg| {
             // A sync iterator with no `return` is already finished, and the
             // answer is still a promise.
-            let context = ctx.execution_context().cloned()?;
+            let context = ctx.execution_context().cloned();
             let record = match iter_result_object(ctx, arg.unwrap_or_else(Value::undefined), true) {
                 Ok(record) => record,
                 Err(err) => return Some(Err(err)),
@@ -402,9 +445,9 @@ fn step_return(
                 crate::promise_dispatch::PromiseBuilder::with_context(context)
                     .fulfilled_stack_rooted(interp, stack, record, &[&record], &[])
                     .map(Value::promise)
-                    .map_err(|_| NativeError::TypeError {
-                        name: "AsyncFromSyncIterator.return",
-                        reason: "promise allocation failed".to_string(),
+                    .map_err(|error| {
+                        CommittedValueError::JavaScript(VmError::from(error))
+                            .into_native(interp, "AsyncFromSyncIterator.return")
                     })
             }))
         },
@@ -432,31 +475,36 @@ fn step_throw(
             // returns its own abrupt completion (e.g. a poisoned `return`
             // getter), and that value rejects the promise instead of the
             // protocol TypeError.
-            let context = ctx.execution_context().cloned()?;
+            let context = ctx.execution_context().cloned();
             let close_error = ctx.with_turn_parts(|interp, stack| {
-                match interp.iterator_close_sync(stack, &context, &sync_iterator) {
-                    Ok(()) => None,
-                    Err(error) => Some(
-                        interp
-                            .take_pending_uncaught_throw()
-                            .or_else(|| {
-                                interp.vm_error_to_throwable_with_stack_roots(
-                                    Some(&context),
-                                    stack,
-                                    &error,
-                                )
-                            })
-                            .unwrap_or_else(Value::undefined),
-                    ),
+                match interp.iterator_close_sync(stack, context.as_ref(), &sync_iterator) {
+                    Ok(()) => Ok(None),
+                    Err(error @ CommittedValueError::Fatal(_)) => {
+                        Err(error.into_native(interp, "AsyncFromSyncIterator.throw"))
+                    }
+                    Err(CommittedValueError::JavaScript(error)) => interp
+                        .vm_error_to_throwable_with_stack_roots(context.as_ref(), stack, &error)
+                        .map(Some)
+                        .map_err(|error| {
+                            crate::native_function::vm_to_native_error(
+                                interp,
+                                error,
+                                "AsyncFromSyncIterator.throw",
+                            )
+                        }),
                 }
             });
             let reason = match close_error {
-                Some(reason) => reason,
-                None => type_error_value(ctx, "iterator has no 'throw' method"),
+                Err(error) => return Some(Err(error)),
+                Ok(Some(reason)) => reason,
+                Ok(None) => match type_error_value(ctx, "iterator has no 'throw' method") {
+                    Ok(reason) => reason,
+                    Err(error) => return Some(Err(error)),
+                },
             };
             Some(reject_with(
                 ctx,
-                &context,
+                context.as_ref(),
                 reason,
                 "AsyncFromSyncIterator.throw",
             ))
@@ -509,33 +557,27 @@ fn step_anchored(
     let anchored = |ctx: &mut NativeCtx<'_>, index: usize| {
         ctx.with_turn_parts(|interp, _| interp.iteration_anchor(index))
     };
-    let context = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
+    let context = ctx.execution_context().cloned();
     let method = match cached_method {
         // The sync record cached this method at adapter creation
         // (GetIteratorDirect); no per-step property read.
         Some(method) => Ok(method),
         None => ctx.with_turn_parts(|interp, stack| {
             let sync_iterator = interp.iteration_anchor(anchor);
-            interp.iterator_member(stack, &context, sync_iterator, name)
+            interp.iterator_member(stack, context.as_ref(), sync_iterator, name)
         }),
     };
     let method = match method {
         Ok(method) => method,
-        Err(err) => return rejected_promise(ctx, &context, err, name),
+        Err(err) => return rejected_promise(ctx, context.as_ref(), err, name),
     };
     if method.is_nullish() {
         let argument = has_argument.then(|| anchored(ctx, anchor + 1));
         return match missing(ctx, argument) {
             Some(answer) => answer,
             None => {
-                let reason = type_error_value(ctx, "iterator has no 'next' method");
-                reject_with(ctx, &context, reason, name)
+                let reason = type_error_value(ctx, "iterator has no 'next' method")?;
+                reject_with(ctx, context.as_ref(), reason, name)
             }
         };
     }
@@ -546,21 +588,28 @@ fn step_anchored(
             args.push(interp.iteration_anchor(anchor + 1));
         }
         let sync_iterator = interp.iteration_anchor(anchor);
-        interp.run_callable_sync_rooted(stack, &context, &method, sync_iterator, args)
+        interp.run_callable_sync_rooted(stack, context.as_ref(), &method, sync_iterator, args)
     });
     let result = match result {
         Ok(result) => result,
-        Err(err) => return rejected_promise(ctx, &context, err, name),
+        Err(error) => {
+            return rejected_promise(
+                ctx,
+                context.as_ref(),
+                CommittedValueError::completed_call(error),
+                name,
+            );
+        }
     };
     if !is_object_like(&result) {
-        let reason = type_error_value(ctx, "iterator result is not an object");
-        return reject_with(ctx, &context, reason, name);
+        let reason = type_error_value(ctx, "iterator result is not an object")?;
+        return reject_with(ctx, context.as_ref(), reason, name);
     }
     let outcome = ctx.with_turn_parts(|interp, stack| {
         let sync_iterator = interp.iteration_anchor(anchor);
         interp.async_from_sync_continuation(
             stack,
-            &context,
+            context.as_ref(),
             result,
             sync_iterator,
             close_on_rejection,
@@ -568,7 +617,15 @@ fn step_anchored(
     });
     match outcome {
         Ok(promise) => Ok(promise),
-        Err(err) => rejected_promise(ctx, &context, err, name),
+        Err(error @ CommittedValueError::Fatal(_)) => {
+            Err(error.into_native(ctx.interp_mut(), name))
+        }
+        Err(CommittedValueError::JavaScript(error)) => rejected_promise(
+            ctx,
+            context.as_ref(),
+            CommittedValueError::JavaScript(error),
+            name,
+        ),
     }
 }
 

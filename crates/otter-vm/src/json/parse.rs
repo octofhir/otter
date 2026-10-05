@@ -8,9 +8,11 @@
 //!
 //! # Contents
 //! - [`parse`] — public entry, byte cursor → [`Value`].
-//! - [`ParseError`] — strict-mode failure with byte offset.
+//! - [`ParseError`] distinguishes byte-position syntax errors from actual OOM.
 //!
 //! # Invariants
+//! - Fresh ordinary object fields use complete CreateDataProperty descriptors;
+//!   allocation failure retains its original typed cause.
 //! - Recursion-free. Object / array bodies live on a Rust stack of
 //!   builder frames capped at [`super::MAX_NESTING_DEPTH`] levels.
 //! - Strict spec: trailing commas, comments, single quotes, leading
@@ -26,23 +28,30 @@ use otter_gc::heap::RootSlotVisitor;
 
 use crate::Value;
 use crate::number::NumberValue;
+use crate::rooting::RootScopeExt;
 use crate::string::JsString;
 
 use super::MAX_NESTING_DEPTH;
 
-/// Strict-mode parse failure.
+/// Syntax failure or an actual allocator refusal during parsing.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{message} at byte {position}")]
-pub struct ParseError {
-    /// Diagnostic body.
-    pub message: String,
-    /// 0-based byte offset.
-    pub position: usize,
+pub enum ParseError {
+    /// Malformed JSON with an exact source byte offset.
+    #[error("{message} at byte {position}")]
+    Syntax {
+        /// Diagnostic body.
+        message: String,
+        /// Zero-based byte offset.
+        position: usize,
+    },
+    /// The original collector allocation failure.
+    #[error(transparent)]
+    OutOfMemory(#[from] otter_gc::OutOfMemory),
 }
 
 impl ParseError {
     fn at(pos: usize, message: impl Into<String>) -> Self {
-        Self {
+        Self::Syntax {
             message: message.into(),
             position: pos,
         }
@@ -353,10 +362,17 @@ pub(crate) fn parse_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
     object_proto: Option<Value>,
 ) -> Result<Value, ParseError> {
+    let mut prototype = object_proto.unwrap_or_else(Value::null);
+    let mut roots = otter_gc::RootScope::new(gc_heap);
+    // SAFETY: the canonical prototype slot precedes the guard and remains
+    // stationary through every string/container allocation and root lookup.
+    unsafe {
+        roots.add_value(&mut prototype);
+    }
     let bytes = text.as_bytes();
     let mut cursor = Cursor { bytes, pos: 0 };
     cursor.skip_ws();
-    let value = read_value(&mut cursor, gc_heap, external_visit, object_proto)?;
+    let value = read_value(&mut cursor, gc_heap, external_visit, &prototype)?;
     cursor.skip_ws();
     if cursor.pos != bytes.len() {
         return Err(ParseError::at(cursor.pos, "unexpected trailing content"));
@@ -405,7 +421,7 @@ fn read_value(
     cursor: &mut Cursor<'_>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: Option<Value>,
+    object_proto: &Value,
 ) -> Result<Value, ParseError> {
     let mut stack: Vec<Builder> = Vec::with_capacity(8);
     let result = read_step(cursor, &mut stack, gc_heap, external_visit, object_proto)?;
@@ -432,7 +448,7 @@ fn read_step(
     stack: &mut Vec<Builder>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: Option<Value>,
+    object_proto: &Value,
 ) -> Result<Value, ParseError> {
     cursor.skip_ws();
     let b = cursor
@@ -538,7 +554,7 @@ fn continue_container(
     just_read: Value,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: Option<Value>,
+    object_proto: &Value,
 ) -> Result<Value, ParseError> {
     let frame = stack.last_mut().expect("non-empty stack");
     match frame {
@@ -638,7 +654,7 @@ fn finish_builder(
     gc_heap: &mut otter_gc::GcHeap,
     pos: usize,
     external_visit: &mut RootSlotVisitor<'_>,
-    object_proto: Option<Value>,
+    object_proto: &Value,
 ) -> Result<Value, ParseError> {
     match builder {
         Builder::Array {
@@ -665,8 +681,7 @@ fn finish_builder(
                     elements.iter().cloned(),
                     source,
                     &mut roots,
-                )
-                .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?,
+                )?,
             ))
         }
         Builder::Object { entries, .. } => {
@@ -682,15 +697,15 @@ fn finish_builder(
             // an own `"__proto__"` stays a data property.
             let root = crate::object::root_for_prototype(
                 gc_heap,
-                object_proto.and_then(|proto| proto.as_object()),
-            )
-            .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
+                object_proto.as_object(),
+                crate::object::ShapeState::ORDINARY,
+                &mut roots,
+            )?;
             let mut obj = crate::object::alloc_object_with_roots(
                 gc_heap,
                 crate::object::shape_body::dictionary_of(root),
                 &mut roots,
-            )
-            .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
+            )?;
             // Filling each property transitions the hidden class and can grow the
             // value slab — an allocation that may collect. The object being
             // filled, the values not yet installed, and the enclosing builder
@@ -726,7 +741,16 @@ fn finish_builder(
             let _build_roots_guard =
                 gc_heap.register_extra_roots(otter_gc::ExtraRoots::new(&build_roots));
             for (k, v) in &entries {
-                crate::object::set(&mut obj, gc_heap, k, *v);
+                let accepted = crate::object::define_own_property_in_place(
+                    &mut obj,
+                    gc_heap,
+                    k,
+                    crate::object::PropertyDescriptor::data(*v, true, true, true),
+                )?;
+                assert!(
+                    accepted,
+                    "a fresh extensible JSON object accepts complete data fields"
+                );
             }
             Ok(Value::object(obj))
         }
@@ -910,12 +934,11 @@ fn read_string(
         // A span carrying high bytes still needs UTF-8 validation first.
         if slice.is_ascii() {
             return JsString::from_latin1_with_roots(slice, heap, &mut roots)
-                .map_err(|_| ParseError::at(start, "out of memory while interning string"));
+                .map_err(ParseError::from);
         }
         let text = std::str::from_utf8(slice)
             .map_err(|_| ParseError::at(start, "invalid utf-8 in string"))?;
-        return JsString::from_str_with_roots(text, heap, &mut roots)
-            .map_err(|_| ParseError::at(start, "out of memory while interning string"));
+        return JsString::from_str_with_roots(text, heap, &mut roots).map_err(ParseError::from);
     }
     if b < 0x20 {
         return Err(ParseError::at(cursor.pos, "control character in string"));
@@ -950,9 +973,8 @@ fn read_string_with_escapes(
                     external_visit(visitor);
                     trace_builder_stack(stack, visitor);
                 };
-                return JsString::from_utf16_units_with_roots(&buf, heap, &mut roots).map_err(
-                    |_| ParseError::at(plain_start, "out of memory while interning string"),
-                );
+                return JsString::from_utf16_units_with_roots(&buf, heap, &mut roots)
+                    .map_err(ParseError::from);
             }
             b'\\' => {
                 cursor.pos += 1;

@@ -26,7 +26,9 @@
 //!   namespace table.
 //! - `import.meta` is a null-prototype object whose receiver and URL remain in
 //!   one handle scope until the allocating string/property build is complete.
-//! - Dynamic import always writes a Promise to the destination register.
+//! - Dynamic import writes a Promise for catchable failures. Structural/control
+//!   failures and failed exception materialization return their original Result;
+//!   async module reactions never invent an undefined rejection value.
 //! - `import.meta.resolve` accepts only string specifiers.
 //! - Module init, deferred-namespace accessors, and async continuation jobs
 //!   re-enter above an activation floor on the current rooted runtime turn.
@@ -36,6 +38,7 @@
 //! - [`crate::execution_context`]
 
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
 use crate::{
     ExecutionContext, Interpreter, JsString, Value, VmError, module_records::ModuleStatus,
     operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
@@ -98,7 +101,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let namespace = self
-            .get_or_create_module_namespace(target.as_str())
+            .get_or_create_module_namespace(target.as_str())?
             .ok_or_else(|| {
                 self.err_unknown_intrinsic(format!("import * as \"{target}\"").into())
             })?;
@@ -133,7 +136,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let value = self
-            .resolve_module_binding(&url, &name)
+            .resolve_module_binding(&url, &name)?
             .unwrap_or_else(Value::undefined);
         if value.is_hole() {
             return Err(self.err_this_uninit(
@@ -439,7 +442,7 @@ impl Interpreter {
             // Step 12 — [[AsyncEvaluation]] := true, in evaluation
             // order. The per-module gate promise generalises the
             // spec's capability-on-cycle-root.
-            let gate = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            let gate = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                 .pending_stack_rooted(self, stack, &[], &[])?;
             let order = self.next_module_async_order;
             self.next_module_async_order += 1;
@@ -672,11 +675,11 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let url = url_arc.as_ref();
         let Some(function_id) = context.module_init_function_id(url) else {
-            self.async_module_execution_fulfilled(stack, context, url_arc);
+            self.async_module_execution_fulfilled(stack, context, url_arc)?;
             return Ok(());
         };
         if !self.module_environments.contains_key(url_arc) {
-            self.async_module_execution_fulfilled(stack, context, url_arc);
+            self.async_module_execution_fulfilled(stack, context, url_arc)?;
             return Ok(());
         }
         self.run_module_hoist_phase(stack, context, url_arc)?;
@@ -684,7 +687,7 @@ impl Interpreter {
         // Environment read AFTER the hoist + import.meta allocations — a
         // pre-allocation copy is a use-after-move under a moving young gen.
         let Some(env) = self.module_environments.get(url_arc).copied() else {
-            self.async_module_execution_fulfilled(stack, context, url_arc);
+            self.async_module_execution_fulfilled(stack, context, url_arc)?;
             return Ok(());
         };
         match self.run_module_init(stack, context, function_id, Value::object(env), meta) {
@@ -695,27 +698,16 @@ impl Interpreter {
             // the init is async; stay safe if the body completed
             // without parking.
             Ok(None) => {
-                self.async_module_execution_fulfilled(stack, context, url_arc);
+                self.async_module_execution_fulfilled(stack, context, url_arc)?;
                 Ok(())
             }
             Err(err) => {
-                let reason = self.thrown_value_for_walk(err)?;
+                let reason =
+                    self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
                 self.async_module_execution_rejected(url_arc, reason);
                 Ok(())
             }
         }
-    }
-
-    /// Convert a body-evaluation `VmError` into the JS value the
-    /// rejected walk propagates. An infrastructure error (no pending
-    /// thrown value) is fatal and propagates as `Err` instead.
-    fn thrown_value_for_walk(&mut self, err: VmError) -> Result<Value, VmError> {
-        if matches!(err, VmError::Uncaught)
-            && let Some(thrown) = self.take_pending_uncaught_throw()
-        {
-            return Ok(thrown);
-        }
-        Err(err)
     }
 
     /// Attach §16.2.1.9 step 8 reactions to a top-level-await init's
@@ -742,15 +734,25 @@ impl Interpreter {
                     SmallVec::new(),
                     &mut |_visitor| {},
                     move |ncx, _args, _captures| {
-                        if let Some(reaction_context) = ncx.execution_context().cloned() {
-                            ncx.with_turn_parts(|interp, stack| {
-                                interp.async_module_execution_fulfilled(
+                        let reaction_context = ncx
+                            .execution_context()
+                            .cloned()
+                            .ok_or(crate::NativeError::InvalidOperand)?;
+                        ncx.with_turn_parts(|interp, stack| {
+                            interp
+                                .async_module_execution_fulfilled(
                                     stack,
                                     &reaction_context,
                                     &fulfilled_url,
-                                );
-                            });
-                        }
+                                )
+                                .map_err(|error| {
+                                    crate::native_function::vm_to_native_error(
+                                        interp,
+                                        error,
+                                        "AsyncModuleExecutionFulfilled",
+                                    )
+                                })
+                        })?;
                         Ok(Value::undefined())
                     },
                 )
@@ -772,7 +774,7 @@ impl Interpreter {
                 )
                 .map_err(VmError::from)?;
             let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
-            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            let capability = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                 .capability_stack_rooted(this, stack, &[], &[])?;
             let init = this
                 .iteration_anchor(init_slot)
@@ -780,16 +782,13 @@ impl Interpreter {
                 .expect("anchored async-module gate survives reaction allocation");
             let on_fulfilled = this.iteration_anchor(fulfilled_slot);
             let on_rejected = this.iteration_anchor(rejected_slot);
-            let async_context = this.async_context();
-            let outcome = crate::JsPromise::perform_then_with_context(
-                &init,
-                &mut this.gc_heap,
+            let outcome = this.register_promise_reactions(
+                init,
                 Some(on_fulfilled),
                 Some(on_rejected),
                 capability,
                 Some(context.clone()),
-                async_context,
-            );
+            )?;
             if let Some(job) = outcome.immediate_job {
                 this.microtasks.enqueue(job);
             }
@@ -811,13 +810,13 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         url_arc: &std::sync::Arc<str>,
-    ) {
+    ) -> Result<(), VmError> {
         {
             let record = self.module_record_mut(url_arc);
             if record.status == ModuleStatus::Evaluated {
                 // Already settled (e.g. the rejected walk got here
                 // first through another parent edge).
-                return;
+                return Ok(());
             }
             record.status = ModuleStatus::Evaluated;
             record.async_order = None;
@@ -837,10 +836,8 @@ impl Interpreter {
                 // §16.2.1.9.4 step 9.b — its own init reactions
                 // continue the walk when it settles.
                 if let Err(err) = self.execute_async_module(stack, context, &module) {
-                    let message = format!("module evaluation failed: {err}");
-                    let reason = self
-                        .make_type_error_with_stack_roots(stack, &message)
-                        .unwrap_or_else(|_| Value::undefined());
+                    let reason =
+                        self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
                     self.async_module_execution_rejected(&module, reason);
                 }
                 continue;
@@ -857,18 +854,14 @@ impl Interpreter {
                     }
                     self.fulfill_module_gate(&module);
                 }
-                Err(err) => match self.thrown_value_for_walk(err) {
-                    Ok(reason) => self.async_module_execution_rejected(&module, reason),
-                    Err(err) => {
-                        let message = format!("module evaluation failed: {err}");
-                        let reason = self
-                            .make_type_error_with_stack_roots(stack, &message)
-                            .unwrap_or_else(|_| Value::undefined());
-                        self.async_module_execution_rejected(&module, reason);
-                    }
-                },
+                Err(err) => {
+                    let reason =
+                        self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)?;
+                    self.async_module_execution_rejected(&module, reason);
+                }
             }
         }
+        Ok(())
     }
 
     /// §16.2.1.9.3 GatherAvailableAncestors: walk
@@ -990,12 +983,14 @@ impl Interpreter {
             smallvec::smallvec![pending_value],
             &mut |visitor| pending_value.trace_value_slots(visitor),
             move |ncx, _args, captures| {
-                let Some(job_context) = ncx.execution_context().cloned() else {
-                    return Ok(Value::undefined());
-                };
-                let Some(pending_value) = captures.first().copied() else {
-                    return Ok(Value::undefined());
-                };
+                let job_context = ncx
+                    .execution_context()
+                    .cloned()
+                    .ok_or(crate::NativeError::InvalidOperand)?;
+                let pending_value = captures
+                    .first()
+                    .copied()
+                    .ok_or(crate::NativeError::InvalidOperand)?;
                 ncx.scope(|mut scope| {
                     let pending = scope.value(pending_value);
                     let evaluation = scope.with_turn_parts(|interp, stack| {
@@ -1048,28 +1043,31 @@ impl Interpreter {
                             });
                         }
                         Err(err) => {
+                            let reason = scope.with_turn_parts(|interp, stack| {
+                                interp
+                                    .vm_error_to_throwable_with_stack_roots(
+                                        Some(&job_context),
+                                        stack,
+                                        &err,
+                                    )
+                                    .map_err(|error| {
+                                        crate::native_function::vm_to_native_error(
+                                            interp, error, "import()",
+                                        )
+                                    })
+                            })?;
+                            let reason = scope.value(reason);
                             let pending = scope
                                 .raw(pending)
                                 .as_promise()
-                                .expect("rooted dynamic-import promise remains a promise");
-                            scope.with_turn_parts(|interp, _stack| {
-                                let reason = match err {
-                                    VmError::Uncaught => interp
-                                        .take_pending_uncaught_throw()
-                                        .unwrap_or_else(Value::undefined),
-                                    other => {
-                                        return Err(crate::native_function::vm_to_native_error(
-                                            interp, other, "import()",
-                                        ));
-                                    }
-                                };
-                                let jobs =
-                                    crate::JsPromise::reject(&pending, &mut interp.gc_heap, reason);
-                                for job in jobs.jobs {
-                                    interp.microtasks.enqueue(job);
-                                }
-                                Ok(())
-                            })?;
+                                .ok_or(crate::NativeError::InvalidOperand)?;
+                            let reason = scope.raw(reason);
+                            let interp = scope.context().interp_mut();
+                            let jobs =
+                                crate::JsPromise::reject(&pending, &mut interp.gc_heap, reason);
+                            for job in jobs.jobs {
+                                interp.microtasks.enqueue(job);
+                            }
                         }
                     }
                     let undefined = scope.undefined();
@@ -1078,11 +1076,13 @@ impl Interpreter {
             },
         )
         .map_err(VmError::from)?;
+        let job = self.stamp_native_creation_realm(job);
         self.microtasks.enqueue(crate::microtask::Microtask {
             callee: job,
             this_value: Value::undefined(),
             args: smallvec::SmallVec::new(),
             context: Some(context.clone()),
+            realm_id: self.active_realm_id,
             result_capability: None,
             kind: crate::microtask::MicrotaskKind::Call,
             async_context: self.async_context(),
@@ -1156,7 +1156,7 @@ impl Interpreter {
                 )
                 .map_err(VmError::from)?;
             let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
-            let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            let capability = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                 .capability_stack_rooted(this, stack, &[], &[])?;
             let init = this
                 .iteration_anchor(init_slot)
@@ -1164,16 +1164,13 @@ impl Interpreter {
                 .expect("anchored module-evaluation gate survives reaction allocation");
             let on_fulfilled = this.iteration_anchor(fulfilled_slot);
             let on_rejected = this.iteration_anchor(rejected_slot);
-            let async_context = this.async_context();
-            let outcome = crate::JsPromise::perform_then_with_context(
-                &init,
-                &mut this.gc_heap,
+            let outcome = this.register_promise_reactions(
+                init,
                 Some(on_fulfilled),
                 Some(on_rejected),
                 capability,
                 Some(context.clone()),
-                async_context,
-            );
+            )?;
             if let Some(job) = outcome.immediate_job {
                 this.microtasks.enqueue(job);
             }
@@ -1226,7 +1223,7 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
         trigger: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let Some(obj) = value.as_object() else {
             return Ok(());
         };
@@ -1237,15 +1234,19 @@ impl Interpreter {
             return Ok(());
         }
         if !self.module_ready_for_sync_execution(context, target_url.as_ref(), &mut Vec::new()) {
-            return Err(self.err_type(
-                ("Cannot synchronously evaluate a deferred module while it is evaluating"
-                    .to_string())
-                .into(),
+            return Err(CommittedValueError::JavaScript(
+                self.err_type(
+                    ("Cannot synchronously evaluate a deferred module while it is evaluating"
+                        .to_string())
+                    .into(),
+                ),
             ));
         }
         self.with_handle_scope(|interp, scope| {
             let namespace = interp.scoped_value(scope, *value);
-            interp.evaluate_module_rec(stack, context, &target_url)?;
+            interp
+                .evaluate_module_rec(stack, context, &target_url)
+                .map_err(CommittedValueError::completed_call)?;
             if let Some(env) = interp.module_environments.get(&target_url).copied() {
                 let env = interp.scoped_value(scope, Value::object(env));
                 let env_value = interp.escape_scoped(env);
@@ -1255,40 +1256,49 @@ impl Interpreter {
                 for name in &names {
                     let key = crate::VmPropertyKey::String(name);
                     let env_value = interp.escape_scoped(env);
-                    let val = match interp
-                        .ordinary_get_value(stack, context, env_value, env_value, &key, 0)?
-                    {
+                    let val = match interp.ordinary_get_value(
+                        stack,
+                        Some(context),
+                        env_value,
+                        env_value,
+                        &key,
+                        0,
+                    )? {
                         crate::VmGetOutcome::Value(value) => value,
                         crate::VmGetOutcome::InvokeGetter { getter } => interp
                             .run_callable_sync_rooted(
                                 stack,
-                                context,
+                                Some(context),
                                 &getter,
                                 env_value,
                                 SmallVec::new(),
-                            )?,
+                            )
+                            .map_err(CommittedValueError::completed_call)?,
                     };
                     let val = interp.scoped_value(scope, val);
                     // §28.3 namespace export properties: writable, enumerable,
                     // non-configurable.
-                    interp.scoped_define_data(
-                        scope,
-                        namespace,
-                        name,
-                        val,
-                        crate::object::PropertyFlags::new(true, true, false),
-                    )?;
+                    interp
+                        .scoped_define_data(
+                            scope,
+                            namespace,
+                            name,
+                            val,
+                            crate::object::PropertyFlags::new(true, true, false),
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 }
                 let namespace_obj = interp
                     .escape_scoped(namespace)
                     .as_object()
-                    .ok_or(VmError::TypeMismatch)?;
-                crate::object::prevent_extensions(namespace_obj, &mut interp.gc_heap);
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                crate::object::prevent_extensions(&mut { namespace_obj }, &mut interp.gc_heap)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
             let namespace_obj = interp
                 .escape_scoped(namespace)
                 .as_object()
-                .ok_or(VmError::TypeMismatch)?;
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
             crate::object::set_deferred_namespace_populated(namespace_obj, &interp.gc_heap);
             Ok(())
         })
@@ -1354,7 +1364,7 @@ impl Interpreter {
             .map(|f| f.module_url.as_ref());
         let resolved = resolve_relative_url(referrer, &specifier);
         let resolved_str =
-            JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
+            JsString::from_str(&resolved, &mut self.gc_heap).map_err(VmError::from)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::string(resolved_str))?;
         frame.advance_pc()?;
@@ -1371,89 +1381,99 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         options: &Value,
-    ) -> Result<Result<Option<String>, Value>, VmError> {
+    ) -> Result<Result<Option<String>, Value>, CommittedValueError> {
         if options.is_undefined() {
             return Ok(Ok(None));
         }
         if !options.is_object_type() {
-            let reason =
-                self.make_type_error_with_stack_roots(stack, "import options must be an object")?;
+            let reason = self
+                .make_type_error_with_stack_roots(stack, "import options must be an object")
+                .map_err(CommittedValueError::Fatal)?;
             return Ok(Err(reason));
         }
-        let attributes = self.with_handle_scope(|interp, scope| -> Result<_, VmError> {
-            let options = interp.scoped_value(scope, *options);
-            let with_value = {
-                let options_now = interp.escape_scoped(options);
-                interp.get_property_value_for_call(stack, context, options_now, "with")?
-            };
-            if with_value.is_undefined() {
-                return Ok(Ok(None));
-            }
-            if !with_value.is_object_type() {
-                let reason = interp.make_type_error_with_stack_roots(
-                    stack,
-                    "import attributes must be an object",
-                )?;
-                return Ok(Err(reason));
-            }
-            // §7.3.24 EnumerableOwnProperties(key+value): own keys in
-            // [[OwnPropertyKeys]] order, string keys only, each value read
-            // through [[Get]] so getters and Proxy traps fire.
-            let with_handle = interp.scoped_value(scope, with_value);
-            let with_now = interp.escape_scoped(with_handle);
-            let keys = interp.own_property_keys_value(stack, context, &with_now)?;
-            let key_handles: Vec<_> = keys
-                .into_iter()
-                .map(|key| interp.scoped_value(scope, key))
-                .collect();
-            let mut attr_type: Option<String> = None;
-            for key_handle in key_handles {
-                let key_value = interp.escape_scoped(key_handle);
-                let Some(key_string) = key_value.as_string(&interp.gc_heap) else {
-                    // Symbol keys are filtered by EnumerableOwnProperties.
-                    continue;
+        let attributes =
+            self.with_handle_scope(|interp, scope| -> Result<_, CommittedValueError> {
+                let options = interp.scoped_value(scope, *options);
+                let with_value = {
+                    let options_now = interp.escape_scoped(options);
+                    interp.get_property_value_for_call(stack, context, options_now, "with")?
                 };
-                let key = key_string.to_lossy_string(&interp.gc_heap);
-                let with_now = interp.escape_scoped(with_handle);
-                let descriptor = interp.get_own_property_descriptor_for_value(
-                    stack,
-                    context,
-                    with_now,
-                    Some(&interp.escape_scoped(key_handle)),
-                )?;
-                if !descriptor.is_some_and(|descriptor| descriptor.enumerable()) {
-                    continue;
+                if with_value.is_undefined() {
+                    return Ok(Ok(None));
                 }
-                let with_now = interp.escape_scoped(with_handle);
-                let value =
-                    interp.get_property_value_for_call(stack, context, with_now, key.as_str())?;
-                let Some(value_string) = value.as_string(&interp.gc_heap) else {
-                    let reason = interp.make_type_error_with_stack_roots(
-                        stack,
-                        &format!("import attribute \"{key}\" value must be a string"),
-                    )?;
-                    return Ok(Err(reason));
-                };
-                if key != "type" {
-                    let reason = interp.make_type_error_with_stack_roots(
-                        stack,
-                        &format!("unsupported import attribute \"{key}\""),
-                    )?;
+                if !with_value.is_object_type() {
+                    let reason = interp
+                        .make_type_error_with_stack_roots(
+                            stack,
+                            "import attributes must be an object",
+                        )
+                        .map_err(CommittedValueError::Fatal)?;
                     return Ok(Err(reason));
                 }
-                attr_type = Some(value_string.to_lossy_string(&interp.gc_heap));
-            }
-            Ok(Ok(attr_type))
-        });
+                // §7.3.24 EnumerableOwnProperties(key+value): own keys in
+                // [[OwnPropertyKeys]] order, string keys only, each value read
+                // through [[Get]] so getters and Proxy traps fire.
+                let with_handle = interp.scoped_value(scope, with_value);
+                let with_now = interp.escape_scoped(with_handle);
+                let keys = interp.own_property_keys_value(stack, context, &with_now)?;
+                let key_handles: Vec<_> = keys
+                    .into_iter()
+                    .map(|key| interp.scoped_value(scope, key))
+                    .collect();
+                let mut attr_type: Option<String> = None;
+                for key_handle in key_handles {
+                    let key_value = interp.escape_scoped(key_handle);
+                    let Some(key_string) = key_value.as_string(&interp.gc_heap) else {
+                        // Symbol keys are filtered by EnumerableOwnProperties.
+                        continue;
+                    };
+                    let key = key_string.to_lossy_string(&interp.gc_heap);
+                    let with_now = interp.escape_scoped(with_handle);
+                    let descriptor = interp.get_own_property_descriptor_for_value(
+                        stack,
+                        context,
+                        with_now,
+                        Some(&interp.escape_scoped(key_handle)),
+                    )?;
+                    if !descriptor.is_some_and(|descriptor| descriptor.enumerable()) {
+                        continue;
+                    }
+                    let with_now = interp.escape_scoped(with_handle);
+                    let value = interp.get_property_value_for_call(
+                        stack,
+                        context,
+                        with_now,
+                        key.as_str(),
+                    )?;
+                    let Some(value_string) = value.as_string(&interp.gc_heap) else {
+                        let reason = interp
+                            .make_type_error_with_stack_roots(
+                                stack,
+                                &format!("import attribute \"{key}\" value must be a string"),
+                            )
+                            .map_err(CommittedValueError::Fatal)?;
+                        return Ok(Err(reason));
+                    };
+                    if key != "type" {
+                        let reason = interp
+                            .make_type_error_with_stack_roots(
+                                stack,
+                                &format!("unsupported import attribute \"{key}\""),
+                            )
+                            .map_err(CommittedValueError::Fatal)?;
+                        return Ok(Err(reason));
+                    }
+                    attr_type = Some(value_string.to_lossy_string(&interp.gc_heap));
+                }
+                Ok(Ok(attr_type))
+            });
         match attributes {
             Ok(result) => Ok(result),
-            Err(VmError::Uncaught) => Ok(Err(self
-                .take_pending_uncaught_throw()
-                .unwrap_or_else(Value::undefined))),
-            Err(error) => {
+            Err(error @ CommittedValueError::Fatal(_)) => Err(error),
+            Err(CommittedValueError::JavaScript(error)) => {
                 let reason = self
                     .vm_error_to_throwable_with_stack_roots(Some(context), stack, &error)
-                    .ok_or(error)?;
+                    .map_err(CommittedValueError::Fatal)?;
                 Ok(Err(reason))
             }
         }
@@ -1465,11 +1485,15 @@ impl Interpreter {
         stack: &mut ActivationStack,
         top_idx: usize,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let spec_reg = register_operand(operands.get(1))?;
-        let options_reg = register_operand(operands.get(2))?;
-        let spec_value = *read_register(&stack[top_idx], spec_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let dst = register_operand(operands.first())
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let spec_reg = register_operand(operands.get(1))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let options_reg = register_operand(operands.get(2))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let spec_value = *read_register(&stack[top_idx], spec_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         // §13.3.10 step 1 / GetActiveScriptOrModule — eval-compiled chunks
         // carry no module URL of their own, so walk the live activations
         // down to the nearest frame whose owning chunk supplies one.
@@ -1498,24 +1522,23 @@ impl Interpreter {
             Ok(specifier) => {
                 // Re-read the options register after specifier coercion: the
                 // coercion can collect, and registers are the traced home.
-                let options_value = *read_register(&stack[top_idx], options_reg)?;
+                let options_value = *read_register(&stack[top_idx], options_reg)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 let attr_type =
                     match self.evaluate_import_call_options(stack, context, &options_value)? {
                         Ok(attr_type) => attr_type,
                         Err(reason) => {
-                            let promise = promise_dispatch::PromiseBuilder::with_context(
+                            let promise = promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
-                            )
-                            .rejected_stack_rooted(
-                                self,
-                                stack,
-                                reason,
-                                &[],
-                                &[],
-                            )?;
+                            ))
+                            .rejected_stack_rooted(self, stack, reason, &[], &[])
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let frame = &mut stack[top_idx];
-                            write_register(frame, dst, Value::promise(promise))?;
-                            frame.advance_pc()?;
+                            write_register(frame, dst, Value::promise(promise))
+                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                            frame
+                                .advance_pc()
+                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                             return Ok(());
                         }
                     };
@@ -1532,43 +1555,49 @@ impl Interpreter {
                     if self.module_evaluation_depth > 0
                         && self.module_record_status(&target) == ModuleStatus::New
                     {
-                        let pending =
-                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                                .pending_stack_rooted(self, stack, &[], &[])?;
+                        let pending = promise_dispatch::PromiseBuilder::with_context(Some(
+                            import_context.clone(),
+                        ))
+                        .pending_stack_rooted(self, stack, &[], &[])
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         self.defer_dynamic_import_evaluation(
                             context,
                             pending,
                             target,
                             referrer.clone(),
                             specifier.clone(),
-                        )?;
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         let frame = &mut stack[top_idx];
-                        write_register(frame, dst, Value::promise(pending))?;
-                        frame.advance_pc()?;
+                        write_register(frame, dst, Value::promise(pending))
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+                        frame
+                            .advance_pc()
+                            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                         return Ok(());
                     }
-                    match self.evaluate_module(stack, context, &target) {
+                    match self
+                        .evaluate_module(stack, context, &target)
+                        .map_err(CommittedValueError::completed_call)
+                    {
                         Ok(Some(gate)) => {
                             // §13.3.10 — an async-evaluating target
                             // settles the import promise only when its
                             // module subtree does; the per-record gate
                             // is the import's `[[TopLevelCapability]]`.
-                            let pending = promise_dispatch::PromiseBuilder::with_context(
+                            let pending = promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
-                            )
-                            .pending_stack_rooted(
-                                self,
-                                stack,
-                                &[],
-                                &[],
-                            )?;
+                            ))
+                            .pending_stack_rooted(self, stack, &[], &[])
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             self.settle_promise_on_module_evaluation(
                                 stack,
                                 context,
                                 pending,
                                 gate,
                                 std::sync::Arc::from(target.as_str()),
-                            )?;
+                            )
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             pending
                         }
                         Ok(None) => {
@@ -1578,47 +1607,48 @@ impl Interpreter {
                                     self.err_unknown_intrinsic(
                                         format!("import \"{specifier}\"").into(),
                                     )
-                                })?;
+                                })
+                                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let namespace_value = Value::object(ns);
-                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                                .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])?
+                            promise_dispatch::PromiseBuilder::with_context(Some(
+                                import_context.clone(),
+                            ))
+                            .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
-                        Err(VmError::Uncaught) => {
+                        Err(error @ CommittedValueError::Fatal(_)) => return Err(error),
+                        Err(CommittedValueError::JavaScript(err)) => {
                             let reason = self
-                                .take_pending_uncaught_throw()
-                                .unwrap_or_else(Value::undefined);
-                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                                .rejected_stack_rooted(self, stack, reason, &[], &[])?
-                        }
-                        Err(err) => {
-                            let reason = self.make_type_error_with_stack_roots(
-                                stack,
-                                &format!("dynamic import: evaluation failed: {err}"),
-                            )?;
-                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                                .rejected_stack_rooted(self, stack, reason, &[], &[])?
+                                .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
+                                .map_err(CommittedValueError::Fatal)?;
+                            promise_dispatch::PromiseBuilder::with_context(Some(
+                                import_context.clone(),
+                            ))
+                            .rejected_stack_rooted(self, stack, reason, &[], &[])
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
                     }
                 } else if let Some(loader) = self.dynamic_import_loader.clone() {
                     match loader.admit() {
                         Err(error) => {
-                            let reason = self.make_type_error_with_stack_roots(
-                                stack,
-                                &format!("dynamic import: {error}"),
-                            )?;
-                            promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                                .rejected_stack_rooted(self, stack, reason, &[], &[])?
+                            let reason = self
+                                .make_type_error_with_stack_roots(
+                                    stack,
+                                    &format!("dynamic import: {error}"),
+                                )
+                                .map_err(CommittedValueError::Fatal)?;
+                            promise_dispatch::PromiseBuilder::with_context(Some(
+                                import_context.clone(),
+                            ))
+                            .rejected_stack_rooted(self, stack, reason, &[], &[])
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
                         Ok(admission) => {
-                            let pending = promise_dispatch::PromiseBuilder::with_context(
+                            let pending = promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
-                            )
-                            .pending_stack_rooted(
-                                self,
-                                stack,
-                                &[],
-                                &[],
-                            )?;
+                            ))
+                            .pending_stack_rooted(self, stack, &[], &[])
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let token = self.dynamic_import_registry.insert(
                                 pending,
                                 import_context.clone(),
@@ -1633,10 +1663,12 @@ impl Interpreter {
                             ) {
                                 Ok(()) => self.record_runtime_host_op_enqueued(),
                                 Err(error) => {
-                                    let reason = self.make_type_error_with_stack_roots(
-                                        stack,
-                                        &format!("dynamic import: {error}"),
-                                    )?;
+                                    let reason = self
+                                        .make_type_error_with_stack_roots(
+                                            stack,
+                                            &format!("dynamic import: {error}"),
+                                        )
+                                        .map_err(CommittedValueError::Fatal)?;
                                     let _ = self.settle_dynamic_import_inner(token, Err(reason));
                                 }
                             }
@@ -1644,44 +1676,32 @@ impl Interpreter {
                         }
                     }
                 } else {
-                    let reason = self.make_type_error_with_stack_roots(
-                        stack,
-                        &format!("dynamic import: module not resolvable: \"{specifier}\""),
-                    )?;
-                    promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                        .rejected_stack_rooted(self, stack, reason, &[], &[])?
+                    let reason = self
+                        .make_type_error_with_stack_roots(
+                            stack,
+                            &format!("dynamic import: module not resolvable: \"{specifier}\""),
+                        )
+                        .map_err(CommittedValueError::Fatal)?;
+                    promise_dispatch::PromiseBuilder::with_context(Some(import_context.clone()))
+                        .rejected_stack_rooted(self, stack, reason, &[], &[])
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
             }
-            Err(VmError::Uncaught) => {
-                let value = match self.take_error_detail() {
-                    Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                    _ => Default::default(),
-                };
-                let reason = if let Some(thrown) = self.take_pending_uncaught_throw() {
-                    thrown
-                } else {
-                    let fallback = JsString::from_str(&value, &mut self.gc_heap).map_err(|_| {
-                        self.err_type(
-                            ("dynamic import: failed to allocate rejection reason".to_string())
-                                .into(),
-                        )
-                    })?;
-                    Value::string(fallback)
-                };
-                promise_dispatch::PromiseBuilder::with_context(import_context)
-                    .rejected_stack_rooted(self, stack, reason, &[], &[])?
-            }
-            Err(err) => {
-                let reason = self.make_type_error_with_stack_roots(
-                    stack,
-                    &format!("dynamic import: specifier ToString failed: {err}"),
-                )?;
-                promise_dispatch::PromiseBuilder::with_context(import_context)
-                    .rejected_stack_rooted(self, stack, reason, &[], &[])?
+            Err(error @ CommittedValueError::Fatal(_)) => return Err(error),
+            Err(CommittedValueError::JavaScript(err)) => {
+                let reason = self
+                    .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
+                    .map_err(CommittedValueError::Fatal)?;
+                promise_dispatch::PromiseBuilder::with_context(Some(import_context))
+                    .rejected_stack_rooted(self, stack, reason, &[], &[])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             }
         };
-        write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
-        stack[top_idx].advance_pc()?;
+        write_register(&mut stack[top_idx], dst, Value::promise(promise))
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 }

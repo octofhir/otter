@@ -1,20 +1,24 @@
 //! Node-compatible `process` global installed by the runtime.
 //!
 //! # Contents
-//! - [`default_argv`] builds the runtime's default `process.argv` snapshot.
 //! - [`default_cwd`] builds the runtime's default `process.cwd()` snapshot.
-//! - [`install_global`] materializes the JS-visible `process` object.
+//! - [`install_global`] materializes `process` and default argv from one host snapshot.
 //! - [`crate::process_events`] owns EventEmitter and warning behavior.
 //! - [`crate::process_flags`] owns the immutable NODE_OPTIONS allowlist.
 //!
 //! # Invariants
 //! - `process.env` is capability-filtered at install time and never bypasses
 //!   the runtime's deny-by-default policy or secret denylist.
+//! - Default arguments are declarative absence until installation. One host
+//!   snapshot supplies the default argv, execPath, pid/ppid and uptime base;
+//!   explicit arguments (including an empty list) remain distinct inputs.
 //! - Host data is copied into JS-owned values. This module does not expose VM
 //!   internals across the public runtime boundary.
 //! - `process.binding()` is present for Node shape compatibility but remains
 //!   deny-by-default; it never exposes Otter or host internals.
 //! - Event listeners and warning jobs use scoped handles and JS-owned records.
+//! - `getBuiltinModule` returns `undefined` only for discovery absence. A
+//!   discovered builtin's installer failure keeps its native completion domain.
 //!
 //! # See also
 //! - [`crate::RuntimeBuilder::process_argv`]
@@ -31,17 +35,13 @@ use sysinfo::{ProcessesToUpdate, System};
 
 use crate::{CapabilitySet, DiagnosticCode, OtterError, RuntimeHooks};
 
-pub(crate) fn default_argv() -> Vec<String> {
-    vec![runtime_process_snapshot().exec_path]
-}
-
 pub(crate) fn default_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 pub(crate) fn install_global(
     interp: &mut Interpreter,
-    process_argv: &[String],
+    process_argv: Option<&[String]>,
     process_exec_argv: &[String],
     process_cwd: &Path,
     process_env_overlay: &std::collections::BTreeMap<String, String>,
@@ -57,6 +57,13 @@ pub(crate) fn install_global(
     // it inherited the same channel.
     let channel = inherited_channel(runtime_task_spawner);
     let snapshot = runtime_process_snapshot();
+    let default_argv;
+    let process_argv = if let Some(argv) = process_argv {
+        argv
+    } else {
+        default_argv = [snapshot.exec_path.clone()];
+        &default_argv
+    };
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
     let function_prototype = function_prototype_object(interp);
@@ -513,7 +520,8 @@ fn install_get_builtin_module(
             ctx.scope(|mut scope| {
                 // A name the runtime does not own is not an error; it is simply
                 // not a builtin, which is what `undefined` says.
-                let Ok(module) = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, &name) else {
+                let Some(module) = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, &name)?
+                else {
                     let undefined = scope.undefined();
                     return Ok(scope.finish(undefined));
                 };
@@ -574,7 +582,13 @@ fn install_stdin(
                 if !scope.is_undefined(opened) {
                     return Ok(scope.finish(opened));
                 }
-                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?;
+                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?
+                    .ok_or_else(|| {
+                        crate::runtime_type_error(
+                            "import",
+                            format!("no builtin module named '{STDIO_MODULE}'"),
+                        )
+                    })?;
                 let make = scope.get(stdio, "makeStdin")?;
                 let undefined = scope.undefined();
                 let stream = scope.call(make, undefined, &[])?;
@@ -650,7 +664,13 @@ fn install_one_stdio(
                 if !scope.is_undefined(opened) {
                     return Ok(scope.finish(opened));
                 }
-                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?;
+                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?
+                    .ok_or_else(|| {
+                        crate::runtime_type_error(
+                            "import",
+                            format!("no builtin module named '{STDIO_MODULE}'"),
+                        )
+                    })?;
                 let make = scope.get(stdio, "makeStdout")?;
                 let undefined = scope.undefined();
                 let fd = scope.number(f64::from(fd));
@@ -750,6 +770,118 @@ fn stderr_write(
     let _ = err.write_all(&bytes);
     let _ = err.flush();
     Ok(Value::boolean(true))
+}
+
+/// Define the natives Node's console writes through before any standard
+/// stream exists onto `target` (the `internal/otter/stdio` exports):
+///
+/// - `holdsAccessor(holder, key, getter)`: whether `holder`'s own `key` is
+///   still exactly the accessor whose getter is `getter`.
+/// - `streamUnset(process, fd)`: whether `process.stdout` (fd 1) or
+///   `process.stderr` (fd 2) currently holds no stream — neither built by its
+///   getter nor assigned — so reading it would build the default one.
+/// - `isatty(fd)`: whether the descriptor is a terminal, the same decision
+///   the stream makes when it is built.
+/// - `write(fd, chunk)`: exactly the host write a stream built for `fd`
+///   performs for `chunk`: synchronous, with the same ignored errors.
+///
+/// `process.stdout`/`process.stderr` are non-configurable accessors whose
+/// current stream lives in their slot, so an empty slot is the whole answer.
+///
+/// # Errors
+/// Returns a native error when a function cannot be allocated or defined.
+pub fn define_stdio_natives(
+    scope: &mut NativeScope<'_, '_>,
+    target: Local<'_>,
+) -> Result<(), NativeError> {
+    define_method_on(
+        scope,
+        target,
+        "holdsAccessor",
+        3,
+        NativeCall::Static(stdio_holds_accessor),
+    )?;
+    define_method_on(
+        scope,
+        target,
+        "streamUnset",
+        2,
+        NativeCall::Static(stdio_stream_unset),
+    )?;
+    define_method_on(scope, target, "isatty", 1, NativeCall::Static(stdio_isatty))?;
+    define_method_on(scope, target, "write", 2, NativeCall::Static(stdio_write))
+}
+
+/// The slot holding the stream of standard descriptor `fd`.
+fn stdio_slot(fd: Option<f64>) -> Option<(&'static str, i32)> {
+    match fd {
+        Some(1.0) => Some(("__otterStdout", 1)),
+        Some(2.0) => Some(("__otterStderr", 2)),
+        _ => None,
+    }
+}
+
+fn stdio_holds_accessor(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let arg = |index: usize| args.get(index).copied().unwrap_or_else(Value::undefined);
+    let heap = ctx.heap();
+    let (Some(holder), Some(key)) = (
+        arg(0).as_object(),
+        arg(1).as_string(heap).map(|key| key.to_lossy_string(heap)),
+    ) else {
+        return Ok(Value::boolean(false));
+    };
+    let current = match otter_vm::object::lookup_own(holder, heap, &key) {
+        otter_vm::object::PropertyLookup::Accessor {
+            getter: Some(current),
+            ..
+        } => current,
+        _ => return Ok(Value::boolean(false)),
+    };
+    Ok(Value::boolean(ctx.strict_equals(current, arg(2))))
+}
+
+fn stdio_stream_unset(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let (Some(process), Some((slot, _))) = (
+        args.first().and_then(|process| process.as_object()),
+        stdio_slot(args.get(1).and_then(|fd| fd.as_f64())),
+    ) else {
+        return Ok(Value::boolean(false));
+    };
+    let unset = matches!(
+        otter_vm::object::lookup_own(process, ctx.heap(), slot),
+        otter_vm::object::PropertyLookup::Data { value, .. } if value.is_undefined()
+    );
+    Ok(Value::boolean(unset))
+}
+
+fn stdio_isatty(
+    _ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    use std::io::IsTerminal;
+    let terminal = match stdio_slot(args.first().and_then(|fd| fd.as_f64())) {
+        Some((_, 1)) => std::io::stdout().is_terminal(),
+        Some((_, 2)) => std::io::stderr().is_terminal(),
+        _ => false,
+    };
+    Ok(Value::boolean(terminal))
+}
+
+fn stdio_write(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    match stdio_slot(args.first().and_then(|fd| fd.as_f64())) {
+        Some((_, 1)) => stdout_write(ctx, args.get(1..).unwrap_or_default()),
+        Some((_, 2)) => stderr_write(ctx, args.get(1..).unwrap_or_default()),
+        _ => Ok(Value::boolean(false)),
+    }
 }
 
 pub(crate) fn define_process_method(
@@ -1699,6 +1831,45 @@ fn inherited_channel(
 #[cfg(test)]
 mod tests {
     use crate::{CapabilitySet, Otter};
+
+    #[test]
+    fn process_argv_materialization_distinguishes_default_empty_and_configured_inputs() {
+        let default = Otter::new();
+        let result = default
+            .blocking_run_script(
+                "[process.argv.length, process.argv[0] === process.execPath, process.argv0 === process.execPath].join(':')",
+            )
+            .expect("actual default process installation");
+        assert_eq!(result.completion_string(), "1:true:true");
+        drop(default);
+
+        let empty = Otter::builder()
+            .process_argv(["replaced-spawn", "replaced-entry.js"])
+            .process_argv(std::iter::empty::<String>())
+            .build()
+            .expect("actual explicitly empty process installation");
+        let result = empty
+            .blocking_run_script(
+                "[process.argv.length, process.argv0, process.argv[0] === undefined, typeof process.execPath].join(':')",
+            )
+            .expect("explicit empty arguments remain distinct from default");
+        assert_eq!(result.completion_string(), "0:otter:true:string");
+        drop(empty);
+
+        let configured = Otter::builder()
+            .process_argv(["configured-spawn", "entry.js", "alpha", "beta"])
+            .build()
+            .expect("actual configured process installation");
+        let result = configured
+            .blocking_run_script(
+                "[process.argv0, process.argv[0] === process.execPath, process.argv.slice(1).join('|')].join(':')",
+            )
+            .expect("installed index zero and explicit argument tails");
+        assert_eq!(
+            result.completion_string(),
+            "configured-spawn:true:entry.js|alpha|beta"
+        );
+    }
 
     #[test]
     fn process_argv_uses_configured_snapshot() {

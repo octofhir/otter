@@ -262,7 +262,7 @@ fn stack_limits_reject_before_publishing_a_child() {
 
 #[test]
 fn moving_collection_rewrites_the_entire_native_call_chain() {
-    let mut vm = crate::Interpreter::new();
+    let mut vm = crate::Interpreter::new().expect("fixture interpreter bootstrap");
     let mut stack = crate::ActivationStack::new();
     vm.with_runtime_turn(&mut stack, |turn| {
         let (vm, _) = turn.into_parts();
@@ -289,7 +289,7 @@ fn moving_collection_rewrites_the_entire_native_call_chain() {
         ctx.pending_call.new_target = args[1];
         let enclosing = unsafe {
             (*harness.vm)
-                .jit_enter_native_frames(std::ptr::NonNull::from(&mut ctx.native_frame).cast())
+                .jit_enter_native_frames(std::ptr::NonNull::from(&mut ctx))
                 .unwrap()
         };
         let result = unsafe { call_trampoline(&mut ctx) };
@@ -638,4 +638,130 @@ fn tail_call_from_a_resumed_record_returns_the_request_to_its_owner() {
     assert_eq!(harness.entries, 1);
     assert_eq!(harness.max_rust, 1);
     assert!(error.is_none());
+}
+
+// This entry checks the private transport contract. Actual source ownership
+// and lexical binding are covered by the constructor runtime fixtures.
+extern "C" fn super_origin_transport_entry(ctx: *mut JitCtx) -> NativeResultPair {
+    // SAFETY: the fixture retains the trampoline-published frame and context.
+    let ctx = unsafe { &*ctx };
+    let Some(frame) = (unsafe { ctx.native_frame.as_ref() }) else {
+        return NativeResultPair::fatal_internal();
+    };
+    let expected = if frame.is_construct() {
+        frame.caller
+    } else {
+        0
+    };
+    let valid = frame.super_origin == expected && ctx.pending_call.super_origin == 0;
+    // A function is an object result: primitive constructor substitution must
+    // not obscure the transport predicate. No assert can unwind across entry.
+    NativeResultPair::success(Value::function(u32::from(valid)))
+}
+
+#[test]
+fn super_origin_moves_before_entry_and_is_cleared_on_both_admission_failures() {
+    let mut thread = VmThread::empty();
+    let mut error = None;
+    let mut ctx = context(&mut thread, &mut error);
+    let mut source = Frame::new(
+        VmFrameHeader::interpreter(3, 0),
+        0,
+        Value::function(3),
+        Value::hole(),
+    );
+    source.depth = 1;
+    source.set_derived_constructor();
+    let source_address = std::ptr::from_mut(&mut source);
+    ctx.native_frame = source_address;
+    for construct in [false, true] {
+        let mut incoming = request(super_origin_transport_entry, &[], 0, 0);
+        if construct {
+            incoming.header.flags = super::super::NativeFrameFlags::from_bits(
+                super::super::NativeFrameFlags::CONSTRUCT,
+            );
+            incoming.new_target = Value::function(7);
+            incoming.super_origin = source_address as usize as u64;
+        }
+        ctx.pending_call = incoming;
+        // SAFETY: this context, source and empty windows stay live; no GC.
+        let result = unsafe { call_trampoline(&mut ctx) };
+        assert_eq!(result, NativeResultPair::success(Value::function(1)));
+        assert_eq!(ctx.native_frame, source_address);
+        assert_eq!(ctx.pending_call.super_origin, 0);
+        assert!(error.is_none());
+    }
+    for stack_failure in [false, true] {
+        ctx.generated_depth_limit = if stack_failure { 512 } else { 1 };
+        ctx.native_stack_limit = if stack_failure { usize::MAX } else { 0 };
+        let mut incoming = request(super_origin_transport_entry, &[], 0, 0);
+        incoming.header.flags =
+            super::super::NativeFrameFlags::from_bits(super::super::NativeFrameFlags::CONSTRUCT);
+        incoming.super_origin = source_address as usize as u64;
+        ctx.pending_call = incoming;
+        let result = unsafe { call_trampoline(&mut ctx) };
+        assert_eq!(result, NativeResultPair::fatal_internal());
+        assert!(matches!(error.take(), Some(VmError::StackOverflow { .. })));
+        assert_eq!(ctx.native_frame, source_address);
+        assert_eq!(ctx.pending_call.super_origin, 0);
+        assert_eq!(source.super_origin, 0);
+    }
+}
+
+#[derive(Default)]
+struct ReentryAnchorObservation {
+    child_caller: u64,
+    child_anchor: u64,
+    pending_caller: u64,
+    pending_anchor: u64,
+}
+
+extern "C" fn observe_reentry_anchor(ctx: *mut JitCtx) -> NativeResultPair {
+    // SAFETY: the fixture request and observation outlive this native extent.
+    let ctx = unsafe { &mut *ctx };
+    let child = unsafe { &*ctx.native_frame };
+    let observation =
+        unsafe { &mut *((*ctx.thread).runtime_context as *mut ReentryAnchorObservation) };
+    observation.child_caller = child.caller;
+    observation.child_anchor = child.caller_return_pc;
+    observation.pending_caller = ctx.pending_call.caller;
+    observation.pending_anchor = ctx.pending_call.caller_return_pc;
+    NativeResultPair::success(Value::number_i32(731))
+}
+
+#[test]
+fn rust_reentry_preserves_zero_and_explicit_suspended_caller_anchors() {
+    // The published parent has a compiled-generation identity. The ordinary
+    // Rust call below still has no generated source return of its own.
+    let mut parent = Frame::new(
+        VmFrameHeader::interpreter(9, 0),
+        0,
+        Value::function(9),
+        Value::UNDEFINED,
+    );
+    parent.header.kind = NativeFrameKind::Baseline;
+    parent.code_object_id = 17;
+    let parent_address = std::ptr::from_mut(&mut parent) as u64;
+    for anchor in [0, 0x1738_9173_0000_0108] {
+        let mut observation = ReentryAnchorObservation::default();
+        let mut thread = VmThread::empty();
+        thread.runtime_context = std::ptr::from_mut(&mut observation) as u64;
+        let mut error = None;
+        let mut ctx = context(&mut thread, &mut error);
+        ctx.native_frame = std::ptr::from_mut(&mut parent);
+        ctx.pending_call = request(observe_reentry_anchor, &[], 0, 0);
+        if anchor != 0 {
+            ctx.pending_call.caller = parent_address;
+            ctx.pending_call.caller_return_pc = anchor;
+        }
+        // SAFETY: both records and their empty windows remain initialized.
+        let result = unsafe { call_trampoline(&mut ctx) };
+        assert_eq!(result, NativeResultPair::success(Value::number_i32(731)));
+        assert_eq!(observation.child_caller, parent_address);
+        assert_eq!(observation.child_anchor, anchor);
+        assert_eq!(observation.pending_caller, 0);
+        assert_eq!(observation.pending_anchor, 0);
+        assert_eq!(ctx.native_frame, std::ptr::from_mut(&mut parent));
+        assert!(error.is_none());
+    }
 }

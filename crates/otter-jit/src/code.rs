@@ -9,6 +9,8 @@
 //! - The executable mapping lives exactly as long as the [`CompiledCode`]; the
 //!   entry pointer is invalid after drop. Callers must keep the value alive for
 //!   the duration of any call into the code.
+//! - Logical instruction bytes and retained mapping capacity are distinct:
+//!   artifacts and entry bounds use the former, resource admission the latter.
 //!
 //! # See also
 //! - [`crate`] — the JIT tier and its rooting/`unsafe` contract.
@@ -66,10 +68,18 @@ impl CompiledCode {
         self.buf.ptr(AssemblyOffset(offset))
     }
 
-    /// Size in bytes of the finalized code mapping.
+    /// Number of finalized instruction bytes, excluding unused mapping capacity.
     #[must_use]
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Backing capacity retained by the executable mapping, including its
+    /// unused tail. This is the owner's requested mapping size, independent
+    /// of the instruction length and of process resident-memory measurements.
+    #[must_use]
+    pub fn retained_mapping_bytes(&self) -> usize {
+        self.buf.size()
     }
 
     /// `true` when the compiled code mapping is empty.
@@ -90,5 +100,28 @@ impl CompiledCode {
     #[must_use]
     pub const fn entry_offset(&self) -> usize {
         self.entry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dynasmrt::DynasmApi;
+
+    use super::CompiledCode;
+
+    #[test]
+    fn retained_mapping_counts_reserved_tail_without_changing_code_bytes() {
+        // Emission is target independent; this byte is inspected, never run.
+        let mut assembler = dynasmrt::x64::Assembler::new_with_capacity(32_768).unwrap();
+        let entry = assembler.offset();
+        assembler.push(0x90);
+        let buffer = assembler.finalize().unwrap();
+        let reserved = buffer.size();
+        assert!(reserved >= 32_768);
+        let code = CompiledCode::new(buffer, entry);
+        assert_eq!(code.len(), 1);
+        assert_eq!(code.bytes(), &[0x90]);
+        assert_eq!(code.retained_mapping_bytes(), reserved);
+        assert!(code.retained_mapping_bytes() > code.len());
     }
 }

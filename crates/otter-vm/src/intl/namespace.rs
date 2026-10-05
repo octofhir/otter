@@ -8,10 +8,10 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#intl-object>
 
-use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
+use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, ObjectBuilder};
 use crate::native_function::NativeCall;
-use crate::object::{self, JsObject, PartialPropertyDescriptor};
-use crate::symbol::{WellKnown, WellKnownSymbols};
+use crate::object::{self, JsObject};
+use crate::symbol::WellKnownSymbols;
 use crate::{NativeCtx, NativeError, Value};
 
 const fn method(
@@ -48,22 +48,12 @@ pub fn install_namespace_well_knowns(
     global: JsObject,
     well_known: &WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
-    let Some(mut intl) = object::get(global, heap, "Intl").and_then(|v| v.as_object()) else {
+    let Some(intl) = object::get(global, heap, "Intl").and_then(|value| value.as_object()) else {
         return Ok(());
     };
-    let tag =
-        crate::string::JsString::from_str("Intl", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::define_own_symbol_property_partial(
-        &mut intl,
-        heap,
-        well_known.get(WellKnown::ToStringTag),
-        PartialPropertyDescriptor {
-            value: Some(Value::string(tag)),
-            writable: Some(false),
-            enumerable: Some(false),
-            configurable: Some(true),
-            ..Default::default()
-        },
-    );
+    let mut builder =
+        ObjectBuilder::from_object_with_value_roots(heap, intl, vec![Value::object(global)]);
+    builder.to_string_tag(well_known, "Intl")?;
+    let _current = builder.build();
     Ok(())
 }

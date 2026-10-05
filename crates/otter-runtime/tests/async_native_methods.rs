@@ -8,6 +8,17 @@
 //! completer holds a liveness ref), immediately-ready futures must
 //! settle with no executor round-trip, and rejections must surface as
 //! real error instances.
+//!
+//! # Contents
+//! - Immediate, suspended, rejected and abandoned async native methods.
+//! - Runtime host-job structural/control/typed OOM and reaction-drain failures.
+//!
+//! # Invariants
+//! - Futures carry owned Rust data and settle through the production job queue.
+//! - Failed terminal credits leave no pending host activity or fabricated rejection.
+//!
+//! # See also
+//! - `otter_vm::host_completion` and `otter_vm::marshal::PromiseCompleter`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,7 +32,10 @@ use otter_runtime::{
     HostCompletionOutcome, HostCompletionSink, NativeCtx, NativeError, Otter, OtterError, Runtime,
     SourceInput, Value,
 };
-use otter_vm::marshal::{JsError, MarshalCx};
+use otter_vm::marshal::{IntoJs, JsError, MarshalCx};
+
+#[path = "async_native_methods/error_boundary.rs"]
+mod error_boundary;
 
 #[derive(Debug, Default)]
 struct LogCapture {
@@ -83,6 +97,77 @@ impl Sleeper {
     async fn js_boom(self) -> Result<f64, JsError> {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         Err(JsError::Range(format!("{} exploded", self.label)))
+    }
+
+    #[method(name = "fatal")]
+    async fn js_fatal(self, mode: f64) -> Result<f64, JsError> {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let error = match mode as u32 {
+            0 => NativeError::InvalidOperand,
+            1 => NativeError::MissingReturn,
+            2 => NativeError::Interrupted,
+            3 => NativeError::BudgetExceeded {
+                reason: "async budget detail".into(),
+            },
+            _ => NativeError::Exit { code: 27 },
+        };
+        Err(JsError::Native(error))
+    }
+
+    #[method(name = "conversionFailure")]
+    async fn js_conversion_failure(self) -> StructuralConversionFailure {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        StructuralConversionFailure
+    }
+
+    #[method(name = "failSync")]
+    fn js_fail_sync(&self) -> Result<f64, JsError> {
+        Err(JsError::Native(NativeError::InvalidOperand))
+    }
+
+    #[method(name = "authoredError")]
+    fn js_authored_error(&self, kind: f64) -> Result<f64, JsError> {
+        let message = format!("{} exact text", self.label);
+        Err(match kind as u32 {
+            0 => JsError::Type(message),
+            1 => JsError::Range(message),
+            _ => JsError::Dom {
+                name: "NotSupportedError",
+                message,
+            },
+        })
+    }
+
+    #[method(name = "largeSync")]
+    fn js_large_sync(&self) -> Result<f64, JsError> {
+        Err(JsError::Native(NativeError::SyntaxError {
+            name: "Sleeper.largeSync",
+            reason: "m".repeat(8 * 1024 * 1024),
+        }))
+    }
+
+    #[method(name = "syntax")]
+    async fn js_syntax(self, large: bool) -> Result<f64, JsError> {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        Err(JsError::Native(NativeError::SyntaxError {
+            name: "Sleeper.syntax",
+            reason: if large {
+                "m".repeat(8 * 1024 * 1024)
+            } else {
+                "original syntax payload".into()
+            },
+        }))
+    }
+}
+
+/// A successful host result whose isolate-thread conversion fails structurally.
+/// This has no GC data and must be projected by the same completion owner.
+#[derive(Debug)]
+pub struct StructuralConversionFailure;
+
+impl IntoJs for StructuralConversionFailure {
+    fn into_js<'s>(self, _cx: &mut MarshalCx<'_, '_, 's>) -> Result<otter_vm::Local<'s>, JsError> {
+        Err(JsError::Native(NativeError::MissingReturn))
     }
 }
 
@@ -386,7 +471,9 @@ fn layer_a_embedder_delivers_async_completion_on_its_own_thread() {
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("executor posts the completion to the embedder queue");
     assert_eq!(outcome, HostCompletionOutcome::Completed);
-    runtime.run_host_completion(job);
+    runtime
+        .run_host_completion(job)
+        .expect("live completion and its reaction drain succeed");
     drop(admission);
 
     assert_eq!(capture.snapshot(), vec!["browser+1".to_string()]);
@@ -417,4 +504,29 @@ fn build_handle_uses_an_explicit_embedder_tokio_runtime() {
         .expect("script completes on the supplied executor");
 
     assert_eq!(capture.snapshot(), vec!["shared+1".to_string()]);
+}
+
+/// The same macro lowering supplies exact class/message payloads for ordinary
+/// synchronous method errors; asynchronous rejection uses that owner too.
+#[test]
+fn synchronous_authored_error_messages_keep_their_original_text() {
+    let capture = LogCapture::new();
+    let otter = build_otter(capture.clone());
+    otter.blocking_run_script(r#"
+        for (let kind = 0; kind < 3; kind++) {
+            try { new Sleeper('macro').authoredError(kind); }
+            catch (error) {
+                console.log((error instanceof RangeError ? 'RangeError' :
+                    error instanceof TypeError ? 'TypeError' : 'wrong class') + ':' + error.message);
+            }
+        }
+    "#).expect("actual macro method exceptions are caught");
+    assert_eq!(
+        capture.snapshot(),
+        vec![
+            "TypeError:macro exact text",
+            "RangeError:macro exact text",
+            "TypeError:NotSupportedError: macro exact text",
+        ]
+    );
 }

@@ -16,6 +16,8 @@
 //! - Public realm APIs never expose interpreter, value, object, or GC handles.
 //! - Realm ids are scalar identities; all moving handles remain traced by the
 //!   interpreter.
+//! - A successful script completion remains in the existing persistent-root
+//!   owner through its microtask checkpoint and is released on every outcome.
 //! - Installer callbacks can add globals and run bootstrap source, but cannot
 //!   reach raw heap mutation or retain an isolate-local borrow.
 //! - Async completion and module evaluation always re-enter the scalar origin
@@ -158,8 +160,32 @@ impl<'a> RuntimeRealmContext<'a> {
                 otter_vm::Value::string(value)
             }
         };
-        self.interp.set_global(name, value);
+        self.interp.set_global(name, value).map_err(|error| {
+            crate::map_vm_error(otter_vm::RunError {
+                error,
+                frames: Vec::new(),
+                detail: None,
+            })
+        })?;
         Ok(())
+    }
+
+    /// Execute a trusted bootstrap script the product build compiled under
+    /// `<realm-installer>` in the active realm.
+    ///
+    /// The embedded module links after verification and its program-image
+    /// text registers without a copy; a configured compile hook compiles that
+    /// same text instead. Nothing touches the compile cache.
+    ///
+    /// # Errors
+    /// Returns the verification, link, or evaluation failure.
+    pub fn install_static_script(&mut self, script: &crate::ExtensionJs) -> Result<(), OtterError> {
+        let (linked, _metadata) =
+            crate::static_bootstrap::prepare(self.interp, self.hooks, script, "<realm-installer>")?;
+        self.interp.run(&linked).map_err(crate::map_vm_error)?;
+        self.interp
+            .drain_microtasks(|_, _| Ok(false))
+            .map_err(crate::map_vm_error)
     }
 
     /// Execute trusted bootstrap source in the active realm.
@@ -167,36 +193,48 @@ impl<'a> RuntimeRealmContext<'a> {
     /// This surface is for extension installation. Page code should use
     /// [`crate::Runtime::run_script_in_realm`] or the corresponding handle API.
     pub fn install_script(&mut self, source: SourceInput) -> Result<(), OtterError> {
+        let text = crate::module_loader::admit_source(
+            &self.interp.resource_account(),
+            "<realm-installer>",
+            source.text,
+        )
+        .map_err(crate::module_loader::LoaderError::into_otter_error)?;
         let context = if let Some(hook) = self.hooks.compile_hook() {
-            let text = crate::module_loader::admit_source(
-                &self.interp.source_account(),
-                "<realm-installer>",
-                source.text,
-            )
-            .map_err(crate::module_loader::LoaderError::into_otter_error)?;
             let resolved = crate::module_loader::ResolvedSource {
                 url: "<realm-installer>".to_string(),
                 kind: source.kind,
                 jsx: None,
-                text,
+                text: text.clone(),
             };
             let bytecode = hook
                 .compile(crate::RuntimeCompileRequest { source: &resolved })?
                 .bytecode;
-            self.interp.link_module(bytecode)?
+            let sources = crate::script_source::script_sources(
+                &bytecode,
+                text,
+                "<realm-installer>",
+                &self.interp.resource_account(),
+            )?;
+            self.interp.link_module(bytecode, sources)?
         } else {
             // The same bootstrap sources on every launch, so the same cache.
             let cache = crate::compile_cache::CompileCache::user_default();
             let key = cache.as_ref().map(|_| {
-                crate::compile_cache::cache_key(&source.text, source.kind, "<realm-installer>")
+                crate::compile_cache::cache_key(text.as_ref(), source.kind, "<realm-installer>")
             });
             if let (Some(cache), Some(key)) = (&cache, &key)
                 && let Some(bytecode) = cache.load(key)
             {
-                self.interp.link_verified_module(bytecode)?
+                let sources = crate::script_source::script_sources(
+                    bytecode.module(),
+                    text,
+                    "<realm-installer>",
+                    &self.interp.resource_account(),
+                )?;
+                self.interp.link_verified_module(bytecode, sources)?
             } else {
                 let compiled = otter_compiler::compile_script_source_to_module(
-                    &source.text,
+                    text.as_ref(),
                     source.kind,
                     "<realm-installer>",
                 )
@@ -204,12 +242,18 @@ impl<'a> RuntimeRealmContext<'a> {
                 if let (Some(cache), Some(key)) = (&cache, &key) {
                     cache.store(key, &compiled.bytecode);
                 }
-                self.interp.link_module(compiled.bytecode)?
+                let sources = crate::script_source::script_sources(
+                    &compiled.bytecode,
+                    text,
+                    "<realm-installer>",
+                    &self.interp.resource_account(),
+                )?;
+                self.interp.link_module(compiled.bytecode, sources)?
             }
         };
         self.interp.run(&context).map_err(crate::map_vm_error)?;
         self.interp
-            .drain_microtasks(&context)
+            .drain_microtasks(|_, _| Ok(false))
             .map_err(crate::map_vm_error)
     }
 }
@@ -252,7 +296,13 @@ impl<'a> RuntimeExtensionContext<'a> {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
-        self.realm.interp.set_global(name, value);
+        self.realm.interp.set_global(name, value).map_err(|error| {
+            crate::map_vm_error(otter_vm::RunError {
+                error,
+                frames: Vec::new(),
+                detail: None,
+            })
+        })?;
         Ok(())
     }
 
@@ -271,7 +321,13 @@ impl<'a> RuntimeExtensionContext<'a> {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
-        self.realm.interp.set_global(name, value);
+        self.realm.interp.set_global(name, value).map_err(|error| {
+            crate::map_vm_error(otter_vm::RunError {
+                error,
+                frames: Vec::new(),
+                detail: None,
+            })
+        })?;
         Ok(())
     }
 }
@@ -292,7 +348,7 @@ impl<'a> std::ops::DerefMut for RuntimeExtensionContext<'a> {
 
 pub(crate) struct PendingRealmScripts {
     pub(crate) class_js: Vec<(&'static str, &'static str)>,
-    pub(crate) extension_js: Vec<(String, String)>,
+    pub(crate) extension_js: Vec<(&'static str, crate::ExtensionJs)>,
 }
 
 pub(crate) fn install_class_surfaces(
@@ -308,13 +364,8 @@ pub(crate) fn install_class_surfaces(
         for spec in extension.classes {
             install_class(interp, spec.inner, &mut class_js)?;
         }
-        if !extension.js.is_empty() {
-            let mut source = String::new();
-            for entry in extension.js {
-                source.push_str(entry.source);
-                source.push_str("\n;\n");
-            }
-            extension_js.push((extension.name.to_string(), source));
+        if let Some(script) = extension.js {
+            extension_js.push((extension.name, script));
         }
     }
     Ok(PendingRealmScripts {
@@ -329,14 +380,7 @@ fn install_class(
     pending_js: &mut Vec<(&'static str, &'static str)>,
 ) -> Result<(), OtterError> {
     match class {
-        GlobalClassInner::Spec(raw) => {
-            interp
-                .install_global_class(raw)
-                .map_err(|error| OtterError::Internal {
-                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                    message: error.to_string(),
-                })
-        }
+        GlobalClassInner::Spec(raw) => interp.install_global_class(raw).map_err(OtterError::from),
         GlobalClassInner::Intrinsic {
             install,
             install_well_knowns,
@@ -347,16 +391,10 @@ fn install_class(
                 pending_js.push((name, source));
             }
             let global = *interp.global_this();
-            install(interp.gc_heap_mut(), global).map_err(|error| OtterError::Internal {
-                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                message: error.to_string(),
-            })?;
+            install(interp.gc_heap_mut(), global).map_err(OtterError::from)?;
             interp
                 .run_install_well_knowns(install_well_knowns, global)
-                .map_err(|error| OtterError::Internal {
-                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                    message: error.to_string(),
-                })
+                .map_err(OtterError::from)
         }
     }
 }
@@ -394,13 +432,12 @@ impl crate::Runtime {
                         &config.hooks,
                         task_spawner,
                     );
-                    for (name, source) in pending.extension_js {
-                        context
-                            .install_script(SourceInput::from_javascript(source))
-                            .map_err(|error| OtterError::Internal {
-                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                message: format!("extension `{name}` globals failed: {error}"),
-                            })?;
+                    for (name, script) in pending.extension_js {
+                        let installed = context.install_static_script(&script);
+                        installed.map_err(|error| OtterError::Internal {
+                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                            message: format!("extension `{name}` globals failed: {error}"),
+                        })?;
                     }
                     for (name, source) in pending.class_js {
                         context
@@ -467,15 +504,27 @@ impl crate::Runtime {
         self.interp.begin_jit_debug_capture();
         let started = std::time::Instant::now();
         let compiled = self.compile_source(&source, specifier)?;
-        let (result, context) = self
+        let (module, sources) = self.prepare_script_source(compiled.bytecode, source, specifier)?;
+        let result = self
             .interp
             .with_host_realm(realm.realm, |interp| {
-                let context = match interp.link_module(compiled.bytecode) {
+                let context = match interp.link_module(module, sources) {
                     Ok(context) => context,
                     Err(error) => return Ok(Err(OtterError::from(error))),
                 };
-                let script = interp.run(&context);
-                let checkpoint = interp.drain_microtasks(&context);
+                // A checkpoint can evacuate the completion after the script's
+                // activation has ended. Keep only its rooted identity across
+                // that boundary, then release it exactly once on every outcome.
+                let script = interp
+                    .run(&context)
+                    .map(|value| interp.persistent_root_insert(value));
+                let checkpoint = crate::checkpoint::after_script(&script, || {
+                    interp.drain_microtasks(|_, _| Ok(false))
+                });
+                let completion = script
+                    .as_ref()
+                    .ok()
+                    .and_then(|root| interp.persistent_root_remove(*root));
                 let result = match (script, checkpoint) {
                     (
                         Err(otter_vm::RunError {
@@ -495,18 +544,24 @@ impl crate::Runtime {
                         started.elapsed(),
                     )),
                     (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                    (Ok(value), Ok(())) => Ok(crate::ExecutionResult::from_vm_value(
-                        value,
-                        started.elapsed(),
-                        interp.gc_heap_mut(),
-                    )
-                    .with_exit_code(crate::process::exit_code(interp))),
+                    (Ok(_), Ok(())) => completion
+                        .ok_or_else(|| otter_vm::RunError::bare(otter_vm::VmError::InvalidOperand))
+                        .map(|value| {
+                            crate::ExecutionResult::from_vm_value(
+                                value,
+                                started.elapsed(),
+                                interp.gc_heap_mut(),
+                            )
+                            .with_exit_code(crate::process::exit_code(interp))
+                        }),
                 };
-                Ok(Ok((result, context)))
+                Ok(Ok(result))
             })
             .map_err(map_realm_vm_error)??;
         let result = result.map_err(crate::map_vm_error)?;
-        self.pump_layer_a_dynamic_imports(&context)?;
+        if !result.explicit_exit() {
+            self.pump_layer_a_dynamic_imports()?;
+        }
         let result = self.attach_execution_stats(result);
         Ok(self.attach_jit_debug_report(result))
     }
@@ -578,7 +633,7 @@ impl crate::Runtime {
         let task_spawner = self.runtime_task_spawner.clone();
         let records = &mut self.module_records;
         let started = std::time::Instant::now();
-        let (result, context) = self
+        let result = self
             .interp
             .with_host_realm(realm.realm, |interp| {
                 Ok(execute_linked_module_in_active_realm(
@@ -591,7 +646,9 @@ impl crate::Runtime {
                 ))
             })
             .map_err(map_realm_vm_error)??;
-        self.pump_layer_a_dynamic_imports(&context)?;
+        if !result.explicit_exit() {
+            self.pump_layer_a_dynamic_imports()?;
+        }
         let result = self.attach_execution_stats(result);
         Ok(self.attach_jit_debug_report(result))
     }
@@ -618,17 +675,26 @@ fn execute_linked_module_in_active_realm(
     task_spawner: Option<RuntimeTaskSpawner>,
     linked: crate::module_graph::LinkedProgram,
     started: std::time::Instant,
-) -> Result<(crate::ExecutionResult, otter_vm::ExecutionContext), OtterError> {
+) -> Result<crate::ExecutionResult, OtterError> {
     let mut module = linked.module;
     let entry_url = linked.entry_url;
-    records.allocate_for_module_inits(
-        interp,
-        &module.module_inits,
-        &config.hosted_modules,
-        &config.capabilities,
-        task_spawner,
-    )?;
     let realm_id = interp.active_host_realm_id();
+    crate::hosted_completion::prepare_entry_resolutions(records, realm_id, &mut module, &entry_url);
+    let sources = otter_vm::source_registry::SourceRegistry::new(
+        linked.module_sources,
+        &config.resource_account,
+    )
+    .map_err(OtterError::from)?;
+    let context = interp.link_module(module, sources)?;
+    records
+        .allocate_for_module_inits(
+            interp,
+            &context,
+            &config.hosted_modules,
+            &config.capabilities,
+            task_spawner,
+        )
+        .map_err(|error| crate::hosted_completion::into_runtime(interp, error))?;
     for metadata in &linked.metadata {
         if metadata.source_url.is_empty() || metadata.resolved_exports.is_empty() {
             continue;
@@ -651,29 +717,10 @@ fn execute_linked_module_in_active_realm(
             table,
         );
     }
-    for (url, text) in &linked.module_sources {
-        interp.register_module_source(url.clone(), text.clone());
-    }
-    records.for_each_record(realm_id, |url, _| {
-        for referrer in [&entry_url, ""] {
-            module
-                .module_resolutions
-                .push(otter_bytecode::ModuleResolution {
-                    referrer: referrer.to_string(),
-                    specifier: url.to_string(),
-                    attr_type: None,
-                    target: url.to_string(),
-                    deferred: false,
-                    dynamic: false,
-                    synthetic: true,
-                });
-        }
-    });
-    let context = interp.link_module(module)?;
-    records.retain_linked_context(realm_id, &context);
     records.mark_evaluating(realm_id);
     let script = interp.run(&context);
-    let checkpoint = interp.drain_microtasks(&context);
+    let checkpoint =
+        crate::checkpoint::after_script(&script, || interp.drain_microtasks(|_, _| Ok(false)));
     let value = match (script, checkpoint) {
         (
             Err(otter_vm::RunError {
@@ -690,9 +737,9 @@ fn execute_linked_module_in_active_realm(
             }),
         ) => {
             records.mark_evaluated(realm_id);
-            return Ok((
-                crate::ExecutionResult::from_exit_code(code, started.elapsed()),
-                context,
+            return Ok(crate::ExecutionResult::from_exit_code(
+                code,
+                started.elapsed(),
             ));
         }
         (Err(error), _) | (Ok(_), Err(error)) => {
@@ -705,11 +752,10 @@ fn execute_linked_module_in_active_realm(
         (Ok(value), Ok(())) => value,
     };
     records.mark_evaluated(realm_id);
-    Ok((
+    Ok(
         crate::ExecutionResult::from_vm_value(value, started.elapsed(), interp.gc_heap_mut())
             .with_exit_code(crate::process::exit_code(interp)),
-        context,
-    ))
+    )
 }
 
 pub(crate) fn map_realm_vm_error(error: otter_vm::VmError) -> OtterError {
@@ -719,3 +765,6 @@ pub(crate) fn map_realm_vm_error(error: otter_vm::VmError) -> OtterError {
         detail: None,
     })
 }
+
+#[cfg(test)]
+mod dynamic_resource_tests;

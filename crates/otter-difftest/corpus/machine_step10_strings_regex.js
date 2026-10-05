@@ -58,7 +58,8 @@ const slicedWide = sequentialWide.slice(5, 45);
 // That lookup allocates, so the inferred young name must already be rooted.
 const inferredName = { ["computed" + "Name"]: function () {} }.computedName;
 
-// The string helper reaches Template at 79 entries and Machine at 148 entries.
+// The string helper reaches Template at 79 entries and the optimizing tier at
+// 148 entries.
 // Seven calls per outer iteration make 64 iterations a bounded margin above
 // both thresholds without turning full GC verification into a minute-scale run.
 for (let warm = 0; warm < 64; warm++) {

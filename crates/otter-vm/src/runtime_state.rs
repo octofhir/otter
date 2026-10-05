@@ -27,7 +27,7 @@
 //!
 //! - GC architecture plan §4.2 (root sources), §4.3
 //!   (pseudocode).
-//! - `constructor_profile` for observations discarded before tracing.
+//! - `crate::constructor_layout` for exact strong owner/ticket roots.
 
 use crate::Interpreter;
 use crate::gc_trace::{GcRootVisitor, GcTrace};
@@ -174,6 +174,14 @@ impl<'a> RuntimeState<'a> {
         for shape in interp.simple_constructor_shapes_for_trace() {
             let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
             visitor(p);
+        }
+        for layout in interp.function_constructor_layouts_for_trace() {
+            if !layout.is_null() {
+                visitor(
+                    layout as *const crate::constructor_layout::ConstructorLayout
+                        as *mut otter_gc::raw::RawGc,
+                );
+            }
         }
         // 7b) Live CodeBlock property slots can retain cached shape transitions.
         interp.trace_property_ic_roots(visitor);

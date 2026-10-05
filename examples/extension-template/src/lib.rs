@@ -14,7 +14,7 @@
 //!
 //! ```rust,ignore
 //! let runtime = Runtime::builder()
-//!     .extension(&ACME_EXTENSION)          // Counter + Acme + lazy JS
+//!     .extension(&ACME_EXTENSION)          // Counter + Acme + eager class glue
 //!     .hosted_module(UTIL_HOSTED_MODULE)   // acme:util
 //!     .build()?;
 //! ```
@@ -137,7 +137,6 @@ romp! {
     name = "acme",
     ident = ACME_EXTENSION,
     classes = [CounterIntrinsic, AcmeIntrinsic],
-    // Pure-JS members would go here as (source, defines = [...]) rows,
-    // materialized natively on first touch of any defined name.
-    js = [],
+    // A build-produced ExtensionJs bundle supplies pure-JS members.
+    js = None,
 }

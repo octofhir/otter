@@ -20,6 +20,33 @@ impl Interpreter {
         err
     }
 
+    /// Publish the exact admitted-resource refusal before its fatal scalar.
+    pub(crate) fn err_resource(&self, error: otter_resource::ResourceError) -> VmError {
+        self.raise(
+            run_control::ErrorDetail::Resource(error),
+            VmError::ResourceLimit,
+        )
+    }
+
+    /// Owned UTF-8 source admission has only resource refusal or a source
+    /// length that cannot fit the supported ledger geometry. Actual resource
+    /// cause is published atomically; malformed unsupported geometry is a
+    /// structural boundary, never a fabricated resource/OOM/JavaScript error.
+    pub(crate) fn err_owned_source(&self, error: otter_resource::SharedSourceError) -> VmError {
+        match error {
+            otter_resource::SharedSourceError::Resource(error) => self.err_resource(error),
+            _ => VmError::InvalidOperand,
+        }
+    }
+
+    /// Preserve ledger refusals from the single code-space publication owner.
+    pub(crate) fn err_link(&self, error: crate::BytecodeLinkError) -> VmError {
+        match error {
+            crate::BytecodeLinkError::RetainedBytes(error) => self.err_resource(error),
+            _ => VmError::InvalidOperand,
+        }
+    }
+
     /// Raise a `TypeError` carrying `message`.
     pub(crate) fn err_type(&self, message: Box<str>) -> VmError {
         self.raise(
@@ -146,47 +173,6 @@ impl Interpreter {
     /// `VmError`'s own `Display` is intentionally lossy (no isolate access), so
     /// any site that needs the dynamic message must route through here.
     pub(crate) fn render_vm_error(&self, err: &VmError) -> String {
-        use run_control::ErrorDetail;
-        let detail = self.pending_error_detail.borrow();
-        match err {
-            VmError::TypeError
-            | VmError::RangeError
-            | VmError::SyntaxError
-            | VmError::URIError
-            | VmError::BudgetExceeded
-            | VmError::ThisUninitialized
-            | VmError::InvalidRegExp => match detail.as_ref() {
-                Some(ErrorDetail::Message(m)) => m.to_string(),
-                _ => err.to_string(),
-            },
-            VmError::UndefinedIdentifier => match detail.as_ref() {
-                Some(ErrorDetail::Name(n)) => format!("{n} is not defined"),
-                _ => err.to_string(),
-            },
-            VmError::UnknownIntrinsic => match detail.as_ref() {
-                Some(ErrorDetail::Name(n)) => format!("unknown intrinsic method `{n}`"),
-                _ => err.to_string(),
-            },
-            VmError::Uncaught => match detail.as_ref() {
-                Some(ErrorDetail::Uncaught(v)) => format!("uncaught exception: {v}"),
-                _ => err.to_string(),
-            },
-            VmError::TypeMismatchAt => match detail.as_ref() {
-                Some(ErrorDetail::Mismatch(p)) => {
-                    format!("{}: cannot operate on a value of type {}", p.op, p.kind)
-                }
-                _ => err.to_string(),
-            },
-            VmError::JsonError => match detail.as_ref() {
-                Some(ErrorDetail::Json(p)) => p.message.clone(),
-                _ => err.to_string(),
-            },
-            VmError::Coded => match detail.as_ref() {
-                Some(ErrorDetail::Coded(p)) => p.message.clone(),
-                Some(ErrorDetail::Syscall(p)) => p.message.clone(),
-                _ => err.to_string(),
-            },
-            other => other.to_string(),
-        }
+        err.render_with_detail(self.pending_error_detail.borrow().as_ref())
     }
 }

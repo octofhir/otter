@@ -354,8 +354,27 @@ impl ActivationStack {
             call.trace_slots(visitor);
         }
         if let Some(request) = &self.request {
-            for value in [&request.callee, &request.receiver, &request.new_target] {
+            for value in [
+                &request.callee,
+                &request.receiver,
+                &request.new_target,
+                &request.construct_receiver,
+            ] {
                 value.trace_value_slots(visitor);
+            }
+            if !request.construct_layout.is_null() {
+                visitor(
+                    std::ptr::addr_of!(request.construct_layout)
+                        .cast_mut()
+                        .cast(),
+                );
+            }
+            if !request.derived_this_context.is_null() {
+                visitor(
+                    std::ptr::addr_of!(request.derived_this_context)
+                        .cast_mut()
+                        .cast(),
+                );
             }
         }
         for value in &self.staged {
@@ -377,12 +396,12 @@ impl Interpreter {
         stack: &mut ActivationStack,
         body: impl FnOnce(RuntimeTurn<'_>) -> R,
     ) -> R {
-        let enclosing_cell = self.jit_frame_cell;
+        let enclosing_cell = self.jit_context;
         if let Some(context) = unsafe { stack.execution_context().as_mut() } {
             if context.native_frame.is_null() {
                 context.native_frame = self.jit_innermost_native_frame();
             }
-            self.jit_frame_cell = Some(std::ptr::NonNull::from(&mut context.native_frame).cast());
+            self.jit_context = Some(std::ptr::NonNull::from(&mut *context));
         }
         let owner = self as *const Interpreter as usize;
         let cold_frames = &self.cold_frames as *const crate::cold_frame::ColdFramePool;
@@ -407,7 +426,7 @@ impl Interpreter {
         }
         drop(extra_roots_guard);
         drop(frame_roots_guard);
-        self.jit_frame_cell = enclosing_cell;
+        self.jit_context = enclosing_cell;
         result
     }
 }

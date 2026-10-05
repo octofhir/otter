@@ -1,7 +1,8 @@
 //! Native half of `node:dns`: host name resolution.
 //!
 //! # Contents
-//! - [`dns_cjs_value`] installs the module's JavaScript shim.
+//! - [`dns_cjs_value`] installs the native surface, then runs the module's
+//!   build-produced JavaScript.
 //! - `lookupHost` resolves a name to addresses through the host resolver.
 //! - `lookupService` maps an address back to a host name.
 //!
@@ -49,7 +50,7 @@ pub fn dns_cjs_value<'scope>(
         }
         .to_flags(),
     )?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:dns", include_str!("dns.js"), module, require)
+    otter_runtime::run_builtin_cjs_shim(scope, &crate::nodelib::embedded::node_dns, module, require)
 }
 
 fn build_native<'scope>(

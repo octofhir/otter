@@ -16,6 +16,8 @@
 //! # Invariants
 //! - The object is represented with the ordinary descriptor-capable
 //!   object storage; no array identity is exposed.
+//! - The caller allocates the final shape's lineage root and inline capacity
+//!   before initialization; installing its slots preserves that footprint.
 //! - Indexed properties are writable, enumerable, and configurable.
 //! - `length` is writable, non-enumerable, and configurable.
 //! - Unmapped `callee` is the restricted accessor with
@@ -50,7 +52,7 @@ pub(crate) fn initialize_unmapped(
     mut throw_type_error: Value,
     iterator: Option<(JsSymbol, Value)>,
     shape: crate::object::ShapeHandle,
-) -> JsObject {
+) -> Result<JsObject, otter_gc::OutOfMemory> {
     let (iterator_symbol, mut iterator_method) = match iterator {
         Some((symbol, method)) => (Some(symbol), method),
         None => (None, Value::undefined()),
@@ -64,7 +66,10 @@ pub(crate) fn initialize_unmapped(
         scope.add_value(&mut iterator_method);
     }
 
-    object::mark_as_arguments_object(&mut obj, heap);
+    object::mark_as_arguments_object(&mut obj, heap)?;
+    // Reserve before copying argv/accessor words into the installation buffer.
+    // Every pending value still resides in the actual RootScope slots above.
+    object::reserve_fresh_object_slot_capacity(&mut obj, heap, args.len() + 2)?;
     // The shape already names every slot: indices, then `length`, then the
     // `callee` accessor. One shape install plus a flat slab fill replaces a
     // dictionary insert per key.
@@ -73,8 +78,7 @@ pub(crate) fn initialize_unmapped(
         &mut obj,
         Some(throw_type_error),
         Some(throw_type_error),
-    )
-    .expect("arguments callee accessor cell allocation");
+    )?;
     let mut slab: SmallVec<[Value; 8]> = SmallVec::with_capacity(args.len() + 2);
     slab.extend(args.iter().copied());
     slab.push(Value::number(NumberValue::from_i32(args.len() as i32)));
@@ -92,13 +96,13 @@ pub(crate) fn initialize_unmapped(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )?;
     }
     drop(scope);
     // `obj` was forwarded in place by the rooted scope across the
     // property definitions above; hand the current handle back so the
     // caller writes the live object into its register, not a stale copy.
-    obj
+    Ok(obj)
 }
 
 /// Populate a sloppy mapped `arguments` object from a captured argv
@@ -111,7 +115,7 @@ pub(crate) fn initialize_mapped(
     mut mapped: Option<MappedArguments>,
     iterator: Option<(JsSymbol, Value)>,
     shape: crate::object::ShapeHandle,
-) -> JsObject {
+) -> Result<JsObject, otter_gc::OutOfMemory> {
     let (iterator_symbol, mut iterator_method) = match iterator {
         Some((symbol, method)) => (Some(symbol), method),
         None => (None, Value::undefined()),
@@ -130,7 +134,10 @@ pub(crate) fn initialize_mapped(
         }
     }
 
-    object::mark_as_arguments_object(&mut obj, heap);
+    object::mark_as_arguments_object(&mut obj, heap)?;
+    // Reserve before copying argv/accessor words into the installation buffer.
+    // Every pending value still resides in the actual RootScope slots above.
+    object::reserve_fresh_object_slot_capacity(&mut obj, heap, args.len() + 2)?;
     // The shape already names every slot: indices, then `length`, then
     // `callee`. One shape install plus a flat slab fill replaces a dictionary
     // insert per key.
@@ -151,14 +158,14 @@ pub(crate) fn initialize_mapped(
                 configurable: Some(true),
                 ..Default::default()
             },
-        );
+        )?;
     }
     // The context is rooted in place, so the map moves into
     // `install_mapped_arguments` only after the scope closes; by then `obj`
     // and the context are current.
     drop(scope);
     if let Some(mapped) = mapped {
-        object::install_mapped_arguments(obj, heap, mapped);
+        object::install_mapped_arguments(&mut obj, heap, mapped)?;
     }
-    obj
+    Ok(obj)
 }

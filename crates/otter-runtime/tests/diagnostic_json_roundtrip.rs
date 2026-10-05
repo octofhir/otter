@@ -12,13 +12,15 @@
 //! 2. serializes it through the stable wire format
 //!    ([`otter_runtime::OtterError::to_json`] for top-level errors and
 //!    `serde_json::to_string_pretty` for standalone diagnostics);
-//! 3. deserializes the produced JSON back through `serde_json::from_str`;
-//! 4. re-serializes the round-tripped value and asserts byte-identity
-//!    against the original JSON.
+//! 3. decodes the produced JSON back through `serde_json::from_str` into a
+//!    generic [`serde_json::Value`] (the DTOs carry admitted source handles,
+//!    so they are serialize-only);
+//! 4. asserts the decoded document equals the DTO's serde model and
+//!    re-serializes byte-identically against the original JSON.
 //!
 //! Byte-identical re-serialization pins the wire shape: any field
-//! added without a `#[serde(skip_serializing_if = "Option::is_none")]`
-//! escape hatch (or any rename) immediately fails.
+//! whose text does not decode to the DTO's own model (or any rename)
+//! immediately fails.
 
 use otter_runtime::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, OtterError};
 
@@ -118,7 +120,15 @@ fn every_category_diagnostic_round_trips_byte_identical() {
         }
 
         let first = serde_json::to_string_pretty(&diagnostic).expect("serialize diagnostic");
-        let parsed: Diagnostic = serde_json::from_str(&first).expect("deserialize diagnostic");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&first).expect("deserialize diagnostic");
+        assert_eq!(
+            parsed,
+            serde_json::to_value(&diagnostic).expect("diagnostic model"),
+            "[{category:?}] decoded diagnostic diverged from its model"
+        );
+        assert_eq!(parsed["code"], diagnostic.code.as_str());
+        assert_eq!(parsed["message"], diagnostic.message.as_str());
         let second = serde_json::to_string_pretty(&parsed).expect("re-serialize diagnostic");
         assert_eq!(
             first, second,
@@ -174,16 +184,19 @@ fn otter_error_envelope_round_trips_byte_identical() {
 
 fn assert_round_trip(err: &OtterError) {
     let first = err.to_json_pretty().expect("serialize error");
-    // The envelope deserializes through a private wrapper in
-    // `error.rs`; rebuild the wrapper here so we round-trip the
-    // exact wire shape `--json` writes to stdout.
-    #[derive(Debug, serde::Deserialize, serde::Serialize)]
-    struct Envelope {
-        error: OtterError,
-    }
-    let parsed: Envelope = serde_json::from_str(&first).expect("deserialize error envelope");
-    let second_inner = parsed.error.to_json_pretty().expect("re-serialize error");
-    assert_eq!(first, second_inner, "OtterError JSON round-trip diverged");
+    // The envelope is the exact wire shape `--json` writes to stdout:
+    // `{"error": <OtterError>}` plus a trailing newline.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&first).expect("deserialize error envelope");
+    assert_eq!(
+        parsed["error"],
+        serde_json::to_value(err).expect("error model"),
+        "decoded OtterError diverged from its model"
+    );
+    assert!(parsed["error"]["kind"].is_string(), "envelope lost its tag");
+    let mut second = serde_json::to_string_pretty(&parsed).expect("re-serialize error");
+    second.push('\n');
+    assert_eq!(first, second, "OtterError JSON round-trip diverged");
 }
 
 #[test]
@@ -204,10 +217,11 @@ fn diagnostic_cause_chain_round_trips() {
     .with_cause(inner.clone());
 
     let json = serde_json::to_string_pretty(&outer).expect("serialize chain");
-    let parsed: Diagnostic = serde_json::from_str(&json).expect("deserialize chain");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("deserialize chain");
     let re = serde_json::to_string_pretty(&parsed).expect("re-serialize chain");
     assert_eq!(json, re);
-    let parsed_cause = parsed.cause.expect("cause survived round-trip");
-    assert_eq!(parsed_cause.code, inner.code);
-    assert_eq!(parsed_cause.message, inner.message);
+    let parsed_cause = &parsed["cause"];
+    assert!(parsed_cause.is_object(), "cause survived round-trip");
+    assert_eq!(parsed_cause["code"], inner.code.as_str());
+    assert_eq!(parsed_cause["message"], inner.message.as_str());
 }

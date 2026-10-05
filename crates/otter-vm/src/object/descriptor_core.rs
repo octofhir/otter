@@ -1,25 +1,17 @@
-//! Descriptor validation and ordinary data-assignment core.
+//! Field-presence-aware ordinary descriptor validation.
 //!
 //! This private submodule keeps the production descriptor algorithms out of the
 //! already-large `object.rs` surface while staying inside the object module's
 //! storage boundary.
 //!
 //! # Contents
-//! - [`ordinary_set_data_property`] — the string-keyed data-write half of
-//!   ordinary `[[Set]]`.
-//! - [`ordinary_set_data_property_with_shape`] — the same write core when
-//!   the caller has already allocated the next GC-managed shape.
-//! - [`ordinary_set_symbol_data_property`] — the symbol-keyed data-write half.
-//! - [`validate_and_apply`] — `ValidateAndApplyPropertyDescriptor` for an
-//!   existing ordinary string-keyed slot.
+//! - [`validate_and_apply_partial`] — field-presence-aware slot validation.
+//! - [`validate_descriptor_partial`] — the same validation for array symbols.
 //!
 //! # Invariants
-//! - Runtime `[[Set]]` data writes preserve an existing data descriptor's
-//!   `enumerable` / `configurable` bits and never overwrite accessors.
-//! - New ordinary data properties are installed with the default
-//!   writable/enumerable/configurable triple only when the receiver is
-//!   extensible.
-//! - Successful stores record the object write barrier after the payload update.
+//! - Validation preserves every absent incoming field.
+//! - Rejection performs no mutation and never allocates.
+//! - Publication belongs solely to `super::descriptor_install`.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
@@ -28,209 +20,9 @@
 use crate::Value;
 
 use super::{
-    DescriptorKind, JsObject, JsSymbol, PartialPropertyDescriptor, PropertyDescriptor,
-    PropertyFlags, ShapeHandle, SlotData, SlotKind, SlotMeta,
+    DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags, SlotData,
+    SlotKind,
 };
-
-pub(super) fn ordinary_set_data_property(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: &str,
-    value: Value,
-) -> bool {
-    let mut obj = obj;
-    let mut stored = value;
-    let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
-    if existing_offset.is_none() {
-        // A fresh key demotes this object to dictionary mode, and
-        // demotion writes through the sidecar. Reserved here, outside
-        // every payload borrow, because creating it allocates — and only
-        // for the append that will actually write it.
-        super::ensure_exotic_with_pending_values(&mut obj, heap, std::slice::from_mut(&mut stored))
-            .expect("exotic sidecar");
-    }
-    let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
-    let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
-    let append_index = heap.read_payload(obj, |body| super::body_property_count(heap, body));
-    // An overwrite of an existing slot fits the capacity it already has;
-    // only a genuine append needs one more word. Reserving `count + 1`
-    // for overwrites silently spilled every object whose in-object slots
-    // were exactly full out of line on its first slow-path store.
-    let needed = append_index + usize::from(existing_offset.is_none());
-    // The writable/accessor gate reads the slot's attributes through the shape,
-    // which `with_payload` cannot walk, so resolve it under a read borrow first.
-    let existing_attrs = existing_offset
-        .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
-    if super::reserve_slot_capacity(&mut obj, heap, needed, std::slice::from_mut(&mut stored))
-        .is_err()
-    {
-        return false;
-    }
-    let Ok(slot_meta_table) = super::slot_meta_table_for_install(
-        &mut obj,
-        heap,
-        &slot_metas,
-        needed,
-        std::slice::from_mut(&mut stored),
-    ) else {
-        return false;
-    };
-    let dict_table = if existing_offset.is_none() {
-        let Ok(table) = super::dict_keys_table_for_install(
-            &mut obj,
-            heap,
-            &dictionary_keys,
-            key,
-            std::slice::from_mut(&mut stored),
-        ) else {
-            return false;
-        };
-        table
-    } else {
-        None
-    };
-    let success = heap.with_payload(obj, |body| {
-        if let Some(offset) = existing_offset {
-            let i = offset as usize;
-            let (flags, is_accessor) = existing_attrs.expect("attrs read for existing slot");
-            if !flags.writable() || is_accessor {
-                return false;
-            }
-            body.set_data_value(i, stored);
-            return true;
-        }
-
-        if !body.extensible() {
-            return false;
-        }
-        body.enter_dictionary_mode(true);
-        if let Some(table) = dict_table {
-            body.exotic_mut().dictionary_keys = table;
-        }
-        if let Some(table) = slot_meta_table {
-            body.exotic_mut().slots = table;
-        }
-        super::dict_push_key(body, key.to_owned());
-        body.push_slot(append_index, SlotMeta::data_default(), stored);
-        true
-    });
-    let sidecar = heap.read_payload(obj, |body| body.exotic.get());
-    if let Some(table) = slot_meta_table {
-        heap.record_write(sidecar, &table);
-    }
-    if let Some(table) = dict_table {
-        heap.record_write(sidecar, &table);
-    }
-    if success {
-        super::record_slot_write(heap, obj, stored);
-    }
-    success
-}
-
-pub(super) fn ordinary_set_data_property_with_shape(
-    obj: &mut JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: &str,
-    value: Value,
-    next_shape: ShapeHandle,
-    append_index: usize,
-) -> bool {
-    let stored = value;
-    let existing_offset = heap.read_payload(*obj, |body| super::body_offset_of(heap, body, key));
-    let existing_attrs = existing_offset
-        .map(|offset| heap.read_payload(*obj, |body| body.slot_attrs(heap, offset as usize)));
-    // `append_index` (the slot the new property occupies) is supplied by the
-    // caller from the shape it transitioned from, so the hot path adds no shape
-    // read; verify the invariant in debug builds.
-    debug_assert_eq!(
-        append_index,
-        super::shape_property_count(next_shape, heap) as usize - 1
-    );
-    let mut stored = stored;
-    if super::reserve_slot_capacity(
-        obj,
-        heap,
-        append_index + 1,
-        std::slice::from_mut(&mut stored),
-    )
-    .is_err()
-    {
-        return false;
-    }
-    let success = heap.with_payload(*obj, |body| {
-        if let Some(offset) = existing_offset {
-            let i = offset as usize;
-            let (flags, is_accessor) = existing_attrs.expect("attrs read for existing slot");
-            if !flags.writable() || is_accessor {
-                return false;
-            }
-            body.set_data_value(i, stored);
-            return true;
-        }
-
-        if !body.extensible() {
-            return false;
-        }
-        body.invalidate_prototype_proofs();
-        body.shape = next_shape;
-        body.push_slot(append_index, SlotMeta::data_default(), stored);
-        true
-    });
-    if success {
-        super::record_slot_write(heap, *obj, stored);
-        heap.record_write(*obj, &next_shape);
-    }
-    success
-}
-
-pub(super) fn ordinary_set_symbol_data_property(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: JsSymbol,
-    value: Value,
-) -> bool {
-    // Symbol properties live in the sidecar. Reserved here, outside the
-    // payload borrow, because creating it allocates — which may also move
-    // `obj` and the pending value's referent.
-    let mut obj = obj;
-    let mut value = value;
-    {
-        // The collector rewrites the pending value through this exclusive
-        // borrow; the stores below read it back after the borrow ends.
-        let value_slot = &mut value;
-        let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            value_slot.trace_value_slot_mut(visitor);
-        };
-        super::reserve_symbol_prop_capacity(&mut obj, heap, &mut roots).expect("symbol prop table");
-    }
-    let barrier_value = value;
-    let success = heap.with_payload(obj, |body| {
-        if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {
-            let slot = &mut body
-                .symbol_props_mut()
-                .expect("existing symbol slot implies a table")
-                .entries_mut()[pos]
-                .1;
-            if !slot.flags.writable() || !slot.kind.is_data() {
-                return false;
-            }
-            slot.value = value;
-            return true;
-        }
-
-        if !body.extensible() {
-            return false;
-        }
-        body.symbol_props_mut()
-            .expect("symbol table reserved before the borrow")
-            .push((key, SlotData::data_default(value)));
-        true
-    });
-    if success {
-        super::record_symbol_entry_write(heap, obj, &key, &barrier_value);
-    }
-    success
-}
 
 /// Implements §10.1.6.3 ValidateAndApplyPropertyDescriptor for an existing
 /// slot. Field-presence aware: a missing field in `incoming` means
@@ -299,7 +91,9 @@ pub(super) fn validate_and_apply_partial(
         enumerable = e;
     }
     let kind = if incoming_is_accessor || (!incoming_is_data && !existing_is_data) {
-        // Result is an accessor descriptor.
+        // Accessor descriptors never carry the data-only writable bit.
+        // This applies to data-to-accessor and partial accessor updates alike.
+        writable = false;
         let (mut getter, mut setter) = match &existing.kind {
             SlotKind::Accessor(pair) => (pair.getter, pair.setter),
             SlotKind::Data => (None, None),
@@ -405,6 +199,17 @@ pub(super) fn validate_descriptor_update(
     validate_and_apply(&existing, incoming, heap).map(|slot| slot.to_descriptor())
 }
 
+/// Validate a present partial descriptor against one stored descriptor.
+/// Array symbol properties share this exact ordinary validation authority.
+pub(crate) fn validate_descriptor_partial(
+    existing: &PropertyDescriptor,
+    incoming: &PartialPropertyDescriptor,
+    heap: &otter_gc::GcHeap,
+) -> Option<PropertyDescriptor> {
+    let existing = SlotData::from_descriptor(existing.clone());
+    validate_and_apply_partial(&existing, incoming, heap).map(|slot| slot.to_descriptor())
+}
+
 fn optional_value_eq(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc::GcHeap) -> bool {
     // §10.1.6.3 — a missing accessor side (`[[Get]]` / `[[Set]]`) is
     // spec-defined to be `undefined`, so a stored `None` slot
@@ -420,3 +225,6 @@ fn optional_value_eq(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc::GcHe
 fn same_value(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
     crate::abstract_ops::same_value(a, b, heap)
 }
+
+#[cfg(test)]
+mod tests;

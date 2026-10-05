@@ -7,7 +7,8 @@
 //! # Invariants
 //! - No variadic semantics are duplicated in JIT code; each opcode reconstructs
 //!   its operand list from the packed argument tail and calls the same
-//!   operand-based helper the interpreter dispatches.
+//!   operand-based helper the interpreter dispatches. Completed terminal
+//!   failures retain the existing Fatal status; local source failures throw.
 //! - The lowering guarantees the argument count fits the four packed lanes; a
 //!   larger list lowers to an exact pre-effect side exit and serves loop OSR.
 //!
@@ -15,6 +16,7 @@
 //! - [`crate::Interpreter::run_array_static_operands`]
 //! - [`crate::Interpreter::run_queue_microtask_operands`]
 
+use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
@@ -33,10 +35,10 @@ impl Interpreter {
         prefix: u64,
         count: u64,
         packed_args: u64,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
         if frame_index + 1 != stack.len() {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         }
         let saved_pc = stack[frame_index].pc;
         let argc = count as usize;
@@ -59,9 +61,10 @@ impl Interpreter {
                 self.run_array_static_operands(Op::ArrayOf, context, stack, &ops[..])?;
             }
             value if value == Op::QueueMicrotask as u8 => {
-                self.run_queue_microtask_operands(context, &mut stack[frame_index], &ops[..])?;
+                self.run_queue_microtask_operands(context, &mut stack[frame_index], &ops[..])
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             }
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         }
         stack[frame_index].pc = saved_pc;
         Ok(())

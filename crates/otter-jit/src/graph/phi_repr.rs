@@ -18,7 +18,8 @@
 //! - Every check that unboxed an untagged phi (to an int32 or an element
 //!   index) is replaced by the phi itself, in node inputs and frame states
 //!   alike; every direct use of the phi read it tagged and receives a box
-//!   placed in its own block, right before it.
+//!   placed in its own block, right before it. A Number check of such a box
+//!   is dropped.
 //!
 //! # See also
 //! - [`super::builder`] — creates every phi tagged and records the loop
@@ -234,6 +235,22 @@ pub(crate) fn untag_phis(graph: &mut Graph, layout: &[BlockId], loop_headers: &[
                 *value = replacement;
             }
         });
+    }
+    // A Number check of a value now boxed from an unboxed number holds.
+    for &block in layout {
+        let body = graph.block(block).body.clone();
+        let kept: Vec<NodeId> = body
+            .into_iter()
+            .filter(|&node| {
+                let data = graph.node(node);
+                data.kind != Kind::CheckNumber
+                    || !matches!(
+                        graph.node(data.inputs[0]).kind,
+                        Kind::Int32ToTagged | Kind::Float64ToTagged
+                    )
+            })
+            .collect();
+        graph.block_mut(block).body = kept;
     }
 }
 

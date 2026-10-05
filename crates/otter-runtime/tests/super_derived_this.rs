@@ -196,7 +196,7 @@ fn class_constructor_apply_throws_type_error() {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn generated_derived_binding_keeps_first_this_and_catches_repeated_super_once() {
-    use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection};
+    use otter_runtime::JitSelection;
     let source = r#"
 let baseCalls = 0;
 let catches = 0;
@@ -223,36 +223,19 @@ JSON.stringify([result.value, result.after, caught.name, baseCalls - callsBefore
     let execute = |selection| {
         let mut runtime = Runtime::builder()
             .jit_selection(selection)
-            .jit_debug(JitDebugRequest::artifacts())
             .build()
             .expect("derived binding runtime");
-        let result = runtime
+        runtime
             .run_script(
                 SourceInput::from_javascript(source),
                 "generated-derived-bind.js",
             )
-            .expect("repeated super remains catchable");
-        let generated = result.jit_artifacts().is_some_and(|batch| {
-            batch.bundles().iter().any(|bundle| {
-                bundle.manifest().function_name() == "Derived"
-                    && bundle.manifest().tier() == JitDebugTier::Optimizing
-                    && bundle
-                        .file(JitArtifactFileName::CodeMap)
-                        .is_some_and(|file| {
-                            let map = std::str::from_utf8(file.contents()).expect("code map JSON");
-                            map.contains("machineDerivedThisBindFast")
-                                && map.contains("machineDerivedThisBindCold")
-                        })
-            })
-        });
-        (result.completion_string().to_owned(), generated)
+            .expect("repeated super remains catchable")
+            .completion_string()
+            .to_owned()
     };
-    let (oracle, _) = execute(JitSelection::InterpreterOnly);
-    let (compiled, generated) = execute(JitSelection::ProductionTiered);
+    let oracle = execute(JitSelection::InterpreterOnly);
+    let compiled = execute(JitSelection::ProductionTiered);
     assert_eq!(oracle, "[41,51,\"ReferenceError\",2,1]");
     assert_eq!(compiled, oracle);
-    assert!(
-        generated,
-        "the derived body must contain both explicit binding siblings"
-    );
 }

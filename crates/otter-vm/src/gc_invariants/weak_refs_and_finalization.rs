@@ -36,10 +36,6 @@ fn empty_module() -> BytecodeModule {
     crate::test_support::minimal_bytecode_module("weakref-finalization-test")
 }
 
-fn empty_context() -> ExecutionContext {
-    ExecutionContext::from_module(empty_module()).expect("valid bytecode fixture")
-}
-
 #[test]
 fn weak_ref_does_not_keep_target_alive() {
     let mut heap = crate::object::fixture_heap();
@@ -76,15 +72,18 @@ fn weak_ref_returns_target_while_strongly_rooted() {
 
 #[test]
 fn weak_ref_target_becomes_unavailable_after_force_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
     let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::object(target)).expect("weak ref");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "wr",
-        Value::weak_ref(weak_ref),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "wr",
+            crate::object::PropertyDescriptor::data(Value::weak_ref(weak_ref), true, true, true)
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
@@ -96,7 +95,7 @@ fn weak_ref_target_becomes_unavailable_after_force_gc() {
 
 #[test]
 fn finalization_registry_registers_without_strong_target_retention() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let calls = Arc::new(AtomicUsize::new(0));
     let callback = native_value(interp.gc_heap_mut(), "cleanup", {
         let calls = Arc::clone(&calls);
@@ -108,11 +107,19 @@ fn finalization_registry_registers_without_strong_target_retention() {
     .expect("native cleanup");
     let registry = alloc_finalization_registry(interp.gc_heap_mut(), callback).expect("registry");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "registry",
-        Value::finalization_registry(registry),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "registry",
+            crate::object::PropertyDescriptor::data(
+                Value::finalization_registry(registry),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
     // Stabilise the baseline before measuring: bootstrap creates
     // transient `ObjectBody` allocations (intermediate descriptor
@@ -142,11 +149,11 @@ fn finalization_registry_registers_without_strong_target_retention() {
     );
 
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("drain cleanup");
     interp.force_gc().expect("force GC");
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("second drain");
     assert_eq!(
         calls.load(Ordering::Relaxed),
@@ -186,7 +193,7 @@ fn dropped_finalization_registry_self_cycle_is_reaped() {
 
 #[test]
 fn finalization_registry_schedules_cleanup_microtask() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let calls = Arc::new(AtomicUsize::new(0));
     let seen_held = Arc::new(AtomicBool::new(false));
     let callback = {
@@ -213,11 +220,19 @@ fn finalization_registry_schedules_cleanup_microtask() {
     )
     .expect("register");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "registry",
-        Value::finalization_registry(registry),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "registry",
+            crate::object::PropertyDescriptor::data(
+                Value::finalization_registry(registry),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
@@ -228,14 +243,14 @@ fn finalization_registry_schedules_cleanup_microtask() {
     );
     assert!(interp.microtasks().has_pending_sync());
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("drain finalization callback");
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(seen_held.load(Ordering::Relaxed));
 
     interp.force_gc().expect("force GC");
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("second drain");
     assert_eq!(
         calls.load(Ordering::Relaxed),
@@ -246,7 +261,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
 
 #[test]
 fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let observed_undefined = Arc::new(AtomicBool::new(false));
     let callback = {
         let observed_undefined = Arc::clone(&observed_undefined);
@@ -275,23 +290,31 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
     )
     .expect("register");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "registry",
-        Value::finalization_registry(registry),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "registry",
+            crate::object::PropertyDescriptor::data(
+                Value::finalization_registry(registry),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("drain finalization callback");
     assert!(observed_undefined.load(Ordering::Relaxed));
 }
 
 #[test]
 fn finalization_cleanup_job_carries_registry_context() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let called = Arc::new(AtomicBool::new(false));
     let callback = native_value(interp.gc_heap_mut(), "cleanup", {
         let called = Arc::clone(&called);
@@ -304,7 +327,13 @@ fn finalization_cleanup_job_carries_registry_context() {
     let registry = alloc_finalization_registry_with_context(
         interp.gc_heap_mut(),
         callback,
-        Some(ExecutionContext::from_module(empty_module()).expect("valid bytecode fixture")),
+        Some(
+            ExecutionContext::from_module(
+                empty_module(),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .expect("valid bytecode fixture"),
+        ),
     )
     .expect("registry");
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
@@ -317,23 +346,31 @@ fn finalization_cleanup_job_carries_registry_context() {
     )
     .expect("register");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "registry",
-        Value::finalization_registry(registry),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "registry",
+            crate::object::PropertyDescriptor::data(
+                Value::finalization_registry(registry),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
     interp
-        .drain_microtasks_with_default(None)
+        .drain_microtasks(|_, _| Ok(false))
         .expect("cleanup job should carry its own context");
     assert!(called.load(Ordering::Relaxed));
 }
 
 #[test]
 fn pending_finalization_microtask_roots_held_value_across_next_gc() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let observed_undefined = Arc::new(AtomicBool::new(false));
     let callback = {
         let observed_undefined = Arc::clone(&observed_undefined);
@@ -362,25 +399,33 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
     )
     .expect("register");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "registry",
-        Value::finalization_registry(registry),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "registry",
+            crate::object::PropertyDescriptor::data(
+                Value::finalization_registry(registry),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
     assert!(interp.microtasks().has_pending_sync());
     interp.force_gc().expect("force GC");
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("drain finalization callback");
     assert!(observed_undefined.load(Ordering::Relaxed));
 }
 
 #[test]
 fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let allocated_after_gc = Arc::new(AtomicBool::new(false));
     let callback = native_value(interp.gc_heap_mut(), "cleanup", {
         let allocated_after_gc = Arc::clone(&allocated_after_gc);
@@ -402,11 +447,19 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
     )
     .expect("register");
     let mut global = *interp.global_this();
-    crate::object::set(
-        &mut global,
-        interp.gc_heap_mut(),
-        "registry",
-        Value::finalization_registry(registry),
+    assert!(
+        crate::object::define_own_property_in_place(
+            &mut global,
+            interp.gc_heap_mut(),
+            "registry",
+            crate::object::PropertyDescriptor::data(
+                Value::finalization_registry(registry),
+                true,
+                true,
+                true
+            )
+        )
+        .expect("fixture property allocation")
     );
 
     interp.force_gc().expect("force GC");
@@ -415,7 +468,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         "raw GC must only enqueue cleanup and must not run user callback"
     );
     interp
-        .drain_microtasks(&empty_context())
+        .drain_microtasks(|_, _| Ok(false))
         .expect("drain finalization callback");
     assert!(allocated_after_gc.load(Ordering::Relaxed));
 }

@@ -412,9 +412,7 @@ pub(crate) fn string_proto_iterator(
             let text = scope.with_turn_parts(|interp, stack| {
                 interp
                     .coerce_to_string(stack, &exec, &this_raw)
-                    .map_err(|error| {
-                        crate::native_function::vm_to_native_error(interp, error, NAME)
-                    })
+                    .map_err(|error| error.into_native(interp, NAME))
             })?;
             scope.string(&text)?
         };
@@ -473,9 +471,9 @@ pub(crate) fn install_string_iterator_post_bootstrap(
         string_proto_iterator,
         &[&global_root, &prototype_root],
     )
-    .map_err(|_| crate::js_surface::JsSurfaceError::OutOfMemory)?;
+    .map_err(crate::js_surface::JsSurfaceError::from)?;
     let sym = well_known.get(symbol::WellKnown::Iterator);
-    crate::object::define_own_symbol_property_partial(
+    if !crate::object::define_own_symbol_property_partial(
         &mut prototype,
         heap,
         sym,
@@ -486,7 +484,9 @@ pub(crate) fn install_string_iterator_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    );
+    )? {
+        return Err(JsSurfaceError::DefinePropertyFailed("[[SymbolProperty]]"));
+    };
     Ok(())
 }
 

@@ -6,9 +6,12 @@
 //! - Typed-array element coercion.
 //!
 //! # Invariants
+//! - Feedback selects dense own-slot access only while the receiver's cached
+//!   eligibility agrees with its current exotic state.
 //! - A dense hole bypasses prototype lookup only while the one-shot indexed
 //!   accessor protector remains intact.
 
+use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
 use super::{canonical_numeric_index_string, typed_array_valid_index};
@@ -25,14 +28,7 @@ impl Interpreter {
     pub(crate) fn element_family_of(&self, recv: Value) -> crate::jit::JitElementFamily {
         use crate::jit::JitElementFamily as Family;
         if let Some(array) = recv.as_array() {
-            return match crate::array::dense_element_kind(array, &self.gc_heap) {
-                crate::array::DenseElementKind::PackedDouble => Family::DenseFloat64,
-                crate::array::DenseElementKind::Tagged => Family::DenseTagged,
-                crate::array::DenseElementKind::HoleyDouble => Family::DenseHoleyFloat64,
-                // An empty array is a transient construction layout. The
-                // feedback cell ignores Unseen until storage is published.
-                crate::array::DenseElementKind::Empty => Family::Unseen,
-            };
+            return crate::array::dense_element_family(array, &self.gc_heap);
         }
         match recv.as_typed_array(&self.gc_heap).map(|view| view.kind()) {
             Some(kind) if crate::jit::JitElementRepr::for_typed_kind(kind).is_some() => {
@@ -50,12 +46,17 @@ impl Interpreter {
         dst: u16,
         recv_reg: u16,
         idx_reg: u16,
-    ) -> Result<(), VmError> {
-        let receiver = *read_register(&stack[top_idx], recv_reg)?;
-        let key = *read_register(&stack[top_idx], idx_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let receiver = *read_register(&stack[top_idx], recv_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let key = *read_register(&stack[top_idx], idx_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let value = self.load_element_values(stack, context, receiver, key)?;
-        write_register(&mut stack[top_idx], dst, value)?;
-        stack[top_idx].advance_pc()
+        write_register(&mut stack[top_idx], dst, value)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))
     }
 
     /// Complete computed element lookup against either physical activation.
@@ -70,7 +71,7 @@ impl Interpreter {
         context: &ExecutionContext,
         mut recv: Value,
         mut idx_value_raw: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // Generated dense loads enter this Rust completion only for a failed
         // guard. The common miss is an in-bounds hole. When the one-shot
         // indexed-accessor protector is still intact and the receiver has no
@@ -97,9 +98,9 @@ impl Interpreter {
             roots.add_value(&mut result);
         }
         if recv.is_nullish() {
-            return Err(
-                self.err_type(("Cannot read property of null or undefined".to_string()).into())
-            );
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Cannot read property of null or undefined".to_string()).into(),
+            )));
         }
         idx_value = self.coerce_property_key_value(stack, context, idx_value_raw)?;
         // Exotic receivers that keep their own-property bag on an expando —
@@ -118,7 +119,7 @@ impl Interpreter {
             let spelled = number.to_display_string();
             idx_value = Value::string(
                 crate::string::JsString::from_str(&spelled, &mut self.gc_heap)
-                    .map_err(|_| VmError::TypeMismatch)?,
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
             );
         }
         let value = if let Some(obj) = recv.as_object() {
@@ -131,16 +132,23 @@ impl Interpreter {
                 } else if let Some(n) = idx_value.as_number() {
                     n.to_display_string()
                 } else {
-                    return Err(VmError::TypeMismatch);
+                    return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
                 // Atomized once for the whole prototype walk.
                 VmPropertyKey::Atom(self.atomized_key(&name))
             };
-            match self.ordinary_get_value(stack, context, Value::object(obj), recv, &key, 0)? {
+            match self.ordinary_get_value(
+                stack,
+                Some(context),
+                Value::object(obj),
+                recv,
+                &key,
+                0,
+            )? {
                 VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync_rooted(stack, context, &getter, recv, SmallVec::new())?
-                }
+                VmGetOutcome::InvokeGetter { getter } => self
+                    .run_callable_sync_rooted(stack, Some(context), &getter, recv, SmallVec::new())
+                    .map_err(CommittedValueError::completed_call)?,
             }
         } else if let Some(arr) = recv.as_array() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
@@ -152,12 +160,19 @@ impl Interpreter {
                         v
                     } else {
                         let key = VmPropertyKey::Symbol(sym);
-                        match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                        match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                             crate::VmGetOutcome::Value(v) => v,
                             crate::VmGetOutcome::InvokeGetter { getter } => {
                                 let args: smallvec::SmallVec<[Value; 8]> =
                                     smallvec::SmallVec::new();
-                                self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                                self.run_callable_sync_rooted(
+                                    stack,
+                                    Some(context),
+                                    &getter,
+                                    recv,
+                                    args,
+                                )
+                                .map_err(CommittedValueError::completed_call)?
                             }
                         }
                     }
@@ -168,7 +183,9 @@ impl Interpreter {
                     match crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
                         Some(v) => v,
                         None => {
-                            let proto = self.constructor_prototype_value("Array")?;
+                            let proto = self
+                                .constructor_prototype_value("Array")
+                                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                             if let Some(p) = proto.as_object() {
                                 crate::object::get_symbol(p, &self.gc_heap, sym)
                                     .unwrap_or(Value::undefined())
@@ -191,7 +208,8 @@ impl Interpreter {
                     match getter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                            self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                                .map_err(CommittedValueError::completed_call)?
                         }
                         _ => Value::undefined(),
                     }
@@ -234,11 +252,12 @@ impl Interpreter {
                                         smallvec::SmallVec::new();
                                     self.run_callable_sync_rooted(
                                         stack,
-                                        context,
+                                        Some(context),
                                         &getter,
                                         Value::array(arr),
                                         args,
-                                    )?
+                                    )
+                                    .map_err(CommittedValueError::completed_call)?
                                 }
                                 _ => Value::undefined(),
                             }
@@ -261,7 +280,7 @@ impl Interpreter {
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if recv.as_function().is_some() || recv.as_closure(&self.gc_heap).is_some() {
             // Computed keys walk the ordinary [[Get]] ladder like dotted
@@ -277,15 +296,16 @@ impl Interpreter {
                     .map(VmPropertyKey::Symbol)
             };
             if let Some(key) = key {
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if recv.as_native_function().is_some() {
             // Computed string keys walk the same ordinary [[Get]]
@@ -296,24 +316,26 @@ impl Interpreter {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(key);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if recv.as_bound_function().is_some() {
             // Same ladder for bound functions — own descriptor first,
@@ -321,31 +343,36 @@ impl Interpreter {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(key);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(t) = recv.as_typed_array(&self.gc_heap) {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     match typed_array_valid_index(&t, &self.gc_heap, n) {
-                        Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                        Some(idx) => t
+                            .get(&mut self.gc_heap, idx)
+                            .map_err(crate::oom_to_vm)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                         None => Value::undefined(),
                     }
                 } else {
@@ -359,7 +386,14 @@ impl Interpreter {
                             VmGetOutcome::Value(v) => v,
                             VmGetOutcome::InvokeGetter { getter } => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                                self.run_callable_sync_rooted(
+                                    stack,
+                                    Some(context),
+                                    &getter,
+                                    recv,
+                                    args,
+                                )
+                                .map_err(CommittedValueError::completed_call)?
                             }
                         };
                         found = true;
@@ -382,21 +416,25 @@ impl Interpreter {
                 match crate::array::index_from_number(n) {
                     Some(idx) => match t.get_uint8_value(&self.gc_heap, idx) {
                         Some(value) => value,
-                        None => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                        None => t
+                            .get(&mut self.gc_heap, idx)
+                            .map_err(crate::oom_to_vm)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                     },
                     None => Value::undefined(),
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if let Some(s) = recv.as_string(&self.gc_heap) {
             // §10.4.3 String exotic [[GetOwnProperty]] — UTF-16 code
@@ -413,20 +451,23 @@ impl Interpreter {
                 self.load_string_primitive_property(stack, context, &recv, s, &name)?
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                let proto = self.constructor_prototype_value("String")?;
+                let proto = self
+                    .constructor_prototype_value("String")
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 if proto.is_nullish() {
                     Value::undefined()
                 } else {
-                    match self.ordinary_get_value(stack, context, proto, recv, &key, 0)? {
+                    match self.ordinary_get_value(stack, Some(context), proto, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
                             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                            self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                                .map_err(CommittedValueError::completed_call)?
                         }
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if recv.as_regexp().is_some() {
             if let Some(key) = idx_value.as_string(&self.gc_heap) {
@@ -437,24 +478,26 @@ impl Interpreter {
                 // static-key path.
                 let name = key.to_lossy_string(&self.gc_heap);
                 let key = VmPropertyKey::OwnedString(name);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             }
         } else if recv.is_symbol() || recv.is_boolean() || recv.is_number() || recv.is_big_int() {
             // §7.1.18 ToObject — primitive receivers walk wrapper
@@ -475,17 +518,20 @@ impl Interpreter {
             } else if let Some(n) = idx_value.as_number() {
                 VmPropertyKey::OwnedString(n.to_display_string())
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             };
-            let proto = self.constructor_prototype_value(ctor_name)?;
+            let proto = self
+                .constructor_prototype_value(ctor_name)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if proto.is_nullish() {
                 Value::undefined()
             } else {
-                match self.ordinary_get_value(stack, context, proto, recv, &key, 0)? {
+                match self.ordinary_get_value(stack, Some(context), proto, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                        self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                            .map_err(CommittedValueError::completed_call)?
                     }
                 }
             }
@@ -501,13 +547,14 @@ impl Interpreter {
             } else if let Some(n) = idx_value.as_number() {
                 VmPropertyKey::OwnedString(n.to_display_string())
             } else {
-                return Err(VmError::TypeMismatch);
+                return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
             };
-            match self.ordinary_get_value(stack, context, recv, recv, &key, 0)? {
+            match self.ordinary_get_value(stack, Some(context), recv, recv, &key, 0)? {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
                     let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    self.run_callable_sync_rooted(stack, context, &getter, recv, args)?
+                    self.run_callable_sync_rooted(stack, Some(context), &getter, recv, args)
+                        .map_err(CommittedValueError::completed_call)?
                 }
             }
         };
@@ -527,7 +574,7 @@ impl Interpreter {
         context: &ExecutionContext,
         kind: crate::binary::TypedArrayKind,
         value: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let converted = if kind.is_bigint() {
             Value::big_int(crate::coerce::to_big_int_or_throw(
                 self, stack, context, &value,
@@ -538,5 +585,6 @@ impl Interpreter {
             )?)
         };
         binary::dispatch::coerce_element_for_store(&mut self.gc_heap, kind, &converted)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))
     }
 }

@@ -7,7 +7,7 @@
 //!
 //! # Invariants
 //! - Call ABI registers: `x0` context, `x1` callee, `x2` receiver, `x3`
-//!   `new.target`, `x4` actual count, the padded actual span at `sp`.
+//!   `new.target`, `x4` actual count, the exact aligned actual span at `sp`.
 //! - The emitters here clobber only x5, x9 and x10 besides their outputs.
 //!
 //! # See also

@@ -2,8 +2,8 @@
 //!
 //! # Contents
 //! - Relational and additive sites whose feedback saw a non-Number operand
-//!   keep the function in Machine IR; Number operands complete in the inline
-//!   probe without a runtime transition.
+//!   keep the function optimized; Number operands complete without a runtime
+//!   transition.
 //! - Object operands coerce exactly once, left before right, including a
 //!   throwing `valueOf` caught by the caller.
 //! - Strings, BigInt, Symbol, `%`, `**`, NaN and negative zero keep exact
@@ -14,66 +14,61 @@
 //! - A generic site never deoptimizes: every non-Number operand completes
 //!   once through the committed operator. A site first compiled from Number
 //!   feedback takes at most one exact exit before it turns generic.
+//! - A script body compiled on a loop header leaves once at the first site
+//!   after the loop that never ran before the compile.
 
 use otter_runtime::{
-    JitArtifactFileName, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
-    RuntimeExecutionStats, SourceInput,
+    JitDebugEvent, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
+use otter_vm::native_abi::ExitReason;
 
 struct Run {
     completion: String,
     stats: RuntimeExecutionStats,
-    probes: usize,
+    /// Function name and reason of every side exit taken by generated code.
+    exits: Vec<(String, ExitReason)>,
 }
 
-fn run(source: &str, selection: JitSelection, function: &str) -> Run {
-    let mut builder = Runtime::builder().jit_selection(selection);
-    if selection == JitSelection::ProductionTiered {
-        builder = builder.jit_debug(JitDebugRequest::artifacts());
-    }
-    let mut runtime = builder.build().expect("generic operator runtime");
+fn run(source: &str, selection: JitSelection) -> Run {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_debug(JitDebugRequest::events())
+        .build()
+        .expect("generic operator runtime");
     let result = runtime
         .run_script(SourceInput::from_javascript(source), "generic-binary.js")
         .unwrap_or_else(|error| panic!("generic operator fixture: {error:?}"));
-    let completion = result.completion_string().to_owned();
-    let probes = result.jit_artifacts().map_or(0, |artifacts| {
-        artifacts
-            .bundles()
-            .iter()
-            .filter(|bundle| {
-                bundle.manifest().function_name() == function
-                    && bundle.manifest().tier() == JitDebugTier::Optimizing
-            })
-            .map(|bundle| {
-                String::from_utf8_lossy(
-                    bundle
-                        .file(JitArtifactFileName::CodeMap)
-                        .expect("optimizing code map")
-                        .contents(),
-                )
-                .matches("\"machineBinaryNumberProbe\"")
-                .count()
-            })
-            .max()
-            .unwrap_or(0)
-    });
+    let exits = result
+        .jit_debug_report()
+        .expect("events enabled")
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            JitDebugEvent::Bail {
+                function_name,
+                exit_reason,
+                ..
+            } => Some((function_name.clone(), *exit_reason)),
+            _ => None,
+        })
+        .collect();
     Run {
-        completion,
+        completion: result.completion_string().to_owned(),
         stats: runtime.execution_stats(),
-        probes,
+        exits,
     }
 }
 
-fn compare(source: &str, function: &str, expected: &str) -> Run {
-    let oracle = run(source, JitSelection::InterpreterOnly, function);
+fn compare(source: &str, expected: &str) -> Run {
+    let oracle = run(source, JitSelection::InterpreterOnly);
     assert_eq!(oracle.completion, expected);
-    let compiled = run(source, JitSelection::ProductionTiered, function);
+    let compiled = run(source, JitSelection::ProductionTiered);
     assert_eq!(compiled.completion, oracle.completion);
     compiled
 }
 
 #[test]
-fn polluted_sites_stay_optimized_and_numbers_take_the_probe() {
+fn polluted_sites_stay_optimized_and_numbers_stay_inline() {
     const SOURCE: &str = r#"
 function polluted(count) {
     let checksum = 0;
@@ -91,12 +86,11 @@ let total = 0;
 for (let call = 0; call < 40; call++) total += polluted(5000);
 String(total);
 "#;
-    let run = compare(SOURCE, "polluted", "4284560");
-    assert!(run.probes >= 2, "both generic sites must carry a probe");
+    let run = compare(SOURCE, "4284560");
     assert_eq!(run.stats.jit_optimized_deopts, 0, "{:?}", run.stats);
     assert!(
         run.stats.jit_reentrant_stub_transitions <= 2 * 40,
-        "Number operands must not leave the probe: {:?}",
+        "Number operands must complete without a runtime transition: {:?}",
         run.stats
     );
 }
@@ -124,7 +118,6 @@ JSON.stringify([last, result, log.join(""), caught]);
 "#;
     let run = compare(
         SOURCE,
-        "mix",
         r#"[["72",5,14,3.5,1,49,false,false,true,true],[11,7,18,4.5,1,81,false,false,true,true],"LRLRLRLRLRLRLRLRLRLR","boom"]"#,
     );
     // At most one exact exit in `mix` when object operands first reach its
@@ -157,8 +150,17 @@ JSON.stringify([out.slice(0, cases.length), out.length, symbolError, mixedError]
 "#;
     let run = compare(
         SOURCE,
-        "ops",
         r#"[[["12",-1,2,true,false],["a3",null,null,false,false],["7n","3n","10n",false,true],[null,null,null,false,false],[null,null,null,false,false],[0,"-0","-0",false,true],[-1,1,"-0",false,true],[null,null,null,false,false],[2,-2,0,true,false],[2147483649,2147483645,4294967294,false,true],[-2147483647,-2147483649,-2147483648,true,false],[131072,0,4294967296,false,true],[4,10,-21,false,true]],650,"TypeError","TypeError"]"#,
     );
-    assert!(run.stats.jit_optimized_deopts <= 1, "{:?}", run.stats);
+    // `ops` saw strings while warming, so its sites are generic and never
+    // exit. The script body is compiled on each of its two loop headers and
+    // leaves each generation once, at the first never-run site after the loop.
+    assert!(
+        run.exits
+            .iter()
+            .all(|(name, reason)| name == "<main>" && *reason == ExitReason::InsufficientFeedback),
+        "{:?}",
+        run.exits
+    );
+    assert!(run.stats.jit_optimized_deopts <= 2, "{:?}", run.stats);
 }

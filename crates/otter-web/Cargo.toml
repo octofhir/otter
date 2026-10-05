@@ -21,6 +21,16 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "gc", "gc-drc", "wat", "std"] }
 
+[build-dependencies]
+otter-compiler = { workspace = true }
+otter-bytecode = { workspace = true }
+otter-syntax = { workspace = true }
+
 [dev-dependencies]
+tempfile = "3"
+otter-compiler = { workspace = true }
+otter-bytecode = { workspace = true }
+otter-syntax = { workspace = true }
+otter-vm = { workspace = true }
 tokio = { workspace = true }
 wat = "1"

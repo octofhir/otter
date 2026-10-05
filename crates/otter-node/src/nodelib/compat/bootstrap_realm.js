@@ -138,121 +138,844 @@ const symbolWells = {
   SymbolKeyFor: Symbol.keyFor,
 };
 
-const lowerFirst = (name) => name.charAt(0).toLowerCase() + name.slice(1);
+
 
 const cache = new Map();
 
+const __otterPrimordialMissing = {};
+
 function derive(name) {
+  // Generated from the current in-repo AST catalog; members remain lazy/live.
   if (name in explicit) return explicit[name];
   if (name in symbolWells) return symbolWells[name];
   if (name in constructors) return constructors[name];
   if (name in namespaces) return namespaces[name];
-
-  // `<Base>Prototype` — the prototype object itself.
-  let m = /^([A-Z][A-Za-z0-9]*?)Prototype$/.exec(name);
-  if (m) {
-    const base = constructors[m[1]] ??
-      (m[1] === 'TypedArray' ? TypedArray : undefined) ??
-      (m[1] === 'AsyncGenerator' ? AsyncGeneratorFunction.prototype.prototype : undefined);
-    if (base) return base.prototype ?? base;
-  }
-
-  // `<Base>PrototypeGet<Name>` / `<Base>PrototypeSet<Name>` — uncurried
-  // accessor halves, tried before the plain method rule so getter names
-  // never resolve to `undefined` methods.
-  m = /^([A-Z][A-Za-z0-9]*?)Prototype(Get|Set)([A-Z][A-Za-z0-9]*)$/.exec(name);
-  if (m) {
-    const base = m[1] === 'TypedArray' ? TypedArray : constructors[m[1]];
-    const proto = base?.prototype;
-    if (proto) {
-      const key = m[3] in symbolWells === false && m[3].startsWith('Symbol')
-        ? symbolWells[`Symbol${m[3].slice(6)}`]
-        : lowerFirst(m[3]);
-      const lookup = m[3].startsWith('Symbol')
-        ? symbolWells[m[3]] ?? Symbol[lowerFirst(m[3].slice(6))]
-        : lowerFirst(m[3]);
-      const desc = Object.getOwnPropertyDescriptor(proto, lookup ?? key);
-      const half = desc?.[m[2] === 'Get' ? 'get' : 'set'];
-      if (half) return uncurryThis(half);
-      // Fall through: names like `MapPrototypeGetSize` exist, but so do
-      // plain methods that merely start with Get (`MapPrototypeGet`).
-    }
-  }
-
-  // `<Base>Prototype<Method>Apply` — the spread-call form:
-  // ArrayPrototypePushApply(target, items) = Array.prototype.push.apply.
-  m = /^([A-Z][A-Za-z0-9]*?)Prototype([A-Z][A-Za-z0-9]*)Apply$/.exec(name);
-  if (m) {
-    const base = m[1] === 'TypedArray' ? TypedArray : constructors[m[1]];
-    const method = base?.prototype?.[lowerFirst(m[2])];
-    if (typeof method === 'function') {
-      return (thisArg, args) => ReflectApply(method, thisArg, args);
-    }
-  }
-
-  // `<Namespace><Member>Apply` — the spread-call form of a static:
-  // MathMaxApply(args) = Math.max.apply(Math, args). Node builds these by
-  // binding `Function.prototype.apply`, so they take the argument list as one
-  // array rather than the receiver-plus-list the prototype forms take.
-  m = /^([A-Z][A-Za-z0-9]*?)([A-Z][A-Za-z0-9_]*)Apply$/.exec(name);
-  if (m) {
-    const stem = name.slice(0, -'Apply'.length);
-    for (const [prefix, holder] of [
-      ...Object.entries(namespaces),
-      ...Object.entries(constructors),
-    ]) {
-      if (!holder || !stem.startsWith(prefix)) continue;
-      const rest = stem.slice(prefix.length);
-      if (!/^[A-Z]/.test(rest)) continue;
-      const member = rest === rest.toUpperCase()
-        ? holder[rest]
-        : holder[lowerFirst(rest)] ?? holder[rest];
-      if (typeof member === 'function') {
-        return (args) => ReflectApply(member, holder, args);
-      }
-    }
-  }
-
-  // `<Base>Prototype<Method>` — uncurried prototype method.
-  m = /^([A-Z][A-Za-z0-9]*?)Prototype([A-Z][A-Za-z0-9]*)$/.exec(name);
-  if (m) {
-    const base = m[1] === 'TypedArray' ? TypedArray : constructors[m[1]];
-    const proto = base?.prototype;
-    if (proto) {
-      const key = m[2].startsWith('Symbol')
-        ? symbolWells[m[2]] ?? Symbol[lowerFirst(m[2].slice(6))]
-        : lowerFirst(m[2]);
-      const method = proto[key];
-      if (typeof method === 'function') return uncurryThis(method);
-      const desc = Object.getOwnPropertyDescriptor(proto, key);
-      if (desc?.get) return uncurryThis(desc.get);
-    }
-  }
-
-  // `<Namespace><Member>` — statics on constructors and namespaces:
-  // ArrayIsArray, ObjectDefineProperty, MathMin, JSONStringify, ReflectApply,
-  // NumberMAX_SAFE_INTEGER, PromiseResolve.
-  m = /^([A-Z][A-Za-z0-9]*?)([A-Z][A-Za-z0-9_]*)$/.exec(name);
-  if (m) {
-    for (const [prefix, holder] of [
-      ...Object.entries(namespaces),
-      ...Object.entries(constructors),
-    ]) {
-      if (!holder || !name.startsWith(prefix)) continue;
-      const rest = name.slice(prefix.length);
-      if (!/^[A-Z]/.test(rest)) continue;
-      const candidates = rest === rest.toUpperCase()
-        ? [rest]
-        : [lowerFirst(rest), rest];
-      for (const key of candidates) {
-        if (key in holder) {
-          const member = holder[key];
-          return typeof member === 'function' ? member.bind(holder) : member;
-        }
-      }
-    }
+  let value;
+  switch (name) {
+    case "AggregateErrorPrototype":
+      value=__otterPrimordialObject(constructors["AggregateError"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["AggregateError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayBuffer":
+      value=__otterPrimordialStatic(constructors["Array"],"buffer","Buffer"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayBufferIsView":
+      value=__otterPrimordialStatic(constructors["Array"],"bufferIsView","BufferIsView"); if(value!==__otterPrimordialMissing)return value;
+      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"isView","IsView"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayBufferPrototype":
+      value=__otterPrimordialObject(constructors["ArrayBuffer"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"bufferPrototype","BufferPrototype"); if(value!==__otterPrimordialMissing)return value;
+      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayBufferPrototypeGetByteLength":
+      value=__otterPrimordialHalf(constructors["ArrayBuffer"],"byteLength",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["ArrayBuffer"],"getByteLength",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"bufferPrototypeGetByteLength","BufferPrototypeGetByteLength"); if(value!==__otterPrimordialMissing)return value;
+      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototypeGetByteLength","PrototypeGetByteLength"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayBufferPrototypeSlice":
+      value=__otterPrimordialMethod(constructors["ArrayBuffer"],"slice",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"bufferPrototypeSlice","BufferPrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
+      value=__otterPrimordialStatic(constructors["ArrayBuffer"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayFrom":
+      value=__otterPrimordialStatic(constructors["Array"],"from","From"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayFromAsync":
+      value=__otterPrimordialStatic(constructors["Array"],"fromAsync","FromAsync"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayIsArray":
+      value=__otterPrimordialStatic(constructors["Array"],"isArray","IsArray"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototype":
+      value=__otterPrimordialObject(constructors["Array"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeAt":
+      value=__otterPrimordialMethod(constructors["Array"],"at",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeAt","PrototypeAt"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeEvery":
+      value=__otterPrimordialMethod(constructors["Array"],"every",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeEvery","PrototypeEvery"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeFill":
+      value=__otterPrimordialMethod(constructors["Array"],"fill",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeFill","PrototypeFill"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeFilter":
+      value=__otterPrimordialMethod(constructors["Array"],"filter",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeFilter","PrototypeFilter"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeFind":
+      value=__otterPrimordialMethod(constructors["Array"],"find",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeFind","PrototypeFind"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeFlatMap":
+      value=__otterPrimordialMethod(constructors["Array"],"flatMap",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeFlatMap","PrototypeFlatMap"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeForEach":
+      value=__otterPrimordialMethod(constructors["Array"],"forEach",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeForEach","PrototypeForEach"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeIncludes":
+      value=__otterPrimordialMethod(constructors["Array"],"includes",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeIncludes","PrototypeIncludes"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeIndexOf":
+      value=__otterPrimordialMethod(constructors["Array"],"indexOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeIndexOf","PrototypeIndexOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeJoin":
+      value=__otterPrimordialMethod(constructors["Array"],"join",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeJoin","PrototypeJoin"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeMap":
+      value=__otterPrimordialMethod(constructors["Array"],"map",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeMap","PrototypeMap"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypePop":
+      value=__otterPrimordialMethod(constructors["Array"],"pop",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypePop","PrototypePop"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypePush":
+      value=__otterPrimordialMethod(constructors["Array"],"push",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypePush","PrototypePush"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypePushApply":
+      value=__otterPrimordialApply(constructors["Array"],"push"); if(value!==undefined)return value;
+      value=__otterPrimordialStaticApply(constructors["Array"],"prototypePush","PrototypePush"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Array"],"pushApply",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypePushApply","PrototypePushApply"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeReduce":
+      value=__otterPrimordialMethod(constructors["Array"],"reduce",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeReduce","PrototypeReduce"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeReverse":
+      value=__otterPrimordialMethod(constructors["Array"],"reverse",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeReverse","PrototypeReverse"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeShift":
+      value=__otterPrimordialMethod(constructors["Array"],"shift",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeShift","PrototypeShift"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeSlice":
+      value=__otterPrimordialMethod(constructors["Array"],"slice",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeSome":
+      value=__otterPrimordialMethod(constructors["Array"],"some",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeSome","PrototypeSome"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeSort":
+      value=__otterPrimordialMethod(constructors["Array"],"sort",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeSort","PrototypeSort"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeSplice":
+      value=__otterPrimordialMethod(constructors["Array"],"splice",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeSplice","PrototypeSplice"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeToSorted":
+      value=__otterPrimordialMethod(constructors["Array"],"toSorted",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeToSorted","PrototypeToSorted"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeUnshift":
+      value=__otterPrimordialMethod(constructors["Array"],"unshift",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeUnshift","PrototypeUnshift"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ArrayPrototypeUnshiftApply":
+      value=__otterPrimordialApply(constructors["Array"],"unshift"); if(value!==undefined)return value;
+      value=__otterPrimordialStaticApply(constructors["Array"],"prototypeUnshift","PrototypeUnshift"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Array"],"unshiftApply",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Array"],"prototypeUnshiftApply","PrototypeUnshiftApply"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "AsyncIteratorPrototype":
+      value=__otterPrimordialObject(constructors["AsyncIterator"]); if(value!==undefined)return value;
+      return undefined;
+    case "BigIntPrototypeToString":
+      value=__otterPrimordialMethod(constructors["BigInt"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["BigInt"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "BigIntPrototypeValueOf":
+      value=__otterPrimordialMethod(constructors["BigInt"],"valueOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["BigInt"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "BooleanPrototype":
+      value=__otterPrimordialObject(constructors["Boolean"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Boolean"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "BooleanPrototypeValueOf":
+      value=__otterPrimordialMethod(constructors["Boolean"],"valueOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Boolean"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DataViewPrototype":
+      value=__otterPrimordialObject(constructors["DataView"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["DataView"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DataViewPrototypeGetBuffer":
+      value=__otterPrimordialHalf(constructors["DataView"],"buffer",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["DataView"],"getBuffer",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetBuffer","PrototypeGetBuffer"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DataViewPrototypeGetByteLength":
+      value=__otterPrimordialHalf(constructors["DataView"],"byteLength",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["DataView"],"getByteLength",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetByteLength","PrototypeGetByteLength"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DataViewPrototypeGetByteOffset":
+      value=__otterPrimordialHalf(constructors["DataView"],"byteOffset",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["DataView"],"getByteOffset",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["DataView"],"prototypeGetByteOffset","PrototypeGetByteOffset"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DateNow":
+      value=__otterPrimordialStatic(constructors["Date"],"now","Now"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototype":
+      value=__otterPrimordialObject(constructors["Date"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetDate":
+      value=__otterPrimordialHalf(constructors["Date"],"date",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getDate",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetDate","PrototypeGetDate"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetFullYear":
+      value=__otterPrimordialHalf(constructors["Date"],"fullYear",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getFullYear",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetFullYear","PrototypeGetFullYear"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetHours":
+      value=__otterPrimordialHalf(constructors["Date"],"hours",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getHours",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetHours","PrototypeGetHours"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetMinutes":
+      value=__otterPrimordialHalf(constructors["Date"],"minutes",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getMinutes",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetMinutes","PrototypeGetMinutes"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetMonth":
+      value=__otterPrimordialHalf(constructors["Date"],"month",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getMonth",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetMonth","PrototypeGetMonth"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetSeconds":
+      value=__otterPrimordialHalf(constructors["Date"],"seconds",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getSeconds",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetSeconds","PrototypeGetSeconds"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeGetTime":
+      value=__otterPrimordialHalf(constructors["Date"],"time",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Date"],"getTime",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeGetTime","PrototypeGetTime"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeToISOString":
+      value=__otterPrimordialMethod(constructors["Date"],"toISOString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeToISOString","PrototypeToISOString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeToLocaleString":
+      value=__otterPrimordialMethod(constructors["Date"],"toLocaleString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeToLocaleString","PrototypeToLocaleString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "DatePrototypeToString":
+      value=__otterPrimordialMethod(constructors["Date"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Date"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ErrorCaptureStackTrace":
+      value=__otterPrimordialStatic(constructors["Error"],"captureStackTrace","CaptureStackTrace"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ErrorPrototype":
+      value=__otterPrimordialObject(constructors["Error"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Error"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ErrorPrototypeToString":
+      value=__otterPrimordialMethod(constructors["Error"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Error"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "FunctionPrototype":
+      value=__otterPrimordialObject(constructors["Function"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Function"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "FunctionPrototypeBind":
+      value=__otterPrimordialMethod(constructors["Function"],"bind",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Function"],"prototypeBind","PrototypeBind"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "FunctionPrototypeCall":
+      value=__otterPrimordialMethod(constructors["Function"],"call",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Function"],"prototypeCall","PrototypeCall"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "FunctionPrototypeSymbolHasInstance":
+      value=__otterPrimordialMethod(constructors["Function"],"symbolHasInstance","SymbolHasInstance","hasInstance"); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Function"],"prototypeSymbolHasInstance","PrototypeSymbolHasInstance"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "FunctionPrototypeToString":
+      value=__otterPrimordialMethod(constructors["Function"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Function"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "IteratorPrototype":
+      value=__otterPrimordialObject(constructors["Iterator"]); if(value!==undefined)return value;
+      return undefined;
+    case "JSONParse":
+      value=__otterPrimordialStatic(namespaces["JSON"],"parse","Parse"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "JSONStringify":
+      value=__otterPrimordialStatic(namespaces["JSON"],"stringify","Stringify"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MapPrototype":
+      value=__otterPrimordialObject(constructors["Map"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Map"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MapPrototypeEntries":
+      value=__otterPrimordialMethod(constructors["Map"],"entries",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Map"],"prototypeEntries","PrototypeEntries"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MapPrototypeGet":
+      value=__otterPrimordialMethod(constructors["Map"],"get",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Map"],"prototypeGet","PrototypeGet"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MapPrototypeGetSize":
+      value=__otterPrimordialHalf(constructors["Map"],"size",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Map"],"getSize",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Map"],"prototypeGetSize","PrototypeGetSize"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MapPrototypeValues":
+      value=__otterPrimordialMethod(constructors["Map"],"values",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Map"],"prototypeValues","PrototypeValues"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathAbs":
+      value=__otterPrimordialStatic(namespaces["Math"],"abs","Abs"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathCeil":
+      value=__otterPrimordialStatic(namespaces["Math"],"ceil","Ceil"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathFloor":
+      value=__otterPrimordialStatic(namespaces["Math"],"floor","Floor"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathImul":
+      value=__otterPrimordialStatic(namespaces["Math"],"imul","Imul"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathMax":
+      value=__otterPrimordialStatic(namespaces["Math"],"max","Max"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathMaxApply":
+      value=__otterPrimordialStaticApply(namespaces["Math"],"max","Max"); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(namespaces["Math"],"maxApply","MaxApply"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathMin":
+      value=__otterPrimordialStatic(namespaces["Math"],"min","Min"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathRandom":
+      value=__otterPrimordialStatic(namespaces["Math"],"random","Random"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathRound":
+      value=__otterPrimordialStatic(namespaces["Math"],"round","Round"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathSqrt":
+      value=__otterPrimordialStatic(namespaces["Math"],"sqrt","Sqrt"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "MathTrunc":
+      value=__otterPrimordialStatic(namespaces["Math"],"trunc","Trunc"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberIsFinite":
+      value=__otterPrimordialStatic(constructors["Number"],"isFinite","IsFinite"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberIsInteger":
+      value=__otterPrimordialStatic(constructors["Number"],"isInteger","IsInteger"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberIsNaN":
+      value=__otterPrimordialStatic(constructors["Number"],"isNaN","IsNaN"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberIsSafeInteger":
+      value=__otterPrimordialStatic(constructors["Number"],"isSafeInteger","IsSafeInteger"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberMAX_SAFE_INTEGER":
+      value=__otterPrimordialStatic(constructors["Number"],"MAX_SAFE_INTEGER",null); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberMIN_SAFE_INTEGER":
+      value=__otterPrimordialStatic(constructors["Number"],"MIN_SAFE_INTEGER",null); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberParseFloat":
+      value=__otterPrimordialStatic(constructors["Number"],"parseFloat","ParseFloat"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberParseInt":
+      value=__otterPrimordialStatic(constructors["Number"],"parseInt","ParseInt"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberPrototype":
+      value=__otterPrimordialObject(constructors["Number"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Number"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberPrototypeToFixed":
+      value=__otterPrimordialMethod(constructors["Number"],"toFixed",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Number"],"prototypeToFixed","PrototypeToFixed"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberPrototypeToString":
+      value=__otterPrimordialMethod(constructors["Number"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Number"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "NumberPrototypeValueOf":
+      value=__otterPrimordialMethod(constructors["Number"],"valueOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Number"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectAssign":
+      value=__otterPrimordialStatic(constructors["Object"],"assign","Assign"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectCreate":
+      value=__otterPrimordialStatic(constructors["Object"],"create","Create"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectDefineProperties":
+      value=__otterPrimordialStatic(constructors["Object"],"defineProperties","DefineProperties"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectDefineProperty":
+      value=__otterPrimordialStatic(constructors["Object"],"defineProperty","DefineProperty"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectEntries":
+      value=__otterPrimordialStatic(constructors["Object"],"entries","Entries"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectFreeze":
+      value=__otterPrimordialStatic(constructors["Object"],"freeze","Freeze"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectGetOwnPropertyDescriptor":
+      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyDescriptor","GetOwnPropertyDescriptor"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectGetOwnPropertyDescriptors":
+      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyDescriptors","GetOwnPropertyDescriptors"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectGetOwnPropertyNames":
+      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertyNames","GetOwnPropertyNames"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectGetOwnPropertySymbols":
+      value=__otterPrimordialStatic(constructors["Object"],"getOwnPropertySymbols","GetOwnPropertySymbols"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectGetPrototypeOf":
+      value=__otterPrimordialMethod(constructors["ObjectGet"],"of",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"getPrototypeOf","GetPrototypeOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectHasOwn":
+      value=__otterPrimordialStatic(constructors["Object"],"hasOwn","HasOwn"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectIs":
+      value=__otterPrimordialStatic(constructors["Object"],"is","Is"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectIsExtensible":
+      value=__otterPrimordialStatic(constructors["Object"],"isExtensible","IsExtensible"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectKeys":
+      value=__otterPrimordialStatic(constructors["Object"],"keys","Keys"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectPrototype":
+      value=__otterPrimordialObject(constructors["Object"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectPrototypeHasOwnProperty":
+      value=__otterPrimordialMethod(constructors["Object"],"hasOwnProperty",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"prototypeHasOwnProperty","PrototypeHasOwnProperty"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectPrototypeIsPrototypeOf":
+      value=__otterPrimordialMethod(constructors["Object"],"isPrototypeOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"prototypeIsPrototypeOf","PrototypeIsPrototypeOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectPrototypePropertyIsEnumerable":
+      value=__otterPrimordialMethod(constructors["Object"],"propertyIsEnumerable",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"prototypePropertyIsEnumerable","PrototypePropertyIsEnumerable"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectPrototypeToString":
+      value=__otterPrimordialMethod(constructors["Object"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectSeal":
+      value=__otterPrimordialStatic(constructors["Object"],"seal","Seal"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectSetPrototypeOf":
+      value=__otterPrimordialMethod(constructors["ObjectSet"],"of",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Object"],"setPrototypeOf","SetPrototypeOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ObjectValues":
+      value=__otterPrimordialStatic(constructors["Object"],"values","Values"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "PromisePrototype":
+      value=__otterPrimordialObject(constructors["Promise"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Promise"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "PromisePrototypeCatch":
+      value=__otterPrimordialMethod(constructors["Promise"],"catch",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Promise"],"prototypeCatch","PrototypeCatch"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "PromisePrototypeThen":
+      value=__otterPrimordialMethod(constructors["Promise"],"then",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Promise"],"prototypeThen","PrototypeThen"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "PromiseReject":
+      value=__otterPrimordialStatic(constructors["Promise"],"reject","Reject"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "PromiseResolve":
+      value=__otterPrimordialStatic(constructors["Promise"],"resolve","Resolve"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "PromiseWithResolvers":
+      value=__otterPrimordialStatic(constructors["Promise"],"withResolvers","WithResolvers"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RangeErrorPrototype":
+      value=__otterPrimordialObject(constructors["RangeError"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RangeError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ReflectApply":
+      value=__otterPrimordialStatic(namespaces["Reflect"],"apply","Apply"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ReflectConstruct":
+      value=__otterPrimordialStatic(namespaces["Reflect"],"construct","Construct"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ReflectDefineProperty":
+      value=__otterPrimordialStatic(namespaces["Reflect"],"defineProperty","DefineProperty"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ReflectGet":
+      value=__otterPrimordialStatic(namespaces["Reflect"],"get","Get"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ReflectGetOwnPropertyDescriptor":
+      value=__otterPrimordialStatic(namespaces["Reflect"],"getOwnPropertyDescriptor","GetOwnPropertyDescriptor"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "ReflectOwnKeys":
+      value=__otterPrimordialStatic(namespaces["Reflect"],"ownKeys","OwnKeys"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototype":
+      value=__otterPrimordialObject(constructors["RegExp"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeExec":
+      value=__otterPrimordialMethod(constructors["RegExp"],"exec",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeExec","PrototypeExec"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetDotAll":
+      value=__otterPrimordialHalf(constructors["RegExp"],"dotAll",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getDotAll",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetDotAll","PrototypeGetDotAll"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetGlobal":
+      value=__otterPrimordialHalf(constructors["RegExp"],"global",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getGlobal",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetGlobal","PrototypeGetGlobal"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetHasIndices":
+      value=__otterPrimordialHalf(constructors["RegExp"],"hasIndices",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getHasIndices",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetHasIndices","PrototypeGetHasIndices"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetIgnoreCase":
+      value=__otterPrimordialHalf(constructors["RegExp"],"ignoreCase",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getIgnoreCase",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetIgnoreCase","PrototypeGetIgnoreCase"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetMultiline":
+      value=__otterPrimordialHalf(constructors["RegExp"],"multiline",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getMultiline",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetMultiline","PrototypeGetMultiline"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetSource":
+      value=__otterPrimordialHalf(constructors["RegExp"],"source",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getSource",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetSource","PrototypeGetSource"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetSticky":
+      value=__otterPrimordialHalf(constructors["RegExp"],"sticky",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getSticky",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetSticky","PrototypeGetSticky"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeGetUnicode":
+      value=__otterPrimordialHalf(constructors["RegExp"],"unicode",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["RegExp"],"getUnicode",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeGetUnicode","PrototypeGetUnicode"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeSymbolReplace":
+      value=__otterPrimordialMethod(constructors["RegExp"],"symbolReplace","SymbolReplace","replace"); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeSymbolReplace","PrototypeSymbolReplace"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeSymbolSplit":
+      value=__otterPrimordialMethod(constructors["RegExp"],"symbolSplit","SymbolSplit","split"); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeSymbolSplit","PrototypeSymbolSplit"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeTest":
+      value=__otterPrimordialMethod(constructors["RegExp"],"test",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeTest","PrototypeTest"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "RegExpPrototypeToString":
+      value=__otterPrimordialMethod(constructors["RegExp"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["RegExp"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SafePromisePrototypeFinally":
+      value=__otterPrimordialMethod(constructors["SafePromise"],"finally",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "SafeStringPrototypeSearch":
+      value=__otterPrimordialMethod(constructors["SafeString"],"search",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "SetPrototype":
+      value=__otterPrimordialObject(constructors["Set"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Set"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SetPrototypeGetSize":
+      value=__otterPrimordialHalf(constructors["Set"],"size",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Set"],"getSize",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Set"],"prototypeGetSize","PrototypeGetSize"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SetPrototypeUnion":
+      value=__otterPrimordialMethod(constructors["Set"],"union",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Set"],"prototypeUnion","PrototypeUnion"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SetPrototypeValues":
+      value=__otterPrimordialMethod(constructors["Set"],"values",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Set"],"prototypeValues","PrototypeValues"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringFromCharCode":
+      value=__otterPrimordialStatic(constructors["String"],"fromCharCode","FromCharCode"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototype":
+      value=__otterPrimordialObject(constructors["String"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeCharAt":
+      value=__otterPrimordialMethod(constructors["String"],"charAt",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeCharAt","PrototypeCharAt"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeCharCodeAt":
+      value=__otterPrimordialMethod(constructors["String"],"charCodeAt",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeCharCodeAt","PrototypeCharCodeAt"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeCodePointAt":
+      value=__otterPrimordialMethod(constructors["String"],"codePointAt",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeCodePointAt","PrototypeCodePointAt"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeEndsWith":
+      value=__otterPrimordialMethod(constructors["String"],"endsWith",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeEndsWith","PrototypeEndsWith"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeIncludes":
+      value=__otterPrimordialMethod(constructors["String"],"includes",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeIncludes","PrototypeIncludes"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeIndexOf":
+      value=__otterPrimordialMethod(constructors["String"],"indexOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeIndexOf","PrototypeIndexOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeLastIndexOf":
+      value=__otterPrimordialMethod(constructors["String"],"lastIndexOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeLastIndexOf","PrototypeLastIndexOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeLocaleCompare":
+      value=__otterPrimordialMethod(constructors["String"],"localeCompare",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeLocaleCompare","PrototypeLocaleCompare"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeNormalize":
+      value=__otterPrimordialMethod(constructors["String"],"normalize",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeNormalize","PrototypeNormalize"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypePadEnd":
+      value=__otterPrimordialMethod(constructors["String"],"padEnd",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypePadEnd","PrototypePadEnd"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypePadStart":
+      value=__otterPrimordialMethod(constructors["String"],"padStart",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypePadStart","PrototypePadStart"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeRepeat":
+      value=__otterPrimordialMethod(constructors["String"],"repeat",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeRepeat","PrototypeRepeat"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeReplace":
+      value=__otterPrimordialMethod(constructors["String"],"replace",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeReplace","PrototypeReplace"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeReplaceAll":
+      value=__otterPrimordialMethod(constructors["String"],"replaceAll",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeReplaceAll","PrototypeReplaceAll"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeSlice":
+      value=__otterPrimordialMethod(constructors["String"],"slice",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeSlice","PrototypeSlice"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeSplit":
+      value=__otterPrimordialMethod(constructors["String"],"split",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeSplit","PrototypeSplit"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeStartsWith":
+      value=__otterPrimordialMethod(constructors["String"],"startsWith",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeStartsWith","PrototypeStartsWith"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeSubstring":
+      value=__otterPrimordialMethod(constructors["String"],"substring",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeSubstring","PrototypeSubstring"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeToLowerCase":
+      value=__otterPrimordialMethod(constructors["String"],"toLowerCase",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeToLowerCase","PrototypeToLowerCase"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeToUpperCase":
+      value=__otterPrimordialMethod(constructors["String"],"toUpperCase",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeToUpperCase","PrototypeToUpperCase"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeToWellFormed":
+      value=__otterPrimordialMethod(constructors["String"],"toWellFormed",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeToWellFormed","PrototypeToWellFormed"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeTrim":
+      value=__otterPrimordialMethod(constructors["String"],"trim",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeTrim","PrototypeTrim"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "StringPrototypeValueOf":
+      value=__otterPrimordialMethod(constructors["String"],"valueOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["String"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolAsyncDispose":
+      value=__otterPrimordialStatic(constructors["Symbol"],"asyncDispose","AsyncDispose"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolAsyncIterator":
+      value=__otterPrimordialStatic(constructors["Symbol"],"asyncIterator","AsyncIterator"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolDispose":
+      value=__otterPrimordialStatic(constructors["Symbol"],"dispose","Dispose"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolFor":
+      value=__otterPrimordialStatic(constructors["Symbol"],"for","For"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolHasInstance":
+      value=__otterPrimordialStatic(constructors["Symbol"],"hasInstance","HasInstance"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolIterator":
+      value=__otterPrimordialStatic(constructors["Symbol"],"iterator","Iterator"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolKeyFor":
+      value=__otterPrimordialStatic(constructors["Symbol"],"keyFor","KeyFor"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolPrototypeGetDescription":
+      value=__otterPrimordialHalf(constructors["Symbol"],"description",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(constructors["Symbol"],"getDescription",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Symbol"],"prototypeGetDescription","PrototypeGetDescription"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolPrototypeToString":
+      value=__otterPrimordialMethod(constructors["Symbol"],"toString",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Symbol"],"prototypeToString","PrototypeToString"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolPrototypeValueOf":
+      value=__otterPrimordialMethod(constructors["Symbol"],"valueOf",null,null); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["Symbol"],"prototypeValueOf","PrototypeValueOf"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolReplace":
+      value=__otterPrimordialStatic(constructors["Symbol"],"replace","Replace"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolSpecies":
+      value=__otterPrimordialStatic(constructors["Symbol"],"species","Species"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolSplit":
+      value=__otterPrimordialStatic(constructors["Symbol"],"split","Split"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolToPrimitive":
+      value=__otterPrimordialStatic(constructors["Symbol"],"toPrimitive","ToPrimitive"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "SymbolToStringTag":
+      value=__otterPrimordialStatic(constructors["Symbol"],"toStringTag","ToStringTag"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "TypeErrorPrototype":
+      value=__otterPrimordialObject(constructors["TypeError"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["TypeError"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "TypedArrayPrototype":
+      value=__otterPrimordialObject((constructors["TypedArray"] ?? TypedArray)); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeAt":
+      value=__otterPrimordialMethod(TypedArray,"at",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeFill":
+      value=__otterPrimordialMethod(TypedArray,"fill",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeGetBuffer":
+      value=__otterPrimordialHalf(TypedArray,"buffer",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(TypedArray,"getBuffer",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeGetByteLength":
+      value=__otterPrimordialHalf(TypedArray,"byteLength",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(TypedArray,"getByteLength",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeGetByteOffset":
+      value=__otterPrimordialHalf(TypedArray,"byteOffset",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(TypedArray,"getByteOffset",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeGetLength":
+      value=__otterPrimordialHalf(TypedArray,"length",null,null,"get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(TypedArray,"getLength",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeGetSymbolToStringTag":
+      value=__otterPrimordialHalf(TypedArray,"symbolToStringTag","SymbolToStringTag","toStringTag","get"); if(value!==undefined)return value;
+      value=__otterPrimordialMethod(TypedArray,"getSymbolToStringTag",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeIncludes":
+      value=__otterPrimordialMethod(TypedArray,"includes",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeSet":
+      value=__otterPrimordialMethod(TypedArray,"set",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeSlice":
+      value=__otterPrimordialMethod(TypedArray,"slice",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "TypedArrayPrototypeSubarray":
+      value=__otterPrimordialMethod(TypedArray,"subarray",null,null); if(value!==undefined)return value;
+      return undefined;
+    case "WeakMapPrototype":
+      value=__otterPrimordialObject(constructors["WeakMap"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["WeakMap"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
+    case "WeakSetPrototype":
+      value=__otterPrimordialObject(constructors["WeakSet"]); if(value!==undefined)return value;
+      value=__otterPrimordialStatic(constructors["WeakSet"],"prototype","Prototype"); if(value!==__otterPrimordialMissing)return value;
+      return undefined;
   }
   return undefined;
+}
+
+function __otterPrimordialObject(base) {
+  if(base)return base.prototype??base;
+}
+
+function __otterPrimordialHalf(base,key,symbolName,symbolFallback,half) {
+  const proto=base?.prototype;
+  if(proto){
+    const fallback=symbolName && !(symbolName in symbolWells)?symbolWells[symbolName]:key;
+    const lookup=symbolName?(symbolWells[symbolName]??Symbol[symbolFallback]):key;
+    const descriptor=Object.getOwnPropertyDescriptor(proto,lookup??fallback);
+    const method=descriptor?.[half];
+    if(method)return uncurryThis(method);
+  }
+}
+
+function __otterPrimordialApply(base,key) {
+  const method=base?.prototype?.[key];
+  if(typeof method==='function')return (thisArg,args)=>ReflectApply(method,thisArg,args);
+}
+
+function __otterPrimordialMethod(base,key,symbolName,symbolFallback) {
+  const proto=base?.prototype;
+  if(proto){
+    const lookup=symbolName?(symbolWells[symbolName]??Symbol[symbolFallback]):key;
+    const method=proto[lookup];
+    if(typeof method==='function')return uncurryThis(method);
+    const descriptor=Object.getOwnPropertyDescriptor(proto,lookup);
+    if(descriptor?.get)return uncurryThis(descriptor.get);
+  }
+}
+
+function __otterPrimordialStatic(holder,key0,key1) {
+  if(!holder)return __otterPrimordialMissing;
+  let key;
+  if(key0 in holder)key=key0;
+  else if(key1!==null && key1 in holder)key=key1;
+  else return __otterPrimordialMissing;
+  const member=holder[key];
+  return typeof member==='function'?member.bind(holder):member;
+}
+
+function __otterPrimordialStaticApply(holder,key0,key1) {
+  if(holder){
+    const member=key1===null?holder[key0]:(holder[key0]??holder[key1]);
+    if(typeof member==='function')return (args)=>ReflectApply(member,holder,args);
+  }
 }
 
 const primordials = new Proxy(Object.create(null), {

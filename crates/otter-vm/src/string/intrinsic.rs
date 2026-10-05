@@ -50,7 +50,7 @@ fn pin_string_data_and_aliases(
 ) -> Result<(), JsSurfaceError> {
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        .map_err(JsSurfaceError::from)?;
     let mut prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
@@ -58,15 +58,25 @@ fn pin_string_data_and_aliases(
         Some(p) => p,
         None => return Ok(()),
     };
-    let empty_str =
-        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
-    crate::object::set_string_data(&mut prototype, heap, empty_str);
+    use crate::rooting::RootScopeExt;
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the prototype slot precedes this scope and is not moved until
+    // after all allocating state/descriptor owners return.
+    unsafe { roots.add_object(&mut prototype) };
+    let empty_str = crate::string::JsString::from_str("", heap)?;
+    crate::object::set_string_data(&mut prototype, heap, empty_str)?;
 
-    if let Some(start_fn) = object::get(prototype, heap, "trimStart") {
-        object::set(&mut prototype, heap, "trimLeft", start_fn);
-    }
-    if let Some(end_fn) = object::get(prototype, heap, "trimEnd") {
-        object::set(&mut prototype, heap, "trimRight", end_fn);
+    for (alias, original) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
+        if let Some(function) = object::get(prototype, heap, original)
+            && !object::define_own_property_in_place(
+                &mut prototype,
+                heap,
+                alias,
+                object::PropertyDescriptor::data(function, true, false, true),
+            )?
+        {
+            return Err(JsSurfaceError::DefinePropertyFailed(alias));
+        }
     }
     Ok(())
 }
@@ -130,9 +140,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                 crate::abstract_ops::ToPrimitiveHint::String,
             )
         });
-        let primitive = primitive.map_err(|error| {
-            crate::native_function::vm_to_native_error(ctx.interp_mut(), error, "String")
-        })?;
+        let primitive = primitive.map_err(|error| error.into_native(ctx.interp_mut(), "String"))?;
         // The step-2.a shortcut covers only a Symbol passed directly.
         // A Symbol *object* reaches step 2.b, where its
         // `@@toPrimitive` hands back the wrapped Symbol and ToString
@@ -163,7 +171,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         };
         let this = *ctx.this_value();
         if let Some(mut obj) = this.as_object() {
-            crate::object::set_string_data(&mut obj, ctx.heap_mut(), string);
+            crate::object::set_string_data(&mut obj, ctx.heap_mut(), string)?;
             Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {

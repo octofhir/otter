@@ -334,11 +334,7 @@ fn coerce_set_args(
             let number = match number {
                 Ok(number) => number,
                 Err(error) => {
-                    return Err(crate::native_function::vm_to_native_error(
-                        scope.context().interp_mut(),
-                        error,
-                        name,
-                    ));
+                    return Err(error.into_native(scope.context().interp_mut(), name));
                 }
             };
             coerced.push(Value::number(number));
@@ -816,7 +812,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         });
         let primitive = match primitive {
             Ok(value) => value,
-            Err(error) => return Err(vm_to_native(scope.context().interp_mut(), NAME, error)),
+            Err(error) => return Err(error.into_native(scope.context().interp_mut(), NAME)),
         };
         // Step 3 — non-finite Number → null.
         if let Some(number) = primitive.as_number()
@@ -845,7 +841,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         let method_outcome = scope.with_turn_parts(|interp, stack| {
             interp.ordinary_get_value(
                 stack,
-                &exec,
+                Some(&exec),
                 base,
                 receiver_value,
                 &VmPropertyKey::String("toISOString"),
@@ -854,7 +850,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         });
         let method_outcome = match method_outcome {
             Ok(outcome) => outcome,
-            Err(error) => return Err(vm_to_native(scope.context().interp_mut(), NAME, error)),
+            Err(error) => return Err(error.into_native(scope.context().interp_mut(), NAME)),
         };
         let method_value = match method_outcome {
             VmGetOutcome::Value(value) => value,
@@ -865,7 +861,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
                 let result = scope.with_turn_parts(|interp, stack| {
                     interp.run_callable_sync_rooted(
                         stack,
-                        &exec,
+                        Some(&exec),
                         &getter_value,
                         receiver_value,
                         SmallVec::new(),
@@ -891,7 +887,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         let result = scope.with_turn_parts(|interp, stack| {
             interp.run_callable_sync_rooted(
                 stack,
-                &exec,
+                Some(&exec),
                 &method_value,
                 receiver_value,
                 SmallVec::new(),

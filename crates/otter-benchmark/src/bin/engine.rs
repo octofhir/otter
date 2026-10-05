@@ -19,14 +19,15 @@
 //!   through measurement but covers only actual tier-up invocations, while
 //!   layout diagnostics describe the prepared module and final native-code
 //!   residency once.
-//! - Kernel allocation and GC deltas use the same untimed snapshot window;
-//!   minor and full pause times stay separate because full GC includes a minor.
+//! - Kernel allocation and GC deltas use the same untimed snapshot window.
+//! - Every GC measurement keeps minor and full pause times separate because
+//!   a full collection includes a minor; their totals cannot be added.
 //! - Feedback seeding, JIT snapshot construction, and compiler-hook
 //!   construction are outside native-emitter samples.
 //! - Feedback seed calls stay interpreted so hot loops cannot OSR before every
 //!   operation has contributed type feedback to the measured snapshot.
 //! - Optimizing compile samples are accepted only when an untimed artifact
-//!   proof identifies the replacement Machine IR backend for the same snapshot.
+//!   proof shows the graph backend's IR for the same snapshot.
 //! - Every idle-memory sample owns a fresh release process and runtime.
 //! - Idle-memory diagnostics allocate only in the benchmark process; ordinary
 //!   runtime construction does not enable background sampling.
@@ -34,6 +35,9 @@
 //!   measured samples remain independently fresh.
 //! - Raw observations are retained alongside their median aggregates.
 //! - Every successful record is semantically validated.
+
+#[path = "engine/source.rs"]
+mod source;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -267,7 +271,8 @@ struct Measurements {
     runtime_build_time_ns: Vec<u64>,
     code_bytes: Vec<u64>,
     allocations: Vec<u64>,
-    gc_time_ns: Vec<u64>,
+    full_gc_pause_time_ns: Vec<u64>,
+    minor_gc_pause_time_ns: Vec<u64>,
     heap_bytes: Vec<u64>,
     startup_time_ns: Vec<u64>,
     bootstrap_rss_bytes: Vec<u64>,
@@ -442,10 +447,6 @@ fn jit_counter_deltas(before: JitRuntimeStats, after: JitRuntimeStats) -> Vec<(&
             "jit-class-super-resolution-transitions",
             class_super_resolution_transitions
         ),
-        (
-            "jit-constructor-field-transition-installs",
-            constructor_field_transition_installs
-        ),
         ("jit-caller-invalidations", caller_invalidations),
         ("jit-to-rust-call-transitions", jit_to_rust_call_transitions),
         ("jit-generated-template-entries", generated_template_entries),
@@ -581,10 +582,16 @@ fn benchmark_result(record: RunRecord) -> BenchmarkResult {
         &record.measurements.allocations,
     );
     push_metric(
-        "gc-time",
+        "full-gc-pause-time-total",
         MetricUnit::Nanoseconds,
         MetricDirection::LowerIsBetter,
-        &record.measurements.gc_time_ns,
+        &record.measurements.full_gc_pause_time_ns,
+    );
+    push_metric(
+        "minor-gc-pause-time-total",
+        MetricUnit::Nanoseconds,
+        MetricDirection::LowerIsBetter,
+        &record.measurements.minor_gc_pause_time_ns,
     );
     push_metric(
         "retained-heap",
@@ -835,7 +842,15 @@ fn run_call(
             );
         }
     };
-    let context = match ExecutionContext::from_module(module) {
+    let sources = match source::registry(
+        &source,
+        "engine-call.js",
+        &otter_runtime::ResourceAccount::default(),
+    ) {
+        Ok(sources) => sources,
+        Err(error) => return fail(error.kind, error.message),
+    };
+    let context = match ExecutionContext::from_module(module, sources) {
         Ok(context) => context,
         Err(error) => {
             return fail(
@@ -844,7 +859,15 @@ fn run_call(
             );
         }
     };
-    let mut interpreter = Interpreter::new();
+    let mut interpreter = match Interpreter::new() {
+        Ok(interpreter) => interpreter,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Runtime,
+                format!("interpreter bootstrap failed: {error}"),
+            );
+        }
+    };
     configure_interpreter(&mut interpreter, jit_tier);
     let validate = |value: otter_vm::Value| {
         value
@@ -1012,7 +1035,12 @@ fn compile_kernel_context(
         .find(|function| function.name == KERNEL_INVOCATION_FUNCTION)
         .expect("exactly one invocation function was counted")
         .id;
-    let context = ExecutionContext::from_module(module).map_err(|error| RunFailure {
+    let sources = source::registry(
+        &source,
+        source_path.to_string_lossy().as_ref(),
+        &otter_runtime::ResourceAccount::default(),
+    )?;
+    let context = ExecutionContext::from_module(module, sources).map_err(|error| RunFailure {
         kind: RunFailureKind::Compile,
         message: format!("bytecode link failed: {error}"),
     })?;
@@ -1106,7 +1134,15 @@ fn run_kernel(
         bytecode_bytes,
         opcode_count,
     } = prepared;
-    let mut interpreter = Interpreter::new();
+    let mut interpreter = match Interpreter::new() {
+        Ok(interpreter) => interpreter,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Runtime,
+                format!("interpreter bootstrap failed: {error}"),
+            );
+        }
+    };
     let compiler_probe = jit_tier.compiler().map(JitCompilerProbe::new);
     if let Some(compiler_probe) = &compiler_probe {
         compiler_probe.install(&mut interpreter);
@@ -1603,8 +1639,24 @@ fn run_jit_compile(
         }
     };
     let validation_module = module.clone();
-    let mut feedback_interpreter = Interpreter::new();
-    let context = match feedback_interpreter.link_module(module) {
+    let mut feedback_interpreter = match Interpreter::new() {
+        Ok(interpreter) => interpreter,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Runtime,
+                format!("interpreter bootstrap failed: {error}"),
+            );
+        }
+    };
+    let sources = match source::registry(
+        &source,
+        source_path.to_string_lossy().as_ref(),
+        &feedback_interpreter.resource_account(),
+    ) {
+        Ok(sources) => sources,
+        Err(error) => return fail(error.kind, error.message),
+    };
+    let context = match feedback_interpreter.link_module(module, sources.clone()) {
         Ok(context) => context,
         Err(error) => {
             return fail(
@@ -1745,39 +1797,28 @@ fn run_jit_compile(
                 "optimizing backend artifact omitted optimized-ir.txt".into(),
             );
         };
-        if !optimized_ir
-            .contents()
-            .starts_with(b"; backend=otter-machine-ir scalar-function\n")
-        {
-            let feedback = view
-                .instructions
-                .iter()
-                .filter_map(|instruction| {
-                    let feedback = instruction.arith_feedback();
-                    (!feedback.is_empty()).then(|| {
-                        format!(
-                            "{}:{:?}=0x{:02x}",
-                            instruction.instruction_pc(&view.code_block),
-                            instruction.op(&view.code_block),
-                            feedback.bits()
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(",");
+        if !optimized_ir.contents().starts_with(b"; otter graph\n") {
             return fail(
                 RunFailureKind::Validation,
-                format!("optimizing artifact is not Machine IR; feedback={feedback}"),
+                "optimizing backend artifact does not contain graph IR".into(),
             );
         }
-        "otter-machine-ir"
+        "otter-graph"
     } else {
         "template"
     };
     let validation = validation_code.into_validation();
-    let mut validation_interpreter = Interpreter::new();
+    let mut validation_interpreter = match Interpreter::new() {
+        Ok(interpreter) => interpreter,
+        Err(error) => {
+            return fail(
+                RunFailureKind::Runtime,
+                format!("interpreter bootstrap failed: {error}"),
+            );
+        }
+    };
     validation.install(&mut validation_interpreter);
-    let validation_context = match validation_interpreter.link_module(validation_module) {
+    let validation_context = match validation_interpreter.link_module(validation_module, sources) {
         Ok(context) => context,
         Err(error) => {
             return fail(
@@ -1885,7 +1926,15 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
             );
         }
     };
-    let context = match ExecutionContext::from_module(module) {
+    let sources = match source::registry(
+        &source,
+        "engine-memory.js",
+        &otter_runtime::ResourceAccount::default(),
+    ) {
+        Ok(sources) => sources,
+        Err(error) => return fail(error.kind, error.message),
+    };
+    let context = match ExecutionContext::from_module(module, sources) {
         Ok(context) => context,
         Err(error) => {
             return fail(
@@ -1897,7 +1946,15 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
     let expected = f64::from(iterations) * f64::from(iterations.saturating_add(1)) / 2.0;
     let mut measurements = Measurements::default();
     for _ in 0..samples {
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = match Interpreter::new() {
+            Ok(interpreter) => interpreter,
+            Err(error) => {
+                return fail(
+                    RunFailureKind::Runtime,
+                    format!("interpreter bootstrap failed: {error}"),
+                );
+            }
+        };
         let before = interpreter.gc_stats_snapshot();
         let wall_started = Instant::now();
         let execution_started = Instant::now();
@@ -1939,15 +1996,18 @@ fn run_memory(iterations: u32, samples: u32) -> RunRecord {
         measurements
             .heap_bytes
             .push(u64::try_from(after.live_bytes).unwrap_or(u64::MAX));
-        let before_gc = before
-            .minor_pause_ns_total
-            .saturating_add(before.full_pause_ns_total);
-        let after_gc = after
-            .minor_pause_ns_total
-            .saturating_add(after.full_pause_ns_total);
-        measurements
-            .gc_time_ns
-            .push(after_gc.saturating_sub(before_gc));
+        // A full pause includes its initial minor collection. Preserve both
+        // counters independently rather than double-counting that scavenge.
+        measurements.full_gc_pause_time_ns.push(
+            after
+                .full_pause_ns_total
+                .saturating_sub(before.full_pause_ns_total),
+        );
+        measurements.minor_gc_pause_time_ns.push(
+            after
+                .minor_pause_ns_total
+                .saturating_sub(before.minor_pause_ns_total),
+        );
     }
     RunRecord {
         name,
@@ -1981,6 +2041,7 @@ enum IdleMemoryMessage {
         off_heap_reserved_bytes: u64,
         full_gc_cycles: u64,
         full_gc_time_ns: u64,
+        minor_gc_time_ns: u64,
         release_binary_bytes: u64,
         pending_timers: u64,
     },
@@ -2093,6 +2154,9 @@ fn emit_idle_memory_sample(idle_ms: u64) -> Result<(), String> {
             full_gc_time_ns: after
                 .full_pause_ns_total
                 .saturating_sub(before.full_pause_ns_total),
+            minor_gc_time_ns: after
+                .minor_pause_ns_total
+                .saturating_sub(before.minor_pause_ns_total),
             release_binary_bytes,
             pending_timers: u64::from(runtime.has_pending_timer_callbacks()),
         },
@@ -2246,6 +2310,7 @@ fn run_idle_memory(idle_ms: u64, samples: u32) -> RunRecord {
             off_heap_reserved_bytes,
             full_gc_cycles,
             full_gc_time_ns,
+            minor_gc_time_ns,
             release_binary_bytes,
             pending_timers,
         } = complete
@@ -2282,7 +2347,8 @@ fn run_idle_memory(idle_ms: u64, samples: u32) -> RunRecord {
             .off_heap_reserved_bytes
             .push(off_heap_reserved_bytes);
         measurements.full_gc_cycles.push(full_gc_cycles);
-        measurements.gc_time_ns.push(full_gc_time_ns);
+        measurements.full_gc_pause_time_ns.push(full_gc_time_ns);
+        measurements.minor_gc_pause_time_ns.push(minor_gc_time_ns);
         measurements.release_binary_bytes.push(release_binary_bytes);
     }
 
@@ -2528,6 +2594,10 @@ mod tests {
             primary_metric: "wall-time",
             measurements: Measurements {
                 wall_time_ns: vec![9, 1, 4],
+                // Full pauses already contain their minor phase. These
+                // unequal samples must survive independently in the report.
+                full_gc_pause_time_ns: vec![11, 8, 13],
+                minor_gc_pause_time_ns: vec![3, 2, 5],
                 ..Measurements::default()
             },
             validation_marker: Some("ok".into()),
@@ -2545,6 +2615,26 @@ mod tests {
         );
         assert_eq!(result.metrics[0].aggregate.value.as_f64(), 4.0);
         assert_eq!(result.metrics[0].aggregate.statistic, Statistic::Median);
+        for (name, expected, median) in [
+            ("full-gc-pause-time-total", vec![11.0, 8.0, 13.0], 11.0),
+            ("minor-gc-pause-time-total", vec![3.0, 2.0, 5.0], 3.0),
+        ] {
+            let pause = result
+                .metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .unwrap();
+            assert_eq!(
+                pause
+                    .samples
+                    .iter()
+                    .map(|value| value.as_f64())
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            assert_eq!(pause.aggregate.value.as_f64(), median);
+        }
+        assert!(result.metrics.iter().all(|metric| metric.name != "gc-time"));
         assert!(result.sampling.timeout_ms.is_none());
         assert!(result.outcome.process_exit_code.is_none());
         let json = serde_json::to_value(result).unwrap();
@@ -2876,7 +2966,7 @@ mod tests {
             ..
         } = compile_kernel_context(source, Path::new("kernel.js"), "engineKernel")
             .expect("compile kernel");
-        let mut interpreter = Interpreter::new();
+        let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         interpreter.run(&context).expect("evaluate setup");
         interpreter.force_gc().expect("force full GC");
         let value = run_kernel_invocation(&mut interpreter, &context, invocation_id)
@@ -3175,13 +3265,13 @@ iterations = 20000;
             record
                 .validation_marker
                 .as_deref()
-                .is_some_and(|marker| marker.contains("tier=optimizing;backend=otter-machine-ir"))
+                .is_some_and(|marker| marker.contains("tier=optimizing;backend=otter-graph"))
         );
     }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn jit_compile_executes_typed_parameter_loop_through_machine_ir() {
+    fn jit_compile_executes_typed_parameter_loop_through_graph() {
         let record = run_jit_compile(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../benchmarks/scripts/typed-parameter-loop.js"),
@@ -3197,7 +3287,7 @@ iterations = 20000;
             record
                 .validation_marker
                 .as_deref()
-                .is_some_and(|marker| marker.contains("backend=otter-machine-ir"))
+                .is_some_and(|marker| marker.contains("backend=otter-graph"))
         );
     }
 

@@ -31,52 +31,76 @@ so the compiler rejects code that lets one escape.
 use otter_vm::{NativeCtx, NativeError, Value};
 
 fn build_config(ctx: &mut NativeCtx<'_>, port: u16) -> Result<Value, NativeError> {
-    ctx.scope(|ctx, s| {
-        let obj = ctx.scoped_object(s)?;                       // %Object.prototype%
-        let href = ctx.scoped_string(s, "http://localhost/")?;
-        ctx.scoped_set(s, obj, "href", href)?;
-        let port_value = ctx.scoped_number(s, f64::from(port));
-        ctx.scoped_set(s, obj, "port", port_value)?;
+    ctx.scope(|mut scope| {
+        let obj = scope.object()?;                       // %Object.prototype%
+        let href = scope.string( "http://localhost/")?;
+        scope.set( obj, "href", href)?;
+        let port_value = scope.number( f64::from(port));
+        scope.set( obj, "port", port_value)?;
 
-        let items = ctx.scoped_array(s, 2)?;
-        let first = ctx.scoped_string(s, "a")?;
-        ctx.scoped_set_index(s, items, 0, first)?;
-        ctx.scoped_set(s, obj, "items", items)?;
+        let items = scope.array( 2)?;
+        let first = scope.string( "a")?;
+        scope.set_index( items, 0, first)?;
+        scope.set( obj, "items", items)?;
 
-        Ok(ctx.escape(obj))                                    // hand off to the VM
+        Ok(scope.finish(obj))                                    // hand off to the VM
     })
 }
 ```
 
-Everything minted through `s` is rooted for the whole closure. Allocate in
+Every local minted through `scope` is rooted for the whole closure. Allocate in
 any order, let collections fire wherever they like — every handle keeps
 resolving to the current location of its object.
 
 ## Method reference
 
-Creation (all park the result in the scope and return `Scoped<'s>`):
+Creation methods on `NativeScope` park each result and return `Local<'scope>`:
 
 | Method | Produces |
 |---|---|
-| `scoped_string(s, &str)` | JS string |
-| `scoped_object(s)` | ordinary object, `%Object.prototype%` |
-| `scoped_object_bare(s)` | object with `null` prototype |
-| `scoped_array(s, len)` | array of `len` holes |
-| `scoped_host_object(s, data)` | host-backed object (`T: HostObjectData`), null proto |
-| `scoped_native_method(s, name, arity, fn)` | builtin-tagged static native function |
-| `scoped_number(s, f64)` / `scoped_boolean` / `scoped_undefined` / `scoped_null` | immediates (infallible — no `Result`) |
-| `scoped_value(s, value)` | park an **incoming** raw `Value` (do this first!) |
+| `string(&str)` | JS string |
+| `object()` / `bare_object()` | ordinary object with the default or null prototype |
+| `object_with_prototype(local)` | object with a rooted explicit prototype |
+| `array(len)` | array of `len` holes |
+| `host_object(data)` | host-backed object |
+| `number(f64)` / `boolean` / `undefined` / `null` | immediates |
+| `value(value)` | parks an incoming raw `Value` before allocation |
 
-Access (handles resolve through the arena at call time):
+Access resolves locals through their current arena slots:
 
 | Method | Does |
 |---|---|
-| `scoped_get(s, obj, key)` | property read → new scoped handle |
-| `scoped_set(s, obj, key, val)` | ordinary property write |
-| `scoped_define_data(s, obj, key, val, flags)` | define with explicit `PropertyFlags` |
-| `scoped_set_index(s, arr, i, val)` | array element write |
-| `scoped_as_str(v)` / `scoped_as_f64(v)` / `scoped_is_*` | non-allocating reads |
-| `escape(v)` | read the raw `Value` out — **valid until the next allocation** |
+| `get(obj, key)` | property read returning a new local |
+| `global_binding(name)` | ordinary global identifier read, including script lexical bindings, TDZ and unresolvable-name errors |
+| `global_binding_typeof(name)` | observable `typeof` global read, suppressing only unresolvable names |
+| `typeof_kind(local)` | canonical nonallocating ECMAScript `typeof` classification |
+| `set(obj, key, value)` | ordinary property assignment |
+| `define(obj, key, value, flags)` | defines explicit data attributes |
+| `set_index(array, index, value)` | array element write |
+| `string_value(local)` | returns an owned Rust string |
+| `object_allocation_bytes(local)` | reads the actual ordinary cell footprint |
+| `finish(local)` | synchronous value handoff, valid until the next allocation |
+
+`object_allocation_bytes` includes the GC header and inline field region. It
+excludes separate slabs, exotic state and external storage; it is not a retained
+heap estimate. The query performs no JS allocation or reentry and returns only
+an owned scalar.
+
+`global_binding` follows the active realm's global environment: script lexical
+bindings precede the global object record; TDZ and unresolvable names throw.
+`global_binding_typeof` applies the special `typeof` rule only to unresolvable
+names. Object-record getters run normally. `global(name)` is
+the existing nonobservable bootstrap probe; use `global_binding` when replacing
+an observable identifier read. Keep repeated reads separate when getters can
+replace the receiver or callable between a guard and the call.
+
+A top-level engine host extent may consume its `NativeError` through
+`NativeCtx::take_native_error` into the existing owned `RunError`, then use the
+runtime's canonical diagnostic mapping. The conversion delegates the VM's one
+native-error projection and transfers actual pending source frames and detail.
+An already-thrown JS value retains its pending root; a bare native error class
+uses the canonical intrinsic materializer. This boundary does not give nested
+contributors permission to clear an enclosing call's pending error state.
 
 Interpreter-internal code (inside `otter-vm`) uses the same core via
 `Interpreter::with_handle_scope` + the `scoped_*` methods on `Interpreter`.
@@ -85,18 +109,18 @@ Interpreter-internal code (inside `otter-vm`) uses the same core via
 
 1. **Never hold a raw `Value`/`JsObject`/`JsString` across an allocating
    call.** If you receive one (an argument, a property read), park it with
-   `scoped_value` before your first allocation and use the handle from then
+   `scope.value` before your first allocation and use the handle from then
    on.
-2. **`escape` is a hand-off, not a loophole.** The raw `Value` it returns is
+2. **`finish` is a hand-off, not a loophole.** The raw `Value` it returns is
    valid only until the next allocation. Return it to the VM immediately or
    store it into an already-rooted object. Never stash it in a local and keep
    allocating.
 3. **Don't re-derive raw values inside the scope.** Resolve through the
-   handle every time (`scoped_get`, `scoped_as_str`, …). The whole point is
+   handle every time (`scope.get`, `scope.string_value`, …). The whole point is
    that the arena slot is the single source of truth.
-4. **Flags must match the surface you're building.** `scoped_set` gives
-   ordinary data properties; spec'd attributes go through
-   `scoped_define_data` with explicit `Attr::…().to_flags()` — copy the
+4. **Flags must match the surface you're building.** `scope.set` performs
+   ordinary assignment; spec'd attributes go through
+   `scope.define` with explicit `Attr::…().to_flags()` — copy the
    attribute choices from the code you're replacing or the spec text.
 5. **Scopes nest freely.** Open an inner scope for per-iteration temporaries
    in a loop; its handles die at the inner boundary, the outer ones survive.
@@ -139,11 +163,11 @@ handle fails deterministically instead of once a week in production.
 
 ## Escape-proofing is compiler-enforced
 
-`Scoped<'s>` borrows the scope token; letting a handle outlive its scope is
+`Local<'scope>` borrows the scope token; letting a handle outlive its scope is
 a compile error:
 
 ```rust
-let leaked = ctx.scope(|ctx, s| ctx.scoped_string(s, "x").unwrap());
+let leaked = ctx.scope(|ctx, s| scope.string( "x").unwrap());
 // error[E0597]: borrowed value does not live long enough
 ```
 

@@ -1,37 +1,34 @@
 //! `test262_config.toml` loader.
 //!
-//! The format is the one the project has used since the legacy
-//! runner: `timeout_secs`, `max_heap_bytes_per_test`, `skip_features`,
-//! `skip_flags`, `ignored_tests`, `known_panics`. The new-engine
-//! runner reads exactly this file — no renames, no parallel formats.
+//! # Contents
+//! Effective limits and ordered feature, flag, ignored and known-panic policies.
 //!
-//! Resolution rules (CLI flags always win over config defaults):
-//! 1. `--config <path>` if supplied;
-//! 2. `test262_config.toml` in the current working directory;
-//! 3. compiled-in defaults.
+//! # Invariants
+//! The first matching configured pattern determines the typed skip reason.
+//! The CLI validates explicit config files and freezes policy for all workers.
+//!
+//! # See also
+//! - [`crate::provenance::RunConfig`] records effective semantic policy.
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Test262 runner configuration loaded from `test262_config.toml`.
 ///
-/// Fields match the format the project has carried since the legacy
-/// runner — see [`test262_config.toml`](../../../../test262_config.toml)
+/// Effective policy is read from [`test262_config.toml`](../../../../test262_config.toml)
 /// in the repository root.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct Test262Config {
-    /// Path to the test262 directory (informational; the new-engine
-    /// runner always uses `vendor/test262`).
+    /// Informational corpus path; execution uses `vendor/test262`.
     pub test262_path: Option<PathBuf>,
 
     /// Pinned upstream commit (informational; the actual pin lives
     /// in the `vendor/test262` submodule).
     pub test262_commit: Option<String>,
 
-    /// `features:` tokens whose tests are reported as
-    /// `Skipped(<feature>)`.
+    /// `features:` tokens whose tests report a typed feature skip.
     pub skip_features: Vec<String>,
 
     /// `flags:` tokens whose tests are reported as skipped. This is
@@ -73,47 +70,22 @@ impl Test262Config {
             .map_err(|e| format!("failed to parse config '{}': {}", path.display(), e))
     }
 
-    /// Resolve config from `path` if supplied, else
-    /// `test262_config.toml` in the cwd, else defaults. Prints a
-    /// warning to stderr on parse failure but never panics.
-    #[must_use]
-    pub fn load_or_default(path: Option<&Path>) -> Self {
-        if let Some(path) = path {
-            return match Self::load(path) {
-                Ok(cfg) => cfg,
-                Err(message) => {
-                    eprintln!("warning: {message}");
-                    Self::default()
-                }
-            };
-        }
-        let default_path = Path::new("test262_config.toml");
-        if default_path.exists() {
-            return match Self::load(default_path) {
-                Ok(cfg) => cfg,
-                Err(message) => {
-                    eprintln!("warning: {message}");
-                    Self::default()
-                }
-            };
-        }
-        Self::default()
-    }
-
     /// Substring match a normalised path against `ignored_tests`.
     #[must_use]
-    pub fn is_ignored(&self, test_path: &str) -> bool {
+    pub fn first_ignored(&self, test_path: &str) -> Option<&str> {
         self.ignored_tests
             .iter()
-            .any(|pattern| test_path.contains(pattern.as_str()))
+            .find(|pattern| test_path.contains(pattern.as_str()))
+            .map(String::as_str)
     }
 
     /// Substring match a normalised path against `known_panics`.
     #[must_use]
-    pub fn is_known_panic(&self, test_path: &str) -> bool {
+    pub fn first_known_panic(&self, test_path: &str) -> Option<&str> {
         self.known_panics
             .iter()
-            .any(|pattern| test_path.contains(pattern.as_str()))
+            .find(|pattern| test_path.contains(pattern.as_str()))
+            .map(String::as_str)
     }
 
     /// Return the first configured `flags:` token present in
@@ -134,7 +106,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_legacy_config_shape() {
+    fn parses_current_config_shape() {
         let toml = r#"
 timeout_secs = 10
 max_heap_bytes_per_test = 536870912
@@ -151,15 +123,23 @@ known_panics = ["S15.10.2.8_A3_T15"]
             cfg.first_skipped_flag(&["noStrict".to_string()]),
             Some("noStrict")
         );
-        assert!(cfg.is_ignored("staging/sm/Math/foo.js"));
-        assert!(cfg.is_known_panic("RegExp/S15.10.2.8_A3_T15.js"));
+        assert_eq!(
+            cfg.first_ignored("staging/sm/Math/foo.js"),
+            Some("staging/sm/Math")
+        );
+        assert_eq!(
+            cfg.first_known_panic("RegExp/S15.10.2.8_A3_T15.js"),
+            Some("S15.10.2.8_A3_T15")
+        );
     }
 
     #[test]
-    fn defaults_when_missing() {
-        let cfg =
-            Test262Config::load_or_default(Some(Path::new("/definitely/does/not/exist.toml")));
-        assert!(cfg.skip_features.is_empty());
-        assert_eq!(cfg.timeout_secs, None);
+    fn explicit_missing_and_malformed_configs_fail_without_policy_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Test262Config::load(&dir.path().join("missing.toml")).is_err());
+        let path = dir.path().join("broken.toml");
+        std::fs::write(&path, "skip_features = [").unwrap();
+        assert!(Test262Config::load(&path).is_err());
+        assert!(Test262Config::default().skip_features.is_empty());
     }
 }

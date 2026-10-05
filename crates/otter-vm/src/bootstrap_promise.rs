@@ -94,7 +94,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
         promise_species_get,
         &[&global_root, &ctor_root],
     )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    .map_err(JsSurfaceError::from)?;
     if !ctor.define_own_symbol_property(
         heap,
         well_known.get(WellKnown::Species),
@@ -104,7 +104,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
             configurable: Some(true),
             ..Default::default()
         },
-    ) {
+    )? {
         return Err(JsSurfaceError::DefinePropertyFailed(
             "Promise[Symbol.species]",
         ));
@@ -158,9 +158,10 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         }
 
         let executor_value = scope.raw(executor);
-        let (handle, resolve_value, reject_value) = PromiseBuilder::with_context(context.clone())
-            .construct_native_rooted(scope.context(), &[&executor_value], &[args])
-            .map_err(|_| oom("Promise"))?;
+        let (handle, resolve_value, reject_value) =
+            PromiseBuilder::with_context(Some(context.clone()))
+                .construct_native_rooted(scope.context(), &[&executor_value], &[args])
+                .map_err(|_| oom("Promise"))?;
         let promise = scope.value(Value::promise(handle));
         let resolve = scope.value(resolve_value);
         let reject = scope.value(reject_value);

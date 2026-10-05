@@ -35,20 +35,9 @@ use otter_runtime::{
 };
 use otter_vm::object;
 
-const SHIM: &str = include_str!("child_process.js");
 const MAX_SYNC_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 /// CommonJS export: the `child_process` namespace built by `child_process.js`.
-pub fn child_process_cjs_value<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    _caps: &CapabilitySet,
-    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    module: Local<'scope>,
-    require: Local<'scope>,
-) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:child_process", SHIM, module, require)
-}
-
 /// Hidden CommonJS row supplying the capability-gated spawn primitive.
 pub fn child_process_native_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,

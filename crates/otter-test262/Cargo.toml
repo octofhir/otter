@@ -26,6 +26,7 @@ smallvec     = { workspace = true }
 # Parsing helpers (frontmatter + reports).
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+sha2        = { workspace = true }
 serde_yaml  = { workspace = true }
 toml        = { workspace = true }
 

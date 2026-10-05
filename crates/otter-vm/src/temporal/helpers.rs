@@ -110,8 +110,7 @@ pub fn to_number_field(
             })?;
         let computed =
             ctx.with_turn_parts(|interp, stack| interp.number_for_number_ctor(stack, &exec, value));
-        let n = computed
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
+        let n = computed.map_err(|e| e.into_native(ctx.cx.interp, class))?;
         return Ok(n.as_f64());
     }
     Ok(crate::number::parse::to_number_value(value, ctx.heap()))
@@ -135,7 +134,7 @@ pub fn to_big_int_field(
     let computed = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_big_int_or_throw(interp, stack, &exec, value)
     });
-    computed.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))
+    computed.map_err(|e| e.into_native(ctx.cx.interp, class))
 }
 
 pub fn to_integer_with_truncation(
@@ -267,7 +266,7 @@ pub fn read_option_string(
         ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &field));
     coerced
         .map(Some)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))
+        .map_err(|error| error.into_native(ctx.cx.interp, class))
 }
 
 /// Read a string-typed field that requires a String value (§the field
@@ -295,7 +294,7 @@ pub fn read_required_string(
         let prim = ctx.with_turn_parts(|interp, stack| {
             interp.to_primitive_string_hint_sync(stack, &exec, field)
         });
-        prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?
+        prim.map_err(|e| e.into_native(ctx.cx.interp, class))?
     } else {
         field
     };
@@ -360,8 +359,7 @@ pub fn parse_overflow(
         })?;
     let coerced =
         ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &field));
-    let s = coerced
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Temporal"))?;
+    let s = coerced.map_err(|e| e.into_native(ctx.cx.interp, "Temporal"))?;
     temporal_rs::options::Overflow::from_str(&s)
         .map(Some)
         .map_err(|_| NativeError::RangeError {
@@ -710,8 +708,7 @@ pub fn read_fractional_second_digits(
             })?;
         let coerced =
             ctx.with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &exec, &frac));
-        let s = coerced
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
+        let s = coerced.map_err(|e| e.into_native(ctx.cx.interp, class))?;
         if s == "auto" {
             Ok(temporal_rs::parsers::Precision::Auto)
         } else {

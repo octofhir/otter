@@ -15,8 +15,7 @@
 //!   subset).
 //! - per-method native handlers using [`NativeCtx`] for spec-faithful
 //!   coercion of `index` and `value` arguments.
-//! - legacy `call()` opcode entry kept for the AtomicsCall fast
-//!   path that older bytecode files may still carry.
+//! - `call()` opcode entry for the verified AtomicsCall fast path.
 //!
 //! # Invariants
 //! - `Uint8ClampedArray`, `Float32Array`, `Float64Array` are never
@@ -32,6 +31,9 @@
 //!   (validate-arraytype-before-value-coercion).
 //! - `waitAsync` result labels, promises, and result objects remain in one
 //!   handle scope until both `async` and `value` have been published.
+//! - Allocation failures keep their typed request/cap cause. Notify jobs settle
+//!   and drain reactions in the original live realm; disposed origins release
+//!   their root and cannot run reactions in another realm.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-atomics-object>
@@ -44,7 +46,6 @@ use crate::bigint::BigIntValue;
 use crate::binary::{JsTypedArray, TypedArrayKind};
 use crate::number::NumberValue;
 use crate::number::parse::to_integer_or_infinity;
-use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value, VmError};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -238,42 +239,15 @@ fn to_primitive_number(
     if abstract_ops::is_primitive(value) {
         return Ok(*value);
     }
-    let exec = ctx.execution_context().cloned().ok_or_else(|| {
-        type_err(
-            method_name,
-            "missing execution context for ToPrimitive".to_string(),
-        )
-    })?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or(NativeError::InvalidOperand)?;
     ctx.with_turn_parts(|interp, stack| {
         interp
             .evaluate_to_primitive(stack, &exec, value, ToPrimitiveHint::Number)
-            .map_err(|e| vm_error_to_native(interp, method_name, e))
+            .map_err(|e| e.into_native(interp, method_name))
     })
-}
-
-/// Convert a [`VmError`] surfaced from re-entering the interpreter
-/// into the matching [`NativeError`]. Crucially, `VmError::Uncaught`
-/// maps to `NativeError::Thrown` so the original user-thrown value
-/// rides through (the runtime mapper at `lib.rs:15616` reconstructs
-/// the JS exception from the `message` field).
-fn vm_error_to_native(
-    interp: &crate::Interpreter,
-    method_name: &'static str,
-    err: VmError,
-) -> NativeError {
-    match err {
-        VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name: spec_name(method_name),
-                message: value.into(),
-            }
-        }
-        other => type_err(method_name, other.to_string()),
-    }
 }
 
 /// Coerce the third / fourth argument of a read-modify-write op to
@@ -287,23 +261,13 @@ fn coerce_element_value(
 ) -> Result<Value, NativeError> {
     let primitive = to_primitive_number(ctx, value, method_name)?;
     if kind.is_bigint() {
-        let oom_to_err = |err: otter_gc::OutOfMemory| {
-            type_err(
-                method_name,
-                format!(
-                    "out of memory: requested {} bytes, heap limit {}",
-                    err.requested_bytes(),
-                    err.heap_limit_bytes(),
-                ),
-            )
-        };
         let s_opt = primitive.as_string(ctx.heap());
         let heap = ctx.interp_mut().gc_heap_mut();
         if let Some(b) = primitive.as_big_int() {
             Ok(Value::big_int(b))
         } else if let Some(b) = primitive.as_boolean() {
             let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
-                .map_err(oom_to_err)?;
+                .map_err(NativeError::from)?;
             Ok(Value::big_int(handle))
         } else if let Some(s) = s_opt {
             let txt = s.to_lossy_string(heap);
@@ -311,7 +275,7 @@ fn coerce_element_value(
             let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
                 type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
             })?;
-            let handle = BigIntValue::from_inner(heap, parsed).map_err(oom_to_err)?;
+            let handle = BigIntValue::from_inner(heap, parsed).map_err(NativeError::from)?;
             Ok(Value::big_int(handle))
         } else if primitive.is_number() {
             Err(type_err(
@@ -345,24 +309,11 @@ fn coerce_element_value(
 }
 
 fn type_err(name: &'static str, reason: String) -> NativeError {
-    NativeError::TypeError {
-        name: spec_name(name),
-        reason,
-    }
+    NativeError::TypeError { name, reason }
 }
 
 fn range_err(name: &'static str, reason: String) -> NativeError {
-    NativeError::RangeError {
-        name: spec_name(name),
-        reason,
-    }
-}
-
-/// Map "add" → "Atomics.add" etc. for diagnostic strings.
-const fn spec_name(method: &'static str) -> &'static str {
-    // Static strings; the runtime mapper only reads `.name` for
-    // diagnostics so a plain method name is acceptable.
-    method
+    NativeError::RangeError { name, reason }
 }
 
 // =====================================================================
@@ -386,16 +337,7 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     )?;
     revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.load")?;
     let heap = ctx.interp_mut().gc_heap_mut();
-    ta.get(heap, idx).map_err(|e| {
-        type_err(
-            "Atomics.load",
-            format!(
-                "out of memory: {} requested, limit {}",
-                e.requested_bytes(),
-                e.heap_limit_bytes()
-            ),
-        )
-    })
+    ta.get(heap, idx).map_err(NativeError::from)
 }
 
 fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -451,20 +393,10 @@ fn modify_op(
     )?;
     revalidate_atomic_access(&ta, ctx.heap(), idx, method_name)?;
     let heap = ctx.interp_mut().gc_heap_mut();
-    let oom_to_err = |err: otter_gc::OutOfMemory| {
-        type_err(
-            method_name,
-            format!(
-                "out of memory: requested {} bytes, heap limit {}",
-                err.requested_bytes(),
-                err.heap_limit_bytes(),
-            ),
-        )
-    };
     let _atomic_guard = ATOMICS_RMW_LOCK
         .lock()
         .expect("Atomics read-modify-write mutex poisoned");
-    let prev = ta.get(heap, idx).map_err(oom_to_err)?;
+    let prev = ta.get(heap, idx).map_err(NativeError::from)?;
     if ta.kind().is_bigint() {
         let prev_b = prev
             .as_big_int()
@@ -475,7 +407,7 @@ fn modify_op(
             .map(|b| b.clone_inner(heap))
             .unwrap_or_else(|| num_bigint::BigInt::from(0));
         let new_b = op_big(&prev_b, &v_b);
-        let handle = BigIntValue::from_inner(heap, new_b).map_err(oom_to_err)?;
+        let handle = BigIntValue::from_inner(heap, new_b).map_err(NativeError::from)?;
         ta.set(heap, idx, &Value::big_int(handle));
     } else {
         let prev_n = prev.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);
@@ -547,16 +479,7 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let _atomic_guard = ATOMICS_RMW_LOCK
         .lock()
         .expect("Atomics read-modify-write mutex poisoned");
-    let prev = ta.get(heap, idx).map_err(|e| {
-        type_err(
-            "Atomics.exchange",
-            format!(
-                "out of memory: requested {} bytes, heap limit {}",
-                e.requested_bytes(),
-                e.heap_limit_bytes(),
-            ),
-        )
-    })?;
+    let prev = ta.get(heap, idx).map_err(NativeError::from)?;
     ta.set(heap, idx, &value);
     Ok(prev)
 }
@@ -594,21 +517,12 @@ fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     // `123456789` as `-13035`, so expected `123456789` must compare
     // against `-13035`, not the original Number).
     let heap = ctx.interp_mut().gc_heap_mut();
-    let oom_to_err = |err: otter_gc::OutOfMemory| {
-        type_err(
-            "Atomics.compareExchange",
-            format!(
-                "out of memory: requested {} bytes, heap limit {}",
-                err.requested_bytes(),
-                err.heap_limit_bytes(),
-            ),
-        )
-    };
     let _atomic_guard = ATOMICS_RMW_LOCK
         .lock()
         .expect("Atomics read-modify-write mutex poisoned");
-    let expected_narrow = narrow_through_kind(heap, ta.kind(), &expected).map_err(oom_to_err)?;
-    let current = ta.get(heap, idx).map_err(oom_to_err)?;
+    let expected_narrow =
+        narrow_through_kind(heap, ta.kind(), &expected).map_err(NativeError::from)?;
+    let current = ta.get(heap, idx).map_err(NativeError::from)?;
     if values_equal_strict(&current, &expected_narrow, heap) {
         ta.set(heap, idx, &replacement);
     }
@@ -741,22 +655,13 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
         ));
     }
     let heap = ctx.interp_mut().gc_heap_mut();
-    let current = ta.get(heap, idx).map_err(|e| {
-        type_err(
-            method_name,
-            format!(
-                "out of memory: requested {} bytes, heap limit {}",
-                e.requested_bytes(),
-                e.heap_limit_bytes(),
-            ),
-        )
-    })?;
+    let current = ta.get(heap, idx).map_err(NativeError::from)?;
     if is_async {
         if !values_equal_strict(&current, &expected, heap) {
-            return wait_async_result(ctx, method_name, false, "not-equal");
+            return wait_async_result(ctx, false, "not-equal");
         }
         if timeout == 0.0 {
-            return wait_async_result(ctx, method_name, false, "timed-out");
+            return wait_async_result(ctx, false, "timed-out");
         }
         return wait_async_parked(ctx, method_name, buf_id, idx, timeout);
     }
@@ -789,7 +694,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             }
         }
     };
-    string_value(ctx, method_name, label)
+    string_value(ctx, label)
 }
 
 /// One poll-driven `Atomics.waitAsync` waiter (sink-less embeddings).
@@ -799,23 +704,34 @@ pub(crate) struct PendingAtomicWait {
     buf_id: u64,
     idx: usize,
     deadline: Option<std::time::Instant>,
+    context: Option<crate::ExecutionContext>,
+    realm_id: u32,
 }
 
 impl crate::Interpreter {
     /// Settle this isolate's poll-driven waitAsync waiters: a slot the
     /// notify side claimed resolves "ok", an expired deadline resolves
     /// "timed-out". Returns `(settled, still_pending)`.
-    pub fn poll_async_atomic_waits(&mut self) -> (usize, usize) {
+    pub fn poll_async_atomic_waits(&mut self) -> Result<(usize, usize), VmError> {
         if self.pending_atomic_waits.is_empty() {
-            return (0, 0);
+            return Ok((0, 0));
         }
         let now = std::time::Instant::now();
         let mut waits = std::mem::take(&mut self.pending_atomic_waits);
         let mut settled = 0;
+        let mut failure = None;
         waits.retain(|wait| {
+            // A failed settlement removes only the claimed waiter's root.
+            // Remaining waiters stay in the one traced pending queue.
+            if failure.is_some() {
+                return true;
+            }
             if wait.slot.is_notified() {
-                settle_wait_async(self, wait.root, "ok");
-                settled += 1;
+                match settle_polled_wait(self, wait, "ok") {
+                    Ok(true) => settled += 1,
+                    Ok(false) => {}
+                    Err(error) => failure = Some(error),
+                }
                 return false;
             }
             if wait.slot.is_closed() {
@@ -827,8 +743,11 @@ impl crate::Interpreter {
             if wait.deadline.is_some_and(|deadline| now >= deadline) && wait.slot.claim_for_close()
             {
                 crate::atomics_wait::remove_async_waiter(wait.buf_id, wait.idx, &wait.slot);
-                settle_wait_async(self, wait.root, "timed-out");
-                settled += 1;
+                match settle_polled_wait(self, wait, "timed-out") {
+                    Ok(true) => settled += 1,
+                    Ok(false) => {}
+                    Err(error) => failure = Some(error),
+                }
                 return false;
             }
             true
@@ -836,7 +755,10 @@ impl crate::Interpreter {
         let pending = waits.len();
         debug_assert!(self.pending_atomic_waits.is_empty());
         self.pending_atomic_waits = waits;
-        (settled, pending)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok((settled, pending)),
+        }
     }
 
     /// Earliest poll deadline across pending waiters, if any carries one.
@@ -865,17 +787,20 @@ fn wait_async_parked(
     let Some(sink) = ctx.interp_mut().host_completion_sink() else {
         // Sink-less embedding (direct runtime on a plain thread): park a
         // poll-driven waiter the host drives via `poll_async_atomic_waits`.
-        return wait_async_parked_polled(ctx, method_name, buf_id, idx, timeout);
+        return wait_async_parked_polled(ctx, buf_id, idx, timeout);
     };
     let admission = sink
         .admit()
         .map_err(|reason| type_err(method_name, reason))?;
     let promise = crate::promise_dispatch::pending_runtime_rooted(ctx.interp_mut(), &[], &[])
-        .map_err(|_| type_err(method_name, "promise allocation failed".to_string()))?;
+        .map_err(NativeError::from)?;
     let promise_value = Value::promise(promise);
     let root = ctx.interp_mut().persistent_root_insert(promise_value);
     let timer_token: Arc<StdMutex<Option<u64>>> = Arc::new(StdMutex::new(None));
     let notify_timer = Arc::clone(&timer_token);
+    let context = ctx.execution_context().cloned();
+    let timeout_context = context.clone();
+    let realm_id = ctx.interp_mut().active_host_realm_id();
     let job = crate::host_completion::HostCompletionJob::new_with_cancel(
         move |interp: &mut crate::Interpreter| {
             if let Ok(mut token) = notify_timer.lock()
@@ -883,7 +808,29 @@ fn wait_async_parked(
             {
                 let _ = interp.cancel_timer(token);
             }
-            settle_wait_async(interp, root, "ok");
+            match crate::host_completion::with_rooted_origin_realm(
+                interp,
+                root,
+                realm_id,
+                move |interp, root| {
+                    settle_wait_async(interp, root, "ok", context.as_ref()).map_err(|error| {
+                        crate::RunError {
+                            error,
+                            frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                            detail: interp.take_error_detail(),
+                        }
+                    })?;
+                    interp.drain_microtasks(|_, _| Ok(false))
+                },
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => Ok(()),
+                Err(error) => Err(crate::RunError {
+                    error,
+                    frames: interp.pending_uncaught_frames.take().unwrap_or_default(),
+                    detail: interp.take_error_detail(),
+                }),
+            }
         },
         move |interp: &mut crate::Interpreter| {
             // Isolate teardown: release the promise root without settling.
@@ -895,43 +842,78 @@ fn wait_async_parked(
         admission,
         job,
     };
-    let wait_agent = ctx.interp_mut().atomics_wait_agent_handle();
-    let Some(slot) = atomics_wait::register_async_waiter(buf_id, idx, &wait_agent, Some(wake))
-    else {
+    let mut registered_slot = None;
+    let preparation = ctx.scope(|mut scope| {
+        let promise = scope.value(promise_value);
+        let current_promise = scope.raw(promise);
+        let result = wait_async_promise_result(scope.context(), current_promise)?;
+        let result = scope.value(result);
+        let wait_agent = scope.context().interp_mut().atomics_wait_agent_handle();
+        let Some(slot) = atomics_wait::register_async_waiter(buf_id, idx, &wait_agent, Some(wake))
+        else {
+            return Err(NativeError::Interrupted);
+        };
+        registered_slot = Some(Arc::clone(&slot));
+        if timeout.is_finite() {
+            let ms = timeout.min(u64::MAX as f64) as u64;
+            let timeout_slot = Arc::clone(&slot);
+            let callback = scope
+                .context()
+                .native_value(
+                    "AtomicsWaitAsyncTimeout",
+                    smallvec::SmallVec::new(),
+                    move |ncx, _args, _captures| {
+                        if timeout_slot.claim_for_close() {
+                            atomics_wait::remove_async_waiter(buf_id, idx, &timeout_slot);
+                            settle_wait_async(
+                                ncx.interp_mut(),
+                                root,
+                                "timed-out",
+                                timeout_context.as_ref(),
+                            )
+                            .map_err(|error| {
+                                crate::native_function::vm_to_native_error(
+                                    ncx.interp_mut(),
+                                    error,
+                                    "Atomics.waitAsync",
+                                )
+                            })?;
+                        }
+                        Ok(Value::undefined())
+                    },
+                )
+                .map_err(NativeError::from)?;
+            let token = crate::timers::schedule_timer_entry(
+                scope.context(),
+                callback,
+                ms,
+                None,
+                &[],
+                crate::timers::TimerKind::Timeout,
+                method_name,
+            )?;
+            *timer_token.lock().expect("waitAsync timer token poisoned") = Some(token);
+        }
+        Ok(scope.finish(result))
+    });
+    if preparation.is_err() {
+        // Failed preparation never owns a live Promise/waiter/timer. Notify
+        // may already have claimed the slot; its posted job then observes the
+        // removed persistent root and performs no settlement.
         ctx.interp_mut().persistent_root_remove(root);
-        return Err(NativeError::Interrupted);
-    };
-    if timeout.is_finite() {
-        let ms = timeout.min(u64::MAX as f64) as u64;
-        let timeout_slot = Arc::clone(&slot);
-        let callback = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            ctx.interp_mut().gc_heap_mut(),
-            "AtomicsWaitAsyncTimeout",
-            smallvec::SmallVec::new(),
-            &mut |visitor| promise_value.trace_value_slots(visitor),
-            move |ncx, _args, _captures| {
-                // Losing the claim race means a notify already owns
-                // settlement; the fired timer is a no-op then.
-                if timeout_slot.claim_for_close() {
-                    atomics_wait::remove_async_waiter(buf_id, idx, &timeout_slot);
-                    settle_wait_async(ncx.interp_mut(), root, "timed-out");
-                }
-                Ok(Value::undefined())
-            },
-        )
-        .map_err(|_| type_err(method_name, "timer callback allocation failed".to_string()))?;
-        let token = crate::timers::schedule_timer_entry(
-            ctx,
-            callback,
-            ms,
-            None,
-            &[],
-            crate::timers::TimerKind::Timeout,
-            method_name,
-        )?;
-        *timer_token.lock().expect("waitAsync timer token poisoned") = Some(token);
+        if let Some(slot) = registered_slot {
+            let _ = slot.claim_for_close();
+            atomics_wait::remove_async_waiter(buf_id, idx, &slot);
+        }
+        if let Some(token) = timer_token
+            .lock()
+            .expect("waitAsync timer token poisoned")
+            .take()
+        {
+            let _ = ctx.interp_mut().cancel_timer(token);
+        }
     }
-    wait_async_promise_result(ctx, method_name, promise_value)
+    preparation
 }
 
 /// Sink-less variant of [`wait_async_parked`]: the waiter is queued on the
@@ -939,113 +921,147 @@ fn wait_async_parked(
 /// the host between script turns) performs settlement.
 fn wait_async_parked_polled(
     ctx: &mut NativeCtx<'_>,
-    method_name: &'static str,
     buf_id: u64,
     idx: usize,
     timeout: f64,
 ) -> Result<Value, NativeError> {
     let promise = crate::promise_dispatch::pending_runtime_rooted(ctx.interp_mut(), &[], &[])
-        .map_err(|_| type_err(method_name, "promise allocation failed".to_string()))?;
+        .map_err(NativeError::from)?;
     let promise_value = Value::promise(promise);
     let root = ctx.interp_mut().persistent_root_insert(promise_value);
-    let wait_agent = ctx.interp_mut().atomics_wait_agent_handle();
-    let Some(slot) = atomics_wait::register_async_waiter(buf_id, idx, &wait_agent, None) else {
-        ctx.interp_mut().persistent_root_remove(root);
-        return Err(NativeError::Interrupted);
-    };
-    let deadline = timeout.is_finite().then(|| {
-        let ms = timeout.min(u64::MAX as f64) as u64;
-        std::time::Instant::now() + Duration::from_millis(ms)
-    });
-    ctx.interp_mut()
-        .pending_atomic_waits
-        .push(PendingAtomicWait {
-            slot,
-            root,
-            buf_id,
-            idx,
-            deadline,
+    let preparation = ctx.scope(|mut scope| {
+        let promise = scope.value(promise_value);
+        let current_promise = scope.raw(promise);
+        let result = wait_async_promise_result(scope.context(), current_promise)?;
+        let result = scope.value(result);
+        let wait_agent = scope.context().interp_mut().atomics_wait_agent_handle();
+        let Some(slot) = atomics_wait::register_async_waiter(buf_id, idx, &wait_agent, None) else {
+            return Err(NativeError::Interrupted);
+        };
+        let deadline = timeout.is_finite().then(|| {
+            let ms = timeout.min(u64::MAX as f64) as u64;
+            std::time::Instant::now() + Duration::from_millis(ms)
         });
-    wait_async_promise_result(ctx, method_name, promise_value)
+        let context = scope.context().execution_context().cloned();
+        let realm_id = scope.context().interp_mut().active_host_realm_id();
+        scope
+            .context()
+            .interp_mut()
+            .pending_atomic_waits
+            .push(PendingAtomicWait {
+                slot,
+                root,
+                buf_id,
+                idx,
+                deadline,
+                context,
+                realm_id,
+            });
+        Ok(scope.finish(result))
+    });
+    if preparation.is_err() {
+        ctx.interp_mut().persistent_root_remove(root);
+    }
+    preparation
+}
+
+/// Poll settlement shares the source-realm gate but leaves reaction drain to
+/// the embedding's ordinary checkpoint; it never reenters while a native runs.
+fn settle_polled_wait(
+    interp: &mut crate::Interpreter,
+    wait: &PendingAtomicWait,
+    label: &str,
+) -> Result<bool, VmError> {
+    match crate::host_completion::with_rooted_origin_realm(
+        interp,
+        wait.root,
+        wait.realm_id,
+        |interp, root| settle_wait_async(interp, root, label, wait.context.as_ref()),
+    )? {
+        Some(result) => result.map(|()| true),
+        None => Ok(false),
+    }
 }
 
 /// Settle a parked waitAsync promise with `label`, consuming its root.
-fn settle_wait_async(interp: &mut crate::Interpreter, root: crate::PersistentRootId, label: &str) {
+fn settle_wait_async(
+    interp: &mut crate::Interpreter,
+    root: crate::PersistentRootId,
+    label: &str,
+    context: Option<&crate::ExecutionContext>,
+) -> Result<(), VmError> {
     let Some(promise_value) = interp.persistent_root_remove(root) else {
-        return;
+        return Ok(());
     };
-    let Some(promise) = promise_value.as_promise() else {
-        return;
-    };
-    let Ok(text) = crate::JsString::from_str(label, interp.gc_heap_mut()) else {
-        return;
-    };
-    let jobs =
-        crate::promise::JsPromise::fulfill(&promise, interp.gc_heap_mut(), Value::string(text));
-    interp.enqueue_promise_settle_jobs(jobs);
+    crate::NativeCtx::with_host_context(
+        interp,
+        crate::NativeCallInfo::default_call(),
+        context,
+        |ctx| {
+            ctx.scope(|mut scope| {
+                let promise = scope.value(promise_value);
+                let text = scope.string(label)?;
+                let promise = scope
+                    .raw(promise)
+                    .as_promise()
+                    .ok_or(NativeError::InvalidOperand)?;
+                let text = scope.raw(text);
+                let interp = scope.context().interp_mut();
+                let jobs = crate::promise::JsPromise::fulfill(&promise, interp.gc_heap_mut(), text);
+                interp.note_settle_rejection(&jobs, context);
+                for mut job in jobs.jobs {
+                    if job.context.is_none() {
+                        job.context = context.cloned();
+                    }
+                    interp.microtasks_mut().enqueue(job);
+                }
+                Ok::<(), NativeError>(())
+            })
+            .map_err(|error| ctx.native_error_to_vm(error))
+        },
+    )
 }
 
 /// Shape `{ async: true, value: <pending promise> }`.
 fn wait_async_promise_result(
     ctx: &mut NativeCtx<'_>,
-    method_name: &'static str,
     promise_value: Value,
 ) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let promise = scope.value(promise_value);
-        let result = scope
-            .object()
-            .map_err(|error| type_err(method_name, format!("object allocation failed: {error}")))?;
+        let result = scope.object()?;
         let is_async = scope.boolean(true);
-        scope
-            .set(result, "async", is_async)
-            .map_err(|error| type_err(method_name, error.to_string()))?;
-        scope
-            .set(result, "value", promise)
-            .map_err(|error| type_err(method_name, error.to_string()))?;
+        scope.set(result, "async", is_async)?;
+        scope.set(result, "value", promise)?;
         Ok(scope.finish(result))
     })
 }
 
 fn wait_async_result(
     ctx: &mut NativeCtx<'_>,
-    method_name: &'static str,
     is_async: bool,
     label: &str,
 ) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
-        let label = scope
-            .string(label)
-            .map_err(|error| type_err(method_name, format!("string allocation failed: {error}")))?;
+        let label = scope.string(label)?;
         let value = if is_async {
-            scope.promise_fulfilled(label).map_err(|error| {
-                type_err(method_name, format!("promise allocation failed: {error}"))
-            })?
+            scope.promise_fulfilled(label)?
         } else {
             label
         };
-        let result = scope
-            .object()
-            .map_err(|error| type_err(method_name, format!("object allocation failed: {error}")))?;
+        let result = scope.object()?;
         let is_async = scope.boolean(is_async);
-        scope
-            .set(result, "async", is_async)
-            .map_err(|error| type_err(method_name, error.to_string()))?;
-        scope
-            .set(result, "value", value)
-            .map_err(|error| type_err(method_name, error.to_string()))?;
+        scope.set(result, "async", is_async)?;
+        scope.set(result, "value", value)?;
         Ok(scope.finish(result))
     })
 }
 
-fn string_value(
-    ctx: &mut NativeCtx<'_>,
-    method_name: &'static str,
-    value: &str,
-) -> Result<Value, NativeError> {
-    let label_str = JsString::from_str(value, ctx.heap_mut())
-        .map_err(|e| type_err(method_name, format!("string allocation failed: {e}")))?;
-    Ok(Value::string(label_str))
+fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
+    ctx.scope(|mut scope| {
+        let string = scope.string(value)?;
+        Ok(scope.finish(string))
+    })
 }
 
 fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1112,3 +1128,6 @@ fn values_equal_strict(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+mod boundary_tests;

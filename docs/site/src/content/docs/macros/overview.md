@@ -367,10 +367,13 @@ caller adds one row to `BOOTSTRAP_ENTRIES` in
 crate::bootstrap_entry!(crate::intrinsics::math::MathIntrinsic),
 ```
 
-Bootstrap iterates the registry once at `Interpreter::new()`,
-calling `install` on each entry in declaration order. The macros
-do not register themselves — that stays an explicit, auditable
-decision in `bootstrap.rs`.
+Bootstrap iterates the registry once during the fallible
+`Interpreter::new()`, calling `install` on each entry in declaration order.
+The constructor returns `Result<Interpreter, JsSurfaceError>`; descriptor
+rejection and the actual allocation failure propagate to the caller.
+The public runtime builder maps that same failure into `OtterError`,
+preserving requested bytes and heap limits. The macros do not register
+themselves — registration stays explicit in `bootstrap.rs`.
 
 ## Invariants
 

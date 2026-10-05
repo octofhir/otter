@@ -521,8 +521,8 @@ fn require_number_format(
         name,
         reason: "intrinsic called on a non-Intl.NumberFormat receiver".to_string(),
     };
-    let intl =
-        crate::intl::helpers::unwrap_legacy_receiver(ctx, *ctx.this_value()).ok_or_else(bad)?;
+    let intl = crate::intl::helpers::unwrap_legacy_receiver(ctx, *ctx.this_value(), name)?
+        .ok_or_else(bad)?;
     match intl.payload_clone(ctx.heap()) {
         IntlPayload::NumberFormat(n) => Ok(n),
         _ => Err(bad()),
@@ -687,9 +687,7 @@ fn coerce_format_arg_numeric(
     let number = ctx.with_turn_parts(|interp, stack| {
         crate::coerce::to_number_or_throw(interp, stack, &exec, &value)
     });
-    let n = number.map_err(|error| {
-        crate::native_function::vm_to_native_error(ctx.interp_mut(), error, "format")
-    })?;
+    let n = number.map_err(|error| error.into_native(ctx.interp_mut(), "format"))?;
     Ok(NumericArg::Number(n.as_f64()))
 }
 

@@ -74,8 +74,11 @@ owned `self` only on `async fn` (the glue clones a snapshot — nothing
 GC-touching may cross an `.await`; requires `Clone`).
 
 Fallible bodies return literally `Result<T, JsError>` (`JsError::Type`
-/ `Range` / `Dom { name, message }`); the operation name is prefixed
-automatically.
+/ `Range` / `Dom { name, message }`). Authored `Type` and `Range`
+messages reach the JavaScript error's `.message` unchanged; `Dom` retains its
+explicit error name in that text. Imported `JsError::Native` errors retain the
+original native payload. The operation name labels thrown-text and allocation
+failure transport rather than adding a message prefix.
 
 ### Native subclassing
 
@@ -233,9 +236,9 @@ declaration:
 #[js_class(name = "URL", feature = WEB, js = "url.class.js")]
 ```
 
-The source evaluates immediately after the native install — the two
-halves are one unit, so a JS-defined member can never be missing next
-to a live native class. Pattern: consume private `__native*` members,
+The source evaluates during bootstrap after the native/global installers
+and extension bundles — both halves are installed before the runtime is
+returned, so a JS-defined member is present alongside its native class. Pattern: consume private `__native*` members,
 wrap them with spec validation, `delete` them (see
 `crates/otter-web/src/crypto.ns.js`).
 
@@ -246,23 +249,30 @@ otter_macros::romp! {
     name = "web",
     ident = WEB_EXTENSION,
     classes = [url::WebUrlIntrinsic, blob::BlobIntrinsic, blob::FileIntrinsic],
-    js = [
-        (include_str!("web_bootstrap.js"), defines = ["Event", "EventTarget", /* … */]),
-        (include_str!("web_fetch.js"),     defines = ["Headers", "Request", "Response"]),
-    ],
+    // Produced by this product crate's build script from one ordered source bundle.
+    js = Some(include!(concat!(env!("OUT_DIR"), "/web-bootstrap.rs"))),
 }
 
 // registration — one line:
 builder.extension(&WEB_EXTENSION)
 ```
 
-Classes install eagerly in declaration order. Every `js` source
-registers under **native lazy globals**: per-name accessors on
-`globalThis` whose first read evaluates the sources once and reads the
-real global back. `defines` is the declaration of what each source
-installs — keep it honest with a def-scan test (see
-`lazy_global_names_match_shim_def_calls` in `otter-web`). There is no
-other registry to maintain.
+Classes install eagerly in declaration order. Each nonempty JS half is one
+build-produced `ExtensionJs { source, bytecode, defines }` bundle. Its source
+files share one classic-script scope, and separate extensions execute in
+declaration order after every native/global installer and before attached
+class glue. Native-only bundles declare `js = None`.
+
+The product's build script compiles the exact ordered source once with
+`otter_compiler`, encodes it with the current `otter_bytecode` codec, and emits
+one static source/code/name descriptor. The frontend build graph does not
+depend on the runtime. Runtime installation still verifies, admits source
+and code, links in the actual realm, and executes the complete script. A
+configured compile hook receives the exact original source and actual
+specifier instead of using embedded default-compiler bytecode. No lazy-global
+registry, persistent cache reader or heap image is involved in this static
+bundle path. Keep `Extension::defined_names()` honest with actual installed
+global descriptor tests.
 
 ## Testing your surface
 
@@ -280,8 +290,8 @@ done
 
 And drive the JS-visible behavior end to end: `instanceof`, a JS
 subclass, `Object.prototype.toString.call(x)`, promise methods through
-`.then`, and (for extensions) a cold start that touches exactly one
-lazy name.
+`.then`, and (for extensions) a cold start that observes the complete
+bundle's installed descriptors before any other script runs.
 
 ## When to stay manual
 

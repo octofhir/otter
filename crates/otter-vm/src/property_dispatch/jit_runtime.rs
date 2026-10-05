@@ -12,12 +12,15 @@
 //!   compile snapshots, never an already-published code object.
 //! - Named-property operands live in the shared handle arena. Scope exit
 //!   restores its depth, and every post-allocation read resolves the live slot.
+//! - Every source site records its first attempt before receiver classification
+//!   or user code, including receivers no CacheIR program can describe.
 //!
 //! # See also
 //! - `cache_ir` and `object::shape_transition` own the complete store guards.
 //! - `handles` owns reusable operand storage and scope cleanup.
 
 use crate::activation_stack::ActivationStack;
+use crate::native_abi::CommittedValueError;
 use crate::{
     ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError, VmPropertyKey,
     cache_ir, object, property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind,
@@ -86,9 +89,11 @@ impl Interpreter {
         function_id: u32,
         instruction_pc: u32,
         mut receiver: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         let (atomized_key, slot) =
-            named_property_site(context, function_id, instruction_pc, PropertyIcKind::Load)?;
+            named_property_site(context, function_id, instruction_pc, PropertyIcKind::Load)
+                .map_err(CommittedValueError::Fatal)?;
+        slot.record_attempt();
         self.record_jit_runtime_property_stub();
         let scope_frame = crate::handles::HandleScopeFrame::enter(self);
         let scope = scope_frame.token();
@@ -158,7 +163,7 @@ impl Interpreter {
     /// Instruction metadata is decoded from `function_id` and logical PC.
     /// Both operands remain rooted across shape work, moving collection, and
     /// setter/proxy reentry. Success means the store committed exactly once and
-    /// and updates only the CodeBlock-owned CacheIR feedback.
+    /// publishes eligible CacheIR and shared action facts for either tier.
     pub fn jit_runtime_store_property_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -167,8 +172,7 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
-        fill_megamorphic_cache: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         if self.jit_debug_request().events_enabled() {
             self.complete_named_store::<true>(
                 stack,
@@ -177,7 +181,6 @@ impl Interpreter {
                 instruction_pc,
                 receiver,
                 value,
-                fill_megamorphic_cache,
             )
         } else {
             self.complete_named_store::<false>(
@@ -187,7 +190,6 @@ impl Interpreter {
                 instruction_pc,
                 receiver,
                 value,
-                fill_megamorphic_cache,
             )
         }
     }
@@ -202,10 +204,11 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         value: Value,
-        fill_megamorphic_cache: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         let (atomized_key, slot) =
-            named_property_site(context, function_id, instruction_pc, PropertyIcKind::Store)?;
+            named_property_site(context, function_id, instruction_pc, PropertyIcKind::Store)
+                .map_err(CommittedValueError::Fatal)?;
+        slot.record_attempt();
         self.record_jit_runtime_property_stub();
         let strict = context.function_is_strict(function_id);
         use crate::jit_debug::JitPropertyStorePath as Path;
@@ -245,15 +248,11 @@ impl Interpreter {
             // probe hit needs no semantic resolution, exactly as on the
             // interpreter's store path.
             path = Path::Cached;
-            if slot.probe_store(obj, &mut self.gc_heap, atomized_key, &value)? {
+            if slot
+                .probe_store(obj, &mut self.gc_heap, atomized_key, &value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
                 slot.record_hit();
-                let current_obj = self
-                    .escape_scoped(receiver_root)
-                    .as_object()
-                    .ok_or(VmError::InvalidOperand)?;
-                if fill_megamorphic_cache && slot.is_megamorphic() {
-                    let _ = self.resolve_property_data_slot(current_obj, atomized_key);
-                }
                 return Ok(());
             }
             if entries_len > 0 {
@@ -265,12 +264,18 @@ impl Interpreter {
             // shared table replays one another site (or this one) captured
             // for this receiver class, under the same complete guards.
             if slot.is_megamorphic()
-                && self
-                    .store_transition_cache
-                    .replay(obj, &mut self.gc_heap, atomized_key, &value)?
-                    .is_some()
+                && let Some(action) = self
+                    .property_cache
+                    .replay_store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             {
-                path = Path::SharedTransition;
+                path = match action {
+                    crate::property_cache::PropertyStoreAction::OwnWritable => Path::SharedOwn,
+                    crate::property_cache::PropertyStoreAction::AddOwn => Path::SharedTransition,
+                    crate::property_cache::PropertyStoreAction::Unknown => {
+                        unreachable!("completed cache action")
+                    }
+                };
                 return Ok(());
             }
 
@@ -300,7 +305,8 @@ impl Interpreter {
             let current_obj = self
                 .escape_scoped(receiver_root)
                 .as_object()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             if slot.is_megamorphic() {
                 if let Some(ic) = cache_ir::CacheStub::install_store_existing(
                     current_obj,
@@ -308,13 +314,14 @@ impl Interpreter {
                     atomized_key,
                 ) {
                     if ic
-                        .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)?
+                        .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         .is_some()
                     {
                         path = Path::InstallExisting;
-                        if fill_megamorphic_cache {
-                            let _ = self.resolve_property_data_slot(current_obj, atomized_key);
-                        }
+                        self.property_cache.record_own_store(
+                            ic.store_own_data_hit().expect("existing-own-store program"),
+                        );
                         return Ok(());
                     }
                 } else {
@@ -325,9 +332,10 @@ impl Interpreter {
                             current_obj,
                             atomized_key,
                             &value,
-                        )?
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     {
-                        self.store_transition_cache.record(transition);
+                        self.property_cache.record_store(transition);
                         return Ok(());
                     }
                 }
@@ -337,10 +345,14 @@ impl Interpreter {
                     &self.gc_heap,
                     atomized_key,
                 ) && ic
-                    .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)?
+                    .run_store(current_obj, &mut self.gc_heap, atomized_key, &value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     .is_some()
                 {
                     path = Path::InstallExisting;
+                    self.property_cache.record_own_store(
+                        ic.store_own_data_hit().expect("existing-own-store program"),
+                    );
                     slot.install(ic);
                     return Ok(());
                 }
@@ -349,13 +361,17 @@ impl Interpreter {
                 // roots the complete stack plus receiver/value and commits the
                 // property exactly once when it returns a transition.
                 path = Path::InstallTransition;
-                if let Some(transition) = self.capture_store_property_transition_with_stack_roots(
-                    stack,
-                    current_obj,
-                    atomized_key,
-                    &value,
-                )? {
-                    slot.install(cache_ir::CacheStub::store_transition(transition));
+                if let Some(transition) = self
+                    .capture_store_property_transition_with_stack_roots(
+                        stack,
+                        current_obj,
+                        atomized_key,
+                        &value,
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                {
+                    slot.install(cache_ir::CacheStub::store_transition(transition.clone()));
+                    self.property_cache.record_store(transition);
                     return Ok(());
                 }
             }
@@ -365,15 +381,20 @@ impl Interpreter {
             let current_obj = self
                 .escape_scoped(receiver_root)
                 .as_object()
-                .ok_or(VmError::InvalidOperand)?;
+                .ok_or(VmError::InvalidOperand)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             path = Path::UncachedData;
             let value = self.escape_scoped(value_root);
-            if !self.ordinary_set_data_property(current_obj, atomized_key.name(), value)? {
+            if !self
+                .ordinary_set_data_property(current_obj, atomized_key.name(), value)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+            {
                 self.failed_set_result(
                     strict,
                     format!("Cannot assign to property '{}'", atomized_key.name()),
-                )?;
-            } else if fill_megamorphic_cache && slot.is_megamorphic() {
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            } else if slot.is_megamorphic() {
                 // The committed store may have allocated a slab or published a
                 // child shape. Re-read the rooted receiver, then make that
                 // final own writable slot available to already-installed
@@ -381,7 +402,8 @@ impl Interpreter {
                 let current_obj = self
                     .escape_scoped(receiver_root)
                     .as_object()
-                    .ok_or(VmError::InvalidOperand)?;
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 let _ = self.resolve_property_data_slot(current_obj, atomized_key);
             }
             Ok(())
@@ -415,7 +437,7 @@ impl Interpreter {
         instruction_pc: u32,
         receiver: Value,
         key: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.record_jit_runtime_property_stub();
         if let Some(code_block) = context.exec_function(function_id) {
             self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
@@ -438,10 +460,10 @@ impl Interpreter {
         function_id: u32,
         dst: u16,
         name_idx: u32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_property_stub();
         let value = self.load_global_or_throw_value(stack, context, function_id, name_idx)?;
-        frame.write(dst, value)
+        frame.write(dst, value).map_err(CommittedValueError::Fatal)
     }
 
     /// `Op::DefineDataProperty obj, key, value` — construction-time data-property
@@ -459,11 +481,17 @@ impl Interpreter {
         obj_reg: u16,
         key_reg: u16,
         value_reg: u16,
-    ) -> Result<(), VmError> {
-        let frame = stack.get(top_idx).ok_or(VmError::InvalidOperand)?;
-        let target = *read_register(frame, obj_reg)?;
-        let key_value = *read_register(frame, key_reg)?;
-        let value = *read_register(frame, value_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let frame = stack
+            .get(top_idx)
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let target = *read_register(frame, obj_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let key_value = *read_register(frame, key_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        let value = *read_register(frame, value_reg)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         self.define_data_property_values(stack, context, target, key_value, value)
     }
 
@@ -481,10 +509,10 @@ impl Interpreter {
         obj_reg: u16,
         key_reg: u16,
         value_reg: u16,
-    ) -> Result<(), VmError> {
-        let target = frame.read(obj_reg)?;
-        let key_value = frame.read(key_reg)?;
-        let value = frame.read(value_reg)?;
+    ) -> Result<(), CommittedValueError> {
+        let target = frame.read(obj_reg).map_err(CommittedValueError::Fatal)?;
+        let key_value = frame.read(key_reg).map_err(CommittedValueError::Fatal)?;
+        let value = frame.read(value_reg).map_err(CommittedValueError::Fatal)?;
         self.define_data_property_values(stack, context, target, key_value, value)
     }
 
@@ -495,7 +523,7 @@ impl Interpreter {
         target: Value,
         key_value: Value,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let target = interp.scoped_value(scope, target);
             let key_value = interp.scoped_value(scope, key_value);
@@ -504,42 +532,32 @@ impl Interpreter {
                 interp.to_property_key_sync(stack, context, interp.escape_scoped(key_value))?;
             let target = interp.escape_scoped(target);
             let value = interp.escape_scoped(value);
-            // Fast path: a plain object receiver takes the shape-friendly
-            // construction-time store (no prototype consult — define semantics).
-            if let Some(obj) = target.as_object() {
+            if let Some(mut obj) = target.as_object() {
                 match &key {
                     VmPropertyKey::Symbol(sym) => {
-                        object::set_symbol(obj, &mut interp.gc_heap, *sym, value);
+                        let descriptor = object::PartialPropertyDescriptor::from_full(
+                            &object::PropertyDescriptor::data(value, true, true, true),
+                        );
+                        if !object::define_own_symbol_property_partial(
+                            &mut obj,
+                            &mut interp.gc_heap,
+                            *sym,
+                            descriptor,
+                        )
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+                        {
+                            return Err(CommittedValueError::JavaScript(interp.err_type(
+                                "Cannot define symbol on object literal".to_string().into(),
+                            )));
+                        }
                     }
                     _ => {
                         let name = key
                             .string_name()
-                            .expect("non-symbol key has string spelling")
-                            .to_string();
-                        // A duplicate key over an earlier accessor member is a
-                        // full REDEFINITION (§13.2.5.5 CreateDataPropertyOrThrow):
-                        // the slot's kind flips to data and the hidden class is
-                        // rebuilt. The lenient shape store would write the value
-                        // into the accessor cell and leave the class claiming an
-                        // accessor — poisoning the shared transition/lookup
-                        // caches for every same-shaped literal.
-                        let existing_accessor = matches!(
-                            object::lookup_own(obj, &interp.gc_heap, &name),
-                            object::PropertyLookup::Accessor { .. }
-                        );
-                        if existing_accessor {
-                            let descriptor = object::PartialPropertyDescriptor {
-                                value: Some(value),
-                                writable: Some(true),
-                                enumerable: Some(true),
-                                configurable: Some(true),
-                                ..Default::default()
-                            };
-                            let mut obj_ref = obj;
-                            interp.define_own_property_partial(&mut obj_ref, &name, descriptor)?;
-                        } else {
-                            interp.set_property(obj, &name, value)?;
-                        }
+                            .expect("non-symbol key has string spelling");
+                        interp
+                            .create_data_property(&mut obj, name, value)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                     }
                 }
             } else {
@@ -551,9 +569,9 @@ impl Interpreter {
                     ..Default::default()
                 };
                 if !interp.define_own_property_value(stack, context, &target, &key, descriptor)? {
-                    return Err(interp.err_type(
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
                         ("Cannot define property on object literal".to_string()).into(),
-                    ));
+                    )));
                 }
             }
             Ok(())
@@ -577,7 +595,7 @@ impl Interpreter {
         receiver: Value,
         key_value: Value,
         value: Value,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         self.record_jit_runtime_property_stub();
         if let Some(code_block) = context.exec_function(function_id) {
             self.record_element_family_feedback(code_block, instruction_pc, function_id, receiver);
@@ -606,7 +624,7 @@ impl Interpreter {
         mut key_value: Value,
         mut value: Value,
         force_strict: bool,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), CommittedValueError> {
         // Complete the dense-array miss without allocating a property key.
         // Existing slots need only the write barrier; plain holes, appends
         // and dense gaps are also safe while no indexed property has ever
@@ -629,7 +647,8 @@ impl Interpreter {
                 return Ok(());
             }
             if allow_plain_hole
-                && crate::array::create_plain_dense_element(arr, &mut self.gc_heap, index, value)?
+                && crate::array::create_plain_dense_element(arr, &mut self.gc_heap, index, value)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             {
                 return Ok(());
             }
@@ -655,13 +674,13 @@ impl Interpreter {
         } else if let Some(number) = property_key.as_number() {
             VmPropertyKey::OwnedString(number.to_display_string())
         } else {
-            return Err(VmError::InvalidOperand);
+            return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
         };
 
         if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
-            return Err(self.err_type(
+            return Err(CommittedValueError::JavaScript(self.err_type(
                 (format!("Cannot set property on {}", value_kind_name(&receiver))).into(),
-            ));
+            )));
         }
         let wrapper_name = if receiver.is_boolean() {
             Some("Boolean")
@@ -677,7 +696,9 @@ impl Interpreter {
             None
         };
         let accepted = if let Some(wrapper_name) = wrapper_name {
-            let parent = self.primitive_wrapper_prototype(wrapper_name)?;
+            let parent = self
+                .primitive_wrapper_prototype(wrapper_name)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             self.ordinary_set_data_value(
                 stack,
                 context,
@@ -692,7 +713,8 @@ impl Interpreter {
         };
         if !accepted {
             let name = key.string_name().unwrap_or("symbol");
-            self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))?;
+            self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
         }
         drop(roots);
         Ok(())

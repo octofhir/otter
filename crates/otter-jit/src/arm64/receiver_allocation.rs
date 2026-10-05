@@ -5,18 +5,18 @@
 //! - Linear-allocation-buffer bump probe and complete object initialization.
 //! - Explicit publication/accounting after every pre-effect proof succeeds.
 //! - SSA probe completion with separately counted pre-effect misses.
-//! - [`emit_object_type_branch`] — the exact Object-vs-primitive split a base
-//!   constructor's result needs.
 //!
 //! # Invariants
-//! - Ordinary closure probes require an active weak-observation ledger entry;
-//!   GC flush invalidates that permission before moving either sampled object.
+//! - A live exact constructor family must be finalized and match the plan;
+//!   first-seven provisional lineages always use canonical preparation.
 //! - Descriptor/shape guards load the live own prototype slot, never a cached
 //!   prototype value. Every uncertain case reaches rooted canonical preparation.
 //! - The receiver's shape fixes its prototype: a baked shape is proved to fix
-//!   the live prototype, and a receiver with no initial fields takes the root
-//!   the live prototype caches for its instances.
-//! - Header and slots are initialized before publishing the bump.
+//!   the live prototype and immutable inline capacity. An empty receiver uses
+//!   the exact baked capacity root, never a prototype cache-chain head.
+//! - Header and slots are initialized before publishing the bump. The already
+//!   proven family and original receiver enter the sole CallRequest ticket,
+//!   consumed by the callee before GC or by the unentered failure owner.
 //! - The candidate helper mutates only bytes at or beyond the buffer's `top`;
 //!   the publication helper is the first operation that makes the cell
 //!   observable.
@@ -24,7 +24,7 @@
 //!   cap needs the rooted path, so the bump is the only collector test.
 //!
 //! # See also
-//! - `otter_vm::closure_construct` — canonical state and weak observation lifetime.
+//! - `otter_vm::closure_construct` — exact family state and canonical terminal sampling.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG, value::tag as value_tag};
@@ -52,6 +52,11 @@ fn emit_receiver_candidate(
     space_miss: DynamicLabel,
     ready: DynamicLabel,
 ) {
+    assert_ne!(
+        plan.family_id, 0,
+        "receiver requires an exact finalized family"
+    );
+    crate::arm64::js_call::emit_clear_construct_ticket(ops, context_register);
     emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_ATTEMPTS_OFFSET);
 
     let closure = ops.new_dynamic_label();
@@ -68,7 +73,7 @@ fn emit_receiver_candidate(
         ; ldrb w11, [x2]
         ; cmp w11, JS_CLOSURE_BODY_TYPE_TAG as u32 ; b.eq =>closure
     );
-    if !plan.class_allocation {
+    if !plan.new_target_is_class {
         dynasm!(ops ; .arch aarch64 ; b =>guard_miss);
     }
     dynasm!(ops ; .arch aarch64
@@ -90,6 +95,10 @@ fn emit_receiver_candidate(
     emit_compare_function_id(ops, plan.new_target_function_id);
     dynasm!(ops ; .arch aarch64
         ; b.ne =>guard_miss ; =>target_ready
+        ; ldr w17, [x2, view.class_constructor_layout.constructor_layouts_byte]
+    );
+    emit_finalized_family_guard(ops, view, plan, guard_miss);
+    dynasm!(ops ; .arch aarch64
         ; ldr w4, [x2, view.class_constructor_layout.prototype_byte]
         ; cbz w4, =>guard_miss ; add x13, x12, x4 ; b =>prototype_ready
         ; =>closure
@@ -97,27 +106,17 @@ fn emit_receiver_candidate(
     );
     emit_compare_function_id(ops, plan.new_target_function_id);
     dynasm!(ops ; .arch aarch64 ; b.ne =>guard_miss);
-    // A nonzero sample proves the existing ledger owns this weak observation.
-    // No generated operation creates a ledger entry or keeps it across GC.
-    // The learned size and the `prototype` slot live in the closure's rare
-    // record (`x17`); a closure without one was never prepared as a
-    // constructor.
+    // Rare-record and family handles are live traced roots. Neither a
+    // receiver nor a moving layout address is baked or weakly observed.
     dynasm!(ops ; .arch aarch64
         ; ldr w17, [x2, view.closure_call_layout.rare_byte]
         ; cbz w17, =>guard_miss ; add x17, x12, x17
-        ; ldr w11, [x2, view.closure_call_layout.last_instance_byte]
-        ; cbz w11, =>guard_miss ; add x13, x12, x11
-        // The last receiver's slot count is its shape's; a dictionary shape
-        // counts none, so a dictionary-mode receiver teaches nothing.
-        ; ldr w11, [x13, view.object_shape_byte]
-        ; add x11, x12, x11
-        ; ldr w11, [x11, view.shape_property_count_byte]
-        ; ldrh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
-        ; cmp w11, w14 ; csel w14, w11, w14, hi
-        ; cmp w14, u32::from(plan.inline_capacity) ; b.hi =>guard_miss
-        ; strh w14, [x17, view.closure_call_layout.learned_instance_fields_byte]
-        // The function's `prototype` slot: the hole until the default
-        // object exists, which the cell test below rejects.
+        ; ldr w17, [x17, view.closure_call_layout.constructor_layouts_byte]
+    );
+    emit_finalized_family_guard(ops, view, plan, guard_miss);
+    dynasm!(ops ; .arch aarch64
+        ; ldr w17, [x2, view.closure_call_layout.rare_byte]
+        ; add x17, x12, x17
         ; ldr x4, [x17, view.closure_call_layout.prototype_byte]
     );
     emit_cell_test(ops, 4, 11, CellTest::IsNotCell, guard_miss);
@@ -134,11 +133,15 @@ fn emit_receiver_candidate(
             14,
             guard_miss,
         );
-        emit_load_u64(ops, 14, u64::from(plan.prototype_root));
-        dynasm!(ops ; .arch aarch64 ; add x14, x12, x14
-            ; ldr w14, [x14, view.shape_prototype_byte]
-            ; cmp w14, w4 ; b.ne =>guard_miss);
     }
+    assert_ne!(
+        plan.prototype_root, 0,
+        "receiver allocation needs an exact capacity root"
+    );
+    emit_load_u64(ops, 14, u64::from(plan.prototype_root));
+    dynasm!(ops ; .arch aarch64 ; add x14, x12, x14
+        ; ldr w14, [x14, view.shape_prototype_byte]
+        ; cmp w14, w4 ; b.ne =>guard_miss);
     // The receiver's shape, into `w4` (the live prototype is no longer needed
     // once its lineage is proven).
     if plan.receiver_shape != 0 {
@@ -152,15 +155,7 @@ fn emit_receiver_candidate(
         );
         emit_load_u64(ops, 4, u64::from(plan.receiver_shape));
     } else {
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x13, x12, x4
-            ; ldr w14, [x13, view.object_exotic_handle_byte]
-            ; cbz w14, =>guard_miss
-            ; add x14, x12, x14
-            ; ldr w4, [x14, view.exotic_instance_root_byte]
-            ; cbz w4, =>guard_miss
-        );
+        emit_load_u64(ops, 4, u64::from(plan.prototype_root));
     }
 
     // Only a complete cell fit below the buffer limit may mutate the nursery.
@@ -177,11 +172,11 @@ fn emit_receiver_candidate(
     );
 
     // Initialize the header and the whole fixed body before publishing the
-    // bump cursor. The header carries the flag and in-object capacity bytes;
+    // bump cursor. The header carries flags; capacity belongs to the shape;
     // the body is two words: shape + null slab, null sidecar + padding.
     // The receiver shape names exactly the initial fields, so the slot count
-    // follows from it. In-object words past the initial fields are never
-    // read before a store publishes them.
+    // follows from it. In-object words past the initial fields are
+    // all initialized to undefined before a store publishes them.
     emit_load_u64(ops, 14, plan.cell_header_word(cell_bytes));
     dynasm!(ops
         ; .arch aarch64
@@ -189,10 +184,12 @@ fn emit_receiver_candidate(
         ; str x4, [x16, view.object_shape_byte]
         ; str xzr, [x16, view.object_exotic_handle_byte]
     );
-    if plan.initial_field_count != 0 {
+    if plan.inline_capacity != 0 {
         emit_load_u64(ops, 14, VALUE_UNDEFINED);
-        for index in 0..u32::from(plan.initial_field_count) {
-            let offset = view.object_inline_values_byte + index * 8;
+        for index in 0..u32::from(plan.inline_capacity) {
+            let offset = view
+                .field_layout
+                .inline_byte(otter_vm::object::FieldLocation::inline(index));
             dynasm!(ops ; .arch aarch64 ; str x14, [x16, offset]);
         }
     }
@@ -204,13 +201,40 @@ fn emit_receiver_candidate(
     );
 }
 
+/// Read the head in w17, preserving new.target and the cage base. All
+/// failures precede candidate writes; publication never mutates family state.
+///
+/// A finalized family takes no further terminal samples, so the entered
+/// constructor owes no completion ticket and none is published.
+fn emit_finalized_family_guard(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    miss: DynamicLabel,
+) {
+    let layout = view.constructor_layout;
+    dynasm!(ops ; .arch aarch64
+        ; cbz w17, =>miss ; add x17, x12, x17
+        ; ldr x11, [x17, layout.family_id_byte]
+    );
+    emit_load_u64(ops, 14, plan.family_id);
+    dynasm!(ops ; .arch aarch64
+        ; cmp x11, x14 ; b.ne =>miss
+        ; ldrb w11, [x17, layout.samples_remaining_byte] ; cbnz w11, =>miss
+        ; ldr w11, [x17, layout.root_byte]
+    );
+    emit_load_u64(ops, 14, u64::from(plan.prototype_root));
+    dynasm!(ops ; .arch aarch64 ; cmp w11, w14 ; b.ne =>miss);
+}
+
 /// Cell bytes of the receiver `plan` allocates: the fixed object cell plus
 /// its in-object slots.
 fn receiver_cell_bytes(
     view: &JitCompileSnapshot,
     plan: otter_vm::jit::JitReceiverAllocationPlan,
 ) -> u32 {
-    view.object_fixed_cell_bytes + 8 * u32::from(plan.inline_capacity)
+    view.field_layout
+        .cell_bytes(usize::from(plan.inline_capacity)) as u32
 }
 
 /// Publish one completely initialized candidate from `x0` in buffer `x1`.
@@ -221,7 +245,10 @@ fn receiver_cell_bytes(
 /// candidate creation and this effect. The cell size is read back from the
 /// candidate's header, which the candidate wrote from its plan. Clobbers
 /// `x13`–`x17`.
-fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot, context_register: u8) {
+fn emit_receiver_publication(ops: &mut Assembler, context_register: u8) {
+    dynasm!(ops ; .arch aarch64
+        ; str x0, [X(context_register), crate::entry::PENDING_CALL_OFFSET + otter_vm::native_abi::REQUEST_CONSTRUCT_RECEIVER_OFFSET]
+    );
     dynasm!(ops
         ; .arch aarch64
         ; mov x16, x0
@@ -238,12 +265,6 @@ fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot, con
         13,
         14,
     );
-    let observation_done = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64
-        ; ldrb w14, [x2] ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG as u32 ; b.ne =>observation_done
-        ; str w16, [x2, view.closure_call_layout.last_instance_byte]
-        ; =>observation_done
-    );
     emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_GENERATED_OFFSET);
     dynasm!(ops ; .arch aarch64 ; mov x0, x16);
 }
@@ -251,7 +272,7 @@ fn emit_receiver_publication(ops: &mut Assembler, view: &JitCompileSnapshot, con
 /// Byte offset of the `u32` cell size inside a GC header.
 const GC_HEADER_SIZE_BYTE: u32 = otter_vm::jit::JIT_GC_HEADER_SIZE_BYTES_OFFSET;
 
-/// Complete the allocation half of a Machine receiver probe.
+/// Complete the allocation half of an optimizing receiver probe.
 ///
 /// `x2` is the new.target input. A hit returns the initialized unpublished cell
 /// in `x0` and its allocation buffer in `x1`; either pre-effect miss returns
@@ -282,52 +303,20 @@ pub(crate) fn emit_receiver_candidate_probe(
     dynasm!(ops ; .arch aarch64 ; b =>miss ; =>space_miss);
     emit_increment_runtime_counter(ops, context_register, RECEIVER_ALLOC_SPACE_MISSES_OFFSET);
     dynasm!(ops ; .arch aarch64 ; =>miss);
+    crate::arm64::js_call::emit_clear_construct_ticket(ops, context_register);
     emit_load_u64(ops, 0, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; mov x1, xzr);
     dynasm!(ops ; .arch aarch64 ; =>ready);
 }
 
-/// Commit one Machine receiver candidate after the probe's hit edge dominates.
+/// Commit one optimizing receiver candidate after the probe's hit edge
+/// dominates.
 pub(crate) fn emit_receiver_publication_effect(
     ops: &mut Assembler,
-    view: &JitCompileSnapshot,
+    _view: &JitCompileSnapshot,
     context_register: u8,
 ) {
-    emit_receiver_publication(ops, view, context_register);
-}
-
-/// Branch on the exact ECMAScript Object-vs-primitive split for one tagged
-/// value. Function-id immediates and every non-primitive GC body are Objects;
-/// strings, symbols, and bigints are the only primitive cell families. The
-/// three scratch registers are clobbered; `value` is preserved.
-pub(crate) fn emit_object_type_branch(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    value: u8,
-    scratch: [u8; 3],
-    object: DynamicLabel,
-    primitive: DynamicLabel,
-) {
-    let [a, b, c] = scratch;
-    let non_cell = ops.new_dynamic_label();
-    emit_cell_test(ops, value, a, CellTest::IsNotCell, non_cell);
-    // A cell value is its header's full address.
-    dynasm!(ops ; .arch aarch64 ; ldrb W(b), [X(value)]);
-    for tag in view.primitive_cell_type_tags {
-        emit_load_u64(ops, c, u64::from(tag));
-        dynasm!(ops ; .arch aarch64 ; cmp W(b), W(c) ; b.eq =>primitive);
-    }
-    dynasm!(ops ; .arch aarch64 ; b =>object ; =>non_cell ; lsr X(b), X(value), #48);
-    dynasm!(ops ; .arch aarch64 ; cbnz X(b), =>primitive);
-    emit_load_u64(ops, b, value_tag::FUNCTION_ID_TAG);
-    emit_load_u64(ops, c, 0xffff);
-    dynasm!(ops
-        ; .arch aarch64
-        ; and W(c), W(value), W(c)
-        ; cmp W(c), W(b)
-        ; b.eq =>object
-        ; b =>primitive
-    );
+    emit_receiver_publication(ops, context_register);
 }
 
 fn emit_increment_runtime_counter(ops: &mut Assembler, context_register: u8, offset: u32) {

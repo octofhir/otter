@@ -104,6 +104,8 @@ impl otter_gc::trace::SeverRestoredPayload for FinalizationRegistryBody {
         unsafe {
             std::ptr::write(&mut self.cells, Vec::new());
             std::ptr::write(&mut self.cleanup_context, None);
+            self.cleanup_realm_id = 0;
+            self.cleanup_async_context = Value::undefined();
         }
     }
 }
@@ -172,6 +174,9 @@ pub struct FinalizationRegistryBody {
     cleanup_callback: Value,
     #[pelt(skip)]
     cleanup_context: Option<ExecutionContext>,
+    #[pelt(skip)]
+    cleanup_realm_id: u32,
+    cleanup_async_context: Value,
     cells: Vec<FinalizerCell>,
     prototype_override: Option<Value>,
 }
@@ -179,6 +184,7 @@ pub struct FinalizationRegistryBody {
 impl FinalizationRegistryBody {
     pub(crate) fn visit_function_ids(&self, visitor: &mut dyn FnMut(u32)) {
         crate::code_liveness::visit_value(&self.cleanup_callback, visitor);
+        crate::code_liveness::visit_value(&self.cleanup_async_context, visitor);
         for cell in &self.cells {
             crate::code_liveness::visit_value(&cell.held_value, visitor);
         }
@@ -195,6 +201,10 @@ pub struct FinalizationJob {
     pub cleanup_callback: Value,
     /// VM context that owns the cleanup callback.
     pub context: Option<ExecutionContext>,
+    /// Realm selected when the registry was created.
+    pub realm_id: u32,
+    /// Traced async context selected when the registry was created.
+    pub async_context: Value,
     /// Held value passed as the sole cleanup callback argument.
     pub held_value: Value,
 }
@@ -290,6 +300,8 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     heap: &mut otter_gc::GcHeap,
     cleanup_callback: Value,
     cleanup_context: Option<ExecutionContext>,
+    cleanup_realm_id: u32,
+    cleanup_async_context: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsFinalizationRegistry, crate::VmError> {
     if !is_callable(&cleanup_callback) {
@@ -304,6 +316,8 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
         FinalizationRegistryBody {
             cleanup_callback,
             cleanup_context,
+            cleanup_realm_id,
+            cleanup_async_context,
             cells: Vec::new(),
             prototype_override: None,
         },
@@ -327,6 +341,8 @@ pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
     let registry = heap.alloc_old(FinalizationRegistryBody {
         cleanup_callback,
         cleanup_context,
+        cleanup_realm_id: 0,
+        cleanup_async_context: Value::undefined(),
         cells: Vec::new(),
         prototype_override: None,
     })?;
@@ -525,6 +541,8 @@ pub fn take_finalization_jobs(heap: &mut otter_gc::GcHeap) -> Vec<FinalizationJo
                     jobs.push(FinalizationJob {
                         cleanup_callback,
                         context: cleanup_context.clone(),
+                        realm_id: body.cleanup_realm_id,
+                        async_context: body.cleanup_async_context,
                         held_value: cell.held_value,
                     });
                     false

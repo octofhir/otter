@@ -1,10 +1,19 @@
 //! High-level additional-realm embedding coverage.
 //!
+//! # Contents
+//! - Scalar realm identity, isolated globals and high-level isolate routing.
+//! - Rooted script completions across collecting microtask checkpoints.
+//!
 //! # Invariants
 //! - Public realm identity is an owned scalar, never a VM/GC handle.
 //! - Configured installers run in every realm through the safe installer API.
 //! - Globals are isolated while repeated turns in one realm retain state.
 //! - Layer B routes realm operations through the owning isolate.
+//! - Checkpoint callbacks retain only owned observations; assertions run after
+//!   the host ABI has returned.
+//!
+//! # See also
+//! - `otter_runtime::Runtime::run_script_in_realm` owns direct script entry.
 
 use otter_runtime::{
     OtterError, RealmError, Runtime, RuntimeGlobalInstaller, RuntimeRealmContext, RuntimeRealmId,
@@ -147,3 +156,9 @@ async fn runtime_handle_exposes_only_high_level_realm_operations() {
         }
     ));
 }
+
+#[path = "realm_embedding/completion_gc.rs"]
+mod completion_gc;
+
+#[path = "realm_embedding/source_lifetime.rs"]
+mod source_lifetime;

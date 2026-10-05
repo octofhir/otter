@@ -40,7 +40,7 @@ fn coerce_length_integer<'scope>(
         let primitive = scope.with_turn_parts(|interp, stack| {
             interp
                 .evaluate_to_primitive(stack, context, &value_raw, ToPrimitiveHint::Number)
-                .map_err(|error| vm_to_native(interp, error, name))
+                .map_err(|error| error.into_native(interp, name))
         })?;
         scope.value(primitive)
     };
@@ -283,7 +283,7 @@ fn observable_to_index_arg<'scope>(
     let n = scope.with_turn_parts(|interp, stack| {
         interp
             .coerce_to_number(stack, context, &value_raw)
-            .map_err(|error| vm_to_native(interp, error, name))
+            .map_err(|error| error.into_native(interp, name))
     })?;
     Ok(scope.value(Value::number(n)))
 }
@@ -312,13 +312,13 @@ fn observable_max_byte_length_option<'scope>(
         interp
             .ordinary_get_value(
                 stack,
-                context,
+                Some(context),
                 options_raw,
                 options_raw,
                 &VmPropertyKey::String("maxByteLength"),
                 0,
             )
-            .map_err(|err| vm_to_native(interp, err, name))
+            .map_err(|err| err.into_native(interp, name))
     })?;
     let value = match outcome {
         VmGetOutcome::Value(value) => scope.value(value),
@@ -479,7 +479,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         let start_f = scope.with_turn_parts(|interp, stack| {
             interp
                 .integer_or_infinity_for_arg(stack, &context, Some(&start_raw))
-                .map_err(|error| vm_to_native(interp, error, NAME))
+                .map_err(|error| error.into_native(interp, NAME))
         })?;
         let first = relative_clamp_f(start_f, len);
         let end_f = match end_arg {
@@ -490,7 +490,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
                 scope.with_turn_parts(|interp, stack| {
                     interp
                         .integer_or_infinity_for_arg(stack, &context, Some(&end_raw))
-                        .map_err(|error| vm_to_native(interp, error, NAME))
+                        .map_err(|error| error.into_native(interp, NAME))
                 })?
             }
         };
@@ -508,7 +508,7 @@ fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
         let ctor = scope.with_turn_parts(|interp, stack| {
             interp
                 .species_constructor_value(stack, &context, &source_raw, &default_ctor_raw)
-                .map_err(|error| vm_to_native(interp, error, NAME))
+                .map_err(|error| error.into_native(interp, NAME))
         })?;
         let ctor = scope.value(ctor);
         let length_arg = scope.number(new_len as f64);
@@ -620,7 +620,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         let start_f = scope.with_turn_parts(|interp, stack| {
             interp
                 .integer_or_infinity_for_arg(stack, &context, Some(&start_raw))
-                .map_err(|error| vm_to_native(interp, error, NAME))
+                .map_err(|error| error.into_native(interp, NAME))
         })?;
         let first = relative_clamp_f(start_f, len);
         let end_f = match end_arg {
@@ -631,7 +631,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
                 scope.with_turn_parts(|interp, stack| {
                     interp
                         .integer_or_infinity_for_arg(stack, &context, Some(&end_raw))
-                        .map_err(|error| vm_to_native(interp, error, NAME))
+                        .map_err(|error| error.into_native(interp, NAME))
                 })?
             }
         };
@@ -650,7 +650,7 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         let ctor = scope.with_turn_parts(|interp, stack| {
             interp
                 .species_constructor_value(stack, &context, &source_raw, &default_ctor_raw)
-                .map_err(|error| vm_to_native(interp, error, NAME))
+                .map_err(|error| error.into_native(interp, NAME))
         })?;
         let ctor = scope.value(ctor);
         let length_arg = scope.number(new_len as f64);

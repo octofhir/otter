@@ -288,7 +288,7 @@ fn call_int(
 }
 
 fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntimeStats) {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     match selection {
         JitSelection::ProductionTiered => {
             interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
@@ -299,7 +299,10 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntim
         JitSelection::InterpreterOnly => {}
     }
     let context = interp
-        .link_module(fixture_module())
+        .link_module(
+            fixture_module(),
+            otter_vm::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     for _ in 0..4010 {
         assert_eq!(
@@ -409,12 +412,15 @@ fn optimized_return_and_deopt_match_interpreter() {
 #[test]
 fn optimized_float_function_matches_interpreter_bits() {
     let run_float = |selection| {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         if !matches!(selection, JitSelection::InterpreterOnly) {
             interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
         }
         let context = interp
-            .link_module(fixture_module())
+            .link_module(
+                fixture_module(),
+                otter_vm::source_registry::SourceRegistry::default(),
+            )
             .expect("valid bytecode fixture");
         for _ in 0..4010 {
             assert_eq!(
@@ -438,10 +444,13 @@ fn optimized_float_function_matches_interpreter_bits() {
 
 #[test]
 fn optimized_long_loop_interrupts_through_leaf_poll_without_reentry() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp
-        .link_module(fixture_module())
+        .link_module(
+            fixture_module(),
+            otter_vm::source_registry::SourceRegistry::default(),
+        )
         .expect("valid bytecode fixture");
     for _ in 0..4010 {
         assert_eq!(

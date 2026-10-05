@@ -1,0 +1,44 @@
+[
+  {
+    "anchor": "ts",
+    "source": "ts.js",
+    "originalPath": "benchmarks/results/slice11/ts-fixed.js",
+    "sha256": "09a383b31c016cf303bfd0ec220c75efb35f8183a97cf1540ed0eda5913e2203"
+  },
+  {
+    "anchor": "zlib",
+    "source": "zlib.js",
+    "originalPath": "benchmarks/results/slice11/zlib-fixed.js",
+    "sha256": "a7061b7ee56180d0a7fe9ea630e60cda43ed0e366113b12678e86257e5435130"
+  },
+  {
+    "anchor": "crypto",
+    "source": "crypto.js",
+    "originalPath": "benchmarks/results/slice11/crypto-fixed.js",
+    "sha256": "01757736b2baa369b03c27a912e17e76209ed915f6c625ff0ab31090146d88c8"
+  },
+  {
+    "anchor": "fib",
+    "source": "fib.js",
+    "originalPath": "benchmarks/results/calls/fib.js",
+    "sha256": "ca1b2f293556d0a4c9aa16ac405072aada33c01bb9fd0a92491d31ad94850d19"
+  },
+  {
+    "anchor": "mega_method",
+    "source": "mega_method.js",
+    "originalPath": "benchmarks/results/calls/mega_method.js",
+    "sha256": "1f75db87be075b4ad05298cd2941755b6ae5119f85dc8e47019ea9df73e85541"
+  },
+  {
+    "anchor": "ast_ctor",
+    "source": "ast_ctor.js",
+    "originalPath": "benchmarks/results/calls/ast_ctor.js",
+    "sha256": "096f241237f7de047e15b27ee4bd0ac5687931726d808273777e99c4c4344988"
+  },
+  {
+    "anchor": "earley-boyer",
+    "source": "earley-boyer.js",
+    "originalPath": "benchmarks/results/octane_fixed/earley-boyer-x1.js",
+    "sha256": "401dfa05435e2ea7be4716ead24e93627485b363592ec92f860cc6248153b5e3"
+  }
+]

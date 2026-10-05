@@ -1,19 +1,19 @@
 //! Native JIT tiers for the Otter VM.
 //!
-//! The baseline compiler is a Sparkplug-style template macro-assembler that
+//! The baseline compiler is a template macro-assembler that
 //! lowers Otter register bytecode directly to native machine code with no
-//! register allocation or deopt. The optimizing tier has one implementation:
-//! typed scalar HIR lowers to target-neutral [`machine`] IR, regalloc2 assigns
-//! physical homes, and the selected target encoder consumes that allocation. The
+//! register allocation or deopt. The optimizing tier is the graph tier: an
+//! SSA graph built straight from bytecode and feedback, with calls inlined,
+//! live-interval allocation with planned canonical homes, and AArch64 code
+//! generation. The
 //! dynasm-backed [`CompiledCode`] remains the sole W^X executable-memory owner.
 //!
 //! # Contents
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
-//! - [`machine`] — verified target-neutral instructions, descriptors,
-//!   allocation, safepoints, and deoptimization metadata.
-//! - [`optimizing`] — the production-wired Machine compiler and finalized code
-//!   objects with function and loop-header OSR entries.
+//! - `graph` — the optimizing compiler (AArch64).
+//! - [`optimizing`] — finalized optimizing code objects with function and
+//!   loop-header OSR entries.
 //! - Default-off owned artifact sidecars containing tier input, exact code,
 //!   code maps, deopt metadata, and safepoints for outer-host persistence.
 //!
@@ -24,10 +24,11 @@
 //!   stays behind this crate's safe API; `otter-vm` keeps the ban and reaches
 //!   the JIT through a runtime-wired trait hook (no dependency cycle).
 //! - **Canonical GC roots.** Template code roots its published register window.
-//!   Machine code derives native root slots and stack maps from final allocator
-//!   locations and reloads moving values after every safepoint. A value cached
-//!   only in an unreported machine location across a safepoint would be a
-//!   use-after-move bug.
+//!   Optimizing entries initialize the whole tagged spill region before
+//!   publication. Collecting slow paths save exact-live registers to canonical
+//!   homes and reload relocated values afterwards; unboxed homes occupy a
+//!   separate region. Pure guard exits materialize register-only values into
+//!   canonical homes on the cold path before frame reconstruction.
 //! - **One runtime stack.** The optimizing tier and template baseline share the
 //!   VM-owned hook, registry, frame array, and fallback interpreter; neither is
 //!   a parallel engine/runtime stack.
@@ -43,27 +44,22 @@
 //! - `otter-gc` — the moving collector, `FrameRoots`, and the W^X/rooting
 //!   contract this tier must honor.
 
+mod allocation;
 #[cfg(target_arch = "aarch64")]
 mod arm64;
 mod artifact;
 mod call_linkage;
 mod code;
 mod entry;
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
+mod frame;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod graph;
-pub mod machine;
 mod measurement;
 pub mod optimizing;
+mod return_sites;
 mod template;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
-
-/// Backedges between shared interrupt/work-budget probes in generated code.
-///
-/// Every native tier and target uses the same batch so cooperative scheduling
-/// does not depend on the selected machine-code encoder.
-pub(crate) const GENERATED_POLL_BATCH: u32 = 16;
 
 pub use code::CompiledCode;
 pub use entry::{BackendFailure, TransitionTable, Unsupported};
@@ -77,7 +73,7 @@ pub use template::{TemplateCode, compile};
 /// Native-tier policy selected by the embedding runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitTierPolicy {
-    /// Enable the Machine optimizing tier alongside the template baseline.
+    /// Enable the optimizing tier alongside the template baseline.
     ProductionTiered,
     /// Compile only with the template tier.
     TemplateOnly,
@@ -122,13 +118,15 @@ impl OtterJitCompiler {
         Self::with_policy(JitTierPolicy::TemplateOnly)
     }
 
-    /// Whether this compiler policy admits Machine IR promotion.
+    /// Whether this compiler policy admits optimizing promotion on this
+    /// target: the optimizing tier generates AArch64 code.
     ///
     /// This scalar query keeps clients from importing the VM's compiler-hook
     /// contract merely to verify a selected production policy.
     #[must_use]
     pub fn supports_optimizing_tier(&self) -> bool {
         self.policy == JitTierPolicy::ProductionTiered
+            && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
     }
 
     fn with_policy(policy: JitTierPolicy) -> Self {
@@ -236,30 +234,20 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                     }),
             });
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        let compiled = optimizing::compile_optimized_with_artifacts(
+        let compiled = graph::compile_optimized(
             &request.snapshot,
             request.code_object_id,
             &self.transitions,
-            request.debug.events_enabled(),
-            artifact_request,
             request.osr_pc,
+            artifact_request,
+            request.debug.events_enabled(),
         );
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let compiled = {
+        let compiled: Result<artifact::NativeCompileOutput<OptimizedCode>, Unsupported> = {
             let _ = artifact_request;
-            optimizing::compile_optimized_with_transitions(
-                &request.snapshot,
-                request.code_object_id,
-                &self.transitions,
-                request.osr_pc,
-            )
-            .map(|code| artifact::NativeCompileOutput {
-                code,
-                artifact: None,
-                diagnostics: Box::default(),
-                ir_node_count: u64::try_from(request.snapshot.instructions.len())
-                    .unwrap_or(u64::MAX),
-            })
+            Err(Unsupported::OperandShape(
+                "optimizing compiler target is unavailable",
+            ))
         };
         match compiled {
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
@@ -283,9 +271,11 @@ mod tier_policy_tests {
 
     #[test]
     fn compiler_reports_only_the_selected_tiers() {
-        assert!(
+        assert_eq!(
             OtterJitCompiler::production_tiered().optimizing_tier_enabled(),
-            "production policy must expose optimizing compilation"
+            cfg!(any(target_arch = "aarch64", target_arch = "x86_64")),
+            "production policy exposes optimizing compilation where the tier \
+             generates code"
         );
         assert!(
             !OtterJitCompiler::template_only().optimizing_tier_enabled(),

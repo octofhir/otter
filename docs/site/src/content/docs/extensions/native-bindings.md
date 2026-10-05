@@ -182,7 +182,7 @@ Layer A remains driven by the embedder's loop. Install a
 then spawn the owned future and post each unique
 `(HostCompletionAdmission, HostCompletionJob, HostCompletionOutcome)` tuple
 into that loop. Keep the admission attached until the event reaches the
-runtime's owning thread, call `Runtime::run_host_completion(job)`, and release
+runtime's owning thread, call `Runtime::run_host_completion(job)?`, and release
 the admission according to the terminal outcome. An eager-ready future uses
 `finish_inline` instead. Never run the completion job on a Tokio worker; it
 re-enters the isolate and may touch the GC heap.

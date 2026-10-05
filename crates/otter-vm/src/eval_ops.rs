@@ -7,13 +7,20 @@
 //! # Contents
 //! - Indirect eval execution and writeback.
 //! - `Function` constructor argument coercion and body synthesis.
-//! - [`commonjs_wrapper_source`] — the one CommonJS module wrapper text.
+//! - [`EmbeddedCommonJs`] / [`CommonJsBody`] — the two origins of a CommonJS
+//!   wrapper: a file body wrapped and compiled now, or a builtin compiled at
+//!   product build time.
 //!
 //! # Invariants
 //! - Helpers advance the current frame PC exactly once on success.
 //! - Compiled eval / `new Function` modules link into the
 //!   interpreter's code space, so escaping closures and classes keep
 //!   resolvable global function ids.
+//! - Each retained dynamic body carries its own immutable admitted source;
+//!   reused eval/CommonJS URLs never replace earlier live source text.
+//! - An embedded builtin registers its program-image wrapper text without a
+//!   copy, and its bytecode reaches linking only through the host's
+//!   verifier (or the host's own compiler).
 //! - Per-argument coercion re-reads each value from its GC-visited
 //!   slot (frame register / native argument storage) because user
 //!   `toString` can move the heap.
@@ -34,6 +41,7 @@
 //! - [`crate::ExecutionContext`]
 
 use crate::activation_stack::ActivationStack;
+use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::{BytecodeModule, Operand};
 use smallvec::SmallVec;
 
@@ -70,6 +78,35 @@ impl DynamicFunctionKind {
 }
 
 impl Interpreter {
+    /// One admitted exact source owner for an actual dynamically compiled body.
+    /// Compile-only parameter/body probes never enter this retained owner.
+    fn sources_for_dynamic_body(
+        &self,
+        urls: impl IntoIterator<Item = String>,
+        source: String,
+    ) -> Result<crate::source_registry::SourceRegistry, VmError> {
+        let text = otter_resource::SharedSource::admit(&self.resource_account, source)
+            .map_err(|error| self.err_owned_source(error))?;
+        let entries = urls.into_iter().map(|url| (url, text.clone())).collect();
+        crate::source_registry::SourceRegistry::new(entries, &self.resource_account)
+            .map_err(|error| self.err_resource(error))
+    }
+
+    fn sources_for_dynamic_module(
+        &self,
+        module: &BytecodeModule,
+        source: String,
+    ) -> Result<crate::source_registry::SourceRegistry, VmError> {
+        let urls = std::iter::once(module.module.clone()).chain(
+            module
+                .functions
+                .iter()
+                .filter(|function| !function.module_url.is_empty())
+                .map(|function| function.module_url.clone()),
+        );
+        self.sources_for_dynamic_body(urls, source)
+    }
+
     /// `Eval dst, src, ctx, flags` — §19.2.1.1 PerformEval with
     /// `direct = true`.
     pub(crate) fn run_eval_operands(
@@ -117,7 +154,7 @@ impl Interpreter {
                     super_property_allowed,
                     super_call_allowed,
                     function_constructor: false,
-                    cache_specifier: None,
+                    embedded: None,
                 },
                 ctx_reg,
                 in_class_field_initializer,
@@ -165,9 +202,10 @@ impl Interpreter {
         let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
         let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         let module = self.compile_escaped_source(&source, options)?;
+        let sources = self.sources_for_dynamic_module(&module, source)?;
         let context = self
-            .link_evictable_module(module)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .link_evictable_module(module, sources)
+            .map_err(|error| self.err_link(error))?;
         let main = context.exec_main();
         // Linking can collect: the caller context is read back from its
         // traced register only now.
@@ -206,11 +244,12 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
+    ) -> Result<(), CommittedValueError> {
+        let dst = register_operand(operands.first())
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         let argc = match operands.get(1) {
             Some(Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
+            _ => return Err(CommittedValueError::Fatal(VmError::InvalidOperand)),
         };
         // Coerce one argument at a time, re-reading each value from
         // its frame register right before coercion: user `toString`
@@ -219,15 +258,25 @@ impl Interpreter {
         // snapshot of the whole argument list would go stale.
         let mut parts: Vec<String> = Vec::with_capacity(argc);
         for i in 0..argc {
-            let r = register_operand(operands.get(2 + i))?;
+            let r = register_operand(operands.get(2 + i))
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             let top_idx = stack.len() - 1;
-            let value = *read_register(&stack[top_idx], r)?;
+            let value = *read_register(&stack[top_idx], r)
+                .map_err(|error| CommittedValueError::Fatal(error.into()))?;
             parts.push(self.function_constructor_arg_to_string(stack, context, &value)?);
         }
-        let result = self.build_function_constructor_from_parts(stack, parts)?;
-        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-        write_register(frame, dst, result)?;
-        frame.advance_pc()?;
+        let result = self
+            .build_function_constructor_from_parts(stack, parts)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+        let frame = stack
+            .last_mut()
+            .ok_or(VmError::InvalidOperand)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        write_register(frame, dst, result)
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
+        frame
+            .advance_pc()
+            .map_err(|error| CommittedValueError::Fatal(error.into()))?;
         Ok(())
     }
 
@@ -285,9 +334,10 @@ impl Interpreter {
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.
+        let sources = self.sources_for_dynamic_module(&module, source)?;
         let context = self
-            .link_evictable_module(module)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .link_evictable_module(module, sources)
+            .map_err(|error| self.err_link(error))?;
         let main = context.exec_main();
         let self_value = self.main_self_closure(main.id, Value::undefined())?;
         // §19.2.1.3 — eval code evaluated at global scope (direct at
@@ -305,7 +355,7 @@ impl Interpreter {
         stack.push(entry);
         self.with_handle_scope(|interp, scope| {
             let entry_promise = if entry_is_async {
-                let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                let result = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                     .pending_stack_rooted(interp, stack, &[], &[])?;
                 let frame = stack.pending_mut().expect("entry inputs were just queued");
                 interp.prepared_set_async_state(
@@ -325,7 +375,7 @@ impl Interpreter {
                 // Drain microtasks attached to top-level await so the
                 // entry promise settles before we read its value.
                 interp
-                    .drain_microtasks_with_default(Some(context))
+                    .drain_microtasks(|_, _| Ok(false))
                     .map_err(|e| e.error)?;
                 let promise = interp
                     .escape_scoped(promise)
@@ -360,7 +410,7 @@ impl Interpreter {
         context: &ExecutionContext,
         args: &[Value],
         kind: DynamicFunctionKind,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let arg_handles: SmallVec<[crate::Local<'_>; 8]> = args
                 .iter()
@@ -375,7 +425,9 @@ impl Interpreter {
                 let arg = interp.escape_scoped(handle);
                 parts.push(interp.function_constructor_arg_to_string(stack, context, &arg)?);
             }
-            interp.build_dynamic_function_from_parts(stack, parts, kind)
+            interp
+                .build_dynamic_function_from_parts(stack, parts, kind)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))
         })
     }
 
@@ -392,8 +444,7 @@ impl Interpreter {
     /// value:
     ///
     /// ```text
-    /// (function anonymous(exports, require, module, __filename, __dirname) {
-    ///   <body>
+    /// (function (exports, require, module, __filename, __dirname) { <body>
     /// })
     /// ```
     ///
@@ -406,27 +457,38 @@ impl Interpreter {
     ///
     /// # Errors
     /// Returns a `VmError` if the body fails to compile (surfaced as a
-    /// `SyntaxError`) or if the eval/compiler hook is not installed.
+    /// `SyntaxError`), if embedded bytecode fails host verification, or if
+    /// the eval/compiler hook is not installed.
     pub fn create_commonjs_wrapper(
         &mut self,
         stack: &mut ActivationStack,
         module_url: &str,
-        body: &str,
-        builtin: bool,
+        body: CommonJsBody<'_>,
     ) -> Result<Value, VmError> {
-        let source = commonjs_wrapper_source(body);
-        // A builtin body is identical on every launch, so the host may
-        // reuse its verified compile.
-        let options = EvalCompileOptions {
-            cache_specifier: builtin.then(|| format!("<commonjs:{module_url}>")),
-            ..EvalCompileOptions::default()
+        let (compiled, sources) = match body {
+            CommonJsBody::File(body) => {
+                let source = otter_bytecode::commonjs::wrapper_source(body);
+                let compiled = self.compile_eval_source(&source, EvalCompileOptions::default())?;
+                let sources = self.sources_for_dynamic_body([module_url.to_owned()], source)?;
+                (compiled, sources)
+            }
+            CommonJsBody::Embedded(unit) => {
+                // The host verifies the build-produced module, or compiles
+                // the identical wrapper text with its own configured compiler.
+                let options = EvalCompileOptions {
+                    embedded: Some(unit),
+                    ..EvalCompileOptions::default()
+                };
+                let compiled = self.compile_eval_source(unit.source, options)?;
+                let text = otter_resource::SharedSource::from_static(unit.source);
+                let sources = crate::source_registry::SourceRegistry::new(
+                    std::collections::BTreeMap::from([(module_url.to_owned(), text)]),
+                    &self.resource_account,
+                )
+                .map_err(|error| self.err_resource(error))?;
+                (compiled, sources)
+            }
         };
-        let compiled = self.compile_eval_source(&source, options)?;
-        // Register the wrapped source so frame spans resolve to
-        // `(line, column)` against it. The wrapper is VM-synthesized, so it
-        // is admitted against the registry's source budget here.
-        self.register_module_source_owned(module_url.to_string(), source)
-            .map_err(|_| VmError::InvalidOperand)?;
         // Stamp the synthesized module + its functions with the file URL
         // so frames captured for `Error.prototype.stack` report the file
         // rather than the synthetic eval name.
@@ -436,13 +498,19 @@ impl Interpreter {
                 for function in &mut module.functions {
                     function.module_url = module_url.to_string();
                 }
-                self.link_evictable_module(module)
+                self.link_evictable_module(module, sources)
             }
             crate::CompiledEvalSource::Verified(verified) => {
-                self.link_evictable_verified_module(verified.with_module_url(module_url))
+                // Build-produced builtins already carry their URL.
+                let verified = if verified.module().module == module_url {
+                    verified
+                } else {
+                    verified.with_module_url(module_url)
+                };
+                self.link_evictable_verified_module(verified, sources)
             }
         }
-        .map_err(|_| VmError::InvalidOperand)?;
+        .map_err(|error| self.err_link(error))?;
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
         // completion).
@@ -503,9 +571,10 @@ impl Interpreter {
                 ..EvalCompileOptions::default()
             },
         )?;
+        let sources = self.sources_for_dynamic_module(&module, source)?;
         let context = self
-            .link_evictable_module(module)
-            .map_err(|_| VmError::InvalidOperand)?;
+            .link_evictable_module(module, sources)
+            .map_err(|error| self.err_link(error))?;
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion).
@@ -528,7 +597,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
-    ) -> Result<String, VmError> {
+    ) -> Result<String, CommittedValueError> {
         let primitive = if value.is_object() || value.is_proxy() {
             self.to_primitive_string_hint_sync(stack, context, *value)?
         } else {
@@ -541,9 +610,9 @@ impl Interpreter {
             return Ok(s.with_utf16(&self.gc_heap, crate::eval_source::encode));
         }
         if primitive.is_symbol() {
-            return Err(
-                self.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
-            );
+            return Err(CommittedValueError::JavaScript(self.err_type(
+                ("Cannot convert a Symbol value to a string".to_string()).into(),
+            )));
         }
         Ok(primitive.display_string(&self.gc_heap))
     }
@@ -557,7 +626,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Value, CommittedValueError> {
         // §7.1.1 ToPrimitive with hint "string" — must first consult the
         // `@@toPrimitive` method, then fall back to the
         // OrdinaryToPrimitive `toString` / `valueOf` ladder. Delegate to
@@ -595,15 +664,29 @@ impl Interpreter {
     }
 }
 
-/// The function a CommonJS module body runs in:
-/// `(function (exports, require, module, __filename, __dirname) { <body> })`.
+/// A builtin CommonJS module whose wrapper the product build compiled.
 ///
-/// The whole prologue sits on line 1, so a source line `N` maps to wrapped
-/// line `N`: stack-trace line numbers match the original file (only line-1
-/// columns carry the prologue offset — the same quirk Node has).
-#[must_use]
-pub fn commonjs_wrapper_source(body: &str) -> String {
-    format!("(function (exports, require, module, __filename, __dirname) {{ {body}\n}})")
+/// `source` is exactly [`otter_bytecode::commonjs::wrapper_source`] of the
+/// builtin's body, and `bytecode` is the current-codec module the default
+/// compiler produced from it, already named `url`. Both live in the program
+/// image for the life of the process.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddedCommonJs {
+    /// Module URL frames, `__filename`, and `require.cache` report.
+    pub url: &'static str,
+    /// The complete wrapper text the bytecode was compiled from.
+    pub source: &'static str,
+    /// Current-codec module compiled from `source`.
+    pub bytecode: &'static [u8],
+}
+
+/// Where a CommonJS wrapper comes from.
+#[derive(Debug, Clone, Copy)]
+pub enum CommonJsBody<'a> {
+    /// A module body read at run time, wrapped and compiled now.
+    File(&'a str),
+    /// A builtin compiled when the product was built.
+    Embedded(&'static EmbeddedCommonJs),
 }
 
 fn is_v8_native_eval_hint(source: &str) -> bool {
@@ -692,7 +775,7 @@ mod tests {
 
     #[test]
     fn direct_eval_shared_stack_reclaims_every_nested_completion_path() {
-        let mut interp = Interpreter::new();
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         interp.set_eval_hook(Some(std::sync::Arc::new(|source, _| {
             Ok(crate::CompiledEvalSource::Fresh(eval_module(source)))
         })));

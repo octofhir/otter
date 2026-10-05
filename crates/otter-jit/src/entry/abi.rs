@@ -78,6 +78,7 @@ pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, 
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const VM_THREAD_MARKING_FLAG_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, marking_flag_cell) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, array_index_protector_cell) as u32;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -97,13 +98,18 @@ pub(crate) const ALLOC_WINDOW_LAB_OFFSET: u32 = (std::mem::offset_of!(JitCtx, al
 pub(crate) const ALLOC_WINDOW_TYPE_STATS_OFFSET: u32 = (std::mem::offset_of!(JitCtx, alloc_window)
     + std::mem::offset_of!(otter_vm::jit::JitMachineAllocationWindow, type_stats))
     as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RUNTIME_STATS_OFFSET: u32 = std::mem::offset_of!(JitCtx, runtime_stats) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RECEIVER_ALLOC_ATTEMPTS_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_attempts) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RECEIVER_ALLOC_GENERATED_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_generated) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RECEIVER_ALLOC_GUARD_MISSES_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_guard_misses) as u32;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const RECEIVER_ALLOC_SPACE_MISSES_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitRuntimeStats, receiver_alloc_space_misses) as u32;
 pub(crate) const LAB_TOP_OFFSET: u32 = otter_vm::jit::JIT_LAB_TOP_OFFSET;
@@ -122,14 +128,13 @@ pub(crate) const ALLOC_CTX_STACK_SIZE: u32 =
 /// boxed by the isolate registry and never reused.
 pub(crate) const CODE_ENTRY_GENERATED_ENTRIES_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_entries) as u32;
-pub(crate) const CODE_ENTRY_TIERING_BREAK_EVEN_OFFSET: u32 =
-    std::mem::offset_of!(CodeEntryCell, generated_tiering_break_even) as u32;
+pub(crate) const CODE_ENTRY_TIERING_WORK_TARGET_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, generated_tiering_work_target) as u32;
 pub(crate) const CODE_ENTRY_TIERING_ENABLED_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, generated_tiering_enabled) as u32;
 /// Byte offsets of the callee-frame fields emitted nested-call sequences fill,
 /// re-exported from the VM-owned [`Frame`] layout.
 pub(crate) use otter_vm::native_abi::{
-    NATIVE_FRAME_CALL_SITE_OFFSET, NATIVE_FRAME_MACHINE_ROOTS_OFFSET,
     NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET,
     NATIVE_FRAME_THIS_OFFSET,
 };

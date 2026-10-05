@@ -17,7 +17,7 @@ threads = re.split(r"\n    (?=\d+ Thread_)", graph)
 BUCKETS = [
     ("jit-code", lambda s: s == "???" or "(in <unknown binary>)" in s),
     ("regalloc", lambda s: "regalloc2" in s),
-    ("jit-compiler", lambda s: "otter_jit" in s and ("machine" in s or "optimizing" in s or "numeric" in s)),
+    ("jit-compiler", lambda s: "otter_jit" in s and ("graph" in s or "optimizing" in s or "numeric" in s)),
     ("template-compiler", lambda s: "otter_jit" in s and "template" in s),
     ("jit-other", lambda s: "otter_jit" in s),
     ("gc", lambda s: "otter_gc" in s),

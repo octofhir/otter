@@ -6,9 +6,28 @@ publish.workspace = true
 license.workspace = true
 description = "Node.js-compatible hosted modules for Otter."
 
+[features]
+default = []
+primordials-codegen = [
+    "dep:otter-syntax",
+    "dep:oxc_ast",
+    "dep:oxc_ast_visit",
+    "dep:oxc_span",
+    "dep:oxc_syntax",
+    "dep:serde_json",
+    "dep:syn",
+]
+
 [dependencies]
 otter-runtime = { workspace = true }
 otter-vm = { workspace = true }
+otter-syntax = { workspace = true, optional = true }
+oxc_ast = { workspace = true, optional = true }
+oxc_ast_visit = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+oxc_syntax = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+syn = { workspace = true, optional = true }
 thiserror = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }
@@ -29,5 +48,17 @@ nix = { workspace = true }
 libc = { workspace = true }
 notify = { workspace = true }
 
+[build-dependencies]
+otter-bytecode = { workspace = true }
+otter-compiler = { workspace = true }
+otter-syntax = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
+otter-bytecode = { workspace = true }
+otter-compiler = { workspace = true }
+
+[[bin]]
+name = "otter-primordials"
+path = "src/bin/primordials.rs"
+required-features = ["primordials-codegen"]

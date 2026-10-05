@@ -18,6 +18,9 @@
 //! Dynamic-code reclamation runs only with no active native/materialized
 //! activation, completes a full collection, retires generated code, and only
 //! then tombstones a payload proven free of ids and retained contexts.
+//! Successful payload eviction purges function-, chunk- and constant-keyed
+//! caches across active and parked realms. Constructor pairs retire when either
+//! function is evicted; shared shape/argument-count caches retain their owners.
 #![allow(unused_imports)]
 use super::call_dispatch::DispatchOutcome;
 use crate::activation_stack::ThrowSite;
@@ -60,7 +63,7 @@ impl Interpreter {
 
         self.code_eviction_stats.census_passes =
             self.code_eviction_stats.census_passes.saturating_add(1);
-        self.force_gc()?;
+        self.force_gc_with_trigger(otter_gc::GcPauseTrigger::CodeReclamation)?;
         let candidates = self.code_space.eviction_candidates();
         let liveness = crate::code_liveness::census_candidate_ids(self, candidates.clone());
         let mut retired_jit = false;
@@ -107,7 +110,7 @@ impl Interpreter {
         self.jit_template_osr_fids.clear();
         self.jit_entry_osr_only.clear();
         self.jit_template_compiling.clear();
-        self.jit_code_registry.retire_unreferenced();
+        self.retire_unreferenced_jit_code();
     }
 
     fn purge_chunk_side_tables(&mut self, candidate: crate::code_space::ChunkEvictionCandidate) {
@@ -122,18 +125,22 @@ impl Interpreter {
             .retain(|(identity, _), _| *identity != candidate.module_identity);
         self.simple_constructor_init_cache
             .retain(|id, _| outside(id));
+        self.simple_constructor_absence.retain(|id, _| outside(id));
         self.simple_constructor_shape_cache
             .retain(|(id, _), _| outside(id));
-        self.constructor_field_transition_cache
-            .retain(|id, _| outside(id));
-        self.constructor_field_capacity_cache
-            .retain(|(id, _), _| outside(id));
-        self.constructor_instance_profiles
-            .retain(|(id, _), _| outside(id));
-        self.constructor_prototype_validity_cache
-            .retain(|(id, _, _), _| outside(id));
+        self.object_literal_layouts.retain(|(id, _), _| outside(id));
+        self.prune_constructor_layouts_for_evicted_range(start, end);
         self.global_lexical_load_ic.retain(|(id, _), _| outside(id));
         self.global_object_load_ic.retain(|(id, _), _| outside(id));
+        for realm in &mut self.extra_realms {
+            realm
+                .template_objects
+                .retain(|(function_base, _), _| *function_base != start);
+            realm
+                .global_lexical_load_ic
+                .retain(|(id, _), _| outside(id));
+            realm.global_object_load_ic.retain(|(id, _), _| outside(id));
+        }
         self.function_realm_ids.retain(|id, _| outside(id));
         self.function_user_props.retain(|id, _| outside(id));
         self.function_prototype_overrides
@@ -141,6 +148,13 @@ impl Interpreter {
         self.function_prototype_slots.retain(|id, _| outside(id));
         self.function_non_extensible.retain(outside);
         self.function_deleted_metadata.retain(|(id, _)| outside(id));
+        self.jit_optimized_exit_profiles
+            .retain(|(id, _, _), _| outside(id));
+        self.jit_parameter_widening.retain(|id, _| outside(id));
+        self.jit_entry_bail_counts.retain(|id, _| outside(id));
+        self.jit_osr_disabled.retain(|(id, _)| outside(id));
+        self.jit_optimized_declined_epoch
+            .retain(|id, _| outside(id));
         self.optimizing_tier_policy.evict_function_range(start, end);
         self.method_feedback.evict_site_range(
             candidate.property_ic_site_base,
@@ -157,7 +171,6 @@ impl Interpreter {
     /// Mutable borrow of the per-isolate GC heap.
     #[must_use]
     pub fn gc_heap_mut(&mut self) -> &mut otter_gc::GcHeap {
-        self.flush_constructor_observations(&self.gc_heap);
         &mut self.gc_heap
     }
 
@@ -190,10 +203,18 @@ impl Interpreter {
     /// **Debug / test only** — production embedders let the GC
     /// trigger itself.
     pub fn force_gc(&mut self) -> Result<(), otter_gc::OutOfMemory> {
+        self.force_gc_with_trigger(otter_gc::GcPauseTrigger::Explicit)
+    }
+
+    /// One rooted full-collection owner for explicit and code-reclamation entry.
+    fn force_gc_with_trigger(
+        &mut self,
+        trigger: otter_gc::GcPauseTrigger,
+    ) -> Result<(), otter_gc::OutOfMemory> {
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.gc_heap.collect_full(&mut noop)?;
+        self.gc_heap.collect_full_observed(&mut noop, trigger)?;
         self.enqueue_finalization_cleanup();
         Ok(())
     }
@@ -208,15 +229,15 @@ impl Interpreter {
         for job in crate::weak_refs::take_finalization_jobs(&mut self.gc_heap) {
             let mut args = SmallVec::new();
             args.push(job.held_value);
-            let async_context = self.async_context();
             self.microtasks.enqueue(Microtask {
                 callee: job.cleanup_callback,
                 this_value: Value::undefined(),
                 args,
                 context: job.context,
+                realm_id: job.realm_id,
                 result_capability: None,
                 kind: MicrotaskKind::FinalizationCallback,
-                async_context,
+                async_context: job.async_context,
             });
         }
     }
@@ -235,6 +256,7 @@ impl Interpreter {
     pub fn link_module(
         &mut self,
         module: otter_bytecode::BytecodeModule,
+        sources: crate::source_registry::SourceRegistry,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         let function_count = u32::try_from(module.functions.len()).map_err(|_| {
             crate::BytecodeLinkError::FunctionIdCapacity {
@@ -244,7 +266,7 @@ impl Interpreter {
         })?;
         let context = self
             .code_space
-            .link_module(module, self.module_sources.account())?;
+            .link_module(module, sources, &self.resource_account)?;
         self.finish_linked_module(context, function_count)
     }
 
@@ -253,6 +275,7 @@ impl Interpreter {
     pub fn link_evictable_module(
         &mut self,
         module: otter_bytecode::BytecodeModule,
+        sources: crate::source_registry::SourceRegistry,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         let function_count = u32::try_from(module.functions.len()).map_err(|_| {
             crate::BytecodeLinkError::FunctionIdCapacity {
@@ -260,9 +283,9 @@ impl Interpreter {
                 function_count: module.functions.len(),
             }
         })?;
-        let context = self
-            .code_space
-            .link_evictable_module(module, self.module_sources.account())?;
+        let context =
+            self.code_space
+                .link_evictable_module(module, sources, &self.resource_account)?;
         let context = self.finish_linked_module(context, function_count)?;
         let retained = self.code_space.evictable_retained_bytes();
         self.code_eviction_stats.retained_bytes = retained;
@@ -276,6 +299,7 @@ impl Interpreter {
     pub fn link_evictable_verified_module(
         &mut self,
         module: otter_bytecode::VerifiedBytecodeModule,
+        sources: crate::source_registry::SourceRegistry,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         let function_count = u32::try_from(module.module().functions.len()).map_err(|_| {
             crate::BytecodeLinkError::FunctionIdCapacity {
@@ -283,9 +307,11 @@ impl Interpreter {
                 function_count: module.module().functions.len(),
             }
         })?;
-        let context = self
-            .code_space
-            .link_evictable_verified_module(module, self.module_sources.account())?;
+        let context = self.code_space.link_evictable_verified_module(
+            module,
+            sources,
+            &self.resource_account,
+        )?;
         let context = self.finish_linked_module(context, function_count)?;
         let retained = self.code_space.evictable_retained_bytes();
         self.code_eviction_stats.retained_bytes = retained;
@@ -304,6 +330,7 @@ impl Interpreter {
     pub fn link_verified_module(
         &mut self,
         module: otter_bytecode::VerifiedBytecodeModule,
+        sources: crate::source_registry::SourceRegistry,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         let function_count = u32::try_from(module.module().functions.len()).map_err(|_| {
             crate::BytecodeLinkError::FunctionIdCapacity {
@@ -311,9 +338,9 @@ impl Interpreter {
                 function_count: module.module().functions.len(),
             }
         })?;
-        let context = self
-            .code_space
-            .link_verified_module(module, self.module_sources.account())?;
+        let context =
+            self.code_space
+                .link_verified_module(module, sources, &self.resource_account)?;
         self.finish_linked_module(context, function_count)
     }
 
@@ -377,11 +404,9 @@ impl Interpreter {
                 self.jit_code_registry.link_function(function, realm_id);
             }
         }
-        // Remember the realm's dispatch context as the universal microtask
-        // fallback. It shares the code space adopted above, so it resolves
-        // function ids for any closure in the realm — a later drain of a
-        // context-less job (async-resume continuation, host-settled reaction)
-        // never strands for want of one.
+        // Retain the explicit realm host-script context. Queued jobs never
+        // consult this field: they carry source admission or resolve their own
+        // bytecode FunctionID through CodeSpace.
         self.realm_context = Some(context.clone());
         if let Err(error) = self.reclaim_dynamic_code() {
             return Err(RunError {
@@ -405,71 +430,32 @@ impl Interpreter {
         }
     }
 
-    /// Drain the microtask queue until empty.
-    ///
-    /// Each task is executed by invoking its callee with `this`
-    /// and `args` set up at enqueue time. Tasks pushed during the
-    /// drain go on the **next** generation, mirroring V8 / JSC.
-    ///
-    /// Foundation exception policy: the **first** error wins.
-    /// The remaining queue is left in place so a follow-up
-    /// `drain_microtasks` after the embedder recovers picks up
-    /// where this drain stopped. Once the `Promise` constructor
-    /// lands (task 34), this flips to spec semantics ("rejected
-    /// promise, continue draining").
-    pub fn drain_microtasks(&mut self, context: &ExecutionContext) -> Result<(), RunError> {
-        self.drain_microtasks_with_default(Some(context.clone()))
-    }
-
-    /// Drain queued microtasks using each task's origin context,
-    /// falling back to the caller-supplied context for jobs created
-    /// inside the same VM turn. Host-settlement paths pass `None`
-    /// so missing task origin is reported as an engine error.
-    pub fn drain_microtasks_with_default(
+    /// Drain record-owned jobs until quiescent. An escaping failure stops this
+    /// checkpoint; remaining jobs stay traced for a deliberate later turn.
+    pub fn drain_microtasks(
         &mut self,
-        default_context: Option<ExecutionContext>,
+        mut report: impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
     ) -> Result<(), RunError> {
-        // The drain runs outside `Interpreter::run`'s rooted scope
-        // (the runtime layer drains after `run` returns), so register
-        // the interpreter's runtime roots here. Without this, a
-        // scavenge triggered by any allocation in a microtask body —
-        // including async-resume parked frames and queued reaction
-        // values — would miss every root enumerated by
-        // [`crate::runtime_state::RuntimeState`] (shape side tables,
-        // the microtask queue itself, globalThis, module envs) and
-        // free or move objects still reachable through them.
+        if self.microtasks.begin_drain().is_none() {
+            return Ok(());
+        }
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.begin_work_budget_turn();
-        let result = self.drain_microtasks_with_default_inner(default_context);
+        let result = self.drain_microtasks_inner(&mut report);
+        self.microtasks.end_drain();
         self.finish_work_budget_turn();
         result
     }
 
-    pub(crate) fn drain_microtasks_with_default_inner(
+    pub(crate) fn drain_microtasks_inner(
         &mut self,
-        default_context: Option<ExecutionContext>,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
     ) -> Result<(), RunError> {
-        // Alternate draining the queue empty with the HTML unhandled-rejection
-        // checkpoint. The checkpoint's reporter/handler can enqueue follow-up
-        // microtasks (and those can reject further promises), so loop until both
-        // the queue and the tracker are quiescent.
         loop {
             self.enqueue_finalization_cleanup();
-            self.drain_microtask_generations_inner(default_context.clone())?;
-            if !self.promise_rejections_need_checkpoint() {
-                return Ok(());
-            }
-            let context = default_context
-                .clone()
-                .or_else(|| self.realm_context.clone());
-            let Some(context) = context else {
-                // No realm context established yet — the JS reporter cannot run.
-                // Drop the tracked rejections rather than strand them.
-                self.clear_promise_rejection_tracking();
-                return Ok(());
-            };
-            self.run_promise_rejection_checkpoint(&context)?;
+            self.drain_microtask_generations_inner(report)?;
+            self.run_all_promise_rejection_checkpoints(report)?;
             if !self.microtasks.has_any_pending() {
                 return Ok(());
             }
@@ -478,73 +464,148 @@ impl Interpreter {
 
     fn drain_microtask_generations_inner(
         &mut self,
-        default_context: Option<ExecutionContext>,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
     ) -> Result<(), RunError> {
         self.record_runtime_microtask_drain_started();
         loop {
-            let Some(batch_len) = self.microtasks.begin_drain() else {
-                return Ok(());
-            };
-            if batch_len == 0 {
-                self.microtasks.end_drain();
-                return Ok(());
+            if !self.microtasks.has_in_flight() {
+                if !self.microtasks.has_pending_sync() {
+                    return Ok(());
+                }
+                self.microtasks.next_generation();
             }
-            // Tasks stay queue-owned (`next_in_flight`) rather than
-            // being moved into a driver-local batch, so the ones
-            // waiting behind the executing task remain visible to
-            // the GC root walk — parked async frames in the queue
-            // hold raw register slots a scavenge must rewrite.
-            while let Some(task) = self.microtasks.next_in_flight() {
-                self.record_runtime_microtask_executed();
+            // Waiting jobs stay in the queue's traced owner through every
+            // budget checkpoint and every predecessor's collecting call.
+            while self.microtasks.has_in_flight() {
                 if let Err(error) = self.enforce_work_budget_checkpoint() {
-                    self.microtasks.end_drain();
                     return Err(RunError {
                         error,
                         frames: Vec::new(),
                         detail: self.take_error_detail(),
                     });
                 }
-                // Context resolution is uniform for every drain entry point:
-                // the job's own origin context, else the caller's hint, else
-                // the realm fallback captured in `run`. Only a drain before any
-                // top-level run (no realm context yet) can fail here, which is
-                // an engine invariant violation, not a stranded async chain.
-                let context = task
-                    .context
-                    .clone()
-                    .or_else(|| default_context.clone())
-                    .or_else(|| self.realm_context.clone());
-                let Some(context) = context else {
-                    self.microtasks.end_drain();
-                    return Err(RunError {
-                        error: VmError::InvalidOperand,
-                        frames: Vec::new(),
-                        detail: self.take_error_detail(),
-                    });
-                };
-                // The task runs in the async context it was queued under, and
-                // the drain restores the ambient one afterwards: two tasks
-                // queued from different stores must not see each other's.
-                let ambient = self.async_context();
-                self.set_async_context(task.async_context);
-                let outcome = self.invoke_microtask(&context, task);
-                if let Err(err) = outcome {
-                    // The failing task's context stays installed: the host
-                    // decides what to do with the error and needs to see the
-                    // context it was raised in. Restoring is the host's job
-                    // from here.
-                    self.microtasks.end_drain();
-                    return Err(err);
+                let task = self
+                    .microtasks
+                    .next_in_flight()
+                    .expect("checked queued job");
+                if !self.job_realm_is_live(task.realm_id) {
+                    // Dropping the existing record releases its parked state
+                    // and source lease. Disposed jobs do not settle or reenter.
+                    continue;
                 }
-                self.set_async_context(ambient);
+                self.record_runtime_microtask_executed();
+                let realm_id = task.realm_id;
+                let outcome = self.with_handle_scope(|vm, scope| {
+                    let ambient = vm.async_context();
+                    let ambient = vm.scoped_value(scope, ambient);
+                    vm.set_async_context(task.async_context);
+                    // Capture RunError and its source diagnostics inside the
+                    // owning realm; the realm boundary itself carries VmError.
+                    let outcome = vm.with_host_realm_id(realm_id, |vm| {
+                        let context = task.context.clone();
+                        let outcome = vm.invoke_microtask(context.as_ref(), task);
+                        Ok(match outcome {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                vm.report_microtask_failure(context.as_ref(), error, report)
+                            }
+                        })
+                    });
+                    vm.set_async_context(vm.escape_scoped(ambient));
+                    match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => Err(RunError {
+                            error,
+                            frames: Vec::new(),
+                            detail: vm.take_error_detail(),
+                        }),
+                    }
+                });
+                if let Err(error) = outcome {
+                    return Err(error);
+                }
             }
-            self.microtasks.end_drain();
-            // Loop continues: any tasks pushed during this
-            // generation get picked up by the next `begin_drain`.
             if !self.microtasks.has_any_pending() {
                 return Ok(());
             }
         }
+    }
+
+    /// Offer one catchable failure before restoring its job realm/async
+    /// context. Fatal/control and escaping allocation failure never invoke a
+    /// reporter. The original exception is a scoped root throughout reporter
+    /// allocation; owned diagnostics return unchanged on an unhandled throw or
+    /// catchable reporter failure. An actual fatal reporter failure replaces
+    /// it with its own cause and provenance.
+    pub(crate) fn report_microtask_failure(
+        &mut self,
+        context: Option<&ExecutionContext>,
+        error: RunError,
+        report: &mut impl FnMut(&mut NativeCtx<'_>, &RunError) -> Result<bool, NativeError>,
+    ) -> Result<(), RunError> {
+        if error.error.is_fatal() || matches!(error.error, VmError::OutOfMemory { .. }) {
+            return Err(error);
+        }
+        self.with_handle_scope(|vm, scope| {
+            let thrown = vm
+                .take_pending_uncaught_throw()
+                .map(|value| vm.scoped_value(scope, value));
+            let from_rejection = vm.take_uncaught_from_promise_rejection();
+            if let Some(thrown) = thrown {
+                vm.set_pending_uncaught_throw(vm.escape_scoped(thrown));
+            }
+            vm.uncaught_from_promise_rejection = from_rejection;
+            let outcome =
+                NativeCtx::with_host_context(vm, NativeCallInfo::default_call(), context, |ctx| {
+                    report(ctx, &error)
+                });
+            match outcome {
+                Ok(true) => {
+                    let _ = vm.take_pending_uncaught_throw();
+                    let _ = vm.take_error_detail();
+                    vm.pending_uncaught_frames = None;
+                    vm.uncaught_from_promise_rejection = false;
+                    Ok(())
+                }
+                Err(native) => {
+                    if native.is_fatal() || matches!(native, NativeError::OutOfMemory { .. }) {
+                        // A fatal reporter does not throw the original job
+                        // exception. Its owned imported failure installs its
+                        // own diagnostics at the canonical projection.
+                        let _ = vm.take_pending_uncaught_throw();
+                        vm.uncaught_from_promise_rejection = false;
+                    }
+                    let cause = crate::native_to_vm_error(vm, native);
+                    if cause.is_fatal() || matches!(cause, VmError::OutOfMemory { .. }) {
+                        return Err(RunError {
+                            error: cause,
+                            frames: vm.pending_uncaught_frames.take().unwrap_or_default(),
+                            detail: vm.take_error_detail(),
+                        });
+                    }
+                    // Catchable reporting failure is subordinate to the
+                    // original job failure; it never resumes this drain.
+                    let _ = vm.take_pending_uncaught_throw();
+                    if let Some(thrown) = thrown {
+                        vm.set_pending_uncaught_throw(vm.escape_scoped(thrown));
+                    }
+                    *vm.pending_error_detail.borrow_mut() = error.detail.clone();
+                    vm.pending_uncaught_frames = Some(error.frames.clone());
+                    vm.uncaught_from_promise_rejection = from_rejection;
+                    Err(error)
+                }
+                Ok(false) => {
+                    let _ = vm.take_pending_uncaught_throw();
+                    if let Some(thrown) = thrown {
+                        vm.set_pending_uncaught_throw(vm.escape_scoped(thrown));
+                    }
+                    *vm.pending_error_detail.borrow_mut() = error.detail.clone();
+                    vm.pending_uncaught_frames = Some(error.frames.clone());
+                    vm.uncaught_from_promise_rejection = from_rejection;
+                    Err(error)
+                }
+            }
+        })
     }
 
     /// Invoke one microtask top-level. Builds a fresh frame stack
@@ -553,7 +614,7 @@ impl Interpreter {
     /// the task accumulated when it failed.
     pub(crate) fn invoke_microtask(
         &mut self,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         task: Microtask,
     ) -> Result<(), RunError> {
         // Reaction-mode rejection forwarding (§27.2.1.3.2) reads the
@@ -562,6 +623,9 @@ impl Interpreter {
         // carried over from a prior microtask so we cannot read a
         // foreign reaction's value into this one.
         self.pending_uncaught_throw = None;
+        self.pending_uncaught_frames = None;
+        self.uncaught_from_promise_rejection = false;
+        let _ = self.take_error_detail();
         // Async-resume tasks bypass callee resolution entirely:
         // the parked frame replaces a fresh callee invocation,
         // so route them to `run_async_resume` directly.
@@ -573,7 +637,10 @@ impl Interpreter {
         } = task.kind
         {
             let value = task.args.into_iter().next().unwrap_or(Value::undefined());
-            return self.run_async_resume(context, frame, cold, await_dst, fulfilled, value);
+            let context = self
+                .function_context(context, frame.header.function_id)
+                .map_err(RunError::bare)?;
+            return self.run_async_resume(&context, frame, cold, await_dst, fulfilled, value);
         }
         if let MicrotaskKind::AsyncGenResume {
             frame,
@@ -584,8 +651,11 @@ impl Interpreter {
         } = task.kind
         {
             let value = task.args.into_iter().next().unwrap_or(Value::undefined());
+            let context = self
+                .function_context(context, frame.header.function_id)
+                .map_err(RunError::bare)?;
             return self
-                .run_async_gen_resume(context, frame, cold, await_dst, fulfilled, value, owner);
+                .run_async_gen_resume(&context, frame, cold, await_dst, fulfilled, value, owner);
         }
         // Resolve callee → function_id + SELF. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
@@ -634,7 +704,7 @@ impl Interpreter {
     /// with its result promise, which the downstream capability adopts.
     fn invoke_microtask_rooted(
         &mut self,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         result_capability: &mut Option<crate::microtask::MicrotaskCapability>,
         current: &mut Value,
         effective_this: &mut Value,
@@ -655,12 +725,23 @@ impl Interpreter {
                 Ok(value),
             ),
             Err(error) => {
-                if result_capability.is_some() && !error.is_termination() {
+                if result_capability.is_some()
+                    && !error.is_fatal()
+                    && !matches!(error, VmError::OutOfMemory { .. })
+                {
                     // §27.2.1.3.2 step 1.f.iii: the rejection carries the
                     // original thrown value when one was preserved.
-                    let reason = self.pending_uncaught_throw.take().unwrap_or_else(|| {
-                        crate::promise_dispatch::rejection_value_for(self, &error)
-                    });
+                    let reason = self
+                        .vm_error_to_throwable_with_stack_roots(context, stack, &error)
+                        .map_err(|error| RunError {
+                            error,
+                            frames: self.pending_uncaught_frames.take().unwrap_or_else(|| {
+                                context.map_or_else(Vec::new, |context| {
+                                    self.snapshot_active_frames(context, usize::MAX)
+                                })
+                            }),
+                            detail: self.take_error_detail(),
+                        })?;
                     self.settle_microtask_capability(
                         context,
                         stack,
@@ -668,7 +749,11 @@ impl Interpreter {
                         Err(reason),
                     )
                 } else {
-                    let frames = self.snapshot_active_frames(context, usize::MAX);
+                    let frames = self.pending_uncaught_frames.take().unwrap_or_else(|| {
+                        context.map_or_else(Vec::new, |context| {
+                            self.snapshot_active_frames(context, usize::MAX)
+                        })
+                    });
                     Err(RunError {
                         error,
                         frames,
@@ -684,7 +769,7 @@ impl Interpreter {
     /// `queueMicrotask` callbacks).
     pub(crate) fn settle_microtask_capability(
         &mut self,
-        context: &ExecutionContext,
+        context: Option<&ExecutionContext>,
         stack: &mut ActivationStack,
         cap: Option<microtask::MicrotaskCapability>,
         outcome: Result<Value, Value>,
@@ -704,7 +789,11 @@ impl Interpreter {
             .map(|_| ())
             .map_err(|error| RunError {
                 error,
-                frames: Vec::new(),
+                frames: self.pending_uncaught_frames.take().unwrap_or_else(|| {
+                    context.map_or_else(Vec::new, |context| {
+                        self.snapshot_active_frames(context, usize::MAX)
+                    })
+                }),
                 detail: self.take_error_detail(),
             })
     }
@@ -742,7 +831,7 @@ impl Interpreter {
         // The dispatch loop's exit returns the result promise's
         // resolved value once microtasks drain.
         let entry_promise = if entry_is_async {
-            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            let result = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
                 .pending_stack_rooted(self, &stack, &[], &[])
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
             let frame = stack.pending_mut().expect("entry inputs were just queued");
@@ -770,8 +859,12 @@ impl Interpreter {
                     // Drain microtasks until the entry promise
                     // settles. The settled value (or rejection)
                     // becomes the program's completion value.
-                    if let Err(err) = self.drain_microtasks_with_default(Some(context.clone())) {
+                    if let Err(err) = self.drain_microtasks(|_, _| Ok(false)) {
                         self.json_root_pop_to(root_idx);
+                        // The drain already owns the exact completed detail.
+                        // run_inner returns the existing scalar/frames tuple;
+                        // run takes this sole pending owner into its RunError.
+                        *self.pending_error_detail.borrow_mut() = err.detail;
                         return Err((err.error, err.frames));
                     }
                     let promise = self
@@ -833,7 +926,7 @@ impl Interpreter {
         // extent, then retains the physical caller chain until completion.
         self.with_runtime_turn(stack, |turn| {
             let (interp, stack) = turn.into_parts();
-            interp.execute_prepared_call(context, stack)
+            interp.execute_prepared_call(Some(context), stack)
         })
     }
 
@@ -850,7 +943,7 @@ impl Interpreter {
         if floor.depth() > stack.len() || !stack.is_runtime_rooted_by(self) {
             return Err(VmError::InvalidOperand);
         }
-        self.execute_prepared_call(context, stack)
+        self.execute_prepared_call(Some(context), stack)
     }
 
     /// Drive the dispatch loop, converting convertible `VmError`
@@ -859,9 +952,10 @@ impl Interpreter {
     /// into typed `Error` instances that flow through `unwind_throw`
     /// — so user code can `try { … } catch (e) { e instanceof
     /// TypeError }` and observe the same shape it would in any
-    /// spec-conforming engine. Variants that aren't user-recoverable
-    /// (StackOverflow, Interrupted, Uncaught, MissingReturn,
-    /// InvalidOperand) propagate as-is.
+    /// spec-conforming engine. Structural and runtime-control failures
+    /// propagate unchanged. An explicit completed terminal outcome bypasses
+    /// this source-error conversion. A failure while creating the exception value
+    /// propagates its actual typed cause instead of suppressing the failure.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
@@ -889,6 +983,10 @@ impl Interpreter {
                     ),
                 };
                 match step {
+                    // This operation's native failure was projected at its
+                    // live source/root boundary. Final failure must not enter
+                    // the ordinary source VM error materializer again.
+                    Ok(DispatchOutcome::Fatal(error)) => break Err(error),
                     Ok(value) => break Ok(value),
                     Err(err) => {
                         if matches!(err, VmError::Uncaught)
@@ -924,38 +1022,42 @@ impl Interpreter {
                             }
                             continue;
                         }
-                        if let Some(thrown) =
-                            self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
-                        {
-                            let uncaught = if matches!(
-                                err,
-                                VmError::OutOfMemory { .. } | VmError::JsonError
-                            ) {
-                                Some(err)
-                            } else {
-                                None
-                            };
-                            if self.pending_uncaught_frames.is_none() {
-                                self.pending_uncaught_frames =
-                                    Some(self.snapshot_active_frames(context, usize::MAX));
+                        match self.vm_error_to_throwable_with_stack_roots(
+                            Some(context),
+                            stack,
+                            &err,
+                        ) {
+                            Ok(thrown) => {
+                                let uncaught = if matches!(
+                                    err,
+                                    VmError::OutOfMemory { .. } | VmError::JsonError
+                                ) {
+                                    Some(err)
+                                } else {
+                                    None
+                                };
+                                if self.pending_uncaught_frames.is_none() {
+                                    self.pending_uncaught_frames =
+                                        Some(self.snapshot_active_frames(context, usize::MAX));
+                                }
+                                let unwind = self.unwind_throw_with_uncaught_above(
+                                    context, stack, floor, thrown, uncaught, site,
+                                );
+                                if unwind.is_ok() {
+                                    self.pending_uncaught_frames = None;
+                                }
+                                unwind?;
+                                if stack.is_at_floor(floor) {
+                                    let result = self
+                                        .completed_activation_result
+                                        .take()
+                                        .unwrap_or_else(Value::undefined);
+                                    break Ok(DispatchOutcome::Returned(result));
+                                }
+                                continue;
                             }
-                            let unwind = self.unwind_throw_with_uncaught_above(
-                                context, stack, floor, thrown, uncaught, site,
-                            );
-                            if unwind.is_ok() {
-                                self.pending_uncaught_frames = None;
-                            }
-                            unwind?;
-                            if stack.is_at_floor(floor) {
-                                let result = self
-                                    .completed_activation_result
-                                    .take()
-                                    .unwrap_or_else(Value::undefined);
-                                break Ok(DispatchOutcome::Returned(result));
-                            }
-                            continue;
+                            Err(error) => break Err(error),
                         }
-                        break Err(err);
                     }
                 }
             }
@@ -990,6 +1092,371 @@ impl otter_gc::ExtraRootSource for MicrotaskLocalsRoot {
                 capability.resolve.trace_value_slots(visitor);
                 capability.reject.trace_value_slots(visitor);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Interpreter;
+    use crate::jit::{JitExitProfile, JitParameterWidening};
+    use crate::native_abi::{ExitAction, ExitReason};
+    use crate::test_support::minimal_bytecode_module;
+    use crate::{Value, activation_stack::ActivationStack};
+    use otter_bytecode::{Constant, FunctionCodeBuilder, Op, Operand};
+
+    #[test]
+    fn chunk_eviction_purges_all_function_side_tables_only_in_its_function_range() {
+        fn module(name: &str) -> otter_bytecode::BytecodeModule {
+            let mut module = minimal_bytecode_module(name);
+            module.constants = ["evictionLexical", "evictionObject"]
+                .into_iter()
+                .map(|name| Constant::String {
+                    utf16: name.encode_utf16().collect(),
+                })
+                .collect();
+            // An unreachable method site provides a real verified directory
+            // address without invoking JavaScript or retaining a callable.
+            let mut code = FunctionCodeBuilder::new();
+            code.push(Op::ReturnUndefined, &[]);
+            code.push(
+                Op::CallMethodValue,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::ConstIndex(1),
+                    Operand::ConstIndex(0),
+                ],
+            );
+            module.functions[0].code = code.finish();
+            module
+        }
+        let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.create_host_realm().unwrap();
+        vm.set_code_eviction_high_water_bytes(0);
+        let before = vm
+            .link_module(
+                module("pinned-before.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .unwrap();
+        let mut dynamic_module = module("dynamic.js");
+        let mut second = dynamic_module.functions[0].clone();
+        second.id = 1;
+        second.name = "second".to_owned();
+        dynamic_module.functions.push(second);
+        let dynamic = vm
+            .link_evictable_module(
+                dynamic_module,
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .unwrap();
+        let after = vm
+            .link_module(
+                module("pinned-after.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .unwrap();
+        let before_fid = before.function_base();
+        let first_evicted = dynamic.function_base();
+        let second_evicted = first_evicted + 1;
+        let after_fid = after.function_base();
+        assert_eq!(after_fid, second_evicted + 1);
+
+        vm.declare_global_lex_value(&before, before_fid, 0, false)
+            .unwrap();
+        vm.init_global_lex_value(&before, before_fid, 0, Value::boolean(true))
+            .unwrap();
+        let mut stack = ActivationStack::new();
+        vm.define_global_var_value(&before, &mut stack, before_fid, 1, Value::boolean(false))
+            .unwrap();
+        let mut global = vm.global_this;
+        vm.migrate_slow_to_fast(&mut global);
+        vm.global_this = global;
+        vm.load_global_or_throw_value(&mut stack, &before, before_fid, 0)
+            .unwrap();
+        vm.load_global_or_throw_value(&mut stack, &before, before_fid, 1)
+            .unwrap();
+        let lexical = vm.global_lexical_load_ic[&(before_fid, 0)];
+        let object_load = vm.global_object_load_ic[&(before_fid, 1)];
+        let layout = vm.object_layout(&["field"]).unwrap();
+        let shape_id = layout.shape_id();
+        let shape = vm.shape_runtime.handle_for_id(shape_id).unwrap();
+        let mut prototype = vm.realm_intrinsics.object_prototype().unwrap();
+        vm.migrate_slow_to_fast(&mut prototype);
+        let validity =
+            crate::object::prototype_validity::chain_validity(prototype, vm.gc_heap()).unwrap();
+        // Argument counts and shape identities are shared cache domains, even
+        // when their numeric value happens to lie in the evicted fid range.
+        vm.arguments_shape_cache
+            .insert((first_evicted, false, shape_id), shape);
+
+        let mut method_sites = Vec::new();
+        for context in [&before, &dynamic, &after] {
+            vm.template_objects
+                .insert((context.function_base(), 0), Value::boolean(true));
+            vm.extra_realms[0]
+                .template_objects
+                .insert((context.function_base(), 0), Value::boolean(false));
+            vm.string_constant_cells
+                .insert(context.constant_cache_key(0), Box::new(Value::undefined()));
+            vm.bigint_constant_cache
+                .insert(context.constant_cache_key(1), Value::undefined());
+            vm.ensure_method_feedback_context(context);
+            for (site, address) in context.feedback_slot_addresses() {
+                assert!(address.is_method());
+                vm.saturate_method_site_feedback(site);
+                assert!(vm.method_feedback.install_method_ic(
+                    site,
+                    crate::method_ops::MethodCallIc::Collection(
+                        crate::method_ops::CollectionMethodCallIc {
+                            proto_shape: shape_id,
+                            proto_slot: 0,
+                            op: crate::method_ops::CollectionFastOp::MapGet,
+                            leaf_stub_id: Some(crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF.id),
+                            mutating_stub_id: None,
+                            alloc_stub_id: None,
+                        },
+                    ),
+                ));
+                method_sites.push((context.function_base(), site));
+            }
+        }
+        let evicted_constants = [dynamic.constant_cache_key(0), dynamic.constant_cache_key(1)];
+
+        for fid in [before_fid, first_evicted, second_evicted, after_fid] {
+            // Default-realm linking omits the redundant zero entry. Seed its
+            // equivalent explicit mapping so this range cleanup is exercised.
+            vm.function_realm_ids.insert(fid, vm.active_realm_id);
+            vm.jit_entry_bail_counts.insert(fid, fid + 12);
+            vm.jit_osr_disabled.insert((fid, 8));
+            vm.jit_optimized_declined_epoch.insert(fid, Some(fid + 14));
+            vm.optimizing_tier_policy.begin_retraining(fid, 16);
+            for tier in [
+                crate::tier_policy::CostedTier::Template,
+                crate::tier_policy::CostedTier::Optimizing,
+            ] {
+                vm.optimizing_tier_policy.record_compile_attempt(fid, tier);
+            }
+            vm.simple_constructor_init_cache.insert(fid, None);
+            vm.simple_constructor_absence.insert(fid, validity.clone());
+            vm.simple_constructor_shape_cache
+                .insert((fid, shape_id), shape);
+            vm.object_literal_layouts.insert((fid, 0), layout);
+            vm.global_lexical_load_ic.insert((fid, 0), lexical);
+            vm.global_object_load_ic.insert((fid, 1), object_load);
+            vm.extra_realms[0]
+                .global_lexical_load_ic
+                .insert((fid, 0), lexical);
+            vm.extra_realms[0]
+                .global_object_load_ic
+                .insert((fid, 1), object_load);
+            vm.function_user_props.insert(fid, vm.global_this);
+            vm.function_prototype_overrides
+                .insert(fid, Value::undefined());
+            vm.function_prototype_slots
+                .insert(fid, (Value::undefined(), false));
+            vm.function_non_extensible.insert(fid);
+            vm.function_deleted_metadata.insert((fid, "name"));
+            for (pc, reason) in [(0, ExitReason::ShapeGuard), (7, ExitReason::IdentityGuard)] {
+                vm.jit_optimized_exit_profiles.insert(
+                    (fid, pc, reason),
+                    JitExitProfile {
+                        action: ExitAction::Recompile,
+                        count: fid + pc + 1,
+                        feedback_population: Some(fid + 2),
+                    },
+                );
+            }
+            vm.jit_parameter_widening.insert(
+                fid,
+                vec![JitParameterWidening::Number, JitParameterWidening::Tagged].into(),
+            );
+        }
+        let pairs = [
+            (before_fid, after_fid),
+            (after_fid, before_fid),
+            (before_fid, first_evicted),
+            (before_fid, second_evicted),
+            (first_evicted, after_fid),
+            (second_evicted, after_fid),
+        ];
+        for (base, target) in pairs {
+            vm.constructor_layout_for_receiver(
+                base,
+                Value::function(target),
+                Value::object(prototype),
+                |_, _| 0,
+            )
+            .expect("actual new.target family");
+        }
+        let profiles_before = vm.jit_optimized_exit_profiles.clone();
+        let widening_before = vm.jit_parameter_widening.clone();
+
+        vm.reclaim_dynamic_code().unwrap();
+        assert_eq!(vm.code_eviction_stats().evicted_chunks, 0);
+        assert_eq!(vm.jit_optimized_exit_profiles, profiles_before);
+        assert_eq!(vm.jit_parameter_widening, widening_before);
+        assert_eq!(vm.object_literal_layouts.len(), 4);
+        assert_eq!(
+            vm.function_constructor_layouts.len(),
+            4,
+            "actual immediate targets own heads, and same-target base families form one list"
+        );
+        assert_eq!(vm.extra_realms[0].global_lexical_load_ic.len(), 4);
+
+        drop(dynamic);
+        vm.reclaim_dynamic_code().unwrap();
+        assert_eq!(vm.code_eviction_stats().evicted_chunks, 1);
+        assert_eq!(vm.jit_optimized_exit_profiles.len(), 4);
+        assert_eq!(vm.jit_parameter_widening.len(), 2);
+        assert_eq!(vm.template_objects.len(), 2);
+        assert_eq!(vm.extra_realms[0].template_objects.len(), 2);
+        assert_eq!(vm.string_constant_cells.len(), 2);
+        assert_eq!(vm.bigint_constant_cache.len(), 2);
+        assert!(!vm.string_constant_cells.contains_key(&evicted_constants[0]));
+        assert!(!vm.bigint_constant_cache.contains_key(&evicted_constants[1]));
+        macro_rules! outside_keys {
+            ($map:expr, $expected:expr) => {
+                assert_eq!(
+                    $map.keys()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>(),
+                    $expected
+                        .into_iter()
+                        .collect::<std::collections::HashSet<_>>()
+                );
+            };
+        }
+        let surviving = [before_fid, after_fid];
+        outside_keys!(vm.jit_entry_bail_counts, surviving);
+        outside_keys!(vm.jit_optimized_declined_epoch, surviving);
+        outside_keys!(vm.simple_constructor_init_cache, surviving);
+        outside_keys!(vm.simple_constructor_absence, surviving);
+        outside_keys!(
+            vm.simple_constructor_shape_cache,
+            surviving.map(|fid| (fid, shape_id))
+        );
+        outside_keys!(vm.object_literal_layouts, surviving.map(|fid| (fid, 0)));
+        outside_keys!(vm.global_lexical_load_ic, surviving.map(|fid| (fid, 0)));
+        outside_keys!(vm.global_object_load_ic, surviving.map(|fid| (fid, 1)));
+        outside_keys!(
+            vm.extra_realms[0].global_lexical_load_ic,
+            surviving.map(|fid| (fid, 0))
+        );
+        outside_keys!(
+            vm.extra_realms[0].global_object_load_ic,
+            surviving.map(|fid| (fid, 1))
+        );
+        outside_keys!(vm.function_realm_ids, surviving);
+        outside_keys!(vm.function_user_props, surviving);
+        outside_keys!(vm.function_prototype_overrides, surviving);
+        outside_keys!(vm.function_prototype_slots, surviving);
+        outside_keys!(vm.function_constructor_layouts, surviving);
+        assert_eq!(
+            vm.function_non_extensible
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            surviving.into()
+        );
+        assert_eq!(
+            vm.function_deleted_metadata
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            surviving.map(|fid| (fid, "name")).into()
+        );
+        assert_eq!(
+            vm.jit_osr_disabled
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            surviving.map(|fid| (fid, 8)).into()
+        );
+        assert!(
+            vm.arguments_shape_cache
+                .contains_key(&(first_evicted, false, shape_id))
+        );
+        for (base, site) in method_sites {
+            if base == first_evicted {
+                assert!(vm.method_target_feedback(site).is_none());
+                assert!(vm.method_feedback.method_ic(site).is_none());
+            } else {
+                assert!(vm.method_target_feedback_saturated(site));
+                assert!(vm.method_feedback.method_ic(site).is_some());
+            }
+        }
+        for fid in [first_evicted, second_evicted] {
+            assert!(!vm.jit_parameter_widening.contains_key(&fid));
+            assert!(
+                !vm.jit_optimized_exit_profiles
+                    .keys()
+                    .any(|(source_fid, _, _)| *source_fid == fid)
+            );
+            assert!(
+                vm.optimizing_tier_policy
+                    .retraining_generation(fid)
+                    .is_none()
+            );
+            for tier in [
+                crate::tier_policy::CostedTier::Template,
+                crate::tier_policy::CostedTier::Optimizing,
+            ] {
+                assert_eq!(vm.optimizing_tier_policy.compile_attempts(fid, tier), 0);
+            }
+        }
+        for fid in [before_fid, after_fid] {
+            assert_eq!(vm.jit_parameter_widening[&fid], widening_before[&fid]);
+            assert_eq!(vm.jit_entry_bail_counts[&fid], fid + 12);
+            assert_eq!(vm.jit_optimized_declined_epoch[&fid], Some(fid + 14));
+            assert!(std::sync::Arc::ptr_eq(
+                &vm.simple_constructor_absence[&fid],
+                &validity
+            ));
+            assert_eq!(vm.object_literal_layouts[&(fid, 0)], layout);
+            assert_eq!(
+                crate::read_upvalue(vm.gc_heap(), vm.global_lexical_load_ic[&(fid, 0)]),
+                Value::boolean(true)
+            );
+            assert_eq!(vm.function_user_props[&fid], vm.global_this);
+            assert_eq!(
+                vm.function_prototype_slots[&fid],
+                (Value::undefined(), false)
+            );
+            assert!(
+                vm.optimizing_tier_policy
+                    .retraining_generation(fid)
+                    .is_some()
+            );
+            for tier in [
+                crate::tier_policy::CostedTier::Template,
+                crate::tier_policy::CostedTier::Optimizing,
+            ] {
+                assert_eq!(vm.optimizing_tier_policy.compile_attempts(fid, tier), 1);
+            }
+            for (pc, reason) in [(0, ExitReason::ShapeGuard), (7, ExitReason::IdentityGuard)] {
+                let key = (fid, pc, reason);
+                assert_eq!(vm.jit_optimized_exit_profiles[&key], profiles_before[&key]);
+            }
+        }
+        for pair in &pairs[..2] {
+            let head = vm.function_constructor_layouts[&pair.1];
+            assert_eq!(
+                vm.gc_heap.read_payload(
+                    head,
+                    crate::constructor_layout::ConstructorLayoutBody::base_function_id
+                ),
+                pair.0,
+                "evicted base keys were pruned without retaining their code"
+            );
+            assert_eq!(
+                vm.gc_heap.read_payload(
+                    head,
+                    crate::constructor_layout::ConstructorLayoutBody::samples_remaining
+                ),
+                7
+            );
         }
     }
 }

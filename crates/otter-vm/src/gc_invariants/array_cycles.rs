@@ -9,7 +9,7 @@ use crate::Value;
 use crate::array::ARRAY_BODY_TYPE_TAG;
 
 fn assert_array_self_reference_reaped() {
-    let mut interp = Interpreter::new();
+    let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
 
     interp.force_gc().expect("force GC");
     let baseline = interp.gc_heap_mut().gc_stats().by_type[ARRAY_BODY_TYPE_TAG as usize].live_bytes;

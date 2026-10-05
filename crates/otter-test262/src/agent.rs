@@ -625,7 +625,15 @@ fn agent_sleep(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     // `Atomics.waitAsync` waiters (notified cross-agent, or past their
     // deadline) here; the fulfilment reactions drain at this native's
     // ordinary checkpoint.
-    let _ = ctx.interp_mut().poll_async_atomic_waits();
+    ctx.interp_mut()
+        .poll_async_atomic_waits()
+        .map_err(|error| {
+            otter_vm::native_function::vm_to_native_error(
+                ctx.interp_mut(),
+                error,
+                "$262.agent.sleep",
+            )
+        })?;
     Ok(Value::undefined())
 }
 

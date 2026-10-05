@@ -46,7 +46,8 @@ pub mod __macro_support {
     pub use crate::symbol;
     pub use crate::{
         AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
-        MethodSpec, NamespaceBuilder, NamespaceSpec, NativeCall, NativeCtx, NativeError, Value,
+        MethodSpec, NamespaceBuilder, NamespaceSpec, NativeCall, NativeCtx, NativeError,
+        ObjectBuilder, Value,
     };
     pub use crate::{bootstrap, groom, intrinsic_install, marshal, object, pelt, rooting, string};
 }
@@ -82,7 +83,7 @@ pub mod collections_prototype;
 pub mod console;
 mod constant_ops;
 mod constructor_fast_path;
-mod constructor_profile;
+mod constructor_layout;
 pub mod context;
 mod context_ops;
 mod conversion;
@@ -90,6 +91,7 @@ mod cpu_profile;
 pub mod date;
 mod element_feedback;
 mod eval_env;
+mod literal_allocation;
 mod native_stack_snapshot;
 mod stack_snapshot;
 // `date` is a directory module — see `date/mod.rs`.
@@ -250,7 +252,7 @@ pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef};
 pub use arithmetic_dispatch::NumericRuntimeOp;
 pub use code_space::BytecodeLinkError;
 pub use cpu_profile::CpuProfile;
-pub use eval_ops::commonjs_wrapper_source;
+pub use eval_ops::{CommonJsBody, EmbeddedCommonJs};
 pub use execution_context::{CallFeedbackStats, ExecutionContext};
 pub use frame_state::{
     AsyncFrameState, PendingBindFunction, PendingBindStage, PendingGetIterator,
@@ -301,8 +303,8 @@ pub use jit::{
     JitElementRepr, JitFunctionCallLookup, JitFunctionCode, JitFunctionPrototypeCall,
     JitFunctionPrototypeCallSite, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
     JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitMapTableLayout, JitMethodHolder,
-    JitParameterWidening, JitRuntimeStubBinding, JitStaticNativeCall, JitStringLayout,
-    VmRuntimeActivation,
+    JitNativeCall, JitParameterWidening, JitRuntimeStubBinding, JitStaticNativeCall,
+    JitStringLayout, VmRuntimeActivation,
 };
 pub use jit_artifact::{
     JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JitArtifactBatch, JitArtifactBuildError,
@@ -313,8 +315,8 @@ pub use jit_debug::{
     JIT_DEBUG_EVENT_LIMIT, JitCompilerDiagnostic, JitDebugCompileOutcome, JitDebugEvent,
     JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitDirectCallLoweringOutcome,
     JitDirectCallLoweringRejectionReason, JitDirectCallPlanOutcome, JitDirectCallRejectionReason,
-    JitInlineLoweringOutcome, JitInlineRejectionReason, JitStaticNativeCallLoweringOutcome,
-    JitStaticNativeCallLoweringRejectionReason,
+    JitInlineLoweringOutcome, JitInlineRejectionReason, JitInstallDeclineReason,
+    JitStaticNativeCallLoweringOutcome, JitStaticNativeCallLoweringRejectionReason,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -565,7 +567,8 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitRuntimeStats {
-    /// Optimizing-tier function and OSR entries.
+    /// Materialized interpreter-to-optimizing entry and OSR transfers.
+    /// Ordinary calls that select the compiled call ABI bypass this counter.
     pub optimized_entries: u64,
     /// Optimizing-tier entries materialized at a hot loop header.
     pub optimized_osr_entries: u64,
@@ -575,7 +578,8 @@ pub struct JitRuntimeStats {
     pub runtime_calls: u64,
     /// Compiled `Op::New` in-place construct transitions.
     pub runtime_constructs: u64,
-    /// Compiler-generated stack-frame calls that entered native callee code.
+    /// Counted Template stack-frame calls into native callee code.
+    /// The Graph backend records cold exits but omits entry accounting.
     pub generated_calls: u64,
     /// Compiler-generated stack-frame calls that cold-deoptimized and resumed
     /// through the interpreter.
@@ -588,8 +592,6 @@ pub struct JitRuntimeStats {
     pub derived_this_bind_transitions: u64,
     /// Generated exact-class superclass resolution transitions.
     pub class_super_resolution_transitions: u64,
-    /// VM-baked constructor field transitions published for recompilation.
-    pub constructor_field_transition_installs: u64,
     /// Generated callers invalidated because a callee generation changed.
     /// Stable function entry cells keep this at zero for tier publication.
     pub caller_invalidations: u64,
@@ -601,9 +603,11 @@ pub struct JitRuntimeStats {
     pub generated_template_returns: u64,
     /// Generated template-tier callees that cold-deoptimized.
     pub generated_template_deopts: u64,
-    /// Generated optimizing-tier callee entries.
+    /// Generated optimizing-tier callee entries. The current Graph backend
+    /// omits this accounting, so it reports zero.
     pub generated_optimizing_entries: u64,
-    /// Generated optimizing-tier callees that returned normally.
+    /// Generated optimizing-tier returns derived from recorded entries.
+    /// The current Graph backend omits entries, so it reports zero.
     pub generated_optimizing_returns: u64,
     /// Generated optimizing-tier callees that cold-deoptimized.
     pub generated_optimizing_deopts: u64,
@@ -720,7 +724,7 @@ pub(crate) struct PolyMethodTarget {
     pub(crate) method_fid: u32,
     pub(crate) recv_shape: object::ShapeId,
     pub(crate) prototype: MethodLookupProof,
-    pub(crate) method_value_byte: u32,
+    pub(crate) method_field: object::FieldLocation,
     /// Observations that resolved to exactly this target. Used only to order
     /// the emitted guard chain; not a correctness input.
     pub(crate) hits: u32,
@@ -733,7 +737,7 @@ impl PolyMethodTarget {
         self.method_fid == method_fid
             && self.recv_shape == site.recv_shape
             && self.prototype.same(&site.prototype)
-            && self.method_value_byte == site.method_value_byte
+            && self.method_field == site.method_field
     }
 }
 
@@ -742,13 +746,13 @@ pub(crate) enum MethodCallFeedback {
     /// One method function id and one receiver shape observed so far.
     ///
     /// `prototype` holds the shared validity proof and holder root identity;
-    /// `method_value_byte` names the current callable slot. The generated
+    /// `method_field` names the current callable slot. The generated
     /// guard validates the cell and callable before any method effect.
     Mono {
         method_fid: u32,
         recv_shape: object::ShapeId,
         prototype: MethodLookupProof,
-        method_value_byte: u32,
+        method_field: object::FieldLocation,
     },
     /// Two-to-[`MAX_POLY_METHOD_TARGETS`] distinct inlinable targets observed
     /// at this site. The baseline bakes one inline guard+body per target into a
@@ -772,7 +776,7 @@ pub(crate) enum MethodCallFeedback {
         stub_id: native_abi::RuntimeStubId,
         recv_shape: object::ShapeId,
         prototype: MethodLookupProof,
-        method_value_byte: u32,
+        method_field: object::FieldLocation,
     },
     /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
     /// site is too polymorphic to inline profitably and always side-exits.
@@ -792,7 +796,7 @@ pub(crate) struct MethodSite {
     /// empty when the method slot lives directly on the receiver.
     prototype: MethodLookupProof,
     /// Byte offset of the method slot within the holder's value slab.
-    method_value_byte: u32,
+    method_field: object::FieldLocation,
 }
 
 /// Match-based bytecode interpreter and isolate-owned runtime state.
@@ -921,11 +925,8 @@ pub struct Interpreter {
     /// cache stops answering once its site goes megamorphic; this table does
     /// not care which site asks, so a dispatch loop over sibling classes keeps
     /// resolving properties in one probe instead of re-entering the `[[Get]]`
-    /// ladder. See [`property_cache`].
-    property_cache: property_cache::PropertyLookupCache,
-    /// Shared `(receiver shape, property atom)` add-property transitions for
-    /// megamorphic store sites. See [`property_cache::StoreTransitionCache`].
-    store_transition_cache: property_cache::StoreTransitionCache,
+    /// ladder. Independent load and store facts share one key. See [`property_cache`].
+    property_cache: property_cache::PropertyActionCache,
     /// The most recent top-level [`ExecutionContext`] this interpreter ran.
     /// Every chunk links into the shared [`code_space`], so this context
     /// resolves function ids for any closure reachable in the realm — it is the
@@ -958,31 +959,11 @@ pub struct Interpreter {
     /// Final hidden class of each `Op::NewObjectLiteral` site, keyed by the
     /// owning function id and the site's first key constant.
     object_literal_layouts: rustc_hash::FxHashMap<(u32, u32), handles::ObjectLayout>,
-    /// Generated constructor-field transition programs learned while the
-    /// exact receiver prototype is rooted during allocation.
-    constructor_field_transition_cache: rustc_hash::FxHashMap<
-        u32,
-        rustc_hash::FxHashMap<u32, jit::JitConstructorFieldTransitionPlan>,
-    >,
-    /// Reserved own-slot capacity for an already planned exact base/derived
-    /// chain. Plans remain guarded at their original stores, so repeated
-    /// receiver allocation need not rescan the prototype graph.
-    constructor_field_capacity_cache: rustc_hash::FxHashMap<(u32, u32), usize>,
-    /// Shared proof per constructor pair and prototype lineage. Closures
-    /// sharing a function body can own different prototype objects.
-    constructor_prototype_validity_cache: rustc_hash::FxHashMap<
-        (u32, u32, object::ShapeId),
-        std::sync::Arc<object::prototype_validity::PrototypeValidity>,
-    >,
-    /// Instance size learned per exact constructor / `new.target` pair from
-    /// the receivers the runtime prepared for it, so a body that grows its
-    /// receiver outside the baked transition program (an `initialize` reached
-    /// through `apply`, a helper called from the constructor) still receives
-    /// storage for every field before its first store.
-    constructor_instance_profiles:
-        rustc_hash::FxHashMap<(u32, u32), constructor_profile::ConstructorInstanceProfile>,
-    pending_constructor_samples:
-        std::cell::RefCell<Vec<constructor_profile::PendingConstructorSample>>,
+    /// Traced family heads belonging to immediate callable values. Function
+    /// keys select existing owners and never mark code live by themselves.
+    function_constructor_layouts: rustc_hash::FxHashMap<u32, constructor_layout::ConstructorLayout>,
+    /// Weak family-identity index; never a root.
+    constructor_families: constructor_layout::ConstructorFamilies,
     /// Final hidden class of an arguments object, keyed by argument count,
     /// mapped-ness and the id of the `%Object.prototype%` root it grows from.
     /// Same tracing contract as the constructor cache above.
@@ -1116,19 +1097,12 @@ pub struct Interpreter {
     /// Owned, bounded compile artifacts kept separate from hot installed code.
     /// Disabled state owns no bundle buffer.
     jit_artifacts: jit_artifact::JitArtifactState,
-    /// Per-function call counter driving function-entry tier-up. Only mutated
-    /// when a JIT hook is installed.
-    jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// Isolate-local optimizing-tier feedback-stability telemetry. Entry
-    /// selection samples it only after the shared call counter is hot.
+    /// One per-source deterministic opcode-work, feedback-epoch, attempt and
+    /// interpreter-retraining policy. Installed Template code retains the
+    /// exact same source-work scalar; diagnostic entry counts do not fund it.
     optimizing_tier_policy: tier_policy::TierPolicy,
-    /// Per-function count of *entry* bails out of an installed compiled body
-    /// (function-entry, sync-entry, and direct-call callee entries alike). A
-    /// body that bails on every call — typically compiled early against
-    /// feedback that later turned polymorphic — is worse than the interpreter:
-    /// each call pays the compiled prologue, the failing guard, and the frame
-    /// hand-off, then interprets anyway. The cost policy evicts only after the
-    /// measured loss repays compilation and executable-memory cost.
+    /// Per-function entry-bail count retained for compile diagnostics. Exact
+    /// source-owned exit profiles and opcode work drive suppression/admission.
     jit_entry_bail_counts: rustc_hash::FxHashMap<u32, u32>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
@@ -1137,20 +1111,6 @@ pub struct Interpreter {
     /// can still tier up. A `(fid, u32::MAX)` entry disables the whole function
     /// only after a structural compiler rejection.
     jit_osr_disabled: rustc_hash::FxHashSet<(u32, u32)>,
-    /// Per-`(function_id, loop_header_pc)` back-edge counters driving loop-OSR
-    /// tier-up. A single shared counter let a frequently-back-edging callee
-    /// (e.g. a hot builtin loop) monopolize the count and starve a hot script
-    /// loop that calls out — that loop then never tiered up. An independent
-    /// counter per loop header lets every hot loop reach the threshold on its
-    /// own. Only mutated when a JIT hook is installed; an entry is removed once
-    /// its header tiers up (or is recorded disabled), so the map holds only the
-    /// handful of loop headers currently warming up.
-    jit_osr_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
-    /// The loop whose back-edge count triggered the OSR compile in progress:
-    /// `(function, header pc, back-edges observed)`. Call sites inside that
-    /// loop take the observed trip count as execution evidence for their
-    /// direct-call targets.
-    jit_osr_trigger: Option<(u32, u32, u64)>,
     /// Canonical Template code cache keyed by global function id and shared by
     /// ordinary entry and every loop-OSR header. `Some(code)` is the sole
     /// installed Template body for the function; `None` records a permanent
@@ -1171,8 +1131,9 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
-    /// Typed optimizing exit evidence keyed by function, PC, and reason.
-    /// The same record owns the requested policy and current-generation count.
+    /// Lifetime optimizing exit evidence keyed by the owning source function,
+    /// PC and reason, including sites spliced into different native callers.
+    /// The same record owns the requested policy, count and IC population.
     jit_optimized_exit_profiles:
         std::collections::BTreeMap<(u32, u32, native_abi::ExitReason), jit::JitExitProfile>,
     /// Per-function parameter widening learned from failed optimized entry
@@ -1218,10 +1179,10 @@ pub struct Interpreter {
     /// direct call by bumping `reg_top`, writing the callee's window into
     /// `reg_stack[reg_top..reg_top+regcount]`, and running the callee — no Rust
     /// VM-owned native register arena. Its published prefix is a precise GC
-    /// Innermost-frame cell of the live compiled entry (its
-    /// `JitCtx::native_frame`), or `None` while no compiled entry runs.
-    /// Generated linkage keeps the cell current; the frame chain hangs off it.
-    jit_frame_cell: Option<std::ptr::NonNull<u64>>,
+    /// Live compiled-entry context, or `None` outside compiled execution.
+    /// Its native-frame chain and active pending request jointly retain the
+    /// synchronous return anchors and tagged inputs before child publication.
+    jit_context: Option<std::ptr::NonNull<crate::native_abi::JitCtx>>,
     /// Innermost Rust-published frame while no compiled entry runs.
     jit_detached_frame: u64,
     /// Optional per-slice work policy shared by interpreter, JIT, native,
@@ -1327,12 +1288,9 @@ pub struct Interpreter {
     /// not the empty post-unwind stack. Cleared at every `run_*`
     /// entry and at every successful catch.
     pending_uncaught_frames: Option<Vec<StackFrameSnapshot>>,
-    /// Per-interpreter map of `module_url → source text` (+ line index),
-    /// populated by the runtime module loader. Lets the VM resolve a
-    /// frame's byte span to a `(line, column)` position for
-    /// `Error.prototype.stack` and `util.getCallSites` without reaching
-    /// back into the runtime layer.
-    module_sources: source_registry::SourceRegistry,
+    /// General isolate resource ledger for source, code and external storage.
+    /// Exact immutable source ownership belongs to each linked code chunk.
+    resource_account: otter_resource::ResourceAccount,
     /// Per-function user-property bag (§20.2.4 Function-instance
     /// properties + ordinary [[Set]] semantics for callables).
     /// `function_id` → `JsObject` carrying anything the user wrote
@@ -1529,95 +1487,6 @@ impl Interpreter {
     /// Root-tracing view of prepared string-constant cells.
     pub(crate) fn string_constant_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.string_constant_cells.values().map(Box::as_ref)
-    }
-
-    /// Upper bound (exclusive) of the cached small-integer decimal strings.
-    pub(crate) const SMALL_INT_STRING_CACHE: i32 = 1024;
-
-    /// GC-traced cached small-integer decimal strings.
-    pub(crate) fn small_int_strings_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.small_int_string_cache.iter().flatten()
-    }
-
-    /// Decimal string for a small non-negative integer, served from the
-    /// `SmallStrings`-style cache. Allocates and caches on first use; returns
-    /// the shared immutable handle thereafter. `None` for inputs outside
-    /// `0..SMALL_INT_STRING_CACHE` (the caller falls back to `number_to_string`).
-    pub(crate) fn small_int_string(&mut self, i: i32) -> Result<Option<JsString>, VmError> {
-        if !(0..Self::SMALL_INT_STRING_CACHE).contains(&i) {
-            return Ok(None);
-        }
-        if let Some(cached) = self.small_int_string_cache[i as usize] {
-            return Ok(cached.as_string(&self.gc_heap));
-        }
-        let s = number::ecma::number_to_string(f64::from(i), &mut self.gc_heap)
-            .map_err(VmError::from)?;
-        self.small_int_string_cache[i as usize] = Some(Value::string(s));
-        Ok(Some(s))
-    }
-
-    /// `ToString` of a primitive operand for string concatenation, routing small
-    /// non-negative integers through the [`Self::small_int_string`] cache to
-    /// avoid re-allocating their decimal text on every concatenation.
-    pub(crate) fn js_string_for_concat(&mut self, value: Value) -> Result<JsString, VmError> {
-        if let Some(n) = value.as_number() {
-            let f = n.as_f64();
-            if f >= 0.0
-                && f < Self::SMALL_INT_STRING_CACHE as f64
-                && f.fract() == 0.0
-                && let Some(s) = self.small_int_string(f as i32)?
-            {
-                return Ok(s);
-            }
-        }
-        conversion::to_js_string_primitive(&value, self.gc_heap_mut())
-    }
-
-    /// One-allocation concat for `<short flat latin1 string> + <int32>` and its
-    /// mirror — the common key-building shape (`"k" + n`). Formats the integer's
-    /// ASCII digits straight into a single flat latin1 result, skipping the
-    /// throwaway number string, the cons rope, and the flatten the general path
-    /// would build. Returns `None` when the operands are not that shape (the
-    /// caller takes the general concat path). Only exact int32-tagged operands
-    /// qualify, so `ToString` semantics are unchanged. No rooting is needed: the
-    /// string's bytes are copied before the result allocation and the integer is
-    /// not a heap value.
-    pub(crate) fn try_concat_string_int32(
-        &mut self,
-        lhs: Value,
-        rhs: Value,
-    ) -> Option<Result<Value, otter_gc::OutOfMemory>> {
-        let (handle, n, number_first) = match (
-            lhs.as_string(&self.gc_heap),
-            rhs.as_i32(),
-            lhs.as_i32(),
-            rhs.as_string(&self.gc_heap),
-        ) {
-            (Some(string), Some(n), _, _) => (string.handle(), n, false),
-            (_, _, Some(n), Some(string)) => (string.handle(), n, true),
-            _ => return None,
-        };
-        let mut string_bytes = [0u8; 32];
-        let string_len = crate::string::gc_body::read_short_flat_latin1(
-            &self.gc_heap,
-            handle,
-            &mut string_bytes,
-        )?;
-        let mut digits = [0u8; crate::number::integer_fast::I32_BUF_LEN];
-        let digit_len = crate::number::integer_fast::format_i32(n, &mut digits);
-        let mut out = [0u8; 32 + crate::number::integer_fast::I32_BUF_LEN];
-        let (first, second): (&[u8], &[u8]) = if number_first {
-            (&digits[..digit_len], &string_bytes[..string_len])
-        } else {
-            (&string_bytes[..string_len], &digits[..digit_len])
-        };
-        out[..first.len()].copy_from_slice(first);
-        out[first.len()..first.len() + second.len()].copy_from_slice(second);
-        let total = first.len() + second.len();
-        Some(
-            crate::string::JsString::from_latin1(&out[..total], &mut self.gc_heap)
-                .map(Value::string),
-        )
     }
 
     /// Root-tracing view of cached BigInt constants.
@@ -1824,19 +1693,14 @@ impl Interpreter {
 }
 
 impl otter_gc::ExtraRootSource for Interpreter {
-    fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
-        self.flush_constructor_observations(heap);
-    }
-
     /// Hidden classes are collectable: forget the shapes the marking left
     /// unreached in the shape tables and in every table generated code
     /// probes by shape handle. Rust-side hits that outlive their shape are
     /// rejected by id ([`object::load_own_data_slot_atom`] and siblings).
     fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
-        let dead = self.shape_runtime.sweep_dead(heap);
-        if !dead.is_empty() {
-            self.property_cache.forget_shapes(&dead);
-        }
+        self.shape_runtime.sweep_dead(heap);
+        self.property_cache.sweep_dead_holders(heap);
+        self.constructor_families.sweep_dead(heap);
     }
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);
@@ -1891,11 +1755,11 @@ pub struct EvalCompileOptions {
     /// self-name binding (`typeof anonymous` inside the body is
     /// `"undefined"`).
     pub function_constructor: bool,
-    /// Host compile-cache identity of a byte-identical trusted source, such
-    /// as a builtin module body. The host may answer with a verified earlier
-    /// compile of the same source under this identity; `None` compiles
-    /// afresh.
-    pub cache_specifier: Option<String>,
+    /// The build-produced compile of a builtin CommonJS wrapper whose text is
+    /// the source being compiled. The host answers with that module after
+    /// verifying it, or with its own configured compiler's output for the
+    /// same text; `None` compiles afresh.
+    pub embedded: Option<&'static EmbeddedCommonJs>,
 }
 
 /// Where an error's captured stack points, resolved against the source the
@@ -1903,7 +1767,7 @@ pub struct EvalCompileOptions {
 ///
 /// # See also
 /// - [`runtime_cx::NativeCtx::error_source_position`]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ErrorSourcePosition {
     /// Module URL / file path the top frame was compiled from.
     pub script_name: String,
@@ -1913,7 +1777,7 @@ pub struct ErrorSourcePosition {
     /// source line by.
     pub start_column: u32,
     /// Text of the source line, without its terminator.
-    pub source_line: String,
+    pub source_line: otter_resource::SharedSource,
 }
 
 /// One call-site record for `util.getCallSites`, serialized to JSON and
@@ -2035,9 +1899,3 @@ mod interp;
 #[allow(unused_imports)]
 pub(crate) use interp::helpers::*;
 pub use interp::helpers::{GeneratorResumeKind, is_callable_value};
-
-impl Default for Interpreter {
-    fn default() -> Self {
-        Self::new()
-    }
-}

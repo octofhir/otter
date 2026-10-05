@@ -518,6 +518,15 @@ impl Interpreter {
     /// `uncaught_error` replaces [`VmError::Uncaught`] only after every frame
     /// above `floor` has been unwound. As on the root path, a structured error
     /// does not publish `value` through `pending_uncaught_throw`.
+    ///
+    /// # Throw-site provenance
+    /// A throw that lands in a handler or an async frame costs no stack
+    /// capture and clears `pending_uncaught_frames`. Raw sites of the whole
+    /// published chain are captured only before the first handler-less frame
+    /// is popped; they are resolved into owned snapshots, and the thrown value
+    /// rendered, only when the throw leaves this region at `floor`. Provenance
+    /// already pending from a nested throw that escaped an inner region stays
+    /// authoritative.
     pub(crate) fn unwind_throw_with_uncaught_above(
         &mut self,
         context: &ExecutionContext,
@@ -530,7 +539,8 @@ impl Interpreter {
         if floor.depth() > stack.len() {
             return Err(VmError::InvalidOperand);
         }
-        let display = self.render_thrown(&value);
+        let inherited_provenance = self.pending_uncaught_frames.is_some();
+        let mut unwound_sites: Option<Vec<crate::native_stack_snapshot::FrameSite>> = None;
         let mut value = value;
         let mut value_root = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: `value` precedes the scope and stays in place until it
@@ -542,12 +552,23 @@ impl Interpreter {
         let mut site = site;
         loop {
             if stack.is_at_floor(floor) {
-                if uncaught_error.is_none() {
-                    self.pending_uncaught_throw = Some(value);
+                if !inherited_provenance {
+                    let frames = match unwound_sites.take() {
+                        Some(sites) => crate::native_stack_snapshot::resolve_frame_sites(
+                            context,
+                            &sites,
+                            usize::MAX,
+                        ),
+                        None => self.snapshot_active_frames(context, usize::MAX),
+                    };
+                    self.pending_uncaught_frames = Some(frames);
                 }
-                return Err(uncaught_error
-                    .take()
-                    .unwrap_or(self.err_uncaught((display).into())));
+                if let Some(error) = uncaught_error.take() {
+                    return Err(error);
+                }
+                let display = self.render_thrown(&value);
+                self.pending_uncaught_throw = Some(value);
+                return Err(self.err_uncaught(display.into()));
             }
             let frame = stack.last_mut().expect("frame present");
             if let Some(handler) = frame_handler(context, frame, site)? {
@@ -557,6 +578,7 @@ impl Interpreter {
                     .get_mut(usize::from(handler.exception))
                     .ok_or(VmError::InvalidOperand)?;
                 *slot = value;
+                self.pending_uncaught_frames = None;
                 return Ok(());
             }
             site = ThrowSite::AfterCall;
@@ -577,7 +599,11 @@ impl Interpreter {
                 for j in jobs.jobs {
                     self.microtasks.enqueue(j);
                 }
+                self.pending_uncaught_frames = None;
                 return Ok(());
+            }
+            if !inherited_provenance && unwound_sites.is_none() {
+                unwound_sites = Some(self.capture_active_sites());
             }
             let popped = stack.pop().expect("frame still present");
             self.complete_interpreted_retraining_activation(popped);

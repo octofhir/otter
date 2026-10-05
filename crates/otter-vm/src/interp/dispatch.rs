@@ -906,15 +906,8 @@ impl Interpreter {
                         .get(src as usize)
                         .cloned()
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    // Capture frames at the originating throw site
-                    // before `unwind_throw` pops handler-less
-                    // frames. If a catch absorbs the throw the
-                    // unwind path clears `pending_uncaught_frames`
-                    // through [`Self::clear_pending_uncaught_frames`].
-                    if self.pending_uncaught_frames.is_none() {
-                        self.pending_uncaught_frames =
-                            Some(self.snapshot_active_frames(context, usize::MAX));
-                    }
+                    // The unwind owns throw-site provenance: it captures
+                    // frames only when this throw leaves the region.
                     let unwind = self.unwind_throw_above(
                         context,
                         stack,
@@ -922,9 +915,7 @@ impl Interpreter {
                         value,
                         crate::activation_stack::ThrowSite::Instruction,
                     );
-                    if unwind.is_ok() {
-                        self.pending_uncaught_frames = None;
-                    } else {
+                    if unwind.is_err() {
                         // No handler in this dispatch stack — stash
                         // the thrown VALUE so outer loops / native
                         // boundaries keep identity instead of the

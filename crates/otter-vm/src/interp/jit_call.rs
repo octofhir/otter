@@ -79,21 +79,14 @@ impl Interpreter {
         floor: ActivationFloor,
         thrown: Value,
     ) -> Result<(), VmError> {
-        if self.pending_uncaught_frames.is_none() {
-            self.pending_uncaught_frames = Some(self.snapshot_active_frames(context, usize::MAX));
-        }
         // A compiled frame publishes the PC of the instruction that raised.
-        let unwind = self.unwind_throw_above(
+        self.unwind_throw_above(
             context,
             stack,
             floor,
             thrown,
             crate::activation_stack::ThrowSite::Instruction,
-        );
-        if unwind.is_ok() {
-            self.pending_uncaught_frames = None;
-        }
-        unwind
+        )
     }
 
     /// Count a generated receiver-allocation miss that left compiled code

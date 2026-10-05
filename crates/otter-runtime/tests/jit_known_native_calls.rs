@@ -16,8 +16,8 @@
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use otter_runtime::{
     JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDebugTarget,
-    JitSelection, Runtime, RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx,
-    RuntimeNativeError, RuntimeRealmId, RuntimeValue, SourceInput,
+    JitDebugTier, JitSelection, Runtime, RuntimeExtensionInstaller, RuntimeNativeCall,
+    RuntimeNativeCtx, RuntimeNativeError, RuntimeRealmId, RuntimeValue, SourceInput,
     inspect::{StepEvent, StepTracer},
 };
 use otter_vm::{
@@ -367,7 +367,12 @@ fn assert_native_edge(bundle: &JitArtifactBundle) {
     assert_eq!(region["logicalPc"], record["callPc"]);
     assert!(region["bytePc"].as_u64().is_some());
     assert!(record["inlineFrames"].as_array().unwrap().is_empty());
-    assert!(!record["taggedLocations"].as_array().unwrap().is_empty());
+    // A Template record names no spill roots: the collector traces its whole
+    // register window, which holds the live target.
+    assert_eq!(
+        record["taggedLocations"].as_array().unwrap().is_empty(),
+        bundle.manifest().tier() == JitDebugTier::Template
+    );
     if matches!(
         bundle.manifest().function_name(),
         "knownNativeZero" | "knownNativeOne" | "knownNativeOdd"

@@ -287,7 +287,32 @@ fn call_int(
     )
 }
 
-fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntimeStats) {
+/// Whether `fid`'s current entry is an installed optimizing generation.
+/// Host and generated calls enter it through the function cell, so the
+/// Rust-mediated tier-entry counter does not observe them.
+fn optimizing_entry_installed(interp: &Interpreter, fid: u32) -> bool {
+    interp
+        .jit_code_generation_snapshot()
+        .iter()
+        .any(|generation| {
+            generation.function_id == fid
+                && generation.tier == otter_vm::native_abi::NativeFrameKind::Optimizing
+                && generation.lifecycle == otter_vm::native_abi::CodeLifetimeState::Installed
+                && generation.current_entry
+        })
+}
+
+type RunResult = (
+    Value,
+    Value,
+    Value,
+    Value,
+    Value,
+    JitRuntimeStats,
+    [bool; 3],
+);
+
+fn run(selection: JitSelection) -> RunResult {
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     match selection {
         JitSelection::ProductionTiered => {
@@ -332,6 +357,7 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntim
             Some(45)
         );
     }
+    let warmed = [1, 2, 3].map(|fid| optimizing_entry_installed(&interp, fid));
     let optimized = call_add(
         &mut interp,
         &context,
@@ -364,12 +390,13 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntim
         max_right,
         sum,
         interp.jit_runtime_stats(),
+        warmed,
     )
 }
 
 #[test]
 fn template_selection_never_enters_optimizer() {
-    let (_, _, _, _, _, stats) = run(JitSelection::Template);
+    let (_, _, _, _, _, stats, warmed) = run(JitSelection::Template);
     assert!(
         stats.compile_attempts > 0,
         "template tier must compile the hot fixture: {stats:?}"
@@ -380,13 +407,14 @@ fn template_selection_never_enters_optimizer() {
     );
     assert_eq!(stats.optimized_osr_entries, 0);
     assert_eq!(stats.optimized_deopts, 0);
+    assert_eq!(warmed, [false; 3]);
 }
 
 #[test]
 fn optimized_return_and_deopt_match_interpreter() {
-    let (oracle_return, oracle_deopt, oracle_max_left, oracle_max_right, oracle_sum, _) =
+    let (oracle_return, oracle_deopt, oracle_max_left, oracle_max_right, oracle_sum, _, _) =
         run(JitSelection::InterpreterOnly);
-    let (tiered_return, tiered_deopt, tiered_max_left, tiered_max_right, tiered_sum, stats) =
+    let (tiered_return, tiered_deopt, tiered_max_left, tiered_max_right, tiered_sum, stats, warmed) =
         run(JitSelection::ProductionTiered);
 
     assert_eq!(oracle_return.as_i32(), Some(16));
@@ -399,8 +427,8 @@ fn optimized_return_and_deopt_match_interpreter() {
     assert_eq!(tiered_max_right.to_bits(), oracle_max_right.to_bits());
     assert_eq!(oracle_sum.as_i32(), Some(4_950));
     assert_eq!(tiered_sum.to_bits(), oracle_sum.to_bits());
-    assert!(
-        stats.optimized_entries >= 5,
+    assert_eq!(
+        warmed, [true; 3],
         "arithmetic, diamond, and loop fixtures must enter optimized code: {stats:?}"
     );
     assert!(
@@ -428,16 +456,17 @@ fn optimized_float_function_matches_interpreter_bits() {
                 Value::number_f64(3.75).to_bits()
             );
         }
+        let optimized = optimizing_entry_installed(&interp, 5);
         let result = call_float_add(&mut interp, &context, -4.5, 0.25);
-        (result, interp.jit_runtime_stats())
+        (result, interp.jit_runtime_stats(), optimized)
     };
 
-    let (oracle, _) = run_float(JitSelection::InterpreterOnly);
-    let (tiered, stats) = run_float(JitSelection::ProductionTiered);
+    let (oracle, _, _) = run_float(JitSelection::InterpreterOnly);
+    let (tiered, stats, optimized) = run_float(JitSelection::ProductionTiered);
     assert_eq!(oracle.to_bits(), Value::number_f64(-4.25).to_bits());
     assert_eq!(tiered.to_bits(), oracle.to_bits());
     assert!(
-        stats.optimized_entries > 0,
+        optimized,
         "floatAdd must execute through the optimizing entry: {stats:?}"
     );
 }
@@ -461,9 +490,8 @@ fn optimized_long_loop_interrupts_through_leaf_poll_without_reentry() {
         );
     }
     let before = interp.jit_runtime_stats();
-    let entries_before = before.optimized_entries;
     assert!(
-        entries_before > 0,
+        optimizing_entry_installed(&interp, 4),
         "count loop must be optimized after warmup"
     );
 
@@ -478,14 +506,13 @@ fn optimized_long_loop_interrupts_through_leaf_poll_without_reentry() {
 
     assert_eq!(result, Err(otter_vm::VmError::Interrupted));
     let stats = interp.jit_runtime_stats();
-    assert!(stats.optimized_entries > entries_before, "{stats:?}");
     assert!(
         stats.leaf_stub_transitions > before.leaf_stub_transitions,
         "interrupt poll must exit through the allocation-free leaf path: {stats:?}"
     );
     assert!(
-        stats.optimized_deopts > before.optimized_deopts,
-        "the interrupt must leave optimized execution: {stats:?}"
+        optimizing_entry_installed(&interp, 4),
+        "the interrupt leaves its activation, not the installed generation: {stats:?}"
     );
     assert_eq!(stats.runtime_calls, before.runtime_calls);
     assert_eq!(

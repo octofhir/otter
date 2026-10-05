@@ -365,9 +365,10 @@ fn old_graph_guard_exit_preserves_the_reentrant_current_replacement() {
     assert!(!retained_old.linked);
     // Generated frames pin the native retirement epoch, rather than taking
     // optional Rust-side CodeEntryLease ownership on every call. Invalid
-    // executable metadata remains registered until that old extent returns.
+    // executable metadata remains registered until that old extent returns:
+    // its one published frame is the only activity it reports.
     assert!(retained_old.dependencies.is_some());
-    assert_eq!(retained_old.active_count, 0);
+    assert_eq!(retained_old.active_count, 1);
     for checkpoint in [after_old_exit, after_recovery] {
         assert_eq!(
             current_graph(&checkpoint.generations).code_object_id,

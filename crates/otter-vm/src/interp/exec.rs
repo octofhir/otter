@@ -1231,7 +1231,7 @@ mod tests {
             vm.jit_entry_bail_counts.insert(fid, fid + 12);
             vm.jit_osr_disabled.insert((fid, 8));
             vm.jit_optimized_declined_epoch.insert(fid, Some(fid + 14));
-            vm.optimizing_tier_policy.begin_retraining(fid, 16);
+            vm.optimizing_tier_policy.begin_retraining(fid);
             for tier in [
                 crate::tier_policy::CostedTier::Template,
                 crate::tier_policy::CostedTier::Optimizing,

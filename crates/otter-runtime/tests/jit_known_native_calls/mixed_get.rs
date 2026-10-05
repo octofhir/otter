@@ -119,9 +119,11 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
                 && region["functionId"].as_u64() == Some(u64::from(own.function_id))
                 && region["logicalPc"].as_u64() == Some(u64::from(pc))
                 && region["bytePc"].as_u64() == Some(u64::from(byte_pc))
-                && region["operation"]
-                    .as_str()
-                    .is_some_and(|op| op.starts_with("LoadProperty {") || op.contains(" Generic {"))
+                && region["operation"].as_str().is_some_and(|op| {
+                    op.starts_with("LoadProperty {")
+                        || op.contains(" LoadPropertyCached {")
+                        || op.contains(" Generic {")
+                })
         })
         .collect();
     assert_eq!(regions.len(), 1, "one actual emitted property consumer");
@@ -130,6 +132,21 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
     let end = region["endOffset"].as_u64().unwrap();
     assert!(start < end);
     let relocations = json(bundle, JitArtifactFileName::Relocations);
+    // A Template body shares one out-of-line property probe per code object;
+    // the source instruction branches to it, and the probe owns the committed
+    // C entry. An optimizing body emits the edge inside the instruction.
+    let shared = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|region| region["kind"] == "sharedPropertyProbes")
+        .map(|region| {
+            (
+                region["startOffset"].as_u64().unwrap(),
+                region["endOffset"].as_u64().unwrap(),
+            )
+        });
+    let (start, end) = shared.unwrap_or((start, end));
     let links: Vec<_> = relocations["relocations"]
         .as_array()
         .unwrap()
@@ -179,14 +196,35 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
         .iter()
         .filter(|record| record["callPc"].as_u64() == Some(u64::from(pc)))
         .collect();
-    assert_eq!(records.len(), 1, "exact Get source/root record");
-    let tagged = records[0]["taggedLocations"].as_array().unwrap();
-    assert!(!tagged.is_empty(), "actual boxed receiver remains rooted");
-    assert!(
-        tagged
+    if bundle.manifest().tier() == JitDebugTier::Template {
+        // A Template transition publishes its source PC in the frame header
+        // and the collector traces the whole register window, which holds the
+        // actual boxed receiver: the body owns no per-site root record.
+        assert!(
+            roots["records"].as_array().unwrap().is_empty(),
+            "Template window roots need no record"
+        );
+    } else {
+        // Graph boundary records publish their source PC in the frame
+        // header; each names the spill homes live across its C entry.
+        let boundaries: Vec<_> = roots["records"]
+            .as_array()
+            .unwrap()
             .iter()
-            .all(|location| location["kind"] != "machineRegister")
-    );
+            .filter(|record| record["callPc"].is_null())
+            .collect();
+        assert!(records.is_empty(), "a C Get boundary is no call record");
+        assert!(
+            boundaries.iter().any(|record| {
+                let tagged = record["taggedLocations"].as_array().unwrap();
+                !tagged.is_empty()
+                    && tagged
+                        .iter()
+                        .all(|location| location["kind"] != "machineRegister")
+            }),
+            "actual boxed receiver remains rooted"
+        );
+    }
     assert!(
         roots["returnSites"].as_array().unwrap().is_empty(),
         "a C Get transition does not fabricate a JS return anchor"

@@ -12,8 +12,10 @@
 //! - Wall-clock durations are diagnostics and never enter policy.
 //! - Feedback changes restart the stable work origin; wakeup targets name that
 //!   origin plus required work, preserving already observed work.
-//! - Retraining additionally requires interpreted work and a complete fresh
-//!   activation or loop iteration of its exact generation.
+//! - Retraining requires one complete fresh interpreted activation or loop
+//!   iteration of its exact generation. Re-optimization then waits for a full
+//!   stable work window after the deopt's feedback change, earned in any
+//!   tier, as V8 and JSC re-warm a deoptimized function in baseline code.
 //! - Code objects retain the same scalar allocation through active retirement.
 //!
 //! # See also
@@ -116,6 +118,7 @@ impl TierWorkModel {
         Self
     }
 
+    #[cfg(test)]
     pub(crate) fn minimum_required_work(self, input: TierWorkInput) -> u64 {
         self.decide(input).required_work
     }
@@ -185,13 +188,7 @@ struct FunctionTierState {
     /// admission. Same-epoch retries require this physical headroom.
     refused_code_bytes: [u64; 2],
     retraining_generation: u64,
-    retraining: Option<RetrainingState>,
-}
-
-#[derive(Debug)]
-struct RetrainingState {
-    remaining_work: u64,
-    completed_path: bool,
+    retraining: bool,
 }
 
 /// Evidence carried by one interpreter activation, independently of recursion.
@@ -246,19 +243,16 @@ impl TierPolicy {
         }
     }
 
-    pub(crate) fn begin_retraining(&mut self, function_id: u32, work: u64) {
+    pub(crate) fn begin_retraining(&mut self, function_id: u32) {
         let state = self.functions.entry(function_id).or_default();
-        if state.retraining.is_none() {
+        if !state.retraining {
             self.retraining_functions += 1;
         }
         state.retraining_generation = state
             .retraining_generation
             .checked_add(1)
             .expect("function retraining generation overflow");
-        state.retraining = Some(RetrainingState {
-            remaining_work: work.max(1),
-            completed_path: false,
-        });
+        state.retraining = true;
         state.last_feedback_epoch = None;
         state.observed_feedback_change = false;
     }
@@ -272,34 +266,15 @@ impl TierPolicy {
             return None;
         }
         let state = self.functions.get(&fid)?;
-        state
-            .retraining
-            .as_ref()
-            .map(|_| state.retraining_generation)
+        state.retraining.then_some(state.retraining_generation)
     }
-    pub(crate) fn note_interpreted_work(&mut self, fid: u32, generation: u64) {
-        self.update_retraining(fid, generation, false);
-    }
+    /// One complete fresh interpreted path of `generation` ends retraining.
     pub(crate) fn note_completed_interpreted_path(&mut self, fid: u32, generation: u64) {
-        self.update_retraining(fid, generation, true);
-    }
-    fn update_retraining(&mut self, fid: u32, generation: u64, completed: bool) {
         let Some(state) = self.functions.get_mut(&fid) else {
             return;
         };
-        if state.retraining_generation != generation {
-            return;
-        }
-        let Some(retraining) = state.retraining.as_mut() else {
-            return;
-        };
-        if completed {
-            retraining.completed_path = true;
-        } else {
-            retraining.remaining_work = retraining.remaining_work.saturating_sub(1);
-        }
-        if retraining.remaining_work == 0 && retraining.completed_path {
-            state.retraining = None;
+        if state.retraining && state.retraining_generation == generation {
+            state.retraining = false;
             self.retraining_functions -= 1;
         }
     }
@@ -317,7 +292,7 @@ impl TierPolicy {
         self.retraining_functions -= self
             .functions
             .iter()
-            .filter(|(fid, state)| **fid >= start && **fid < end && state.retraining.is_some())
+            .filter(|(fid, state)| **fid >= start && **fid < end && state.retraining)
             .count();
         self.functions
             .retain(|fid, _| !(*fid >= start && *fid < end));
@@ -387,7 +362,7 @@ impl TierPolicy {
         decision.work_target = decision
             .work_target
             .and_then(|required| origin.checked_add(required));
-        if state.retraining.is_some()
+        if state.retraining
             || (decision.work_target.is_none()
                 && decision.reason != TierWorkReason::CodeMemoryBudget)
         {
@@ -441,53 +416,33 @@ mod tests {
     }
 
     #[test]
-    fn retraining_requires_exact_work_and_completed_path() {
+    fn retraining_ends_on_one_completed_path_of_its_generation() {
         let mut policy = TierPolicy::default();
-        policy.begin_retraining(7, 3);
+        policy.begin_retraining(7);
         let generation = policy.retraining_generation(7).unwrap();
-        for _ in 0..3 {
-            policy.note_interpreted_work(7, generation);
-        }
-        assert_eq!(
-            policy.retraining_generation(7),
-            Some(generation),
-            "a suffix alone is insufficient"
-        );
+        assert!(policy.has_retraining());
         policy.note_completed_interpreted_path(7, generation);
         assert!(!policy.has_retraining());
-
-        policy.begin_retraining(7, 3);
-        let generation = policy.retraining_generation(7).unwrap();
         policy.note_completed_interpreted_path(7, generation);
-        for _ in 0..2 {
-            policy.note_interpreted_work(7, generation);
-        }
-        assert!(
-            policy.has_retraining(),
-            "completion cannot erase unpaid work"
-        );
-        policy.note_interpreted_work(7, generation);
-        assert!(!policy.has_retraining());
+        assert!(!policy.has_retraining(), "completion is idempotent");
     }
 
     #[test]
     fn new_retraining_generation_rejects_older_recursive_evidence_and_evicts() {
         let mut policy = TierPolicy::default();
-        policy.begin_retraining(7, 1);
+        policy.begin_retraining(7);
         let old = policy.retraining_generation(7).unwrap();
-        policy.begin_retraining(7, 1);
+        policy.begin_retraining(7);
         let current = policy.retraining_generation(7).unwrap();
         assert_ne!(old, current);
         policy.note_completed_interpreted_path(7, old);
-        policy.note_interpreted_work(7, old);
         assert_eq!(policy.retraining_generation(7), Some(current));
-        policy.note_interpreted_work(7, current);
         assert!(policy.has_retraining());
         policy.note_completed_interpreted_path(7, current);
         assert!(!policy.has_retraining());
 
-        policy.begin_retraining(7, 1);
-        policy.begin_retraining(8, 1);
+        policy.begin_retraining(7);
+        policy.begin_retraining(8);
         policy.evict_function_range(7, 8);
         assert!(policy.has_retraining());
         assert!(policy.retraining_generation(7).is_none());

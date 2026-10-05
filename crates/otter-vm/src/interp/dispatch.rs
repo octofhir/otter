@@ -257,9 +257,6 @@ impl Interpreter {
             if jit_installed {
                 function.source_work().charge(1);
             }
-            if jit_installed && self.optimizing_tier_policy.has_retraining() {
-                self.note_interpreted_retraining_step(&mut stack[top_idx]);
-            }
             // Feedback is dense in the owning CodeBlock. Interpreter-only
             // execution keeps the cell untouched and pays no atomic update.
             let feedback = if jit_installed {
@@ -507,6 +504,27 @@ impl Interpreter {
                         });
                     let mut receiver = receiver_value.filter(|_| capture);
                     let name_idx = const_operand(function.operand(instr, 2)).ok();
+                    if let (Some(recv), Some(name_idx), Some(site)) =
+                        (receiver, name_idx, feedback_site)
+                        && let Ok(argc) = const_operand(function.operand(instr, 3))
+                        && self
+                            .recorded_method_call(
+                                context,
+                                function_id,
+                                name_idx,
+                                site,
+                                context.property_feedback_slot(
+                                    function_id,
+                                    instr.instruction_pc,
+                                    crate::property_ic::PropertyIcKind::Load,
+                                ),
+                                recv,
+                                argc as usize,
+                            )
+                            .is_some()
+                    {
+                        receiver = None;
+                    }
                     // The receiver is refreshed in place: resolving the site can
                     // migrate a dictionary-mode receiver onto the shaped path,
                     // and that allocation may relocate it.
@@ -516,6 +534,15 @@ impl Interpreter {
                         }
                         _ => None,
                     };
+                    // An object receiver no guard can describe gets no record;
+                    // without saturation every later call would repeat the
+                    // capture. A primitive receiver costs no capture work.
+                    if receiver.is_some_and(|recv| recv.as_object().is_some())
+                        && method_site.is_none()
+                        && let Some(site) = feedback_site
+                    {
+                        self.saturate_method_site_feedback(site);
+                    }
                     // A declared native leaf completes synchronously and pushes
                     // no frame, so its identity has to be classified here, while
                     // the receiver is still live, or the site records nothing.

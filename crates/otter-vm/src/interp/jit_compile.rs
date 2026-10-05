@@ -59,11 +59,27 @@ pub(super) enum TemplateCompileOutcome {
 impl Interpreter {
     /// Snapshot installed, invalid, and retired-tombstone JIT generations.
     ///
-    /// This explicit diagnostics call walks cold registry metadata and performs
-    /// no work during ordinary compilation or execution.
+    /// This explicit diagnostics call walks cold registry metadata and the
+    /// published frame chain; it performs no work during ordinary compilation
+    /// or execution. A generation's `active_count` adds the published native
+    /// frames executing it to its explicit entry leases.
     #[must_use]
     pub fn jit_code_generation_snapshot(&self) -> Vec<jit::JitCodeGenerationSnapshot> {
-        self.jit_code_registry.generation_snapshot()
+        let mut generations = self.jit_code_registry.generation_snapshot();
+        for frame in self.jit_native_frames() {
+            // SAFETY: every published record stays live while it is linked.
+            let code_object_id = u64::from(unsafe { (*frame).code_object_id });
+            if code_object_id == 0 {
+                continue;
+            }
+            if let Some(generation) = generations
+                .iter_mut()
+                .find(|generation| generation.code_object_id == code_object_id)
+            {
+                generation.active_count = generation.active_count.saturating_add(1);
+            }
+        }
+        generations
     }
 
     /// Snapshot all executable code objects currently retained by this isolate.
@@ -3021,7 +3037,7 @@ mod tests {
                 crate::source_registry::SourceRegistry::default(),
             )
             .unwrap();
-        interpreter.optimizing_tier_policy.begin_retraining(0, 1);
+        interpreter.optimizing_tier_policy.begin_retraining(0);
         assert!(
             interpreter
                 .prewarm_string_constant_cells(&context, 0)

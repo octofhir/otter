@@ -1576,6 +1576,7 @@ pub(crate) fn emit_operation<'a>(
                 identity_guard_exit,
                 threw,
                 committed_throw,
+                fatal,
             )?;
         }
         TemplateOp::TailCall {
@@ -1636,6 +1637,7 @@ pub(crate) fn emit_operation<'a>(
                 identity_guard_exit,
                 threw,
                 committed_throw,
+                fatal,
             )?;
         }
         TemplateOp::Construct {
@@ -1663,6 +1665,7 @@ pub(crate) fn emit_operation<'a>(
                 byte_pc,
                 threw,
                 committed_throw,
+                fatal,
             )?;
         }
         TemplateOp::MethodCall {
@@ -2039,6 +2042,7 @@ pub(crate) fn emit_operation<'a>(
                 instr.byte_pc,
                 threw,
                 committed_throw,
+                fatal,
             )?;
         }
         TemplateOp::ClassValueOp {

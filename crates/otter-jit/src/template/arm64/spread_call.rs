@@ -42,6 +42,7 @@ pub(super) fn emit_spread_call_op(
     byte_pc: u32,
     threw: DynamicLabel,
     throw_value: DynamicLabel,
+    fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let lane = |packed: u64, index: usize| ((packed >> (index * 16)) & 0xffff) as u16;
     let (dst, callee, receiver, array, new_target) =
@@ -110,5 +111,6 @@ pub(super) fn emit_spread_call_op(
         dst,
         throw_value,
         threw,
+        fatal,
     )
 }

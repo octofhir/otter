@@ -239,6 +239,7 @@ fn caller(view: &JitCompileSnapshot, table: &TransitionTable) -> dynasmrt::Execu
         ],
         throw_value,
         threw,
+        threw,
     )
     .unwrap();
     dynasm!(ops ; .arch x64

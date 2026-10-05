@@ -2362,7 +2362,8 @@ pub struct JitCodeGenerationSnapshot {
     /// is no in-mapping call entry or the mapping has retired. This describes
     /// emitted capability independently of the compile trigger and linkage.
     pub call_entry_offset: Option<u32>,
-    /// Native activations currently holding an entry lease.
+    /// Published native frames executing this generation plus explicit
+    /// entry leases.
     pub active_count: u32,
     /// Formal parameter count frozen into the entry cell.
     pub param_count: u16,

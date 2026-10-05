@@ -73,10 +73,19 @@ pub(crate) mod engine {
         Regex::compile_utf16(pattern_utf16, flags).map_err(|e| format!("{e}"))
     }
 
-    /// Collect every successful match from `start` with exact work accounting.
-    pub(crate) fn find(re: &Regex, text: &[u16], start: usize) -> Execution<Vec<Match>> {
-        let mut matches =
-            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig::default());
+    /// Collect every successful match from `start` with exact work accounting,
+    /// exploring at most `step_limit` backtrack points.
+    pub(crate) fn find(
+        re: &Regex,
+        text: &[u16],
+        start: usize,
+        step_limit: u64,
+    ) -> Execution<Vec<Match>> {
+        let mut matches = re.find_from_utf16_with_config(
+            text,
+            start,
+            otter_regex::ExecConfig { step_limit },
+        );
         let mut found = Vec::new();
         let result = loop {
             match matches.next() {
@@ -93,11 +102,19 @@ pub(crate) mod engine {
 
     /// Find only the first match from `start` — the single-match path for
     /// `exec`/`test`. The iterator is lazy, so this computes one match instead
-    /// of the whole remaining set. Budget exhaustion remains an explicit
+    /// of the whole remaining set. Exceeding `step_limit` remains an explicit
     /// resource error for the VM boundary to surface.
-    pub(crate) fn find_one(re: &Regex, text: &[u16], start: usize) -> Execution<Option<Match>> {
-        let mut matches =
-            re.find_from_utf16_with_config(text, start, otter_regex::ExecConfig::default());
+    pub(crate) fn find_one(
+        re: &Regex,
+        text: &[u16],
+        start: usize,
+        step_limit: u64,
+    ) -> Execution<Option<Match>> {
+        let mut matches = re.find_from_utf16_with_config(
+            text,
+            start,
+            otter_regex::ExecConfig { step_limit },
+        );
         let result = matches.next().transpose();
         Execution {
             result,
@@ -187,8 +204,8 @@ impl RegexCompileCache {
 use crate::Value;
 use crate::number::NumberValue;
 
-/// Charge one matcher execution to the runtime ledger and retain finite-engine
-/// exhaustion as the VM's structural resource error.
+/// Charge one matcher execution to the runtime ledger; a search the work
+/// budget cut short is the VM's structural resource error.
 pub(crate) fn finish_execution<T>(
     ctx: &mut crate::NativeCtx<'_>,
     execution: engine::Execution<T>,
@@ -197,7 +214,7 @@ pub(crate) fn finish_execution<T>(
     execution
         .result
         .map_err(|_| crate::NativeError::BudgetExceeded {
-            reason: "regular expression backtrack budget exceeded".to_string(),
+            reason: "work budget exceeded in a regular expression search".to_string(),
         })
 }
 
@@ -567,23 +584,25 @@ impl JsRegExp {
         heap: &otter_gc::GcHeap,
         text_units: &[u16],
         start: usize,
+        step_limit: u64,
     ) -> engine::Execution<Option<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find_one(&body.regex, text_units, start)
+            engine::find_one(&body.regex, text_units, start, step_limit)
         })
     }
 
-    /// Run the compiled engine from a UTF-16 offset and collect
-    /// owned matches. The standalone engine's finite default bounds the scan;
-    /// the returned work count is charged at the runtime boundary.
+    /// Run the compiled engine from a UTF-16 offset and collect owned matches,
+    /// exploring at most `step_limit` backtrack points; the returned work count
+    /// is charged at the runtime boundary.
     pub(crate) fn find_from_utf16(
         &self,
         heap: &otter_gc::GcHeap,
         text_units: &[u16],
         start: usize,
+        step_limit: u64,
     ) -> engine::Execution<Vec<engine::Match>> {
         heap.read_payload(self.inner, |body| {
-            engine::find(&body.regex, text_units, start)
+            engine::find(&body.regex, text_units, start, step_limit)
         })
     }
 
@@ -817,7 +836,7 @@ mod tests {
         assert!(r.flags(&heap).ignore_case);
         let utf16: Vec<u16> = "abbbcXabbbbc".encode_utf16().collect();
         let m = r
-            .find_from_utf16(&heap, &utf16, 0)
+            .find_from_utf16(&heap, &utf16, 0, u64::MAX)
             .result
             .expect("within matcher budget")
             .into_iter()

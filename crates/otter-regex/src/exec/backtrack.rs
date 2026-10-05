@@ -1,22 +1,20 @@
-//! Bounded backtracking executor — the primary matcher backend.
+//! Backtracking executor — the primary matcher backend.
 //!
 //! This backend implements every ECMAScript matching feature exactly: capturing
 //! groups, backreferences, lookahead, lookbehind, and precise greedy/lazy
 //! quantifier priority. Backtracking uses an **explicit stack** (not native
 //! recursion) so a long input under a quantifier loop cannot overflow the Rust
 //! stack; native recursion is used only to evaluate a lookaround body, whose
-//! depth is bounded by pattern nesting. A step budget
-//! ([`crate::ExecConfig::step_limit`]) bounds worst-case time so a
-//! catastrophic-backtracking input aborts instead of hanging.
+//! depth is bounded by pattern nesting. A host step budget
+//! ([`crate::ExecConfig::step_limit`]) can end a search early with an error.
 //!
 //! # Contents
 //! - [`attempt`] — try to match a program anchored at one start offset.
 //!
 //! # Invariants
 //! - Greedy quantifiers explore the longer match first; lazy the shorter.
-//! - Each backtrack point explored counts one step against the budget, so a
-//!   catastrophic-backtracking input aborts while a linear forward match pays
-//!   nothing per character.
+//! - Each backtrack point explored counts one step against the budget, while
+//!   a linear forward match pays nothing per character.
 //! - Reported positions are UTF-16 code-unit offsets.
 //!
 //! # Lookbehind

@@ -366,7 +366,7 @@ fn collect_regex_matches(
     text_units: &[u16],
 ) -> Result<Vec<crate::regexp::engine::Match>, NativeError> {
     let global = re.flags(ctx.heap()).global;
-    let execution = re.find_from_utf16(ctx.heap(), text_units, 0);
+    let execution = re.find_from_utf16(ctx.heap(), text_units, 0, ctx.regex_step_limit());
     let mut out = crate::regexp::finish_execution(ctx, execution)?;
     if !global {
         out.truncate(1);
@@ -2370,7 +2370,7 @@ fn regex_split(
     let recv_units = recv.to_utf16_vec(ctx.heap_mut());
     let mut out: Vec<Value> = Vec::new();
     let mut cursor: usize = 0;
-    let execution = re.find_from_utf16(ctx.heap(), &recv_units, 0);
+    let execution = re.find_from_utf16(ctx.heap(), &recv_units, 0, ctx.regex_step_limit());
     let mut iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
     while (out.len() as u32) < limit {
         let m = match iter.next() {
@@ -2387,7 +2387,8 @@ fn regex_split(
             // Drop the iterator and resume after the cursor advance.
             drop(iter);
             cursor += 1;
-            let execution = re.find_from_utf16(ctx.heap(), &recv_units, cursor);
+            let execution =
+                re.find_from_utf16(ctx.heap(), &recv_units, cursor, ctx.regex_step_limit());
             iter = crate::regexp::finish_execution(ctx, execution)?.into_iter();
             continue;
         }

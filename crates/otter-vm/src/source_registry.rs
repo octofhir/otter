@@ -35,6 +35,8 @@ pub struct ModuleSource {
     /// `\n`. Sorted ascending, so a byte offset maps to a line by
     /// `partition_point`.
     line_starts: Box<[u32]>,
+    /// Every byte is ASCII, so a column is a byte distance.
+    ascii: bool,
 }
 
 impl ModuleSource {
@@ -48,9 +50,11 @@ impl ModuleSource {
                 line_starts.push((idx + 1) as u32);
             }
         }
+        let ascii = text.is_ascii();
         Ok(Self {
             text,
             line_starts: line_starts.into_boxed_slice(),
+            ascii,
         })
     }
 
@@ -69,8 +73,14 @@ impl ModuleSource {
         let line = self.line_starts.partition_point(|&s| s <= clamped);
         let line = line.max(1);
         let line_start = self.line_starts[line - 1] as usize;
-        let slice = &self.text[line_start..clamped as usize];
-        let col_units = slice.chars().map(|c| c.len_utf16()).sum::<usize>();
+        let col_units = if self.ascii {
+            clamped as usize - line_start
+        } else {
+            self.text[line_start..clamped as usize]
+                .chars()
+                .map(char::len_utf16)
+                .sum::<usize>()
+        };
         (line as u32, (col_units as u32) + 1)
     }
 

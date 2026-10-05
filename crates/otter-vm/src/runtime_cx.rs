@@ -402,7 +402,8 @@ impl<'rt> NativeCtx<'rt> {
         self.context
     }
 
-    /// Snapshot the current JavaScript activation stack, top frame first.
+    /// Snapshot at most `limit` innermost JavaScript activations, top frame
+    /// first.
     ///
     /// The activation borrow comes from this context's [`RuntimeTurn`], so the
     /// operation is safe during inline native execution and needs no ambient
@@ -410,8 +411,20 @@ impl<'rt> NativeCtx<'rt> {
     pub(crate) fn capture_active_frames(
         &self,
         context: &ExecutionContext,
+        limit: usize,
     ) -> Vec<crate::StackFrameSnapshot> {
-        self.cx.interp.snapshot_active_frames(context, usize::MAX)
+        self.cx.interp.snapshot_active_frames(context, limit)
+    }
+
+    /// The innermost activations, after `skip` of them, as an error's
+    /// captured stack of at most `limit` frames.
+    pub(crate) fn error_stack_draft(
+        &self,
+        context: &ExecutionContext,
+        skip: usize,
+        limit: usize,
+    ) -> crate::object::ErrorStackDraft {
+        self.cx.interp.error_stack_draft(context, skip, limit)
     }
 
     /// How many innermost frames belong to `callee` and its callees.
@@ -433,12 +446,8 @@ impl<'rt> NativeCtx<'rt> {
         skip: usize,
         count: usize,
     ) -> String {
-        let mut frames = self.capture_active_frames(context);
-        let skip = skip.min(frames.len());
-        frames.drain(0..skip);
-        if frames.len() > count {
-            frames.truncate(count);
-        }
+        let mut frames = self.capture_active_frames(context, skip.saturating_add(count));
+        frames.drain(0..skip.min(frames.len()));
         let sites: Vec<crate::CallSiteInfo> = frames
             .into_iter()
             .map(|frame| {

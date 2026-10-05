@@ -75,7 +75,8 @@ impl Interpreter {
     /// still propagating already owns the provenance.
     pub(crate) fn record_throw_site(&mut self) {
         if self.pending_throw_provenance.is_none() {
-            self.pending_throw_provenance = Some(ThrowProvenance::Sites(self.capture_active_sites()));
+            let sites = self.capture_active_sites(usize::MAX);
+            self.pending_throw_provenance = Some(ThrowProvenance::Sites(sites));
         }
     }
 
@@ -159,40 +160,64 @@ impl Interpreter {
         context: &ExecutionContext,
         limit: usize,
     ) -> Vec<StackFrameSnapshot> {
-        resolve_frame_sites(context, &self.capture_active_sites(), limit)
+        resolve_frame_sites(context, &self.capture_active_sites(limit), limit)
     }
 
-    /// Raw sites of every published JavaScript activation, innermost first.
+    /// The innermost activations, after `skip` of them, as an error's
+    /// captured stack — at most `limit` frames.
+    pub(crate) fn error_stack_draft(
+        &self,
+        context: &ExecutionContext,
+        skip: usize,
+        limit: usize,
+    ) -> crate::object::ErrorStackDraft {
+        let mut draft = crate::object::ErrorStackDraft::default();
+        let total = skip.saturating_add(limit);
+        let mut index = 0;
+        visit_frame_sites(context, &self.capture_active_sites(total), total, |frame| {
+            if index >= skip {
+                draft.push(frame);
+            }
+            index += 1;
+            true
+        });
+        draft
+    }
+
+    /// Raw sites of the innermost published JavaScript activations, at most
+    /// `limit` of them, innermost first.
     ///
     /// Reads only frame headers and safepoint records: no names, modules,
     /// source positions or allocations beyond the returned vector.
-    pub(crate) fn capture_active_sites(&self) -> Vec<FrameSite> {
-        // Resolve against the complete physical chain first. A Host child owns
-        // its compiled caller's return anchor even though it has no JS source.
-        let mut natives: Vec<_> = self.jit_native_frames().collect();
-        natives.reverse();
-        let mut sites = Vec::with_capacity(natives.len());
-        for address in natives {
+    pub(crate) fn capture_active_sites(&self, limit: usize) -> Vec<FrameSite> {
+        let mut sites = Vec::new();
+        for address in self.jit_native_frames() {
+            if sites.len() >= limit {
+                break;
+            }
+            // SAFETY: every published record stays live while it is linked.
             let native = unsafe { &*address };
+            // A Host child owns its compiled caller's return anchor even
+            // though it has no JS source.
             if native.header.kind == crate::native_abi::NativeFrameKind::Host {
                 continue;
             }
             let call = self
                 .jit_frame_safepoint(native)
                 .expect("published source anchor must resolve exactly");
-            let pc = self.jit_frame_source_pc(native, call);
-            sites.push(FrameSite::Instruction {
-                function_id: native.header.function_id,
-                pc,
-            });
+            // Inline parents recorded outermost first; the innermost one is
+            // the most recent activation.
             if let Some(record) = call {
-                sites.extend(record.inline_frames.iter().map(|frame| FrameSite::Inline {
+                sites.extend(record.inline_frames.iter().rev().map(|frame| FrameSite::Inline {
                     function_id: frame.function_id,
                     byte_pc: frame.byte_pc,
                 }));
             }
+            sites.push(FrameSite::Instruction {
+                function_id: native.header.function_id,
+                pc: self.jit_frame_source_pc(native, call),
+            });
         }
-        sites.reverse();
         sites
     }
 
@@ -202,7 +227,7 @@ impl Interpreter {
         limit: usize,
         visit: impl FnMut(StackFrameSnapshotView<'_>) -> bool,
     ) {
-        visit_frame_sites(context, &self.capture_active_sites(), limit, visit);
+        visit_frame_sites(context, &self.capture_active_sites(limit), limit, visit);
     }
 }
 

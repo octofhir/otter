@@ -463,28 +463,6 @@ fn is_anonymous_frame_name(name: &str) -> bool {
     name.is_empty() || name.starts_with('<')
 }
 
-/// Append V8-style frame lines to an error's stack string. Each line is
-/// `    at <fn> (<module>:<line>:<col>)`, or `    at <module>:<line>:<col>`
-/// for anonymous/top-level frames. Line/column come from the exact captured
-/// defining source (1-based, UTF-16 columns); when the source is unknown
-/// the module URL is emitted without a position.
-pub(crate) fn append_stack_frames(
-    out: &mut String,
-    frames: &[crate::run_control::StackFrameSnapshot],
-) {
-    for frame in frames {
-        append_stack_frame(
-            out,
-            &frame.function_name,
-            &frame.module,
-            frame
-                .source_position
-                .as_ref()
-                .map(|position| (position.line_number, position.start_column)),
-        );
-    }
-}
-
 /// Render one captured frame without copying or admitting its source text.
 pub(crate) fn append_stack_frame(
     out: &mut String,
@@ -730,6 +708,13 @@ impl ErrorClassRegistry {
             if !has_error_data {
                 return Ok(Value::undefined());
             }
+            // The string is rendered once, at the first read, as V8 does.
+            if let Some(stack) = receiver
+                .as_object()
+                .and_then(|obj| crate::object::error_stack_string(obj, ctx.heap()))
+            {
+                return Ok(Value::string(stack));
+            }
             // step 4 — implementation-defined stack string. The header
             // is the error's `toString` form (`Name: message`); when
             // construction captured a call stack, append V8-style frame
@@ -745,6 +730,10 @@ impl ErrorClassRegistry {
                 );
             }
             let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(NativeError::from)?;
+            // The allocation may have moved the receiver; its rooted slot is live.
+            if let Some(obj) = ctx.this_value().as_object() {
+                crate::object::set_error_stack_string(obj, ctx.heap_mut(), s);
+            }
             Ok(Value::string(s))
         }
         fn error_stack_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1005,20 +994,13 @@ impl ErrorClassRegistry {
                 // formatted lazily on first `.stack` access).
                 let limit = stack_trace_limit(scope.context());
                 if limit > 0 {
-                    let mut frames = scope.context().capture_active_frames(&context);
-                    if frames.len() > limit {
-                        frames.truncate(limit);
-                    }
-                    if !frames.is_empty() {
+                    let draft = scope.context().error_stack_draft(&context, 0, limit);
+                    if !draft.is_empty() {
                         let mut object = scope
                             .raw(instance)
                             .as_object()
                             .expect("scoped Error instance remains an object");
-                        object::set_error_stack_frames(
-                            &mut object,
-                            scope.context().heap_mut(),
-                            frames,
-                        )?;
+                        object::set_error_stack(&mut object, scope.context().heap_mut(), &draft)?;
                     }
                 }
                 Ok(scope.finish(instance))
@@ -1351,33 +1333,32 @@ impl ErrorClassRegistry {
                         reason: "missing execution context".to_string(),
                     })?;
             let limit = stack_trace_limit(ctx);
-            let mut frames = if limit > 0 {
-                ctx.capture_active_frames(&context)
-            } else {
-                Vec::new()
-            };
             // skip-until-function: when `constructorOpt` is a function,
             // drop every frame at or above the topmost frame belonging to
             // it (matched by function identity, the V8 semantics). This
             // lets a subclass constructor hide its own and inner frames.
-            if let Some(ctor) = args.get(1).copied()
-                && let Some(skip) = ctor_frames_to_skip(ctx, ctor)
-            {
-                frames.drain(0..skip.min(frames.len()));
-            }
-            if frames.len() > limit {
-                frames.truncate(limit);
-            }
-            if crate::object::has_error_data(target_obj, ctx.heap()) {
-                // Target inherits the `Error.prototype.stack` getter:
-                // store frames and let it format lazily (V8 model).
-                crate::object::set_error_stack_frames(&mut target_obj, ctx.heap_mut(), frames)?;
-            } else {
+            let skip = args
+                .get(1)
+                .copied()
+                .and_then(|ctor| ctor_frames_to_skip(ctx, ctor))
+                .unwrap_or(0);
+            let draft = ctx.error_stack_draft(&context, skip, limit);
+            // Keep the structured frames on every target: the stack getter
+            // formats them lazily (V8 model), and callers that want the
+            // position rather than the rendered text read them.
+            crate::object::set_error_stack(&mut target_obj, ctx.heap_mut(), &draft)?;
+            if !crate::object::has_error_data(target_obj, ctx.heap()) {
                 // Plain object: install an own formatted `stack` data
                 // property (the JSC-style eager shape, acceptable per the
                 // TC39 capture-stack-trace proposal).
                 let mut rendered = render_error_to_string(&target, ctx.heap());
-                append_stack_frames(&mut rendered, &frames);
+                crate::object::visit_error_stack_frames(
+                    target_obj,
+                    ctx.heap(),
+                    |name, module, position| {
+                        append_stack_frame(&mut rendered, name, module, position);
+                    },
+                );
                 let s = JsString::from_str(&rendered, ctx.heap_mut()).map_err(NativeError::from)?;
                 // The string allocation may have moved the target; the
                 // rooted argument slot is the live handle.
@@ -1391,16 +1372,6 @@ impl ErrorClassRegistry {
                     "stack",
                     PropertyDescriptor::data(Value::string(s), true, false, true),
                 )?;
-                // Keep the structured frames as well. A plain object is a
-                // capture target precisely because it is cheap, and callers
-                // that want the position rather than the rendered text ask
-                // for the frames — the rendering above must not be the only
-                // record of where the capture happened.
-                let mut target_obj = args
-                    .first()
-                    .and_then(|value| value.as_object())
-                    .unwrap_or(target_obj);
-                crate::object::set_error_stack_frames(&mut target_obj, ctx.heap_mut(), frames)?;
             }
             Ok(Value::undefined())
         }

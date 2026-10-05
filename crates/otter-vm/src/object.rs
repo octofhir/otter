@@ -1027,6 +1027,9 @@ pub struct ExoticSlots {
     /// `util.getCallSites`. `None` until captured; holds only owned
     /// `String`/offset data (no GC handles), so it needs no tracing.
     error_stack_frames: ErrorStackHandle,
+    /// The `stack` string rendered at its first read; cleared when frames
+    /// are captured again.
+    error_stack_string: Option<JsString>,
     /// `[[ParameterMap]]` presence marker for arguments-exotic objects
     /// (§10.4.4); mapping data itself lives in `host_data`.
     is_arguments_object: bool,
@@ -1092,6 +1095,9 @@ impl otter_gc::SafeTraceable for ExoticSlots {
         if !self.error_stack_frames.is_null() {
             let slot = &mut self.error_stack_frames as *mut ErrorStackHandle as *mut RawGc;
             v(slot);
+        }
+        if let Some(stack) = &mut self.error_stack_string {
+            stack.trace_handle_slot(v);
         }
         if let Some(native) = &mut self.call_native {
             native.trace_value_slot_mut(v);
@@ -1502,7 +1508,8 @@ struct ErrorFrameRecord {
 }
 
 /// Captured `Error` stack frames: fixed records followed by a UTF-8
-/// arena holding every frame's function/module name and exact captured source line. Written once
+/// arena holding every frame's function/module name and the top frame's
+/// captured source line. Written once
 /// at capture, never mutated, no GC references — the page image
 /// carries it whole where the old `Vec<StackFrameSnapshot>` (owned
 /// `String`s) could not ride at all.
@@ -4583,32 +4590,117 @@ pub fn has_error_data(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     heap.read_payload(obj, |body| body.error_data())
 }
 
+/// Captured frames on their way into an [`ErrorStackBody`]: fixed records
+/// and one UTF-8 arena, filled from borrowed frame views without a
+/// per-frame allocation. Only the top frame keeps its source line, the one
+/// line an uncaught-error report shows.
+#[derive(Default)]
+pub(crate) struct ErrorStackDraft {
+    records: Vec<ErrorFrameRecord>,
+    bytes: Vec<u8>,
+}
+
+impl ErrorStackDraft {
+    /// No frame was captured.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Append the next frame, top of stack first.
+    pub(crate) fn push(&mut self, frame: crate::stack_snapshot::StackFrameSnapshotView<'_>) {
+        let position = frame.source.map(|source| {
+            let (line, column) = source.line_col(frame.span.0);
+            let text = if self.records.is_empty() {
+                source.line_text(line).unwrap_or_default()
+            } else {
+                ""
+            };
+            (line, column.saturating_sub(1), text)
+        });
+        self.push_parts(
+            frame.function_id,
+            frame.function_name,
+            frame.module,
+            frame.span,
+            position,
+        );
+    }
+
+    /// Append an owned snapshot, top of stack first.
+    pub(crate) fn push_snapshot(&mut self, frame: &crate::run_control::StackFrameSnapshot) {
+        let top = self.records.is_empty();
+        let position = frame.source_position.as_ref().map(|position| {
+            let text: &str = if top { &position.source_line } else { "" };
+            (position.line_number, position.start_column, text)
+        });
+        self.push_parts(
+            frame.function_id,
+            &frame.function_name,
+            &frame.module,
+            frame.span,
+            position,
+        );
+    }
+
+    fn push_parts(
+        &mut self,
+        function_id: u32,
+        name: &str,
+        module: &str,
+        span: (u32, u32),
+        position: Option<(u32, u32, &str)>,
+    ) {
+        let name_offset = self.bytes.len();
+        self.bytes.extend_from_slice(name.as_bytes());
+        let module_offset = self.bytes.len();
+        self.bytes.extend_from_slice(module.as_bytes());
+        let source_offset = self.bytes.len();
+        let (line_number, start_column) = position.map_or((0, 0), |(line, column, text)| {
+            self.bytes.extend_from_slice(text.as_bytes());
+            (line, column)
+        });
+        self.records.push(ErrorFrameRecord {
+            function_id,
+            name_offset,
+            name_len: name.len(),
+            module_offset,
+            module_len: module.len(),
+            span_lo: span.0,
+            span_hi: span.1,
+            has_source: position.is_some(),
+            line_number,
+            start_column,
+            source_offset,
+            source_len: self.bytes.len() - source_offset,
+        });
+    }
+}
+
 /// Record the captured JS call-stack frames for an error object
-/// (top-of-stack first). Replaces any previously captured frames, as
-/// `Error.captureStackTrace` may re-capture onto an existing target.
+/// (top-of-stack first). Replaces any previously captured frames and the
+/// rendered `stack` string, as `Error.captureStackTrace` may re-capture onto
+/// an existing target.
 pub fn set_error_stack_frames(
     obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     frames: Vec<crate::run_control::StackFrameSnapshot>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    // Exact UTF-8 line bytes are part of the managed variable allocation,
-    // admitted by the heap before publication. Owned snapshots share the
-    // original source lease; the managed body has no source or code handle.
-    let bytes = frames.iter().fold(0u64, |bytes, frame| {
-        bytes
-            .saturating_add(frame.function_name.len() as u64)
-            .saturating_add(frame.module.len() as u64)
-            .saturating_add(
-                frame
-                    .source_position
-                    .as_ref()
-                    .map_or(0, |position| position.source_line.len() as u64),
-            )
-    });
-    let records =
-        (frames.len() as u64).saturating_mul(std::mem::size_of::<ErrorFrameRecord>() as u64);
-    let unaligned = bytes
-        .saturating_add(records)
+    let mut draft = ErrorStackDraft::default();
+    for frame in &frames {
+        draft.push_snapshot(frame);
+    }
+    set_error_stack(obj, heap, &draft)
+}
+
+/// Publish captured frames on an error object; see [`set_error_stack_frames`].
+pub(crate) fn set_error_stack(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    draft: &ErrorStackDraft,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let frame_count = draft.records.len();
+    let bytes = draft.bytes.len();
+    let unaligned = (ErrorStackBody::trailing_bytes(frame_count, bytes) as u64)
         .saturating_add(std::mem::size_of::<ErrorStackBody>() as u64)
         .saturating_add(std::mem::size_of::<otter_gc::GcHeader>() as u64);
     let alignment = otter_gc::OBJECT_ALIGNMENT as u64;
@@ -4620,7 +4712,6 @@ pub fn set_error_stack_frames(
             max_bytes,
         });
     }
-    let bytes = bytes as usize;
     ensure_exotic(obj, heap)?;
     let object_slot = std::ptr::from_mut(obj);
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -4628,72 +4719,41 @@ pub fn set_error_stack_frames(
     };
     let stack = heap.alloc_variable_with_roots::<ErrorStackBody>(
         ErrorStackBody {
-            frame_count: frames.len(),
+            frame_count,
             byte_len: bytes,
         },
-        ErrorStackBody::trailing_bytes(frames.len(), bytes),
+        ErrorStackBody::trailing_bytes(frame_count, bytes),
         &mut visit,
     )?;
     // SAFETY: exact record and UTF-8 extents were admitted before allocation;
     // initialization performs no JS allocation or collection.
     unsafe {
         let body = error_stack_body_of(stack).expect("fresh stack body");
-        let mut offset = 0;
-        for (i, frame) in frames.iter().enumerate() {
-            let name_offset = offset;
-            std::ptr::copy_nonoverlapping(
-                frame.function_name.as_ptr(),
-                (*body).bytes_ptr().add(offset),
-                frame.function_name.len(),
-            );
-            offset += frame.function_name.len();
-            let module_offset = offset;
-            std::ptr::copy_nonoverlapping(
-                frame.module.as_ptr(),
-                (*body).bytes_ptr().add(offset),
-                frame.module.len(),
-            );
-            offset += frame.module.len();
-            let source_offset = offset;
-            let source_len = frame
-                .source_position
-                .as_ref()
-                .map_or(0, |position| position.source_line.len());
-            if let Some(position) = &frame.source_position {
-                std::ptr::copy_nonoverlapping(
-                    position.source_line.as_ptr(),
-                    (*body).bytes_ptr().add(offset),
-                    source_len,
-                );
-                offset += source_len;
-            }
-            (*body).records_ptr().add(i).write(ErrorFrameRecord {
-                function_id: frame.function_id,
-                name_offset,
-                name_len: frame.function_name.len(),
-                module_offset,
-                module_len: frame.module.len(),
-                span_lo: frame.span.0,
-                span_hi: frame.span.1,
-                has_source: frame.source_position.is_some(),
-                line_number: frame
-                    .source_position
-                    .as_ref()
-                    .map_or(0, |position| position.line_number),
-                start_column: frame
-                    .source_position
-                    .as_ref()
-                    .map_or(0, |position| position.start_column),
-                source_offset,
-                source_len,
-            });
-        }
-        debug_assert_eq!(offset, bytes);
+        std::ptr::copy_nonoverlapping(draft.records.as_ptr(), (*body).records_ptr(), frame_count);
+        std::ptr::copy_nonoverlapping(draft.bytes.as_ptr(), (*body).bytes_ptr(), bytes);
     }
-    heap.with_payload(*obj, |body| body.exotic_mut().error_stack_frames = stack);
+    heap.with_payload(*obj, |body| {
+        let exotic = body.exotic_mut();
+        exotic.error_stack_frames = stack;
+        exotic.error_stack_string = None;
+    });
     let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
     heap.record_write(sidecar, &stack);
     Ok(())
+}
+
+/// The `stack` string rendered at the error's first `stack` read.
+pub(crate) fn error_stack_string(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
+    heap.read_payload(obj, |body| body.exotic().and_then(|e| e.error_stack_string))
+}
+
+/// Keep the rendered `stack` string of an error that has a sidecar.
+pub(crate) fn set_error_stack_string(obj: JsObject, heap: &mut otter_gc::GcHeap, stack: JsString) {
+    let sidecar = heap.with_payload(obj, |body| {
+        body.exotic_mut().error_stack_string = Some(stack);
+        body.exotic.get()
+    });
+    heap.record_write(sidecar, &Value::string(stack));
 }
 
 /// Read owned captured frames. Source-line copies are admitted before return;

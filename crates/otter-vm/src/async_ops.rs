@@ -605,7 +605,7 @@ impl Interpreter {
                 return Ok(());
             }
             if !inherited_provenance && unwound_sites.is_none() {
-                unwound_sites = Some(self.capture_active_sites());
+                unwound_sites = Some(self.capture_active_sites(usize::MAX));
             }
             let popped = stack.pop().expect("frame still present");
             self.complete_interpreted_retraining_activation(popped);

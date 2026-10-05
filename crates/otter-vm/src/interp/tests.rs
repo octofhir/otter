@@ -5626,7 +5626,7 @@ fn native_construct_context_walks_the_live_caller_stack() {
                 name: "recordDepth",
                 reason: "missing execution context".to_string(),
             })?;
-        let depth = i32::try_from(ctx.capture_active_frames(&context).len()).unwrap_or(i32::MAX);
+        let depth = i32::try_from(ctx.capture_active_frames(&context, usize::MAX).len()).unwrap_or(i32::MAX);
         let receiver = *ctx.this_value();
         ctx.set_value_property(receiver, "callerDepth", Value::number_i32(depth))?;
         Ok(Value::undefined())

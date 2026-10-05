@@ -54,10 +54,12 @@ fn managed_source_arena_collects_roots_charges_exact_extent_and_extracts_fallibl
                 }),
             })
             .collect();
+        // Only the top frame keeps its source line.
         let arena_bytes: usize = frames
             .iter()
-            .map(|frame| frame.function_name.len() + frame.module.len() + source.len())
-            .sum();
+            .map(|frame| frame.function_name.len() + frame.module.len())
+            .sum::<usize>()
+            + source.len();
         let unaligned = std::mem::size_of::<otter_gc::GcHeader>()
             + std::mem::size_of::<ErrorStackBody>()
             + ErrorStackBody::trailing_bytes(frames.len(), arena_bytes);
@@ -130,15 +132,16 @@ fn managed_source_arena_collects_roots_charges_exact_extent_and_extracts_fallibl
         let copied = error_stack_frames(current, &vm.gc_heap, &extracted_account)
             .unwrap()
             .unwrap();
-        assert_eq!(usage(&extracted_account), 3 * text.len() as u64);
-        for frame in &copied {
+        assert_eq!(usage(&extracted_account), text.len() as u64);
+        for (index, frame) in copied.iter().enumerate() {
+            let expected = if index == 0 { text.as_str() } else { "" };
             assert_eq!(
                 frame.source_position.as_ref().unwrap().source_line.as_ref(),
-                text
+                expected
             );
         }
         let copy_alias = copied.clone();
-        assert_eq!(usage(&extracted_account), 3 * text.len() as u64);
+        assert_eq!(usage(&extracted_account), text.len() as u64);
         drop(copied);
         drop(copy_alias);
         assert_eq!(usage(&extracted_account), 0);

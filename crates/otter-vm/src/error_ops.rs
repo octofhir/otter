@@ -138,9 +138,9 @@ impl Interpreter {
         if limit == 0 {
             return Ok(());
         }
-        let frames = self.snapshot_active_frames(context, limit);
-        if !frames.is_empty() {
-            object::set_error_stack_frames(obj, self.gc_heap_mut(), frames)?;
+        let draft = self.error_stack_draft(context, 0, limit);
+        if !draft.is_empty() {
+            object::set_error_stack(obj, self.gc_heap_mut(), &draft)?;
         }
         Ok(())
     }

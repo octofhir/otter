@@ -99,10 +99,15 @@ impl Interpreter {
             // The shared table answers first, so a site re-learning after a
             // miss pays a probe instead of another chain walk; a megamorphic
             // site walks at most once per receiver class and name.
-            let resolved = self.resolve_property_data_slot(obj, atomized_key);
-            self.update_load_ic(slot, obj, atomized_key, resolved.as_ref());
-            if let Some(resolved) = resolved {
-                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, resolved.value)
+            let load = self.resolve_property_load(obj, atomized_key);
+            self.update_load_ic(slot, obj, &load);
+            let value = match load {
+                crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
+                crate::property_cache::PropertyLoad::Absent(_) => Some(Value::undefined()),
+                crate::property_cache::PropertyLoad::Other => None,
+            };
+            if let Some(value) = value {
+                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                     .map_err(|error| CommittedValueError::Fatal(error.into()))?;
                 return Ok(true);
             }

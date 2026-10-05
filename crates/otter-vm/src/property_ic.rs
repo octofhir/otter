@@ -21,6 +21,12 @@
 //!   transition target died before those cells can be reused, so a handle
 //!   compare is an exact layout proof. Only fast ordinary shapes are
 //!   installed; dictionary and opaque objects never match an entry.
+//! - A function receiver's map is its property bag's shape, keyed with the
+//!   low bit set (shape handles are 8-aligned, so the key never equals an
+//!   ordinary receiver's shape): the bag carries the function's own
+//!   `[[Prototype]]`, so the bag's shape fixes the function's ordinary lookup
+//!   for every key the function does not synthesize. Its handlers act on the
+//!   bag as their lookup-start object (V8's `lookup_start_object`).
 //! - A matched receiver shape fixes the object's lookup state, own keys,
 //!   attributes, prototype and storage banks. Prototype-field and
 //!   nonexistent handlers additionally require their chain proof; a
@@ -137,13 +143,17 @@ pub enum TransitionGuard {
     /// No link of the proved chain owns the key.
     ChainMissing = 1,
     /// The direct prototype owns writable data of the key.
-    DirectPrototypeWritable = 2,
+    PrototypeWritable = 2,
 }
 
 /// The empty shape word. Shape handles are 8-aligned non-zero cage offsets,
 /// so this never equals a receiver's shape and the inline compare needs no
 /// separate emptiness test.
 pub const EMPTY_SHAPE: u32 = u32::MAX;
+
+/// Key bit of a function receiver's map: its property bag's shape handle with
+/// the low bit set.
+pub const FUNCTION_RECEIVER_KEY_BIT: u32 = 1;
 
 const STATE_COUNT_MASK: u32 = 0xff;
 const STATE_ATTEMPTED: u32 = 1 << 8;
@@ -209,6 +219,7 @@ impl IcEntry {
     }
 
     fn write(&self, handler: IcHandler) {
+        let key = handler.key();
         let old = self.validity.swap(
             handler.validity.map_or(0, PrototypeValidity::into_raw),
             Ordering::Relaxed,
@@ -224,8 +235,18 @@ impl IcEntry {
             .store(handler.transition as u8, Ordering::Relaxed);
         self.slot.store(handler.slot, Ordering::Relaxed);
         self.aux.store(handler.aux.offset(), Ordering::Relaxed);
-        self.shape
-            .store(handler.receiver_shape.offset(), Ordering::Relaxed);
+        self.shape.store(key, Ordering::Relaxed);
+    }
+
+    /// Shape handle the entry's key names, with the function bit cleared.
+    fn shape_handle(&self) -> ShapeHandle {
+        // SAFETY: entry keys hold shape handles (plus the function bit)
+        // published by `write`; the weak pass clears dead ones.
+        unsafe { ShapeHandle::from_offset(self.shape() & !FUNCTION_RECEIVER_KEY_BIT) }
+    }
+
+    fn function_receiver(&self) -> bool {
+        self.shape() != EMPTY_SHAPE && self.shape() & FUNCTION_RECEIVER_KEY_BIT != 0
     }
 
     /// Move `other`'s contents (including its proof count) into `self`.
@@ -268,7 +289,7 @@ impl IcEntry {
     fn transition_guard(&self) -> TransitionGuard {
         match self.transition.load(Ordering::Relaxed) {
             1 => TransitionGuard::ChainMissing,
-            2 => TransitionGuard::DirectPrototypeWritable,
+            2 => TransitionGuard::PrototypeWritable,
             _ => TransitionGuard::OwnAdd,
         }
     }
@@ -278,6 +299,7 @@ impl IcEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct IcHandler {
     receiver_shape: ShapeHandle,
+    function_receiver: bool,
     kind: IcHandlerKind,
     field: FieldLocation,
     slot: u16,
@@ -312,6 +334,7 @@ impl IcHandler {
             }
             return Some(Self {
                 receiver_shape,
+                function_receiver: false,
                 kind: IcHandlerKind::OwnField,
                 field,
                 slot: resolved.hit.slot,
@@ -325,6 +348,7 @@ impl IcHandler {
         }
         Some(Self {
             receiver_shape,
+            function_receiver: false,
             kind: IcHandlerKind::PrototypeField,
             field,
             slot: resolved.hit.slot,
@@ -342,6 +366,7 @@ impl IcHandler {
     ) -> Option<Self> {
         Self::eligible_receiver(receiver_shape).then(|| Self {
             receiver_shape,
+            function_receiver: false,
             kind: IcHandlerKind::NonExistent,
             field: FieldLocation::from_cache_key(0),
             slot: 0,
@@ -349,6 +374,24 @@ impl IcHandler {
             validity,
             transition: TransitionGuard::OwnAdd,
         })
+    }
+
+    /// This load handler, serving a function receiver whose property bag has
+    /// the handler's receiver shape: the bag is the lookup-start object.
+    #[must_use]
+    pub(crate) fn for_function_receiver(mut self) -> Self {
+        debug_assert!(!self.kind.is_store(), "function receivers take loads only");
+        self.function_receiver = true;
+        self
+    }
+
+    fn key(&self) -> u32 {
+        self.receiver_shape.offset()
+            | if self.function_receiver {
+                FUNCTION_RECEIVER_KEY_BIT
+            } else {
+                0
+            }
     }
 
     /// The store handler for the receiver's existing writable own data slot.
@@ -384,6 +427,7 @@ impl IcHandler {
             (
                 Self {
                     receiver_shape,
+                    function_receiver: false,
                     kind: IcHandlerKind::StoreField,
                     field: object::field_location(receiver_shape, u32::from(hit.slot)),
                     slot: hit.slot,
@@ -414,10 +458,9 @@ impl IcHandler {
             StorePropertyTransitionKind::PrototypeChainMissing { validity } => {
                 (TransitionGuard::ChainMissing, Some(validity.clone()))
             }
-            StorePropertyTransitionKind::DirectPrototypeWritableData { validity } => (
-                TransitionGuard::DirectPrototypeWritable,
-                Some(validity.clone()),
-            ),
+            StorePropertyTransitionKind::PrototypeWritableData { validity } => {
+                (TransitionGuard::PrototypeWritable, Some(validity.clone()))
+            }
         };
         // A dictionary target has no layout to publish; its location is the
         // flat slot, consumed only by the VM's replay.
@@ -428,6 +471,7 @@ impl IcHandler {
         };
         Some(Self {
             receiver_shape: from_shape,
+            function_receiver: false,
             kind: IcHandlerKind::StoreTransition,
             field,
             slot: transition.slot,
@@ -446,6 +490,7 @@ impl IcHandler {
         Self {
             // SAFETY: the fixture handle is never dereferenced.
             receiver_shape: unsafe { ShapeHandle::from_offset(shape_offset) },
+            function_receiver: false,
             kind: IcHandlerKind::OwnField,
             field: FieldLocation::inline(0),
             slot: 0,
@@ -628,7 +673,10 @@ impl PropertyIcSlot {
             PropertyIcKind::Load => IcHandlerKind::OwnField,
             PropertyIcKind::Store => IcHandlerKind::StoreField,
         };
-        let entry = self.live().iter().find(|entry| entry.kind() == own);
+        let entry = self
+            .live()
+            .iter()
+            .find(|entry| entry.kind() == own && !entry.function_receiver());
         match entry {
             Some(entry) => {
                 self.inline_field
@@ -653,7 +701,27 @@ impl PropertyIcSlot {
     /// Run the load handler of `obj`'s shape. `None` on a miss.
     #[must_use]
     pub(crate) fn probe_load(&self, obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
-        let entry = self.matching(object::shape(obj, heap).offset())?;
+        self.probe_load_from(obj, object::shape(obj, heap).offset(), heap)
+    }
+
+    /// Run the load handler of a function receiver whose property bag is
+    /// `bag`. `None` on a miss.
+    #[must_use]
+    pub(crate) fn probe_function_load(
+        &self,
+        bag: JsObject,
+        heap: &otter_gc::GcHeap,
+    ) -> Option<Value> {
+        let shape = object::keyed_shape(bag, heap);
+        if shape.is_null() {
+            return None;
+        }
+        self.probe_load_from(bag, shape.offset() | FUNCTION_RECEIVER_KEY_BIT, heap)
+    }
+
+    /// Run the load handler keyed `key` with `obj` as lookup-start object.
+    fn probe_load_from(&self, obj: JsObject, key: u32, heap: &otter_gc::GcHeap) -> Option<Value> {
+        let entry = self.matching(key)?;
         match entry.kind() {
             IcHandlerKind::OwnField => Some(object::load_proven_data_slot(obj, heap, entry.slot())),
             IcHandlerKind::PrototypeField => {
@@ -700,17 +768,14 @@ impl PropertyIcSlot {
                         }
                     }
                     // SAFETY: as above.
-                    TransitionGuard::DirectPrototypeWritable if word != 0 => {
-                        StorePropertyTransitionKind::DirectPrototypeWritableData {
+                    TransitionGuard::PrototypeWritable if word != 0 => {
+                        StorePropertyTransitionKind::PrototypeWritableData {
                             validity: unsafe { PrototypeValidity::clone_raw(word) },
                         }
                     }
                     _ => return Ok(false),
                 };
-                let from = object::shape_body::id_of(
-                    // SAFETY: entry shapes are live handles (weak pass).
-                    unsafe { ShapeHandle::from_offset(entry.shape()) },
-                );
+                let from = object::shape_body::id_of(entry.shape_handle());
                 let target = entry.aux();
                 let target_id = if target.is_null() {
                     object::ShapeId::UNASSIGNED
@@ -749,8 +814,7 @@ impl PropertyIcSlot {
             self.kind == PropertyIcKind::Store,
             "handler family matches the site"
         );
-        let shape = handler.receiver_shape.offset();
-        if let Some(entry) = self.matching(shape) {
+        if let Some(entry) = self.matching(handler.key()) {
             entry.write(handler);
             self.refresh_inline();
             self.installs.fetch_add(1, Ordering::Relaxed);
@@ -804,7 +868,7 @@ impl PropertyIcSlot {
             heap.is_marked(unsafe { ShapeHandle::from_offset(handle) }.raw())
         };
         self.retain(|entry| {
-            live(entry.shape())
+            live(entry.shape() & !FUNCTION_RECEIVER_KEY_BIT)
                 && (entry.aux.load(Ordering::Relaxed) == 0
                     || live(entry.aux.load(Ordering::Relaxed)))
         });
@@ -816,13 +880,8 @@ impl PropertyIcSlot {
         let [entry] = self.live() else {
             return None;
         };
-        (entry.kind() == IcHandlerKind::OwnField).then(|| {
-            // SAFETY: a live entry's shape is a live handle.
-            (
-                unsafe { ShapeHandle::from_offset(entry.shape()) },
-                entry.slot(),
-            )
-        })
+        (entry.kind() == IcHandlerKind::OwnField && !entry.function_receiver())
+            .then(|| (entry.shape_handle(), entry.slot()))
     }
 
     /// Count one VM-served hit.
@@ -880,8 +939,7 @@ impl PropertyIcSlot {
             .live()
             .iter()
             .map(|entry| {
-                // SAFETY: live entries hold live handles.
-                let receiver = unsafe { ShapeHandle::from_offset(entry.shape()) };
+                let receiver = entry.shape_handle();
                 let variant = match (entry.kind(), entry.transition_guard()) {
                     (IcHandlerKind::OwnField | IcHandlerKind::StoreField, _) => {
                         IcEntryVariant::OwnData
@@ -894,8 +952,8 @@ impl PropertyIcSlot {
                     (IcHandlerKind::StoreTransition, TransitionGuard::ChainMissing) => {
                         IcEntryVariant::PrototypeChainMissingTransition
                     }
-                    (IcHandlerKind::StoreTransition, TransitionGuard::DirectPrototypeWritable) => {
-                        IcEntryVariant::DirectPrototypeWritableDataTransition
+                    (IcHandlerKind::StoreTransition, TransitionGuard::PrototypeWritable) => {
+                        IcEntryVariant::PrototypeWritableDataTransition
                     }
                     (IcHandlerKind::Empty, _) => IcEntryVariant::OwnData,
                 };
@@ -914,13 +972,14 @@ impl PropertyIcSlot {
         IcSiteState::Polymorphic { entries }
     }
 
-    /// Copy every entry generated code can lower into compile metadata.
+    /// Copy every entry the optimizing tier can lower into compile metadata.
     ///
     /// `bake_shape` names a shape in the compilation (and retains it);
     /// `bake_validity` retains a still-valid proof. An entry whose shape can
-    /// no longer be named, or whose proof died, is dropped. `None` rejects the
-    /// whole site when an entry has no lowering (nonexistent loads, dictionary
-    /// transitions) or nothing remains.
+    /// no longer be named or whose proof died is dropped, as are entries with
+    /// no CacheIR lowering (nonexistent keys, dictionary transitions): their
+    /// receivers reach the optimized code like unseen shapes. `None` when
+    /// nothing remains.
     pub(crate) fn jit_programs(
         &self,
         atom: u32,
@@ -932,8 +991,12 @@ impl PropertyIcSlot {
         use crate::jit::JitCacheIrOp;
         let mut programs = Vec::with_capacity(self.entry_count());
         for entry in self.live() {
-            // SAFETY: live entries hold live handles.
-            let receiver = unsafe { ShapeHandle::from_offset(entry.shape()) };
+            // Function receivers have no CacheIR lowering in the optimizing
+            // tier; they reach its generic node like unseen shapes.
+            if entry.function_receiver() {
+                continue;
+            }
+            let receiver = entry.shape_handle();
             let Some(shape) = bake_shape(receiver) else {
                 continue;
             };
@@ -983,7 +1046,7 @@ impl PropertyIcSlot {
                 ],
                 IcHandlerKind::StoreTransition => {
                     if entry.aux().is_null() {
-                        return None;
+                        continue;
                     }
                     let Some(to_shape) = bake_shape(entry.aux()) else {
                         continue;
@@ -1006,7 +1069,7 @@ impl PropertyIcSlot {
                     });
                     ops
                 }
-                IcHandlerKind::NonExistent | IcHandlerKind::Empty => return None,
+                IcHandlerKind::NonExistent | IcHandlerKind::Empty => continue,
             };
             programs.push(crate::jit::JitCacheIrProgram {
                 ops: ops.into_boxed_slice(),

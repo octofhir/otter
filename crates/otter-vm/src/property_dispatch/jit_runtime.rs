@@ -102,6 +102,9 @@ impl Interpreter {
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
         let Some(obj) = receiver.as_object() else {
+            if let Some(value) = self.closure_receiver_load(slot, receiver, atomized_key) {
+                return Ok(value);
+            }
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
         };
@@ -109,10 +112,16 @@ impl Interpreter {
             // A saturated site still reads one slot per receiver class. The
             // shared `(shape, atom)` table answers it without the ladder; only
             // a pair nothing has resolved falls through.
-            if let Some(resolved) = self.resolve_property_data_slot(obj, atomized_key) {
-                slot.record_hit();
-                let result = resolved.value;
-                return Ok(result);
+            match self.resolve_property_load(obj, atomized_key) {
+                crate::property_cache::PropertyLoad::Data(resolved) => {
+                    slot.record_hit();
+                    return Ok(resolved.value);
+                }
+                crate::property_cache::PropertyLoad::Absent(_) => {
+                    slot.record_hit();
+                    return Ok(Value::undefined());
+                }
+                crate::property_cache::PropertyLoad::Other => {}
             }
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
@@ -131,10 +140,12 @@ impl Interpreter {
         receiver = Value::object(migrating);
         self.set_scoped(receiver_root, receiver);
         let obj = migrating;
-        let resolved = self.resolve_property_data_slot(obj, atomized_key);
-        self.update_load_ic(slot, obj, atomized_key, resolved.as_ref());
-        if let Some(resolved) = resolved {
-            return Ok(resolved.value);
+        let load = self.resolve_property_load(obj, atomized_key);
+        self.update_load_ic(slot, obj, &load);
+        match load {
+            crate::property_cache::PropertyLoad::Data(resolved) => return Ok(resolved.value),
+            crate::property_cache::PropertyLoad::Absent(_) => return Ok(Value::undefined()),
+            crate::property_cache::PropertyLoad::Other => {}
         }
         // No data slot (accessor, opaque lookup, absent): complete the load in
         // place through the full cascade.

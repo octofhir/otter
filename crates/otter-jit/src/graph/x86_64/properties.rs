@@ -340,6 +340,34 @@ impl Codegen<'_> {
     ) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
+        let table = self.ops.new_dynamic_label();
+        // V8's generic LoadIC: the site's own handlers first, then the
+        // isolate's shared table, then the committed miss.
+        if let Some((slot, function_id, byte_pc)) = self.property_ic_slot(node, pc) {
+            let view = self.view_of(node);
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                temps[0],
+                slot,
+                RelocationTarget::PropertyIcSlot {
+                    function_id,
+                    byte_pc,
+                },
+            );
+            crate::x86_64::property_ic::emit_slot_load(
+                &mut self.ops,
+                view,
+                receiver,
+                temps[0],
+                [temps[1], temps[2], temps[3]],
+                destination,
+                table,
+                table,
+                done,
+            );
+        }
+        dynasm!(self.ops ; .arch x64 ; =>table);
         let cache = self.view_of(node).property_action_cache;
         emit_action_probe(
             &mut self.ops,
@@ -379,6 +407,36 @@ impl Codegen<'_> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let appended = self.ops.new_dynamic_label();
+        let table = self.ops.new_dynamic_label();
+        let slot_stored = self.ops.new_dynamic_label();
+        // V8's generic StoreIC: the site's own handlers, then the shared
+        // table; an append leaves its compressed child in `temps[1]`.
+        let slot = self.property_ic_slot(node, pc);
+        if let Some((slot, function_id, byte_pc)) = slot {
+            let view = self.view_of(node);
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                temps[0],
+                slot,
+                RelocationTarget::PropertyIcSlot {
+                    function_id,
+                    byte_pc,
+                },
+            );
+            crate::x86_64::property_ic::emit_slot_store(
+                &mut self.ops,
+                view,
+                receiver,
+                value,
+                temps[0],
+                [temps[2], temps[3], temps[1]],
+                table,
+                table,
+                slot_stored,
+            );
+        }
+        dynasm!(self.ops ; .arch x64 ; =>table);
         let cache = self.view_of(node).property_action_cache;
         emit_action_probe(
             &mut self.ops,
@@ -395,6 +453,13 @@ impl Codegen<'_> {
             done,
             appended,
         );
+        if slot.is_some() {
+            dynasm!(self.ops ; .arch x64
+                ; jmp =>slow
+                ; =>slot_stored
+                ; test Rd(temps[1]), Rd(temps[1])
+                ; jz =>done);
+        }
         dynasm!(self.ops ; .arch x64 ; =>appended);
         self.emit_dynamic_shape_child_barrier(node, receiver, temps[1], temps[0]);
         dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>slow);
@@ -409,6 +474,21 @@ impl Codegen<'_> {
         // The existing StorePropertyCached value-barrier node follows both
         // native actions. Child publication uses its existing NoAlloc owner.
         Ok(())
+    }
+
+    /// The native IC slot of the property site at `pc` of the body `node`
+    /// belongs to: `(address, function id, byte pc)`. A site that was already
+    /// megamorphic at compile time has none: that state is terminal, so its
+    /// handlers stay empty and the shared table serves every receiver.
+    fn property_ic_slot(&self, node: NodeId, pc: u32) -> Option<(u64, u32, u32)> {
+        let view = self.view_of(node);
+        let byte_pc = view.instructions.get(pc as usize)?.byte_pc;
+        let access = view.property_accesses.get(&byte_pc)?;
+        (access.ic_slot != 0 && !access.shared && view.cage_base != 0).then_some((
+            access.ic_slot,
+            view.code_block.id,
+            byte_pc,
+        ))
     }
 
     fn emit_property_runtime(

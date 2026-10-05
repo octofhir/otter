@@ -2378,6 +2378,34 @@ impl<'a> Codegen<'a> {
     ) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
+        let table = self.ops.new_dynamic_label();
+        // V8's generic LoadIC: the site's own handlers first, then the
+        // isolate's shared table, then the committed miss.
+        if let Some((slot, function_id, byte_pc)) = self.property_ic_slot(node, pc) {
+            let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                temps[0],
+                slot,
+                RelocationTarget::PropertyIcSlot {
+                    function_id,
+                    byte_pc,
+                },
+            );
+            crate::arm64::property_ic::emit_slot_load(
+                &mut self.ops,
+                view,
+                receiver,
+                temps[0],
+                [temps[1], temps[2], temps[3]],
+                destination,
+                table,
+                table,
+                done,
+            );
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>table);
         if let Some(atom) = atom {
             let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
             crate::arm64::property_actions::emit_load(
@@ -2413,10 +2441,40 @@ impl<'a> Codegen<'a> {
         pc: u32,
         atom: Option<u32>,
         [receiver, value]: [u8; 2],
-        temps @ [holder, child_shape, _, _]: [u8; 4],
+        temps @ [holder, child_shape, entry, index]: [u8; 4],
     ) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
+        let table = self.ops.new_dynamic_label();
+        let stored = self.ops.new_dynamic_label();
+        // V8's generic StoreIC: the site's own handlers, then the shared
+        // table; both leave the compressed child (zero for an overwrite).
+        let slot = self.property_ic_slot(node, pc);
+        if let Some((slot, function_id, byte_pc)) = slot {
+            let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
+            emit_load_symbol_u64(
+                &mut self.ops,
+                &mut self.relocations,
+                holder,
+                slot,
+                RelocationTarget::PropertyIcSlot {
+                    function_id,
+                    byte_pc,
+                },
+            );
+            crate::arm64::property_ic::emit_slot_store(
+                &mut self.ops,
+                view,
+                receiver,
+                value,
+                holder,
+                [entry, index, child_shape],
+                table,
+                table,
+                stored,
+            );
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>table);
         if let Some(atom) = atom {
             let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
             crate::arm64::property_actions::emit_store(
@@ -2428,8 +2486,12 @@ impl<'a> Codegen<'a> {
                 temps,
                 slow,
             );
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b =>slow);
+        }
+        if atom.is_some() || slot.is_some() {
             let overwritten = self.ops.new_dynamic_label();
-            dynasm!(self.ops ; .arch aarch64 ; cbz W(child_shape), =>overwritten);
+            dynasm!(self.ops ; .arch aarch64 ; =>stored ; cbz W(child_shape), =>overwritten);
             self.emit_dynamic_shape_child_barrier(node, receiver, child_shape, holder);
             dynasm!(self.ops ; .arch aarch64 ; =>overwritten ; b =>done);
         }
@@ -2443,6 +2505,21 @@ impl<'a> Codegen<'a> {
         )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
+    }
+
+    /// The native IC slot of the property site at `pc` of the body `node`
+    /// belongs to: `(address, function id, byte pc)`. A site that was already
+    /// megamorphic at compile time has none: that state is terminal, so its
+    /// handlers stay empty and the shared table serves every receiver.
+    fn property_ic_slot(&self, node: NodeId, pc: u32) -> Option<(u64, u32, u32)> {
+        let view = self.view_of(node);
+        let byte_pc = view.instructions.get(pc as usize)?.byte_pc;
+        let access = view.property_accesses.get(&byte_pc)?;
+        (access.ic_slot != 0 && !access.shared && view.cage_base != 0).then_some((
+            access.ic_slot,
+            view.code_block.id,
+            byte_pc,
+        ))
     }
 
     /// The full property operation at `pc` in the runtime, with every live

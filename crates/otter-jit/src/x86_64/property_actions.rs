@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - One full-width shape/atom set walk shared by Template and Graph.
-//! - Independent own/inherited loads and writable/append store actions.
+//! - Independent own/inherited/absent loads and writable/append store actions.
 //! - Live persistent-prefix/suffix addressing and pre-effect guards.
 //!
 //! # Invariants
@@ -172,8 +172,11 @@ pub(crate) fn emit_action_probe(
             let destination = destination.expect("property load destination");
             let own = ops.new_dynamic_label();
             let holder_ready = ops.new_dynamic_label();
+            let absent = ops.new_dynamic_label();
+            let undefined = ops.new_dynamic_label();
             dynasm!(ops ; .arch x64
                 ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::OwnData as i8 ; je =>own
+                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::NonExistent as i8 ; je =>absent
                 ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::InheritedData as i8 ; jne =>miss
                 ; mov r10, [Rq(entry) + cache.load_validity_byte as i32]
                 ; test r10, r10 ; jz =>miss
@@ -203,7 +206,16 @@ pub(crate) fn emit_action_probe(
             emit_slot_storage(ops, view, shape, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
-                ; jmp =>done);
+                ; jmp =>done
+                // Absent from the whole chain: the proof (none for a `null`
+                // prototype the receiver shape fixes) authorizes `undefined`.
+                ; =>absent
+                ; mov r10, [Rq(entry) + cache.load_validity_byte as i32]
+                ; test r10, r10 ; jz =>undefined
+                ; cmp DWORD [r10], 0 ; je =>miss
+                ; =>undefined);
+            emit_load_u64(ops, destination, crate::entry::VALUE_UNDEFINED);
+            dynasm!(ops ; .arch x64 ; jmp =>done);
         }
         PropertySourceAccess::Store => {
             let value = value.expect("property store value");

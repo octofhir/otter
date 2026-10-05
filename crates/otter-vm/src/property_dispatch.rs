@@ -266,9 +266,13 @@ impl Interpreter {
             // location.
             let mut owner_value = Value::closure(c);
             self.ensure_closure_rare(Some(stack), &mut owner_value, value_roots)?;
+            // The bag inherits the closure's own `[[Prototype]]`, so its shape
+            // fixes the function's ordinary lookup for every key the closure
+            // does not synthesize: property ICs use it as the function's map.
+            let prototype = self.get_prototype_for_op(&owner_value)?.as_object();
             let mut roots: smallvec::SmallVec<[&Value; 4]> = value_roots.iter().copied().collect();
             roots.push(&owner_value);
-            let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, &roots)?;
+            let bag = self.alloc_stack_rooted_object_with_prototype(stack, &roots, prototype)?;
             // SAFETY: an initialized `Value` local the collector rewrote.
             let owner_now = unsafe { std::ptr::read_volatile(&owner_value) }
                 .as_closure(&self.gc_heap)

@@ -1554,7 +1554,12 @@ impl Interpreter {
                 }
                 let mut closure_value = Value::closure(closure);
                 interp.ensure_closure_rare(Some(stack), &mut closure_value, &[])?;
-                let bag = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+                // The bag inherits the closure's own `[[Prototype]]`, so its
+                // shape fixes the function's ordinary lookup for every key the
+                // closure does not synthesize: property ICs use it as the
+                // function's map.
+                let prototype = interp.get_prototype_for_op(&closure_value)?.as_object();
+                let bag = interp.alloc_stack_rooted_object_with_prototype(stack, &[], prototype)?;
                 let closure = interp
                     .escape_scoped(owner)
                     .as_closure(&interp.gc_heap)

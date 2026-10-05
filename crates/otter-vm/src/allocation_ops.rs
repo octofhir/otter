@@ -550,6 +550,38 @@ impl Interpreter {
         .map_err(VmError::from)
     }
 
+    /// Allocate an ordinary object whose `[[Prototype]]` is `prototype`
+    /// (`None` for `null`), rooting the frame stack and `value_roots`.
+    pub(crate) fn alloc_stack_rooted_object_with_prototype(
+        &mut self,
+        stack: &ActivationStack,
+        value_roots: &[&Value],
+        prototype: Option<crate::object::JsObject>,
+    ) -> Result<crate::object::JsObject, VmError> {
+        let Some(prototype) = prototype else {
+            return self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots);
+        };
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+        };
+        let root = crate::object::heap_instance_root(
+            crate::object::ObjectPrototype::Object(prototype),
+            &mut self.gc_heap,
+            crate::object::DEFAULT_INLINE_CAPACITY,
+            crate::object::ShapeState::ORDINARY,
+            &mut external_visit,
+        )?;
+        self.shape_runtime.register_shape(&self.gc_heap, root);
+        crate::object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
     pub(crate) fn alloc_stack_rooted_object_with_value_roots(
         &mut self,
         stack: &ActivationStack,

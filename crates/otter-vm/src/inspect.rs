@@ -248,7 +248,7 @@ pub enum IcEntryVariant {
     PrototypeChainMissingTransition,
     /// Store transition guarded by a direct-prototype writable
     /// data slot.
-    DirectPrototypeWritableDataTransition,
+    PrototypeWritableDataTransition,
 }
 
 /// One inline-cache site dump. The `site_index` matches the dense

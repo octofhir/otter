@@ -32,6 +32,7 @@ pub(crate) mod inline_guard;
 pub(crate) mod js_call;
 mod method_guard;
 pub(crate) mod property_actions;
+pub(crate) mod property_ic;
 mod receiver_allocation;
 
 /// Whether this CPU implements the ARMv8.3 JavaScript conversion

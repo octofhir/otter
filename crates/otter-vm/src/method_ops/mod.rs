@@ -1976,9 +1976,13 @@ impl Interpreter {
             return Some(value);
         }
         slot.record_miss();
-        let resolved = self.resolve_property_data_slot(obj, key);
-        self.update_load_ic(slot, obj, key, resolved.as_ref());
-        Some(resolved?.value)
+        let load = self.resolve_property_load(obj, key);
+        self.update_load_ic(slot, obj, &load);
+        match load {
+            crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
+            crate::property_cache::PropertyLoad::Absent(_)
+            | crate::property_cache::PropertyLoad::Other => None,
+        }
     }
 
     fn callable_has_own_function_method_shadow(

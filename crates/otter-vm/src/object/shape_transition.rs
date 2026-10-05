@@ -25,9 +25,9 @@
 //!   before publication. A miss never traverses the old chain.
 //! - Generated stores into watched prototypes enter the mutation boundary
 //!   before committing, so they cannot bypass invalidation.
-//! - Accessors, proxies, string wrapper objects, deep prototype hits,
-//!   non-writable inherited data, and dictionary-compatible objects remain
-//!   fallback paths.
+//! - Accessors, proxies, string wrapper objects, non-writable inherited data,
+//!   and dictionary-compatible objects remain fallback paths. Writable
+//!   inherited data at any depth is shadowed under the chain's proof.
 //!
 //! # See also
 //! - [`crate::property_ic`]
@@ -70,8 +70,10 @@ pub(crate) enum StorePropertyTransitionKind {
         /// Shared proof invalidated by any mutation along the chain.
         validity: Arc<PrototypeValidity>,
     },
-    /// The direct prototype had writable data of this name.
-    DirectPrototypeWritableData {
+    /// A link of the ordinary prototype chain had writable data of this name;
+    /// the appended own property shadows it (V8 stores through a writable
+    /// inherited field the same way, under one chain validity cell).
+    PrototypeWritableData {
         /// Shared proof includes descriptor and value mutations.
         validity: Arc<PrototypeValidity>,
     },
@@ -354,14 +356,14 @@ fn transition_kind(
         ObjectPrototype::Null => Some(StorePropertyTransitionKind::OwnAdd),
         ObjectPrototype::Object(first) => {
             let mut proto = first;
-            for depth in 0..super::PROTO_CHAIN_HARD_CAP {
+            for _ in 0..super::PROTO_CHAIN_HARD_CAP {
                 if !super::supports_fast_property_ic(proto, heap) {
                     return None;
                 }
                 match lookup_own_atom(proto, heap, key).lookup {
                     PropertyLookup::Absent => {}
-                    PropertyLookup::Data { flags, .. } if flags.writable() && depth == 0 => {
-                        return Some(StorePropertyTransitionKind::DirectPrototypeWritableData {
+                    PropertyLookup::Data { flags, .. } if flags.writable() => {
+                        return Some(StorePropertyTransitionKind::PrototypeWritableData {
                             validity: chain_validity(first, heap)?,
                         });
                     }
@@ -391,7 +393,7 @@ fn transition_kind_matches(
             && match kind {
                 StorePropertyTransitionKind::OwnAdd => true,
                 StorePropertyTransitionKind::PrototypeChainMissing { validity }
-                | StorePropertyTransitionKind::DirectPrototypeWritableData { validity } => {
+                | StorePropertyTransitionKind::PrototypeWritableData { validity } => {
                     validity.is_valid()
                 }
             }
@@ -407,7 +409,7 @@ fn transition_kind_matches_receiver_body(
         (StorePropertyTransitionKind::OwnAdd, ObjectPrototype::Null)
             | (
                 StorePropertyTransitionKind::PrototypeChainMissing { .. }
-                    | StorePropertyTransitionKind::DirectPrototypeWritableData { .. },
+                    | StorePropertyTransitionKind::PrototypeWritableData { .. },
                 ObjectPrototype::Object(_),
             )
     )

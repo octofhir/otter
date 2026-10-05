@@ -69,8 +69,9 @@ pub use crate::property_cache::jit::JitPropertyActionCache;
 pub use crate::property_cache::{PropertyLoadAction, PropertyStoreAction};
 
 pub use crate::property_ic::{
-    EMPTY_SHAPE as PROPERTY_IC_EMPTY_SHAPE, IcHandlerKind as PropertyIcHandlerKind,
-    PropertyIcLayout,
+    EMPTY_SHAPE as PROPERTY_IC_EMPTY_SHAPE,
+    FUNCTION_RECEIVER_KEY_BIT as PROPERTY_IC_FUNCTION_RECEIVER_KEY_BIT,
+    IcHandlerKind as PropertyIcHandlerKind, PropertyIcLayout,
 };
 
 /// Native layout of every named-property IC slot generated code reads.

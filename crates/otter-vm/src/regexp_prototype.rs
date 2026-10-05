@@ -607,7 +607,7 @@ pub fn native_regexp_symbol_search(
 /// §22.2.7.3 `AdvanceStringIndex(S, index, unicode)`. When `unicode`
 /// is true and the current code unit is a high surrogate followed
 /// by a low surrogate, the index advances by two; otherwise by one.
-fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
+pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
     if !unicode || index + 1 >= units.len() {
         return index + 1;
     }
@@ -1280,6 +1280,28 @@ pub fn native_regexp_symbol_replace(
                 .set_iteration_anchor(anchor_base + TEMPLATE, Value::string(template));
         }
 
+        // A pristine, non-sticky receiver replaces over match records; every
+        // later step of this ladder is then unobservable.
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        if receiver
+            .as_regexp()
+            .is_some_and(|re| !re.flags(ctx.heap()).sticky)
+            && ctx.interp_mut().is_pristine_regexp(receiver)
+        {
+            let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let replacement = ctx.interp_mut().iteration_anchor(
+                anchor_base + if functional_replace { REPLACER } else { TEMPLATE },
+            );
+            return crate::regexp_fast::replace(
+                ctx,
+                receiver,
+                input,
+                replacement,
+                functional_replace,
+            );
+        }
+
         // Step 6 — flags = ? ToString(? Get(rx, "flags")).
         let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
         let flags = get_property_runtime(ctx, &receiver, "flags", name)?;
@@ -1289,11 +1311,10 @@ pub fn native_regexp_symbol_replace(
         let flags = coerce_to_jsstring_runtime(ctx, &flags, name)?;
         ctx.interp_mut()
             .set_iteration_anchor(anchor_base + FLAGS, Value::string(flags));
-        let (global, full_unicode, sticky) = flags.with_utf16(ctx.heap(), |units| {
+        let (global, full_unicode) = flags.with_utf16(ctx.heap(), |units| {
             (
                 units.contains(&(b'g' as u16)),
                 units.contains(&(b'u' as u16)) || units.contains(&(b'v' as u16)),
-                units.contains(&(b'y' as u16)),
             )
         });
 
@@ -1301,88 +1322,6 @@ pub fn native_regexp_symbol_replace(
         if global {
             let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
             set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
-        }
-
-        // Fast path: a global, non-sticky, pristine RegExp with the native `exec`
-        // and a literal (`$`-free) string replacement. The replacement reads neither
-        // the matched text nor captures, and `lastIndex` was just reset to a plain
-        // `0`, so the per-match exec protocol and substitution machinery have no
-        // observable effect: collect the matches in one engine pass and stitch the
-        // source segments and literal template directly. Restricted to global so a
-        // non-global `lastIndex` read (its `ToLength` may fire a `valueOf`) stays
-        // observable, and to a regex with no own-property expando so an overridden
-        // `unicode` / `flags` cannot change the empty-match advancement the engine
-        // pass bakes in from the compiled flags. The whole loop runs on host
-        // buffers; only the final string allocation touches the GC.
-        let fast_receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
-        if global
-            && let Some(re) = fast_receiver.as_regexp()
-            && !sticky
-            && !functional_replace
-            && re.expando(ctx.heap()).is_none()
-        {
-            let template = ctx.interp_mut().iteration_anchor(anchor_base + TEMPLATE);
-            let template =
-                template
-                    .as_string(ctx.heap())
-                    .ok_or_else(|| crate::NativeError::TypeError {
-                        name,
-                        reason: "replace template root is not a string".to_string(),
-                    })?;
-            let template_units = template.to_utf16_vec(ctx.heap());
-            if !template_units.contains(&0x24) {
-                let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
-                let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
-                ctx.interp_mut()
-                    .set_iteration_anchor(anchor_base + TEMP, exec_fn);
-                let exec_fn = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
-                if exec_fn.as_native_function().is_some_and(|nf| {
-                    nf.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec)
-                }) {
-                    let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
-                    let re = receiver
-                        .as_regexp()
-                        .ok_or_else(|| crate::NativeError::TypeError {
-                            name,
-                            reason: "replace receiver root is not a RegExp".to_string(),
-                        })?;
-                    let execution =
-                        re.find_from_utf16(ctx.heap(), &s_units, 0, ctx.regex_step_limit());
-                    let found = crate::regexp::finish_execution(ctx, execution)?;
-                    let mut accumulated: Vec<u16> = Vec::new();
-                    let mut next_source_position: usize = 0;
-                    for m in &found {
-                        let position = m.range.start;
-                        let match_length = m.range.end - m.range.start;
-                        if position >= next_source_position {
-                            let projected = accumulated
-                                .len()
-                                .saturating_add(position - next_source_position)
-                                .saturating_add(template_units.len());
-                            if projected > MAX_STRING_UNITS {
-                                return Err(crate::NativeError::RangeError {
-                                    name,
-                                    reason: "Invalid string length".to_string(),
-                                });
-                            }
-                            accumulated.extend_from_slice(&s_units[next_source_position..position]);
-                            accumulated.extend_from_slice(&template_units);
-                            next_source_position = position + match_length;
-                        }
-                    }
-                    if next_source_position < length_s {
-                        accumulated.extend_from_slice(&s_units[next_source_position..]);
-                    }
-                    return Ok(Value::string(
-                        JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
-                            crate::NativeError::TypeError {
-                                name,
-                                reason: "out of memory".to_string(),
-                            }
-                        })?,
-                    ));
-                }
-            }
         }
 
         // Step 10-12 — collect results.
@@ -1932,6 +1871,27 @@ pub fn native_regexp_symbol_split(
         let input = coerce_to_jsstring_runtime(ctx, &input, name)?;
         ctx.interp_mut()
             .set_iteration_anchor(anchor_base + INPUT, Value::string(input));
+
+        // A pristine receiver whose species is %RegExp% splits with its own
+        // matcher; every later step of this ladder is then unobservable.
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let limit = ctx.interp_mut().iteration_anchor(anchor_base + LIMIT);
+        if let Some(limit) = crate::regexp_fast::plain_split_limit(limit)
+            && ctx.interp_mut().is_pristine_regexp(receiver)
+            && ctx.interp_mut().regexp_species_is_builtin()
+        {
+            let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            return crate::regexp_fast::split(ctx, receiver, input, limit);
+        }
+        let input = ctx
+            .interp_mut()
+            .iteration_anchor(anchor_base + INPUT)
+            .as_string(ctx.heap())
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "split input root is not a string".to_string(),
+            })?;
         let s_units = input.to_utf16_vec(ctx.heap());
         let size = s_units.len();
 

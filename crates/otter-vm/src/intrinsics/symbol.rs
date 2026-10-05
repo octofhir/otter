@@ -361,6 +361,15 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     Ok(())
 }
 
+/// `get <Ctor>[Symbol.species]` — returns its receiver (§10.4.x `@@species`
+/// accessors of Array, Map, Set, RegExp and the buffer constructors).
+pub(crate) fn constructor_species_get(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    Ok(*ctx.this_value())
+}
+
 /// Install the default `get <Ctor>[@@species]` accessor — returns the
 /// `this` value, configurable, non-enumerable. Used by every
 /// subclassing-aware builtin per §22.1.2.5 (Array), §24.1.2.1 (Map),
@@ -377,13 +386,6 @@ fn install_constructor_species_accessor(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    fn species_get(
-        ctx: &mut crate::NativeCtx<'_>,
-        _args: &[Value],
-    ) -> Result<Value, crate::NativeError> {
-        Ok(*ctx.this_value())
-    }
-
     let Some(ctor_value) = object::get(global, heap, ctor_name) else {
         return Ok(());
     };
@@ -393,7 +395,7 @@ fn install_constructor_species_accessor(
         heap,
         "get [Symbol.species]",
         0,
-        species_get,
+        constructor_species_get,
         &[&global_root, &ctor_root],
     )
     .map_err(JsSurfaceError::from)?;

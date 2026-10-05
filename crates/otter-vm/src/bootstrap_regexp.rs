@@ -304,6 +304,52 @@ fn legacy_accessor_setter(
     Ok(Value::undefined())
 }
 
+/// Whether `prototype` still carries the built-in `exec`, flag getters,
+/// `constructor` and symbol methods, so a RegExp built-in's reads of them
+/// have known answers.
+pub(crate) fn prototype_is_builtin(
+    prototype: JsObject,
+    heap: &otter_gc::GcHeap,
+    symbols: &crate::symbol::WellKnownSymbols,
+) -> bool {
+    use crate::native_function::NativeFastFn;
+    use crate::object::PropertyLookup;
+    use crate::symbol::WellKnown;
+    let is = |value: &Value, call: NativeFastFn| {
+        value
+            .as_native_function()
+            .is_some_and(|native| native.is_static_fn(heap, call))
+    };
+    let data = |lookup: PropertyLookup, call: NativeFastFn| {
+        matches!(lookup, PropertyLookup::Data { value, .. } if is(&value, call))
+    };
+    let getter = |key: &str, call: NativeFastFn| {
+        matches!(
+            object::lookup_own(prototype, heap, key),
+            PropertyLookup::Accessor { getter: Some(getter), .. } if is(&getter, call)
+        )
+    };
+    let method = |symbol: WellKnown, call: NativeFastFn| {
+        data(object::lookup_own_symbol(prototype, heap, symbols.get(symbol)), call)
+    };
+    data(object::lookup_own(prototype, heap, "exec"), proto_exec)
+        && data(object::lookup_own(prototype, heap, "constructor"), regexp_ctor_call)
+        && getter("flags", accessor_flags)
+        && getter("global", accessor_global)
+        && getter("ignoreCase", accessor_ignore_case)
+        && getter("multiline", accessor_multiline)
+        && getter("dotAll", accessor_dot_all)
+        && getter("unicode", accessor_unicode)
+        && getter("unicodeSets", accessor_unicode_sets)
+        && getter("sticky", accessor_sticky)
+        && getter("hasIndices", accessor_has_indices)
+        && method(WellKnown::Match, crate::regexp_prototype::native_regexp_symbol_match)
+        && method(WellKnown::Replace, crate::regexp_prototype::native_regexp_symbol_replace)
+        && method(WellKnown::Search, crate::regexp_prototype::native_regexp_symbol_search)
+        && method(WellKnown::Split, crate::regexp_prototype::native_regexp_symbol_split)
+        && method(WellKnown::MatchAll, crate::regexp_prototype::native_regexp_symbol_match_all)
+}
+
 fn values_strict_equal(a: &Value, b: &Value) -> bool {
     match (a.as_native_function(), b.as_native_function()) {
         (Some(x), Some(y)) => x.ptr_eq(&y),
@@ -900,6 +946,15 @@ fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         let input_value = scope.raw(input);
         let input = coerce_to_string(scope.context(), &input_value, "RegExp.prototype.test")?;
         let input = scope.value(Value::string(input));
+        let receiver_value = scope.raw(receiver);
+        if scope
+            .context()
+            .interp_mut()
+            .is_pristine_regexp(receiver_value)
+        {
+            let matched = crate::regexp_fast::exec_without_result(&mut scope, receiver, input)?;
+            return Ok(Value::boolean(matched));
+        }
         let receiver_value = scope.raw(receiver);
         let input_value = scope.raw(input);
         let input = input_value

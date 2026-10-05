@@ -66,9 +66,9 @@ impl Interpreter {
             let receiver_root = interp.scoped_value(scope, receiver);
 
             if receiver.is_nullish() {
-                return Err(CommittedValueError::JavaScript(interp.err_type(
-                    ("Cannot read property of null or undefined".to_string()).into(),
-                )));
+                return Err(CommittedValueError::JavaScript(
+                    interp.nullish_read_error(&receiver, Some(name)),
+                ));
             }
             let value = if receiver.as_object().is_some()
                 || super::get_walks_prototype_chain(receiver)

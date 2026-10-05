@@ -190,6 +190,27 @@ pub(crate) fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Valu
     }
 }
 
+impl Interpreter {
+    /// V8's TypeError for reading a property of `null` / `undefined`:
+    /// `Cannot read properties of null (reading 'x')`, naming the key when it
+    /// is known without running user code.
+    pub(crate) fn nullish_read_error(&self, base: &Value, key: Option<&str>) -> VmError {
+        let kind = value_kind_name(base);
+        let message = match key {
+            Some(key) => format!("Cannot read properties of {kind} (reading '{key}')"),
+            None => format!("Cannot read properties of {kind}"),
+        };
+        self.err_type(message.into())
+    }
+
+    /// The key text a nullish-read error shows for an element key: primitive
+    /// keys only, which convert without user code.
+    pub(crate) fn element_key_text(&self, key: Value) -> Option<String> {
+        (key.is_string() || key.is_number() || key.is_symbol() || key.is_boolean())
+            .then(|| key.display_string(&self.gc_heap))
+    }
+}
+
 pub(crate) fn value_kind_name(value: &Value) -> &'static str {
     if value.is_undefined() || value.is_hole() {
         "undefined"

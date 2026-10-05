@@ -4,10 +4,14 @@
 //! - import binding records
 //! - module state maps
 //! - module builder storage
+//! - constant-pool interning ([`ModuleBuilder::intern_constant`])
 //! - module source-kind helpers
 //!
 //! # Invariants
 //! - Host-provided resolved imports are trusted by lowering.
+//! - The constant pool is append-only. Interning returns the lowest index whose
+//!   entry equals the candidate, exactly as a scan of the pool would; the
+//!   content index only shortens the search.
 //!
 //! # See also
 //! - `entry` for module compilation
@@ -151,6 +155,8 @@ pub struct ModuleHostInfo {
 pub(crate) struct ModuleBuilder {
     pub(crate) functions: Vec<Function>,
     pub(crate) constants: Vec<Constant>,
+    /// Content hash → index of the first pool entry with that hash.
+    constant_index: rustc_hash::FxHashMap<u64, u32>,
     /// §13.2.8.4 — tagged-template sites, one per Parse Node.
     pub(crate) template_sites: Vec<otter_bytecode::TemplateSite>,
     /// Monotonic counter handed out by `compile_class` so each
@@ -159,6 +165,56 @@ pub(crate) struct ModuleBuilder {
     /// `class B { #x }` mangle to different runtime keys, matching
     /// §15.7.1 PrivateName uniqueness.
     pub(crate) next_private_namespace: u32,
+}
+
+impl ModuleBuilder {
+    /// Index of `constant` in the pool, appending it when no equal entry
+    /// exists. Equal entries resolve to the lowest index.
+    pub(crate) fn intern_constant(&mut self, constant: Constant) -> u32 {
+        let hash = constant_hash(&constant);
+        match self.constant_index.get(&hash) {
+            Some(&index) if self.constants[index as usize] == constant => return index,
+            // A 64-bit hash collision with different content: the pool scan
+            // stays the authority.
+            Some(_) => {
+                if let Some(index) = self.constants.iter().position(|c| *c == constant) {
+                    return index as u32;
+                }
+            }
+            None => {}
+        }
+        self.push_constant(constant)
+    }
+
+    /// Append `constant` without deduplication and return its index.
+    pub(crate) fn push_constant(&mut self, constant: Constant) -> u32 {
+        let index = u32::try_from(self.constants.len()).expect("constant pool exceeds u32");
+        self.constant_index
+            .entry(constant_hash(&constant))
+            .or_insert(index);
+        self.constants.push(constant);
+        index
+    }
+}
+
+fn constant_hash(constant: &Constant) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    std::mem::discriminant(constant).hash(&mut hasher);
+    match constant {
+        Constant::String { utf16 } => utf16.hash(&mut hasher),
+        Constant::Number { bits } => bits.hash(&mut hasher),
+        Constant::FunctionId { index } => index.hash(&mut hasher),
+        Constant::BigInt { decimal } => decimal.hash(&mut hasher),
+        Constant::RegExp {
+            pattern_utf16,
+            flags,
+        } => {
+            pattern_utf16.hash(&mut hasher);
+            flags.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 /// The import binding `name` names in the enclosing module, if any.

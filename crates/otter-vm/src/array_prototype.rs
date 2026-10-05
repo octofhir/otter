@@ -104,6 +104,22 @@ fn numeric_sub_sort_order(x: Value, y: Value) -> Option<std::cmp::Ordering> {
     })
 }
 
+/// Order of the decimal renderings of two int32 values — `ToString` then
+/// code-unit comparison (§7.2.13 IsLessThan on strings) without allocating,
+/// as V8's `SortCompareDefault` does for two Smis. Decimal digits and `-` are
+/// ASCII, so byte order equals code-unit order.
+fn int32_lexicographic_order(x: i32, y: i32) -> std::cmp::Ordering {
+    if x == y {
+        return std::cmp::Ordering::Equal;
+    }
+    let mut x_buffer = itoa::Buffer::new();
+    let mut y_buffer = itoa::Buffer::new();
+    x_buffer
+        .format(x)
+        .as_bytes()
+        .cmp(y_buffer.format(y).as_bytes())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ArrayCallbackFastPath {
     MapMulAdd { mul: f64, add: f64 },
@@ -2372,13 +2388,30 @@ impl Interpreter {
                 Ordering::Equal
             });
         }
-        // ToString(x) may scavenge before ToString(y). Re-read each value
-        // from its collector-rewritten anchor immediately before coercion.
+        // §23.1.3.30.2 SortCompare steps 5-11: ToString both operands, then
+        // IsLessThan over WTF-16 code units. Two int32 values and two strings
+        // need no coercion; their order is decided in place.
         let x = self.iteration_anchor(x_anchor);
-        let xs = self.coerce_to_string(stack, context, &x)?;
         let y = self.iteration_anchor(y_anchor);
-        let ys = self.coerce_to_string(stack, context, &y)?;
-        Ok(xs.cmp(&ys))
+        if let (Some(x), Some(y)) = (x.as_i32(), y.as_i32()) {
+            return Ok(int32_lexicographic_order(x, y));
+        }
+        if let (Some(x), Some(y)) = (x.as_string(&self.gc_heap), y.as_string(&self.gc_heap)) {
+            return Ok(x.compare_lex(y, &self.gc_heap));
+        }
+        // ToString(x) may run user code or allocate before ToString(y): keep
+        // its result in the traced anchor arena and re-read both afterwards.
+        let xs = crate::coerce::to_js_string_or_throw(self, stack, context, &x)?;
+        let xs_anchor = self.push_iteration_anchor(Value::string(xs)) - 1;
+        let y = self.iteration_anchor(y_anchor);
+        let ys = crate::coerce::to_js_string_or_throw(self, stack, context, &y);
+        let xs = self.iteration_anchor(xs_anchor);
+        self.pop_iteration_anchors_to(xs_anchor);
+        let ys = ys?;
+        let xs = xs
+            .as_string(&self.gc_heap)
+            .expect("anchored ToString result stays a string");
+        Ok(xs.compare_lex(ys, &self.gc_heap))
     }
 
     /// Stable merge sort over directly traced item-anchor indices,

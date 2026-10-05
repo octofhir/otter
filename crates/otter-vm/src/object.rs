@@ -7408,7 +7408,7 @@ mod tests {
                 .expect("transition install");
         assert!(matches!(
             transition.kind,
-            StorePropertyTransitionKind::DirectPrototypeWritableData { .. }
+            StorePropertyTransitionKind::PrototypeWritableData { .. }
         ));
 
         let mut second = alloc_object_old(&mut heap, source).expect("same actual ordinary shape");

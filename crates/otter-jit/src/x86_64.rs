@@ -33,6 +33,7 @@ pub(crate) mod frame;
 pub(crate) mod js_call;
 pub(crate) mod method_guard;
 pub(crate) mod property_actions;
+pub(crate) mod property_ic;
 pub(crate) mod values;
 
 pub(crate) mod arguments;

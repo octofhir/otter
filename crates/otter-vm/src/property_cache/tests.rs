@@ -72,7 +72,7 @@ fn inherited_load_and_own_append_preserve_independent_slots_and_writability() {
         .expect("actual direct-prototype writable append");
         assert!(matches!(
             transition.kind,
-            object::StorePropertyTransitionKind::DirectPrototypeWritableData { .. }
+            object::StorePropertyTransitionKind::PrototypeWritableData { .. }
         ));
         assert_eq!(
             transition.slot, 0,

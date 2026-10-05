@@ -47,6 +47,10 @@ pub enum PropertyLoadAction {
     OwnData = 2,
     /// Load a current holder data slot under a complete chain proof.
     InheritedData = 3,
+    /// The key is absent from the receiver and its whole chain: `undefined`
+    /// under the chain proof (none when the receiver's shape fixes a `null`
+    /// prototype). V8's stub cache holds `LoadNonExistent` handlers alike.
+    NonExistent = 4,
 }
 
 /// Selected live shared-table store action, independently authorized from loads.
@@ -134,10 +138,25 @@ struct ActionOwners {
 pub(crate) enum PropertyProbe {
     /// A live data slot authorized under the key and retained chain proof.
     Resolved(cache_ir::ResolvedDataSlot),
+    /// The key is absent from the receiver and its chain, under the live
+    /// proof (none when the receiver's shape fixes a `null` prototype).
+    Absent(Option<Arc<PrototypeValidity>>),
     /// A guarded walk found no cacheable data slot.
     Unresolvable,
     /// No matching valid fact exists.
     Unknown,
+}
+
+/// A named load's resolution through the shared table.
+#[derive(Debug)]
+pub(crate) enum PropertyLoad {
+    /// A live own or inherited data slot.
+    Data(cache_ir::ResolvedDataSlot),
+    /// The key is absent from the receiver and its whole ordinary chain,
+    /// under this proof (none for a `null` prototype).
+    Absent(Option<Arc<PrototypeValidity>>),
+    /// Anything the full `[[Get]]` must complete.
+    Other,
 }
 
 /// One fixed key table for independent property read and write actions.
@@ -223,11 +242,16 @@ impl PropertyActionCache {
             return PropertyProbe::Unknown;
         };
         let validity = self.owners[index].borrow().load.clone();
-        if entry.load_action == PropertyLoadAction::Unresolvable {
-            return if validity.as_ref().is_none_or(|cell| cell.is_valid()) {
-                PropertyProbe::Unresolvable
-            } else {
+        if matches!(
+            entry.load_action,
+            PropertyLoadAction::Unresolvable | PropertyLoadAction::NonExistent
+        ) {
+            return if !validity.as_ref().is_none_or(|cell| cell.is_valid()) {
                 PropertyProbe::Unknown
+            } else if entry.load_action == PropertyLoadAction::NonExistent {
+                PropertyProbe::Absent(validity)
+            } else {
+                PropertyProbe::Unresolvable
             };
         }
         let hit = entry.hit();
@@ -272,18 +296,24 @@ impl PropertyActionCache {
     }
 
     /// Publish one load fact without discarding an independent append action.
+    /// `absent` carries the chain proof of a key no link owns (`Some(None)`
+    /// for a `null` prototype); it is ignored when `resolved` is present.
     pub(crate) fn record_load(
         &self,
         obj: JsObject,
         heap: &otter_gc::GcHeap,
         key: AtomizedPropertyKey<'_>,
         resolved: Option<&cache_ir::ResolvedDataSlot>,
+        absent: Option<Option<Arc<PrototypeValidity>>>,
     ) {
         if key.atom().id() == AtomId::NONE || !object::supports_fast_property_ic(obj, heap) {
             return;
         }
+        let nonexistent = resolved.is_none() && absent.is_some();
         let validity = if let Some(resolved) = resolved {
             resolved.validity.clone()
+        } else if let Some(proof) = absent {
+            proof
         } else if let Some(first) = object::prototype(obj, heap) {
             let Some(cell) = object::prototype_validity::chain_validity(first, heap) else {
                 return;
@@ -317,6 +347,8 @@ impl PropertyActionCache {
                 entry.store_validity = 0;
                 self.owners[index].borrow_mut().store = None;
             }
+        } else if nonexistent {
+            entry.load_action = PropertyLoadAction::NonExistent;
         } else {
             entry.load_action = PropertyLoadAction::Unresolvable;
         }
@@ -361,7 +393,7 @@ impl PropertyActionCache {
         entry.store_validity = match &transition.kind {
             object::StorePropertyTransitionKind::OwnAdd => 0,
             object::StorePropertyTransitionKind::PrototypeChainMissing { validity }
-            | object::StorePropertyTransitionKind::DirectPrototypeWritableData { validity } => {
+            | object::StorePropertyTransitionKind::PrototypeWritableData { validity } => {
                 validity.address()
             }
         };
@@ -467,26 +499,125 @@ impl crate::Interpreter {
         obj: JsObject,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<cache_ir::ResolvedDataSlot> {
+        match self.resolve_property_load(obj, key) {
+            PropertyLoad::Data(resolved) => Some(resolved),
+            PropertyLoad::Absent(_) | PropertyLoad::Other => None,
+        }
+    }
+
+    /// Resolve a named load using the one key/action cache: a live data slot,
+    /// a key absent from the receiver and its whole ordinary chain, or
+    /// neither (accessors, proxies, opaque lookup). Records the answer.
+    #[must_use]
+    pub(crate) fn resolve_property_load(
+        &self,
+        obj: JsObject,
+        key: AtomizedPropertyKey<'_>,
+    ) -> PropertyLoad {
         if key.atom().id() == AtomId::NONE {
-            return cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key);
+            return cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key)
+                .map_or(PropertyLoad::Other, PropertyLoad::Data);
         }
         match self.property_cache.probe_load(obj, &self.gc_heap, key) {
-            PropertyProbe::Resolved(resolved) => return Some(resolved),
-            PropertyProbe::Unresolvable => return None,
+            PropertyProbe::Resolved(resolved) => return PropertyLoad::Data(resolved),
+            PropertyProbe::Absent(proof) => return PropertyLoad::Absent(proof),
+            PropertyProbe::Unresolvable => return PropertyLoad::Other,
             PropertyProbe::Unknown => {}
         }
         let resolved = cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key);
-        if let Some(resolved) = &resolved {
+        let absent = if resolved.is_none() {
+            cache_ir::resolve_absent_atom(obj, &self.gc_heap, key)
+        } else {
+            None
+        };
+        if resolved.is_some() || absent.is_some() {
             self.shape_runtime
                 .register_shape(&self.gc_heap, object::shape(obj, &self.gc_heap));
-            if !resolved.holder_root.is_null() {
-                self.shape_runtime
-                    .register_shape(&self.gc_heap, resolved.holder_root);
-            }
+        }
+        if let Some(resolved) = &resolved
+            && !resolved.holder_root.is_null()
+        {
+            self.shape_runtime
+                .register_shape(&self.gc_heap, resolved.holder_root);
         }
         self.property_cache
-            .record_load(obj, &self.gc_heap, key, resolved.as_ref());
-        resolved
+            .record_load(obj, &self.gc_heap, key, resolved.as_ref(), absent.clone());
+        match (resolved, absent) {
+            (Some(resolved), _) => PropertyLoad::Data(resolved),
+            (None, Some(proof)) => PropertyLoad::Absent(proof),
+            (None, None) => PropertyLoad::Other,
+        }
+    }
+
+    /// Complete a named load on a closure through its site's function-map
+    /// handlers, installing one on a miss: V8 serves `f.call`, constructor
+    /// statics and function expandos through the function's map alike.
+    ///
+    /// The closure's property bag is the lookup-start object. It qualifies
+    /// only while the closure has no `[[Prototype]]` override, the default
+    /// realm is active and the bag's prototype is the closure's own, so the
+    /// bag's shape fixes the whole ordinary lookup. Keys the function
+    /// synthesizes (`prototype`; `name`, `length`, `caller`, `arguments`
+    /// unless the bag owns them) are left to the full `[[Get]]`. `None`
+    /// means the caller completes the load.
+    pub(crate) fn closure_receiver_load(
+        &mut self,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
+        receiver: crate::Value,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<crate::Value> {
+        let closure = receiver.as_closure(&self.gc_heap)?;
+        let bag = closure.own_props(&self.gc_heap)?;
+        if closure.proto_override(&self.gc_heap).is_some() || self.active_realm_id != 0 {
+            return None;
+        }
+        if let Some(value) = slot.native().probe_function_load(bag, &self.gc_heap) {
+            slot.record_hit();
+            return Some(value);
+        }
+        let name = key.name();
+        let synthesized = match name {
+            "prototype" => return None,
+            "name" | "length" | "caller" | "arguments" => true,
+            _ => false,
+        };
+        let own = object::lookup_own_atom(bag, &self.gc_heap, key)
+            .hit
+            .is_some();
+        if synthesized && !own {
+            return None;
+        }
+        let prototype = self.get_prototype_for_op(&receiver).ok()?;
+        let bag_prototype = object::prototype(bag, &self.gc_heap);
+        let mirrored = match (bag_prototype, prototype.as_object()) {
+            (Some(bag_proto), Some(proto)) => bag_proto == proto,
+            (None, None) => {
+                prototype.is_null() && object::prototype_value(bag, &self.gc_heap).is_none()
+            }
+            _ => false,
+        };
+        if !mirrored {
+            return None;
+        }
+        let load = self.resolve_property_load(bag, key);
+        let shape = object::keyed_shape(bag, &self.gc_heap);
+        let (handler, value) = match load {
+            PropertyLoad::Data(resolved) => (
+                crate::property_ic::IcHandler::load_resolved(shape, &resolved),
+                resolved.value,
+            ),
+            PropertyLoad::Absent(proof) => (
+                crate::property_ic::IcHandler::load_nonexistent(shape, proof),
+                crate::Value::undefined(),
+            ),
+            PropertyLoad::Other => return None,
+        };
+        if !slot.is_megamorphic()
+            && let Some(handler) = handler
+        {
+            slot.install(handler.for_function_receiver());
+        }
+        Some(value)
     }
 
     /// V8 `LoadIC::UpdateCaches` for an ordinary receiver that missed its
@@ -496,18 +627,20 @@ impl crate::Interpreter {
         &self,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
         obj: JsObject,
-        key: AtomizedPropertyKey<'_>,
-        resolved: Option<&cache_ir::ResolvedDataSlot>,
+        load: &PropertyLoad,
     ) {
         if slot.is_megamorphic() {
             return;
         }
         let shape = object::keyed_shape(obj, &self.gc_heap);
-        let handler = match resolved {
-            Some(resolved) => crate::property_ic::IcHandler::load_resolved(shape, resolved),
-            None => cache_ir::resolve_absent_atom(obj, &self.gc_heap, key).and_then(|validity| {
-                crate::property_ic::IcHandler::load_nonexistent(shape, validity)
-            }),
+        let handler = match load {
+            PropertyLoad::Data(resolved) => {
+                crate::property_ic::IcHandler::load_resolved(shape, resolved)
+            }
+            PropertyLoad::Absent(proof) => {
+                crate::property_ic::IcHandler::load_nonexistent(shape, proof.clone())
+            }
+            PropertyLoad::Other => None,
         };
         if let Some(handler) = handler {
             slot.install(handler);

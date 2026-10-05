@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - One ordinary receiver/key decode and bounded set scan for both tiers.
-//! - Independent live data loads, writable own stores and add-own stores.
+//! - Independent live data loads, absent-key loads, writable own stores and
+//!   add-own stores.
 //! - Current shape-selected inline/slab bank resolution before any effect.
 //!
 //! # Invariants
@@ -194,9 +195,13 @@ pub(crate) fn emit_load(
     );
     let own = ops.new_dynamic_label();
     let held = ops.new_dynamic_label();
+    let absent = ops.new_dynamic_label();
+    let undefined = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; ldrb w16, [X(entry), cache.load_action_byte]
         ; cmp w16, #PropertyLoadAction::OwnData as u32 ; b.eq =>own
+        ; cmp w16, #PropertyLoadAction::NonExistent as u32 ; b.eq =>absent
         ; cmp w16, #PropertyLoadAction::InheritedData as u32 ; b.ne =>miss
         ; ldr x16, [X(entry), cache.load_validity_byte] ; cbz x16, =>miss
         ; ldar w16, [x16] ; cbz w16, =>miss
@@ -224,7 +229,17 @@ pub(crate) fn emit_load(
         ; ldr x17, [X(entry), cache.holder_shape_id_byte] ; cmp x16, x17 ; b.ne =>miss
         ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
     bank(ops, view, holder, slot, base, miss);
-    dynasm!(ops ; .arch aarch64 ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]);
+    dynasm!(ops ; .arch aarch64
+        ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
+        ; b =>done
+        // Absent from the whole chain: the proof (none for a `null`
+        // prototype the receiver shape fixes) authorizes `undefined`.
+        ; =>absent
+        ; ldr x16, [X(entry), cache.load_validity_byte] ; cbz x16, =>undefined
+        ; ldar w16, [x16] ; cbz w16, =>miss
+        ; =>undefined);
+    emit_load_u64(ops, destination, crate::entry::VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; =>done);
 }
 
 /// Complete an own writable store or no-allocation append. W(slot) is the

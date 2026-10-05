@@ -54,8 +54,11 @@
 //! - Generated callers retain only stable function-cell addresses. Publishing a
 //!   new generation never invalidates or recompiles dependent callers.
 //! - A code object's immutable spliced-function list covers actual inlines,
-//!   including ones without safepoints or exits. Retiring a source function
-//!   unlinks those callers so they cannot bypass interpreted retraining.
+//!   including ones without safepoints or exits. A deopt unlinks the source
+//!   function's optimizing generations and every optimizing caller that
+//!   spliced it; its baseline generation stays installed, and its stable cell
+//!   selects the interpreter until retraining completes (V8 keeps baseline
+//!   code across a deopt the same way).
 //! - Invalidating a generation unlinks its entry cell before executable
 //!   retirement. The cell address remains valid and is never reused.
 //!
@@ -147,6 +150,9 @@ pub struct JitCodeRegistry {
     /// bake these addresses once; tier publication switches only the contained
     /// generation-cell pointer.
     function_entry_cells: rustc_hash::FxHashMap<u32, Box<FunctionEntryCell>>,
+    /// Functions retraining after a deopt: their stable cells select the
+    /// interpreter while their baseline generation stays installed.
+    retraining: rustc_hash::FxHashSet<u32>,
     /// Indexed linkage addresses published through the stable registry view.
     function_entries: Vec<u64>,
     /// Last cumulative generated-call counters merged into VM tier policy.
@@ -172,6 +178,7 @@ impl JitCodeRegistry {
             entry_cells: rustc_hash::FxHashMap::default(),
             retained_bytes: 0,
             function_entry_cells: rustc_hash::FxHashMap::default(),
+            retraining: rustc_hash::FxHashSet::default(),
             function_entries: Vec::new(),
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
@@ -662,6 +669,41 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
+    /// Unlink the optimizing generations compiled from `function_id` and every
+    /// optimizing caller that spliced it, for a deopt's retraining. Baseline
+    /// generations, including baseline callers' guarded leaf splices, stay.
+    pub(crate) fn invalidate_optimizing_for_retraining(&mut self, function_id: u32) -> Vec<u32> {
+        let seeds = self
+            .codes
+            .iter()
+            .filter_map(|(&code_object_id, registered)| {
+                (registered.state == CodeLifetimeState::Installed
+                    && registered.code.native_frame_kind() == NativeFrameKind::Optimizing
+                    && (registered.code.metadata().code_block_id == function_id
+                        || registered
+                            .code
+                            .spliced_functions()
+                            .binary_search(&function_id)
+                            .is_ok()))
+                .then_some(code_object_id)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_code_objects(seeds)
+    }
+
+    /// Route `function_id`'s stable cell to the interpreter while it retrains,
+    /// or back to its best installed generation once retraining completes.
+    pub(crate) fn set_retraining(&mut self, function_id: u32, retraining: bool) {
+        let changed = if retraining {
+            self.retraining.insert(function_id)
+        } else {
+            self.retraining.remove(&function_id)
+        };
+        if changed {
+            self.refresh_function_entry(function_id);
+        }
+    }
+
     /// Unlink every installed generation. Chunk reclamation uses this
     /// conservative boundary because an installed caller may have inlined a
     /// function from the retiring chunk even when its own id lies elsewhere.
@@ -932,6 +974,12 @@ impl JitCodeRegistry {
     /// Select the best entry-capable installed generation for one function and
     /// publish it through the permanent function cell.
     fn refresh_function_entry(&mut self, function_id: u32) {
+        if self.retraining.contains(&function_id) {
+            if let Some(function_entry) = self.function_entry_cells.get(&function_id) {
+                function_entry.restore_interpreter();
+            }
+            return;
+        }
         let target = self
             .codes
             .iter()

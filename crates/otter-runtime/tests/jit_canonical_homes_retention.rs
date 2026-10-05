@@ -20,7 +20,7 @@
 //!
 //! # See also
 //! - `jit_canonical_homes_gc` covers floating pressure and moving tagged roots.
-//! - `otter_vm::interp::frames` traces the complete initialized tagged region.
+//! - `otter_jit::graph::metadata` publishes one exact root record per boundary.
 //! - `otter-benchmark` memory workloads observe interpreter/idle boundaries.
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -278,7 +278,14 @@ fn assert_artifact(bundle: &JitArtifactBundle) -> u32 {
         if value != payload {
             continue;
         }
-        let slot = &frames[0]["slots"][register];
+        // Sparse frames list `[register, slot]` pairs in register order.
+        let slot = frames[0]["slots"]
+            .as_array()
+            .expect("frame slots")
+            .iter()
+            .find(|pair| pair[0].as_u64() == Some(register as u64))
+            .map(|pair| &pair[1])
+            .expect("a live payload register has a recipe");
         assert_eq!(slot["representation"], "tagged");
         assert_eq!(slot["locationKind"], "stackSlot");
         homes.insert(
@@ -292,31 +299,39 @@ fn assert_artifact(bundle: &JitArtifactBundle) -> u32 {
     assert_eq!(homes.len(), 1, "exact payload home: {deopt}");
     let home = homes.into_iter().next().unwrap();
     assert_eq!(home % 8, 0);
+    // Each collecting boundary publishes its own record, which roots exactly
+    // the tagged homes written for values live there. The live Instanceof's
+    // record names the payload home; the dead one's does not. No home is
+    // ever cleared.
     let safepoints = artifact_json(bundle, JitArtifactFileName::Safepoints);
-    // Graph ordinary body points publish this complete region. The bundle
-    // also retains baseline-plan records used by call entry; their frameSlot
-    // roots describe a different boundary and must not stand in for homes.
-    let body_safepoint = otter_vm::native_abi::NO_SAFEPOINT - 1;
-    let body_records: Vec<_> = safepoints["records"]
-        .as_array()
-        .expect("safepoints")
-        .iter()
-        .filter(|point| point["id"].as_u64() == Some(u64::from(body_safepoint)))
-        .collect();
-    assert_eq!(body_records.len(), 1, "exact ordinary Graph body record");
-    let locations = body_records[0]["taggedLocations"]
-        .as_array()
-        .expect("tagged roots");
-    assert!(locations.len() > home as usize / 8);
-    for (index, location) in locations.iter().enumerate() {
-        assert_eq!(location["kind"], "spillSlot");
-        assert_eq!(location["index"].as_u64(), Some(index as u64));
-    }
+    let roots_home = |id: u32| {
+        let record = safepoints["records"]
+            .as_array()
+            .expect("safepoints")
+            .iter()
+            .find(|point| point["id"].as_u64() == Some(u64::from(id)))
+            .expect("published safepoint record");
+        record["taggedLocations"]
+            .as_array()
+            .expect("tagged roots")
+            .iter()
+            .any(|location| {
+                location["kind"] == "spillSlot"
+                    && location["index"].as_u64() == Some(u64::from(home / 8))
+            })
+    };
     let code = bundle
         .file(JitArtifactFileName::Code)
         .expect("native code")
         .contents();
-    let clear_counts = assert_native_home_lifetimes(code, &points, home, body_safepoint, dead_node);
+    let published = assert_native_home_lifetimes(code, &points, home);
+    for (operation, id) in &published {
+        assert_eq!(
+            roots_home(*id),
+            *operation != u64::from(dead_node),
+            "operation {operation} record {id}: the payload home is rooted exactly while live"
+        );
+    }
     eprintln!(
         "canonical-home-retention-proof {}",
         json!({
@@ -325,9 +340,7 @@ fn assert_artifact(bundle: &JitArtifactBundle) -> u32 {
             "payloadNode": payload,
             "livePc": live_pc,
             "deadPc": dead_pc,
-            "bodySafepointId": body_safepoint,
-            "taggedHomeSlotCount": locations.len() - 1,
-            "expiredHomeStoreCounts": clear_counts,
+            "publishedSafepoints": published,
             "taggedHomeOffset": home,
             "payloadLiveEager": eager_values(nodes[&live_node]),
             "payloadDeadEager": eager_values(nodes[&dead_node]),
@@ -346,28 +359,15 @@ fn assert_artifact(bundle: &JitArtifactBundle) -> u32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn assert_native_home_lifetimes(
-    code: &[u8],
-    points: &[&Json],
-    home: u32,
-    body_safepoint: u32,
-    dead_node: u32,
-) -> BTreeMap<u64, usize> {
+fn assert_native_home_lifetimes(code: &[u8], points: &[&Json], home: u32) -> BTreeMap<u64, u32> {
     let start = points[0]["startOffset"].as_u64().unwrap() as usize;
     let end = points[0]["endOffset"].as_u64().unwrap() as usize;
-    // Each measured ordinary node must actually publish the asserted body
-    // record: MOVN w16, #~id; STR w16, [x21, #call_site]. The native frame's
-    // prologue roots its region from the unadjusted spill-area stack base.
-    assert!(!body_safepoint <= 0xffff);
-    let publication = [
-        0x1280_0010 | ((!body_safepoint & 0xffff) << 5),
-        0xb900_0000
-            | (otter_vm::native_abi::NATIVE_FRAME_CALL_SITE_OFFSET / 4) << 10
-            | 21 << 5
-            | 16,
-    ];
-    let dead_clear = 0xf900_03ff | ((home / 8) << 10); // STR XZR, [SP, #home]
-    let mut clear_counts = BTreeMap::new();
+    // MOVN w16, #imm; STR w16, [x21, #call_site] publishes record `!imm`.
+    let stamp = 0xb900_0000
+        | (otter_vm::native_abi::NATIVE_FRAME_CALL_SITE_OFFSET / 4) << 10
+        | 21 << 5
+        | 16;
+    let mut published = BTreeMap::new();
     for point in points {
         let start = point["startOffset"].as_u64().unwrap() as usize;
         let end = point["endOffset"].as_u64().unwrap() as usize;
@@ -375,29 +375,16 @@ fn assert_native_home_lifetimes(
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
             .collect();
-        clear_counts.insert(
-            point["operationIndex"].as_u64().unwrap(),
-            words
-                .iter()
-                .filter(|&&word| word & 0xffc0_03ff == 0xf900_03ff)
-                .count(),
+        let id = words
+            .windows(2)
+            .find(|pair| pair[0] & 0xffe0_001f == 0x1280_0010 && pair[1] == stamp)
+            .map(|pair| !((pair[0] >> 5) & 0xffff))
+            .expect("measured Instanceof publishes its own safepoint record");
+        published.insert(point["operationIndex"].as_u64().unwrap(), id);
+        assert!(
+            !words.contains(&(0xf900_03ff | ((home / 8) << 10))),
+            "a tagged home is never cleared"
         );
-        let published = words
-            .windows(publication.len())
-            .position(|pair| pair == publication)
-            .expect("measured Instanceof must publish the exact full-region safepoint");
-        let cleared = words.iter().position(|&word| word == dead_clear);
-        if point["operationIndex"].as_u64() == Some(u64::from(dead_node)) {
-            assert!(
-                cleared.is_some_and(|index| index < published),
-                "the exact dead payload home must be cleared before the collecting boundary"
-            );
-        } else {
-            assert!(
-                cleared.is_none(),
-                "the live payload home must remain protected"
-            );
-        }
     }
     // STR Xn, [sp, #home] in the actual collecting operation, before its
     // committed runtime call. This value is still needed by the marker read.
@@ -405,17 +392,11 @@ fn assert_native_home_lifetimes(
         let word = u32::from_le_bytes(word.try_into().unwrap());
         word & 0xffc0_03e0 == 0xf900_03e0 && ((word >> 10) & 0xfff) * 8 == home
     }));
-    clear_counts
+    published
 }
 
 #[cfg(target_arch = "x86_64")]
-fn assert_native_home_lifetimes(
-    code: &[u8],
-    points: &[&Json],
-    home: u32,
-    body_safepoint: u32,
-    dead_node: u32,
-) -> BTreeMap<u64, usize> {
+fn assert_native_home_lifetimes(code: &[u8], points: &[&Json], home: u32) -> BTreeMap<u64, u32> {
     let immediate = |operand| match operand {
         Operand::ImmediateI8 { imm } => Some(imm as u32),
         Operand::ImmediateI32 { imm } => Some(imm as u32),
@@ -423,58 +404,41 @@ fn assert_native_home_lifetimes(
         Operand::ImmediateU32 { imm } => Some(imm),
         _ => None,
     };
-    let mut clear_counts = BTreeMap::new();
-    for point in points {
+    let mut published = BTreeMap::new();
+    for (position, point) in points.iter().enumerate() {
         let instructions = native_code::decode(
             code,
             point["startOffset"].as_u64().unwrap() as usize,
             point["endOffset"].as_u64().unwrap() as usize,
         );
-        let published = instructions
+        let (stamp, id) = instructions
             .iter()
-            .position(|instruction| {
-                instruction.opcode() == Opcode::MOV
+            .enumerate()
+            .find_map(|(index, instruction)| {
+                (instruction.opcode() == Opcode::MOV
                     && instruction.mem_size().and_then(|size| size.bytes_size()) == Some(4)
                     && native_code::base_offset(instruction.operand(0))
                         == Some((
                             RegSpec::r14(),
                             otter_vm::native_abi::NATIVE_FRAME_CALL_SITE_OFFSET as i32,
-                        ))
-                    && immediate(instruction.operand(1)) == Some(body_safepoint)
+                        )))
+                .then(|| immediate(instruction.operand(1)).map(|id| (index, id)))
+                .flatten()
             })
-            .expect("measured Instanceof publishes exact full-region safepoint");
-        let clears: Vec<_> = instructions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, instruction)| {
-                if instruction.opcode() != Opcode::MOV
-                    || instruction.mem_size().and_then(|size| size.bytes_size()) != Some(8)
+            .expect("measured Instanceof publishes its own safepoint record");
+        published.insert(point["operationIndex"].as_u64().unwrap(), id);
+        assert!(
+            instructions.iter().all(|instruction| {
+                instruction.opcode() != Opcode::MOV
                     || immediate(instruction.operand(1)) != Some(0)
-                {
-                    return None;
-                }
-                native_code::base_offset(instruction.operand(0))
-                    .filter(|(base, offset)| {
-                        *base == RegSpec::rsp() && *offset >= 0 && offset % 8 == 0
-                    })
-                    .map(|(_, offset)| (index, offset as u32))
-            })
-            .collect();
-        clear_counts.insert(point["operationIndex"].as_u64().unwrap(), clears.len());
-        if point["operationIndex"].as_u64() == Some(u64::from(dead_node)) {
+                    || native_code::base_offset(instruction.operand(0))
+                        != Some((RegSpec::rsp(), home as i32))
+            }),
+            "a tagged home is never cleared"
+        );
+        if position == 0 {
             assert!(
-                clears
-                    .iter()
-                    .any(|(index, offset)| *offset == home && *index < published),
-                "exact dead payload home {home} clears before collecting boundary {published}; decoded own region: {instructions:#?}"
-            );
-        } else {
-            assert!(
-                clears.iter().all(|(_, offset)| *offset != home),
-                "live payload home remains protected"
-            );
-            assert!(
-                instructions[..published]
+                instructions[..stamp]
                     .iter()
                     .any(|instruction| instruction.opcode() == Opcode::MOV
                         && native_code::base_offset(instruction.operand(0))
@@ -485,7 +449,7 @@ fn assert_native_home_lifetimes(
             );
         }
     }
-    clear_counts
+    published
 }
 
 fn measure(last_length: usize) -> Vec<Sample> {

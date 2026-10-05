@@ -99,6 +99,7 @@ fn codegen<'a>(
             bytes: slots.bytes(),
             scratch_slot: Some(slots.spill_tagged),
             safepoint: FIRST_SITE_SAFEPOINT,
+        saved_pairs: 0,
         },
         transitions,
         deopt_runtime: 0,

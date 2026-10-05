@@ -199,6 +199,12 @@ pub(crate) enum Kind {
     /// Checked add; eager deopt on overflow.
     Int32Add,
     Int32Sub,
+    /// Two's-complement add whose every use applies `ToInt32` (or
+    /// `ToUint32`) to it and whose exact sum no frame state records: the
+    /// wrapped word is that conversion of the exact result.
+    Int32AddWrapping,
+    /// Two's-complement subtract under the same truncated-use contract.
+    Int32SubWrapping,
     Int32Mul,
     /// Checked exact division; deopt on a remainder, zero divisor, overflow
     /// or negative zero.
@@ -566,6 +572,8 @@ impl Kind {
             | Self::LoadWindow(_)
             | Self::Phi
             | Self::AllocationProjection(_)
+            | Self::Int32AddWrapping
+            | Self::Int32SubWrapping
             | Self::Int32BitAnd
             | Self::Int32BitOr
             | Self::Int32BitXor
@@ -779,6 +787,8 @@ impl Kind {
             // instruction when it fits.
             Self::Int32Add
             | Self::Int32Sub
+            | Self::Int32AddWrapping
+            | Self::Int32SubWrapping
             | Self::Int32BitAnd
             | Self::Int32BitOr
             | Self::Int32BitXor

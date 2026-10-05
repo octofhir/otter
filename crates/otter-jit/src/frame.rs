@@ -37,6 +37,10 @@ pub(crate) struct SpillArea {
     pub(crate) scratch_slot: Option<u32>,
     /// The entry record, rooting only the scratch.
     pub(crate) safepoint: abi::SafepointId,
+    /// AArch64 callee-saved pairs the body allocates, bit `i` for
+    /// `x(22 + 2i)`/`x(23 + 2i)`; saved below the frame pointer at entry and
+    /// restored when the frame is released.
+    pub(crate) saved_pairs: u8,
 }
 
 impl SpillArea {
@@ -45,7 +49,15 @@ impl SpillArea {
         bytes: 0,
         scratch_slot: None,
         safepoint: abi::NO_SAFEPOINT,
+        saved_pairs: 0,
     };
+
+    /// The callee-saved pairs covering the general registers in `used`.
+    pub(crate) fn saved_pairs_for(used: u32) -> u8 {
+        (0..4u8)
+            .filter(|&pair| used & (0b11 << (22 + 2 * pair)) != 0)
+            .fold(0, |mask, pair| mask | 1 << pair)
+    }
 }
 
 /// Shared completion labels for one native body.

@@ -619,7 +619,7 @@ fn build_once(
 /// dominates it. Replacing one phi can make the phis that read it trivial in
 /// turn, so the pass runs to a fixpoint, then rewrites node inputs, phi
 /// inputs and frame states and drops the replaced phis.
-fn remove_trivial_phis(graph: &mut Graph, layout: &[BlockId]) {
+pub(crate) fn remove_trivial_phis(graph: &mut Graph, layout: &[BlockId]) {
     fn resolve(replaced: &mut FxHashMap<NodeId, NodeId>, node: NodeId) -> NodeId {
         let mut current = node;
         while let Some(&next) = replaced.get(&current) {
@@ -1198,6 +1198,33 @@ impl<'a> Builder<'a> {
             self.goto(target);
         }
         self.current = None;
+    }
+
+    /// Whether the conditional jump `op` over the constant `value` jumps, or
+    /// `None` when the value is not a constant whose test needs no heap: a
+    /// cell's truthiness (an empty string) is left to the branch.
+    fn constant_condition(&self, op: Op, value: NodeId) -> Option<bool> {
+        let Kind::ConstTagged(bits) = self.graph.node(value).kind else {
+            return None;
+        };
+        let constant = otter_vm::Value::from_bits(bits);
+        if op == Op::JumpIfNullish {
+            return Some(constant.is_nullish());
+        }
+        let truthy = if constant.is_nullish() {
+            false
+        } else if let Some(boolean) = constant.as_boolean() {
+            boolean
+        } else if let Some(number) = constant.as_f64() {
+            number != 0.0 && !number.is_nan()
+        } else {
+            return None;
+        };
+        match op {
+            Op::JumpIfTrue => Some(truthy),
+            Op::JumpIfFalse => Some(!truthy),
+            _ => None,
+        }
     }
 
     /// A fresh block for one branch edge; it jumps on to `target`.
@@ -1913,6 +1940,20 @@ impl<'a> Builder<'a> {
                 self.write(instruction.writes[0], result);
                 return;
             }
+            // `ToInt32` already happened on the operands: `x | 0`, `x ^ 0`,
+            // `x << 0`, `x >> 0` and `x & -1` are the int32 operand itself.
+            let identity = match (op, self.int32_constant(a), self.int32_constant(b)) {
+                (Op::BitwiseOr | Op::BitwiseXor, _, Some(0))
+                | (Op::Shl | Op::Shr, _, Some(0))
+                | (Op::BitwiseAnd | Op::BitwiseAndImm, _, Some(-1)) => Some(a),
+                (Op::BitwiseOr | Op::BitwiseXor, Some(0), _)
+                | (Op::BitwiseAnd | Op::BitwiseAndImm, Some(-1), _) => Some(b),
+                _ => None,
+            };
+            if let Some(value) = identity {
+                self.write(instruction.writes[0], value);
+                return;
+            }
             let kind = match op {
                 Op::BitwiseAnd | Op::BitwiseAndImm => Kind::Int32BitAnd,
                 Op::BitwiseOr => Kind::Int32BitOr,
@@ -1961,6 +2002,14 @@ impl<'a> Builder<'a> {
             return;
         }
         self.generic(instruction);
+    }
+
+    /// The value of an int32 constant node.
+    fn int32_constant(&self, node: NodeId) -> Option<i32> {
+        match self.graph.node(node).kind {
+            Kind::ConstInt32(value) => Some(value),
+            _ => None,
+        }
     }
 
     /// An int32 operand of a bitwise operator: `ToInt32` of the number or
@@ -2211,6 +2260,13 @@ impl<'a> Builder<'a> {
         let value = self.tagged(value);
         let taken = self.analysis.block_of[target as usize];
         let fallthrough = self.analysis.block_of[self.pc as usize + 1];
+        // A condition known while building selects its edge now; the other
+        // successor gets no incoming edge from here (Maglev folds a
+        // constant `JumpIf*` the same way).
+        if let Some(jumps) = self.constant_condition(instruction.op, value) {
+            self.goto(if jumps { taken } else { fallthrough });
+            return;
+        }
         match instruction.op {
             Op::JumpIfTrue => self.branch(BranchKind::Truthy, &[value], taken, fallthrough),
             Op::JumpIfFalse => self.branch(BranchKind::Truthy, &[value], fallthrough, taken),

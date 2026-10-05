@@ -100,7 +100,11 @@ impl RegisterContract {
 
 #[cfg(any(test, target_arch = "aarch64"))]
 pub(crate) const AARCH64: RegisterContract = RegisterContract {
-    general: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    // x22–x28 are C callee-saved: a body saves the pairs it uses below its
+    // frame pointer. Every allocatable register is clobbered by calls.
+    general: &[
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 22, 23, 24, 25, 26, 27, 28,
+    ],
     floating: &[
         0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     ],

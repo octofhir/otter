@@ -96,8 +96,23 @@ fn emit_zero_scratch(ops: &mut Assembler, spill: SpillArea) {
     }
 }
 
-/// Save the frame registers and establish `x29`.
-fn emit_save(ops: &mut Assembler) {
+/// Bytes the saved callee-saved pairs occupy just below `x29`.
+fn saved_bytes(pairs: u8) -> u32 {
+    16 * pairs.count_ones()
+}
+
+/// `(first register, x29-relative offset)` of each saved pair, the lowest
+/// pair highest.
+fn saved_slots(pairs: u8) -> impl Iterator<Item = (u8, u32)> {
+    (0..4u8)
+        .filter(move |pair| pairs & (1 << pair) != 0)
+        .enumerate()
+        .map(|(index, pair)| (22 + 2 * pair, 16 * (index as u32 + 1)))
+}
+
+/// Save the frame registers and establish `x29`, then the callee-saved
+/// pairs a Graph body allocates below it.
+fn emit_save(ops: &mut Assembler, pairs: u8) {
     dynasm!(ops
         ; .arch aarch64
         ; stp x29, x30, [sp, #-48]!
@@ -105,12 +120,36 @@ fn emit_save(ops: &mut Assembler) {
         ; str x21, [sp, #32]
         ; mov x29, sp
     );
+    if pairs == 0 {
+        return;
+    }
+    dynasm!(ops ; .arch aarch64 ; sub sp, sp, saved_bytes(pairs));
+    for (first, offset) in saved_slots(pairs) {
+        let offset = -(offset as i32);
+        if first == 28 {
+            dynasm!(ops ; .arch aarch64 ; stur x28, [x29, offset]);
+        } else {
+            dynasm!(ops ; .arch aarch64 ; stp X(first), X(first + 1), [x29, offset]);
+        }
+    }
+}
+
+/// Reload the callee-saved pairs [`emit_save`] stored.
+fn emit_restore_saved(ops: &mut Assembler, pairs: u8) {
+    for (first, offset) in saved_slots(pairs) {
+        let offset = -(offset as i32);
+        if first == 28 {
+            dynasm!(ops ; .arch aarch64 ; ldur x28, [x29, offset]);
+        } else {
+            dynasm!(ops ; .arch aarch64 ; ldp X(first), X(first + 1), [x29, offset]);
+        }
+    }
 }
 
 /// The entry over the published interpreter frame: its window and record
 /// become the body's, and the return publishes that frame again.
 pub(crate) fn emit_tier_prologue(ops: &mut Assembler, spill: SpillArea) {
-    emit_save(ops);
+    emit_save(ops, spill.saved_pairs);
     dynasm!(ops
         ; .arch aarch64
         ; mov x20, x0
@@ -131,12 +170,13 @@ pub(crate) fn emit_tier_prologue(ops: &mut Assembler, spill: SpillArea) {
     }
     emit_zero_scratch(ops, spill);
     emit_load_u64(ops, 17, u64::from(spill.safepoint));
+    let roots = -(saved_bytes(spill.saved_pairs) as i32);
     dynasm!(ops
         ; .arch aarch64
         ; ldr x16, [x21, DEPTH_CALL_SITE]
-        ; stur x16, [x29, -16]
+        ; stur x16, [x29, roots - 16]
         ; ldr x16, [x21, MACHINE_ROOTS]
-        ; stur x16, [x29, -8]
+        ; stur x16, [x29, roots - 8]
         ; str w17, [x21, DEPTH_CALL_SITE + 4]
         ; mov x16, sp
         ; str x16, [x21, MACHINE_ROOTS]
@@ -150,13 +190,14 @@ fn emit_restore_tier_roots(ops: &mut Assembler, spill: SpillArea) {
         return;
     }
     let called = ops.new_dynamic_label();
+    let roots = -(saved_bytes(spill.saved_pairs) as i32);
     dynasm!(ops
         ; .arch aarch64
         ; cmp x9, x21
         ; b.ne =>called
-        ; ldur x16, [x29, -16]
+        ; ldur x16, [x29, roots - 16]
         ; str x16, [x21, DEPTH_CALL_SITE]
-        ; ldur x16, [x29, -8]
+        ; ldur x16, [x29, roots - 8]
         ; str x16, [x21, MACHINE_ROOTS]
         ; =>called
     );
@@ -190,7 +231,7 @@ pub(crate) fn emit_call_entry(
     } = cold;
     let bytes = reservation(shape, spill);
     let window = u32::from(shape.register_count) * 8;
-    emit_save(ops);
+    emit_save(ops, spill.saved_pairs);
     dynasm!(ops ; .arch aarch64 ; mov x20, x0);
     let depth_ready = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
@@ -680,10 +721,11 @@ pub(crate) fn emit_call_entry_cold(
         emit_stub(ops, relocations, transitions, abi::STUB_JIT_PROMOTE_ENTERED);
         dynasm!(ops ; .arch aarch64 ; b =>promoted);
     }
-    // Nothing is published: return the overflow.
+    // Nothing is published: return the overflow. The body never ran, so
+    // the callee-saved pairs still hold their caller's values.
     dynasm!(ops ; .arch aarch64 ; =>cold.overflow ; mov x0, x20);
     emit_stub(ops, relocations, transitions, abi::STUB_JIT_CALL_OVERFLOW);
-    emit_restore(ops);
+    emit_restore(ops, 0);
 }
 
 fn emit_stub(
@@ -697,7 +739,8 @@ fn emit_stub(
 }
 
 /// Release this native frame and return `x0`/`x1`.
-fn emit_restore(ops: &mut Assembler) {
+fn emit_restore(ops: &mut Assembler, pairs: u8) {
+    emit_restore_saved(ops, pairs);
     dynasm!(ops
         ; .arch aarch64
         ; mov sp, x29
@@ -718,7 +761,7 @@ pub(crate) fn emit_epilogue(ops: &mut Assembler, exits: ActivationExits, spill: 
     );
     emit_restore_tier_roots(ops, spill);
     dynasm!(ops ; .arch aarch64 ; str x9, [x20, NATIVE_FRAME_OFFSET]);
-    emit_restore(ops);
+    emit_restore(ops, spill.saved_pairs);
 }
 
 /// Emit the shared constructor completion and side-exit continuation.
@@ -775,7 +818,7 @@ pub(crate) fn emit_exits(
         ; and x9, x9, -2i64 as u64
         ; str x9, [x20, NATIVE_FRAME_OFFSET]
     );
-    emit_restore(ops);
+    emit_restore(ops, spill.saved_pairs);
     // A called record continues in the interpreter on its own window; a
     // tier-entered frame hands the exit back to its interpreter.
     let tier = ops.new_dynamic_label();
@@ -806,7 +849,7 @@ pub(crate) fn emit_exits(
         ; movz x1, abi::NativeResultStatus::SideExit as u32
         ; str x9, [x20, NATIVE_FRAME_OFFSET]
     );
-    emit_restore(ops);
+    emit_restore(ops, spill.saved_pairs);
 }
 
 /// Branch to `leave` unless this body may hand its record to a tail callee,
@@ -854,7 +897,7 @@ pub(crate) fn emit_tail_span_check(ops: &mut Assembler, words: u32, outgrown: Dy
 /// tail call it staged, and the caller enters that request in its place.
 /// [`emit_tail_admission`] passed, so the record owes no constructor
 /// completion.
-pub(crate) fn emit_tail_return(ops: &mut Assembler) {
+pub(crate) fn emit_tail_return(ops: &mut Assembler, saved_pairs: u8) {
     dynasm!(ops
         ; .arch aarch64
         ; movz x0, VALUE_UNDEFINED as u32
@@ -862,7 +905,7 @@ pub(crate) fn emit_tail_return(ops: &mut Assembler) {
         ; ldr x9, [x29, RETURN_FRAME]
         ; str x9, [x20, NATIVE_FRAME_OFFSET]
     );
-    emit_restore(ops);
+    emit_restore(ops, saved_pairs);
 }
 
 /// Retire this called record and enter the callee in `x13` in its place.
@@ -881,8 +924,10 @@ pub(crate) fn emit_tail_transfer(
     bytes: u32,
     count: u32,
     target: crate::arm64::js_call::CallTarget,
+    saved_pairs: u8,
 ) {
     emit_load_u64(ops, 4, u64::from(count));
+    emit_restore_saved(ops, saved_pairs);
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, x20

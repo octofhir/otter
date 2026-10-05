@@ -797,9 +797,10 @@ pub(crate) fn compile_program_parts(
         .with_module_url(script_module_url);
     // A nested closure or direct eval reaching a body binding keeps it in
     // a slot (every body binding when the body contains a direct eval).
-    top.captured_names = capture::analyze_module(program.body);
-    top.dot_arguments_observed = capture::program_reads_dot_arguments(program.body);
-    top.contains_direct_eval = capture::program_contains_direct_eval(program.body);
+    let unit_capture = capture::CaptureFacts::of_unit(program.body);
+    top.captured_names = unit_capture.captured(unit_capture.unit(), false);
+    top.dot_arguments_observed = unit_capture.reads_dot_arguments();
+    top.contains_direct_eval = unit_capture.unit_contains_eval();
 
     let mut top_level_vars: Vec<String> = Vec::new();
     hoist_var_names(program.body, &mut top_level_vars);
@@ -829,7 +830,7 @@ pub(crate) fn compile_program_parts(
         });
     // A script `<main>` and an indirect eval run with no closure context.
     top.closure_context_empty = caller_chain.is_none();
-    let mut cx = Compiler::new(top);
+    let mut cx = Compiler::new(top, unit_capture);
     cx.eval_chain = caller_chain.cloned();
     cx.suppress_global_mirror = eval_mode && (main_is_strict || function_var_env);
     cx.in_eval = eval_mode;
@@ -1146,7 +1147,8 @@ pub fn compile_module_program(
     let mut top = FunctionContext::new(Rc::clone(&module))
         .with_strict(true)
         .with_module_url(host.module_url.clone());
-    top.captured_names = capture::analyze_module(&program.body);
+    let unit_capture = capture::CaptureFacts::of_unit(&program.body);
+    top.captured_names = unit_capture.captured(unit_capture.unit(), false);
     // Hoisted function declarations instantiate during the link-phase
     // init invocation; the evaluation-phase invocation (a separate
     // frame over the same module context) must observe the same closure
@@ -1154,7 +1156,7 @@ pub fn compile_module_program(
     for name in top_level_hoistable_function_names(&program.body) {
         top.captured_names.insert(name);
     }
-    top.contains_direct_eval = capture::program_contains_direct_eval(&program.body);
+    top.contains_direct_eval = unit_capture.unit_contains_eval();
 
     let mut state = ModuleState {
         pre_resolved_imports: host.resolved_imports.clone(),
@@ -1459,7 +1461,7 @@ pub fn compile_module_program(
     let record_count = next_record;
     top.module_state = Some(state);
 
-    let mut cx = Compiler::new(top);
+    let mut cx = Compiler::new(top, unit_capture);
     // The module scope's context (descriptor 0) is allocated by the runtime
     // once per module and handed to both `<module-init>` invocations (link
     // and evaluation) as their closure context.

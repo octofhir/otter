@@ -217,15 +217,16 @@ pub(crate) fn compile_function_impl(
     });
     // Any direct eval inside (nested functions included) can read every
     // binding it can see, so every own binding becomes a slot.
-    let contains_direct_eval = body
-        .is_some_and(|b| capture::body_contains_direct_eval(Some(params), b))
+    let unit = Rc::clone(&parent.capture);
+    let facts = body.map(|b| unit.function(b));
+    let contains_direct_eval = facts.is_some_and(|facts| unit.contains_eval(facts))
         || fields_contain_eval;
     // A sloppy direct eval in the function's OWN code creates `var`s in the
     // variable environment: that scope anchors the eval extension.
-    let params_eval =
-        has_param_expressions && !function_is_strict && capture::params_contain_direct_eval(params);
-    let body_eval = !function_is_strict
-        && body.is_some_and(|b| capture::own_code_contains_direct_eval(None, Some(b)));
+    let params_eval = has_param_expressions
+        && !function_is_strict
+        && facts.is_some_and(capture::ScopeFacts::params_eval);
+    let body_eval = !function_is_strict && facts.is_some_and(capture::ScopeFacts::body_eval);
     let legacy_arguments_observable = !is_arrow
         && parent.dot_arguments_observed
         && !function_is_strict
@@ -243,7 +244,7 @@ pub(crate) fn compile_function_impl(
         });
     let body_needs_arguments_object = !is_arrow
         && !lexical_arguments
-        && (body_references_arguments(params, body) || contains_direct_eval);
+        && (facts.is_some_and(capture::ScopeFacts::uses_arguments) || contains_direct_eval);
     let needs_arguments = body_needs_arguments_object || legacy_arguments_observable;
     let uses_mapped_arguments = body_needs_arguments_object && !function_is_strict && simple_params;
     let arguments_forward_only = body_needs_arguments_object
@@ -276,29 +277,25 @@ pub(crate) fn compile_function_impl(
     child.proper_tail_calls = !is_async && !is_generator;
     let formal_names: Vec<String> = formal_parameter_bound_names(params);
     let mut self_name_referenced = false;
-    if let Some(b) = body {
-        child.captured_names = capture::analyze_function(Some(params), b);
+    if let Some(facts) = facts {
+        child.captured_names = unit.captured(facts, true);
         if is_arrow {
             child.captured_names.remove("arguments");
         }
-        let self_name_in_inner =
-            contains_direct_eval || capture::inner_references_name(Some(params), b, name);
-        self_name_referenced =
-            contains_direct_eval || capture::body_references_name(Some(params), b, name);
+        let self_name_in_inner = contains_direct_eval || unit.inner_references(facts, name);
+        self_name_referenced = contains_direct_eval || unit.references(facts, name);
         if nfe_self && self_name_in_inner {
             child.captured_names.insert(name.to_string());
         }
         // A nested closure referencing `arguments` (in a parameter default
         // or the body) reads the object through a slot.
-        if body_needs_arguments_object
-            && capture::inner_references_name(Some(params), b, "arguments")
-        {
+        if body_needs_arguments_object && unit.inner_references(facts, "arguments") {
             child.captured_names.insert("arguments".to_string());
         }
         if contains_direct_eval {
             child
                 .captured_names
-                .extend(capture::all_own_names(Some(params), b));
+                .extend(unit.own_names(facts, true));
             if is_arrow {
                 child.captured_names.remove("arguments");
                 if child.binds_arguments {

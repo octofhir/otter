@@ -110,6 +110,8 @@ pub(crate) struct Compiler {
     pub(crate) declared_classes: HashMap<String, Option<u32>>,
     /// Class-annotated property sites awaiting name resolution.
     pub(crate) pending_class_hint_sites: Vec<PendingClassHintSite>,
+    /// Capture facts of the unit being compiled.
+    pub(crate) capture: Rc<crate::capture::CaptureFacts>,
 }
 
 /// One class-annotated property site, still holding the interned annotation
@@ -219,7 +221,7 @@ struct WalkState {
 }
 
 impl Compiler {
-    pub(crate) fn new(top: FunctionContext) -> Self {
+    pub(crate) fn new(top: FunctionContext, capture: crate::capture::CaptureFacts) -> Self {
         Self {
             stack: vec![top],
             eval_chain: None,
@@ -244,6 +246,7 @@ impl Compiler {
             class_hint_name_ids: HashMap::new(),
             declared_classes: HashMap::new(),
             pending_class_hint_sites: Vec::new(),
+            capture: Rc::new(capture),
         }
     }
 

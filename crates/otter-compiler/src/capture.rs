@@ -1,179 +1,619 @@
-//! Capture analysis: which of a function's own bindings must live in a
-//! context slot rather than a register.
+//! Capture analysis: which of a scope's own bindings must live in a context
+//! slot rather than a register.
 //!
 //! A binding needs a slot when a nested function references it, when any
 //! direct eval (strict or sloppy) can see it, when a sloppy mapped arguments
 //! object aliases it, or — for a derived constructor's `this` — when an
-//! arrow, a direct eval, or an arrow `super()` observes it. This module runs
-//! name-keyed pre-passes over one function body at a time; over-promotion is
+//! arrow, a direct eval, or an arrow `super()` observes it. Over-promotion is
 //! sound (a slot nothing reads), under-promotion is not.
 //!
 //! # Contents
-//! - [`analyze_function`] / [`analyze_module`] — names a
-//!   nested function references (every own name when a direct eval sits
-//!   anywhere inside).
-//! - [`body_contains_direct_eval`] and friends — direct-eval detection at any
-//!   depth, and [`own_code_contains_direct_eval`] for the function's own
-//!   code only (the eval-extension anchor).
-//! - [`derived_this_observed`] — whether a derived constructor keeps `this`
-//!   in a `DerivedThis` slot.
-//! - [`statement_contains_closure_or_eval`] / [`expression_nested_refs`] —
-//!   per-construct refinements for `with` objects and loop-head TDZ scopes.
+//! - [`CaptureFacts`] — one post-order pass over a compile unit. For every
+//!   function body, static block and the unit itself it records the names the
+//!   scope declares, the names its nested functions reference, how far a
+//!   direct eval reaches and whether the scope reads `arguments`; for the
+//!   whole unit, the source position of every identifier reference and direct
+//!   eval, answering "does this range mention `x`" by binary search.
+//! - [`CaptureFacts::nested_refs_in_statements`] and friends — region queries
+//!   for block, `switch` and loop-head predeclaration.
+//! - Single-construct finders: derived `this`, `with` reachability,
+//!   `.arguments` reads, `new.target`.
 //!
 //! # Invariants
-//! - Shadowing is respected: a nested function that binds its own
-//!   parameter or local of the same spelling as an outer name does
-//!   not mark that outer name as captured.
-//! - We never recurse across module / file boundaries — each
-//!   function body is its own analysis unit.
+//! - Every scope is walked once; a nested scope hands its ancestors only the
+//!   names that escape it. Names are compared by spelling: a nested function
+//!   binding a name as a parameter, `var`, `arguments` or top-level declaration
+//!   hides it from its ancestors; block-level shadowing does not (that only
+//!   over-promotes).
+//! - Facts are keyed by AST node address and valid while the unit's AST lives;
+//!   every function body and static block the compiler lowers belongs to the
+//!   analyzed unit.
 
 use std::collections::HashSet;
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, Class, FormalParameters, Function, FunctionBody,
-    Statement,
+    ArrowFunctionExpression, BindingPattern, Class, Expression, FormalParameters, Function,
+    FunctionBody, Statement,
 };
 use oxc_ast_visit::{Visit, walk};
+use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Names declared by a function that some inner / nested function
-/// references, or every own name when a direct eval sits anywhere inside.
-/// The compiler keeps each such binding in a context slot.
-#[must_use]
-pub fn analyze_function(
-    params: Option<&FormalParameters<'_>>,
-    body: &FunctionBody<'_>,
-) -> HashSet<String> {
-    let mut own = OwnNameCollector::default();
-    if let Some(p) = params {
-        own.visit_formal_parameters(p);
-    }
-    own.names.insert("arguments".to_string());
-    own.visit_function_body(body);
+type NameId = u32;
 
-    // Closures in parameter initializers capture the parameter scope too.
-    let mut inner = InnerRefCollector::default();
-    if let Some(p) = params {
-        inner.visit_formal_parameters(p);
-    }
-    inner.visit_function_body(body);
-
-    if inner.nested_direct_eval {
-        // §19.2.1.3 — a direct eval inside a nested function can read any
-        // visible outer binding; promote every own name to a slot.
-        return own.names;
-    }
-    own.names.intersection(&inner.refs).cloned().collect()
+/// Capture-relevant facts of one scope: a function body, a class static
+/// block, or the compile unit's top level.
+#[derive(Debug, Default)]
+pub(crate) struct ScopeFacts {
+    /// Names declared at any block depth of the scope's own code (parameters,
+    /// declarations, catch parameters, function and class names).
+    own: Vec<NameId>,
+    /// Names referenced from functions nested in the scope (and from class
+    /// field initializers and static blocks, which lower to nested frames).
+    inner: FxHashSet<NameId>,
+    /// A direct eval in the scope or in a nested function that does not
+    /// rebind `eval`.
+    nested_eval: bool,
+    /// Names referenced inside the scope that it does not bind.
+    escape: FxHashSet<NameId>,
+    /// `nested_eval`, unless the scope binds `eval`.
+    escape_eval: bool,
+    /// A direct eval in the parameter list's own code.
+    params_eval: bool,
+    /// A direct eval in the body's own code (outside nested functions,
+    /// arrows and classes).
+    body_eval: bool,
+    /// `arguments` is referenced outside nested non-arrow functions and
+    /// class bodies.
+    uses_arguments: bool,
+    /// Source range of the parameters and body.
+    range: (u32, u32),
 }
 
-/// `true` when functions nested inside `params` / `body` reference
-/// `name`. Used to decide whether a function expression's self-name
-/// binding (§10.2.11 funcEnv) must live in a context slot.
-#[must_use]
-pub fn inner_references_name(
-    params: Option<&FormalParameters<'_>>,
-    body: &FunctionBody<'_>,
-    name: &str,
-) -> bool {
-    let mut inner = InnerRefCollector::default();
-    if let Some(p) = params {
-        inner.visit_formal_parameters(p);
+impl ScopeFacts {
+    /// A direct eval in the parameter list's own code.
+    pub(crate) fn params_eval(&self) -> bool {
+        self.params_eval
     }
-    inner.visit_function_body(body);
-    inner.refs.contains(name)
+
+    /// A direct eval in the body's own code.
+    pub(crate) fn body_eval(&self) -> bool {
+        self.body_eval
+    }
+
+    /// The scope reads its own `arguments` (arrows included).
+    pub(crate) fn uses_arguments(&self) -> bool {
+        self.uses_arguments
+    }
 }
 
-/// `true` when a function body (or its parameter defaults) references
-/// `name` as an identifier *at any depth* — directly in the body
-/// (`return f(n - 1)`) or inside a nested closure. Unlike
-/// [`inner_references_name`], which counts only nested references for
-/// slot promotion, this asks whether the function's self-name is
-/// observable at all, which is what decides whether the §10.2.11
-/// self-binding (`LoadSelf`) is live or dead code. Conservative: a
-/// nested binding that shadows `name` still trips it (the worst case
-/// is emitting an unobservable self-binding, never dropping a live
-/// one).
-#[must_use]
-pub fn body_references_name(
-    params: Option<&FormalParameters<'_>>,
-    body: &FunctionBody<'_>,
-    name: &str,
-) -> bool {
-    let mut any = AnyRefCollector::default();
-    if let Some(p) = params {
-        any.visit_formal_parameters(p);
-    }
-    any.visit_function_body(body);
-    any.refs.contains(name)
+/// Capture facts of one compile unit.
+#[derive(Debug, Default)]
+pub(crate) struct CaptureFacts {
+    names: Vec<Box<str>>,
+    ids: FxHashMap<Box<str>, NameId>,
+    scopes: FxHashMap<usize, ScopeFacts>,
+    unit: ScopeFacts,
+    /// Start offsets of every identifier reference, per name, ascending.
+    references: FxHashMap<NameId, Vec<u32>>,
+    /// Start offsets of every direct-eval call, ascending.
+    evals: Vec<u32>,
+    reads_dot_arguments: bool,
 }
 
-/// `true` when a function body contains a direct-eval call site —
-/// a bare `eval(...)` identifier call — at any nesting depth.
-/// §19.2.1.3 EvalDeclarationInstantiation gives such an eval body
-/// read/write access to the caller's scope chain, so every binding it can
-/// see must live in a context slot. The check is conservative: a locally
-/// shadowed `eval` still trips it (one extra slot per binding, no semantic
-/// change).
-#[must_use]
-pub fn body_contains_direct_eval(
-    params: Option<&FormalParameters<'_>>,
-    body: &FunctionBody<'_>,
-) -> bool {
-    let mut finder = DirectEvalFinder::default();
-    if let Some(p) = params {
-        finder.visit_formal_parameters(p);
+impl CaptureFacts {
+    /// Analyze the top-level statements of one compile unit.
+    #[must_use]
+    pub(crate) fn of_unit(stmts: &[Statement<'_>]) -> Self {
+        let mut builder = Builder::default();
+        builder.facts.intern("arguments");
+        builder.facts.intern("eval");
+        builder.frames.push(Frame::new(FrameKind::Unit, 0));
+        for stmt in stmts {
+            builder.visit_statement(stmt);
+        }
+        let unit = builder.frames.pop().expect("unit frame");
+        let mut facts = builder.facts;
+        facts.unit = unit.facts;
+        for positions in facts.references.values_mut() {
+            positions.sort_unstable();
+        }
+        facts.evals.sort_unstable();
+        facts
     }
-    finder.visit_function_body(body);
-    finder.found
+
+    /// Facts of a function or arrow body of this unit.
+    pub(crate) fn function(&self, body: &FunctionBody<'_>) -> &ScopeFacts {
+        self.scope(std::ptr::from_ref(body) as usize)
+    }
+
+    /// Facts of a class static block of this unit.
+    pub(crate) fn static_block(&self, body: &oxc_allocator::Vec<'_, Statement<'_>>) -> &ScopeFacts {
+        self.scope(std::ptr::from_ref(body) as usize)
+    }
+
+    /// Facts of the unit's top level.
+    pub(crate) fn unit(&self) -> &ScopeFacts {
+        &self.unit
+    }
+
+    fn scope(&self, key: usize) -> &ScopeFacts {
+        self.scopes
+            .get(&key)
+            .expect("capture facts cover every scope of the compile unit")
+    }
+
+    /// Own names that a nested function references — every own name when a
+    /// direct eval reaches the scope. `with_arguments` counts the scope's
+    /// `arguments` binding among its own names.
+    pub(crate) fn captured(&self, scope: &ScopeFacts, with_arguments: bool) -> HashSet<String> {
+        let arguments = with_arguments.then_some(ARGUMENTS);
+        scope
+            .own
+            .iter()
+            .copied()
+            .chain(arguments)
+            .filter(|id| scope.nested_eval || scope.inner.contains(id))
+            .map(|id| self.names[id as usize].to_string())
+            .collect()
+    }
+
+    /// Every name the scope declares, `arguments` included when asked.
+    pub(crate) fn own_names(&self, scope: &ScopeFacts, with_arguments: bool) -> HashSet<String> {
+        let arguments = with_arguments.then_some(ARGUMENTS);
+        scope
+            .own
+            .iter()
+            .copied()
+            .chain(arguments)
+            .map(|id| self.names[id as usize].to_string())
+            .collect()
+    }
+
+    /// Whether a function nested in the scope references `name`.
+    pub(crate) fn inner_references(&self, scope: &ScopeFacts, name: &str) -> bool {
+        self.ids.get(name).is_some_and(|id| scope.inner.contains(id))
+    }
+
+    /// Whether the scope's parameters or body name `name` at any depth,
+    /// shadowed or not.
+    pub(crate) fn references(&self, scope: &ScopeFacts, name: &str) -> bool {
+        self.ids
+            .get(name)
+            .and_then(|id| self.references.get(id))
+            .is_some_and(|positions| any_within(positions, scope.range))
+    }
+
+    /// Whether the scope contains a direct eval at any depth.
+    pub(crate) fn contains_eval(&self, scope: &ScopeFacts) -> bool {
+        any_within(&self.evals, scope.range)
+    }
+
+    /// Whether the unit contains a direct eval anywhere.
+    pub(crate) fn unit_contains_eval(&self) -> bool {
+        !self.evals.is_empty()
+    }
+
+    /// Whether the unit reads a `.arguments` property anywhere.
+    pub(crate) fn reads_dot_arguments(&self) -> bool {
+        self.reads_dot_arguments
+    }
+
+    /// Names referenced from functions nested in `stmts`, and whether such a
+    /// function or the statements themselves contain a direct eval.
+    pub(crate) fn nested_refs_in_statements<'s, 'a: 's>(
+        &self,
+        stmts: impl IntoIterator<Item = &'s Statement<'a>>,
+    ) -> (HashSet<String>, bool) {
+        let mut region = Region::new(self);
+        for stmt in stmts {
+            region.visit_statement(stmt);
+        }
+        region.finish()
+    }
+
+    /// [`Self::nested_refs_in_statements`] for one expression.
+    pub(crate) fn nested_refs_in_expression(&self, expr: &Expression<'_>) -> (HashSet<String>, bool) {
+        let mut region = Region::new(self);
+        region.visit_expression(expr);
+        region.finish()
+    }
+
+    fn intern(&mut self, name: &str) -> NameId {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = NameId::try_from(self.names.len()).expect("name table exceeds u32");
+        self.names.push(name.into());
+        self.ids.insert(name.into(), id);
+        id
+    }
 }
 
-/// All names a function body declares at its own depth (parameters,
-/// `var` / `let` / `const` / function / class declarations, excluding
-/// nested function internals). Used to promote *every* function-scope
-/// binding to a context slot when the body contains a direct eval.
-#[must_use]
-pub fn all_own_names(
-    params: Option<&FormalParameters<'_>>,
-    body: &FunctionBody<'_>,
-) -> HashSet<String> {
-    let mut own = OwnNameCollector::default();
-    if let Some(p) = params {
-        own.visit_formal_parameters(p);
-    }
-    own.names.insert("arguments".to_string());
-    own.visit_function_body(body);
-    own.names
+const ARGUMENTS: NameId = 0;
+const EVAL: NameId = 1;
+
+fn any_within(sorted: &[u32], (start, end): (u32, u32)) -> bool {
+    let first = sorted.partition_point(|&position| position < start);
+    sorted.get(first).is_some_and(|&position| position < end)
 }
 
-/// Expression variant of [`body_contains_direct_eval`] — used for
-/// class field initializers, which compile into the synthesized
-/// constructor's frame.
-#[must_use]
-pub fn expression_contains_direct_eval(expr: &oxc_ast::ast::Expression<'_>) -> bool {
-    let mut finder = DirectEvalFinder::default();
-    finder.visit_expression(expr);
-    finder.found
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    Unit,
+    Function,
+    Arrow,
+    StaticBlock,
 }
 
-/// Statement-list variant of [`body_contains_direct_eval`] for
-/// script / eval program bodies.
-#[must_use]
-pub fn program_contains_direct_eval(stmts: &[Statement<'_>]) -> bool {
-    let mut finder = DirectEvalFinder::default();
-    for stmt in stmts {
-        finder.visit_statement(stmt);
-    }
-    finder.found
+#[derive(Debug)]
+struct Frame {
+    kind: FrameKind,
+    key: usize,
+    facts: ScopeFacts,
+    /// Names referenced in the scope and not bound by a nested scope.
+    refs: FxHashSet<NameId>,
+    /// Parameters, top-level declarations and `arguments`.
+    bound: FxHashSet<NameId>,
+    /// `var`s at any block depth, static blocks included.
+    vars: FxHashSet<NameId>,
+    class_depth: u32,
+    class_body_depth: u32,
+    /// Inside a class field initializer or computed field key.
+    field_depth: u32,
+    in_params: bool,
 }
 
-/// Statement-list variant of [`all_own_names`] for script / eval
-/// program bodies.
-#[must_use]
-pub fn all_program_names(stmts: &[Statement<'_>]) -> HashSet<String> {
-    let mut own = OwnNameCollector::default();
-    for stmt in stmts {
-        own.visit_statement(stmt);
+impl Frame {
+    fn new(kind: FrameKind, key: usize) -> Self {
+        Self {
+            kind,
+            key,
+            facts: ScopeFacts::default(),
+            refs: FxHashSet::default(),
+            bound: FxHashSet::default(),
+            vars: FxHashSet::default(),
+            class_depth: 0,
+            class_body_depth: 0,
+            field_depth: 0,
+            in_params: false,
+        }
     }
-    own.names
+}
+
+#[derive(Default)]
+struct Builder {
+    facts: CaptureFacts,
+    frames: Vec<Frame>,
+}
+
+impl Builder {
+    fn top(&mut self) -> &mut Frame {
+        self.frames.last_mut().expect("scope frame")
+    }
+
+    fn own(&mut self, name: &str) {
+        let id = self.facts.intern(name);
+        let frame = self.top();
+        if frame.class_depth == 0 {
+            frame.facts.own.push(id);
+        }
+    }
+
+    fn own_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        if self.top().class_depth == 0 {
+            pattern_leaves(pattern, &mut |name| self.own(name));
+        }
+    }
+
+    fn enter_function(
+        &mut self,
+        kind: FrameKind,
+        params: &FormalParameters<'_>,
+        body: &FunctionBody<'_>,
+    ) {
+        self.frames
+            .push(Frame::new(kind, std::ptr::from_ref(body) as usize));
+        self.top().in_params = true;
+        self.visit_formal_parameters(params);
+        self.top().in_params = false;
+        // Every name the parameter list declares covers the whole function.
+        let frame = self.top();
+        frame.bound.extend(frame.facts.own.iter().copied());
+        if kind == FrameKind::Function {
+            frame.bound.insert(ARGUMENTS);
+        }
+        for stmt in &body.statements {
+            match stmt {
+                Statement::VariableDeclaration(declaration) => {
+                    for declarator in &declaration.declarations {
+                        pattern_leaves(&declarator.id, &mut |name| {
+                            let id = self.facts.intern(name);
+                            self.top().bound.insert(id);
+                        });
+                    }
+                }
+                Statement::FunctionDeclaration(function) => {
+                    if let Some(id) = &function.id {
+                        let id = self.facts.intern(&id.name);
+                        self.top().bound.insert(id);
+                    }
+                }
+                Statement::ClassDeclaration(class) => {
+                    if let Some(id) = &class.id {
+                        let id = self.facts.intern(&id.name);
+                        self.top().bound.insert(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.visit_function_body(body);
+        let start = params.span.start.min(body.span.start);
+        self.exit((start, body.span.end));
+    }
+
+    fn exit(&mut self, range: (u32, u32)) {
+        let mut frame = self.frames.pop().expect("scope frame");
+        let parent = self.top();
+        if frame.kind == FrameKind::StaticBlock {
+            parent.vars.extend(frame.vars.iter().copied());
+        } else {
+            frame.bound.extend(frame.vars.iter().copied());
+        }
+        frame.refs.retain(|id| !frame.bound.contains(id));
+        let escape_eval = frame.facts.nested_eval && !frame.bound.contains(&EVAL);
+        parent.refs.extend(frame.refs.iter().copied());
+        parent.facts.inner.extend(frame.refs.iter().copied());
+        parent.facts.nested_eval |= escape_eval;
+        frame.facts.escape = frame.refs;
+        frame.facts.escape_eval = escape_eval;
+        frame.facts.range = range;
+        self.facts.scopes.insert(frame.key, frame.facts);
+    }
+
+    /// `arguments` read in the innermost scope reaches through arrows to the
+    /// nearest non-arrow function, unless a class body intervenes.
+    fn note_arguments(&mut self) {
+        for frame in self.frames.iter_mut().rev() {
+            if frame.class_body_depth > 0 {
+                return;
+            }
+            frame.facts.uses_arguments = true;
+            if frame.kind != FrameKind::Arrow {
+                return;
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for Builder {
+    fn visit_function(&mut self, it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        if let Some(id) = &it.id {
+            self.own(&id.name);
+        }
+        // A body-less declaration (an overload signature) has no runtime scope.
+        if let Some(body) = it.body.as_deref() {
+            self.enter_function(FrameKind::Function, &it.params, body);
+        }
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.enter_function(FrameKind::Arrow, &it.params, &it.body);
+    }
+
+    fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
+        self.frames.push(Frame::new(
+            FrameKind::StaticBlock,
+            std::ptr::from_ref(&it.body) as usize,
+        ));
+        for stmt in &it.body {
+            self.visit_statement(stmt);
+        }
+        self.exit((it.span.start, it.span.end));
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        if let Some(id) = &it.id {
+            self.own(&id.name);
+        }
+        self.top().class_depth += 1;
+        walk::walk_class(self, it);
+        self.top().class_depth -= 1;
+    }
+
+    fn visit_class_body(&mut self, it: &oxc_ast::ast::ClassBody<'a>) {
+        self.top().class_body_depth += 1;
+        walk::walk_class_body(self, it);
+        self.top().class_body_depth -= 1;
+    }
+
+    fn visit_property_definition(&mut self, it: &oxc_ast::ast::PropertyDefinition<'a>) {
+        // Field initializers and computed field keys lower into a nested
+        // frame (the constructor or the statics initializer).
+        self.top().field_depth += 1;
+        walk::walk_property_definition(self, it);
+        self.top().field_depth -= 1;
+    }
+
+    fn visit_formal_parameters(&mut self, it: &FormalParameters<'a>) {
+        if let Some(rest) = &it.rest {
+            self.own_pattern(&rest.rest.argument);
+        }
+        walk::walk_formal_parameters(self, it);
+    }
+
+    fn visit_formal_parameter(&mut self, it: &oxc_ast::ast::FormalParameter<'a>) {
+        self.own_pattern(&it.pattern);
+        walk::walk_formal_parameter(self, it);
+    }
+
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if it.kind.is_var() {
+            for declarator in &it.declarations {
+                pattern_leaves(&declarator.id, &mut |name| {
+                    let id = self.facts.intern(name);
+                    self.top().vars.insert(id);
+                });
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+
+    fn visit_variable_declarator(&mut self, it: &oxc_ast::ast::VariableDeclarator<'a>) {
+        self.own_pattern(&it.id);
+        walk::walk_variable_declarator(self, it);
+    }
+
+    fn visit_catch_parameter(&mut self, it: &oxc_ast::ast::CatchParameter<'a>) {
+        self.own_pattern(&it.pattern);
+        walk::walk_catch_parameter(self, it);
+    }
+
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        let id = self.facts.intern(&it.name);
+        self.facts
+            .references
+            .entry(id)
+            .or_default()
+            .push(it.span.start);
+        let frame = self.top();
+        frame.refs.insert(id);
+        if frame.field_depth > 0 {
+            frame.facts.inner.insert(id);
+        }
+        if id == ARGUMENTS {
+            self.note_arguments();
+        }
+    }
+
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        if callee_is_direct_eval(&it.callee) {
+            self.facts.evals.push(it.span.start);
+            let frame = self.top();
+            frame.facts.nested_eval = true;
+            if frame.class_depth == 0 {
+                if frame.in_params {
+                    frame.facts.params_eval = true;
+                } else {
+                    frame.facts.body_eval = true;
+                }
+            }
+        }
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_static_member_expression(&mut self, it: &oxc_ast::ast::StaticMemberExpression<'a>) {
+        if it.property.name == "arguments" {
+            self.facts.reads_dot_arguments = true;
+        }
+        walk::walk_static_member_expression(self, it);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        it: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if matches!(&it.expression, Expression::StringLiteral(key) if key.value == "arguments") {
+            self.facts.reads_dot_arguments = true;
+        }
+        walk::walk_computed_member_expression(self, it);
+    }
+}
+
+/// Collector of the names nested functions in one region reference, reading
+/// each nested scope's escaping names from the unit's facts.
+struct Region<'f> {
+    facts: &'f CaptureFacts,
+    refs: FxHashSet<NameId>,
+    eval: bool,
+    field_depth: u32,
+}
+
+impl<'f> Region<'f> {
+    fn new(facts: &'f CaptureFacts) -> Self {
+        Self {
+            facts,
+            refs: FxHashSet::default(),
+            eval: false,
+            field_depth: 0,
+        }
+    }
+
+    fn absorb(&mut self, scope: &ScopeFacts) {
+        self.refs.extend(scope.escape.iter().copied());
+        self.eval |= scope.escape_eval;
+    }
+
+    fn finish(self) -> (HashSet<String>, bool) {
+        let names = self
+            .refs
+            .into_iter()
+            .map(|id| self.facts.names[id as usize].to_string())
+            .collect();
+        (names, self.eval)
+    }
+}
+
+impl<'a> Visit<'a> for Region<'_> {
+    fn visit_function(&mut self, it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        if let Some(body) = it.body.as_deref() {
+            self.absorb(self.facts.function(body));
+        }
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.absorb(self.facts.function(&it.body));
+    }
+
+    fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
+        self.absorb(self.facts.static_block(&it.body));
+    }
+
+    fn visit_property_definition(&mut self, it: &oxc_ast::ast::PropertyDefinition<'a>) {
+        self.field_depth += 1;
+        walk::walk_property_definition(self, it);
+        self.field_depth -= 1;
+    }
+
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        if self.field_depth > 0
+            && let Some(&id) = self.facts.ids.get(it.name.as_str())
+        {
+            self.refs.insert(id);
+        }
+    }
+
+    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+        if callee_is_direct_eval(&it.callee) {
+            self.eval = true;
+        }
+        walk::walk_call_expression(self, it);
+    }
+}
+
+/// Every identifier a binding pattern declares — `{ a, b: [c, ...d] }`
+/// declares `a`, `c` and `d`.
+fn pattern_leaves(pattern: &BindingPattern<'_>, out: &mut impl FnMut(&str)) {
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => out(&id.name),
+        BindingPattern::AssignmentPattern(assignment) => pattern_leaves(&assignment.left, out),
+        BindingPattern::ArrayPattern(array) => {
+            for element in array.elements.iter().flatten() {
+                pattern_leaves(element, out);
+            }
+            if let Some(rest) = &array.rest {
+                pattern_leaves(&rest.argument, out);
+            }
+        }
+        BindingPattern::ObjectPattern(object) => {
+            for property in &object.properties {
+                pattern_leaves(&property.value, out);
+            }
+            if let Some(rest) = &object.rest {
+                pattern_leaves(&rest.argument, out);
+            }
+        }
+    }
 }
 
 /// `true` when a program body references `new.target` outside any
@@ -204,52 +644,6 @@ pub fn program_references_new_target(stmts: &[Statement<'_>]) -> bool {
     finder.found
 }
 
-/// `true` when the function's OWN code — parameters and body, excluding
-/// nested functions, arrows, and class bodies (which own their variable
-/// environments or are strict) — contains a direct-eval call. Such a sloppy
-/// function's variable scope anchors the eval's `var` extension.
-#[must_use]
-pub fn own_code_contains_direct_eval(
-    params: Option<&FormalParameters<'_>>,
-    body: Option<&FunctionBody<'_>>,
-) -> bool {
-    let mut finder = OwnEvalFinder::default();
-    if let Some(p) = params {
-        finder.visit_formal_parameters(p);
-    }
-    if let Some(body) = body {
-        finder.visit_function_body(body);
-    }
-    finder.found
-}
-
-/// [`own_code_contains_direct_eval`] restricted to the parameter list:
-/// an eval in a parameter initializer declares its `var`s in the callee
-/// environment outside the parameters (§10.2.11 step 20).
-#[must_use]
-pub fn params_contain_direct_eval(params: &FormalParameters<'_>) -> bool {
-    let mut finder = OwnEvalFinder::default();
-    finder.visit_formal_parameters(params);
-    finder.found
-}
-
-#[derive(Default)]
-struct OwnEvalFinder {
-    found: bool,
-}
-
-impl<'a> Visit<'a> for OwnEvalFinder {
-    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
-        if callee_is_direct_eval(&it.callee) {
-            self.found = true;
-            return;
-        }
-        walk::walk_call_expression(self, it);
-    }
-    fn visit_function(&mut self, _it: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {}
-    fn visit_arrow_function_expression(&mut self, _it: &ArrowFunctionExpression<'a>) {}
-    fn visit_class(&mut self, _it: &Class<'a>) {}
-}
 
 /// `true` when a derived constructor's `this` must live in a
 /// `DerivedThis` context slot: an arrow nested in its parameters or body
@@ -320,6 +714,7 @@ impl<'a> Visit<'a> for DerivedThisFinder {
     }
 }
 
+
 /// `true` when `stmt` contains a function, arrow, class, or direct eval —
 /// any construct that can reach a `with` object after the statement's own
 /// straight-line code, so the object must live in a context slot.
@@ -352,15 +747,17 @@ pub fn statement_contains_closure_or_eval(stmt: &Statement<'_>) -> bool {
     finder.found
 }
 
-/// Names referenced from functions nested inside `expr`, and whether it
-/// contains a direct eval. Decides which `for-in` / `for-of` head names a
-/// closure in the right-hand side can observe in their TDZ.
+
+/// Whether `expr` contains a direct eval at any depth — used for
+/// class field initializers, which compile into the synthesized
+/// constructor's frame.
 #[must_use]
-pub fn expression_nested_refs(expr: &oxc_ast::ast::Expression<'_>) -> (HashSet<String>, bool) {
-    let mut inner = InnerRefCollector::default();
-    inner.visit_expression(expr);
-    (inner.refs, inner.nested_direct_eval)
+pub fn expression_contains_direct_eval(expr: &oxc_ast::ast::Expression<'_>) -> bool {
+    let mut finder = DirectEvalFinder::default();
+    finder.visit_expression(expr);
+    finder.found
 }
+
 
 #[derive(Default)]
 struct DirectEvalFinder {
@@ -390,24 +787,6 @@ impl<'a> Visit<'a> for DirectEvalFinder {
     }
 }
 
-/// `true` when some expression in `stmts` reads a `.arguments` property.
-///
-/// The legacy `fn.arguments` accessor (§B.3.6.2) hands back the arguments
-/// object of a sloppy function's running activation, which cannot be seen
-/// from the callee's own body. A whole-program scan is the cheapest sound
-/// trigger: a script that never names the property pays nothing, and one
-/// that does materializes the object in its sloppy functions.
-#[must_use]
-pub fn program_reads_dot_arguments(stmts: &[Statement<'_>]) -> bool {
-    let mut finder = DotArgumentsFinder::default();
-    for stmt in stmts {
-        finder.visit_statement(stmt);
-        if finder.found {
-            return true;
-        }
-    }
-    finder.found
-}
 
 /// `true` when the body of one function, including its arrow functions but
 /// not its other nested functions, reads a `.arguments` property.
@@ -480,274 +859,6 @@ impl<'a> Visit<'a> for DotArgumentsFinder {
     }
 }
 
-/// Module-body variant: collect names declared at the top level of
-/// `<main>` that some nested function references.
-#[must_use]
-pub fn analyze_module(stmts: &[Statement<'_>]) -> HashSet<String> {
-    let mut own = OwnNameCollector::default();
-    for stmt in stmts {
-        own.visit_statement(stmt);
-    }
-    let mut inner = InnerRefCollector::default();
-    for stmt in stmts {
-        inner.visit_statement(stmt);
-    }
-    if inner.nested_direct_eval {
-        return own.names;
-    }
-    own.names.intersection(&inner.refs).cloned().collect()
-}
-
-/// Names referenced from nested functions contained in `stmts`.
-///
-/// Used for block-scope predeclaration. Function-wide capture analysis is
-/// intentionally name-only, but a later closure that captures an outer `x`
-/// must not force an unrelated earlier `{ const x }` block binding into a
-/// context slot.
-#[must_use]
-pub fn nested_function_refs_in_statements(stmts: &[Statement<'_>]) -> (HashSet<String>, bool) {
-    let mut inner = InnerRefCollector::default();
-    for stmt in stmts {
-        inner.visit_statement(stmt);
-    }
-    (inner.refs, inner.nested_direct_eval)
-}
-
-#[must_use]
-pub fn nested_function_refs_in_statement_refs(stmts: &[&Statement<'_>]) -> (HashSet<String>, bool) {
-    let mut inner = InnerRefCollector::default();
-    for stmt in stmts {
-        inner.visit_statement(stmt);
-    }
-    (inner.refs, inner.nested_direct_eval)
-}
-
-/// Walks a function body and collects names declared in it (params,
-/// `let` / `const` / function declarations at any block depth),
-/// excluding anything declared inside a nested function.
-#[derive(Default)]
-struct OwnNameCollector {
-    names: HashSet<String>,
-    nested_depth: u32,
-}
-
-impl OwnNameCollector {
-    fn maybe_collect_pattern(&mut self, pattern: &BindingPattern<'_>) {
-        if self.nested_depth > 0 {
-            return;
-        }
-        self.collect_pattern_leaves(pattern);
-    }
-
-    /// Collect every leaf identifier a binding pattern declares —
-    /// `let { a, b: [c, ...d] } = …` declares `a`, `c`, `d` — so a
-    /// nested function capturing a destructured leaf promotes it to
-    /// a context slot just like a plain `let` binding.
-    fn collect_pattern_leaves(&mut self, pattern: &BindingPattern<'_>) {
-        match pattern {
-            BindingPattern::BindingIdentifier(id) => {
-                self.names.insert(id.name.as_str().to_string());
-            }
-            BindingPattern::AssignmentPattern(asgn) => {
-                self.collect_pattern_leaves(&asgn.left);
-            }
-            BindingPattern::ArrayPattern(arr) => {
-                for elem in arr.elements.iter().flatten() {
-                    self.collect_pattern_leaves(elem);
-                }
-                if let Some(rest) = &arr.rest {
-                    self.collect_pattern_leaves(&rest.argument);
-                }
-            }
-            BindingPattern::ObjectPattern(obj) => {
-                for prop in &obj.properties {
-                    self.collect_pattern_leaves(&prop.value);
-                }
-                if let Some(rest) = &obj.rest {
-                    self.collect_pattern_leaves(&rest.argument);
-                }
-            }
-        }
-    }
-}
-
-impl<'a> Visit<'a> for OwnNameCollector {
-    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
-        // Function declarations binding their own id at the parent
-        // scope happen here (when this is a declaration, not an
-        // expression).
-        if self.nested_depth == 0
-            && let Some(id) = it.id.as_ref()
-        {
-            self.names.insert(id.name.as_str().to_string());
-        }
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_function(self, it, flags);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-    }
-
-    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_arrow_function_expression(self, it);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-    }
-
-    fn visit_formal_parameters(&mut self, it: &FormalParameters<'a>) {
-        // The rest element (`function f(...args)`) lives in `FormalParameters.rest`,
-        // not in `items`, so `visit_formal_parameter` never sees it. Collect its
-        // leaves explicitly, otherwise a rest parameter referenced from a nested
-        // closure is not promoted to a context slot and resolves as undefined.
-        if let Some(rest) = &it.rest {
-            self.maybe_collect_pattern(&rest.rest.argument);
-        }
-        walk::walk_formal_parameters(self, it);
-    }
-
-    fn visit_formal_parameter(&mut self, it: &oxc_ast::ast::FormalParameter<'a>) {
-        self.maybe_collect_pattern(&it.pattern);
-        walk::walk_formal_parameter(self, it);
-    }
-
-    fn visit_variable_declarator(&mut self, it: &oxc_ast::ast::VariableDeclarator<'a>) {
-        self.maybe_collect_pattern(&it.id);
-        walk::walk_variable_declarator(self, it);
-    }
-
-    fn visit_catch_parameter(&mut self, it: &oxc_ast::ast::CatchParameter<'a>) {
-        self.maybe_collect_pattern(&it.pattern);
-        walk::walk_catch_parameter(self, it);
-    }
-
-    fn visit_class(&mut self, it: &Class<'a>) {
-        // Class declarations (and named class expressions) bind
-        // the class name in the enclosing scope, just like function
-        // declarations. Without this hook the capture analyser
-        // would miss class names referenced from inside methods.
-        if self.nested_depth == 0
-            && let Some(id) = it.id.as_ref()
-        {
-            self.names.insert(id.name.as_str().to_string());
-        }
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_class(self, it);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-    }
-}
-
-/// The names a nested function shadows *everywhere inside itself*.
-///
-/// Used to decide whether a reference inside a nested function is a capture of
-/// an outer binding. Only bindings that cover the whole nested function belong
-/// here: its parameters, its `arguments`, the `var`s it declares at any depth
-/// (those are function-scoped), and the lexical declarations at the top level
-/// of its body.
-///
-/// A `let` inside a *block* deliberately does not count. It shadows within its
-/// block and nowhere else, so counting it would suppress the capture of the
-/// outer binding that the rest of the function still refers to — and that
-/// binding would then have no context slot, which is a `ReferenceError` at
-/// the first reference outside the block.
-///
-/// The set is deliberately minimal. Naming one name too few costs a context
-/// slot that nothing reads; naming one too many costs a reference that
-/// resolves to nothing.
-fn nested_function_own_names(
-    params: Option<&FormalParameters<'_>>,
-    body: Option<&FunctionBody<'_>>,
-    is_arrow: bool,
-) -> HashSet<String> {
-    let mut own = OwnNameCollector::default();
-    if let Some(p) = params {
-        own.visit_formal_parameters(p);
-    }
-    if !is_arrow {
-        own.names.insert("arguments".to_string());
-    }
-    let Some(body) = body else {
-        return own.names;
-    };
-
-    // The top level of the body: every declaration here covers the whole
-    // function, whatever its kind.
-    for statement in &body.statements {
-        match statement {
-            Statement::VariableDeclaration(declaration) => {
-                for declarator in &declaration.declarations {
-                    own.collect_pattern_leaves(&declarator.id);
-                }
-            }
-            Statement::FunctionDeclaration(function) => {
-                if let Some(id) = function.id.as_ref() {
-                    own.names.insert(id.name.as_str().to_string());
-                }
-            }
-            Statement::ClassDeclaration(class) => {
-                if let Some(id) = class.id.as_ref() {
-                    own.names.insert(id.name.as_str().to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // And `var`, wherever it is written: a `var` in a block is a binding of the
-    // function, not of the block.
-    let mut vars = VarNameCollector::default();
-    vars.visit_function_body(body);
-    own.names.extend(vars.names);
-    own.names
-}
-
-/// Every `var` a function declares, at any block depth, excluding those of
-/// nested functions.
-#[derive(Default)]
-struct VarNameCollector {
-    names: HashSet<String>,
-    nested_depth: u32,
-}
-
-impl<'a> Visit<'a> for VarNameCollector {
-    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_function(self, it, flags);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-    }
-
-    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_arrow_function_expression(self, it);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-    }
-
-    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
-        if self.nested_depth == 0 && it.kind.is_var() {
-            let mut leaves = OwnNameCollector::default();
-            for declarator in &it.declarations {
-                leaves.collect_pattern_leaves(&declarator.id);
-            }
-            self.names.extend(leaves.names);
-        }
-        walk::walk_variable_declaration(self, it);
-    }
-}
-
-/// Walks a function body and collects the free variables of every nested
-/// function (transitively): identifier names referenced from inside a
-/// nested function that the nested function (or an intervening one) does
-/// not itself bind. A nested function whose own parameter / local shadows
-/// an outer name of the same spelling therefore does not mark that outer
-/// name as captured.
-#[derive(Default)]
-struct InnerRefCollector {
-    refs: HashSet<String>,
-    nested_depth: u32,
-    /// Own-name sets of the nested functions currently on the walk stack.
-    bound: Vec<HashSet<String>>,
-    /// A nested function contains a direct `eval(...)` call: every visible
-    /// outer lexical binding is then reachable from that eval, so capture
-    /// analysis must promote all of them rather than only the named refs.
-    nested_direct_eval: bool,
-}
 
 /// Whether `expr` names `name` anywhere, read or written, nested functions
 /// included.
@@ -769,102 +880,3 @@ pub fn expression_mentions_name(expr: &oxc_ast::ast::Expression<'_>, name: &str)
     finder.found
 }
 
-/// Collects every identifier reference in a function body at any
-/// depth (direct body refs and nested-closure refs alike). Backs
-/// [`body_references_name`]'s "is the self-name observable" question.
-#[derive(Default)]
-struct AnyRefCollector {
-    refs: HashSet<String>,
-}
-
-impl<'a> Visit<'a> for AnyRefCollector {
-    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
-        self.refs.insert(it.name.as_str().to_string());
-    }
-}
-
-impl<'a> Visit<'a> for InnerRefCollector {
-    fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
-        // Any direct eval — in this body or in a nested function — can read
-        // every visible lexical binding, so the whole own-name set promotes.
-        if callee_is_direct_eval(&it.callee)
-            && !self.bound.iter().any(|scope| scope.contains("eval"))
-        {
-            self.nested_direct_eval = true;
-        }
-        walk::walk_call_expression(self, it);
-    }
-
-    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
-        let own = nested_function_own_names(Some(&it.params), it.body.as_deref(), false);
-        self.bound.push(own);
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_function(self, it, flags);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-        self.bound.pop();
-    }
-
-    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        let own = nested_function_own_names(Some(&it.params), Some(&it.body), true);
-        self.bound.push(own);
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_arrow_function_expression(self, it);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-        self.bound.pop();
-    }
-
-    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
-        // A reference is a capture of an *outer* binding only when no nested
-        // function on the walk stack binds the same name (a shadowing param
-        // or local resolves the reference locally, not to the outer scope).
-        if self.nested_depth > 0 {
-            let name = it.name.as_str();
-            if !self.bound.iter().any(|scope| scope.contains(name)) {
-                self.refs.insert(name.to_string());
-            }
-        }
-    }
-
-    fn visit_class(&mut self, it: &Class<'a>) {
-        // Class methods sit inside a Function value, so the
-        // function visit hooks already increment nested_depth for
-        // bodies. The class header itself (super_class expression)
-        // is at the current scope's depth — leave it untouched so
-        // `class B extends A {}` doesn't spuriously mark `A` as a
-        // captured-by-inner reference at module top level.
-        walk::walk_class(self, it);
-    }
-
-    fn visit_property_definition(&mut self, it: &oxc_ast::ast::PropertyDefinition<'a>) {
-        // Field initialisers (`class C { x = expr }`) are emitted by
-        // the compiler inside a synthesised function frame: instance
-        // fields run inside the constructor, static fields run via
-        // `Op::CallWithThis` against the class's statics object.
-        // Treat the value expression as if it were nested so any
-        // outer-scope identifier it references is marked as captured.
-        // Computed property keys (`class C { [expr] = … }`) likewise
-        // currently lower into the synthesised constructor frame, so
-        // their identifier references must escape the surrounding
-        // scope too.
-        if it.computed
-            && let Some(key) = it.key.as_expression()
-        {
-            self.nested_depth = self.nested_depth.saturating_add(1);
-            self.visit_expression(key);
-            self.nested_depth = self.nested_depth.saturating_sub(1);
-        }
-        if let Some(value) = &it.value {
-            self.nested_depth = self.nested_depth.saturating_add(1);
-            self.visit_expression(value);
-            self.nested_depth = self.nested_depth.saturating_sub(1);
-        }
-    }
-
-    fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
-        // §15.7.4 — a static block compiles into a synthesised
-        // parameterless function called via `Op::CallWithThis`.
-        self.nested_depth = self.nested_depth.saturating_add(1);
-        walk::walk_static_block(self, it);
-        self.nested_depth = self.nested_depth.saturating_sub(1);
-    }
-}

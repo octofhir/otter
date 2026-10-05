@@ -68,6 +68,26 @@ use serde::Serialize;
 pub use crate::property_cache::jit::JitPropertyActionCache;
 pub use crate::property_cache::{PropertyLoadAction, PropertyStoreAction};
 
+pub use crate::property_ic::{
+    EMPTY_SHAPE as PROPERTY_IC_EMPTY_SHAPE, IcHandlerKind as PropertyIcHandlerKind,
+    PropertyIcLayout,
+};
+
+/// Native layout of every named-property IC slot generated code reads.
+pub const PROPERTY_IC_LAYOUT: PropertyIcLayout = crate::property_ic::PropertyIcSlot::LAYOUT;
+
+/// The `(function id, instruction pc)` a generated miss passes back to the VM
+/// for the IC slot at `slot` (a [`JitPropertyAccess::ic_slot`] address).
+///
+/// # Safety
+/// `slot` must be the address of a live slot of a CodeBlock the caller's code
+/// object retains.
+#[must_use]
+pub unsafe fn property_ic_site(slot: u64) -> (u32, u32) {
+    // SAFETY: the caller guarantees a live slot address.
+    unsafe { &*(slot as *const crate::property_ic::PropertyIcSlot) }.site()
+}
+
 /// Exact named-site atom and current Graph shared-feedback eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitPropertyAccess {
@@ -75,6 +95,10 @@ pub struct JitPropertyAccess {
     pub atom: u32,
     /// The site currently has terminal megamorphic property feedback.
     pub shared: bool,
+    /// Address of the site's native IC slot
+    /// ([`crate::property_ic::PropertyIcSlot`]); zero when the site owns none.
+    /// The slot lives in the CodeBlock the generated code retains.
+    pub ic_slot: u64,
 }
 
 mod literal_allocations;
@@ -1163,7 +1187,8 @@ pub enum JitDirectCallThisMode {
 ///
 /// Object operands are tiny CacheIR register ids: operand zero is the receiver
 /// and operand one is its direct or pinned intrinsic prototype. Ordinary
-/// programs come from CodeBlock feedback; intrinsic programs compose the same
+/// programs are the optimizing tier's compile-time reading of a site's IC
+/// handlers ([`crate::property_ic`]); intrinsic programs compose the same
 /// slot proof with a realm-owned receiver declaration. Shape tokens are stable
 /// compressed offsets validated by the VM while the snapshot is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,7 +1283,7 @@ pub enum JitCacheIrOp {
 
 /// Complete immutable CacheIR program consumed by a native tier.
 ///
-/// A site is publishable only when every installed stub can be represented.
+/// A site is publishable only when every installed handler can be represented.
 /// Unsupported CacheIR operations therefore keep the entire site on its
 /// committed canonical cold edge; a tier never executes a partial program.
 #[derive(Debug, Clone, PartialEq, Eq)]

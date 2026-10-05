@@ -29,7 +29,11 @@ use std::sync::{Arc, Mutex, Weak};
 use super::{JsObject, ObjectPrototype, ShapeId};
 
 /// Address-stable proof retained by ICs and code generations.
+///
+/// `valid` is the first field, so a raw `Arc` pointer is also the address of
+/// the validity word generated code loads.
 #[derive(Debug)]
+#[repr(C)]
 pub(crate) struct PrototypeValidity {
     valid: AtomicU32,
     identity: ShapeId,
@@ -87,7 +91,45 @@ impl PrototypeValidity {
     pub(crate) fn identity(&self) -> u64 {
         self.identity.raw()
     }
+
+    /// Transfer one strong count into a raw word an IC entry owns. The word
+    /// is the validity word's address.
+    pub(crate) fn into_raw(cell: Arc<Self>) -> u64 {
+        Arc::into_raw(cell) as u64
+    }
+
+    /// Borrow the proof a raw IC word owns.
+    ///
+    /// # Safety
+    /// `raw` must come from [`Self::into_raw`] and still own its count.
+    pub(crate) unsafe fn borrow_raw<'a>(raw: u64) -> &'a Self {
+        // SAFETY: the caller guarantees the word still owns a strong count.
+        unsafe { &*(raw as *const Self) }
+    }
+
+    /// A new strong reference to the proof a raw IC word owns.
+    ///
+    /// # Safety
+    /// As for [`Self::borrow_raw`].
+    pub(crate) unsafe fn clone_raw(raw: u64) -> Arc<Self> {
+        // SAFETY: the word owns one count, so the allocation is live.
+        unsafe {
+            Arc::increment_strong_count(raw as *const Self);
+            Arc::from_raw(raw as *const Self)
+        }
+    }
+
+    /// Release the count a raw IC word owns.
+    ///
+    /// # Safety
+    /// `raw` must come from [`Self::into_raw`]; the word is dead afterwards.
+    pub(crate) unsafe fn release_raw(raw: u64) {
+        // SAFETY: the caller transfers the word's count back.
+        drop(unsafe { Arc::from_raw(raw as *const Self) });
+    }
 }
+
+const _: () = assert!(std::mem::offset_of!(PrototypeValidity, valid) == 0);
 
 #[derive(Debug, Default)]
 struct WatchpointState {

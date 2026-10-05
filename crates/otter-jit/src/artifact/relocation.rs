@@ -45,7 +45,7 @@ const ITEM_DIRECT_BRANCH: u8 = 2;
 
 const TARGET_RUNTIME_STUB: u8 = 1;
 const TARGET_GC_CAGE_BASE: u8 = 2;
-const TARGET_PROPERTY_SOURCE_CELL: u8 = 3;
+const TARGET_PROPERTY_IC_SLOT: u8 = 3;
 const TARGET_GUARDED_HEAP_REFERENCE: u8 = 6;
 const TARGET_FUNCTION_ENTRY_CELL: u8 = 8;
 const TARGET_GLOBAL_LEXICAL_CELL: u8 = 10;
@@ -57,7 +57,7 @@ const TARGET_ARITH_FEEDBACK_CELL: u8 = 17;
 const TARGET_SOURCE_WORK_CELL: u8 = 18;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 
-/// Whether a property source-identity cell serves a load or a store site.
+/// Whether a named-property probe serves a load or a store site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum PropertySourceAccess {
@@ -117,9 +117,12 @@ pub(crate) enum RelocationTarget {
         function_id: u32,
         byte_pc: u32,
     },
-    PropertySourceCell {
-        access: PropertySourceAccess,
-        ordinal: u32,
+    /// The native IC slot of one named-property site, owned by the site's
+    /// CodeBlock feedback vector. A byte PC names an instruction only inside
+    /// its own body, so the function id is part of the identity.
+    PropertyIcSlot {
+        function_id: u32,
+        byte_pc: u32,
     },
     GuardedHeapReference {
         component: GuardedHeapComponent,
@@ -1223,13 +1226,13 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
             put_u32(output, *function_id);
             put_u32(output, *byte_pc);
         }
-        RelocationTarget::PropertySourceCell { access, ordinal } => {
-            output.push(TARGET_PROPERTY_SOURCE_CELL);
-            output.push(match access {
-                PropertySourceAccess::Load => 0,
-                PropertySourceAccess::Store => 1,
-            });
-            put_u32(output, *ordinal);
+        RelocationTarget::PropertyIcSlot {
+            function_id,
+            byte_pc,
+        } => {
+            output.push(TARGET_PROPERTY_IC_SLOT);
+            put_u32(output, *function_id);
+            put_u32(output, *byte_pc);
         }
         RelocationTarget::GuardedHeapReference {
             component,
@@ -1448,9 +1451,9 @@ mod tests {
         let targets = [
             runtime_stub(),
             RelocationTarget::GcCageBase,
-            RelocationTarget::PropertySourceCell {
-                access: PropertySourceAccess::Store,
-                ordinal: 7,
+            RelocationTarget::PropertyIcSlot {
+                function_id: 3,
+                byte_pc: 7,
             },
             function_entry_cell(12),
         ];
@@ -1743,9 +1746,9 @@ mod tests {
                 signature: "poll1",
             },
             RelocationTarget::GcCageBase,
-            RelocationTarget::PropertySourceCell {
-                access: PropertySourceAccess::Load,
-                ordinal: 2,
+            RelocationTarget::PropertyIcSlot {
+                function_id: 1,
+                byte_pc: 2,
             },
             RelocationTarget::CalleeIdentityCell {
                 function_id: 3,

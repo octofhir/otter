@@ -81,22 +81,24 @@ fn final_delete_retires_old_load_proof_and_restores_valid_parent_identity() {
     append_shaped_data_for_fixture(object, &mut heap, key, Value::boolean(true));
     let resolved =
         crate::cache_ir::resolve_atom_data_slot(object, &heap, key).expect("old own proof");
-    let old =
-        crate::cache_ir::CacheStub::from_resolved_load(super::shape_id(object, &heap), &resolved);
-    assert_eq!(old.run_load(object, &heap, key), Some(Value::boolean(true)));
+    let old = crate::property_ic::PropertyIcSlot::new(crate::property_ic::PropertyIcKind::Load);
+    old.install(
+        crate::property_ic::IcHandler::load_resolved(shape(object, &heap), &resolved)
+            .expect("own handler"),
+    );
+    assert_eq!(old.probe_load(object, &heap), Some(Value::boolean(true)));
     assert!(super::delete(&mut object, &mut heap, "x").expect("actual final delete"));
     assert_eq!(shape(object, &heap), parent);
     assert!(!super::is_dictionary(object, &heap));
-    assert_eq!(old.run_load(object, &heap, key), None);
+    assert_eq!(old.probe_load(object, &heap), None);
     assert_eq!(super::get_own(object, &heap, "x"), None);
     append_shaped_data_for_fixture(object, &mut heap, key, Value::boolean(false));
-    assert_eq!(old.run_load(object, &heap, key), None);
     let current =
         crate::cache_ir::resolve_atom_data_slot(object, &heap, key).expect("new actual proof");
-    let current =
-        crate::cache_ir::CacheStub::from_resolved_load(super::shape_id(object, &heap), &current);
-    assert_eq!(
-        current.run_load(object, &heap, key),
-        Some(Value::boolean(false))
+    let fresh = crate::property_ic::PropertyIcSlot::new(crate::property_ic::PropertyIcKind::Load);
+    fresh.install(
+        crate::property_ic::IcHandler::load_resolved(shape(object, &heap), &current)
+            .expect("own handler"),
     );
+    assert_eq!(fresh.probe_load(object, &heap), Some(Value::boolean(false)));
 }

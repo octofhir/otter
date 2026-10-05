@@ -389,8 +389,6 @@ pub(crate) fn compile_optimized(
             osr_pc.into_iter().collect(),
             Box::new([]),
             spliced_functions,
-            emission.load_ic_cells,
-            emission.store_ic_cells,
             plan.register_operands,
             metadata,
         ),

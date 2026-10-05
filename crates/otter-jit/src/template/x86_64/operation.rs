@@ -32,10 +32,7 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) labels: &'c BTreeMap<u32, DynamicLabel>,
     pub(crate) exits: OperationExits,
     pub(crate) frame_kind: abi::NativeFrameKind,
-    pub(crate) load_ic_cells: &'c mut [crate::entry::PropertySourceCell],
-    pub(crate) next_load_ic: &'c mut usize,
-    pub(crate) store_ic_cells: &'c mut [crate::entry::PropertySourceCell],
-    pub(crate) next_store_ic: &'c mut usize,
+    pub(crate) shared_property: &'c mut super::shared_property::SharedPropertyProbes,
     pub(crate) direct_call_events: &'c mut Option<crate::template::DirectCallEvents>,
     pub(crate) code_map: &'c mut Option<CodeMapCapture>,
 }
@@ -56,10 +53,7 @@ pub(crate) fn emit_operation(
         labels,
         exits,
         frame_kind,
-        load_ic_cells,
-        next_load_ic,
-        store_ic_cells,
-        next_store_ic,
+        shared_property,
         direct_call_events,
         code_map,
     } = context;
@@ -789,56 +783,28 @@ pub(crate) fn emit_operation(
             dynasm!(ops ; .arch x64 ; mov rax, [r11]);
             emit_store_reg(ops, 0, dst);
         }
-        TemplateOp::LoadProperty { dst, object, .. } => {
-            let ordinal = u32::try_from(*next_load_ic)
-                .map_err(|_| Unsupported::OperandShape("x86-64 property IC ordinal"))?;
-            let cell = load_ic_cells
-                .get_mut(*next_load_ic)
-                .ok_or(Unsupported::OperandShape("x86-64 property IC inventory"))?;
-            *next_load_ic += 1;
-            cell.set_source(view.code_block.id, instruction.pc);
-            emit_load_property(
-                ops,
-                relocations,
-                transitions,
-                view,
-                instruction.byte_pc,
-                dst,
-                object,
-                cell as *mut crate::entry::PropertySourceCell as u64,
-                ordinal,
-                view.property_programs
-                    .get(&instruction.byte_pc)
-                    .map(Vec::as_slice),
-                committed_throw,
-                fatal,
-            );
-        }
-        TemplateOp::StoreProperty { object, value, .. } => {
-            let ordinal = u32::try_from(*next_store_ic)
-                .map_err(|_| Unsupported::OperandShape("x86-64 property IC ordinal"))?;
-            let cell = store_ic_cells
-                .get_mut(*next_store_ic)
-                .ok_or(Unsupported::OperandShape("x86-64 property IC inventory"))?;
-            *next_store_ic += 1;
-            cell.set_source(view.code_block.id, instruction.pc);
-            emit_store_property(
-                ops,
-                relocations,
-                transitions,
-                view,
-                instruction.byte_pc,
-                object,
-                value,
-                cell as *mut crate::entry::PropertySourceCell as u64,
-                ordinal,
-                view.property_programs
-                    .get(&instruction.byte_pc)
-                    .map(Vec::as_slice),
-                committed_throw,
-                fatal,
-            );
-        }
+        TemplateOp::LoadProperty { dst, object, .. } => emit_load_property(
+            ops,
+            relocations,
+            shared_property,
+            view,
+            instruction.byte_pc,
+            dst,
+            object,
+            committed_throw,
+            fatal,
+        )?,
+        TemplateOp::StoreProperty { object, value, .. } => emit_store_property(
+            ops,
+            relocations,
+            shared_property,
+            view,
+            instruction.byte_pc,
+            object,
+            value,
+            committed_throw,
+            fatal,
+        )?,
         TemplateOp::LoadElement {
             dst,
             receiver,
@@ -1117,6 +1083,7 @@ pub(crate) fn emit_operation(
                 transitions,
                 return_sites,
                 view,
+                shared_property,
                 direct_call_events.as_mut(),
                 code_map.as_mut(),
                 instruction.pc,

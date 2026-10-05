@@ -40,7 +40,6 @@ use super::{
 };
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
-use otter_gc::raw::{RawGc, SlotVisitor};
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -59,15 +58,6 @@ pub(crate) struct StorePropertyTransition {
     pub(crate) kind: StorePropertyTransitionKind,
     /// Slot offset added by this transition.
     pub(crate) slot: u16,
-}
-
-impl StorePropertyTransition {
-    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        if !self.to_shape.get().is_null() {
-            let p = self.to_shape.as_ptr() as *mut RawGc;
-            visitor(p);
-        }
-    }
 }
 
 /// Explicit StoreProperty transition categories.
@@ -495,10 +485,16 @@ mod tests {
             interp.gc_heap().tracked_bytes(),
             interp.gc_heap().gc_cycle_counts(),
         );
-        let result = crate::cache_ir::CacheStub::store_transition(transition).run_store(
+        let result = replay_store_property_transition(
             second,
             interp.gc_heap_mut(),
             key,
+            transition.from_shape_id,
+            transition.atom_id,
+            transition.to_shape_id,
+            || transition.to_shape.get(),
+            &transition.kind,
+            transition.slot,
             &Value::null(),
         );
         assert!(

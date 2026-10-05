@@ -777,7 +777,8 @@ impl CodeSpace {
         }
     }
 
-    pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    /// Full-collector weak pass: property ICs forget unmarked shapes.
+    pub(crate) fn sweep_property_ics(&self, heap: &otter_gc::GcHeap) {
         for current in self.chunks().iter() {
             if let Some(payload) = current
                 .payload
@@ -785,7 +786,7 @@ impl CodeSpace {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
             {
-                payload.executable.trace_property_ic_roots(visitor);
+                payload.executable.sweep_property_ics(heap);
             }
         }
     }
@@ -800,15 +801,7 @@ impl CodeSpace {
             let Some(payload) = payload.as_ref() else {
                 continue;
             };
-            let stats = payload.executable.property_ic_stats();
-            total.load_hits = total.load_hits.saturating_add(stats.load_hits);
-            total.load_misses = total.load_misses.saturating_add(stats.load_misses);
-            total.load_installs = total.load_installs.saturating_add(stats.load_installs);
-            total.load_disables = total.load_disables.saturating_add(stats.load_disables);
-            total.store_hits = total.store_hits.saturating_add(stats.store_hits);
-            total.store_misses = total.store_misses.saturating_add(stats.store_misses);
-            total.store_installs = total.store_installs.saturating_add(stats.store_installs);
-            total.store_disables = total.store_disables.saturating_add(stats.store_disables);
+            total.add(payload.executable.property_ic_stats());
         }
         total
     }
@@ -1230,8 +1223,8 @@ mod tests {
         context
             .property_feedback_slot(0, 0, crate::property_ic::PropertyIcKind::Load)
             .expect("CodeBlock property slot")
-            .install(crate::cache_ir::CacheStub::default());
-        assert_eq!(space.property_ic_snapshots().len(), 1);
+            .install(crate::property_ic::IcHandler::fixture_load(8));
+        assert_eq!(space.property_ic_stats().load_installs, 1);
         drop(context);
 
         let candidate = space
@@ -1243,6 +1236,7 @@ mod tests {
             space.evict_candidate(candidate),
             super::ChunkEvictionResult::Evicted { .. }
         ));
+        assert_eq!(space.property_ic_stats().load_installs, 0);
         assert!(space.property_ic_snapshots().is_empty());
     }
 

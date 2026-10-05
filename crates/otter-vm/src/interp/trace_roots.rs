@@ -310,10 +310,10 @@ impl Interpreter {
         }
     }
 
-    /// Trace cached transition shapes through live CodeBlock-owned IC slots
-    /// and the shared key/action table's actual child words.
+    /// Trace the shared key/action table's cached transition targets.
+    /// CodeBlock property ICs hold shapes weakly and are pruned in
+    /// [`otter_gc::ExtraRootSource::sweep_weak`] instead.
     pub(crate) fn trace_property_ic_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        self.code_space.trace_property_ic_roots(visitor);
         self.property_cache.trace_roots(visitor);
     }
 }

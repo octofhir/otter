@@ -272,7 +272,7 @@ impl Interpreter {
             && let Some(resolved) = self.resolve_method_ic(obj, atomized_key, slot)
             && self.is_callable_runtime(&resolved)
         {
-            if let Some(hit) = slot.mono_load_own_data_hit() {
+            if let Some(hit) = slot.mono_own_hit(atomized_key.atom().id()) {
                 self.method_feedback
                     .install_method_ic(site, crate::method_ops::MethodCallIc::Ordinary(hit));
             }

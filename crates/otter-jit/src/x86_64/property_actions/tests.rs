@@ -303,7 +303,7 @@ impl Fixture {
             &mut RelocationCapture::new(false),
             &self.view,
             Some(self.cache),
-            Some(atom),
+            Some(super::AtomOperand::Immediate(atom)),
             access,
             7,
             (!load).then_some(6),

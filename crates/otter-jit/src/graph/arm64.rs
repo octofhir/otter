@@ -113,12 +113,8 @@ struct Codegen<'a> {
     /// The baseline operations generic nodes run, one sequence per PC.
     plan: &'a crate::template::TemplatePlan,
     plan_index: FxHashMap<u32, Vec<usize>>,
-    load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Shared property subroutines requested by Generic sites.
     shared_property: crate::template::arm64::shared_property::SharedPropertyProbes,
-    next_load_ic: usize,
-    store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-    next_store_ic: usize,
     no_direct_call_events: Option<crate::template::DirectCallEvents>,
     no_code_map: Option<crate::artifact::CodeMapCapture>,
     spliced_functions: std::collections::BTreeSet<u32>,
@@ -214,7 +210,6 @@ pub(crate) fn emit(
     slots.validate(view.code_block.register_count)?;
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let (load_cells, store_cells) = metadata::property_cell_counts(built, plan);
     let labels = built
         .layout
         .iter()
@@ -276,12 +271,6 @@ pub(crate) fn emit(
         plan,
         plan_index: metadata::operation_index(plan),
         shared_property: Default::default(),
-        load_ic_cells: vec![crate::entry::PropertySourceCell::default(); load_cells]
-            .into_boxed_slice(),
-        next_load_ic: 0,
-        store_ic_cells: vec![crate::entry::PropertySourceCell::default(); store_cells]
-            .into_boxed_slice(),
-        next_store_ic: 0,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),
@@ -372,8 +361,6 @@ pub(crate) fn emit(
         &mut codegen.relocations,
         transitions,
         view,
-        codegen.load_ic_cells.as_ptr() as usize,
-        codegen.store_ic_cells.as_ptr() as usize,
     );
     codegen
         .return_sites
@@ -382,8 +369,6 @@ pub(crate) fn emit(
         ops,
         relocations,
         exits,
-        load_ic_cells,
-        store_ic_cells,
         node_offsets,
         sites,
         return_sites,
@@ -397,8 +382,6 @@ pub(crate) fn emit(
         call_entry,
         exits,
         relocations,
-        load_ic_cells,
-        store_ic_cells,
         node_offsets,
         body_end,
         osr_dispatch_end,
@@ -2475,36 +2458,24 @@ impl<'a> Codegen<'a> {
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
         use crate::artifact::relocation::PropertySourceAccess;
-        let function_id = self.view_of(node).code_block.id;
-        let (cell_address, ordinal, stub) = match access {
-            PropertySourceAccess::Load => {
-                let ordinal = self.next_load_ic;
-                let cell = self
-                    .load_ic_cells
-                    .get_mut(ordinal)
-                    .ok_or(Unsupported::OperandShape("graph load property cell"))?;
-                cell.set_source(function_id, pc);
-                self.next_load_ic += 1;
-                (
-                    cell as *mut crate::entry::PropertySourceCell as u64,
-                    ordinal,
-                    abi::STUB_JIT_LOAD_PROPERTY,
-                )
-            }
-            PropertySourceAccess::Store => {
-                let ordinal = self.next_store_ic;
-                let cell = self
-                    .store_ic_cells
-                    .get_mut(ordinal)
-                    .ok_or(Unsupported::OperandShape("graph store property cell"))?;
-                cell.set_source(function_id, pc);
-                self.next_store_ic += 1;
-                (
-                    cell as *mut crate::entry::PropertySourceCell as u64,
-                    ordinal,
-                    abi::STUB_JIT_STORE_PROPERTY,
-                )
-            }
+        let view = self.view_of(node);
+        let function_id = view.code_block.id;
+        let byte_pc = view
+            .instructions
+            .get(pc as usize)
+            .map(|instruction| instruction.byte_pc)
+            .ok_or(Unsupported::OperandShape("graph property site pc"))?;
+        let slot = view
+            .property_accesses
+            .get(&byte_pc)
+            .map(|access| access.ic_slot)
+            .filter(|&slot| slot != 0)
+            .ok_or(Unsupported::OperandShape(
+                "graph property site without an IC slot",
+            ))?;
+        let stub = match access {
+            PropertySourceAccess::Load => abi::STUB_JIT_LOAD_PROPERTY,
+            PropertySourceAccess::Store => abi::STUB_JIT_STORE_PROPERTY,
         };
         let values: &[u8] = match access {
             PropertySourceAccess::Load => &[receiver],
@@ -2516,10 +2487,10 @@ impl<'a> Codegen<'a> {
             .map(CommittedArgument::Value)
             .collect();
         arguments.push(CommittedArgument::Address(
-            cell_address,
-            RelocationTarget::PropertySourceCell {
-                access,
-                ordinal: ordinal as u32,
+            slot,
+            RelocationTarget::PropertyIcSlot {
+                function_id,
+                byte_pc,
             },
         ));
         self.emit_committed_call(node, stub, &arguments, destination)
@@ -3812,10 +3783,6 @@ impl<'a> Codegen<'a> {
                     poll_entry: self.transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
                     far_branches: true,
                     shared_property: &mut self.shared_property,
-                    load_ic_cells: &mut self.load_ic_cells,
-                    next_load_ic: &mut self.next_load_ic,
-                    store_ic_cells: &mut self.store_ic_cells,
-                    next_store_ic: &mut self.next_store_ic,
                     numeric_slow_paths: &mut numeric_slow_paths,
                     coercion_slow_paths: &mut coercion_slow_paths,
                     direct_call_events: &mut self.no_direct_call_events,

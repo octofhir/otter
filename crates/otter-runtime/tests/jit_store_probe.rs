@@ -78,7 +78,7 @@ fn store_diagnostics_count_paths_without_replaying_effects() {
     assert_eq!(result.completion_string(), "[16,12,7,66]");
     let report = result.jit_debug_report().expect("captured report");
     assert!(!report.truncated());
-    // Hot `x` stores complete through their CacheIR programs; only the
+    // Hot `x` stores complete through the site's IC handlers; only the
     // throwing setters and the cold installs reach the runtime store, whose
     // counters aggregate per site instead of emitting one event per store.
     let mut failed = 0;
@@ -106,7 +106,8 @@ fn store_diagnostics_count_paths_without_replaying_effects() {
     let result = runtime
         .run_script(
             SourceInput::from_javascript(
-                "copyProperty({x: {marker: 7}}, Object.create(prototype)).marker",
+                // A receiver shape the site never saw misses its handlers once.
+                "copyProperty({x: {marker: 7}}, {y: 1}).marker",
             ),
             "property-counts-next.js",
         )

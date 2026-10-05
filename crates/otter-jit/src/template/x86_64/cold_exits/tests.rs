@@ -92,10 +92,7 @@ fn narrowed_operations_emit_no_reference_to_an_omitted_cold_exit() {
         let labels = BTreeMap::from([(0, destination)]);
         let mut relocations = crate::artifact::relocation::RelocationCapture::default();
         let mut return_sites = Vec::new();
-        let mut load_cells = [];
-        let mut store_cells = [];
-        let mut next_load = 0;
-        let mut next_store = 0;
+        let mut shared_property = super::super::shared_property::SharedPropertyProbes::default();
         let mut events = None;
         let mut code_map = None;
         super::super::operation::emit_operation(
@@ -120,10 +117,7 @@ fn narrowed_operations_emit_no_reference_to_an_omitted_cold_exit() {
                     fatal: exits[8],
                 },
                 frame_kind: abi::NativeFrameKind::Baseline,
-                load_ic_cells: &mut load_cells,
-                next_load_ic: &mut next_load,
-                store_ic_cells: &mut store_cells,
-                next_store_ic: &mut next_store,
+                shared_property: &mut shared_property,
                 direct_call_events: &mut events,
                 code_map: &mut code_map,
             },

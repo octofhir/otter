@@ -43,13 +43,6 @@ pub struct TemplateCode {
     /// transitions, so the allocation must live exactly as long as the code.
     #[allow(dead_code)]
     register_operands: Box<[u16]>,
-    /// Stable backing store for the self-patching `LoadProperty` IC cells;
-    /// emitted code holds raw addresses into this slice.
-    #[allow(dead_code)]
-    load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-    /// Stable backing store for the self-patching `StoreProperty` IC cells.
-    #[allow(dead_code)]
-    store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     /// Code-object-owned allocating safepoints, sorted by id.
     safepoint_records: Box<[SafepointRecord]>,
     /// Exact CALL/BLR return offsets, sorted and retained with their generation.
@@ -74,8 +67,6 @@ impl TemplateCode {
         spliced_functions: Box<[u32]>,
         source_work: Box<[std::sync::Arc<otter_vm::native_abi::SourceWork>]>,
         register_operands: Box<[u16]>,
-        load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-        store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
         safepoint_records: Box<[SafepointRecord]>,
         return_sites: Box<[SafepointEntry]>,
         osr_entries: std::collections::BTreeMap<u32, usize>,
@@ -99,8 +90,6 @@ impl TemplateCode {
             spliced_functions,
             source_work,
             register_operands,
-            load_ic_cells,
-            store_ic_cells,
             safepoint_records,
             return_sites,
             osr_entries: osr_entries
@@ -189,8 +178,6 @@ impl JitFunctionCode for TemplateCode {
             &[
                 std::mem::size_of::<Self>(),
                 std::mem::size_of_val::<[u16]>(&self.register_operands),
-                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self.load_ic_cells),
-                std::mem::size_of_val::<[crate::entry::PropertySourceCell]>(&self.store_ic_cells),
                 std::mem::size_of_val::<[SafepointRecord]>(&self.safepoint_records),
                 std::mem::size_of_val::<[SafepointEntry]>(&self.return_sites),
                 std::mem::size_of_val::<[CodeDependency]>(&self.dependencies),
@@ -291,8 +278,6 @@ mod tests {
             Box::new([]),
             Box::new([]),
             Box::new([1, 2]),
-            Box::new([]),
-            Box::new([]),
             Box::new([SafepointRecord::window(1, NO_FRAME_STATE)]),
             Box::new([]),
             [(2, 0), (7, 0)].into_iter().collect(),

@@ -346,7 +346,7 @@ impl Codegen<'_> {
             &mut self.relocations,
             self.view,
             cache,
-            atom,
+            atom.map(crate::x86_64::property_actions::AtomOperand::Immediate),
             PropertySourceAccess::Load,
             receiver,
             None,
@@ -385,7 +385,7 @@ impl Codegen<'_> {
             &mut self.relocations,
             self.view,
             cache,
-            atom,
+            atom.map(crate::x86_64::property_actions::AtomOperand::Immediate),
             PropertySourceAccess::Store,
             receiver,
             Some(value),
@@ -419,36 +419,24 @@ impl Codegen<'_> {
         [receiver, value]: [u8; 2],
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
-        let function = self.view_of(node).code_block.id;
-        let (address, ordinal, stub) = match access {
-            PropertySourceAccess::Load => {
-                let ordinal = self.next_load_ic;
-                let cell = self
-                    .load_ic_cells
-                    .get_mut(ordinal)
-                    .ok_or(Unsupported::OperandShape("x86 graph load source cell"))?;
-                cell.set_source(function, pc);
-                self.next_load_ic += 1;
-                (
-                    cell as *mut crate::entry::PropertySourceCell as u64,
-                    ordinal,
-                    abi::STUB_JIT_LOAD_PROPERTY,
-                )
-            }
-            PropertySourceAccess::Store => {
-                let ordinal = self.next_store_ic;
-                let cell = self
-                    .store_ic_cells
-                    .get_mut(ordinal)
-                    .ok_or(Unsupported::OperandShape("x86 graph store source cell"))?;
-                cell.set_source(function, pc);
-                self.next_store_ic += 1;
-                (
-                    cell as *mut crate::entry::PropertySourceCell as u64,
-                    ordinal,
-                    abi::STUB_JIT_STORE_PROPERTY,
-                )
-            }
+        let view = self.view_of(node);
+        let function_id = view.code_block.id;
+        let byte_pc = view
+            .instructions
+            .get(pc as usize)
+            .map(|instruction| instruction.byte_pc)
+            .ok_or(Unsupported::OperandShape("x86 graph property site pc"))?;
+        let slot = view
+            .property_accesses
+            .get(&byte_pc)
+            .map(|access| access.ic_slot)
+            .filter(|&slot| slot != 0)
+            .ok_or(Unsupported::OperandShape(
+                "x86 graph property site without an IC slot",
+            ))?;
+        let stub = match access {
+            PropertySourceAccess::Load => abi::STUB_JIT_LOAD_PROPERTY,
+            PropertySourceAccess::Store => abi::STUB_JIT_STORE_PROPERTY,
         };
         let mut arguments: smallvec::SmallVec<[CommittedArgument; 3]> =
             smallvec::smallvec![CommittedArgument::Value(receiver)];
@@ -456,10 +444,10 @@ impl Codegen<'_> {
             arguments.push(CommittedArgument::Value(value));
         }
         arguments.push(CommittedArgument::Address(
-            address,
-            RelocationTarget::PropertySourceCell {
-                access,
-                ordinal: ordinal as u32,
+            slot,
+            RelocationTarget::PropertyIcSlot {
+                function_id,
+                byte_pc,
             },
         ));
         self.emit_committed_call(node, stub, &arguments, destination)

@@ -698,8 +698,6 @@ impl LoweredInstr {
 pub(crate) struct BaselinePlan {
     pub(crate) instructions: Vec<LoweredInstr>,
     register_operands: Box<[u16]>,
-    pub(crate) load_property_count: usize,
-    pub(crate) store_property_count: usize,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
     /// Allocating safepoints owned by the typed zero/one-argument
@@ -716,20 +714,12 @@ impl BaselinePlan {
         let code_block = view.code_block.as_ref();
         let mut instructions = Vec::with_capacity(view.instructions.len());
         let mut boundaries = BTreeSet::new();
-        let mut load_property_count = 0;
-        let mut store_property_count = 0;
         let mut register_operands = Vec::new();
         for instr in &view.instructions {
             let op = instr.op(code_block);
             let pc = instr.instruction_pc(code_block);
             if !boundaries.insert(pc) {
                 return Err(Unsupported::OperandShape("duplicate instruction pc"));
-            }
-
-            match op {
-                Op::LoadProperty => load_property_count += 1,
-                Op::StoreProperty => store_property_count += 1,
-                _ => {}
             }
 
             let operands = instr.operand_view(code_block);
@@ -1252,8 +1242,6 @@ impl BaselinePlan {
         Ok(Self {
             instructions,
             register_operands: register_operands.into_boxed_slice(),
-            load_property_count,
-            store_property_count,
             safepoint_records,
             add_alloc_safepoints,
             array_construct_alloc_safepoints,

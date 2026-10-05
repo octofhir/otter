@@ -488,6 +488,31 @@ impl crate::Interpreter {
             .record_load(obj, &self.gc_heap, key, resolved.as_ref());
         resolved
     }
+
+    /// V8 `LoadIC::UpdateCaches` for an ordinary receiver that missed its
+    /// site: install the handler of the resolved data slot, or of a key the
+    /// receiver and its whole chain lack. Neither allocates nor runs code.
+    pub(crate) fn update_load_ic(
+        &self,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
+        obj: JsObject,
+        key: AtomizedPropertyKey<'_>,
+        resolved: Option<&cache_ir::ResolvedDataSlot>,
+    ) {
+        if slot.is_megamorphic() {
+            return;
+        }
+        let shape = object::keyed_shape(obj, &self.gc_heap);
+        let handler = match resolved {
+            Some(resolved) => crate::property_ic::IcHandler::load_resolved(shape, resolved),
+            None => cache_ir::resolve_absent_atom(obj, &self.gc_heap, key).and_then(|validity| {
+                crate::property_ic::IcHandler::load_nonexistent(shape, validity)
+            }),
+        };
+        if let Some(handler) = handler {
+            slot.install(handler);
+        }
+    }
 }
 
 #[cfg(test)]

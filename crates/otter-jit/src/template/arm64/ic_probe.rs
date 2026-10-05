@@ -1,15 +1,14 @@
-//! AArch64 lowering of one cache program, shared by every tier that probes a
-//! property site.
+//! AArch64 guard, field and call primitives shared by the property, element
+//! and method sites of every tier.
 //!
 //! # Contents
-//! - [`emit_load_header`] / [`emit_check_shape`] / [`emit_load_field`] — the
-//!   shared object, shape, and field primitives.
-//! - [`emit_property_ic_load`] / [`emit_property_ic_store_guard`] execute an
-//!   immutable CacheIR snapshot; a pre-effect miss can probe the shared table.
-//! - Add-property programs — guard the complete no-allocation append contract
-//!   and publish its child shape before the caller commits barriers.
-//! - [`emit_exotic_length_fast`] — the `.length` reads no cache program can
-//!   describe.
+//! - [`emit_check_shape_identity`] / [`emit_load_field`] /
+//!   [`emit_intrinsic_prototype_header`] — the shape, field and pinned
+//!   intrinsic-prototype primitives of static intrinsic-prototype reads.
+//! - [`emit_property_transition_shape_barrier`] — the child-shape edge barrier
+//!   after an add-transition commit.
+//! - [`emit_exotic_length_fast`] — the `.length` reads no IC handler
+//!   describes.
 //! - [`emit_element_address`] / [`emit_element_read`] / [`emit_element_write`]
 //!   — the indexed element access program.
 //! - [`emit_native_leaf_guard`] / [`emit_native_leaf_call`] — prove a static
@@ -24,12 +23,11 @@
 //!   key/slot layout by its structural id, for every tier alike.
 //!
 //! # Invariants
-//! - Every immutable CacheIR program has one machine lowering. Dynamic
-//!   property actions have their separate shared machine owner in
+//! - Named-property feedback is read at run time from the site's IC slot
+//!   (`super::shared_property`); the static intrinsic-prototype programs
+//!   here describe realm intrinsics and branch to the site's IC on a miss.
+//!   Dynamic property actions have their shared machine owner in
 //!   `crate::arm64::property_actions`, consumed by both tiers.
-//! - A CacheIR snapshot is self-contained compile metadata. Every receiver
-//!   shape, atom slot, prototype link, and publication effect is explicit; an
-//!   unsupported program branches to the caller's pre-effect miss as a whole.
 //! - The call protocol is chosen by the family the entry id resolves in, never
 //!   by which builtin a site named. A read, an in-place mutation and an
 //!   allocating write reach the same sequence from one description.
@@ -46,7 +44,7 @@
 //!   it names exactly one entry, and so its kind.
 //!
 //! # See also
-//! - `otter_vm::cache_ir` owns the runtime proof and immutable snapshot.
+//! - `otter_vm::property_ic` owns the per-site slots and handlers.
 //! - `otter_vm::object::prototype_validity` owns proof invalidation.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -73,92 +71,6 @@ use crate::entry::{
     VM_THREAD_ACTIVE_REALM_CELL_OFFSET, VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET,
     VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
 };
-
-/// Branch before effects when any prohibited shape-state bit is set.
-/// The byte has one owner: the current immutable shape. No GC-header metadata
-/// or sidecar-presence predicate can stand in for that semantic state.
-fn emit_shape_state_mask_guard(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    header: u8,
-    mask: u8,
-    miss: DynamicLabel,
-) {
-    let state = if header == 14 { 12 } else { 14 };
-    let cage = if header == 11 { 12 } else { 11 };
-    super::values::emit_load_shape_state(ops, relocations, view, header, state, cage);
-    // Composite masks need not be AArch64 logical immediates. The address
-    // scratch is dead after the state load, so it also materializes the mask.
-    emit_load_u64(ops, cage, u64::from(mask));
-    dynasm!(ops ; .arch aarch64
-        ; tst W(state), W(cage)
-        ; b.ne =>miss
-    );
-}
-
-/// Decode an ordinary object cell, retaining its header until a safepoint.
-///
-/// Every successful static program below proves an eligible immutable receiver
-/// shape before accessing a field. An inherited program additionally owns the
-/// complete prototype validity word and rooted holder link; its finalized
-/// holder layout is validated before snapshot publication. Lookup state is
-/// therefore proved by those identities, not sidecar absence or GC metadata.
-/// Dynamic runtime CacheIR guards retain their independent semantic checks.
-pub(crate) fn emit_load_header<R>(
-    ops: &mut Assembler,
-    _view: &JitCompileSnapshot,
-    load_receiver: R,
-    header: u8,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported>
-where
-    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
-{
-    emit_load_object_header(ops, load_receiver, header, miss)
-}
-
-/// Prove only that a tagged value is an ordinary object and decompress its
-/// header. Optimizing CacheIR nodes use this after an explicit metadata proof
-/// so each node reads only its declared alias class.
-pub(crate) fn emit_load_object_header<R>(
-    ops: &mut Assembler,
-    load_receiver: R,
-    header: u8,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported>
-where
-    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
-{
-    load_receiver(ops, 9)?;
-    super::values::emit_cell_test(ops, 9, 11, super::values::CellTest::IsNotCell, miss);
-    // A cell value is its header's full address.
-    dynasm!(ops
-        ; .arch aarch64
-        ; mov X(header), x9
-        ; ldrb w14, [X(header)]    // header type tag
-        ; cmp w14, OBJECT_BODY_TYPE_TAG
-        ; b.ne =>miss
-    );
-    Ok(())
-}
-
-/// Prove the holder `header` names still carries the compile-time hidden class
-/// `shape`.
-///
-/// A snapshot shape is an immediate, so the guard needs no mutable cell lookup.
-/// Clobbers `w12` and `w14`.
-pub(crate) fn emit_check_shape(
-    ops: &mut Assembler,
-    view: &JitCompileSnapshot,
-    header: u8,
-    shape: u32,
-    miss: DynamicLabel,
-) {
-    // Compile-boundary resolution admits only eligible immutable shapes.
-    // Exact identity therefore proves their state and descriptor attributes.
-    emit_check_shape_identity(ops, view, header, shape, miss);
-}
 
 /// Compare the immutable hidden-class token. It fixes descriptor attributes,
 /// lookup state, prototype role and bank geometry together.
@@ -261,352 +173,6 @@ pub(crate) fn emit_intrinsic_prototype_header(
         },
     );
     dynasm!(ops ; .arch aarch64 ; add x15, x15, x12);
-}
-
-/// Probe a named-property load site and leave the loaded `Value` in `x9`.
-///
-/// The Template tier consumes the same immutable CacheIR DTO that the
-/// optimizing tier builds into its graph. Every failed guard branches to `miss`, where the fixed
-/// committed boundary owns full `[[Get]]` semantics exactly once.
-///
-/// `load_receiver` materializes the receiver `Value` into the register it is
-/// handed and is the only thing a tier supplies. On return the complete value
-/// is in `x9`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_property_ic_load<R>(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    programs: Option<&[otter_vm::JitCacheIrProgram]>,
-    byte_pc: u32,
-    mut load_receiver: R,
-    _cell_addr: usize,
-    _cell_ordinal: u32,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported>
-where
-    R: FnMut(&mut Assembler, u8) -> Result<(), Unsupported>,
-{
-    let Some(programs) = programs.filter(|programs| !programs.is_empty()) else {
-        dynasm!(ops ; .arch aarch64 ; b =>miss);
-        return Ok(());
-    };
-    let intrinsic = programs.iter().any(|program| {
-        matches!(
-            program.ops.first(),
-            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
-        )
-    });
-    if !intrinsic {
-        emit_load_header(ops, view, &mut load_receiver, 13, miss)?;
-    }
-    let done = ops.new_dynamic_label();
-    for program in programs {
-        let next = ops.new_dynamic_label();
-        if matches!(
-            program.ops.first(),
-            Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. })
-        ) {
-            load_receiver(ops, 9)?;
-        } else if intrinsic {
-            emit_load_header(ops, view, &mut load_receiver, 13, next)?;
-        }
-        let mut terminal = false;
-        for op in program.ops.iter() {
-            match *op {
-                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype {
-                    object: 0,
-                    result: 1,
-                    target,
-                } => {
-                    emit_intrinsic_prototype_header(
-                        ops,
-                        relocations,
-                        view,
-                        target,
-                        byte_pc,
-                        20,
-                        next,
-                    );
-                }
-                otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. } => {
-                    return Err(Unsupported::OperandShape(
-                        "CacheIR intrinsic prototype operands",
-                    ));
-                }
-                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        14,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    emit_load_u64(ops, 15, u64::from(root));
-                    dynasm!(ops ; .arch aarch64 ; add x15, x14, x15
-                        ; ldr w15, [x15, view.shape_prototype_byte] ; add x15, x14, x15);
-                }
-                otter_vm::JitCacheIrOp::LoadPrototypeHolder { .. } => {
-                    return Err(Unsupported::OperandShape("CacheIR holder operand"));
-                }
-                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
-                    super::values::emit_prototype_validity_guard(
-                        ops,
-                        relocations,
-                        validity,
-                        14,
-                        next,
-                    );
-                }
-                otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
-                    let header = match object {
-                        0 => 13,
-                        1 => 15,
-                        _ => return Err(Unsupported::OperandShape("CacheIR object operand")),
-                    };
-                    emit_check_shape(ops, view, header, shape, next);
-                }
-                otter_vm::JitCacheIrOp::GuardDictionaryLayout { object: 1, layout } => {
-                    emit_dictionary_layout_guard(ops, relocations, view, 15, layout, next);
-                }
-                otter_vm::JitCacheIrOp::GuardDictionaryLayout { .. } => {
-                    return Err(Unsupported::OperandShape(
-                        "CacheIR dictionary layout object",
-                    ));
-                }
-                otter_vm::JitCacheIrOp::GuardAtomSlot {
-                    object,
-                    writable: false,
-                    ..
-                } => {
-                    // Eligible immutable identity fixes descriptor attributes,
-                    // lookup state and the atom-to-field mapping together.
-                    let _ = match object {
-                        0 => 13,
-                        1 => 15,
-                        _ => return Err(Unsupported::OperandShape("CacheIR atom-slot object")),
-                    };
-                }
-                otter_vm::JitCacheIrOp::GuardAtomSlot { .. } => {
-                    return Err(Unsupported::OperandShape(
-                        "writable atom-slot guard in load CacheIR",
-                    ));
-                }
-                otter_vm::JitCacheIrOp::LoadField { object, field } => {
-                    let header = match object {
-                        0 => 13,
-                        1 => 15,
-                        _ => return Err(Unsupported::OperandShape("CacheIR field object")),
-                    };
-                    emit_load_field(ops, relocations, view, header, field, next);
-                    dynasm!(ops ; .arch aarch64 ; b =>done);
-                    terminal = true;
-                }
-                otter_vm::JitCacheIrOp::StoreField { .. } => {
-                    return Err(Unsupported::OperandShape("store op in load CacheIR"));
-                }
-                otter_vm::JitCacheIrOp::GuardPrototypeNull { .. }
-                | otter_vm::JitCacheIrOp::GuardExtensible { .. }
-                | otter_vm::JitCacheIrOp::PublishShape { .. } => {
-                    return Err(Unsupported::OperandShape("store-only op in load CacheIR"));
-                }
-            }
-        }
-        if !terminal {
-            return Err(Unsupported::OperandShape("unterminated load CacheIR"));
-        }
-        dynasm!(ops ; .arch aarch64 ; =>next);
-    }
-    dynasm!(ops ; .arch aarch64 ; b =>miss ; =>done);
-    Ok(())
-}
-
-/// Prove a named-property store site's receiver and resolve its slot, leaving
-/// the receiver in `x12`, its field bank in `x13`, the bank-relative slot byte
-/// in `x17`, and the transition child shape in non-allocatable `w16` (`0` for
-/// an existing-slot program).
-///
-/// Existing-slot programs name one guarded own field. Add-transition programs
-/// additionally prove their complete prototype contract, extensibility, exact
-/// append index, and existing storage capacity before publishing the child
-/// shape. The matched program selects its immutable field bank before any
-/// publication.
-///
-/// The caller owns everything after the slot is resolved: loading and storing
-/// the complete value word, then running the child-shape barrier when `w16` is
-/// nonzero and the value barrier when needed. No branch to `miss` is legal
-/// after the helper publishes a transition.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_property_ic_store_guard<R>(
-    ops: &mut Assembler,
-    relocations: &mut RelocationCapture,
-    view: &JitCompileSnapshot,
-    programs: Option<&[otter_vm::JitCacheIrProgram]>,
-    load_receiver: R,
-    _cell_addr: usize,
-    _cell_ordinal: u32,
-    miss: DynamicLabel,
-) -> Result<(), Unsupported>
-where
-    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
-{
-    let Some(programs) = programs.filter(|programs| !programs.is_empty()) else {
-        dynasm!(ops ; .arch aarch64 ; b =>miss);
-        return Ok(());
-    };
-    emit_load_header(ops, view, load_receiver, 13, miss)?;
-    emit_shape_state_mask_guard(
-        ops,
-        relocations,
-        view,
-        13,
-        otter_vm::object::ShapeState::PROTOTYPE_MASK,
-        miss,
-    );
-    let matched = ops.new_dynamic_label();
-    let existing = ops.new_dynamic_label();
-    for program in programs {
-        let next = ops.new_dynamic_label();
-        let mut terminal = false;
-        for (index, op) in program.ops.iter().enumerate() {
-            match *op {
-                otter_vm::JitCacheIrOp::LoadPrototypeHolder { root, result: 1 } => {
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        14,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    emit_load_u64(ops, 15, u64::from(root));
-                    dynasm!(ops ; .arch aarch64 ; add x15, x14, x15
-                        ; ldr w15, [x15, view.shape_prototype_byte] ; add x15, x14, x15);
-                }
-                otter_vm::JitCacheIrOp::LoadPrototypeHolder { .. } => {
-                    return Err(Unsupported::OperandShape("CacheIR holder operand"));
-                }
-                otter_vm::JitCacheIrOp::GuardPrototypeValidity { validity } => {
-                    super::values::emit_prototype_validity_guard(
-                        ops,
-                        relocations,
-                        validity,
-                        14,
-                        next,
-                    );
-                }
-                otter_vm::JitCacheIrOp::GuardShape { object, shape } => {
-                    let header = match object {
-                        0 => 13,
-                        1 => 15,
-                        _ => return Err(Unsupported::OperandShape("store CacheIR shape object")),
-                    };
-                    emit_check_shape(ops, view, header, shape, next);
-                }
-                otter_vm::JitCacheIrOp::GuardDictionaryLayout { .. } => {
-                    return Err(Unsupported::OperandShape(
-                        "dictionary layout guard in store CacheIR",
-                    ));
-                }
-                otter_vm::JitCacheIrOp::GuardAtomSlot {
-                    object,
-                    writable: true,
-                    ..
-                } => {
-                    // GuardShape proves the immutable atom/slot mapping,
-                    // descriptor attributes and lookup state together.
-                    if object > 1 {
-                        return Err(Unsupported::OperandShape("store CacheIR atom-slot object"));
-                    }
-                }
-                otter_vm::JitCacheIrOp::GuardPrototypeNull { object } => {
-                    let header = match object {
-                        0 => 13,
-                        1 => 15,
-                        _ => {
-                            return Err(Unsupported::OperandShape(
-                                "store CacheIR null-prototype object",
-                            ));
-                        }
-                    };
-                    emit_load_symbol_u64(
-                        ops,
-                        relocations,
-                        14,
-                        view.cage_base as u64,
-                        RelocationTarget::GcCageBase,
-                    );
-                    super::values::emit_load_prototype(ops, view, 12, header, 14);
-                    dynasm!(ops ; .arch aarch64 ; cbnz w12, =>next);
-                }
-                otter_vm::JitCacheIrOp::GuardExtensible { object: 0, field } => {
-                    if !field.is_inline() {
-                        emit_load_u64(ops, 17, u64::from(field.index()));
-                        dynasm!(ops ; .arch aarch64
-                            ; ldr w16, [x13, view.field_layout.slab_handle_byte]
-                            ; cbz w16, =>next);
-                        emit_load_symbol_u64(
-                            ops,
-                            relocations,
-                            15,
-                            view.cage_base as u64,
-                            RelocationTarget::GcCageBase,
-                        );
-                        dynasm!(ops ; .arch aarch64
-                            ; add x15, x15, x16
-                            ; ldr w14, [x15, view.field_layout.slab_capacity_byte]
-                            ; cmp w17, w14 ; b.hs =>next);
-                    }
-                    super::values::emit_load_shape_state(ops, relocations, view, 13, 16, 14);
-                    dynasm!(ops ; .arch aarch64
-                        ; tbz w16, otter_vm::object::ShapeState::EXTENSIBLE_MASK.trailing_zeros(), =>next);
-                    // The program's receiver shape guard fixes the slot
-                    // count at the appended index: the store is the exact
-                    // append.
-                }
-                otter_vm::JitCacheIrOp::GuardAtomSlot { .. }
-                | otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { .. }
-                | otter_vm::JitCacheIrOp::GuardExtensible { .. } => {
-                    return Err(Unsupported::OperandShape("store CacheIR guard operands"));
-                }
-                otter_vm::JitCacheIrOp::StoreField { object: 0, field } => {
-                    if !field.is_inline() {
-                        dynasm!(ops ; .arch aarch64
-                            ; ldr w14, [x13, view.field_layout.slab_handle_byte]
-                            ; cbz w14, =>next);
-                    }
-                    dynasm!(ops ; .arch aarch64 ; mov x12, x13);
-                    super::values::emit_field_base(ops, relocations, view, 13, 14, field);
-                    emit_load_u64(ops, 17, u64::from(field.byte_offset()));
-                    terminal = true;
-                    if !matches!(
-                        program.ops.get(index + 1),
-                        Some(otter_vm::JitCacheIrOp::PublishShape { .. })
-                    ) {
-                        dynasm!(ops ; .arch aarch64 ; b =>existing);
-                    }
-                }
-                otter_vm::JitCacheIrOp::PublishShape { object: 0, shape } if terminal => {
-                    emit_load_u64(ops, 16, u64::from(shape));
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; str w16, [x12, view.object_shape_byte]
-                        ; b =>matched
-                    );
-                }
-                otter_vm::JitCacheIrOp::StoreField { .. }
-                | otter_vm::JitCacheIrOp::LoadField { .. }
-                | otter_vm::JitCacheIrOp::PublishShape { .. } => {
-                    return Err(Unsupported::OperandShape("store CacheIR terminal"));
-                }
-            }
-        }
-        if !terminal {
-            return Err(Unsupported::OperandShape("unterminated store CacheIR"));
-        }
-        dynasm!(ops ; .arch aarch64 ; =>next);
-    }
-    dynasm!(ops ; .arch aarch64 ; b =>miss ; =>existing ; mov w16, wzr ; =>matched);
-    Ok(())
 }
 
 /// Run the child-shape edge barrier after an add-transition value commit.
@@ -1980,7 +1546,3 @@ fn emit_native_ref_compare(ops: &mut Assembler, native_ref: u32) {
         ; cmp w14, w15
     );
 }
-
-#[cfg(test)]
-#[path = "ic_probe_field_tests.rs"]
-mod field_tests;

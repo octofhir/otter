@@ -37,8 +37,6 @@ pub(crate) struct Emission {
     pub(crate) call_entry: usize,
     pub(crate) exits: Vec<ExitSite>,
     pub(crate) relocations: RelocationCapture,
-    pub(crate) load_ic_cells: Box<[crate::entry::PropertySourceCell]>,
-    pub(crate) store_ic_cells: Box<[crate::entry::PropertySourceCell]>,
     pub(crate) node_offsets: Vec<(usize, NodeId)>,
     pub(crate) body_end: usize,
     pub(crate) osr_dispatch_end: Option<usize>,

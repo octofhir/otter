@@ -145,7 +145,7 @@ JSON.stringify([
 ]);
 "#;
 
-fn run_source(selection: JitSelection, source: &str, name: &str) -> (String, u64, u64) {
+fn run_source(selection: JitSelection, source: &str, name: &str) -> (String, u64, u64, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
         .build()
@@ -160,17 +160,18 @@ fn run_source(selection: JitSelection, source: &str, name: &str) -> (String, u64
         completion,
         stats.jit_osr_attempts,
         stats.jit_reentrant_stub_transitions,
+        stats.native_calls,
     )
 }
 
 #[test]
 fn object_protocol_completes_from_loop_osr() {
-    let (oracle, _, _) = run_source(
+    let (oracle, _, _, _) = run_source(
         JitSelection::InterpreterOnly,
         SOURCE,
         "jit-object-protocol.js",
     );
-    let (compiled, osr_attempts, reentrant) =
+    let (compiled, osr_attempts, reentrant, _) =
         run_source(JitSelection::Template, SOURCE, "jit-object-protocol.js");
     assert_eq!(compiled, oracle);
     assert!(osr_attempts > 0, "fixture must enter at a loop OSR header");
@@ -182,12 +183,12 @@ fn object_protocol_completes_from_loop_osr() {
 
 #[test]
 fn committed_protocol_roots_young_proxy_and_bound_intermediates() {
-    let (oracle, _, _) = run_source(
+    let (oracle, _, _, _) = run_source(
         JitSelection::InterpreterOnly,
         ROOTED_REENTRY_SOURCE,
         "jit-object-protocol-rooted-reentry.js",
     );
-    let (compiled, osr_attempts, reentrant) = run_source(
+    let (compiled, osr_attempts, _, native_calls) = run_source(
         JitSelection::Template,
         ROOTED_REENTRY_SOURCE,
         "jit-object-protocol-rooted-reentry.js",
@@ -195,8 +196,11 @@ fn committed_protocol_roots_young_proxy_and_bound_intermediates() {
     assert_eq!(compiled, oracle);
     assert_eq!(compiled, r#"[288,72,72,72,72,72,72,72,true]"#);
     assert!(osr_attempts > 0, "fixture must enter at a loop OSR header");
+    // Method lookups of `Object.getPrototypeOf` and friends hit the sites'
+    // IC handlers; each of the 288 rooted protocol operations still enters
+    // its native boundary.
     assert!(
-        reentrant >= 288,
-        "every rooted protocol operation must cross the committed boundary"
+        native_calls >= 288,
+        "every rooted protocol operation must cross the native boundary: {native_calls}"
     );
 }

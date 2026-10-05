@@ -240,6 +240,8 @@ pub enum IcEntryVariant {
     OwnData,
     /// An inherited holder owns the matched data slot.
     InheritedData,
+    /// The key is absent from the receiver and its whole chain.
+    NonExistent,
     /// Append transition that adds a slot on store.
     OwnAddTransition,
     /// Store transition guarded by a missing-key prototype chain.
@@ -369,112 +371,6 @@ impl FrameSnapshot {
             byte_pc: event.byte_pc,
             register_count: event.register_window.len(),
             registers,
-        }
-    }
-}
-
-/// Build the [`IcSiteState`] DTO from one stored
-/// [`crate::property_ic::PropertyIcEntry`] holding a
-/// [`crate::cache_ir::CacheStub`].
-#[must_use]
-pub(crate) fn snapshot_load_state(
-    entry: &crate::property_ic::PropertyIcEntry<crate::cache_ir::CacheStub>,
-) -> IcSiteState {
-    use crate::property_ic::PropertyIcEntry;
-    match entry {
-        PropertyIcEntry::Empty => IcSiteState::Empty,
-        PropertyIcEntry::Uncacheable => IcSiteState::Uncacheable,
-        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
-        PropertyIcEntry::Polymorphic { entries } => {
-            let mapped = entries
-                .iter()
-                .map(|ic| {
-                    if let Some(hit) = ic.own_data_hit() {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::OwnData,
-                            receiver_shape_id: hit.shape_id.raw(),
-                            key: None,
-                            slot: Some(hit.slot),
-                            to_shape_id: None,
-                        }
-                    } else if let Some((receiver_shape_id, hit)) = ic.inherited_data_load() {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::InheritedData,
-                            receiver_shape_id: receiver_shape_id.raw(),
-                            key: None,
-                            slot: Some(hit.slot),
-                            to_shape_id: None,
-                        }
-                    } else {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::OwnData,
-                            receiver_shape_id: 0,
-                            key: None,
-                            slot: None,
-                            to_shape_id: None,
-                        }
-                    }
-                })
-                .collect();
-            IcSiteState::Polymorphic { entries: mapped }
-        }
-    }
-}
-
-/// Build the [`IcSiteState`] DTO from one
-/// [`crate::property_ic::PropertyIcEntry`] holding a
-/// [`crate::cache_ir::CacheStub`].
-#[must_use]
-pub(crate) fn snapshot_store_state(
-    entry: &crate::property_ic::PropertyIcEntry<crate::cache_ir::CacheStub>,
-) -> IcSiteState {
-    use crate::object::StorePropertyTransitionKind;
-    use crate::property_ic::PropertyIcEntry;
-    match entry {
-        PropertyIcEntry::Empty => IcSiteState::Empty,
-        PropertyIcEntry::Uncacheable => IcSiteState::Uncacheable,
-        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
-        PropertyIcEntry::Polymorphic { entries } => {
-            let mapped = entries
-                .iter()
-                .map(|ic| {
-                    if let Some(hit) = ic.store_own_data_hit() {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::OwnData,
-                            receiver_shape_id: hit.shape_id.raw(),
-                            key: None,
-                            slot: Some(hit.slot),
-                            to_shape_id: None,
-                        }
-                    } else if let Some(t) = ic.store_transition_ref() {
-                        let variant = match t.kind {
-                            StorePropertyTransitionKind::OwnAdd => IcEntryVariant::OwnAddTransition,
-                            StorePropertyTransitionKind::PrototypeChainMissing { .. } => {
-                                IcEntryVariant::PrototypeChainMissingTransition
-                            }
-                            StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => {
-                                IcEntryVariant::DirectPrototypeWritableDataTransition
-                            }
-                        };
-                        IcEntrySnapshot {
-                            variant,
-                            receiver_shape_id: t.from_shape_id.raw(),
-                            key: None,
-                            slot: None,
-                            to_shape_id: Some(t.to_shape_id.raw()),
-                        }
-                    } else {
-                        IcEntrySnapshot {
-                            variant: IcEntryVariant::OwnData,
-                            receiver_shape_id: 0,
-                            key: None,
-                            slot: None,
-                            to_shape_id: None,
-                        }
-                    }
-                })
-                .collect();
-            IcSiteState::Polymorphic { entries: mapped }
         }
     }
 }
